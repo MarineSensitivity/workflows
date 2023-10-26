@@ -75,3 +75,194 @@ gh(glue("GET /orgs/{org}/repos")) |>
   kable()
 ```
 
+
+## Add issues to project
+
+Need to use:
+
+
+```{r}
+librarian::shelf(
+  dplyr, 
+  ropensci/ghql, 
+  jsonlite)
+
+token <- readLines("/Users/bbest/My Drive/private/pat4rstudio.txt")
+
+con <- GraphqlClient$new(
+  url = "https://api.github.com/graphql",
+  headers = list(Authorization = paste0("Bearer ", token)))
+con$load_schema()
+
+glueb <- function(...){
+  # glue with brackets
+  glue(..., .open = "[", .close = "]")
+}
+
+get_prj_id <- function(owner = "MarineSensitivities", num = 1){
+  # get Project ID, eg
+  #   https://github.com/orgs/MarineSensitivities/projects/1
+  
+  qry <- Query$new()
+  qry$query(
+    'q', glueb(
+    'query {organization(login: "[owner]")
+      { projectV2(number: [num])
+        {id} } }') )
+  con$exec(qry$queries$q) |> 
+    fromJSON() |> 
+    (\(x){ x$data$organization$projectV2$id })() # "PVT_kwDOCLQwZM4AW8mq"
+}
+
+prj_id <- get_prj_id("MarineSensitivities", 1)
+
+get_prj_issues <- function(prj_id){
+  # return IDs of issues in project
+  
+  qry <- Query$new()
+  qry$query(
+    'q', glueb( 
+      '{ node(id: "[prj_id]") { 
+      ... on ProjectV2 { 
+        items(first: 20) { 
+          nodes{ 
+            id  
+            content{ 
+              ...on Issue { 
+                id title } 
+      }}}}}}') )
+  con$exec(qry$queries$q) |> 
+    fromJSON() |> 
+    (\(x){ x$data$node$items$nodes$content$id })()
+}
+
+prj_issues <- get_prj_issues(prj_id)
+
+get_repo_issues <- function(owner = "MarineSensitivities", repo = "server"){
+  gh(glue("GET /repos/{owner}/{repo}/issues")) |> 
+    vapply("[[", "", "node_id")
+}
+
+get_owner_repos <- function(owner = "MarineSensitivities"){
+  gh(glue("GET /orgs/{owner}/repos")) |> 
+    vapply("[[", "", "name") |> 
+    sort()
+}
+
+repos <- get_owner_repos(org)
+
+add_prj_issue <- function(prj_id, issue_id, verbose = T){
+  # add issue to project, return id of new item in project
+  
+  # issue_id = repo_issue
+  
+  qry <- Query$new()
+  q <- glueb(
+      'mutation {
+        addProjectV2ItemById(
+          input: {
+            projectId: "[prj_id]" 
+            contentId: "[issue_id]" } )
+        {item {id}} }')
+  if (verbose) message(q)
+  qry$query('q', q )
+  con$exec(qry$queries$q) |> 
+    fromJSON() |> 
+    (\(x){ x$data$addProjectV2ItemById$item$id })() # PVTI_lADOCLQwZM4AW8mqzgKL5mU
+}
+
+for (repo in repos){ # repo = repos[1] # repo = "msens"
+  
+  repo_issues <- get_repo_issues(repo = repo)
+  message(glue("{repo} issues -> project '{prj_id}'"))
+          
+  for (issue_id in repo_issues){ # repo_issue = repo_issues[1]
+    if (issue_id %in% prj_issues){
+      message(glue("  issue '{issue_id}' already in project"))
+    } else {
+      message(glue("  adding issue '{issue_id}' to project"))
+      id_new <- add_prj_issue(prj_id, issue_id)
+    }
+  }
+}
+```
+
+```{r OLD manual, eval = F}
+qry$query(
+  'flds', 
+  '{ node(id: "PVT_kwDOCLQwZM4AW8mq") { ... on ProjectV2 { fields(first: 20) { nodes { ... on ProjectV2Field { id name } ... on ProjectV2IterationField { id name configuration { iterations { startDate id }}} ... on ProjectV2SingleSelectField { id name options { id name }}}}}}}')
+(x <- con$exec(qry$queries$flds))
+jsonlite::fromJSON(x)
+
+qry <- Query$new()
+qry$query(
+  'flds_common', 
+  '{ node(id: "PVT_kwDOCLQwZM4AW8mq") { ... on ProjectV2 { fields(first: 20) { nodes { ... on ProjectV2FieldCommon { id name __typename }}}}}}')
+(x <- con$exec(qry$queries$flds_common))
+jsonlite::fromJSON(x)
+
+qry <- Query$new()
+qry$query(
+  'itms', 
+  '{ node(id: "PVT_kwDOCLQwZM4AW8mq") { 
+  ... on ProjectV2 { 
+    items(first: 20) { 
+      nodes{ 
+        id fieldValues(first: 8) { 
+          nodes{ 
+            ... on ProjectV2ItemFieldTextValue { 
+              text field {  ... on ProjectV2FieldCommon {  name }}} 
+            ... on ProjectV2ItemFieldDateValue { 
+              date field { ... on ProjectV2FieldCommon { name }}} 
+          ... on ProjectV2ItemFieldSingleSelectValue { 
+              name field { ... on ProjectV2FieldCommon { name }}} 
+          }
+        } 
+        content{ 
+          ... on DraftIssue { title body } 
+          ...on Issue { 
+            id title assignees(first: 10) { 
+              nodes{ login }} } 
+          ...on PullRequest { title assignees(first: 10) { nodes{ login }}}
+  }}}}}}')
+(x <- con$exec(qry$queries$itms))
+jsonlite::fromJSON(x)
+
+
+
+issueid <- "I_kwDOKemkec50y7V4"
+prjid <- "PVT_kwDOCLQwZM4AW8mq"
+qry <- Query$new()
+qry$query(
+  'addissue2prj', 
+  glue(
+    'mutation {
+      addProjectV2ItemById(
+        input: {
+          projectId: "[prjid]" 
+          contentId: "[issueid]" } )
+      {item {id}} }',
+    .open = "[",
+    .close = "]"))
+(x <- con$exec(qry$queries$addissue2prj))
+id <- jsonlite::fromJSON(x) %>%
+  .$data %>%
+  .$addProjectV2ItemById %>%
+  .$item %>%
+  .$id
+# PVTI_lADOCLQwZM4AW8mqzgKL5mU
+
+# TODO:
+# - loop through issues and add to Project
+# - add to specific column (e.g. "To do")\
+#   [Using the API to manage Projects - GitHub Enterprise Cloud Docs](https://docs.github.com/en/enterprise-cloud@latest/issues/planning-and-tracking-with-projects/automating-your-project/using-the-api-to-manage-projects#updating-a-custom-text-number-or-date-field)
+# - add to specific iteration (e.g. "2021-01-01")
+# - add to specific assignee (e.g. "bbest")
+# - add to specific label (e.g. "type/status")
+# - add to specific milestone (e.g. "v1.0.0")
+# - add to specific project (e.g. "MarineSensitivities.github.io")
+# - add to specific repository (e.g. "MarineSensitivities.github.io")
+# - add to specific column (e.g. "To do")
+
+```
+
