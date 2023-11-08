@@ -13,4 +13,4 @@ These web pages (\*.html) are typically rendered from Quarto markdown (\*.qmd):
 
 ## source
 
-See [github.com/MarineSensitivities/workflows](https://github.com/MarineSensitivities/workflows)
+See [github.com/MarineSensitivity/workflows](https://github.com/MarineSensitivity/workflows)
