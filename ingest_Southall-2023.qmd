@@ -1,0 +1,370 @@
+---
+title: "Ingest Species Sensitivities (Southall et al, 2023)"
+editor_options: 
+  chunk_output_type: console
+format: 
+  html:  
+    css: ./libs/leaflet-control.css
+---
+
+## Introduction
+
+This report by Southall et al. [-@southallVulnerabilityIndexScale2023] describes species vulnerability based on multiple criteria:
+
+-   **Space**
+
+    -   Latitudinal zones
+
+        -   `Zone 1`\
+            Central California\
+            34.5° N to 38.33° N
+
+        -   `Zone 2`\
+            Northern California\
+            38.33° N to 42° N
+
+        -   `Zone 3`\
+            Southern and Central Oregon\
+            42° N to 45° N
+
+        -   `Zone 4`\
+            Columbia River Region\
+            45° N to 47.1° N
+
+        -   `Zone 5`\
+            Central and Northern Washington (Offshore)\
+            47.1° N to 48.5° N
+
+    -   Depth regimes
+
+        -   `Shelf`\
+            \< 100 m
+
+        -   `Slope`\
+            100-1,000 m
+
+        -   `Oceanic`\
+            1,000 - 2,500 m
+
+-   **Time**\
+    Oceanographic season
+
+    -   `Upwelling`\
+        March--June
+
+    -   `Post Upwelling`\
+        July--November
+
+    -   `Winter`\
+        December--February
+
+-   **Taxa**\
+    including sub-population or stock.
+
+
+## Space
+
+```{r}
+#| label: setup
+#| warning: false
+
+librarian::shelf(
+  dplyr, fs, glue, here, leaflet, mapview,
+  MarineSensitivity/msens,
+  sf, terra, tibble, units)
+
+show_all <- T
+dir_data <- "/Users/bbest/My Drive/projects/msens/data"
+g_tif    <- glue("{dir_data}/derived/gebco_depth.tif")
+p_geo    <- here("data/Southall-2023_depth-regimes.geojson")
+dir_xlsx <- here("{dir_data}/raw/studies/southallVulnerabilityIndexScale2023")
+```
+
+```{r}
+#| label: space
+#| warning: false
+#| eval: false
+
+if (!file.exists(p_geo) | show_all){
+  
+  bbox <- c(
+    -127 + 360, 
+    -119 + 360, 
+    34.5, 48.5)  # (xmin, xmax, ymin, ymax)
+  r_g <- rast(g_tif, win=bbox)
+  ext(r_g) <- bbox - c(360,360,0,0)
+  plot(r_g)
+  
+  # apply focal window to smooth out the raster
+  r_gf <- focal(r_g, w=5, fun="mean", na.rm=T)
+  names(r_gf) <- "depth"
+  
+  # classify into depth regimes
+  r_gc <- classify(r_gf, c(-Inf, 100, 1000, 2500))
+  plot(r_gc)
+  
+  # convert to polygons, calculate area, 
+  #   and centroid for filtering slivers
+  p <- as.polygons(r_gc) |> 
+    st_as_sf() |> 
+    st_cast("POLYGON") |> 
+    mutate(
+      ctr_x   = st_centroid(geometry) |> 
+        st_coordinates() %>%
+        .[,1],
+      ctr_y   = st_centroid(geometry) |> 
+        st_coordinates() %>%
+        .[,2],
+      area_km2 = st_area(geometry) |> 
+        set_units(km^2) |> 
+        as.numeric())
+  
+  # table(p$depth) # before focal()
+  #   (-inf–100]  (100–1000] (1000–2500] 
+  #          137         133         192 
+  # table(p$depth) # w=3
+  #  (-inf–100]  (100–1000] (1000–2500] 
+  #          44          47          61 
+  # table(p$depth) # w=5
+  # (-inf–100]  (100–1000] (1000–2500] 
+  #         36          24          34
+  
+  p_deep = p |> 
+    filter(
+      depth    == "(1000–2500]",
+      area_km2 >  1000)
+  p_other = p |> 
+    filter(
+      depth    != "(1000–2500]")
+  
+  p_slivers <- p |>
+    filter(
+      depth    == "(1000–2500]",
+      area_km2 <  1000)
+  hist(p_slivers$ctr_x, breaks=20)
+  
+  p_slivers_gtn122 <- p |> 
+    filter(
+      depth    == "(1000–2500]",
+      area_km2 <  1000,
+      ctr_x    > -122) # keep
+  p_slivers_ltn122gt124 <- p |> 
+    filter(
+      depth    == "(1000–2500]",
+      area_km2 <  1000,
+      ctr_x    < -122,
+      ctr_x    > -124) # keep
+  p_slivers_ltn124 <- p |> 
+    filter(
+      depth    == "(1000–2500]",
+      area_km2 <  1000,
+      ctr_x    < -124) # remove
+  
+  hist(p_slivers_ltn124$ctr_y, breaks=20)
+  
+  mapView(p_deep, col.regions = "darkgray") +
+    mapView(p_other, col.regions = "lightgray") + 
+    mapView(p_slivers_gtn122, zcol = "ctr_x") +
+    mapView(p_slivers_ltn122gt124, zcol = "ctr_x") +
+    mapView(p_slivers_ltn124, zcol = "ctr_y")
+  
+  p0 <- p
+  p <- p0 |> 
+    filter(
+      (depth == "(1000–2500]" &
+         area_km2 >  1000) |
+        (depth == "(1000–2500]" &
+           area_km2 <  1000 &
+           ctr_x > -124) |
+        (depth != "(1000–2500]")) |> 
+    rename(depth_m = depth) |> 
+    mutate(
+      depth_regime = case_match(
+        depth_m,
+        "(1000–2500]" ~ "Oceanic",
+        "(100–1000]"  ~ "Slope",
+        "(-inf–100]"  ~ "Shelf"))
+  
+  
+  # construct polygons for latitudinal zones
+  x_min <- -127
+  x_max <- -119
+  z <- rbind(
+    # Zone 1: Central California
+    st_bbox(c(
+      xmin = x_min, xmax = x_max,
+      ymin = 34.5, ymax = 38.33)) |>
+      st_as_sfc() |>
+      st_as_sf(
+        tibble(
+          lat_zone_id   = 1,
+          lat_zone_name = "Central California"),
+        crs = "epsg:4326"),
+    # Zone 2: Northern California
+    st_bbox(c(
+      xmin = x_min, xmax = x_max,
+      ymin = 38.33, ymax = 42)) |>
+      st_as_sfc() |>
+      st_as_sf(
+        tibble(
+          lat_zone_id   = 2,
+          lat_zone_name = "Northern California"),
+        crs = "epsg:4326"),
+    # Zone 3: Southern and Central Oregon
+    st_bbox(c(
+      xmin = x_min, xmax = x_max,
+      ymin = 42, ymax = 45)) |>
+      st_as_sfc() |>
+      st_as_sf(
+        tibble(
+          lat_zone_id   = 3,
+          lat_zone_name = "Southern and Central Oregon"),
+        crs = "epsg:4326"),
+    # Zone 4: Columbia River Region
+    st_bbox(c(
+      xmin = x_min, xmax = x_max,
+      ymin = 45, ymax = 47.1)) |>
+      st_as_sfc() |>
+      st_as_sf(
+        tibble(
+          lat_zone_id   = 4,
+          lat_zone_name = "Columbia River Region"),
+        crs = "epsg:4326"),
+    # Zone 5: Central and Northern Washington (Offshore)
+    st_bbox(c(
+      xmin = x_min, xmax = x_max,
+      ymin = 47.1, ymax = 48.5)) |>
+      st_as_sfc() |>
+      st_as_sf(
+        tibble(
+          lat_zone_id   = 5,
+          lat_zone_name = "Central and Northern Washington (Offshore)"),
+        crs = "epsg:4326"))
+  mapView(z, zcol = "lat_zone_name")
+}
+```
+
+```{r}
+#| label: fig-space
+#| fig-cap: "Spatial variation in species vulnerability by latitudinal zone and depth regime."
+#| warning: false
+
+if (!file.exists(p_geo)){
+  pz <- st_intersection(p, z) |> 
+    st_make_valid() |> 
+    mutate(
+      zone_depth_key = glue("{lat_zone_id}.{depth_regime}")) |> 
+    group_by(
+      zone_depth_key, lat_zone_id, lat_zone_name, depth_m, depth_regime) |> 
+    summarise(
+      .groups = "drop") |> 
+    mutate(
+      ctr_x   = st_centroid(geometry) |> 
+        st_coordinates() %>%
+        .[,1],
+      ctr_y   = st_centroid(geometry) |> 
+        st_coordinates() %>%
+        .[,2],
+      area_km2 = st_area(geometry) |> 
+        set_units(km^2) |> 
+        as.numeric() |> 
+        round(3))
+  
+  write_sf(pz, p_geo, delete_dsn = T)
+}
+pz <- read_sf(p_geo)
+
+mapView(pz, zcol = "zone_depth_key")
+```
+
+## Time
+
+```{mermaid}
+%%| label: fig-time
+%%| fig-cap: "Temporal variation in species vulnerability by oceanographic season."
+
+gantt
+    title Oceanographic Season
+    axisFormat  %b
+    Upwelling       :u, 1970-03-01, 1970-07-01
+    Post Upwelling  :p, 1970-07-01, 1970-11-01
+    Winter          :w, 1970-11-01, 1971-03-01
+```
+
+
+## Taxa
+
+```{r}
+#| label: taxa
+#| warning: false
+
+dir_xlsx <- glue("{dir_data}/raw/studies/southallVulnerabilityIndexScale2023")
+
+librarian::shelf(
+  knitr, purrr, readxl, stringr, tidyr,
+  quiet = T)
+
+d <- tibble(
+  path_xlsx = dir_ls(dir_xlsx, glob = "*.xlsx")) |> 
+  mutate(
+    file_xlsx = basename(path_xlsx)) |> 
+  filter(
+    str_starts(file_xlsx, fixed("~$"), negate = T)) |>
+  mutate(
+    sheet = map(path_xlsx, excel_sheets)) |> 
+  unnest(sheet) |> 
+  filter(
+    !sheet %in% c("Data description", "Guide to tabs", "Index to tabs")) |> 
+  separate_wider_regex(
+    sheet,
+    c(
+      sp_code = ".*",
+      "\\(",
+      season  = ".*",
+      "\\)\\s*"),
+    cols_remove = F) |>
+  mutate(
+    season  = str_trim(season),
+    sp_code = str_trim(sp_code),
+    season  = case_match(
+      season,
+      "POST-UPWELLING" ~ "POST UPWELLING",
+      "PST UPWELL"     ~ "POST UPWELLING",
+      "PST UPWELLING"  ~ "POST UPWELLING",
+      "Winter"         ~ "WINTER",
+      .default = season),
+    sp_stock = case_when(
+      !season %in% c("UPWELLING", "POST UPWELLING", "WINTER") ~ season),
+    season = ifelse(
+      season %in% c("UPWELLING", "POST UPWELLING", "WINTER"),
+      season,
+      NA),
+    sp_code = case_match(
+      sp_code,
+      "CAmDPSHUMPBACK" ~ "CAmerDPSHUMPBACK",
+      "GUADALUPE FUR"  ~ "GUADALUPE FUR SEAL",
+      "HI DPSHUMPBACK" ~ "HI DPS_HUMPBACK",
+      "Lags  WSD"      ~ "Lags WSD",
+      "MexDPSHUMPBACK" ~ "MexDPS_HUMPBACK",
+      "STELLER SEA L"  ~ "STELLER SEA LION",
+      .default = sp_code) )
+      
+table(d$sp_code, useNA = "ifany")
+table(d$season, useNA = "ifany")
+d |> 
+  filter(!is.na(sp_stock)) |> 
+  select(sp_code, sp_stock) |> 
+  table(useNA = "ifany")
+
+# read all sheets into data column
+d <- d |>
+  mutate(
+    data = map2(path_xlsx, sheet, read_xlsx))
+  
+d$data[[1]] |> 
+  kable()
+```
+
+...
+
+## References {.unnumbered}
