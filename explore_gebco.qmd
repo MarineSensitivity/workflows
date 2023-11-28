@@ -1,0 +1,174 @@
+---
+title: "Explore GEBCO Bathymetry"
+editor_options: 
+  chunk_output_type: console
+---
+
+## GEBCO - General Bathymetric Chart of the Oceans
+
+Download:
+
+* [GEBCO Gridded Bathymetry Data](https://www.gebco.net/data_and_products/gridded_bathymetry_data/#global)\
+`GEBCO_2022_sub_ice_topo.nc`
+
+```{r}
+# packages ----
+librarian::shelf(
+  fs, glue, leaflet, leaflet.extras,
+  marinesensitivity/msens,
+  sf, terra, yaml,
+  quiet = T)
+# devtools::load_all("~/Github/MarineSensitivity/msens")
+
+g_nc     <- "/Users/bbest/big/gebco_2022_sub_ice_topo/GEBCO_2022_sub_ice_topo.nc"
+dir_data <- "/Users/bbest/My Drive/projects/msens/data"
+g_tif    <- glue("{dir_data}/derived/gebco_depth.tif")
+
+if (!file.exists(g_tif)){
+
+  # prep shelfs polygon ----
+  p <- msens::ply_shlfs
+  b <- st_bbox(p)
+  v <- vect(p)
+  
+  # read GEBCO netcdf ----
+  r_g <- rast(g_nc) |>            # extent: -180, 180, -90, 90  (xmin, xmax, ymin, ymax)
+    rotate(r_g, left=F) |>        # extent:    0, 360, -90, 90
+    crop(r_gr, b) |>              # crop to bounding box
+    mask(r_grc, v, touches = T)   # mask to shelfs polygon
+  
+  # convert elevation to depth ----
+  r_depth <- r_g * -1
+  names(r_depth) <- "depth"
+  crs(r_depth) <- "epsg:4326"
+  
+  # write tif as COG ----
+  writeRaster(
+    r_depth, 
+    g_tif, 
+    overwrite = T,
+    datatype  = "INT2S",
+    gdal      = c(
+      "TILED=YES",
+      "COMPRESS=DEFLATE"))
+}
+
+# break up raster to either side of dateline ----
+r <- rast(g_tif) # for analysis
+
+# TODO: move to msens::projectrast_webmercator_eastwest()
+list(
+  range        = global(r, "range", na.rm=T),
+  bbox         = ext(r) |> st_bbox(),
+  gcs_tif      = "gebco_depth.tif",
+  mer_east_tif = "gebco_depth_mer_e.tif",
+  mer_west_tif = "gebco_depth_mer_w.tif") |> 
+  write_yaml(
+    glue("{dir_data}/derived/gebco_depth.yml"))
+
+projectrast_webmercator_eastwest <- function(
+    r,  # raster or path to tif; must be True: crs(r) == crs("epsg:4326")
+    tif_pfx       = "/Users/bbest/My Drive/projects/msens/data/derived/gebco_depth",
+    tif_east_sfx  = "_mer_e",
+    tif_west_sfx  = "_mer_w",
+    datatype      = "INT2S", 
+    method        = "bilinear"){
+  
+  if (is.character(r))
+    r <- rast(r) # for analysis
+  
+  stopifnot(crs(r) == crs("epsg:4326"))
+  
+  # east of antimeridian
+  message("shift, crop, project East of antimeridian")
+  r_east <- shift(r, -360) |> 
+    crop(ext(-180,180,-90,90), snap="in") |>
+    project("epsg:3857", method = method)
+
+  # west of antimeridian
+  message("shift, crop, project West of antimeridian")
+  r_west <- r |> 
+    crop(ext(-180,180,-90,90), snap="in") |>
+    project("epsg:3857", method = method)
+  
+  # output each {h}eading
+  for (h in c("east","west")){
+    # h_tif <- glue("{g}_{h}.tif")
+    
+    sfx <- get(glue("tif_{h}_sfx"))
+    tif <- glue("{tif_pfx}{sfx}.tif")
+    
+    message(glue("writing TIF {h} of antimeridian: {tif}"))
+    get(glue("r_{h}")) |> 
+      writeRaster(
+        tif, 
+        overwrite = T,
+        datatype  = datatype,
+        gdal      = c(
+          "TILED=YES",
+          "COMPRESS=DEFLATE"))
+    
+    # message(glue("writing COG {h} of antimeridian: {h_cog}"))
+    # gdal_translate(
+    #   h_tif, 
+    #   h_cog,
+    #   co = matrix(c(
+    #     "TILED=YES", 
+    #     "COMPRESS=DEFLATE")))
+  }
+}
+
+tif_pfx <- glue("{dir_data}/derived/gebco_depth")
+tifs_ew <- glue("{tif_pfx}_mer_{c('e','w')}.tif")
+if(!all(file.exists(tifs_ew)))
+  projectrast_webmercator_eastwest(r, tif_pfx)
+
+# TODO: write yaml with range, extent per raster, for reading in fxn
+# rng_e   <- rast(tifs_ew[1]) |> global("range", na.rm=T)
+# rng_w   <- rast(tifs_ew[2]) |> global("range", na.rm=T)
+# cog_range <- c(rng_e, rng_w) |> range()
+
+cog_base       = "https://file.marinesensitivity.org/cog/env/"
+cog_palette    = "spectral_r"
+cog_method     = "average"
+cog_opacity    = 0.9
+lgnd_palette   = "Spectral"
+lgnd_palette_r = TRUE
+title          = "Depth (m)"
+
+m <- read_yaml(glue("{cog_base}/gebco_depth.yml"))
+
+cog_range <- m$range |> as.numeric()
+e_cog_url <- glue("{cog_base}/{m$mer_east_tif}")
+w_cog_url <- glue("{cog_base}/{m$mer_west_tif}")
+
+tile_opts <- glue(
+  "resampling_method={cog_method}&rescale={paste(cog_range, collapse=',')}&return_mask=true&colormap_name={cog_palette}")
+
+e_tile_url <- glue(
+  "https://api.cogeo.xyz/cog/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}@2x?url={e_cog_url}&{tile_opts}")
+w_tile_url <- glue(
+  "https://api.cogeo.xyz/cog/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}@2x?url={w_cog_url}&{tile_opts}")
+
+# bb <- ext(r) |> st_bbox()
+bb <- m$bbox
+
+msens::ms_basemap() |>
+  # West
+  addTiles(
+    urlTemplate = w_tile_url,
+    options     = tileOptions(
+      opacity   = cog_opacity)) |>
+  # East
+  addTiles(
+    urlTemplate = e_tile_url,
+    options     = tileOptions(
+      opacity   = cog_opacity)) |>
+  fitBounds(bb[[1]], bb[[2]], bb[[3]], bb[[4]]) |>
+  addLegend(
+    pal    = colorNumeric(lgnd_palette, cog_range[1]:cog_range[2], reverse = lgnd_palette_r),
+    values = c(cog_range[1], cog_range[2]),
+    title  = title) |> 
+  leaflet.extras::addFullscreenControl()
+```
+
