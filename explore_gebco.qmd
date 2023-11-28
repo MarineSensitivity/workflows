@@ -54,23 +54,12 @@ if (!file.exists(g_tif)){
 }
 
 # break up raster to either side of dateline ----
-r <- rast(g_tif) # for analysis
 
-# TODO: move to msens::projectrast_webmercator_eastwest()
-list(
-  range        = global(r, "range", na.rm=T),
-  bbox         = ext(r) |> st_bbox(),
-  gcs_tif      = "gebco_depth.tif",
-  mer_east_tif = "gebco_depth_mer_e.tif",
-  mer_west_tif = "gebco_depth_mer_w.tif") |> 
-  write_yaml(
-    glue("{dir_data}/derived/gebco_depth.yml"))
-
-projectrast_webmercator_eastwest <- function(
+rast_to_cog3857eastwest <- function(
     r,  # raster or path to tif; must be True: crs(r) == crs("epsg:4326")
-    tif_pfx       = "/Users/bbest/My Drive/projects/msens/data/derived/gebco_depth",
-    tif_east_sfx  = "_mer_e",
-    tif_west_sfx  = "_mer_w",
+    cog_pfx       = "/Users/bbest/My Drive/projects/msens/data/derived/gebco_depth",
+    cog_east_sfx  = "_cog3857e",
+    cog_west_sfx  = "_cog3857w",
     datatype      = "INT2S", 
     method        = "bilinear"){
   
@@ -79,54 +68,55 @@ projectrast_webmercator_eastwest <- function(
   
   stopifnot(crs(r) == crs("epsg:4326"))
   
-  # east of antimeridian
-  message("shift, crop, project East of antimeridian")
-  r_east <- shift(r, -360) |> 
-    crop(ext(-180,180,-90,90), snap="in") |>
-    project("epsg:3857", method = method)
-
-  # west of antimeridian
-  message("shift, crop, project West of antimeridian")
-  r_west <- r |> 
-    crop(ext(-180,180,-90,90), snap="in") |>
-    project("epsg:3857", method = method)
-  
   # output each {h}eading
-  for (h in c("east","west")){
-    # h_tif <- glue("{g}_{h}.tif")
+  for (h in c("east","west")){ # h = "west"
+    message(glue("shift, crop, project {h} of antimeridian"))
     
-    sfx <- get(glue("tif_{h}_sfx"))
-    tif <- glue("{tif_pfx}{sfx}.tif")
+    if (h == "east"){
+      sfx <- cog_east_sfx
+      r_h <- shift(r, -360) |> 
+        crop(ext(-180,180,-90,90), snap="in") |>
+        project("epsg:3857", method = method)
+    }
+    if (h == "west"){
+      sfx <- cog_west_sfx
+      r_h <- r |> 
+        crop(ext(-180,180,-90,90), snap="in") |>
+        project("epsg:3857", method = method)
+    }
     
-    message(glue("writing TIF {h} of antimeridian: {tif}"))
-    get(glue("r_{h}")) |> 
+    tmp <- tempfile(fileext = ".tif")
+    cog <- glue("{cog_pfx}{sfx}.tif")
+    
+    r_h |> 
       writeRaster(
-        tif, 
+        tmp, 
         overwrite = T,
         datatype  = datatype,
         gdal      = c(
           "TILED=YES",
           "COMPRESS=DEFLATE"))
     
-    # message(glue("writing COG {h} of antimeridian: {h_cog}"))
-    # gdal_translate(
-    #   h_tif, 
-    #   h_cog,
-    #   co = matrix(c(
-    #     "TILED=YES", 
-    #     "COMPRESS=DEFLATE")))
+    system(glue("rio cogeo create '{tmp}' '{cog}'"))
+    unlink(tmp)
   }
+  
+  list(
+    range       = global(r, "range", na.rm=T),
+    bbox        = ext(r) |> st_bbox(),
+    tif4326     = basename(glue("{cog_pfx}.tif")),
+    cog3857east = basename(glue("{cog_pfx}{cog_east_sfx}.tif")),
+    cog3857west = basename(glue("{cog_pfx}{cog_west_sfx}.tif"))) |> 
+    write_yaml(
+      glue("{cog_pfx}.yml"))
 }
 
-tif_pfx <- glue("{dir_data}/derived/gebco_depth")
-tifs_ew <- glue("{tif_pfx}_mer_{c('e','w')}.tif")
-if(!all(file.exists(tifs_ew)))
-  projectrast_webmercator_eastwest(r, tif_pfx)
-
-# TODO: write yaml with range, extent per raster, for reading in fxn
-# rng_e   <- rast(tifs_ew[1]) |> global("range", na.rm=T)
-# rng_w   <- rast(tifs_ew[2]) |> global("range", na.rm=T)
-# cog_range <- c(rng_e, rng_w) |> range()
+cog_pfx <- glue("{dir_data}/derived/gebco_depth")
+tifs_ew <- glue("{cog_pfx}_cog3857{c('e','w')}.tif")
+if(!all(file.exists(tifs_ew))){
+  r <- rast(g_tif) 
+  rast_to_cog3857eastwest(r, cog_pfx)
+}
 
 cog_base       = "https://file.marinesensitivity.org/cog/env/"
 cog_palette    = "spectral_r"
@@ -139,8 +129,8 @@ title          = "Depth (m)"
 m <- read_yaml(glue("{cog_base}/gebco_depth.yml"))
 
 cog_range <- m$range |> as.numeric()
-e_cog_url <- glue("{cog_base}/{m$mer_east_tif}")
-w_cog_url <- glue("{cog_base}/{m$mer_west_tif}")
+e_cog_url <- glue("{cog_base}/{m$cog3857east}")
+w_cog_url <- glue("{cog_base}/{m$cog3857west}")
 
 tile_opts <- glue(
   "resampling_method={cog_method}&rescale={paste(cog_range, collapse=',')}&return_mask=true&colormap_name={cog_palette}")
@@ -150,7 +140,6 @@ e_tile_url <- glue(
 w_tile_url <- glue(
   "https://api.cogeo.xyz/cog/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}@2x?url={w_cog_url}&{tile_opts}")
 
-# bb <- ext(r) |> st_bbox()
 bb <- m$bbox
 
 msens::ms_basemap() |>
@@ -170,5 +159,21 @@ msens::ms_basemap() |>
     values = c(cog_range[1], cog_range[2]),
     title  = title) |> 
   leaflet.extras::addFullscreenControl()
+```
+
+## VGPM
+
+TODO:
+
+- [ ] align VGPM with GEBCO
+- [ ] convert to COG
+
+```{r}
+#| eval=FALSE
+
+rast_to_cog3857eastwest(
+  r       = glue("{dir_data}/derived/vgpm_2021.tif"), 
+  cog_pfx = glue("{dir_data}/derived/vgpm_2021"),
+  datatype = "FLT4S")
 ```
 
