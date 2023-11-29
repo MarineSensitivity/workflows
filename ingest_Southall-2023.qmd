@@ -69,15 +69,17 @@ This report by Southall et al. [-@southallVulnerabilityIndexScale2023] describes
 #| warning: false
 
 librarian::shelf(
-  dplyr, fs, glue, here, leaflet, mapview,
+  dplyr, DT, fs, glue, here, knitr, leaflet, mapview,
   MarineSensitivity/msens,
-  sf, terra, tibble, units)
+  purrr, readr, readxl, sf, stringr, terra, tibble, tidyr, units,
+  quiet = T)
 
 show_all <- T
 dir_data <- "/Users/bbest/My Drive/projects/msens/data"
 g_tif    <- glue("{dir_data}/derived/gebco_depth.tif")
 p_geo    <- here("data/Southall-2023_depth-regimes.geojson")
-dir_xlsx <- here("{dir_data}/raw/studies/southallVulnerabilityIndexScale2023")
+dir_xlsx <- glue("{dir_data}/raw/studies/southallVulnerabilityIndexScale2023")
+vuln_csv <- here("data/Southall-2023_vulnerabilities.csv")
 ```
 
 ```{r}
@@ -296,74 +298,233 @@ gantt
 ```{r}
 #| label: taxa
 #| warning: false
+#| message: false
 
-dir_xlsx <- glue("{dir_data}/raw/studies/southallVulnerabilityIndexScale2023")
+redo <- F
 
-librarian::shelf(
-  knitr, purrr, readxl, stringr, tidyr,
-  quiet = T)
+if (!file.exists(vuln_csv) | redo){
 
-d <- tibble(
-  path_xlsx = dir_ls(dir_xlsx, glob = "*.xlsx")) |> 
-  mutate(
-    file_xlsx = basename(path_xlsx)) |> 
-  filter(
-    str_starts(file_xlsx, fixed("~$"), negate = T)) |>
-  mutate(
-    sheet = map(path_xlsx, excel_sheets)) |> 
-  unnest(sheet) |> 
-  filter(
-    !sheet %in% c("Data description", "Guide to tabs", "Index to tabs")) |> 
-  separate_wider_regex(
-    sheet,
-    c(
-      sp_code = ".*",
-      "\\(",
-      season  = ".*",
-      "\\)\\s*"),
-    cols_remove = F) |>
-  mutate(
-    season  = str_trim(season),
-    sp_code = str_trim(sp_code),
-    season  = case_match(
-      season,
-      "POST-UPWELLING" ~ "POST UPWELLING",
-      "PST UPWELL"     ~ "POST UPWELLING",
-      "PST UPWELLING"  ~ "POST UPWELLING",
-      "Winter"         ~ "WINTER",
-      .default = season),
-    sp_stock = case_when(
-      !season %in% c("UPWELLING", "POST UPWELLING", "WINTER") ~ season),
-    season = ifelse(
-      season %in% c("UPWELLING", "POST UPWELLING", "WINTER"),
-      season,
-      NA),
-    sp_code = case_match(
-      sp_code,
-      "CAmDPSHUMPBACK" ~ "CAmerDPSHUMPBACK",
-      "GUADALUPE FUR"  ~ "GUADALUPE FUR SEAL",
-      "HI DPSHUMPBACK" ~ "HI DPS_HUMPBACK",
-      "Lags  WSD"      ~ "Lags WSD",
-      "MexDPSHUMPBACK" ~ "MexDPS_HUMPBACK",
-      "STELLER SEA L"  ~ "STELLER SEA LION",
-      .default = sp_code) )
-      
-table(d$sp_code, useNA = "ifany")
-table(d$season, useNA = "ifany")
-d |> 
-  filter(!is.na(sp_stock)) |> 
-  select(sp_code, sp_stock) |> 
-  table(useNA = "ifany")
-
-# read all sheets into data column
-d <- d |>
-  mutate(
-    data = map2(path_xlsx, sheet, read_xlsx))
+  d <- tibble(
+    path_xlsx = dir_ls(dir_xlsx, glob = "*.xlsx")) |> 
+    mutate(
+      file_xl = basename(path_xlsx)) |> 
+    filter(
+      str_starts(file_xl, fixed("~$"), negate = T)) |>
+    mutate(
+      sheet = map(path_xlsx, excel_sheets)) |> 
+    unnest(sheet) |> 
+    filter(
+      !sheet %in% c("Data description", "Guide to tabs", "Index to tabs")) |> 
+    separate_wider_regex(
+      sheet,
+      c(
+        sp_code = ".*",
+        "\\(",
+        season  = ".*",
+        "\\)\\s*"),
+      cols_remove = F) |>
+    mutate(
+      season  = str_trim(season),
+      sp_code = str_trim(sp_code),
+      season  = case_match(
+        season,
+        "POST-UPWELLING" ~ "POST UPWELLING",
+        "PST UPWELL"     ~ "POST UPWELLING",
+        "PST UPWELLING"  ~ "POST UPWELLING",
+        "Winter"         ~ "WINTER",
+        .default = season),
+      sp_stock = case_when(
+        !season %in% c("UPWELLING", "POST UPWELLING", "WINTER") ~ season),
+      season = ifelse(
+        season %in% c("UPWELLING", "POST UPWELLING", "WINTER"),
+        season,
+        NA),
+      sp_code = case_match(
+        sp_code,
+        "CAmDPSHUMPBACK" ~ "CAmerDPSHUMPBACK",
+        "GUADALUPE FUR"  ~ "GUADALUPE FUR SEAL",
+        "HI DPSHUMPBACK" ~ "HI DPS_HUMPBACK",
+        "Lags  WSD"      ~ "Lags WSD",
+        "MexDPSHUMPBACK" ~ "MexDPS_HUMPBACK",
+        "STELLER SEA L"  ~ "STELLER SEA LION",
+        .default = sp_code) )
   
-d$data[[1]] |> 
-  kable()
+  table(d$sp_code, useNA = "ifany")
+  table(d$season, useNA = "ifany")
+  
+  d |> 
+    filter(!is.na(sp_stock)) |> 
+    select(sp_code, sp_stock) |> 
+    table(useNA = "ifany")
+  
+  read_vulnsheet <- function(path_xlsx, sheet){
+    # path_xlsx <- d1$path_xlsx[1]
+    # sheet <- d1$sheet[1]           # "BLUE WHALE (UPWELLING)"
+    # path_xlsx <- d1$path_xlsx[49]
+    # sheet <- d1$sheet[49]          # "HARBOR PORPOISE (Morro Bay)"
+    # path_xlsx <- d1$path_xlsx[75]
+    # sheet <- d1$sheet[75]          # "BTLN Coastal (UPWELLING)"
+    
+    ln1 <- read_xlsx(
+      path_xlsx, sheet, n_max = 2)
+    
+    if ("ALL SEASONS" %in% names(ln1)){
+      # therefore: HARBOR PORPOISE ({stock})
+      
+      dd <- read_xlsx(
+        path_xlsx, sheet, skip = 1)
+      
+      cols_pfx <- c(
+        "","",
+        tibble(
+          zones = names(dd)[-c(1:2)] |> 
+            str_replace("ZONE ([0-9]+)", "\\1.") |> 
+            str_replace("\\.{3}[0-9]+", "") |> 
+            na_if("")) |>
+          fill(
+            zones,
+            .direction = "down") |> 
+          pull(zones))
+      
+      dd <- read_xlsx(
+        path_xlsx, sheet, skip = 2)
+      
+    } else{
+      
+      ln1 <- ln1 |> slice(1)
+      
+      cols_pfx <- c(
+        "","",
+        tibble(
+          zones = names(ln1)[-c(1:2)] |> 
+            str_replace("ZONE ([0-9]+)", "\\1.") |> 
+            str_replace("\\.{3}[0-9]+", "") |> 
+            na_if("")) |>
+          fill(
+            zones,
+            .direction = "down") |> 
+          pull(zones))
+      
+      cols_na <- ln1 |> 
+        pivot_longer(
+          everything()) |> 
+        pull(value) |> 
+        is.na()
+      cols_pfx[cols_na] <- "x"
+      
+      dd <- read_xlsx(
+        path_xlsx, sheet, skip = 1)
+    }
+    
+    if (ncol(dd) != length(cols_pfx)){
+      browser()
+    } 
+    
+    cols <- names(dd) |> 
+      str_replace("Oecanic", "Oceanic") |>
+      str_replace("Vulnerability Factor","factor") |>
+      str_replace("Factor Element", "element") |>
+      str_replace(".*(Oceanic|Shelf|Slope).*", "\\1")
+    
+    names(dd) <- glue("{cols_pfx}{cols}") |> 
+      str_replace("\\.{3}[0-9]+", "")
+    
+    # dd1 <- dd
+    dd <- dd |> 
+      select(-contains("x")) |> 
+      filter(!is.na(element)) |> 
+      fill(factor, .direction = "down")
+    
+    rows_txt <-  suppressWarnings(
+      dd |> pull(3) |> as.numeric() |> is.na())
+    
+    dd_txt <- dd |> 
+      filter(rows_txt) |> 
+      pivot_longer(
+        cols          = -c(factor, element),
+        names_to      = "zone_depth_key",
+        values_to     = "score_txt")
+    
+    dd_int <- dd |> 
+      filter(!rows_txt) |> 
+      pivot_longer(
+        cols          = -c(factor, element),
+        names_to      = "zone_depth_key",
+        values_to     = "score_int")
+    
+    dd <- dd_int |> 
+      bind_rows(dd_txt)
+    dd
+  }
+  
+  # read all sheets into data column
+  d <- d |>
+    mutate(
+      data = map2(path_xlsx, sheet, read_vulnsheet))
+  
+  # unnest data column and cleanup
+  # d1 <- d
+  d <- d |>
+    select(-path_xlsx) |>
+    relocate(sheet,    .after = file_xl) |> 
+    relocate(sp_stock, .after = sp_code) |> 
+    mutate(
+      season = ifelse(is.na(season), "ALL", season)) |> # for: HARBOR PORPOISE
+    unnest(data) |> 
+    mutate(
+      element = element |>                      # remove:
+        str_replace("\\r\\n", "") |>            # - newlines
+        str_replace("(.*) \\(.+\\)", "\\1") |>  # - suffix parentheticals
+        str_replace("[a-c]\\. (.*)", "\\1") |>  # - prefix a. b. c.
+        str_trim(),
+      factor = case_match(
+        element,
+        c("ALL FACTORS TOTAL","CONFIDENCE LEVEL","VULNERABILITY RATING") ~ "ALL",
+        .default = factor),
+      element = case_when(
+        str_detect(element, "total") ~ "subtotal",
+        str_detect(element, "TOTAL") ~ "TOTAL",
+        .default = element),
+      factor_element = glue("{factor}: {element}"))
+  
+  write_csv(d, vuln_csv)
+}
+d <- read_csv(vuln_csv)
 ```
 
-...
+
+### Table of vulnerabilities
+
+- table dimensions (rows, columns): `r dim(d)`
+- \# unique files: `r length(unique(d$file_xl))`
+- \# unique sheets: `r length(unique(d$sheet))`
+- \# unique `sp_code`: `r length(unique(d$sp_code))`
+
+First 1,000 rows (of `r format(nrow(d), big.mark=",")` rows) of `d` ([`r basename(vuln_csv)`](https://github.com/MarineSensitivity/workflows/blob/main/data/`r basename(vuln_csv)`)):
+
+```{r}
+d |> 
+  slice(1:1000) |> 
+  datatable()
+```
+
+### Counts of `sp_code`
+
+```{r}
+table(d$sp_code, useNA = "ifany")
+```
+
+### Counts of `factor`
+
+```{r}
+table(d$factor, useNA = "ifany")
+```
+
+### Counts of `factor_element`
+
+```{r}
+table(d$factor_element, useNA = "ifany")
+```
+
 
 ## References {.unnumbered}
