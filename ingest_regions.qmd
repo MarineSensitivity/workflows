@@ -1,0 +1,74 @@
+---
+title: "ingest_regions"
+editor_options: 
+  chunk_output_type: console
+---
+
+## Goal
+
+- [x] `msens::shlfs|rgns` -> `pg:shlfs|rgns`\
+  Ingest existing BOEM Shelfs and Regions from [`msens`](https://marinesensitivity.org/msens/reference/index.html#data) R package (performed with [msens: `/data-raw/ply_shlfs_rgns.R`](https://github.com/MarineSensitivity/msens/blob/main/data-raw/ply_shlfs_rgns.R) after workflow: [explore_regions](https://marinesensitivity.org/workflows/explore_regions.html)) into the PostGIS spatial database for performing spatial joins with species and other data.
+
+## Load into PostGIS database
+
+```{r}
+#| label: load_db
+
+librarian::shelf(
+  here, leaflet, # mapview, 
+  marinesensitivity/msens, 
+  sf, tibble,
+  quiet = T)
+
+source(here("libs/db.R")) # define: con
+
+tbls <- c(
+  "ply_shlfs", "ply_shlfs_s05", 
+  "ply_rgns" , "ply_rgns_s05")
+redo <- F
+
+if (!all(tbls %in% dbListTables(con))){
+  for (tbl in tbls){  # tbl = "ply_shlfs_s05"
+    
+    # shift from 0:360 to -180:180
+    o <- get(tbl) |> 
+      st_wrap_dateline()
+    
+    st_write(
+      o,
+      dsn           = con,
+      layer         = tbl,
+      driver        = "PostgreSQL",
+      layer_options = "OVERWRITE=true")
+  
+    # enforce SRID so shows up in tile.marinesensivity.org
+    dbExecute(con, glue("SELECT UpdateGeometrySRID('{tbl}','geometry',4326);"))
+  }
+}
+```
+
+## Test spatial data in database
+
+```{r}
+#| label: test_db
+
+dbListTables(con)
+
+p <- read_sf(con, "ply_shlfs_s05")
+
+# mapView(
+#   p,
+#   zcol       = "shlf_name",
+#   layer.name = "ply_shlfs.shlf_name<br><small>(simplified to 5%)</small>")
+# Error: [weirdly only when run quarto render]
+# ! number of columns of matrices must match (see arg 2)
+
+msens::ms_basemap() |>
+  addPolygons(
+    data      = p,
+    fillColor = "blue",
+    fillOpacity = 0.5,
+    weight    = 2,
+    color     = "black",
+    popup     = ~shlf_name)
+```
