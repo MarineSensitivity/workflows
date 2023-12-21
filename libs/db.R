@@ -15,8 +15,12 @@ host <- ifelse(
 # for localhost db, see: https://github.com/marinesensitivity/server#connect
 
 # database connect ----
-db_pass_txt <- "~/.msens_pass.txt"
-# ln -s '/Users/bbest/My Drive/private/msens_pass.txt' ~/.msens_pass.txt
+dir_private <- switch(
+  Sys.info()[["sysname"]],
+  "Darwin" = "/Users/bbest/My Drive/private",
+  "Linux"  = "/share/private")
+
+db_pass_txt <- glue("{dir_private}/msens-db_admin-pass.txt")
 
 stopifnot(file.exists(db_pass_txt))
 
