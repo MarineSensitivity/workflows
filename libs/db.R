@@ -27,7 +27,7 @@ con <- DBI::dbConnect(
   port     = 5432,
   user     = "admin",
   password = readLines(db_pass_txt),
-  options  ="-c search_path=public")
+  options  ="-c search_path=public,raw")
 
 # test connection:
 # dbListTables(con)

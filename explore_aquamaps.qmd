@@ -25,7 +25,7 @@ librarian::shelf(
   DBI, dplyr, DT, duckdb, fs, glue, here, janitor, 
   leaflet, librarian, mapview,
   # raquamaps/raquamaps,
-  readr, sf, terra, tibble,
+  readr, sf, stringr, terra, tibble,
   quiet = T)  # zeallot
 
 # The legacy packages maptools, rgdal, and rgeos, underpinning the sp package,
@@ -204,23 +204,25 @@ datatable(d_renames)
 #| label: streamline fields to use `cell_id`
 #| eval: false
 
-d_spp_cells <- tbl(con_dd, "spp_cells") |> 
-  left_join(
-    tbl(con_dd, "cells") |> 
-      select(cell_id, csquare_code),
-    by = "csquare_code") |> 
-  select(-csquare_code, -center_lat, -center_long) |> 
-  collect()
-dbWriteTable(con_dd, "spp_cells", d_spp_cells, overwrite = T)
-
-d_spp_occs <- tbl(con_dd, "spp_occs") |> 
-  left_join(
-    tbl(con_dd, "cells") |> 
-      select(cell_id, csquare_code),
-    by = "csquare_code") |> 
-  select(-csquare_code) |> 
-  collect()
-dbWriteTable(con_dd, "spp_occs", d_spp_occs, overwrite = T)
+if (F){
+  d_spp_cells <- tbl(con_dd, "spp_cells") |> 
+    left_join(
+      tbl(con_dd, "cells") |> 
+        select(cell_id, csquare_code),
+      by = "csquare_code") |> 
+    select(-csquare_code, -center_lat, -center_long) |> 
+    collect()
+  dbWriteTable(con_dd, "spp_cells", d_spp_cells, overwrite = T)
+  
+  d_spp_occs <- tbl(con_dd, "spp_occs") |> 
+    left_join(
+      tbl(con_dd, "cells") |> 
+        select(cell_id, csquare_code),
+      by = "csquare_code") |> 
+    select(-csquare_code) |> 
+    collect()
+  dbWriteTable(con_dd, "spp_occs", d_spp_occs, overwrite = T)
+}
 
 # TODO: update _tbl_fld_renames to this streamlining
 #   spp_cells.csquare_code|center_lat|center_long -> cell_id
@@ -238,18 +240,21 @@ create_index <- function(con, tbl, flds, is_unique = F){
   idx  <- glue("{tbl}_{paste(flds, collapse='_')}_idx")
   flds <- glue("{paste(flds, collapse=',')}")
   sql  <- glue("CREATE {unq} INDEX {idx} ON {tbl} ({flds});")
-
+  
   message(sql)
   dbExecute(con, sql)
 }
-create_index(con_dd, "cells",     "cell_id", is_unique = T)
-create_index(con_dd, "spp",       "sp_key",  is_unique = T)
-create_index(con_dd, "spp_cells", "cell_id")
-create_index(con_dd, "spp_cells", "sp_key")
-create_index(con_dd, "spp_prefs", "sp_key", is_unique = T)
-create_index(con_dd, "spp_occs",  "occ_id", is_unique = T)
-create_index(con_dd, "spp_occs",  "cell_id")
-create_index(con_dd, "spp_occs",  "sp_key")
+
+if (F){
+  create_index(con_dd, "cells",     "cell_id", is_unique = T)
+  create_index(con_dd, "spp",       "sp_key",  is_unique = T)
+  create_index(con_dd, "spp_cells", "cell_id")
+  create_index(con_dd, "spp_cells", "sp_key")
+  create_index(con_dd, "spp_prefs", "sp_key", is_unique = T)
+  create_index(con_dd, "spp_occs",  "occ_id", is_unique = T)
+  create_index(con_dd, "spp_occs",  "cell_id")
+  create_index(con_dd, "spp_occs",  "sp_key")
+}
 ```
 
 ## export/import db
@@ -265,40 +270,43 @@ for:
 
 dir_parquet <- glue("{dir_data}/derived/aquamaps/parquet")
 
-dbExecute(con_dd, glue("
+if (F){
+  dbExecute(con_dd, glue("
   -- export the database to the target directory 'db_name' as CSV files
   --   EXPORT DATABASE 'db_name';
   -- export to directory 'db_name', using the given options for the CSV serialization
   --   EXPORT DATABASE 'db_name' (FORMAT CSV, DELIMITER '|');
   -- export to directory 'db_name', tables serialized as Parquet
        EXPORT DATABASE '{dir_parquet}' (FORMAT PARQUET);"))
+}
 ```
 
 ```{r}
 #| label: import duckdb
 #| eval: false
 
-dbDisconnect(con_dd, shutdown = T)
-file_delete(path_dd)
-con_dd   <- dbConnect(
-  duckdb(
-    dbdir     = path_dd,
-    read_only = F))
-file_size(path_dd) # 12K
-
-system.time({
-  dbExecute(con_dd, glue("
+if (F){
+  dbDisconnect(con_dd, shutdown = T)
+  file_delete(path_dd)
+  con_dd   <- dbConnect(
+    duckdb(
+      dbdir     = path_dd,
+      read_only = F))
+  file_size(path_dd) # 12K
+  
+  system.time({
+    dbExecute(con_dd, glue("
     IMPORT DATABASE '{dir_parquet}';"))
-})
-
-dbDisconnect(con_dd, shutdown = T)
-file_size(path_dd) # 698M
-
-con_dd   <- dbConnect(
-  duckdb(
-    dbdir     = path_dd,
-    read_only = F))
-
+  })
+  
+  dbDisconnect(con_dd, shutdown = T)
+  file_size(path_dd) # 698M
+  
+  con_dd   <- dbConnect(
+    duckdb(
+      dbdir     = path_dd,
+      read_only = F))
+}
 # TODO: + fxns: export_duckdb(), import_duckdb(format="parquet")
 ```
 
@@ -360,35 +368,171 @@ r_cells <- rast(cells_tif)
 plot(r_cells)
 ```
 
-## plot species
+## plot 'blue whale'
 
 ```{r}
+# function for getting raster of species
+am_rast <- function(sp_key){
+  
+  # TODO: filter also by
+  # - fao_area_yn: Does this cell fall within an FAO area where the species is known to occur (endemic/native)? 0=No, 1=Yes
+  # - bound_box_yn: Does this cell fall within the geographical bounding box known for the species? 0=No, 1=Yes
+  
+  # get sp cells
+  d <- tbl(con_dd, "spp_cells") |> 
+    filter(sp_key == !!sp_key) |> 
+    left_join(
+      tbl(con_dd, "cells") |> 
+        select(cell_id, cell_idx), 
+      by = "cell_id") |> 
+    filter(
+      !is.na(cell_idx),
+      !is.na(probability)) |> 
+    select(cell_idx, probability) |> 
+    collect()
+  
+  # create template raster from global dimensions and resolution
+  r <- rast(
+    xmin = -180, xmax = 180, 
+    ymin = -90,  ymax = 90, 
+    resolution = 0.5)
+  
+  # substitute raster values
+  r[d$cell_idx] <- d$probability
+
+  names(r) <- sp_key
+  r
+}
+
 sp_name <- "blue whale"
 
 # get sp_key
 sp_key <- tbl(con_dd, "spp") |> 
-  filter(common_name == !!sp_name) |> 
+  filter(common_name == !!sp_name) |>
   pull(sp_key)
 
-# get sp cells
-d <- tbl(con_dd, "spp_cells") |> 
-  filter(sp_key == !!sp_key) |> 
-  left_join(
-    tbl(con_dd, "cells") |> 
-      select(cell_id, cell_idx), 
-    by = "cell_id") |> 
-  select(cell_idx, probability) |> 
-  collect()
-# TODO: filter also by
-# - fao_area_yn: Does this cell fall within an FAO area where the species is known to occur (endemic/native)? 0=No, 1=Yes
-# - bound_box_yn: Does this cell fall within the geographical bounding box known for the species? 0=No, 1=Yes
-
-r <- r_cells
-values(r) <- NA
-
-r[d$cell_idx] <- d$probability
-plot(r)
+am_rast(sp_key) |> 
+  plot()
 ```
+
+## export rasters for all order == 'Cetacea'
+
+```{r}
+spp_keys <- tbl(con_dd, "spp") |> 
+  filter(
+    order == "Cetacea") |>
+  pull(sp_key)
+
+for (sp_key in spp_keys){
+
+  sp_tif <- glue("{dir_data}/derived/aquamaps/spp/{sp_key}.tif")
+  
+  r <- am_rast(sp_key) * 100 |> as.integer() 
+
+  # write to smallest possible raster
+  r |> 
+    writeRaster(
+      sp_tif, 
+      overwrite = T,
+      datatype  = "INT1U",
+      gdal      = c(
+        "TILED=YES",
+        "COMPRESS=DEFLATE"))
+  # message(basename(sp_tif), ": ", file_size(sp_tif))
+} 
+```
+
+## compare individual vs combined *.tif file sizes
+
+```{r}
+spp_tif <- glue("{dir_data}/derived/aquamaps/spp/_Cetacea.tif")
+
+# get all tifs
+d_tifs <- tibble(
+  path = dir_ls(
+    path   = glue("{dir_data}/derived/aquamaps/spp"),
+    type   = "file",
+    regexp = ".*\\.tif$"),
+  base = basename(path)) |>
+  # filter out tifs starting with "_"
+  filter(!str_detect(base, "^[_]"))
+
+if (!file.exists(spp_tif)){
+  
+  r <- rast(d_tifs$path)
+  
+  # write to smallest possible raster
+  r |> 
+    writeRaster(
+      spp_tif, 
+      overwrite = T,
+      datatype  = "INT1U",
+      gdal      = c(
+        "TILED=YES",
+        "COMPRESS=DEFLATE"))
+}
+
+message(basename(spp_tif), ": ", file_size(spp_tif)) # _Cetacea.tif:  3.8M
+sum(file_size(d_tifs$path))                          # *.tif       :  2.8M
+```
+
+Presumably individual TIFs are smaller because they are compressed individually, whereas the combined TIF is compressed as a whole. This may be especially true 
+since `TILED=YES` option excludes tiles without data.
+
+## try `stars` library
+
+```{r}
+library(stars)
+
+s <- read_stars(d_tifs$path, proxy=T)
+# TODO: time proxy vs non-proxy vs CLUSTER
+names(s) <- basename(d_tifs$path) |> path_ext_remove()
+  
+s_m <- merge(s)
+
+# as.data.frame(s_m) |> head()
+# faster: 
+s_m |> split("band") |> 
+  as.data.frame() |>
+  head()
+
+# install.packages("starsdata", repos = "http://gis-bigdata.uni-muenster.de/pebesma", type = "source") 
+# possibly after: options(timeout = 100)
+# or from an alternative repository:
+install.packages("starsdata", repos = "http://pebesma.staff.ifgi.de", type = "source") # 1037.4 MB
+granule = system.file("sentinel/S2A_MSIL1C_20180220T105051_N0206_R051_T32ULE_20180221T134037.zip", package = "starsdata")
+s2 = paste0("SENTINEL2_L1C:/vsizip/", granule, "/S2A_MSIL1C_20180220T105051_N0206_R051_T32ULE_20180221T134037.SAFE/MTD_MSIL1C.xml:10m:EPSG_32632")
+p = read_stars(s2, proxy = T)
+
+ndvi = function(x1, x2, x3, x4) (x4 - x1)/(x4 + x1)
+rm(x)
+(s2.ndvi = st_apply(p, c("x", "y"), ndvi))
+
+
+
+
+stars::
+
+stars::st_dim_to_attr()
+
+
+tif = system.file("tif/L7_ETMs.tif", package = "stars")
+x1 = read_stars(tif)
+(x = st_dim_to_attr(x1))
+
+attributes(s)
+st_dimensions(s)
+plot(s[1])
+plot(s[2])
+plot(s_m)
+
+# Read or write data using GDAL's multidimensional array API
+spp_nc <- glue("{dir_data}/derived/aquamaps/spp/_Cetacea.nc")
+
+write_mdim(s_m, spp_nc)	
+print(read_mdim(nc))
+```
+
 
 ## next steps
 

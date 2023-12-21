@@ -1,0 +1,251 @@
+---
+title: "ingest_regions"
+editor_options: 
+  chunk_output_type: console
+---
+
+## Goal
+
+See: 
+
+* [inject fine scale aliquots into database and use vector tile service · Issue #14 · MarineSensitivity/workflows](https://github.com/MarineSensitivity/workflows/issues/14)
+* [README - Google Docs](https://docs.google.com/document/d/1jpW3As6sve5LkI7r8Os3YpDk8zyBMz2r3_2irFHzorc/edit)
+
+## Load into PostGIS database
+
+```{r}
+#| label: load_db
+
+librarian::shelf(
+  fs, glue, here, janitor, leaflet, leaflet.extras, # mapview, 
+  marinesensitivity/msens, 
+  purrr, readr, sf, tibble, tidyr,
+  quiet = T)
+options(readr.show_col_types = F)
+source(here("libs/db.R")) # define: con
+
+d_csv <- here("data/ingest_blocks_spatial-paths.csv")
+redo  <- F
+
+d <- read_csv(d_csv)
+
+for (i in seq_len(nrow(d))){ # i = 2
+  # path   <- "/Users/bbest/My Drive/projects/msens/data/raw/boem.gov/blocks/PC/PC_PROT_CLIP/PC_PROT_CLIP.shp"
+  # path   <- "/Users/bbest/My Drive/projects/msens/data/raw/boem.gov/blocks/GMX/BlockPolygonsClipped.gdb"
+  # path   <- "/Users/bbest/My Drive/projects/msens/data/raw/boem.gov/blocks/USA/BOEMWindLayers_4Download.gdb"
+  # tbl    <- "boem_pc_prot_clip"
+  # schema <- "raw"
+  path   <- d$path[i]
+  lyr    <- d$lyr[i]
+  schema <- d$schema[i]
+  tbl    <- d$tbl[i]
+  
+  txt_lyr <- ifelse(is.na(lyr), '', glue(':{lyr}'))
+  message(glue("loading {basename(path)}{txt_lyr} into {schema}.{tbl}"))
+  
+  if (dbExistsTable(con, Id(schema = schema, table  = tbl)) & !redo){
+    message("  table exists, skipping")
+    next()
+  }
+  
+  if (is.na(lyr) && 
+      path_ext(path) == "gdb" && 
+      length(st_layers(path)$name) > 1)
+    stop("  multiple layers in gdb, must specify which to load")
+  
+  if (!is.na(lyr)){
+    o <- read_sf(path, layer = lyr)
+  } else {
+    o <- read_sf(path)
+  }
+  # mapview::mapView(o)
+  
+  o <- o |> 
+    clean_names() |>
+    st_transform(4326)
+  st_geometry(o) <- "geom"
+  # TODO: check
+  # st_is_valid(o) |> table()      # all TRUE
+  # st_geometry_type(o) |> table() # all MULTIPOLYGON
+  
+  write_sf(
+    o,
+    con,
+    Id(schema=schema, table = tbl), append=F)
+  
+  # enforce SRID so shows up in tile.marinesensivity.org
+  dbExecute(con, glue("SELECT UpdateGeometrySRID('{schema}','{tbl}','geom',4326);"))
+}
+
+# o_ck <- read_sf(
+#   con,
+#   Id(schema=schema, table = tbl))
+# mapview::mapView(o_ck)
+
+pkey <- "ms_key"  # d <- read_csv(d_csv)
+for (i in seq_len(nrow(d))){ # d <- read_csv(d_csv); i = 13
+  schema         <- d$schema[i]
+  tbl            <- d$tbl[i]
+  key_expression <- d$key_expression[i]
+  
+  message(glue("{i}: + {pkey} to {schema}.{tbl}: {key_expression}"))
+  
+  pkey_exists <- dbGetQuery(con, glue(
+    "SELECT EXISTS (
+      SELECT 1 FROM information_schema.columns 
+      WHERE 
+        table_schema = '{schema}' AND
+        table_name   = '{tbl}'    AND 
+        column_name  = '{pkey}');")) |> 
+    pull(exists)
+  
+  if (pkey_exists & !redo){
+    message("  pkey exists, skipping")
+    next()
+  }
+    
+  dbExecute(con, glue(
+    "ALTER TABLE {schema}.{tbl} ADD COLUMN {pkey} VARCHAR;"))
+  
+  dbExecute(con, glue(
+     "UPDATE {schema}.{tbl} SET {pkey} = {key_expression};"))
+  
+  if (tbl %in% c("boem_atl_blk_clp","boem_atl_prot_clp"))
+    dbExecute(con, glue(  # delete 2 erroneous slivers
+      "DELETE FROM {schema}.{tbl} WHERE {pkey} IS NULL;"))
+
+  if (tbl == "boem_usa_wind_lease"){
+    o <- read_sf(con, Id(schema=schema, table = tbl))
+    # o |> st_drop_geometry() |> pull(additional_information) |> table(useNA = "ifany")
+    
+    # filter for duplicate ms_key
+    key_dupes <- o |> 
+      filter(duplicated(ms_key)) |> 
+      pull(ms_key)
+    o_d <- o |> 
+      arrange(ms_key) |>
+      filter(ms_key %in% key_dupes)
+    # o_d |> st_drop_geometry() |> View()
+    # mapview::mapView(o_d)
+    
+    # merge 4 to 2 polygon easements with same attributes
+    o_s <- o_d |> 
+      select(ms_key, shape_length, shape_area) |> 
+      group_by(ms_key) |>
+      summarize(
+        shape_length = sum(shape_length),
+        shape_area   = sum(shape_area))
+    o_a <- o_d |> 
+      st_drop_geometry() |> 
+      select(-shape_length, -shape_area) |> 
+      distinct()
+    o_m <- o_s |> 
+      left_join(o_a, by = "ms_key")
+    
+    dbExecute(con, glue(
+      "DELETE FROM {schema}.{tbl} WHERE {pkey} IN ('{paste(key_dupes, collapse='\\',\\'')}');"))
+
+    st_write(
+      o_m,
+      con,
+      Id(schema=schema, table = tbl), append=T)
+  }
+  
+  dbExecute(con, glue(
+   "ALTER TABLE {schema}.{tbl} ADD PRIMARY KEY ({pkey});"))
+  # Error: Failed to fetch row : ERROR:  could not create unique index "boem_usa_wind_plan_pkey"
+  # DETAIL:  Key (ms_key)=(boem-usa-wind-plan_NK10-04_7121D) is duplicated.
+  # o <- read_sf(
+  #   con,
+  #   query = glue("SELECT * FROM {schema}.{tbl} WHERE {pkey} = 'boem-usa-wind-plan_NK10-04_7121D';"))
+  # additional_information | secondary_wpa_category
+  # o |> View()
+  # o |> mapview::mapView()
+  
+  # ERROR:  column "ms_key" of relation "boem_atl_prot_clp" contains null values
+  # o <- read_sf(con, Id(schema=schema, table = tbl))
+  # o_notnull <- read_sf(
+  #   con,
+  #   query = glue("SELECT * FROM {schema}.{tbl} WHERE {pkey} IS NOT NULL;"))
+  # o_null <- read_sf(
+  #   con,
+  #   query = glue("SELECT * FROM {schema}.{tbl} WHERE {pkey} IS NULL;"))
+  # o |> st_drop_geometry() |> pull(additional_information) |> table(useNA = "ifany")
+  # o_notnull |> st_drop_geometry() |> View()
+  # o_notnull |> st_drop_geometry() |> pull(additional_information) |> table(useNA = "ifany")
+  # o_null |> st_drop_geometry() |> View()
+  # # additional_information
+  # mapview::mapView(o_notnull) +
+  #   mapview::mapView(o_null)
+}
+```
+
+
+```{r}
+
+d2 <- d |> 
+  mutate(
+    flds = map2(schema, tbl, \(schema, tbl)
+      dbListFields(con, Id(schema = schema, table = tbl)) )) |> 
+  unnest(flds) |> 
+  select(tbl, flds)
+
+View(d2)
+
+
+```
+
+
+## OLD
+
+```{r}
+tbls <- c(
+  "ply_shlfs", "ply_shlfs_s05", 
+  "ply_rgns" , "ply_rgns_s05")
+redo <- F
+
+if (!all(tbls %in% dbListTables(con))){
+  for (tbl in tbls){  # tbl = "ply_shlfs_s05"
+    
+    # shift from 0:360 to -180:180
+    o <- get(tbl) |> 
+      st_wrap_dateline()
+    
+    st_write(
+      o,
+      dsn           = con,
+      layer         = tbl,
+      driver        = "PostgreSQL",
+      layer_options = "OVERWRITE=true")
+  
+    # enforce SRID so shows up in tile.marinesensivity.org
+    dbExecute(con, glue("SELECT UpdateGeometrySRID('{tbl}','geometry',4326);"))
+  }
+}
+```
+
+## Test spatial data in database
+
+```{r}
+#| label: test_db
+
+dbListTables(con)
+
+p <- read_sf(con, "ply_shlfs_s05")
+
+# mapView(
+#   p,
+#   zcol       = "shlf_name",
+#   layer.name = "ply_shlfs.shlf_name<br><small>(simplified to 5%)</small>")
+# Error: [weirdly only when run quarto render]
+# ! number of columns of matrices must match (see arg 2)
+
+msens::ms_basemap() |>
+  addPolygons(
+    data      = p,
+    fillColor = "blue",
+    weight      = 2,
+    color       = "blue",
+    label       = ~shlf_name) |> 
+  addFullscreenControl()
+```
