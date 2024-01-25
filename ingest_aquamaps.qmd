@@ -1,0 +1,248 @@
+---
+title: "ingest_aquamaps"
+author: "Ben Best"
+format:
+  html:
+    code-fold: show
+editor_options: 
+  chunk_output_type: console
+---
+
+## AquaMapsDuckDB
+
+* [marinebon/aquamapsduckdb](https://github.com/marinebon/aquamapsduckdb)
+  Reformatting of aquamapsdata R package with faster duck database and new terra package for rasters
+  * [data-raw/am.duckdb_create.R](https://github.com/marinebon/aquamapsduckdb/blob/main/data-raw/am.duckdb_create.R)
+
+```{r}
+#| eval: false
+
+librarian::shelf(
+  dplyr, duckdb, glue, here, 
+  marinesensitivity/msens, 
+  sf, terra, tibble,
+  quiet = T)
+
+source(here("libs/db.R")) # define: con
+
+dir_bigdata  <- glue("/Users/bbest/My Drive/projects/msens/data/derived/aquamaps")
+path_duckdb  <- glue("{dir_bigdata}/am.duckdb")
+
+con_dd <- dbConnect(
+  duckdb(
+    dbdir     = path_duckdb,
+    read_only = T))
+
+dbListTables(con_dd)
+# [1] "_tbl_fld_renames" "cells"            "spp"             
+# [4] "spp_cells"        "spp_occs"         "spp_prefs"
+
+# get cells as points
+pts_cells <- tbl(con_dd, "cells") |> 
+  select(cell_id, csquare_code, center_long, center_lat) |> 
+  collect() |> 
+  st_as_sf(
+    coords = c("center_long", "center_lat"), crs = 4326)
+
+# create template raster from global dimensions and resolution
+r_g <- rast(
+  xmin = -180, xmax = 180, 
+  ymin = -90,  ymax = 90, 
+  resolution = 0.5)
+
+# rasterize based on cell_id
+r_cells <- rasterize(pts_cells, r_g, field = "cell_id", fun = "last")
+names(r_cells) <- "cell_id"
+
+# convert to polygons
+p_cells <- as.polygons(r_cells) |> 
+  st_as_sf() |> 
+  st_set_crs(4326) |> 
+  st_cast("POLYGON")
+
+# p_cells_0 <- p_cells
+
+t_cells <- tbl(con_dd, "cells") |> 
+  collect()
+
+p_cells <- p_cells_0 |> 
+  inner_join(t_cells, by = "cell_id")
+st_geometry(p_cells) <- "geom" # rename
+
+# ensure no duplicate cell_ids
+stopifnot(sum(duplicated(p_cells$cell_id)) == 0)
+
+st_write(
+  p_cells,
+  dsn           = con,
+  layer         = Id(schema="aquamaps", table = "cells"),
+  driver        = "PostgreSQL",
+  layer_options = "OVERWRITE=true")
+    
+# enforce SRID so shows up in tile.marinesensivity.org
+dbExecute(con, glue(
+  "SELECT UpdateGeometrySRID('aquamaps','cells','geom',4326);"))
+
+tbls <- dbListTables(con_dd) |> setdiff(c("_tbl_fld_renames", "cells"))
+
+for (tbl in tbls) { # tbl = tbls[1]
+
+  # read
+  d <- dbReadTable(con_dd, tbl)
+  
+  # write
+  dbWriteTable(con, Id(schema = "aquamaps", table = tbl), d, overwrite = T)
+}
+
+create_index <- function(con, tbl, flds, schema = "aquamaps", geom=F, unique=F, overwrite=F, show=F, exec=T){
+  # tbl = "taxa"; flds = c("tbl_orig", "aphia_id"); unique = T; geom=F
+  stopifnot(!(geom == T & length(flds) != 1))
+  sfx <- ifelse(
+    geom,
+    glue::glue(" USING GIST ({flds})"),
+    glue::glue("({paste(flds, collapse=', ')})"))
+  idx <- ifelse(
+    unique,
+    glue("{tbl}_unique_idx"),
+    glue("{tbl}_{paste(flds, collapse='_')}_idx"))
+
+  if (overwrite)
+    dbSendQuery(con, glue("DROP INDEX IF EXISTS {idx}"))
+
+  sql <- glue::glue(
+    "CREATE {ifelse(unique, 'UNIQUE','')} INDEX IF NOT EXISTS {idx} ON {schema}.{tbl}{sfx}")
+  if (show)
+    message(sql)
+  if (exec)
+    DBI::dbSendQuery(con, sql)
+}
+
+create_index(con, "cells",    "cell_id", unique = T)
+create_index(con, "cells",    "geom",    geom = T)
+create_index(con, "spp",      "sp_key",  unique = T)
+create_index(con, "spp_cells", c("cell_id", "sp_key"), unique = T)
+create_index(con, "spp_prefs", "sp_key", unique = T)
+create_index(con, "spp_occs",  "occ_id", unique = T)
+create_index(con, "spp_occs",  "cell_id")
+create_index(con, "spp_occs",  "sp_key")
+
+create_index(con, "mr_eez", "geom",  geom = T,   schema="raw")
+create_index(con, "mr_eez", "mrgid", unique = T, schema="raw")
+
+```
+
+![View of `aquamaps.cells` at [tile.marinesensitivity.org](https://tile.marinesensitivity.org/aquamaps.cells.html#3.54/37.86/-78.57)](./images/ingest_aquamaps/tile.msens - aquamaps.cells.png)
+
+```{r}
+#| eval: false
+
+dbExecute(con, "ALTER TABLE aquamaps.cells DROP COLUMN area_km2")
+dbExecute(con, "ALTER TABLE aquamaps.cells ADD COLUMN area_km2 DECIMAL")
+# dbExecute(con, "UPDATE aquamaps.cells SET area_km2 = ST_AREA(geom) / (1000 * 1000)")
+dbExecute(con, "UPDATE aquamaps.cells SET area_km2 = ST_AREA(geom::geography) / (1000 * 1000)")
+
+tbl(con, Id(schema="aquamaps", table="cells")) |> 
+  pull(area_km2) |>
+  summary()
+  hist()
+  select(area_km2) |> 
+  collect() |> 
+  summary()
+
+# get [c]ells that intersect with [a]rea of interest 
+q <- "
+  WITH
+    c AS (
+      SELECT
+      c.cell_id,
+      c.area_km2 AS cell_km2,
+      a.geoname,
+      a.mrgid,
+      CASE
+        WHEN ST_CoveredBy(c.geom, a.geom)
+          THEN c.geom
+        ELSE
+          ST_Multi(ST_Intersection(c.geom, a.geom))
+      END AS geom
+    FROM
+      aquamaps.cells c
+      INNER JOIN raw.mr_eez a
+        ON ST_Intersects(c.geom, a.geom)
+    WHERE
+      a.mrgid = 8442
+    ORDER BY
+      c.cell_id),
+  k AS (
+    SELECT *,
+      ST_AREA(geom::geography) / (1000 * 1000) AS aoi_km2
+    FROM c),
+  a AS (
+    SELECT *,
+      aoi_km2 / cell_km2 AS pct_cell
+    FROM k),
+  s AS (
+    SELECT a.*,
+      sc.sp_key, sc.probability
+    FROM a
+      LEFT JOIN aquamaps.spp_cells sc
+        ON a.cell_id = sc.cell_id),
+  g AS (
+    SELECT
+      sp_key,
+      COUNT(*)                                  AS n_cells,
+      AVG(pct_cell)                             AS avg_pct_cell,
+      SUM(aoi_km2)                              AS area_km2,
+      SUM(probability * aoi_km2) / SUM(aoi_km2) AS avg_suit
+    FROM s
+    GROUP BY sp_key)
+  SELECT 
+    sp_key, n_cells, avg_pct_cell, area_km2, avg_suit,
+    n_cells * avg_pct_cell * avg_suit AS amt
+  FROM g"
+# cells <- st_read(con, query = q)
+# mapview::mapView(cells)
+system.time({
+d <- dbGetQuery(con, q) |> 
+  as_tibble()
+}) # 22.804 
+
+q2 <- "WITH 
+  merged_data AS (
+    SELECT
+      c.cell_id,
+      c.area_km2 AS cell_km2,
+      a.mrgid,
+      sc.sp_key, 
+      sc.probability,
+      c.geom
+    FROM
+      aquamaps.cells c
+        INNER JOIN raw.mr_eez a ON ST_Intersects(c.geom, a.geom)
+        LEFT JOIN aquamaps.spp_cells sc ON c.cell_id = sc.cell_id
+    WHERE
+        a.mrgid = 8442), 
+  summary AS (
+    SELECT
+        sp_key,
+        COUNT(*) AS n_cells,
+        SUM(cell_km2) AS cells_km2,
+        SUM(probability * cell_km2) / SUM(cell_km2) AS avg_suit
+    FROM merged_data
+    GROUP BY sp_key)
+  SELECT 
+      sp_key, 
+      n_cells, 
+      cells_km2, 
+      avg_suit,
+      n_cells * avg_suit AS amt
+  FROM summary"
+system.time({
+d2 <- dbGetQuery(con, q2) |> 
+  as_tibble()
+}) # 16.659 
+
+View(d)
+
+```
+
+
