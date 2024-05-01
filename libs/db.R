@@ -35,3 +35,27 @@ con <- DBI::dbConnect(
 
 # test connection:
 # dbListTables(con)
+
+# helper functions ----
+create_index <- function(con, tbl, flds, schema = "public", geom=F, unique=F, overwrite=F, show=F, exec=T){
+  # tbl = "taxa"; flds = c("tbl_orig", "aphia_id"); unique = T; geom=F
+  stopifnot(!(geom == T & length(flds) != 1))
+  sfx <- ifelse(
+    geom,
+    glue::glue(" USING GIST ({flds})"),
+    glue::glue("({paste(flds, collapse=', ')})"))
+  idx <- ifelse(
+    unique,
+    glue("{tbl}_unique_idx"),
+    glue("{tbl}_{paste(flds, collapse='_')}_idx"))
+
+  if (overwrite)
+    dbExecute(con, glue("DROP INDEX IF EXISTS {schema}.{idx}"))
+
+  sql <- glue::glue(
+    "CREATE {ifelse(unique, 'UNIQUE','')} INDEX IF NOT EXISTS {idx} ON {schema}.{tbl}{sfx}")
+  if (show)
+    message(sql)
+  if (exec)
+    dbExecute(con, sql)
+}
