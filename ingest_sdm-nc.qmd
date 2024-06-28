@@ -191,124 +191,128 @@ d <- bind_rows(
   d_atl,
   d_pac)
 
-# read in rasters ----
-d <- d |> 
-  select(region, sp_code, season, var, path_tif) |> 
-  mutate(
-    r      = map(path_tif, terra::rast),
-    crs    = map_chr(r, crs, proj=T),
-    crs_tr = map_chr(crs, str_trunc, 24),
-    nrow   = map_int(r, nrow),
-    ncol   = map_int(r, ncol)) |> 
-  arrange(region, crs_tr, sp_code, season, var)
-# confirm same dims per region: d |> select(nrow, ncol, region) |> table()
-
-# fix rasters in Atlantic missing crs ----
-
-# unique(d$crs)
-# [1] "+proj=omerc +lat_0=35 +lonc=-75 +alpha=40 +gamma=40 +k=0.9996 +x_0=0 +y_0=0 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs"
-# [2] ""
-# [3] "+proj=omerc +lat_0=39 +lonc=-125 +alpha=75 +gamma=75 +k=0.9996 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
-
-# d |> select(crs_tr, region) |> table()
-#                           region
-# crs_tr                     Atlantic Pacific
-#                                   7       0
-#   +proj=omerc +lat_0=35...      413       0
-#   +proj=omerc +lat_0=39...        0     270
-
-crs_atl <- d |> 
-  filter(region == "Atlantic" & crs != "") |> 
-  first() |> 
-  pull(crs)
-
-d <- d |> 
-  mutate(
-    r = map(r, \(x) {
-      if (crs(x) == "")
-        crs(x) <- crs_atl
-      x } ) ) |> 
-  select(-crs, -crs_tr, -nrow, -ncol)
-
-# write rasters per model (region-species-season), including all vars ----
-dir_tif <- here("data/sdm/raw")
-for (dir_ds in glue("{dir_tif}/{d_datasets$ds_key}"))
-  dir.create(dir_ds, recursive = T, showWarnings = F)
-
-# * standardize vars ----
-# d |> select(region, var) |> table()
-#           var
-# region      CV density density_CV QUANT_50 RANGE_CI90
-#   Atlantic 140       0          0      140        140
-#   Pacific    0     135        135        0          0
-d <- d |> 
-  mutate(
-    ds_key  = case_match(
-      region,
-      "Atlantic" ~ "nc_atl_birds_dens",
-      "Pacific"  ~ "nc_pac_birds_dens"),
-    mdl_tif = glue("{dir_tif}/{ds_key}/{sp_code}_{season}.tif"),
-    var     = case_match(
-      var,
-      "density"    ~ "n_per_km2",
-      "QUANT_50"   ~ "n_per_km2",
-      "density_CV" ~ "cv_n_per_km2",
-      "CV"         ~ "cv_n_per_km2",
-      "RANGE_CI90" ~ "ci90_n_per_km2") )
-
-d_mdls <- d |> 
-  arrange(
-    ds_key, region, sp_code, season, 
-    # arrange by var to ensure n_per_km2 (density) is first, cv second
-    factor(var, levels = c("n_per_km2", "cv_n_per_km2", "ci90_n_per_km2"))) |>
-  group_by(ds_key, region, sp_code, season, mdl_tif) |> 
-  nest() |> 
-  ungroup()
-
-# * write out rasters per model, convert to COG ----
-d_mdls |>
-  select(data, mdl_tif) |>
-  pwalk(\(data, mdl_tif) {
-    
-    tmp_tif <- tempfile(fileext = ".tif")
-    
-    # if mdl_tif already exists and is a valid COG, skip
-    if (file_exists(mdl_tif)){
+# run once
+if (F){
+  
+  # read in rasters ----
+  d <- d |> 
+    select(region, sp_code, season, var, path_tif) |> 
+    mutate(
+      r      = map(path_tif, terra::rast),
+      crs    = map_chr(r, crs, proj=T),
+      crs_tr = map_chr(crs, str_trunc, 24),
+      nrow   = map_int(r, nrow),
+      ncol   = map_int(r, ncol)) |> 
+    arrange(region, crs_tr, sp_code, season, var)
+  # confirm same dims per region: d |> select(nrow, ncol, region) |> table()
+  
+  # fix rasters in Atlantic missing crs ----
+  
+  # unique(d$crs)
+  # [1] "+proj=omerc +lat_0=35 +lonc=-75 +alpha=40 +gamma=40 +k=0.9996 +x_0=0 +y_0=0 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs"
+  # [2] ""
+  # [3] "+proj=omerc +lat_0=39 +lonc=-125 +alpha=75 +gamma=75 +k=0.9996 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
+  
+  # d |> select(crs_tr, region) |> table()
+  #                           region
+  # crs_tr                     Atlantic Pacific
+  #                                   7       0
+  #   +proj=omerc +lat_0=35...      413       0
+  #   +proj=omerc +lat_0=39...        0     270
+  
+  crs_atl <- d |> 
+    filter(region == "Atlantic" & crs != "") |> 
+    first() |> 
+    pull(crs)
+  
+  d <- d |> 
+    mutate(
+      r = map(r, \(x) {
+        if (crs(x) == "")
+          crs(x) <- crs_atl
+        x } ) ) |> 
+    select(-crs, -crs_tr, -nrow, -ncol)
+  
+  # write rasters per model (region-species-season), including all vars ----
+  dir_tif <- here("data/sdm/raw")
+  for (dir_ds in glue("{dir_tif}/{d_datasets$ds_key}"))
+    dir.create(dir_ds, recursive = T, showWarnings = F)
+  
+  # * standardize vars ----
+  # d |> select(region, var) |> table()
+  #           var
+  # region      CV density density_CV QUANT_50 RANGE_CI90
+  #   Atlantic 140       0          0      140        140
+  #   Pacific    0     135        135        0          0
+  d <- d |> 
+    mutate(
+      ds_key  = case_match(
+        region,
+        "Atlantic" ~ "nc_atl_birds_dens",
+        "Pacific"  ~ "nc_pac_birds_dens"),
+      mdl_tif = glue("{dir_tif}/{ds_key}/{sp_code}_{season}.tif"),
+      var     = case_match(
+        var,
+        "density"    ~ "n_per_km2",
+        "QUANT_50"   ~ "n_per_km2",
+        "density_CV" ~ "cv_n_per_km2",
+        "CV"         ~ "cv_n_per_km2",
+        "RANGE_CI90" ~ "ci90_n_per_km2") )
+  
+  d_mdls <- d |> 
+    arrange(
+      ds_key, region, sp_code, season, 
+      # arrange by var to ensure n_per_km2 (density) is first, cv second
+      factor(var, levels = c("n_per_km2", "cv_n_per_km2", "ci90_n_per_km2"))) |>
+    group_by(ds_key, region, sp_code, season, mdl_tif) |> 
+    nest() |> 
+    ungroup()
+  
+  # * write out rasters per model, convert to COG ----
+  d_mdls |>
+    select(data, mdl_tif) |>
+    pwalk(\(data, mdl_tif) {
       
-      is_cog <- system(glue("rio cogeo validate {mdl_tif}"), intern=T) |> 
-        str_detect(" is a valid cloud optimized GeoTIFF")
+      tmp_tif <- tempfile(fileext = ".tif")
       
-      if (is_cog)
-        return()
+      # if mdl_tif already exists and is a valid COG, skip
+      if (file_exists(mdl_tif)){
+        
+        is_cog <- system(glue("rio cogeo validate {mdl_tif}"), intern=T) |> 
+          str_detect(" is a valid cloud optimized GeoTIFF")
+        
+        if (is_cog)
+          return()
+        
+        file_move(mdl_tif, tmp_tif)
+      } else {
+        r        <- rast(data$r)
+        names(r) <- data$var
+        writeRaster(r, file = tmp_tif, overwrite = T)
+      }
       
-      file_move(mdl_tif, tmp_tif)
-    } else {
-      r        <- rast(data$r)
-      names(r) <- data$var
-      writeRaster(r, file = tmp_tif, overwrite = T)
-    }
-    
-    system(glue("rio cogeo create {tmp_tif} {mdl_tif}"))
-    unlink(tmp_tif)
-  })
-
-# Uploaded all data/sdm/raw/{ds_key}/*.tif to rstudio.marinesensitivity.org:/share/public/cog/sdm/raw/{ds_key}/*.tif 
-
-# TODO: make COGs (*.tif) into STAC w/ json metadata
-
-# * write out temp csv (later db tbl) of all models for shiny app sdm-cog, including band index `bidx` ----
-d |> 
-  arrange(
-    ds_key, region, sp_code, season, 
-    # arrange by var to ensure n_per_km2 (density) is first, cv second
-    factor(var, levels = c("n_per_km2", "cv_n_per_km2", "ci90_n_per_km2"))) |>
-  mutate(
-    cog_url = glue("https://file.marinesensitivity.org/cog/sdm/raw/{ds_key}/{basename(mdl_tif)}"),
-    bidx    = factor(var, levels = c("n_per_km2", "cv_n_per_km2", "ci90_n_per_km2")) |> as.integer()) |> 
-  select(-r, -path_tif, -mdl_tif) |> 
-  relocate(ds_key) |>
-  write_csv(here("data/nc_models.csv"))
-# check: x |> select(var, bidx) |> table() 
+      system(glue("rio cogeo create {tmp_tif} {mdl_tif}"))
+      unlink(tmp_tif)
+    })
+  
+  # Uploaded all data/sdm/raw/{ds_key}/*.tif to rstudio.marinesensitivity.org:/share/public/cog/sdm/raw/{ds_key}/*.tif 
+  
+  # TODO: make COGs (*.tif) into STAC w/ json metadata
+  
+  # * write out temp csv (later db tbl) of all models for shiny app sdm-cog, including band index `bidx` ----
+  d |> 
+    arrange(
+      ds_key, region, sp_code, season, 
+      # arrange by var to ensure n_per_km2 (density) is first, cv second
+      factor(var, levels = c("n_per_km2", "cv_n_per_km2", "ci90_n_per_km2"))) |>
+    mutate(
+      cog_url = glue("https://file.marinesensitivity.org/cog/sdm/raw/{ds_key}/{basename(mdl_tif)}"),
+      bidx    = factor(var, levels = c("n_per_km2", "cv_n_per_km2", "ci90_n_per_km2")) |> as.integer()) |> 
+    select(-r, -path_tif, -mdl_tif) |> 
+    relocate(ds_key) |>
+    write_csv(here("data/nc_models.csv"))
+  # check: x |> select(var, bidx) |> table() 
+}
 
 # TODO: write d_mdls, d_spp to db 
 #       use 'nc_*', not 'gm'
@@ -336,7 +340,9 @@ d |>
 #     datatype = map_chr(r, datatype))
 # table(d$datatype, d$region)
 # FLT8S
+```
 
+```{r map-cog}
 # map COG ----
 cog_url        = "https://file.marinesensitivity.org/cog/sdm/raw/nc_atl_birds_dens/ARTE_summer.tif"
 cog_method     = "bilinear"
