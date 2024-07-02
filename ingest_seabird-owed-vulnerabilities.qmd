@@ -1,14 +1,382 @@
 ---
 title: "Ingest Seabird Vulnerabilities to Offshore Wind Energy Development"
+editor_options: 
+  chunk_output_type: console
 ---
+
+## Process
+
+Goal: Summarize and compare seabird vulnerabilities to offshore wind energy development in the Atlantic and Pacific Oceans.
+
+1.  Import data from "sensitivity" or "vulnerability" studies
+
+    > A species' **vulnerability** is based on a combination of its **sensitivity** and **exposure**. Exposure is determined by the overlap of the species' current distribution and the magnitude of the expected climate change.\
+    > [@morrison2016]
+
+2.  Match taxonomy (`sp_id`)
+
+    -   Use [GBIF](https://www.gbif.org) since comprehensive (includes [OBIS](https://obis.org/))
+
+    -   [WoRMS](https://marinespecies.org) missing 8 seabirds from Willmott et al. [-@willmott2013]).
+
+    -   Map occurrences using GBIF's [Maps API](https://techdocs.gbif.org/en/openapi/v2/maps#:~:text=Fulmarus%20glacialis%20(northern%20fulmar)%20observations).
+
+    -   Use [`taxadb`](https://docs.ropensci.org/taxadb/articles/intro.html) R package for copy of local taxa database and fast matching:
+
+        ``` r
+        sp_id = taxadb::get_ids(
+          names    = "Chen caerulescens", 
+          provider = "gbif", 
+          format   = "prefix")
+        # "GBIF:2498165"
+        ```
+
+3.  Match species with mapped distributions
+
+    -   Q: What to do with species sensitivities but no maps or maps but no sensitivities?
+
+4.  Calculate population-weighted sensitivities
+
+    -   Normalize for combining species layers, using:
+
+        ``` r
+        base::scale(x, center = TRUE, scale = TRUE)
+        ```
+
+        based on mean ($\bar{x}$) and standard deviation ($\sigma$): $$
+        x_{normalized} = \frac{x - \bar{x}}{\sigma}
+        $$
+
+```{r setup}
+librarian::shelf(
+  dplyr, DT, janitor, glue, here, leaflet, 
+  purrr, readxl, readr, scales, stringr, taxadb, terra, tidyr,
+  quiet = T)
+options(readr.show_col_types = F)
+
+knitr::opts_chunk$set(
+  message = F)
+
+willmott2013_xls <- "/Users/bbest/My Drive/projects/msens/data/raw/studies/willmott2013/Willmott et al. - 2013 - The relative vulnerability of migratory bird speci.xlsx"
+
+winship2018_xls <- "/Users/bbest/My Drive/projects/_archive/offhab/data/raw/ncei.noaa.gov - seabirds, atlantic/0176682/1.1/data/0-data/NCCOS-Atlantic-Birds_ArchiveDataPackage/Documentation/atl_spp.xlsx"
+
+dir_atl_raw    <- here("data/sdm/raw/nc_atl_birds_dens")
+dir_atl_out    <- here("data/sdm/derived/nc_atl_birds_dens")
+atl_mw_csv     <- glue("{dir_atl_out}/mw.csv")
+atl_mw_spp_csv <- glue("{dir_atl_out}/mw_spp.csv")
+```
 
 ## Atlantic
 
--   Data [@willmot2013]
+### Species Vulnerability [@willmott2013]
+
+-   Species Vulnerability Data: [@willmott2013]
+
+-   asdf [@willmott2013]
+
+-   **Manual PDF table extraction**. Exported to tables from PDF to XLSX with Adobe Acrobat. Copied individual tables into dedicated sheets and for each: unmerged columns, removed duplicate headers and empty columns.
+
+```{r d_w}
+# install the taxanomic database locally
+taxadb::td_create("gbif")
+
+# get all data from study
+d <- read_excel(willmott2013_xls, sheet = "TableA-2") |> 
+  left_join(
+    read_excel(willmott2013_xls, sheet = "Table5"), 
+    by = "Common Name") |> 
+  left_join(
+    read_excel(willmott2013_xls, sheet = "Table8"), 
+    by = "Common Name") |> 
+  left_join(
+    read_excel(willmott2013_xls, sheet = "Table11"), 
+    by = "Common Name") |> 
+  janitor::clean_names() |> 
+  mutate(
+    sp_id = taxadb::get_ids(
+      scientific_name, "gbif", "prefix")) |> 
+  rename(
+    sp_scientific = scientific_name, 
+    sp_common     = common_name) |> 
+  mutate(
+    study = "willmott2013") |> 
+  relocate(study, sp_id)
+stopifnot(sum(is.na(d$sp_id))      == 0)
+stopifnot(sum(duplicated(d$sp_id)) == 0)
+
+# [d]ata frame of species [spp]
+d_w_spp <- d |> 
+  select(study, sp_id, sp_scientific, sp_common)
+
+# show d_w_spp
+d_w_spp |> 
+  DT::datatable(
+    caption = "Atlantic seabird species with vulnerabilities (Willmott et al. 2013)")
+
+# [d]ata frame of sensitivity [w]eights
+d_w <- d |>
+  select(study, sp_id, where(is.double)) |>
+  pivot_longer(
+    cols      = -c(study, sp_id),
+    names_to  = "parameter",
+    values_to = "value_dbl") |> 
+  bind_rows(
+    d |>
+      select(sp_id, where(is.character)) |>
+      pivot_longer(
+        cols      = -sp_id,
+        names_to  = "parameter",
+        values_to = "value_chr") ) |> 
+  filter(!(is.na(value_dbl) & is.na(value_chr)))
+params <- setdiff(unique(d_w$parameter), names(d_w_spp))
+params
+
+d_w |> 
+  DT::datatable(
+    caption = "Atlantic seabird sensitivity parameters (Willmott et al. 2013)")
+```
+
+### Species Distributions [@winship2018]
+
+-   Species Distribution Data: [@winship2018]\
+    map app: [shiny.marinesensitivity.org/sdm-cog](https://shiny.marinesensitivity.org/sdm-cog/)
+
+```{r d_spp_m}
+# [d]ata frame of species [m]aps
+d_m <- read_excel(winship2018_xls) |> 
+  janitor::clean_names() |> 
+  rename(
+    sp_code       = species_code,
+    sp_scientific = scientific_name,
+    sp_common     = common_name) |> 
+  mutate(
+    study         = "winship2018",
+    sp_common     = str_replace_all(sp_common,     "\r\n", " "),
+    sp_scientific = str_replace_all(sp_scientific, "\r\n", " "),
+    sp_id         = taxadb::get_ids(
+      sp_scientific, "gbif", "prefix")) |> 
+  relocate(study, sp_id)
+stopifnot(sum(is.na(d_m$sp_id)) == 0)
+
+d_m_seasons <- d_m |> 
+  select(study, sp_code, sp_id, spring, summer, fall, winter) |> 
+  pivot_longer(
+    cols      = -c(study, sp_code, sp_id),
+    names_to  = "season",
+    values_to = "season_bln") |> 
+  filter(!is.na(season_bln)) |> 
+  select(study, season, sp_code, sp_id) |> 
+  mutate(
+    tif = glue("{sp_code}_{season}.tif") ) |> 
+  arrange(study, season, sp_code)
+
+d_m_spp <- d_m |> 
+  select(-spring, -summer, -fall, -winter)
+
+d_m |> 
+  DT::datatable(
+    caption = "Atlantic seabird species with map distributions (Winship et al. 2018)")
+```
+
+```{r eval_F}
+# knitr::opts_chunk$set(
+#   eval = F)
+```
+
+### Species Vulnerability x Distribution
+
+```{r d_wm}
+# [d]ata frame of species [spp] with both distribution [m]aps and sensitivity [w]eights
+d_mw_spp <- d_m_spp |> 
+  rename(study_map = study) |>
+  inner_join(
+    d_w_spp |> 
+      rename(study_param = study) |> 
+      select(study_param, sp_id), 
+    by = "sp_id")
+
+# add taxa info to d_mw_spp ----
+d_mw_spp <- d_mw_spp |> 
+  mutate(
+    d_sp = map(sp_id, taxadb::filter_id, provider = "gbif")) |> 
+  unnest(d_sp)
+write_csv(d_mw_spp, atl_mw_spp_csv)
+      
+d_w_spp_notm <- d_w_spp |> 
+  anti_join(
+    d_mw_spp, by = "sp_id") # nrow: 130
+d_m_spp_notw <- d_m_spp |> 
+  anti_join(
+    d_mw_spp, by = "sp_id") # nrow:   0
+stopifnot(
+  0 %in% c(
+    nrow(d_w_spp_notm), 
+    nrow(d_m_spp_notw)))
+
+# [d]ata frame of both distribution [m]aps and sensitivity [w]eights
+d_mw <- d_m_seasons |> # nrow: 140
+  select(-study, -sp_code) |> 
+  inner_join(
+    d_mw_spp,                   # nrow:  47
+    by = "sp_id") |>            # nrow: 140
+  relocate(study_map, season, sp_code, sp_id) |> 
+  arrange(study_map, season, sp_code) |> 
+  left_join(
+    d_w |> 
+      filter(!is.na(value_dbl)) |> 
+      select(-study, -value_chr) |>
+      pivot_wider(
+        names_from  = parameter,
+        values_from = value_dbl),
+    by = "sp_id")
+
+write_csv(d_mw, atl_mw_csv)
+
+d_mw |> 
+  datatable(
+    caption = "Atlantic seabird species and seasons with both map distributions (Winship et al. 2018) and vulnerability parameters (Willmott et al. 2013)")
+```
+
+#### Rasters
+
+```{r writeCOG}
+writeCOG <- function(r, tif, method = "BILINEAR", ...){
+  # TODO: move to oceanmetrics/leaftiles
+
+  tmp <- tempfile(fileext = ".tif")
+
+  terra::writeRaster(r, tmp, ...)
+
+  gdalUtilities::gdal_translate(
+    src_dataset = tmp,
+    dst_dataset = tif,
+    co = matrix(c(
+      "COMPRESS=DEFLATE",
+      paste0("RESAMPLING=", method),
+      paste0("OVERVIEW_RESAMPLING=", method),
+      "PREDICTOR=2",
+      "BIGTIFF=IF_NEEDED"), ncol = 1),
+    of = "COG")
+
+  unlink(tmp)
+}
+```
+
+```{r r_sum}
+d_mw <- read_csv(atl_mw_csv) |>
+  mutate(
+    path_tif = glue("{dir_atl_raw}/{tif}"),
+    r        = map(path_tif, rast, lyrs = "n_per_km2") )
+d_mw_spp <- read_csv(atl_mw_spp_csv)
+
+# TODO: Shiny app
+# - [ ] sel_spp: https://dreamrs.github.io/shinyWidgets/#tree
+# - [ ] txt_eqn_raster_presum & txt_eqn_values_postsum: 
+#       NOTE: experimental and not to be used in production 
+#             for security concerns.
+# - [ ] 
+
+rgn_default <- "Atlantic"
+ssn_default <- "fall"
+spp_default <- d_mw |> 
+  filter(season == ssn_default) |> 
+  pull(sp_id)
+input <- list(
+  sel_rgn = rgn_default,
+  sel_ssn = ssn_default,
+  sel_spp = spp_default,
+  txt_eqn_raster_presum = "terra::scale(r) * (
+    best_estimate_final_population_sensitivity +
+    best_estimate_final_collision_sensitivity_rank +
+    best_estimate_final_displacement_sensitivity_rank )",
+  txt_eqn_values_postsum = "scales::rescale(v, c(0, 100))")
+
+ssn = "fall"
+
+d_mws <- d_mw |> 
+  filter(season == ssn)
+
+librarian::shelf(skimr)
+d_mws |> 
+  select(any_of(params)) |> 
+  skimr::skim() |> 
+  select(-n_missing, -complete_rate) |> 
+  yank("numeric")
+# TODO: Shiny add tab of summary with tab of full table
+
+equn_r <- input$txt_eqn_raster_presum
+equn_v <- input$txt_eqn_values_postsum
+
+d_mws <- d_mws %>% 
+  mutate(
+    r_e = pmap(., function(...) {
+      with(list(...), {
+        eval(parse(text = equn_r)) } ) } ) )
+res_m <- res(d_mws$r[[1]])
+r_sum <- sum(rast(d_mws$r_e)) |> 
+  terra::project("epsg:3857", method="bilinear", res=res_m)
+if (equn_v > ""){
+  v <- values(r_sum)
+  values(r_sum) <- eval(parse(text = equn_v))
+}
+
+plot(r_sum)
+```
+
+```{r leaflet}
+pal <- colorNumeric("Spectral", values(r_sum),
+  na.color = "transparent", reverse = T)
+
+leaflet() |> 
+  addProviderTiles("Esri.OceanBasemap") |> 
+  addRasterImage(
+    r_sum, 
+    project = F,
+    colors  = pal, 
+    opacity = 0.9) |>  # TODO: shiny input$opacity
+  addLegend(
+    pal = pal, 
+    values = values(r_sum),
+    title  = "Species<br>Vulnerability<br>x Density")
+```
 
 ## Pacific
 
 -   Data [@adamsDataCalculatingPopulation2016], report [@adams2016], journal article [@kelsey2018]
+
+```{r d_pac_spp_w}
+dir_study <- "/Users/bbest/My Drive/projects/msens/data/raw/studies/adams2016"
+
+# collision vulnerability
+cv_csv <- glue("{dir_study}/Collisionvulner/CCS_vulnerability_FINAL_VERSION_v10_CV.csv")
+# displacement vulnerability
+dv_csv <- glue("{dir_study}/Displacementvul/CCS_vulnerability_FINAL_VERSION_v10_DV.csv")
+# population vulnerability
+pv_csv <- glue("{dir_study}/Populationvulne/CCS_vulnerability_FINAL_VERSION_v9_PV.csv")
+
+flds_spp <- c("TaxNumCl", "Taxonomy", "AlphaCode", "Common_Name", "Scientific_Name")
+
+d_pv <- read_csv(pv_csv)
+d_cv <- read_csv(cv_csv)
+d_dv <- read_csv(dv_csv)
+# names(d_cv)
+d_spp <- d_cv |> 
+  select(all_of(flds_spp)) |> 
+  mutate(
+    Scientific_Name = case_match(
+      Scientific_Name,
+      "Oceanodroma furcatus" ~ "Oceanodroma furcata",
+      "Pterodroma ultina"    ~ "Pterodroma ultima",
+      .default = Scientific_Name), 
+    sp_id = taxadb::get_ids(
+      Scientific_Name, "gbif", format = "prefix") )
+stopifnot(sum(is.na(d_spp$sp_id)) == 0)
+stopifnot(sum(duplicated(d_spp$sp_id)) == 0)
+
+d_spp |> 
+  datatable()
+```
 
 Other:
 
@@ -29,5 +397,11 @@ Other:
 -   [@fauchald2024]
 
     -   [@garthe2004; @bestMinimizingWildlifeImpacts2019; @furness2013; @bradbury2014; @halpern2013]
+
+## Next Steps
+
+TODO:
+
+-   [ ] [IUCN Red List](https://iucnredlist.org) lookup and update, using `taxadb::td_create("iucn")`
 
 ## References
