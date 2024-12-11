@@ -1,0 +1,78 @@
+---
+title: "Tabulate Species"
+format: html
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+librarian::shelf(
+  DBI, dplyr, dbplyr, httr2, jsonlite, readr)
+source("libs/db.R")
+
+schema    = "public"
+tbl       = "ply_rgns"
+fld_geom  = "geometry"
+fld_key   = "rgn_key"
+
+tbl_ply_spp  = "ply_species"
+```
+
+## Fetch and Store Species Data
+
+```{r}
+#| eval: false
+
+# enforce SRID so shows up in tile.marinesensivity.org
+dbExecute(con, glue("SELECT UpdateGeometrySRID('{schema}','{tbl}','{fld_geom}',4326);"))
+dbExecute(con, glue("CREATE INDEX IF NOT EXISTS {tbl}_{fld_geom}_idx ON {schema}.{tbl} USING gist({fld_geom});"))
+```
+
+
+```{r}
+# Fetch region keys
+rgn_keys <- dbGetQuery(con, glue("SELECT {fld_key} FROM {schema}.{tbl}")) |> 
+  pull(rgn_key)
+
+# Iterate over each region key
+for (i in seq_along(rgn_keys)) {  # key = rgn_keys[1] # bad: key = "ALA" # good: key = "WGM"
+  
+  # message with time stamp
+  message(glue("Fetching species data for {key} ~ {Sys.time()}"))
+  
+  # Fetch species data from API; wrap in tryCatch to avoid breaking the loop
+  tryCatch({
+    d_spp <- request("https://api.marinesensitivity.org") |> 
+      req_url_path_append("species_by_feature") |>
+      req_url_query(
+        `schema.table` = glue("{schema}.{tbl}"), 
+        `where`        = glue("{fld_key} = '{key}'")) |>
+      req_perform() |>
+      resp_body_raw() |>
+      read_csv(show_col_types = F) |> 
+      mutate(
+        ply_tbl = glue("{schema}.{tbl}"), 
+        ply_fld = fld_key, 
+        ply_key = key) |> 
+      relocate(ply_tbl, ply_fld, ply_key)
+  }, error = function(e) {
+    d_spp <- NULL
+    message(glue("Error fetching species data for {key}: {e$message}"))
+  })
+
+  if (!is.null(d_spp)) {
+    # clear existing if table exists
+    if (dbExistsTable(con, tbl_ply_spp)) {
+      dbExecute(con, glue("DELETE FROM {tbl_ply_spp} WHERE ply_tbl = '{schema}.{tbl}' AND ply_fld = '{fld_key}' AND ply_key = '{key}'"))
+    }
+    
+    # Append to database
+    dbWriteTable(con, tbl_ply_spp, d_spp, append = TRUE, row.names = FALSE)
+  }
+}
+```
+
+```{r cleanup, include=FALSE}
+# Disconnect from the database
+DBI::dbDisconnect(con)
+```
