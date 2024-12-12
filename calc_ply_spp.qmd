@@ -7,7 +7,7 @@ editor_options:
 
 ```{r setup, include=FALSE}
 librarian::shelf(
-  DBI, dplyr, dbplyr, httr2, jsonlite, readr)
+  DBI, dplyr, dbplyr, httr2, jsonlite, readr, tictoc)
 source("libs/db.R")
 
 schema    = "public"
@@ -16,6 +16,8 @@ fld_geom  = "geometry"
 fld_key   = "rgn_key"
 
 tbl_ply_spp  = "ply_species"
+
+redo = F
 ```
 
 ## Fetch and Store Species Data
@@ -31,18 +33,36 @@ dbExecute(con, glue("CREATE INDEX IF NOT EXISTS {tbl}_{fld_geom}_idx ON {schema}
 
 ```{r}
 # Fetch region keys
-rgn_keys <- dbGetQuery(con, glue("SELECT {fld_key} FROM {schema}.{tbl}")) |> 
+rgn_keys <- dbGetQuery(con, glue("SELECT {fld_key} FROM {schema}.{tbl} ORDER BY {fld_key}")) |> 
   pull(rgn_key)
 
+# Fetch region keys found in tbl_ply_spp
+rgn_keys_done <- dbGetQuery(con, glue("SELECT DISTINCT ply_key FROM {tbl_ply_spp} WHERE ply_tbl = '{schema}.{tbl}'")) |> 
+  pull(ply_key)
+
+if (!redo)
+  rgn_keys <- setdiff(rgn_keys, rgn_keys_done)
+```
+
+rgn_keys (n = 27):
+```
+ [1] "ALA" "ALB" "BFT" "BOW" "CEC" "CGM" "CHU" "COK" "EGM"
+[10] "FLS" "GEO" "GOA" "HI"  "HOP" "KOD" "MAT" "MDA" "NAL"
+[19] "NAV" "NOA" "NOC" "NOR" "SHU" "SOA" "SOC" "WAO" "WGM"
+```
+
+```{r}
 # Iterate over each region key
-for (i in seq_along(rgn_keys)) {  # key = rgn_keys[1] # bad: key = "ALA" # good: key = "WGM"
+for (i in 1:length(rgn_keys)) {  # key = rgn_keys[1] # bad: i = 1; key = "ALA" # good: key = "WGM"
+  key = rgn_keys[i]
   
   # message with time stamp
-  message(glue("Fetching species data for {key} ~ {Sys.time()}"))
-  
+  tic()
+  message(glue("{sprintf('%02d',i)}: {key} ~ {Sys.time()}"))
+
   # Fetch species data from API; wrap in tryCatch to avoid breaking the loop
-  tryCatch({
-    d_spp <- request("https://api.marinesensitivity.org") |> 
+  d_spp <- tryCatch({
+    request("https://api.marinesensitivity.org") |> 
       req_url_path_append("species_by_feature") |>
       req_url_query(
         `schema.table` = glue("{schema}.{tbl}"), 
@@ -56,8 +76,9 @@ for (i in seq_along(rgn_keys)) {  # key = rgn_keys[1] # bad: key = "ALA" # good:
         ply_key = key) |> 
       relocate(ply_tbl, ply_fld, ply_key)
   }, error = function(e) {
-    d_spp <- NULL
     message(glue("Error fetching species data for {key}: {e$message}"))
+    source("libs/db.R") # reset database con
+    return(NULL)
   })
 
   if (!is.null(d_spp)) {
@@ -69,7 +90,60 @@ for (i in seq_along(rgn_keys)) {  # key = rgn_keys[1] # bad: key = "ALA" # good:
     # Append to database
     dbWriteTable(con, tbl_ply_spp, d_spp, append = TRUE, row.names = FALSE)
   }
+  
+  toc <- toc(quiet = T)
+  message(glue("{sprintf('%02d',i)}: {key} ~ {toc$callback_msg}"))
 }
+```
+
+Executing above:
+```
+01: ALA ~ 2024-12-11 23:32:20.493056
+Error fetching species data for ALA: HTTP 500 Internal Server Error.
+01: ALA ~ 1.41 sec elapsed
+02: ALB ~ 2024-12-11 23:32:21.903263
+Error fetching species data for ALB: HTTP 500 Internal Server Error.
+02: ALB ~ 1.509 sec elapsed
+03: BFT ~ 2024-12-11 23:32:23.413059
+03: BFT ~ 35.018 sec elapsed                                                        
+04: BOW ~ 2024-12-11 23:32:58.431392
+Error fetching species data for BOW: HTTP 500 Internal Server Error.
+04: BOW ~ 1.391 sec elapsed
+05: CEC ~ 2024-12-11 23:32:59.822888
+05: CEC ~ 93.324 sec elapsed                                                        
+06: CGM ~ 2024-12-11 23:34:33.14729
+06: CGM ~ 343.167 sec elapsed                                                       
+07: CHU ~ 2024-12-11 23:40:16.315158
+07: CHU ~ 20.115 sec elapsed                                                        
+08: COK ~ 2024-12-11 23:40:36.431037
+08: COK ~ 156.458 sec elapsed                                                       
+09: EGM ~ 2024-12-11 23:43:12.889954
+Error fetching species data for EGM: HTTP 500 Internal Server Error.
+09: EGM ~ 27.012 sec elapsed
+10: FLS ~ 2024-12-11 23:43:39.902751
+10: FLS ~ 607.625 sec elapsed                                 
+11: GEO ~ 2024-12-11 23:53:47.529269
+11: GEO ~ 199.316 sec elapsed                                 
+12: GOA ~ 2024-12-11 23:57:06.845524
+Error fetching species data for GOA: Failed to perform HTTP request.
+12: GOA ~ 328.706 sec elapsed
+13: HI ~ 2024-12-12 00:02:35.552604
+Error fetching species data for HI: Failed to perform HTTP request.
+```
+
+```
+git config --global user.name "Ben Best"
+error: could not lock config file /home/admin/.gitconfig: No space left on device
+```
+
+Error fetching species data for:
+```
+ALA
+ALB
+BOW
+EGM
+GOA
+...
 ```
 
 ```{r cleanup, include=FALSE}
