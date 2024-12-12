@@ -22,29 +22,14 @@ redo = F
 
 ## Fetch and Store Species Data
 
-```{r}
-#| eval: false
-
-# enforce SRID so shows up in tile.marinesensivity.org
-dbExecute(con, glue("SELECT UpdateGeometrySRID('{schema}','{tbl}','{fld_geom}',4326);"))
-dbExecute(con, glue("CREATE INDEX IF NOT EXISTS {tbl}_{fld_geom}_idx ON {schema}.{tbl} USING gist({fld_geom});"))
-```
-
 
 ```{r}
-# Fetch region keys
-rgn_keys <- dbGetQuery(con, glue("SELECT {fld_key} FROM {schema}.{tbl} ORDER BY {fld_key}")) |> 
-  pull(rgn_key)
-
-# Fetch region keys found in tbl_ply_spp
-rgn_keys_done <- dbGetQuery(con, glue("SELECT DISTINCT ply_key FROM {tbl_ply_spp} WHERE ply_tbl = '{schema}.{tbl}'")) |> 
-  pull(ply_key)
-
-if (!redo)
-  rgn_keys <- setdiff(rgn_keys, rgn_keys_done)
+# show region keys
+dbGetQuery(con, glue("SELECT {fld_key} FROM {schema}.{tbl} ORDER BY {fld_key}")) |> 
+  pull(fld_key)
 ```
 
-rgn_keys (n = 27):
+region keys (n = 27):
 ```
  [1] "ALA" "ALB" "BFT" "BOW" "CEC" "CGM" "CHU" "COK" "EGM"
 [10] "FLS" "GEO" "GOA" "HI"  "HOP" "KOD" "MAT" "MDA" "NAL"
@@ -52,49 +37,96 @@ rgn_keys (n = 27):
 ```
 
 ```{r}
-# Iterate over each region key
-for (i in 1:length(rgn_keys)) {  # key = rgn_keys[1] # bad: i = 1; key = "ALA" # good: key = "WGM"
-  key = rgn_keys[i]
+insert_poly_species <- function(
+    schema    = "public",
+    tbl       = "ply_rgns",
+    fld_geom  = "geometry",
+    fld_key   = "rgn_key",
+    tbl_ply_spp  = "ply_species",
+    redo = F){
   
-  # message with time stamp
-  tic()
-  message(glue("{sprintf('%02d',i)}: {key} ~ {Sys.time()}"))
-
-  # Fetch species data from API; wrap in tryCatch to avoid breaking the loop
-  d_spp <- tryCatch({
-    request("https://api.marinesensitivity.org") |> 
-      req_url_path_append("species_by_feature") |>
-      req_url_query(
-        `schema.table` = glue("{schema}.{tbl}"), 
-        `where`        = glue("{fld_key} = '{key}'")) |>
-      req_perform() |>
-      resp_body_raw() |>
-      read_csv(show_col_types = F) |> 
-      mutate(
-        ply_tbl = glue("{schema}.{tbl}"), 
-        ply_fld = fld_key, 
-        ply_key = key) |> 
-      relocate(ply_tbl, ply_fld, ply_key)
-  }, error = function(e) {
-    message(glue("Error fetching species data for {key}: {e$message}"))
-    source("libs/db.R") # reset database con
-    return(NULL)
-  })
-
-  if (!is.null(d_spp)) {
-    # clear existing if table exists
-    if (dbExistsTable(con, tbl_ply_spp)) {
-      dbExecute(con, glue("DELETE FROM {tbl_ply_spp} WHERE ply_tbl = '{schema}.{tbl}' AND ply_fld = '{fld_key}' AND ply_key = '{key}'"))
+  # enforce SRID so shows up in tile.marinesensivity.org
+  # dbExecute(con, glue("SELECT UpdateGeometrySRID('{schema}','{tbl}','{fld_geom}',4326);"))
+  dbExecute(con, glue("CREATE INDEX IF NOT EXISTS {tbl}_{fld_geom}_idx ON {schema}.{tbl} USING gist({fld_geom});"))
+  
+  # keys, all
+  keys <- dbGetQuery(con, glue("SELECT {fld_key} FROM {schema}.{tbl} ORDER BY {fld_key}")) |> 
+    pull(fld_key)
+  
+  # keys, done
+  keys_done <- dbGetQuery(con, glue("SELECT DISTINCT ply_key FROM {tbl_ply_spp} WHERE ply_tbl = '{schema}.{tbl}' ORDER BY ply_key")) |> 
+    pull(ply_key)
+  
+  if (!redo)
+    keys <- setdiff(keys, keys_done)
+  
+  # Iterate over each region key
+  for (i in 1:length(keys)) {  # key = rgn_keys[1] # bad: i = 1; key = "ALA" # good: key = "WGM"
+    key = keys[i]
+    
+    # message with time stamp
+    tic()
+    message(glue("{sprintf('%02d',i)}/{length(keys)}: {key} ~ {Sys.time()}"))
+    
+    # Fetch species data from API; wrap in tryCatch to avoid breaking the loop
+    d_spp <- tryCatch({
+      request("https://api.marinesensitivity.org") |> 
+        req_url_path_append("species_by_feature") |>
+        req_url_query(
+          `schema.table` = glue("{schema}.{tbl}"), 
+          `where`        = glue("{fld_key} = '{key}'")) |>
+        req_perform() |>
+        resp_body_raw() |>
+        read_csv(show_col_types = F) |> 
+        mutate(
+          ply_tbl = glue("{schema}.{tbl}"), 
+          ply_fld = fld_key, 
+          ply_key = key) |> 
+        relocate(ply_tbl, ply_fld, ply_key)
+    }, error = function(e) {
+      message(glue("Error fetching species data for {key}: {e$message}"))
+      source("libs/db.R") # reset database con
+      return(NULL)
+    })
+    
+    if (!is.null(d_spp)) {
+      # clear existing if table exists
+      if (dbExistsTable(con, tbl_ply_spp)) {
+        dbExecute(con, glue("DELETE FROM {tbl_ply_spp} WHERE ply_tbl = '{schema}.{tbl}' AND ply_fld = '{fld_key}' AND ply_key = '{key}'"))
+      }
+      
+      # Append to database
+      dbWriteTable(con, tbl_ply_spp, d_spp, append = TRUE, row.names = FALSE)
     }
     
-    # Append to database
-    dbWriteTable(con, tbl_ply_spp, d_spp, append = TRUE, row.names = FALSE)
+    toc <- toc(quiet = T)
+    message(glue("{sprintf('%02d',i)}/{length(keys)}: {key} ~ {toc$callback_msg}"))
   }
-  
-  toc <- toc(quiet = T)
-  message(glue("{sprintf('%02d',i)}: {key} ~ {toc$callback_msg}"))
 }
 ```
+
+```{r}
+#| eval: false
+insert_poly_species(
+  schema       = "public",
+  tbl          = "ply_shlfs",
+  fld_geom     = "geometry",
+  fld_key      = "shlf_key",
+  tbl_ply_spp  = "ply_species",
+  redo         = F)
+```
+
+```{r}
+#| eval: false
+insert_poly_species(
+  schema    = "public",
+  tbl       = "ply_rgns",
+  fld_geom  = "geometry",
+  fld_key   = "rgn_key",
+  tbl_ply_spp  = "ply_species",
+  redo = F)
+```
+
 
 Executing above:
 ```
@@ -129,11 +161,36 @@ Error fetching species data for GOA: Failed to perform HTTP request.
 12: GOA ~ 328.706 sec elapsed
 13: HI ~ 2024-12-12 00:02:35.552604
 Error fetching species data for HI: Failed to perform HTTP request.
-```
-
-```
-git config --global user.name "Ben Best"
-error: could not lock config file /home/admin/.gitconfig: No space left on device
+...
+06: HI ~ 1.417 sec elapsed
+07: HOP ~ 2024-12-12 00:46:31.430755
+07: HOP ~ 31.362 sec elapsed          
+08: KOD ~ 2024-12-12 00:47:02.792726
+08: KOD ~ 144.358 sec elapsed         
+09: MAT ~ 2024-12-12 00:49:27.151273
+09: MAT ~ 30.936 sec elapsed          
+10: MDA ~ 2024-12-12 00:49:58.088405
+10: MDA ~ 480.974 sec elapsed         
+11: NAL ~ 2024-12-12 00:57:59.063676
+11: NAL ~ 172.836 sec elapsed         
+12: NAV ~ 2024-12-12 01:00:51.900245
+12: NAV ~ 3.234 sec elapsed           
+13: NOA ~ 2024-12-12 01:00:55.13549
+13: NOA ~ 667.073 sec elapsed         
+14: NOC ~ 2024-12-12 01:12:02.20922
+14: NOC ~ 102.602 sec elapsed         
+15: NOR ~ 2024-12-12 01:13:44.812222
+15: NOR ~ 93.109 sec elapsed          
+16: SHU ~ 2024-12-12 01:15:17.922195
+16: SHU ~ 94.259 sec elapsed          
+17: SOA ~ 2024-12-12 01:16:52.182344
+17: SOA ~ 664.422 sec elapsed         
+18: SOC ~ 2024-12-12 01:27:56.605175
+18: SOC ~ 467.248 sec elapsed         
+19: WAO ~ 2024-12-12 01:35:43.853924
+19: WAO ~ 154.774 sec elapsed         
+20: WGM ~ 2024-12-12 01:38:18.627972
+20: WGM ~ 182.608 sec elapsed
 ```
 
 Error fetching species data for:
@@ -143,8 +200,135 @@ ALB
 BOW
 EGM
 GOA
-...
+HI
 ```
+
+## Assign Taxa Groups
+
+```{r}
+where_taxa <- list(
+  mammals = "class = 'Mammalia' 
+    AND \"order\" IN ('Cetacea', 'Carnivora')
+    AND family IN ('Balaenopteridae', 'Delphinidae', 'Phocidae', 'Otariidae')",
+  
+  benthos = "(phylum = 'Annelida' AND class = 'Polychaeta')
+    OR (phylum = 'Mollusca' AND class IN ('Bivalvia', 'Gastropoda'))
+    OR (phylum = 'Echinodermata')
+    OR (phylum = 'Arthropoda' AND class = 'Malacostraca')",
+  
+  corals = "phylum = 'Cnidaria'
+    AND class IN ('Anthozoa', 'Hydrozoa')
+    AND \"order\" IN ('Scleractinia', 'Alcyonacea')",
+  
+  pelagic_fish = "phylum = 'Chordata'
+    AND class = 'Actinopterygii'
+    AND \"order\" IN ('Clupeiformes', 'Perciformes', 'Gadiformes')
+    AND family IN ('Scombridae', 'Clupeidae', 'Gadidae')",
+  
+  seabirds = "class = 'Aves'
+    AND \"order\" IN ('Charadriiformes', 'Procellariiformes', 'Pelecaniformes')
+    AND family IN ('Laridae', 'Procellariidae', 'Sulidae', 'Phalacrocoracidae')",
+  
+  turtles = "class = 'Reptilia'
+    AND \"order\" = 'Testudines'
+    AND family IN ('Cheloniidae', 'Dermochelyidae')",
+  
+  elasmo = "class = 'Chondrichthyes'
+    AND (\"order\" IN ('Lamniformes', 'Carcharhiniformes', 'Rajiformes', 'Myliobatiformes')
+    OR family IN ('Sphyrnidae', 'Pristidae', 'Mobulidae'))",
+  
+  other_fish = "phylum = 'Chordata'
+    AND class = 'Actinopterygii'
+    AND \"order\" NOT IN ('Clupeiformes', 'Perciformes', 'Gadiformes')
+    AND family NOT IN ('Scombridae', 'Clupeidae', 'Gadidae')",
+  
+  other_inverts = "phylum IN ('Porifera', 'Bryozoa', 'Brachiopoda', 'Chaetognatha', 'Nemertea')
+    OR (phylum = 'Arthropoda' AND class NOT IN ('Malacostraca'))
+    OR (phylum = 'Mollusca' AND class NOT IN ('Bivalvia', 'Gastropoda'))"
+)
+
+# add column taxa if not already present
+if (!("taxa" %in% dbListFields(con, tbl_ply_spp))) {
+  dbExecute(con, glue("ALTER TABLE {tbl_ply_spp} ADD COLUMN taxa TEXT"))
+}
+
+# Assign taxa groupings to species
+for (taxa in names(where_taxa)) { # taxa = names(where_taxa)[1]
+  dbExecute(con, glue("UPDATE {tbl_ply_spp} SET taxa = '{taxa}' WHERE {where_taxa[[taxa]]}"))
+}
+```
+
+
+## Visualize Species Data
+
+### Flower Plot
+
+```{r}
+librarian::shelf(
+  dplyr, ggplot2)
+
+# Sample data
+data <- data.frame(
+    category = c("A", "B", "C", "D"),
+    width_value  = c(10, 25, 40, 25),    # Controls segment width
+    height_value = c(80, 65, 45, 60))    # Controls segment height)
+sum(data$width_value)
+
+# Calculate positions
+data <- data %>%
+    arrange(desc(width_value)) %>%
+    mutate(
+        # Calculate angles for plotting
+        ymax = cumsum(width_value),
+        ymin = c(0, head(ymax, n=-1)),
+        xmax = height_value,
+        xmin = 0)
+
+# Create the donut chart
+ggplot(data) +
+  geom_rect(aes(
+    xmin = xmin,
+    xmax = xmax,
+    ymin = ymin,
+    ymax = ymax,
+    fill = category),
+    color = "white") +
+  coord_polar(theta = "y") +
+  # Create donut hole
+  xlim(c(-20, max(data$height_value))) +
+  # Add center score
+  annotate(
+    "text", x = -20, y = 0, 
+    label = "85", 
+    size = 8, 
+    fontface = "bold") +
+  # Customize appearance
+  scale_fill_brewer(palette = "Set2") +
+  theme_void() +
+  theme(
+    legend.position = "bottom",
+    plot.margin = unit(c(20, 20, 20, 20), "pt"))
+```
+
+### Species
+
+```{r}
+ply_key <- "BFT"
+
+# get species data from db
+d_spp <- dbGetQuery(con, glue("SELECT * FROM {tbl_ply_spp} WHERE ply_tbl = '{schema}.{tbl}' AND ply_fld = '{fld_key}' AND ply_key = '{ply_key}'")) |> 
+  mutate(
+    taxa = factor(taxa, levels = names(where_taxa))) |>
+  tibble()
+
+d_taxa <- d_spp |> 
+  group_by(taxa) |>
+  summarize(
+    n_spp       = n(),
+    amt         = sum(amt),
+    amt_per_spp = amt / n_spp)
+```
+
 
 ```{r cleanup, include=FALSE}
 # Disconnect from the database
