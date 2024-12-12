@@ -110,10 +110,10 @@ insert_poly_species(
 ```{r}
 #| eval: false
 insert_poly_species(
-  schema    = "public",
-  tbl       = "ply_rgns",
-  fld_geom  = "geometry",
-  fld_key   = "rgn_key",
+  schema       = "public",
+  tbl          = "ply_rgns",
+  fld_geom     = "geometry",
+  fld_key      = "rgn_key",
   tbl_ply_spp  = "ply_species",
   redo = F)
 ```
@@ -258,47 +258,64 @@ for (taxa in names(where_taxa)) { # taxa = names(where_taxa)[1]
 librarian::shelf(
   dplyr, ggplot2)
 
-# Sample data
-data <- data.frame(
-    category = c("A", "B", "C", "D"),
-    width_value  = c(10, 25, 40, 25),    # Controls segment width
-    height_value = c(80, 65, 45, 60))    # Controls segment height)
-sum(data$width_value)
-
-# Calculate positions
-data <- data %>%
-    arrange(desc(width_value)) %>%
+# Function to create the flower plot
+plot_flower <- function(
+    data,
+    fld_category,
+    fld_width,
+    fld_height,
+    score,
+    colors = "Set2"){
+  
+  # Calculate positions
+  data <- data  |> 
+    arrange({{ fld_category }}) |> 
     mutate(
-        # Calculate angles for plotting
-        ymax = cumsum(width_value),
-        ymin = c(0, head(ymax, n=-1)),
-        xmax = height_value,
-        xmin = 0)
+      # Calculate angles for plotting
+      ymax = cumsum({{ fld_width }}),
+      ymin = c(0, head(ymax, n=-1)),
+      xmax = {{ fld_height }},
+      xmin = 0)
+  
+  # Create the donut chart
+  ggplot(data) +
+    geom_rect(aes(
+      xmin = xmin,
+      xmax = xmax,
+      ymin = ymin,
+      ymax = ymax,
+      fill = {{ fld_category }}),
+      color = "white") +
+    coord_polar(theta = "y") +
+    # Create donut hole
+    xlim(c(-20, max(data |> pull({{ fld_height }})))) +
+    # Add center score
+    annotate(
+      "text", x = -20, y = 0, 
+      label = "85", 
+      size = 8, 
+      fontface = "bold") +
+    # Customize appearance
+    scale_fill_brewer(palette = colors) +
+    theme_void() +
+    theme(
+      legend.position = "bottom",
+      plot.margin = unit(c(20, 20, 20, 20), "pt"))
+}
 
-# Create the donut chart
-ggplot(data) +
-  geom_rect(aes(
-    xmin = xmin,
-    xmax = xmax,
-    ymin = ymin,
-    ymax = ymax,
-    fill = category),
-    color = "white") +
-  coord_polar(theta = "y") +
-  # Create donut hole
-  xlim(c(-20, max(data$height_value))) +
-  # Add center score
-  annotate(
-    "text", x = -20, y = 0, 
-    label = "85", 
-    size = 8, 
-    fontface = "bold") +
-  # Customize appearance
-  scale_fill_brewer(palette = "Set2") +
-  theme_void() +
-  theme(
-    legend.position = "bottom",
-    plot.margin = unit(c(20, 20, 20, 20), "pt"))
+# Sample data
+ex_data <- data.frame(
+  category     = c("A", "B", "C", "D"),
+  width_value  = c(10, 25, 40, 25),    # Controls segment width
+  height_value = c(80, 65, 45, 60))    # Controls segment height)
+sum(ex_data$width_value)
+
+ex_data |> 
+  plot_flower(
+    category,
+    width_value,
+    height_value,
+    sum(ex_data$width_value))
 ```
 
 ### Species
@@ -307,7 +324,16 @@ ggplot(data) +
 ply_key <- "BFT"
 
 # get species data from db
-d_spp <- dbGetQuery(con, glue("SELECT * FROM {tbl_ply_spp} WHERE ply_tbl = '{schema}.{tbl}' AND ply_fld = '{fld_key}' AND ply_key = '{ply_key}'")) |> 
+schema       = "public"
+tbl          = "ply_rgns"
+fld_key      = "rgn_key"
+tbl_ply_spp  = "ply_species"
+d_spp <- dbGetQuery(con, glue(
+  "SELECT * FROM {tbl_ply_spp} 
+  WHERE
+    ply_tbl = '{schema}.{tbl}' AND 
+    ply_fld = '{fld_key}'      AND 
+    ply_key = '{ply_key}'")) |> 
   mutate(
     taxa = factor(taxa, levels = names(where_taxa))) |>
   tibble()
@@ -318,8 +344,22 @@ d_taxa <- d_spp |>
     n_spp       = n(),
     amt         = sum(amt),
     amt_per_spp = amt / n_spp)
+
+
+ex_data |> 
+  plot_flower(
+    category,
+    width_value,
+    height_value,
+    sum(ex_data$width_value))
+
 ```
 
+$$
+amt = n\_cells * avg\_pct * avg\_suit
+$$
+
+Amount ($amt$) is the multiplication of the number of cells ($n\_cells$), average percent ($avg\_pct$) of a cell's contents within the selected polygon, and the average Suitability ($avg\_suit$; 0 to 100%) of the species given by AquaMaps.
 
 ```{r cleanup, include=FALSE}
 # Disconnect from the database
