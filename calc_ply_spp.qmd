@@ -363,6 +363,58 @@ $$
 
 Amount ($amt$) is the multiplication of the number of cells ($n\_cells$), average percent ($avg\_pct$) of a cell's contents within the selected polygon, and the average Suitability ($avg\_suit$; 0 to 100%) of the species given by AquaMaps.
 
+
+## Get GBIF occurrences, with iucnRedListCategory
+
+```{r}
+librarian::shelf(
+  janitor, purrr, rgbif)
+
+# species in ecoareas
+d_spp <- tbl(con, "ply_species") |> 
+  filter(ply_tbl == "public.ply_ecoareas") |> 
+  # distinct(sp_key, phylum, class, order, family, genus, species) |> 
+  mutate(
+    rank     = "species",
+    sci_name = paste(genus, species)) |> 
+  distinct(sci_name, sp_key, rank, phylum) |> 
+  arrange(sci_name) |>
+  collect() |> 
+  relocate(sci_name)
+
+# GBIF taxon keys for species
+d_spp_ck <- name_backbone_checklist(d_spp |> select(-sp_key))
+# table(d_spp_cklist$confidence)
+# 85    91    95    96    97    98    99   100 
+#  1    10     1    10     8    10    74 10462 
+# sum(is.na(d_spp_cklist$usageKey)) # 0
+
+insert_occs <- function(key){
+  n <- tbl(con, "species") |> 
+    filter(taxon_key == !!key) |> 
+    summarize(n = n()) |> 
+    pull(n)
+  if (n > 0)
+    return(NA)
+  
+  o <- occ_data(taxonKey = key, limit = 100000)
+  
+  d <- o$data |> 
+    select(!where(is.list)) |> # drop column network_keys
+    clean_names()
+  n <- nrow(d)
+  dbWriteTable(con, "species", d, append = T, row.names = F)
+  return(n)
+}
+
+d_spp_ck_occs <- d_spp_ck |> 
+  mutate(
+    n_occs_added = map_int(usageKey, insert_occs))
+
+# TODO: iucnRedListCategory
+```
+
+
 ```{r cleanup, include=FALSE}
 # Disconnect from the database
 DBI::dbDisconnect(con)
