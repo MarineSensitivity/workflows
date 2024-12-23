@@ -492,50 +492,107 @@ Amount ($amt$) is the multiplication of the number of cells ($n\_cells$), averag
 librarian::shelf(
   janitor, purrr, rgbif)
 
-# species in ecoareas
-d_spp <- tbl(con, "ply_species") |> 
-  filter(ply_tbl == "public.ply_ecoareas") |> 
-  # distinct(sp_key, phylum, class, order, family, genus, species) |> 
-  mutate(
-    rank     = "species",
-    sci_name = paste(genus, species)) |> 
-  distinct(sci_name, sp_key, rank, phylum) |> 
-  arrange(sci_name) |>
-  collect() |> 
-  relocate(sci_name)
-
-# GBIF taxon keys for species
-d_spp_ck <- name_backbone_checklist(d_spp |> select(-sp_key))
-# table(d_spp_cklist$confidence)
-# 85    91    95    96    97    98    99   100 
-#  1    10     1    10     8    10    74 10462 
-# sum(is.na(d_spp_cklist$usageKey)) # 0
-
-insert_occs <- function(key){
-  n <- tbl(con, "species") |> 
-    filter(taxon_key == !!key) |> 
-    summarize(n = n()) |> 
-    pull(n)
-  if (n > 0)
-    return(NA)
+if (!"spp" %in% dbListTables(con)){
+  # species in ecoareas
+  d_spp <- tbl(con, "ply_species") |> 
+    filter(ply_tbl == "public.ply_ecoareas") |> 
+    # distinct(sp_key, phylum, class, order, family, genus, species) |> 
+    mutate(
+      am_key   = sp_key,     # AquaMaps key
+      rank     = "species",
+      sci_name = paste(genus, species)) |> 
+    distinct(sci_name, am_key, rank, phylum) |> 
+    arrange(sci_name) |>
+    collect() |> 
+    relocate(sci_name)
   
-  o <- occ_data(taxonKey = key, limit = 100000)
+  # GBIF taxon keys for species
+  d_spp_ck <- name_backbone_checklist(d_spp |> select(-am_key))
+  # table(d_spp_cklist$confidence)
+  # 85    91    95    96    97    98    99   100 
+  #  1    10     1    10     8    10    74 10462 
+  # sum(is.na(d_spp_cklist$usageKey)) # 0
+  
+  # add am_key back
+  d_spp_ck <- d_spp_ck |> 
+    left_join(
+      d_spp |> 
+        select(am_key, sci_name),
+      by = c("verbatim_name" = "sci_name")) |> 
+    relocate(am_key)
+  
+  dbWriteTable(con, Id(schema = "public", table = "spp"), d_spp_ck, append = FALSE, row.names = F)
+}
+
+insert_occs <- function(key, idx, tbl_occs = "sp_occs"){
+
+  if (tbl_occs %in% dbListTables(con)){
+    n <- tbl(con, tbl_occs) |> 
+      filter(taxon_key == !!key) |> 
+      summarize(n = n()) |> 
+      pull(n)
+    flds <- dbListFields(con, tbl_occs)
+  } else {
+    n <- 0
+  }
+  sp_sci <- tbl(con, "spp") |> 
+    filter(usageKey == !!key) |> 
+    pull(verbatim_name)
+  message(glue("{idx} of {nrow(d_spp)}: {sp_sci} ({key}) ~ {Sys.time()}"))
+  
+  if (n > 0){
+    message(paste("  SKIP: already", n, "occs"))
+    return(NA)
+  }
+  
+  o <- occ_search(taxonKey = key, limit = 100000)
   
   d <- o$data |> 
     select(!where(is.list)) |> # drop column network_keys
     clean_names()
+  if (tbl_occs %in% dbListTables(con))
+    d <- d |> 
+      select(any_of(flds))
   n <- nrow(d)
-  dbWriteTable(con, "species", d, append = T, row.names = F)
+  message(paste("  FETCHED:", n, "occs"))
+  
+  dbWriteTable(con, tbl_occs, d, append = T, row.names = F)
   return(n)
 }
 
-d_spp_ck_occs <- d_spp_ck |> 
+d_spp <- tbl(con, "spp") |> 
+  select(am_key, verbatim_name, usageKey) |> 
+  collect()
+
+# dbRemoveTable(con, "sp_occs")
+message(glue("n_spp: {nrow(d_spp)} ~ {Sys.time()}")) # 10,576
+d_spp <- d_spp |> 
+  # slice(1:3) |> 
   mutate(
-    n_occs_added = map_int(usageKey, insert_occs))
+    n_occs_added = imap_int(usageKey, insert_occs))
+d_spp
 
 # TODO: iucnRedListCategory
 ```
 
+Working but SLOW, a week to finish.
+
+```{r}
+#  1 of 10576: Aaptos aaptos (2251089) ~ 2024-12-23 21:03:10.919669
+# 38 of 10576: Acanthephyra eximia (2222578) ~ 2024-12-23 21:47:27.822961
+# 51 of 10576: Acanthocybium solandri (2374069) ~ 2024-12-23 21:49:05.7667
+
+n_all  <- 10576
+n_done <- 50
+n_todo <- n_all - n_done
+
+ts <- as.POSIXct(c(
+  beg = "2024-12-23 21:03:10.919669", 
+  end = "2024-12-23 21:49:05.7667"), tz="UTC")
+ts["end"] + ((ts["end"] - ts["beg"]) / n_done * n_todo)
+# "2025-01-01 16:00:34 UTC"
+# "2024-12-30 14:54:56 UTC"
+```
 
 ```{r cleanup, include=FALSE}
 # Disconnect from the database
