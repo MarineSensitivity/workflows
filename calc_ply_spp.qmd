@@ -7,11 +7,204 @@ editor_options:
 
 ```{r setup, include=FALSE}
 librarian::shelf(
-  DBI, dplyr, dbplyr, httr2, jsonlite, readr, tictoc, tidyr)
+  DBI, dplyr, dbplyr, glue, here, httr2, jsonlite, 
+  MarineSensitivity/msens,
+  readr, sf, stringr, tictoc, tidyr)
 source("libs/db.R")
 ```
 
+```{r}
+# TODO: add req_timeout(60*20) to R fxn so timeout is 20 min, not 10 min
+# https://httr2.r-lib.org/reference/req_timeout.html
+# erEGOM-paEGM: 921.262 sec / 60 = 15.4 min
+get_species_by_feature_localdb <- function(
+    schema.table = "raw.mr_eez",
+    where        = "mrgid = 8442"){
+  
+  # schema.table = "public.ply_ecoareas"
+  # where        = "ecoarea_key = 'erCAC-paCEC'"
+
+  source(here("../workflows/libs/db.R")) # define: con
+  
+  schema <- str_split(schema.table, fixed("."))[[1]][1]
+  table  <- str_split(schema.table, fixed("."))[[1]][2]
+
+  fld_geom <- dbGetQuery(
+    con,
+    glue("
+      SELECT f_geometry_column
+      FROM geometry_columns
+      WHERE
+        f_table_schema = '{schema}' AND
+        f_table_name   = '{table}';")) |>
+    pull(f_geometry_column)
+  # message(glue("schema.table: '{schema}.{table}'; fld_geom: '{fld_geom}'"))
+
+  q <- glue("
+    WITH
+      c AS (
+        SELECT
+        c.cell_id,
+        c.area_km2 AS cell_km2,
+        CASE
+          WHEN ST_CoveredBy(c.geom, a.{fld_geom})
+            THEN c.geom
+          ELSE
+            ST_Multi(ST_Intersection(c.geom, a.{fld_geom}))
+        END AS geom
+      FROM
+        aquamaps.cells c
+        INNER JOIN {table} a
+          ON ST_Intersects(c.geom, a.{fld_geom})
+            AND NOT ST_Touches(c.geom, a.{fld_geom})
+      WHERE
+        a.{where}
+      ORDER BY
+        c.cell_id),
+    k AS (
+      SELECT *,
+        ST_AREA(geom::geography) / (1000 * 1000) AS aoi_km2
+      FROM c),
+    a AS (
+      SELECT *,
+        aoi_km2 / cell_km2 AS pct_cell
+      FROM k),
+    s AS (
+      SELECT a.*,
+        sc.sp_key, sc.probability
+      FROM a
+        LEFT JOIN aquamaps.spp_cells sc
+          ON a.cell_id = sc.cell_id),
+    g AS (
+      SELECT
+        sp_key,
+        COUNT(*)                                  AS n_cells,
+        AVG(pct_cell)                             AS avg_pct_cell,
+        SUM(aoi_km2)                              AS area_km2,
+        SUM(probability * aoi_km2) / SUM(aoi_km2) AS avg_suit
+      FROM s
+      GROUP BY sp_key)
+    SELECT
+      sp_key, n_cells, avg_pct_cell, area_km2, avg_suit,
+      n_cells * avg_pct_cell * avg_suit AS amt,
+      phylum, class, \"order\", family, genus, species
+    FROM
+      g
+      LEFT JOIN aquamaps.spp USING (sp_key)")
+  # message(q)
+
+  dbGetQuery(con, q)
+}
+```
+
+
 ## Fetch and Store Species Data
+
+```{r}
+insert_ply_species <- function(
+    schema       = "public",
+    tbl          = "ply_ecoareas",
+    fld_key      = "ecoarea_key",
+    tbl_ply_spp  = "ply_species",
+    redo = F){
+  
+  # keys, all
+  keys <- dbGetQuery(con, glue("SELECT {fld_key} FROM {schema}.{tbl} ORDER BY {fld_key}")) |> 
+    pull(fld_key)
+  
+  # keys, done
+  if (dbExistsTable(con, tbl_ply_spp) & !redo) {
+    keys_done <- dbGetQuery(con, glue("SELECT DISTINCT ply_key FROM {tbl_ply_spp} WHERE ply_tbl = '{schema}.{tbl}' ORDER BY ply_key")) |> 
+      pull(ply_key)
+    
+    keys <- setdiff(keys, keys_done)
+  }
+  
+  if (length(keys) == 0){
+    message(glue("All keys in {tbl}.{fld_key} were already processed and inserted into {tbl_ply_spp} ~ {Sys.time()}"))
+    return(NULL)
+  }
+  
+  # Iterate over each region key
+  for (i in 1:length(keys)) {  # key = rgn_keys[1] # bad: i = 1; key = "ALA" # good: key = "WGM"
+    key = keys[i]
+    
+    # message with time stamp
+    tic()
+    message(glue("{sprintf('%02d',i)}/{length(keys)}: {key} ~ {Sys.time()}"))
+    
+    # Fetch species data from API; wrap in tryCatch to avoid breaking the loop
+    d_spp <- tryCatch({
+      # msens::get_species_by_feature(
+      get_species_by_feature_localdb(
+        glue("public.{tbl}"),
+        glue("{fld_key} = '{key}'")) }, 
+      error = function(e) {
+        message(glue(
+          "
+        Error fetching species data: {e$message}
+        ~ {Sys.time()}"))
+        source("libs/db.R") # reset database con
+        return(NULL)
+      })
+    
+    if (is.null(d_spp))
+      next
+    
+    # add columns identifying polygon for species
+    d_spp <- d_spp |>
+      mutate(
+        ply_tbl = glue("{schema}.{tbl}"),
+        ply_fld = fld_key,
+        ply_key = key) |>
+      relocate(ply_tbl, ply_fld, ply_key)
+    
+    # clear existing if table exists
+    if (dbExistsTable(con, tbl_ply_spp)) {
+      dbExecute(con, glue("DELETE FROM {tbl_ply_spp} WHERE ply_tbl = '{schema}.{tbl}' AND ply_fld = '{fld_key}' AND ply_key = '{key}'"))
+    }
+      
+    # append to database
+    dbWriteTable(con, tbl_ply_spp, d_spp, append = TRUE, row.names = FALSE)
+
+    toc <- toc(quiet = T)
+    message(glue("{sprintf('%02d',i)}/{length(keys)}: {key} ~ {toc$callback_msg}"))
+  }
+}
+
+# dbRemoveTable(con, "ply_species")
+
+insert_ply_species(
+  schema       = "public",
+  tbl          = "ply_ecoareas",
+  fld_key      = "ecoarea_key",
+  tbl_ply_spp  = "ply_species",
+  redo         = F)
+
+# 01/17: erEGOM-paEGM ~ 2024-12-21 15:43:57.250182
+# Error fetching species data: Failed to perform HTTP request.
+# ~ 2024-12-21 15:53:58.042009
+# 06/17: erGOA-paGOA ~ 2024-12-21 16:03:20.086948
+# Error fetching species data: Failed to perform HTTP request.
+# ~ 2024-12-21 16:13:20.706389
+# 10/17: erNECS-paNOA ~ 2024-12-21 16:26:41.31597
+# Error fetching species data: Failed to perform HTTP request.
+# ~ 2024-12-21 16:36:41.934764
+# 11/17: erSECS-paFLS ~ 2024-12-21 16:36:42.155532
+# Error fetching species data: Failed to perform HTTP request.
+# ~ 2024-12-21 16:46:42.77022
+
+insert_ply_species(
+  schema       = "public",
+  tbl          = "ply_ecorgns",
+  fld_key      = "ecorgn_key",
+  tbl_ply_spp  = "ply_species",
+  redo = F)
+```
+
+
+
+## OLD db: Fetch and Store Species Data
 
 ```{r}
 # show region keys
@@ -27,80 +220,10 @@ region keys (n = 27):
 ```
 
 ```{r}
-insert_poly_species <- function(
-    schema    = "public",
-    tbl       = "ply_rgns",
-    fld_geom  = "geometry",
-    fld_key   = "rgn_key",
-    tbl_ply_spp  = "ply_species",
-    redo = F){
-  
-  # enforce SRID so shows up in tile.marinesensivity.org
-  # dbExecute(con, glue("SELECT UpdateGeometrySRID('{schema}','{tbl}','{fld_geom}',4326);"))
-  dbExecute(con, glue("CREATE INDEX IF NOT EXISTS {tbl}_{fld_geom}_idx ON {schema}.{tbl} USING gist({fld_geom});"))
-  
-  # keys, all
-  keys <- dbGetQuery(con, glue("SELECT {fld_key} FROM {schema}.{tbl} ORDER BY {fld_key}")) |> 
-    pull(fld_key)
-  
-  # keys, done
-  keys_done <- dbGetQuery(con, glue("SELECT DISTINCT ply_key FROM {tbl_ply_spp} WHERE ply_tbl = '{schema}.{tbl}' ORDER BY ply_key")) |> 
-    pull(ply_key)
-  
-  if (!redo)
-    keys <- setdiff(keys, keys_done)
-  
-  # Iterate over each region key
-  for (i in 1:length(keys)) {  # key = rgn_keys[1] # bad: i = 1; key = "ALA" # good: key = "WGM"
-    key = keys[i]
-    
-    # message with time stamp
-    tic()
-    message(glue("{sprintf('%02d',i)}/{length(keys)}: {key} ~ {Sys.time()}"))
-    
-    # Fetch species data from API; wrap in tryCatch to avoid breaking the loop
-    d_spp <- tryCatch({
-      request("https://api.marinesensitivity.org") |> 
-        req_url_path_append("species_by_feature") |>
-        req_url_query(
-          `schema.table` = glue("{schema}.{tbl}"), 
-          `where`        = glue("{fld_key} = '{key}'")) |>
-        req_perform() |>
-        resp_body_raw() |>
-        read_csv(show_col_types = F) |> 
-        mutate(
-          ply_tbl = glue("{schema}.{tbl}"), 
-          ply_fld = fld_key, 
-          ply_key = key) |> 
-        relocate(ply_tbl, ply_fld, ply_key)
-    }, error = function(e) {
-      message(glue("Error fetching species data for {key}: {e$message}"))
-      source("libs/db.R") # reset database con
-      return(NULL)
-    })
-    
-    if (!is.null(d_spp)) {
-      # clear existing if table exists
-      if (dbExistsTable(con, tbl_ply_spp)) {
-        dbExecute(con, glue("DELETE FROM {tbl_ply_spp} WHERE ply_tbl = '{schema}.{tbl}' AND ply_fld = '{fld_key}' AND ply_key = '{key}'"))
-      }
-      
-      # Append to database
-      dbWriteTable(con, tbl_ply_spp, d_spp, append = TRUE, row.names = FALSE)
-    }
-    
-    toc <- toc(quiet = T)
-    message(glue("{sprintf('%02d',i)}/{length(keys)}: {key} ~ {toc$callback_msg}"))
-  }
-}
-```
-
-```{r}
 #| eval: false
-insert_poly_species(
+insert_ply_species(
   schema       = "public",
   tbl          = "ply_shlfs",
-  fld_geom     = "geometry",
   fld_key      = "shlf_key",
   tbl_ply_spp  = "ply_species",
   redo         = F)
@@ -108,10 +231,9 @@ insert_poly_species(
 
 ```{r}
 #| eval: false
-insert_poly_species(
+insert_ply_species(
   schema       = "public",
   tbl          = "ply_rgns",
-  fld_geom     = "geometry",
   fld_key      = "rgn_key",
   tbl_ply_spp  = "ply_species",
   redo = F)
