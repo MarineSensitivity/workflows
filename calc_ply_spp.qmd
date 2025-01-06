@@ -528,42 +528,21 @@ if (!"spp" %in% dbListTables(con)){
     relocate(am_key)
   
   dbWriteTable(con, Id(schema = "public", table = "spp"), d_spp_ck, append = FALSE, row.names = F)
-}
+  
+  # comment on table with source (this script) and date created
+  dbExecute(
+    con,
+    sprintf(
+    "COMMENT ON TABLE %s IS '%s';", 
+    "spp", 
+    paste("Created by [workflows: calc\\_ply\\_spp.qmd](https://github.com/MarineSensitivity/workflows/blob/main/calc_ply_spp.qmd)", "Date:", Sys.Date())))
+  
+  # rename columns in table spp: am_key -> sp_key_am, usageKey -> sp_key_gbif 
+  if ("am_key" %in% dbListFields(con, "occ_species"))
+    dbExecute(con,"ALTER TABLE spp RENAME COLUMN am_key TO sp_key_am")
+  if ("usageKey" %in% dbListFields(con, "occ_species"))
+    dbExecute(con,"ALTER TABLE spp RENAME COLUMN \"usageKey\" TO sp_key_gbif")
 
-insert_occs <- function(key, idx, tbl_occs = "sp_occs"){
-
-  if (tbl_occs %in% dbListTables(con)){
-    n <- tbl(con, tbl_occs) |> 
-      filter(taxon_key == !!key) |> 
-      summarize(n = n()) |> 
-      pull(n)
-    flds <- dbListFields(con, tbl_occs)
-  } else {
-    n <- 0
-  }
-  sp_sci <- tbl(con, "spp") |> 
-    filter(usageKey == !!key) |> 
-    pull(verbatim_name)
-  message(glue("{idx} of {nrow(d_spp)}: {sp_sci} ({key}) ~ {Sys.time()}"))
-  
-  if (n > 0){
-    message(paste("  SKIP: already", n, "occs"))
-    return(NA)
-  }
-  
-  o <- occ_search(taxonKey = key, limit = 100000)
-  
-  d <- o$data |> 
-    select(!where(is.list)) |> # drop column network_keys
-    clean_names()
-  if (tbl_occs %in% dbListTables(con))
-    d <- d |> 
-      select(any_of(flds))
-  n <- nrow(d)
-  message(paste("  FETCHED:", n, "occs"))
-  
-  dbWriteTable(con, tbl_occs, d, append = T, row.names = F)
-  return(n)
 }
 
 d_spp <- tbl(con, "spp") |> 
@@ -688,11 +667,11 @@ GBIF Occurrence Download https://doi.org/10.15468/dl.sspeuj Accessed from R via 
 
 ```{r}
 librarian::shelf(
-  dplyr, glue, here, readr, rgbif, tictoc, utils)
+  dplyr, glue, here, purrr, readr, rgbif, rredlist, tictoc, utils)
 source(here("libs/db.R"))
 
 # DEBUG
-options(error=browser) # options(error=NULL)
+# options(error=browser) # options(error=NULL)
 
 dir_dl  <- "/share/data/gbifdownload"
 dl_key  <- "0047939-241126133413365"
@@ -701,6 +680,14 @@ dl_dir  <- glue("{dir_dl}/{dl_key}")
 occ_txt <- glue("{dir_dl}/{dl_key}/occurrence.txt")
 tbl_spp <- "occ_species"
 tbl_occ <- "occs"
+# TODO: change on server vs laptop
+
+dir_private <- switch(
+  Sys.info()[["sysname"]],
+  Darwin = "/Users/bbest/My Drive/private",  # laptop
+  Linux  = "/share/private")                 # server
+iucn_token_txt <- glue("{dir_private}/iucnredlist.org_api_token.txt")
+Sys.setenv(IUCN_REDLIST_KEY = readLines(iucn_token_txt))
 
 if (!file.exists(dl_zip))
   occ_download_get(dl_key, path = dir_dl)
@@ -778,16 +765,122 @@ read_tsv_chunked(
 
 ```{r}
 
-am_key    usageKey
+if ("taxonKey" %in% dbListFields(con, "occ_species"))
+  dbExecute(
+    con,
+    "ALTER TABLE occ_species RENAME COLUMN \"taxonKey\" TO sp_key_gbif")
 
-d_occ_spp <- tbl(con, "spp") |> 
-  left_join(
-    tbl(con, "occ_species") |> 
-      distinct(taxonKey, iucnRedListCategory),
-    by = c("usageKey" = "taxonKey")) |> 
+# d_occ_spp <- tbl(con, "spp") |> 
+#   select(sp_key_gbif) |> 
+#   left_join(
+#     tbl(con, "occ_species") |> 
+#       distinct(sp_key_gbif, iucnRedListCategory),
+#     by = "sp_key_gbif") |> 
+#   collect() |> 
+#   pull(iucnRedListCategory) |> 
+#   table(useNA = "ifany")
+
+# add text field iucnRedListCategory to table spp
+if (!"iucnRedListCategory" %in% dbListFields(con, "spp"))
+  dbExecute(con, "ALTER TABLE spp ADD COLUMN \"iucnRedListCategory\" TEXT")
+
+# update table spp with iucnRedListCategory from table occ_species
+dbExecute(
+  con,
+  "UPDATE spp
+    SET \"iucnRedListCategory\" = occ_species.\"iucnRedListCategory\"
+    FROM occ_species 
+    WHERE occ_species.sp_key_gbif = spp.sp_key_gbif")
+
+# tbl(con, "spp") |> 
+#   pull(iucnRedListCategory) |> 
+#   table(useNA = "ifany")
+# CR   DD   EN   EX   LC   NE   NT   VU <NA> 
+# 25  114   41    1 1827 5157   52   92 3267
+  
+tbl(con, "spp") |> 
+  # distinct(species) |> 
+  pull(species) |> 
+  duplicated() |> 
+  sum() # 116
+# TODO: fix duplicates
+
+
+d_spp_rlna <- tbl(con, "spp") |> 
+  filter(
+    is.na(iucnRedListCategory) |
+      iucnRedListCategory %in% c("DD","NE")) |> 
+  select(sp_key_gbif, species) |> 
+  arrange(species) |> 
   collect()
+# nrow(d_spp_rlna) # 8,538
 
-stopifnot(sum(duplicated(d_occ_spp$usageKey)) == 0)
+d_spp_rl <- tbl(con, "spp") |> 
+  distinct(species) |> 
+  arrange(species) |> 
+  collect() |> 
+  mutate(
+    iucn_list = imap(
+      species, \(sp, idx){
+        message(glue("{idx}/{nrow(d_spp_rlna)}: {sp} ~ {Sys.time()}"))
+        
+        y <- rl_search(sp, region = "global")
+        # message(str(y))
+        if (length(y$result[]) == 0){
+          message(glue("  not found, skipping", .trim = F))
+          return(NA)
+        }
+        
+        d <- y$result |> 
+          rename(sp_id_iucn = taxonid) |> 
+          mutate(species_spp = sp) |> 
+          relocate(species_spp)
+        n <- nrow(d)
+        message("  adding to iucn_species", .trim = F)
+        # append to database
+        dbWriteTable(con, "iucn_species", d, append = T, row.names = F)
+        return(n)
+
+      }))
+#  1/3267: Aaptos bergmanni ~ 2025-01-02 16:47:52.678079
+# 78/3267: Alionematichthys piger ~ 2025-01-02 16:48:52.679629
+# (2 min / 78 spp) * 3267 spp = 83.8 min
+# https://docs.ropensci.org/rredlist/
+# https://apiv3.iucnredlist.org/api/v3/docs#species-category
+
+d_spp_rl3 |> 
+  select(sp_key_gbif, species, iucn_list) |> 
+  unnest_wider(iucn_list)
+
+  rredlist::rl_sp_category(
+    d_spp_rl$species[1])
+  
+  rl_
+  rredlist::rl_habitats()
+  rredlist::rl_synonyms()
+  names(d_spp_rl)
+    rl_search(d_spp_rl$verbatim_name[1])
+    rl_search(d_spp_rl$species[1])
+    rl_synonyms(d_spp_rl$species[1])
+    rl_search(
+    genus   = "Aaptos",
+    species = "bergmanni",
+    key     = iucn_token)
+  
+
+
+  
+
+# d_spp_rl |> 
+d_spp_rl2 |> 
+  head() |> 
+  View()
+
+# rredlist: 
+librarian::shelf(rredlist)
+rl_use_iucn()
+
+stopifnot(sum(duplicated(d_occ_spp$sp_key_gbif)) == 0)
 
 table(d_occ_spp$iucnRedListCategory, useNA = "ifany")
 # CR   DD   EN   EX     LC     NE   NT   VU   <NA> 
@@ -800,59 +893,13 @@ sum(duplicated(d_spp$taxonKey))
 ```
 
 
-```{r}
-# dbRemoveTable(con, "sp_occs")
-message(glue("n_spp: {nrow(d_spp)} ~ {Sys.time()}")) # 10,576
-# tic()
-d_spp <- d_spp |> 
-  # slice(49:60) |> 
-  mutate(
-    n_occs_added = imap_int(usageKey, insert_occs))
-# toc()
-
-# https://docs.ropensci.org/rgbif/articles/gbif_credentials.html
-# usethis::edit_r_environ()
-
-d_spp
-
-
-# TODO: iucnRedListCategory
-```
-
-Working but SLOW, a week to finish.
+- [rgbif gbif_credentials](https://docs.ropensci.org/rgbif/articles/gbif_credentials.html)\
+  `/Users/bbest/My Drive/private/gbif.org_ecoquants.txt`
 
 ```{r}
-#  1 of 10576: Aaptos aaptos (2251089) ~ 2024-12-23 21:03:10.919669
-# 38 of 10576: Acanthephyra eximia (2222578) ~ 2024-12-23 21:47:27.822961
-# 51 of 10576: Acanthocybium solandri (2374069) ~ 2024-12-23 21:49:05.7667
+#| eval: false
 
-n_all  <- 10576
-n_done <- 50
-n_todo <- n_all - n_done
-
-ts <- as.POSIXct(c(
-  beg = "2024-12-23 21:03:10.919669", 
-  end = "2024-12-23 21:49:05.7667"), tz="UTC")
-ts["end"] + ((ts["end"] - ts["beg"]) / n_done * n_todo)
-# "2025-01-01 16:00:34 UTC"
-# "2024-12-30 14:54:56 UTC"
-```
-
-```{r}
-librarian::shelf(furrr)
-availableCores() # 4 on server
-
-librarian::shelf(furrr)
-availableCores()
-plan(multicore, workers = no_cores)
-
-
-#https://docs.ropensci.org/rgbif/articles/gbif_credentials.html
 usethis::edit_r_environ()
-# GBIF_USER="ecoquants"
-# GBIF_PWD="Fmg7_iiT3S7wN2D"
-# GBIF_EMAIL="ben@ecoquants.com"
-
 ```
 
 
