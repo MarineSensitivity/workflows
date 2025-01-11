@@ -537,11 +537,11 @@ if (!"spp" %in% dbListTables(con)){
     "spp", 
     paste("Created by [workflows: calc\\_ply\\_spp.qmd](https://github.com/MarineSensitivity/workflows/blob/main/calc_ply_spp.qmd)", "Date:", Sys.Date())))
   
-  # rename columns in table spp: am_key -> sp_key_am, usageKey -> sp_key_gbif 
+  # rename columns in table spp: am_key -> sp_key_am, usageKey -> sp_id_gbif 
   if ("am_key" %in% dbListFields(con, "occ_species"))
     dbExecute(con,"ALTER TABLE spp RENAME COLUMN am_key TO sp_key_am")
   if ("usageKey" %in% dbListFields(con, "occ_species"))
-    dbExecute(con,"ALTER TABLE spp RENAME COLUMN \"usageKey\" TO sp_key_gbif")
+    dbExecute(con,"ALTER TABLE spp RENAME COLUMN \"usageKey\" TO sp_id_gbif")
 
 }
 
@@ -667,7 +667,9 @@ GBIF Occurrence Download https://doi.org/10.15468/dl.sspeuj Accessed from R via 
 
 ```{r}
 librarian::shelf(
-  dplyr, glue, here, purrr, readr, rgbif, rredlist, tictoc, utils)
+  dplyr, glue, here, httr2, jsonlite, purrr, readr, rgbif, 
+  # ropensci/rredlist, 
+  tictoc, tidyr, utils)
 source(here("libs/db.R"))
 
 # DEBUG
@@ -686,8 +688,53 @@ dir_private <- switch(
   Sys.info()[["sysname"]],
   Darwin = "/Users/bbest/My Drive/private",  # laptop
   Linux  = "/share/private")                 # server
-iucn_token_txt <- glue("{dir_private}/iucnredlist.org_api_token.txt")
+iucn_token_txt <- glue("{dir_private}/iucnredlist.org_api_token_v4.txt")
 Sys.setenv(IUCN_REDLIST_KEY = readLines(iucn_token_txt))
+# Sys.getenv("IUCN_REDLIST_KEY")
+
+# # red_list_categories ----
+# resp <- request("https://api.iucnredlist.org/api/v4/") |>
+#   req_headers(Authorization = tkn_v4) |> 
+#   req_url_path_append("red_list_categories") |>
+#   req_perform()
+# 
+# d_rlcats <- resp |> 
+#   resp_body_json() |>
+#   pluck("red_list_categories") |>
+#   map_dfr(~ tibble(
+#     version     = .x$version, # latest: 3.1
+#     code        = .x$code,
+#     description = .x$description$en))
+# View(d_rlcats)
+# 
+# # habitats ----
+# resp <- request("https://api.iucnredlist.org/api/v4/") |>
+#   req_headers(Authorization = tkn_v4) |> 
+#   req_url_path_append("habitats") |>
+#   req_perform()
+# 
+# d_rlhabs <- resp |> 
+#   resp_body_json() |>
+#   pluck("habitats") |>
+#   map_dfr(~ tibble(
+#     code        = .x$code,
+#     description = .x$description$en))
+# 
+# View(d_rlhabs)
+# 
+# # habitats. 9 Marine Neritic ----
+# resp <- request("https://api.iucnredlist.org/api/v4/") |>
+#   req_headers(Authorization = tkn_v4) |> 
+#   req_url_path_append("habitats", 9) |>
+#   req_url_query(page = 1) |>
+#   req_perform()
+# 
+# d_rlhab9p1 <- resp |> 
+#   resp_body_json() |>
+#   pluck("assessments") |>
+#   map_dfr(~ tibble(
+#     code        = .x$code,
+#     description = .x$description$en))
 
 if (!file.exists(dl_zip))
   occ_download_get(dl_key, path = dir_dl)
@@ -763,22 +810,37 @@ read_tsv_chunked(
   progress = F)
 ```
 
-```{r}
+```{r redlist}
 
 if ("taxonKey" %in% dbListFields(con, "occ_species"))
   dbExecute(
     con,
-    "ALTER TABLE occ_species RENAME COLUMN \"taxonKey\" TO sp_key_gbif")
+    "ALTER TABLE occ_species RENAME COLUMN \"taxonKey\" TO sp_id_gbif")
+
+if ("sp_key_gbif" %in% dbListFields(con, "occ_species"))
+  dbExecute(
+    con,
+    "ALTER TABLE occ_species RENAME COLUMN sp_key_gbif TO sp_id_gbif")
+
+if ("sp_key_gbif" %in% dbListFields(con, "spp"))
+  dbExecute(
+    con,
+    "ALTER TABLE spp RENAME COLUMN sp_key_gbif TO sp_id_gbif")
 
 # d_occ_spp <- tbl(con, "spp") |> 
-#   select(sp_key_gbif) |> 
+#   select(sp_id_gbif) |> 
 #   left_join(
 #     tbl(con, "occ_species") |> 
-#       distinct(sp_key_gbif, iucnRedListCategory),
-#     by = "sp_key_gbif") |> 
+#       distinct(sp_id_gbif, iucnRedListCategory),
+#     by = "sp_id_gbif") |> 
 #   collect() |> 
 #   pull(iucnRedListCategory) |> 
 #   table(useNA = "ifany")
+# table(d_occ_spp$iucnRedListCategory, useNA = "ifany")
+# CR   DD   EN   EX     LC     NE   NT   VU   <NA> 
+# 25  114   41    1  1,827  5,157   52   92  3,267
+# NE: not evaluated
+# <NA>: no occurrences
 
 # add text field iucnRedListCategory to table spp
 if (!"iucnRedListCategory" %in% dbListFields(con, "spp"))
@@ -790,7 +852,7 @@ dbExecute(
   "UPDATE spp
     SET \"iucnRedListCategory\" = occ_species.\"iucnRedListCategory\"
     FROM occ_species 
-    WHERE occ_species.sp_key_gbif = spp.sp_key_gbif")
+    WHERE occ_species.sp_id_gbif = spp.sp_id_gbif")
 
 # tbl(con, "spp") |> 
 #   pull(iucnRedListCategory) |> 
@@ -798,98 +860,236 @@ dbExecute(
 # CR   DD   EN   EX   LC   NE   NT   VU <NA> 
 # 25  114   41    1 1827 5157   52   92 3267
   
-tbl(con, "spp") |> 
-  # distinct(species) |> 
-  pull(species) |> 
-  duplicated() |> 
-  sum() # 116
 # TODO: fix duplicates
+species_xx <- tbl(con, "spp") |> 
+  collect() |> 
+  filter(duplicated(species)) |> 
+  pull(species)
+scientificName_xx <- tbl(con, "spp") |> 
+  collect() |> 
+  filter(duplicated(scientificName)) |> 
+  pull(scientificName) # has ({author}, {year})
+# length(scientificName_xx)  # 0
+canonicalName_xx <- tbl(con, "spp") |> 
+  collect() |> 
+  filter(duplicated(canonicalName)) |> 
+  pull(canonicalName)
+# length(canonicalName_xx)  # 0
+d_xx <- tbl(con, "spp") |> 
+  filter(species %in% species_xx) |> 
+  arrange(species) |> 
+  collect()
+table(d_xx$status)
+# ACCEPTED  SYNONYM 
+#       89      107
+table(d_xx$rank)
+# SPECIES 
+#     196 
+
+
+# Dive into duplicate species:
+# 1. sp_key_am: SLB-61269; sp_id_gbif: 2261720; 
+#   scientificName: Acanella eburnea (Pourtalès, 1868); 
+#   status:SYNONYM
+#   rank:SPECIES;
+#   speciesKey:2261717
+#   * https://www.gbif.org/species/2261720
+#   
+# 2. sp_key_am: SLB-61269; sp_id_gbif: 2261717;           # different
+#   scientificName: Acanella arbuscula (Johnson, 1862)   # different 
+#   status:ACCEPTED                                      # different
+#   rank:SPECIES; speciesKey:2261717                     # same
+#   * https://www.gbif.org/species/2261717
+# TODO: Check that occurrences of A. eburnea contained in its accepted synonym A. arbuscula?
+# TODO: Merge or pick AquaMaps SDM for accepted A. arbuscula over its synonym A. eburnea
+
+(d_species_xxgt2 <- tbl(con, "spp") |> 
+    group_by(species) |> 
+    summarize(n = n()) |> 
+    filter(n > 2))
+#   species                    n
+#   <chr>                <int64>
+# 1 NA                        18
+# 2 Lycaea bovallii            3
+# 3 Laurencia dendroidea       3
+species_xxgt2 <- d_species_xxgt2 |> pull(species)
+d_spp_dupesgt2 <- tbl(con, "spp") |> 
+  filter(
+    is.na(species) |
+      species %in% species_xxgt2) |> 
+  collect() 
+write_csv(d_spp_dupesgt2, "data/spp_duplicatesgt2.csv")
+d_spp_dupesgt2 |> 
+  select(status,	matchType) |> 
+  table()
+#           matchType
+# status     EXACT HIGHERRANK
+#   ACCEPTED     2         16
+#   SYNONYM      6          0
+d_spp_dupesgt2 |>
+  mutate(
+    acceptedUsageKey_isna = is.na(acceptedUsageKey)) |> 
+  select(acceptedUsageKey_isna,	matchType) |> 
+  table()
+#                      matchType
+# acceptedUsageKey_isna EXACT HIGHERRANK
+#                 FALSE     6          0
+#                 TRUE      2         16
+d_spp_dupesgt2 |>
+  mutate(
+    acceptedUsageKey_isna = is.na(acceptedUsageKey),
+    spidgbif_isusagekey   = sp_id_gbif == acceptedUsageKey) |> 
+  select(acceptedUsageKey_isna,	spidgbif_isusagekey) |> 
+  table(useNA = "ifany")
+#                      spidgbif_isusagekey
+# acceptedUsageKey_isna FALSE <NA>
+#                 FALSE     6    0
+#                 TRUE      0   18
+
+d_spp_dupesgt2_ok <- d_spp_dupesgt2 |> 
+  filter(
+    status    == "ACCEPTED",
+    matchType == "EXACT")
+View(d_spp_dupesgt2_ok)
 
 
 d_spp_rlna <- tbl(con, "spp") |> 
   filter(
-    is.na(iucnRedListCategory) |
-      iucnRedListCategory %in% c("DD","NE")) |> 
-  select(sp_key_gbif, species) |> 
+    is.na(iucnRedListCategory)) |>  # |
+      # iucnRedListCategory %in% c("DD","NE")) |> 
+  distinct(sp_id_gbif, species) |>  # TODO: remove/sort duplicates
   arrange(species) |> 
   collect()
-# nrow(d_spp_rlna) # 8,538
+sum(duplicated(d_spp_rlna$species))
+# nrow(d_spp_rlna) # 8,538 # 3,267
 
-d_spp_rl <- tbl(con, "spp") |> 
+spp <- tbl(con, "spp") |> 
+  filter(!is.na(species)) |> 
   distinct(species) |> 
   arrange(species) |> 
-  collect() |> 
-  mutate(
-    iucn_list = imap(
-      species, \(sp, idx){
-        message(glue("{idx}/{nrow(d_spp_rlna)}: {sp} ~ {Sys.time()}"))
-        
-        y <- rl_search(sp, region = "global")
-        # message(str(y))
-        if (length(y$result[]) == 0){
-          message(glue("  not found, skipping", .trim = F))
-          return(NA)
-        }
-        
-        d <- y$result |> 
-          rename(sp_id_iucn = taxonid) |> 
-          mutate(species_spp = sp) |> 
-          relocate(species_spp)
-        n <- nrow(d)
-        message("  adding to iucn_species", .trim = F)
-        # append to database
-        dbWriteTable(con, "iucn_species", d, append = T, row.names = F)
-        return(n)
+  pull(species)
 
-      }))
-#  1/3267: Aaptos bergmanni ~ 2025-01-02 16:47:52.678079
-# 78/3267: Alionematichthys piger ~ 2025-01-02 16:48:52.679629
-# (2 min / 78 spp) * 3267 spp = 83.8 min
-# https://docs.ropensci.org/rredlist/
-# https://apiv3.iucnredlist.org/api/v3/docs#species-category
+# redo
+dbRemoveTable(con, "spp_iucn")
+dbRemoveTable(con, "spp_iucn_assessments")
+dbRemoveTable(con, "spp_iucn_assessment_details")
 
-d_spp_rl3 |> 
-  select(sp_key_gbif, species, iucn_list) |> 
-  unnest_wider(iucn_list)
-
-  rredlist::rl_sp_category(
-    d_spp_rl$species[1])
+for (i in 472:length(spp)){  # i=309
+  sp <- spp[i]
   
-  rl_
-  rredlist::rl_habitats()
-  rredlist::rl_synonyms()
-  names(d_spp_rl)
-    rl_search(d_spp_rl$verbatim_name[1])
-    rl_search(d_spp_rl$species[1])
-    rl_synonyms(d_spp_rl$species[1])
-    rl_search(
-    genus   = "Aaptos",
-    species = "bergmanni",
-    key     = iucn_token)
+  message(glue("{format(Sys.time())} {i}/{length(spp)} {sp}"))
+  # https://api.iucnredlist.org/api-docs/index.html
+  # https://api.iucnredlist.org/api/v4/taxa/scientific_name?genus_name=Ablennes&species_name=hians
   
+  req <- request("https://api.iucnredlist.org/api/v4/") |>
+    req_headers(Authorization = tkn_v4) |>
+    req_url_path_append("taxa/scientific_name") |>
+    req_url_query(
+      genus_name   = strsplit(sp, " ", fixed = T)[[1]][1],
+      species_name = strsplit(sp, " ", fixed = T)[[1]][2]) |> 
+    req_error(is_error = \(resp) FALSE)
+  resp <- req_perform(req)
 
-
+  while(resp_status(resp) == 429){
+    message("\tretry")
+    Sys.sleep(10)
+    resp <- req_perform(req)
+  }
+  if (resp_status(resp) == 404){
+    message("\tnot found")
+    next
+  }
   
+  o <- resp |>
+    resp_body_json()
 
-# d_spp_rl |> 
-d_spp_rl2 |> 
-  head() |> 
-  View()
-
-# rredlist: 
-librarian::shelf(rredlist)
-rl_use_iucn()
-
-stopifnot(sum(duplicated(d_occ_spp$sp_key_gbif)) == 0)
-
-table(d_occ_spp$iucnRedListCategory, useNA = "ifany")
-# CR   DD   EN   EX     LC     NE   NT   VU   <NA> 
-# 25  114   41    1  1,827  5,157   52   92  3,267
-# NE: not evaluated
-# <NA>: no occurrences
-
-d_spp
-sum(duplicated(d_spp$taxonKey))
+  # extract taxonomic info, especially IUCN species identifier sis_id -> sp_id_iucn 
+  message("\td_sp")
+  d_sp <- o$taxon[
+    !names(o$taxon) %in% 
+      c("species_taxa", "infrarank_taxa","subpopulation_taxa",
+        "ssc_groups", "common_names","synonyms")] |> 
+    bind_rows() |> 
+    rename(sp_id_iucn = sis_id) |> 
+    mutate(
+      across(where(is.logical), as.character),
+      json = as.character(toJSON(o)))
+  # inject into db table
+  dbWriteTable(con, "spp_iucn", d_sp, append = T, row.names = F)
+  
+  # TODO: inject into table spp_iucn
+  
+  if (length(o$assessments) == 0)
+    next
+  message("\td_as")
+  d_as <- o$assessments %>%
+    map_dfr(~{
+      # Extract the base level information
+      base_info <- list(
+        sp_id_iucn                   = .x$sis_taxon_id,
+        assessment_id                = .x$assessment_id,
+        year_published               = .x$year_published,
+        latest                       = .x$latest,
+        possibly_extinct             = .x$possibly_extinct,
+        possibly_extinct_in_the_wild = .x$possibly_extinct_in_the_wild,
+        url                          = .x$url)
+      
+      # Extract scope information (taking first scope if multiple exist)
+      scope_info <- list(
+        scope_description = .x$scopes[[1]]$description$en,
+        scope_code        = .x$scopes[[1]]$code,
+        json              = as.character(toJSON(o)))
+      
+      # Combine and convert to tibble
+      c(base_info, scope_info) %>%
+        as_tibble()
+    })
+  # inject into db table
+  dbWriteTable(con, "spp_iucn_assessments", d_as, append = T, row.names = F)
+  
+  as_id <- d_as |> 
+    filter(scope_description == "Global") |> 
+    pull(assessment_id)
+  if (length(as_id) == 1){
+    message("\td_asg")
+    # https://api.iucnredlist.org/api/v4/assessment/15603320
+    
+    req <- request("https://api.iucnredlist.org/api/v4/") |>
+      req_headers(Authorization = tkn_v4) |>
+      req_url_path_append("assessment",as_id) |> 
+      req_error(is_error = \(resp) FALSE)
+    resp <- req_perform(req)
+    
+    while(resp_status(resp) == 429){
+      message("\t\tretry")
+      Sys.sleep(10)
+      resp <- req_perform(req)
+    }
+    
+    o <- resp |>
+      resp_body_json()
+    
+    if ("error" %in% names(o)){
+      message("\t\t", o$error)
+      next
+    }
+    
+    d_asg <- with(
+      o,
+      tibble(
+        sp_id_iucn             = sis_taxon_id,
+        assessment_id          = assessment_id,
+        year_published         = year_published,
+        red_list_category_code = red_list_category$code,
+        population_trend       = population_trend$code,
+        assessment_points      = assessment_points,
+        assessment_ranges      = assessment_ranges,
+        json                   = as.character(toJSON(o)) ))
+    
+    # inject into db table
+    dbWriteTable(con, "spp_iucn_assessment_details", d_asg, append = T, row.names = F)
+  }
+}
 ```
 
 
