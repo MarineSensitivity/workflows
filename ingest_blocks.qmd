@@ -17,19 +17,296 @@ See:
 #| label: load_db
 
 librarian::shelf(
-  fs, glue, here, janitor, leaflet, leaflet.extras, # mapview, 
+  dplyr, fs, glue, here, janitor, leaflet, leaflet.extras, mapview, 
   marinesensitivity/msens, 
-  purrr, readr, sf, tibble, tidyr,
+  purrr, readr, rmapshaper, sf, tibble, tidyr, units,
   quiet = T)
 options(readr.show_col_types = F)
+# source(here("libs/db.R")) # define: con
+
+# paths ----
+b_csv        <- here("data/ingest_blocks_spatial-paths_v2.csv")
+dir_data     <- "/Users/bbest/My Drive/projects/msens/data"
+dir_ecorgn   <- glue("{dir_data}/raw/boem.gov/Ecoregion GIS files")
+ecorgn_shps  <- list(
+  AK  = glue("{dir_ecorgn}/Alaska/Area_Alaska_scd.shp"),
+  ATL = glue("{dir_ecorgn}/Atlantic/Area_Atlantic_scd.shp"),
+  GOM = glue("{dir_ecorgn}/GOM/Area_GOM_scd.shp"),
+  PAC = glue("{dir_ecorgn}/Pacific/Area_Pacific_scd.shp") )
+dir_blks   <- glue("{dir_data}/raw/boem.gov/blocks")
+blk_shps  <- list(
+  AK  = glue("{dir_blks}/AK/blocks/AK_BLKCLP.shp"),
+  ATL = glue("{dir_blks}/ATL/ATL_BLKCLIP/ATL_BLKCLP.shp"),
+  GOM = glue("{dir_blks}/GOM/BlockPolygonsClipped.gdb"),
+  PAC = glue("{dir_blks}/PC/PC_BLK_CLIP/PC_BLK_CLIP.shp") )
+
+redo  <- T
+
+# helper functions ----
+
+set_geom_ctr_area <- function(x){
+  x |>
+    st_set_geometry("geom") |>
+    mutate(
+      ctr      = st_centroid(geom),
+      ctr_lon  = ctr |> st_coordinates() %>% .[,"X"],
+      ctr_lat  = ctr |> st_coordinates() %>% .[,"Y"],
+      area_km2 = st_area(geom) |>
+        set_units(km^2) |>
+        as.numeric() ) |>
+    select(-ctr)
+}
+
+drop_ctr_area <- function(x){
+  x |>
+    select(-ctr_lon, -ctr_lat, -area_km2)
+}
+
+
+# ply_ecorgns: Ecoregions ----
+ecorgns_rds <- here(glue("data/ecoblks/ply_ecorgns.rds"))
+if (!file.exists(ecorgns_rds)){
+  ply_ecorgns <- ecorgn_shps |>
+    imap(
+      ~read_sf(.x) |>
+        mutate(
+          boemrgn_key = .y) |>   #
+        rename(any_of(c(
+          ecorgn_name = "Name",
+          ecorgn_name = "LABEL",
+          ecorgn_key  = "CODE",
+          ecorgn_key  = "MMS_PLAN_A"))) |>
+        st_transform(4326)) |>
+    bind_rows() |>
+    mutate(
+      boemrgn_name = case_match(
+        boemrgn_key,
+        "AK"  ~ "Alaska",
+        "ATL" ~ "Atlantic",
+        "GOM" ~ "Gulf of Mexico",
+        "PAC" ~ "Pacific"),
+      ecorgn_key = case_match(
+        ecorgn_name,
+        "California Current"          ~ "CAC",
+        "Chukchi and Beaufort Seas"   ~ "CBS",
+        "East Bering Sea"             ~ "EBS",
+        "Eastern GOM"                 ~ "EGOM",
+        "Gulf of Alaska"              ~ "GOA",
+        "Northeast Continental Shelf" ~ "NECS",
+        "Southeast Continental Shelf" ~ "SECS",
+        "Washington/Oregon"           ~ "WAOR",
+        "Western and Central GOM"     ~ "WCGOM") ) |>
+    relocate(boemrgn_key, boemrgn_name) |>
+    st_make_valid() |>
+    st_shift_longitude() |>   # shift to -180 to 180 for "East Bering Sea" spanning antimeridian
+    set_geom_ctr_area()
+  # mapView(ply_ecorgns); ply_ecorgns |> st_drop_geometry() |> View()
+  saveRDS(ply_ecorgns,  ecorgns_rds)  # 309,842 
+}
+ply_ecorgns <- readRDS(ecorgns_rds)
+
+# ply_blks: Blocks ----
+blks_rds <- here(glue("data/ecoblks/ply_blks.rds"))
+if (!file.exists(blks_rds)){
+  ply_blks <- blk_shps |> 
+    enframe(name = "boemrgn_key", value = "path") |> 
+    mutate(
+      path = unlist(path),
+      sf   = map2(boemrgn_key, path, \(br, path){
+        o <- read_sf(path) |>
+          st_transform(4326)
+        st_geometry(o) <- "geom"
+        
+        # get fieldnames (ie columns) from source shapefile
+        ns <- names(o)
+        f_pa    <- ns[ns %in% c("MMS_PLAN_A","MMS_PLAN_AREA_CD")]
+        f_pd    <- ns[ns %in% c("PROT_NUMBE","PROT_NUMBER")]
+        f_bk    <- ns[ns %in% c("AC_LAB","BLOCK_NUMB")][1] # prefer GOM's AreaCode label
+        f_pd_dt <- ns[ns %in% c("PROT_APRV_","PROT_APRV_DATE")]
+        f_bk_dt <- ns[ns %in% c("BLK_FED_AP","BLK_FED_APRV_DT")]
+        # message(glue("
+        # {d_b$shelf[[i]]} ({basename(d_b$path[[i]])})
+        #   f_pa:    {paste(f_pa, collapse=', ')}
+        #   f_pd:    {paste(f_pd, collapse=', ')}
+        #   f_bk:    {paste(f_bk, collapse=', ')}
+        #   f_pd_dt: {paste(f_pd_dt, collapse=', ')}
+        #   f_bk_dt: {paste(f_bk_dt, collapse=', ')}"))
+        o |> 
+          mutate(
+            # boemrgn_key      = case_match(
+            #   br,
+            #   "Alaska"         ~ "AK",
+            #   "Atlantic"       ~ "ATL",
+            #   "Gulf of Mexico" ~ "GOM",
+            #   "Pacific"        ~ "PAC"),
+            # planarea_key     = glue(glue("{{boemrgn_key}}-pa{{{f_pa}}}")),
+            # prodiag_key      = glue(glue("{{planarea_key}}-pd{{{f_pd}}}")),
+            # blk_key          = glue(glue("{{prodiag_key}}-bk{{{f_bk}}}")),
+            boemrgn_key      = br,
+            planarea_key     = glue(glue("{{{f_pa}}}")),
+            prodiag_key      = glue(glue("{{{f_pd}}}")),
+            blk_key          = glue(glue("{{{f_bk}}}")),
+            prodiag_aprvdate = as.Date(get(f_pd_dt), tryFormats = c("%d-%b-%Y")),
+            blk_aprvdate     = as.Date(get(f_bk_dt), tryFormats = c("%d-%b-%Y"))) |> 
+          select(boemrgn_key, planarea_key, prodiag_key, blk_key, prodiag_aprvdate, blk_aprvdate)
+      })) |> 
+    pull(sf) |> 
+    bind_rows() |> 
+    st_make_valid() |>
+    st_shift_longitude() |>   # shift to -180 to 180 for "East Bering Sea" spanning antimeridian
+    set_geom_ctr_area()
+  # mapView(ply_blks); ply_blks |> st_drop_geometry() |> View()
+  # write_sf(ply_blks, here("data/ply_blks.shp"), delete_dsn=T)
+  saveRDS(ply_blks,  blks_rds)  # 309,842 
+}
+ply_blks <- readRDS(blks_rds)
+
+# ply_ecoblks: Ecoblocks (Ecoregions x Blocks: ply_ecorgns x ply_blks) ----
+for (i in 1:nrow(ply_ecorgns)){ # i = 1
+  
+  # ecoregion: slice 1, without extra cols 
+  p_er <- ply_ecorgns |> 
+    select(-boemrgn_name, -ecorgn_name) |>
+    drop_ctr_area() |>     
+    arrange(boemrgn_key, ecorgn_key) |> 
+    slice(i)
+  
+  eb_rds <- here(glue("data/ecoblks/{p_er$ecorgn_key}.rds"))
+  
+  if (file.exists(eb_rds))
+    next
+  
+  # blocks: filter to boemrgn, limit duplicates, rm cols in er
+  p_b <- ply_blks |>
+    filter(boemrgn_key == p_er$boemrgn_key) |> 
+    mutate(
+      ublk_key = glue("br{ boemrgn_key}-pa{planarea_key}-pd{prodiag_key}-bk{blk_key}")) |> 
+    arrange(desc(area_km2)) |> 
+    filter(!duplicated(ublk_key)) |> # n=1 duplicate: brATL-paNA-pdNA-bkNA (both area_km2 < 0.002)
+    select(-boemrgn_key) |> 
+    drop_ctr_area()
+  
+  message(glue(
+    "{i}/{nrow(ply_ecorgns)}: br{p_er$boemrgn_key}.er{p_er$ecorgn_key}
+     - contains ~ {Sys.time()}"))
+  # er x bks: contains
+  ic <- st_contains(p_er, p_b)[[1]]
+  p_bc <- p_b[ic,] |> 
+    bind_cols(st_drop_geometry(p_er))
+
+  message(glue("- intersects ~ {Sys.time()}"))
+  # er x bks: intersects
+  p_bnc <- p_b |> # 187,581
+      filter(!ublk_key %in% p_bc$ublk_key)
+  ix <- st_intersects(p_er, p_bnc)[[1]]
+  p_bi <- p_bnc[ix,]
+  
+  message(glue("- intersection ~ {Sys.time()}"))
+  p_bix <- st_intersection(p_er, p_bi) |> 
+    st_make_valid()
+  
+  # table(st_is_valid(p_bix))
+  # table(st_is_valid(p_bc))
+  
+  message(glue("- bind_rows ~ {Sys.time()}"))
+  # ecoblocks
+  p_eb <- bind_rows(
+    p_bix, 
+    p_bc) |> 
+    select(-ublk_key) |> 
+    # st_make_valid() |>
+    st_shift_longitude() |>
+    set_geom_ctr_area()
+  
+  # mapView(p_bc |> st_shift_longitude(), alpha.regions = 0.2) +
+  #   mapView(p_bix |> st_shift_longitude(), col.regions="red")
+  message(glue("- saveRDS ~ {Sys.time()}"))
+  saveRDS(p_eb, eb_rds)
+  # mapView(p_eb)
+}
+
+# TODO: 
+# - [ ] combine data/ecoblks/*.rds
+# - [ ] ply_ecoblks |> st_shift_longitude() |> set_geom_ctr_area()
+# - [ ] look for missing slivers
+
+ply_ecoblks <- tibble(
+  ecorgn_key = ply_ecorgns$ecorgn_key) |> 
+  mutate(
+    rds = glue("data/ecoblks/{ecorgn_key}.rds"),
+    sf  = map(rds, readRDS)) |> 
+  pull(sf) |> 
+  bind_rows() |> 
+  st_wrap_dateline() |>  # shift from 0:360 to -180:180
+# ply_ecoblks <- ply_ecoblks |> 
+  mutate(
+    br_er_pa_pd_bk_key = glue(
+      "{boemrgn_key}_{ecorgn_key}_{planarea_key}_{prodiag_key}_{blk_key}")) |> 
+  relocate(br_er_pa_pd_bk_key)
+# sum(duplicated(ply_ecoblks$br_er_pa_pd_bk_key))
+
 source(here("libs/db.R")) # define: con
 
-d_csv <- here("data/ingest_blocks_spatial-paths.csv")
-redo  <- F
+tbl <- "ply_ecoblks"
+ply_ecoblks |> 
+  st_write(
+  dsn           = con,
+  layer         = tbl,
+  driver        = "PostgreSQL",
+  layer_options = "OVERWRITE=true")
 
-d <- read_csv(d_csv)
+# enforce SRID so shows up in tile.marinesensivity.org
+dbExecute(con, glue(
+  "SELECT UpdateGeometrySRID('{tbl}','geom',4326);"))
+    
+# fix any invalid geometries
+dbExecute(con, glue("UPDATE {tbl} SET geom = ST_MakeValid(geom) WHERE NOT ST_IsValid(geom)"))
+    
+# add spatial index for faster queries
+dbExecute(con, glue(
+  "CREATE INDEX IF NOT EXISTS {tbl}_geom_idx ON {tbl} USING gist(geom);"))
 
-for (i in seq_len(nrow(d))){ # i = 14
+# add unique index on br_er_pa_pd_bk_key
+dbExecute(con, glue(
+  "CREATE UNIQUE INDEX IF NOT EXISTS {tbl}_br_er_pa_pd_bk_key_idx ON {tbl} USING btree(br_er_pa_pd_bk_key);"))
+
+flds <- names(ply_ecoblks)[2:6]
+dbExecute(con, glue(
+  "CREATE INDEX IF NOT EXISTS 
+    {tbl}_{paste(flds, collapse = '_')}_idx 
+    ON {tbl} ({paste(flds, collapse = ', ')});"))
+
+```
+
+```{r}
+ply_ecoblks <- ply_ecorgns |>
+  select(-boemrgn_name, -ecorgn_name) |>
+  drop_ctr_area() |>
+  st_contains()
+  st_intersection(
+    ply_blks |>
+      drop_ctr_area()) |>
+  st_make_valid() |>
+  st_shift_longitude()
+write_sf(ply_ecoblks, here("data/ply_ecoblks.shp"), delete_dsn=T)
+
+# append blocks not intersecting ecoregions with nearest ecoregion
+ply_blk_noter <- ply_ecoblks |>
+  drop_ctr_area() |>
+  st_difference(st_union(ply_ecoblks)) |> # n = 25
+  st_shift_longitude() |>
+  st_cast("MULTIPOLYGON") |>
+  st_cast("POLYGON") |>                   # n = 4,683
+  mutate(
+    ecorgn_key = ply_ecorgns$ecorgn_key[st_nearest_feature(geom, ply_ecorgns)]) |>
+  relocate(ecorgn_key, .before = "planarea_key")
+write_sf(ply_blk_noter, here("data/ply_blk_noter.shp"), delete_dsn=T)
+
+# TODO: continue from here 1/20/25: intersect with ecoregions, ck for slivers, dissolve up to protraction diagrams
+```
+
+```{r}
+for (i in seq_len(nrow(d))){ # i = 1
   # path   <- "/Users/bbest/My Drive/projects/msens/data/raw/boem.gov/blocks/PC/PC_PROT_CLIP/PC_PROT_CLIP.shp"
   # path   <- "/Users/bbest/My Drive/projects/msens/data/raw/boem.gov/blocks/GMX/BlockPolygonsClipped.gdb"
   # path   <- "/Users/bbest/My Drive/projects/msens/data/raw/boem.gov/blocks/USA/BOEMWindLayers_4Download.gdb"
@@ -62,7 +339,8 @@ for (i in seq_len(nrow(d))){ # i = 14
   
   o <- o |> 
     clean_names() |>
-    st_transform(4326)
+    st_transform(4326) |>
+    st_wrap_dateline()  # shift from 0:360 to -180:180
   st_geometry(o) <- "geom"
   # mapview::mapView(o)
   # TODO: check

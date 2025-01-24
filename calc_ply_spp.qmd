@@ -17,14 +17,32 @@ source("libs/db.R")
 # TODO: add req_timeout(60*20) to R fxn so timeout is 20 min, not 10 min
 # https://httr2.r-lib.org/reference/req_timeout.html
 # erEGOM-paEGM: 921.262 sec / 60 = 15.4 min
+
+dbExecute(
+  con,"CREATE TABLE IF NOT EXISTS 
+    public.ply_species(
+      ply_tbl text,
+      ply_fld text,
+      ply_key text,
+      sp_key text,
+      area_km2 double precision,
+      avg_suit double precision)")
+
 get_species_by_feature_localdb <- function(
     schema.table = "raw.mr_eez",
     where        = "mrgid = 8442"){
   
-  # schema.table = "public.ply_ecoareas"
+  # schema.table = "public.ply_ecoblks"
   # where        = "ecoarea_key = 'erCAC-paCEC'"
 
   source(here("../workflows/libs/db.R")) # define: con
+  
+  # tbl(con, "ply_ecoblks") |> 
+  #   arrange(br_er_pa_pd_bk_key) |> 
+  #   head(1) |> 
+  #   pull(br_er_pa_pd_bk_key) # "AK_CBS_BFT_NR05-01_6002"
+  # schema.table = "public.ply_ecoblks"
+  # where        = "br_er_pa_pd_bk_key = 'AK_CBS_BFT_NR05-01_6002'"
   
   schema <- str_split(schema.table, fixed("."))[[1]][1]
   table  <- str_split(schema.table, fixed("."))[[1]][2]
@@ -83,14 +101,14 @@ get_species_by_feature_localdb <- function(
         SUM(aoi_km2)                              AS area_km2,
         SUM(probability * aoi_km2) / SUM(aoi_km2) AS avg_suit
       FROM s
-      GROUP BY sp_key)
-    SELECT
-      sp_key, n_cells, avg_pct_cell, area_km2, avg_suit,
-      n_cells * avg_pct_cell * avg_suit AS amt,
-      phylum, class, \"order\", family, genus, species
-    FROM
-      g
-      LEFT JOIN aquamaps.spp USING (sp_key)")
+      GROUP BY sp_key),
+    r AS (
+      SELECT
+        sp_key, area_km2, avg_suit
+      FROM
+        g
+        LEFT JOIN aquamaps.spp USING (sp_key))
+    INSERT INTO ")
   # message(q)
 
   dbGetQuery(con, q)
@@ -317,7 +335,7 @@ HI
 
 ## Assign Taxa Groups
 
-```{r}
+```{r taxa groups}
 where_taxa <- list(
   mammals = "class = 'Mammalia' 
     AND \"order\" IN ('Cetacea', 'Carnivora')
@@ -370,6 +388,26 @@ for (taxa in names(where_taxa)) { # taxa = names(where_taxa)[1]
 }
 ```
 
+```{r ck_ply_species_taxa}
+# TODO: move to single species
+
+d_pspp <- tbl(con, "ply_species") |>
+  distinct(phylum, class, order, family, genus, species) |> 
+  collect()
+
+table(d_pspp$phylum)
+table(d_pspp$class, useNA = "ifany")
+
+with(
+  d_pspp,
+  table(phylum, class, useNA = "ifany"))
+
+
+```
+
+
+https://oceanhealthindex.org/images/htmls/Supplement.html#62_Biodiversity
+
 
 ## Visualize Species Data
 
@@ -383,74 +421,109 @@ librarian::shelf(
 plot_flower <- function(
     data,
     fld_category,
-    fld_width,
     fld_height,
-    score,
+    fld_width,
+    tooltip_expr = NULL,
+    score  = NULL,
     colors = "Set2"){
   
+  stopifnot(is.numeric(data |> pull({{ fld_height }})))
+  stopifnot(is.numeric(data |> pull({{ fld_width }})))
+
+  if (is.null(score)){
+    score <- data |> 
+      # ensure both are not just integer (weighted.mean goes to 0)
+      mutate(
+        "{{fld_height}}" := as.double({{ fld_height }}),
+        "{{fld_width}}"  := as.double({{ fld_width  }}) ) |> 
+      summarize(
+        score = weighted.mean({{ fld_height }}, {{ fld_width }}, na.rm = T)) |> 
+      pull(score)
+  }
+
   # Calculate positions
-  data <- data  |> 
+  d <- data |> 
     arrange({{ fld_category }}) |> 
+    mutate(across(!where(is.character), as.double)) |> 
     mutate(
       # Calculate angles for plotting
-      ymax = cumsum({{ fld_width }}),
-      ymin = c(0, head(ymax, n=-1)),
-      xmax = {{ fld_height }},
-      xmin = 0)
+      ymax    = cumsum({{ fld_width }}),
+      ymin    = lag(ymax, default=0), # ,  c(0, head(ymax, n=-1)),
+      xmax    = {{ fld_height }},
+      xmin    = 0)
   
-  browser()
+  sym_category <- ensym(fld_category)
+  sym_height   <- ensym(fld_height)
+  sym_width    <- ensym(fld_width)
+
+  if (!is.null(tooltip_expr)){
+    d <- d |> 
+      mutate(
+        tooltip = glue(tooltip_expr))
+  } else {
+    d <- d |> 
+      mutate(
+        tooltip = glue("{!!fld_category}"))
+  }
   
-  # Create the donut chart
-  ggplot(data) +
-    geom_rect(aes(
-      xmin = xmin,
-      xmax = xmax,
-      ymin = ymin,
-      ymax = ymax,
-      fill = {{ fld_category }}),
-      color = "white") +
+  g <- ggplot(d) +
+    geom_rect_interactive(aes(
+      xmin    = xmin,
+      xmax    = xmax,
+      ymin    = ymin,
+      ymax    = ymax,
+      fill    = {{ fld_category }},
+      color   = "white",
+      data_id = {{ fld_category }},
+      tooltip = tooltip),
+      color = "white",
+      alpha = 0.5) +
     coord_polar(theta = "y") +
     # Create donut hole
-    xlim(c(-20, max(data |> pull({{ fld_height }})))) +
+    xlim(c(-0.1, max(data |> pull({{ fld_height }})))) +
     # Add center score
     annotate(
-      "text", x = -20, y = 0, 
-      label = "85", 
+      "text", x = -0.1, y = 0, 
+      label = round(score, 2), 
       size = 8, 
       fontface = "bold") +
     # Customize appearance
-    scale_fill_brewer(palette = colors) +
-    theme_void() +
+    scale_fill_brewer(
+      palette = colors) +
+    theme_minimal() +
+    # theme_void() +
     theme(
       legend.position = "bottom",
       plot.margin = unit(c(20, 20, 20, 20), "pt"))
+
+  girafe(ggobj = g)
 }
 
-# Sample data
-ex_data <- data.frame(
-  category     = c("A", "B", "C", "D"),
-  width_value  = c(10, 25, 40, 25),    # Controls segment width
-  height_value = c(80, 65, 45, 60))    # Controls segment height)
-sum(ex_data$width_value)
-
-ex_data |> 
+g <- d_spp_iucn |> 
   plot_flower(
-    category,
-    width_value,
-    height_value,
-    sum(ex_data$width_value))
+    taxa,
+    iucn_score,
+    n_spp,
+    tooltip_expr = "{taxa}: {round(iucn_score, 2)} (n_spp: {n_spp})")
+g
 ```
 
 ### Species
 
-```{r}
-ply_key <- "BFT"
+```{r ply_iucn}
+ply_key <- "erCAC-paCEC"
 
 # get species data from db
 schema       = "public"
-tbl          = "ply_rgns"
-fld_key      = "rgn_key"
+tbl          = "ply_ecoareas"
+fld_key      = "ecoarea_key"
 tbl_ply_spp  = "ply_species"
+
+d_ply_spp <- tbl(con, "ply_species") |> 
+  group_by(ply_key) |> 
+  summarize(n = n()) |> 
+  collect()
+# View(d_ply_spp)
 
 d_spp <- dbGetQuery(con, glue(
   "SELECT * FROM {tbl_ply_spp} 
@@ -464,20 +537,124 @@ d_spp <- dbGetQuery(con, glue(
   #     forcats::fct_na_value_to_level("other_taxa")) |> 
   tibble()
 
-d_taxa <- d_spp |> 
-  group_by(taxa) |>
-  summarize(
-    n_spp       = n(),
-    amt         = sum(amt),
-    amt_per_spp = amt / n_spp)
+tbl(con, tbl_ply_spp) |> 
+  group_by(ply_fld) |> 
+  summarize(n = n()) |> 
+  collect()
+#   ply_fld           n
+# 1 ecoarea_key   94667
+# 2 ecorgn_key    37596
 
-d_taxa |> 
+# d_rlcat <- tbl(con, "spp") |> 
+#   select(sp_id_gbif, iucnRedListCategory) |> 
+#   group_by(iucnRedListCategory) |>
+#   summarize(n = n()) |> 
+#   arrange(iucnRedListCategory) |> 
+#   collect()
+
+d_spp_iucn <- tbl(con, "ply_species") |> 
+  rename(sp_key_am = sp_key) |> 
+  filter(
+    ply_key == !!ply_key) |>   
+  replace_na(list(
+    taxa = "other_taxa")) |>   
+  left_join(
+    tbl(con, "spp") |> 
+      # filter(!is.na(iucnRedListCategory)) |> 
+      select(sp_key_am, sp_id_gbif, iucnRedListCategory) |> 
+      mutate(
+        iucn_score = case_match(
+          iucnRedListCategory,
+          # skipped:
+          # -  EX : extinct
+          # -  NE : not evaluated
+          # -  DD : data deficient
+          # - <NA>: not available
+          # https://oceanhealthindex.org/images/htmls/Supplement.html#62_Biodiversity
+          # included:
+          #  - CR: Critically Endangered	
+          #  - EN: Endangered	
+          #  - VU: Vulnerable
+          #  - NT: Near Threatened
+          #  - LC: Least Concern
+          "CR" ~ 1,
+          "EN" ~ 0.8,
+          "VU" ~ 0.6,
+          "NT" ~ 0.4,
+          "LC" ~ 0.2)),
+    # |> filter(!is.na(iucn_score))
+    by = "sp_key_am") |> 
+  filter(!is.na(iucn_score)) |> 
+  group_by(taxa) |> 
+  summarize(
+    n_spp      = n(),
+    amt        = sum(area_km2 * avg_suit, na.rm=T),
+    amt_per_sp = sum(area_km2 * avg_suit, na.rm=T) / n(),
+    iucn_score = sum(iucn_score * area_km2 * avg_suit, na.rm=T) / sum(area_km2 * avg_suit, na.rm=T)) |> 
+  arrange(taxa) |> 
+  collect() # |> 
+# View(d_spp_iucn)
+# ply_key <- "erCAC-paCEC"
+# d_spp_iucn
+# # A tibble: 8 × 5
+#   taxa            n_spp     amt amt_per_sp iucn_score
+#   <chr>         <int64>   <dbl>      <dbl>      <dbl>
+# 1 benthos           701  3218.        4.59      0.467
+# 2 corals             21   100.        4.78     NA    
+# 3 mammals            31  1017.       32.8       0.286
+# 4 other_fish        533 12543.       23.5       0.214
+# 5 other_inverts     189  1989.       10.5       0.2  
+# 6 other_taxa        586  4639.        7.92      0.302
+# 7 pelagic_fish       18   280.       15.6       0.246
+# 8 turtles             3    69.4      23.1       0.6  
+#
+# ply_key <- "erCAC"
+# d_spp_iucn
+# # A tibble: 8 × 5
+#   taxa            n_spp    amt amt_per_sp iucn_score
+#   <chr>         <int64>  <dbl>      <dbl>      <dbl>
+# 1 benthos          1742 21453.       12.3      0.365
+# 2 corals             52   776.       14.9      0.24 
+# 3 mammals            32  4498.      141.       0.283
+# 4 other_fish        763 55395.       72.6      0.211
+# 5 other_inverts     269 10515.       39.1      0.205
+# 6 other_taxa       1004 25611.       25.5      0.272
+# 7 pelagic_fish       23  1306.       56.8      0.238
+# 8 turtles             3   299.       99.6      0.6  
+
+d_spp_iucn |> 
   plot_flower(
-    taxa,
-    n_spp,
-    amt_per_spp,
-    "99")
+    fld_category = taxa,
+    fld_height   = iucn_score,
+    fld_width    = n_spp)
+
+with(
+  d_spp_iucn,
+  mean(iucn_score))  # 0.3338977
+with(
+  d_spp_iucn,
+  # sum(n_spp * iucn_score) / sum(n_spp)) # 0.285
+  # weighted.mean(iucn_score, n_spp, na.rm = T))  # 0 
+  weighted.mean(iucn_score, as.double(n_spp), na.rm = T))                    # 0.2828092
+weighted.mean(d_spp_iucn$iucn_score, as.double(d_spp_iucn$n_spp), na.rm = T) # 0.2828092
+
 ```
+
+- [ply\_boemrgns](https://tile.marinesensitivity.org/public.ply_boemrgns.html#1.94/56.48/-114.43)
+- [ply\_ecorgns](https://tile.marinesensitivity.org/public.ply_ecorgns.html#0.94/57.3/0)
+- [ply\_planareas](https://tile.marinesensitivity.org/public.ply_planareas.html#0.94/57.3/0)
+- [ply\_ecoareas](https://tile.marinesensitivity.org/public.ply_ecoareas.html#0.94/60.9/-93.9)
+- [pg\_tileserv: raw.boem\_pc\_blk\_clp](https://tile.marinesensitivity.org/raw.boem_pc_blk_clp.html#4.01/39.93/-123.72)
+- [pg\_tileserv: raw.boem\_gom\_blk\_clp](https://tile.marinesensitivity.org/raw.boem_gom_blk_clp.html#5.41/27.082/-89.174)
+- [pg\_tileserv: raw.boem\_atl\_blk\_clp](https://tile.marinesensitivity.org/raw.boem_atl_blk_clp.html#3.91/34.97/-73.55)
+- [pg\_tileserv: raw.boem\_ak\_blk\_clp](https://tile.marinesensitivity.org/raw.boem_ak_blk_clp.html#0.94/61.3/0)
+
+```{r}
+
+
+
+```
+
 
 $$
 amt = n\_cells * avg\_pct * avg\_suit
@@ -810,6 +987,8 @@ read_tsv_chunked(
   progress = F)
 ```
 
+## IUCN RedList, API v4
+
 ```{r redlist}
 
 if ("taxonKey" %in% dbListFields(con, "occ_species"))
@@ -1100,6 +1279,29 @@ length(spp)       # 10,459
 nrow(t_spp_iucn)  #  3,442
 
 stopifnot(nrow(filter(t_spp_iucn, !scientific_name %in% spp)) == 0)
+
+d_spp <- tbl(con, "spp") |> 
+  select(sp_key_am, sp_id_gbif, acceptedUsageKey, scientificName, canonicalName, verbatim_name, rank, status, matchType, iucnRedListCategory) |> 
+  collect()
+
+stopifnot(sum(duplicated(d_spp$sp_key_am))==0)
+table(d_spp$iucnRedListCategory, useNA = "ifany")
+# CR   DD   EN   EX   LC   NE   NT   VU <NA> 
+# 25  114   41    1 1827 5157   52   92 3267
+
+tbl(con, "spp_iucn") |> 
+  collect()
+
+d_spp_iucn <- tbl(con, "spp_iucn") |> 
+      select(scientific_name, sp_id_iucn, authority) |> 
+      left_join(
+        tbl(con, "spp_iucn_assessment_details") |> 
+          select(sp_id_iucn, assessment_id, year_published, red_list_category_code),
+        by = "sp_id_iucn") |> 
+  collect()
+table(d_spp_iucn$red_list_category_code, useNA = "ifany")
+# CR   DD   EN   LC   NT   VU <NA> 
+#  7  135   12 1931   29   21 1307
 ```
 
 
