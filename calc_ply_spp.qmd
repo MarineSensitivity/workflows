@@ -162,10 +162,129 @@ for (i in 1:length(keys)){
 }
 ```
 
-TODO:
+## Make `*_ukey` for er, pa, pd, bk
 
-- [ ] +idx ply_species: ply_tbl, ply_key
-- [ ] +idx ply_species: ply_tbl, ply_key
+```{r}
+#| label: make_ukeys
+
+flds <- list(
+  ecorgn   = "'br', boemrgn_key, '_er', ecorgn_key",
+  planarea = "'br', boemrgn_key, '_er', ecorgn_key, '_pa', planarea_key",
+  prodiag  = "'br', boemrgn_key, '_er', ecorgn_key, '_pa', planarea_key, '_pd', prodiag_key",
+  blk      = "'br', boemrgn_key, '_er', ecorgn_key, '_pa', planarea_key, '_pd', prodiag_key, '_bk', blk_key")
+
+for (fld in names(flds)){
+  dbExecute(
+    con,
+    glue("ALTER TABLE public.ply_ecoblks ADD COLUMN IF NOT EXISTS {fld}_ukey TEXT"))
+  
+  dbExecute(
+    con,
+    glue("UPDATE public.ply_ecoblks SET {fld}_ukey = CONCAT({flds[[fld]]})"))
+}
+```
+
+## Update `ply_species` with `blk_ukey`
+
+```{r}
+#| label: update_blk_ukey
+
+# tbl(con, "ply_species") |> 
+#   group_by(ply_fld) |> 
+#   summarize(
+#     n = n())
+#   ply_fld                    n
+#   <chr>                <int64>
+# 1 br_er_pa_pd_bk_key 279226334
+
+dbExecute(
+  con,
+  glue("ALTER TABLE public.ply_species RENAME COLUMN ply_key TO ply_key_old"))
+
+dbExecute(
+  con,
+  glue("ALTER TABLE public.ply_species ADD COLUMN IF NOT EXISTS ply_key TEXT"))
+
+dbExecute(
+  con,
+  "UPDATE public.ply_species ps
+  SET
+    ply_fld = 'blk_ukey',
+    ply_key = pb.blk_ukey
+  FROM public.ply_ecoblks pb
+  WHERE ps.ply_key_old = pb.br_er_pa_pd_bk_key")
+# 279,226,334
+
+dbExecute(
+  con, "ALTER TABLE public.ply_species DROP COLUMN IF EXISTS ply_key_old")
+
+# TODO: drop ply_ecoblks.br_er_pa_pd_bk_key
+dbExecute(
+  con, "ALTER TABLE public.ply_ecoblks DROP COLUMN IF EXISTS br_er_pa_pd_bk_key")
+
+```
+
+## Add indexes to `ply_ecoblks`, `ply_species`
+
+```{r}
+#| label: add_indexes
+
+dbExecute(
+  con, "ALTER TABLE public.ply_species ADD PRIMARY KEY (ply_tbl, ply_fld, ply_key, sp_key)") # 42 min
+dbExecute(
+  con, "CREATE INDEX IF NOT EXISTS idx_ply_species_ply_key ON public.ply_species (ply_key)")
+dbExecute(
+  con, "CREATE INDEX IF NOT EXISTS idx_ply_species_sp_key ON public.ply_species (sp_key)")
+
+# dbExecute(
+#   con, "CREATE INDEX IF NOT EXISTS idx_ply_species_ply_key ON public.ply_species (ply_tbl)")
+# TODO: add index on ply_species.sp_key to map distribution of species by block, prodiag, etc
+
+add_idx <- function(tbl, flds, schema = "public", msg_only = F, pkey = F){
+  if (pkey){
+    q <- glue("ALTER TABLE {schema}.{tbl} ADD PRIMARY KEY (first_name, last_name)")    
+  } else {
+    idx_name <- "idx_{tbl}"
+    q <- glue("CREATE INDEX IF NOT EXISTS idx_ply_ecoblks ON {tbl} (ply_tbl, ply_key)")
+  }
+  
+  if (msg_only){
+    message(q)
+    return()
+  }
+  
+  stop("doh")
+  dbExecute(con, q)
+}
+
+# add index for compound key to table public.ply_species: ply_tbl, ply_fld, ply_key
+mk_idx("ply_species", c("ply_tbl", "ply_fld", "ply_key"), pkey = T)
+
+idxs <- list(
+  "ply_species" = list(
+    "ply_tbl",
+    "ply_fld",
+    "ply_key")
+  "ply_ecoblks" = list(
+    "boemrgn_key",
+    "ecorgn_ukey",
+    "planarea_ukey",
+    "prodiag_ukey",
+    "blk_ukey"))
+
+for (tbl in names(idxs)){
+  message(glue("tbl: {tbl}"))
+  for (flds in idxs[[tbl]]){
+    message(glue("flds: {paste(flds, collapse=',')}"))
+    mk_idx(tbl, flds,msg_only = T)
+  }
+}
+```
+
+
+## Dissolve ply `ecoblks` to `boemrgns` > `ecorgns` > `planareas` > `prodiags`
+
+- see ingest_blocks.qmd
 
 ## Fetch and Store Species Data
 
@@ -387,6 +506,121 @@ HI
 ## Assign Taxa Groups
 
 ```{r taxa groups}
+ply_spp <- tbl(con, "ply_species") |> 
+  distinct(sp_key) |> 
+  pull(sp_key)
+  
+length(ply_spp) # 10575
+am_spp <- tbl(con, "spp") |> 
+  pull(sp_key_am)
+
+# setdiff(ply_spp, am_spp)
+# setdiff(am_spp, ply_spp) # "Fis-27769"
+
+dbExecute(
+  con, "CREATE INDEX IF NOT EXISTS idx_spp_sp_key_am ON public.spp (sp_key_am)")
+
+dbExecute(
+  con, "ALTER TABLE public.spp ADD COLUMN IF NOT EXISTS group_gmbi text")
+
+dbExecute(con, "
+  UPDATE public.spp
+  SET group_gmbi = CASE
+      WHEN class = 'actinopterygii' AND family NOT IN ('Scombridae', 'Istiophoridae', 'Xiphiidae') 
+        THEN 'Coastal fishes'
+      WHEN class = 'cephalopoda' AND \"order\" NOT IN ('Myopsida','Oegopsida') 
+        THEN 'Non-squid cephalopods'
+      WHEN family IN ('Odobenidae', 'Otariidae', 'Phocidae') 
+        THEN 'Pinnipeds'
+      WHEN class = 'anthozoa' THEN 'Corals'
+      WHEN \"order\" = 'Alismatales' THEN 'Seagrasses'
+      WHEN genus = 'Avicennia' AND species = 'germinans' THEN 'Mangroves'
+      WHEN family IN ('Scombridae', 'Istiophoridae', 'Xiphiidae') 
+        THEN 'Tunas & billfishes'
+      WHEN \"order\" IN ('Myopsida','Oegopsida') THEN 'Squids'
+      WHEN \"order\" = 'Artiodactyla' THEN 'Cetaceans'
+      WHEN \"order\" = 'Euphausiacea' THEN 'Euphausiids'
+      WHEN class IN ('Malacostraca','Ostracoda','Branchiopoda','Cephalocarida','Maxillopoda') 
+        THEN 'Crustaceans'
+      WHEN class = 'Pycnogonida' THEN 'Sea spiders'
+      WHEN class = 'Gastropoda' THEN 'Gastropods'
+      WHEN class = 'Bivalvia' THEN 'Bivalves'
+      WHEN class = 'Polyplacophora' THEN 'Chitons'
+      WHEN class IN ('Ascidiacea','Thaliacea') THEN 'Tunicates'
+      WHEN class = 'Elasmobranchii' THEN 'Sharks'
+      WHEN class = 'Reptilia' THEN 'Reptiles'
+      WHEN phylum = 'Echinodermata' THEN 'Echinoderms'
+      WHEN phylum = 'Porifera' THEN 'Sponges'
+      WHEN phylum = 'Annelida' THEN 'Worms'
+      WHEN class = 'Hydrozoa' THEN 'Hydrozoans'
+      ELSE 'Other'
+    END") # 10,576
+
+tbl(con, "spp") |> 
+  pull(group_gmbi) |> 
+  table(useNA = "ifany")
+#   Bivalves  Chitons         Crustaceans  Echinoderms  Euphausiids  Gastropods 
+#        717       64               1757           490           32        1428 
+# Hydrozoans    Other           Pinnipeds  Sea spiders   Seagrasses      Sharks 
+#        322     4359                  14          100            5         214 
+#    Sponges   Squids  Tunas & billfishes    Tunicates        Worms 
+#        247       88                  33          170          536 
+
+dbExecute(con, glue("ALTER TABLE public.spp ADD COLUMN IF NOT EXISTS group_simple1 TEXT"))
+
+dbExecute(con, glue("
+  UPDATE public.spp
+  SET group_simple1 = CASE
+    WHEN class = 'Mammalia' 
+      AND \"order\" IN ('Cetacea', 'Carnivora')
+      AND family IN ('Balaenopteridae', 'Delphinidae', 'Phocidae', 'Otariidae')
+      THEN 'Mammals'
+    WHEN (phylum = 'Annelida' AND class = 'Polychaeta')
+      OR (phylum = 'Mollusca' AND class IN ('Bivalvia', 'Gastropoda'))
+      OR (phylum = 'Echinodermata')
+      OR (phylum = 'Arthropoda' AND class = 'Malacostraca')
+      THEN 'Benthic'
+    WHEN phylum = 'Cnidaria'
+      AND class IN ('Anthozoa', 'Hydrozoa')
+      AND \"order\" IN ('Scleractinia', 'Alcyonacea')
+      THEN 'Corals'
+    WHEN phylum = 'Chordata'
+      AND class = 'Actinopterygii'
+      AND \"order\" IN ('Clupeiformes', 'Perciformes', 'Gadiformes')
+      AND family IN ('Scombridae', 'Clupeidae', 'Gadidae')
+      THEN 'Pelagic Fish'
+    WHEN class = 'Aves'
+      AND \"order\" IN ('Charadriiformes', 'Procellariiformes', 'Pelecaniformes')
+      AND family IN ('Laridae', 'Procellariidae', 'Sulidae', 'Phalacrocoracidae')
+      THEN 'Seabirds'
+    WHEN class = 'Reptilia'
+      AND \"order\" = 'Testudines'
+      AND family IN ('Cheloniidae', 'Dermochelyidae')
+      THEN 'Turtles'
+    WHEN class = 'Elasmobranchii'
+      THEN 'Elasmobranchs'
+    WHEN (class = 'Actinopterygii' AND \"order\" NOT IN ('Clupeiformes', 'Perciformes', 'Gadiformes'))
+      THEN 'Other Fish'
+    WHEN (class NOT IN ('Mammalia', 'Aves', 'Reptilia', 'Elasmobranchii') 
+      AND phylum != 'Cnidaria')
+      THEN 'Other Invertebrates'
+    ELSE 'Other'
+  END"))
+
+tbl(con, "spp") |> 
+  pull(group_simple1) |> 
+  table(useNA = "ifany")
+#             Benthic  Corals  Elasmobranchs  Mammals  Other 
+#                4897     191            214       42   3643 
+# Other Invertebrates 
+#                1589
+
+# add column taxa if not already present
+if (!("taxa" %in% dbListFields(con, tbl_ply_spp))) {
+  dbExecute(con, glue("ALTER TABLE {tbl_ply_spp} ADD COLUMN taxa TEXT"))
+}
+
+
 where_taxa <- list(
   mammals = "class = 'Mammalia' 
     AND \"order\" IN ('Cetacea', 'Carnivora')
@@ -438,6 +672,7 @@ for (taxa in names(where_taxa)) { # taxa = names(where_taxa)[1]
   dbExecute(con, glue("UPDATE {tbl_ply_spp} SET taxa = '{taxa}' WHERE {where_taxa[[taxa]]}"))
 }
 ```
+
 
 ```{r ck_ply_species_taxa}
 # TODO: move to single species
@@ -559,7 +794,248 @@ g <- d_spp_iucn |>
 g
 ```
 
+
+
 ### Species
+
+## Calc scores by planareas
+
+```{r}
+#| label: calc_planareas
+
+# source("libs/db.R")
+
+# block group scores across ecoregion ----
+
+# DEBUG
+pa <- "brAK_erGOA_paGEO" # (n = 7 blocks)
+er <- "brAK_erGOA" # (n = 7 blocks)
+
+tbl(con, "ply_ecoblks") |> 
+  filter(planarea_key != "NA") |>
+  filter(ecorgn_ukey == er) |> 
+  group_by(ecorgn_ukey) |> 
+  summarize(
+    n = n()) |> 
+  pull(n)
+# 52,593
+
+tbl(con, "ply_ecoblks") |>
+  summarize(n = n()) # 309,229
+tbl(con, "ply_ecoblks") |>
+  group_by(prodiag_ukey) |> 
+  summarize(n_bk = n()) |> 
+  summarize(
+    n_pd     = n(),
+    n_bk_avg = mean(n_bk),
+    n_bk_sd  = sd(n_bk),
+    n_bk_min = min(n_bk),
+    n_bk_max = max(n_bk))
+#  n_pd n_bk_avg n_bk_sd n_bk_min n_bk_max
+#   647     478.    368.        1     1122    
+#   647 * 478 = 309,266
+
+# ply_scores for ecoblks -----
+keys <- tbl(con, "ply_ecoblks") |> 
+  filter(planarea_key != "NA") |> 
+  distinct(prodiag_ukey) |> 
+  pull(prodiag_ukey)
+n_keys <- format(length(keys), big.mark=',')  # 309,229
+
+# dbRemoveTable(con, "ply_scores")
+t0 <- Sys.time()
+for (i in 1:length(keys)){ # i = 1; key = keys[1]
+  
+  key <- keys[i]
+  
+  if (i %% 10 == 0){
+    #     300: AK_CBS_BFT_NR05-01_6659     ~ 2025-01-24 22:38:30.486211
+    # 309,200: PAC_WAOR_WAO_NM10-07_7111   ~ 2025-01-25 08:58:55.109335
+    t1     <- Sys.time() # t1 = as_datetime("2025-01-24 23:05:37.41435")
+    i_togo <- length(keys) - i
+    eta <- t1 + ((t1 - t0) / i) * i_togo
+    message(glue(
+      "{str_pad(format(i, big.mark=','), nchar(n_keys))}: {key}  ~ {format(Sys.time())}; ETA: {format(eta)}"))
+  }
+  
+  d_eb <- tbl(con, "ply_ecoblks") |> 
+    filter(planarea_key != "NA") |>
+    filter(prodiag_ukey == !!key) |> # DEBUG
+    select(blk_ukey) |> 
+    # head(1) |> collect() |> names() |> paste(collapse = ", ")
+    left_join(
+      tbl(con, "ply_species") |> 
+        select(ply_key, sp_key, sp_area_km2 = area_km2, avg_suit),
+      by = c("blk_ukey" = "ply_key")) |> 
+    left_join(
+      tbl(con, "spp") |> 
+        select(sp_key_am, taxa = group_gmbi, iucnRedListCategory),
+      by = c("sp_key" = "sp_key_am")) |> 
+    mutate(
+      iucn_score = case_match(
+        iucnRedListCategory,
+        # skipped: EX (extinct), NE (not evaluated), DD (data deficient), <NA> (not available)
+        # https://oceanhealthindex.org/images/htmls/Supplement.html#62_Biodiversity
+        "CR" ~ 1,       #  - CR: Critically Endangered	
+        "EN" ~ 0.8,     #  - EN: Endangered	
+        "VU" ~ 0.6,     #  - VU: Vulnerable
+        "NT" ~ 0.4,     #  - NT: Near Threatened
+        "LC" ~ 0.2)) |> #  - LC: Least Concern
+    filter(!is.na(iucn_score)) |> 
+    left_join(
+      tbl(con, "ply_ecoblks") |> 
+        select(blk_ukey, eb_area_km2 = area_km2), # TODO: blk_ukey -> ecoblk_ukey
+      by = "blk_ukey") |>
+    mutate(
+      sp_area_pct = round(sp_area_km2 / eb_area_km2, 6)) |> 
+    group_by(blk_ukey, taxa) |> 
+    summarize(
+      n_spp     = n(),
+      sp_pct    = mean(sp_area_pct),
+      sp_suit   = mean(avg_suit),
+      sp_iucn   = mean(iucn_score),
+      # avg_score_raw   = mean(sp_area_pct) * mean(avg_suit) * mean(iucn_score),
+      score_raw = sum(sp_area_pct * avg_suit * iucn_score) / n(),
+      .groups = "drop") |>
+    arrange(blk_ukey, taxa) |> 
+    collect() |> 
+    mutate(
+      ply_fld = "blk_ukey") |> 
+    rename(ply_key = blk_ukey) |> 
+    relocate(ply_fld)
+  
+  dbWriteTable(con, "ply_scores", d_eb, append = T)
+}
+
+# TODO: score (not raw), from ref
+
+q_ebs <- unique(d_eb_scores$blk_ukey) |> paste(collapse = "','")
+
+tbl(con, "ply_ecoblks")
+ply_eb <- st_read(con, query = glue(
+  "SELECT blk_ukey, geom FROM ply_ecoblks WHERE blk_ukey IN ('{q_ebs}')"))
+d_s <- d_eb_scores |> 
+  # filter(is.na(score_raw))
+  group_by(taxa) |> 
+  summarize(
+    n         = n(),
+    score_avg = mean(score_raw),
+    score_sd  = sd(score_raw),
+    score_min = min(score_raw),
+    score_max = max(score_raw),
+    .groups = "drop")
+
+d_eb_scores |> 
+  # arrange(taxa) |> 
+  filter(taxa == "Crustaceans") |> 
+  pull(score_raw) |> 
+  # head(7) |> 
+  sd()
+
+  mutate(score_raw = round(score_raw, 4)) |> 
+  distinct(taxa, score_raw) |> 
+  arrange(taxa)
+d_eb_scores$taxa |> table()
+d_eb_scores |> 
+  filter(taxa == "Pinnipeds")
+
+# planning area group scores ----
+
+d_pas <- tbl(con, "ply_ecoblks") |> 
+  filter(planarea_key != "NA") |>  # | prodiag_key  != "NA" | blk_key      != "NA") |> 
+  group_by(planarea_ukey) |> 
+  summarize(
+    n = n()) |> 
+  arrange(n)
+
+# v_bks <- tbl(con, "ply_scores") |> 
+#   pull(ply_key)
+# v_pd <- str_replace(v_bks, ".*_pd(.+)_.*", "\\1")
+# table(v_pd)
+# v_pd
+# brAK_erGOA_paGEO          NR05-01 
+#              231           810084
+
+# ply_scores for planareas -----
+keys <- tbl(con, "ply_ecoblks") |> 
+  filter(planarea_key != "NA") |> 
+  distinct(planarea_ukey) |> 
+  pull(planarea_ukey)
+n_keys <- format(length(keys), big.mark=',')  # 309,229
+
+t0 <- Sys.time()
+for (i in 1:length(keys)){ # i <- which(keys == "brAK_erGOA_paGEO") # (n = 7 blocks)
+  
+  key <- keys[i]
+  
+  # if (i %% 10 == 0){
+  #     300: AK_CBS_BFT_NR05-01_6659     ~ 2025-01-24 22:38:30.486211
+  # 309,200: PAC_WAOR_WAO_NM10-07_7111   ~ 2025-01-25 08:58:55.109335
+  t1     <- Sys.time() # t1 = as_datetime("2025-01-24 23:05:37.41435")
+  i_togo <- length(keys) - i
+  eta <- t1 + ((t1 - t0) / i) * i_togo
+  message(glue(
+    "{str_pad(format(i, big.mark=','), nchar(n_keys))}: {key}  ~ {format(Sys.time())}; ETA: {format(eta)}"))
+  # }
+  
+  d_pa <- tbl(con, "ply_ecoblks") |> 
+    filter(planarea_ukey == !!key) |>
+    select(planarea_ukey, blk_ukey) |> 
+    # head(1) |> collect() |> names() |> paste(collapse = ", ")
+    left_join(
+      tbl(con, "ply_species") |> 
+        select(ply_key, sp_key, area_km2, avg_suit),
+      by = c("blk_ukey" = "ply_key")) |> 
+    group_by(planarea_ukey, sp_key) |> 
+    summarize(
+      sp_area_km2   = sum(area_km2),
+      avg_suit   = mean(avg_suit * area_km2) / sum(area_km2),
+      .groups = "drop") |> 
+    left_join(
+      tbl(con, "spp") |> 
+        select(sp_key_am, taxa = group_gmbi, iucnRedListCategory),
+      by = c("sp_key" = "sp_key_am")) |> 
+    mutate(
+      iucn_score = case_match(
+        iucnRedListCategory,
+        # skipped: EX (extinct), NE (not evaluated), DD (data deficient), <NA> (not available)
+        # https://oceanhealthindex.org/images/htmls/Supplement.html#62_Biodiversity
+        "CR" ~ 1,       #  - CR: Critically Endangered	
+        "EN" ~ 0.8,     #  - EN: Endangered	
+        "VU" ~ 0.6,     #  - VU: Vulnerable
+        "NT" ~ 0.4,     #  - NT: Near Threatened
+        "LC" ~ 0.2)) |> #  - LC: Least Concern
+    filter(!is.na(iucn_score)) |> 
+    left_join(
+      tbl(con, "ply_eb_planareas") |> 
+        select(planarea_ukey, pa_area_km2 = area_km2),
+      by = "planarea_ukey") |>
+    mutate(
+      sp_area_pct = round(sp_area_km2 / pa_area_km2, 6)) |> 
+    group_by(planarea_ukey, taxa) |> 
+    summarize(
+      n_spp      = n(),
+      sp_pct     = mean(sp_area_pct),
+      sp_suit    = mean(avg_suit),
+      sp_iucn    = mean(iucn_score),
+      score_raw  = sum(sp_area_pct * avg_suit * iucn_score) / n(),
+      .groups = "drop") |>
+    arrange(planarea_ukey, taxa) |> 
+    collect() |> 
+    mutate(
+      ply_fld = "planarea_ukey") |> 
+    rename(ply_key = planarea_ukey) |> 
+    relocate(ply_fld)
+  
+  dbWriteTable(con, "ply_scores", d_pa, append = T)
+}
+
+
+
+
+```
+
+
 
 ```{r ply_iucn}
 ply_key <- "erCAC-paCEC"
@@ -616,23 +1092,13 @@ d_spp_iucn <- tbl(con, "ply_species") |>
       mutate(
         iucn_score = case_match(
           iucnRedListCategory,
-          # skipped:
-          # -  EX : extinct
-          # -  NE : not evaluated
-          # -  DD : data deficient
-          # - <NA>: not available
+          # skipped: EX (extinct), NE (not evaluated), DD (data deficient), <NA> (not available)
           # https://oceanhealthindex.org/images/htmls/Supplement.html#62_Biodiversity
-          # included:
-          #  - CR: Critically Endangered	
-          #  - EN: Endangered	
-          #  - VU: Vulnerable
-          #  - NT: Near Threatened
-          #  - LC: Least Concern
-          "CR" ~ 1,
-          "EN" ~ 0.8,
-          "VU" ~ 0.6,
-          "NT" ~ 0.4,
-          "LC" ~ 0.2)),
+          "CR" ~ 1,     #  - CR: Critically Endangered	
+          "EN" ~ 0.8,   #  - EN: Endangered	
+          "VU" ~ 0.6,   #  - VU: Vulnerable
+          "NT" ~ 0.4,   #  - NT: Near Threatened
+          "LC" ~ 0.2)), #  - LC: Least Concern
     # |> filter(!is.na(iucn_score))
     by = "sp_key_am") |> 
   filter(!is.na(iucn_score)) |> 

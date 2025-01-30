@@ -14,7 +14,7 @@ See:
 ## Load into PostGIS database
 
 ```{r}
-#| label: load_db
+#| label: setup
 
 librarian::shelf(
   dplyr, fs, glue, here, janitor, leaflet, leaflet.extras, mapview, 
@@ -22,7 +22,7 @@ librarian::shelf(
   purrr, readr, rmapshaper, sf, tibble, tidyr, units,
   quiet = T)
 options(readr.show_col_types = F)
-# source(here("libs/db.R")) # define: con
+source(here("libs/db.R")) # define: con
 
 # paths ----
 b_csv        <- here("data/ingest_blocks_spatial-paths_v2.csv")
@@ -61,7 +61,10 @@ drop_ctr_area <- function(x){
   x |>
     select(-ctr_lon, -ctr_lat, -area_km2)
 }
+```
 
+```{r}
+#| label: mk_ply_ecoblks
 
 # ply_ecorgns: Ecoregions ----
 ecorgns_rds <- here(glue("data/ecoblks/ply_ecorgns.rds"))
@@ -277,6 +280,111 @@ dbExecute(con, glue(
     ON {tbl} ({paste(flds, collapse = ', ')});"))
 
 ```
+
+## Dissolve db ply `ecoblks` to `boemrgns` > `ecorgns` > `planareas` > `prodiags`
+
+```{r}
+# label: dissolve_ecoblks
+
+ply_eb <- st_read(con, "ply_ecoblks") |> 
+  select(
+    boemrgn_key, ecorgn_key, ecorgn_ukey, planarea_key, planarea_ukey, 
+    prodiag_key, prodiag_ukey, blk_key, blk_ukey)
+
+sf_use_s2(F)
+
+ply_pd <- ply_eb |> 
+  group_by(prodiag_ukey) |> 
+  summarize(.groups = "drop") |> 
+  left_join(
+    ply_eb |> 
+      st_drop_geometry() |> 
+      distinct(
+        boemrgn_key, 
+        ecorgn_key, ecorgn_ukey, 
+        planarea_key, planarea_ukey, 
+        prodiag_key, prodiag_ukey),
+    by = "prodiag_ukey") |> 
+  set_geom_ctr_area()
+# mapView(ply_pd)
+
+ply_pa <- ply_eb |> 
+  group_by(planarea_ukey) |> 
+  summarize(.groups = "drop") |> 
+  left_join(
+    ply_eb |> 
+      st_drop_geometry() |> 
+      distinct(
+        boemrgn_key, 
+        ecorgn_key, ecorgn_ukey, 
+        planarea_key, planarea_ukey),
+    by = "planarea_ukey") |> 
+  set_geom_ctr_area()
+ 
+ply_er <- ply_eb |> 
+  group_by(ecorgn_ukey) |> 
+  summarize(.groups = "drop") |> 
+  left_join(
+    ply_eb |> 
+      st_drop_geometry() |> 
+      distinct(
+        boemrgn_key, 
+        ecorgn_key, ecorgn_ukey),
+    by = "ecorgn_ukey") |> 
+  set_geom_ctr_area()
+ 
+ply_br <- ply_eb |> 
+  group_by(boemrgn_key) |> 
+  summarize(.groups = "drop") |> 
+  set_geom_ctr_area()
+# mapView(ply_br)
+
+tbl_ply <- list(
+  "ply_eb_prodiags"  = ply_pd,
+  "ply_eb_planareas" = ply_pa,
+  "ply_eb_ecorgns"   = ply_er,
+  "ply_eb_boemrgns"  = ply_br)
+
+for (tbl in names(tbl_ply)){ # tbl = names(tbl_ply)[1]
+
+  message(glue("{tbl}  ~ {Sys.time()}"))
+  
+  d <- tbl_ply[[tbl]]
+  
+  st_write(
+    obj           = d,
+    dsn           = con,
+    layer         = tbl,
+    driver        = "PostgreSQL",
+    layer_options = "OVERWRITE=true")
+  
+  # enforce SRID so shows up in tile.marinesensivity.org
+  dbExecute(con, glue(
+    "SELECT UpdateGeometrySRID('{tbl}','geom',4326);"))
+  
+  # fix any invalid geometries
+  dbExecute(con, glue("UPDATE {tbl} SET geom = ST_MakeValid(geom) WHERE NOT ST_IsValid(geom)"))
+  
+  # add spatial index for faster queries
+  dbExecute(con, glue(
+    "CREATE INDEX IF NOT EXISTS {tbl}_geom_idx ON {tbl} USING gist(geom);"))
+  
+  # add unique index on br_er_pa_pd_bk_key
+  fld <- names(d)[1]
+  dbExecute(con, glue(
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_{fld} ON {tbl} USING btree({fld});"))
+  
+  # flds <- names(ply_ecoblks)[2:6]
+  # dbExecute(con, glue(
+  #   "CREATE INDEX IF NOT EXISTS 
+  #   {tbl}_{paste(flds, collapse = '_')}_idx 
+  #   ON {tbl} ({paste(flds, collapse = ', ')});"))
+}
+```
+
+
+
+## OLD
 
 ```{r}
 ply_ecoblks <- ply_ecorgns |>
