@@ -162,6 +162,227 @@ for (i in 1:length(keys)){
 }
 ```
 
+
+```{r}
+#| label: ecoblk_cell
+
+# source(here("../workflows/libs/db.R")) # define: con
+
+# tbl(con, "ply_ecoblks") |> 
+#   group_by(prodiag_ukey) |> 
+#   summarize(n = n()) |> 
+#   arrange(desc(n)) |> 
+#   collect()
+# brAK_erEBS_paALA_pdNM01-08    1122
+  
+# dbExecute(con, "ALTER TABLE ply_ecoblks ADD PRIMARY KEY (blk_ukey)")
+tbl(con, "cells")
+
+# TODO: check 
+
+
+dbExecute(con, "
+  UPDATE public.ply_ecoblks
+    SET area_km2 = ST_AREA(geom::geography) / (1000 * 1000)")
+
+dbExecute(con, "DROP TABLE IF EXISTS public.ecoblk_cell")
+dbExecute(con, "
+  CREATE TABLE IF NOT EXISTS public.ecoblk_cell (
+    blk_ukey TEXT, 
+    cell_id INTEGER, 
+    area_km2 double precision, 
+    blk_pct double precision, 
+    geom geometry(Geometry,4326) )")
+
+q <- "
+  WITH
+    b AS (
+      SELECT b.blk_ukey, 
+      c.cell_id,
+      b.area_km2 AS blk_km2,
+      CASE
+        WHEN ST_CoveredBy(b.geom, c.geom)
+          THEN b.geom
+        ELSE
+          ST_Multi(ST_Buffer(ST_Intersection(b.geom, c.geom), 0.0))
+      END AS geom
+    FROM
+      public.ply_ecoblks b
+      INNER JOIN aquamaps.cells c
+        ON ST_Intersects(b.geom, c.geom)
+    -- DEBUG: test subset
+    -- WHERE
+    --    b.prodiag_ukey = 'brAK_erEBS_paALA_pdNM01-08'
+    ORDER BY
+      b.blk_ukey, c.cell_id),
+  a AS (
+    SELECT *,
+      ST_AREA(geom::geography) / (1000 * 1000) AS area_km2
+    FROM b
+    WHERE
+      NOT ST_IsEmpty(geom))
+  INSERT INTO public.ecoblk_cell(
+    blk_ukey, cell_id, area_km2, blk_pct, geom)
+  SELECT blk_ukey, cell_id,
+    area_km2,
+    area_km2 / blk_km2 AS blk_pct,
+    geom
+  FROM a"
+dbExecute(con, q) # 377,321
+
+dbExecute(
+  con, "CREATE INDEX IF NOT EXISTS ecoblk_cell_geom_idx 
+    ON ecoblk_cell USING gist (geom)")
+dbExecute(
+  con, "ALTER TABLE IF EXISTS ecoblk_cell
+    ADD CONSTRAINT ecoblk_cell_pkey PRIMARY KEY (blk_ukey, cell_id)")
+dbExecute(
+  con, "CREATE INDEX IF NOT EXISTS idx_ecoblk_cell_cell_id ON ecoblk_cell (cell_id)")
+
+# bc <- st_read(
+#   con, query = "SELECT * FROM ecoblk_cell WHERE prodiag_ukey = 'brAK_erEBS_paALA_pdNM01-08'")
+# sf::st_geometry_type(bc) |> table()
+# mapView(bc, zcol = "pct_blk")
+```
+
+```{r}
+#| label: NEW ply_spp vs OLD ply_species
+
+dbExecute(con, "DROP TABLE IF EXISTS public.ply_spp")
+dbExecute(con, "CREATE TABLE IF NOT EXISTS public.ply_spp (
+    ply_fld text,
+    ply_key text,
+    sp_key text,
+    sp_km2 double precision,
+    sp_suit double precision)")
+
+# ply_spp by blk ----
+# DEBUG: subset
+# d <- tbl(con, "ply_ecoblks") |> 
+#   filter(prodiag_ukey == "brAK_erEBS_paALA_pdNM01-08") |>  # DEBUG
+#   select(blk_ukey) |>
+#   left_join(
+#       tbl(con, "ecoblk_cell") |> 
+#       select(blk_ukey, cell_id, area_km2),
+#     by = "blk_ukey") |> 
+q_sel <- tbl(con, "ecoblk_cell") |> 
+  select(blk_ukey, cell_id, area_km2) |> 
+  left_join(
+    tbl(con, "spp_cells") |> 
+      # head(1) |> collect() |> names() |> paste(collapse = ", "),
+      # sp_key, probability, fao_area_yn, bound_box_yn, cell_id
+      select(cell_id, sp_key, probability),
+    by = "cell_id") |> 
+  group_by(blk_ukey, sp_key) |> 
+  summarize(
+    sp_km2  = sum(area_km2),
+    sp_suit = sum(probability * area_km2) / sum(area_km2),
+    .groups = "drop") |> 
+  mutate(
+    ply_fld = "blk_ukey",
+    ply_key = blk_ukey) |> 
+  select(ply_fld, ply_key, sp_key, sp_km2, sp_suit) |> 
+  # collect()
+  sql_render()
+  
+tic("ply_spp: blk")
+q <- glue("
+  INSERT INTO ply_spp (ply_fld, ply_key, sp_key, sp_km2, sp_suit)
+  {q_sel}") # 384,432: brAK_erEBS_paALA_pdNM01-08
+# message(q)
+dbExecute(con, q)
+toc()
+
+# ply_spp by prodiag ----
+q_sel <- tbl(con, "ply_ecoblks") |>
+  select(blk_ukey, cell_id, area_km2) |> 
+  left_join(
+    tbl(con, "ply_ecoblks") |> 
+      select(blk_ukey, prodiag_ukey),
+    by = "blk_ukey") |> 
+  left_join(
+    tbl(con, "spp_cells") |> 
+      select(cell_id, sp_key, probability),
+    by = "cell_id") |> 
+  group_by(prodiag_ukey, sp_key) |> 
+  summarize(
+    sp_km2  = sum(area_km2),
+    sp_suit = sum(probability * area_km2) / sum(area_km2),
+    .groups = "drop") |> 
+  mutate(
+    ply_fld = "prodiag_ukey",
+    ply_key = prodiag_ukey) |> 
+  select(ply_fld, ply_key, sp_key, sp_km2, sp_suit) |> 
+  sql_render()
+
+tic("ply_spp: prodiag")
+q <- glue("
+  INSERT INTO ply_spp (ply_fld, ply_key, sp_key, sp_km2, sp_suit)
+  {q_sel}")
+dbExecute(con, q)
+toc()
+
+# ply_spp by planarea ----
+q_sel <- tbl(con, "ply_ecoblks") |>
+  select(blk_ukey, cell_id, area_km2) |> 
+  left_join(
+    tbl(con, "ply_ecoblks") |> 
+      select(blk_ukey, planarea_ukey),
+    by = "blk_ukey") |> 
+  left_join(
+    tbl(con, "spp_cells") |> 
+      select(cell_id, sp_key, probability),
+    by = "cell_id") |> 
+  group_by(planarea_ukey, sp_key) |> 
+  summarize(
+    sp_km2  = sum(area_km2),
+    sp_suit = sum(probability * area_km2) / sum(area_km2),
+    .groups = "drop") |> 
+  mutate(
+    ply_fld = "planarea_ukey",
+    ply_key = planarea_ukey) |> 
+  select(ply_fld, ply_key, sp_key, sp_km2, sp_suit) |> 
+  sql_render()
+
+tic("ply_spp: planarea")
+q <- glue("
+  INSERT INTO ply_spp (ply_fld, ply_key, sp_key, sp_km2, sp_suit)
+  {q_sel}")
+dbExecute(con, q)
+toc()
+
+# ply_spp by ecorgn ----
+q_sel <- tbl(con, "ply_ecoblks") |>
+  select(blk_ukey, cell_id, area_km2) |> 
+  left_join(
+    tbl(con, "ply_ecoblks") |> 
+      select(blk_ukey, ecorgn_ukey),
+    by = "blk_ukey") |> 
+  left_join(
+    tbl(con, "spp_cells") |> 
+      select(cell_id, sp_key, probability),
+    by = "cell_id") |> 
+  group_by(ecorgn_ukey, sp_key) |> 
+  summarize(
+    sp_km2  = sum(area_km2),
+    sp_suit = sum(probability * area_km2) / sum(area_km2),
+    .groups = "drop") |> 
+  mutate(
+    ply_fld = "ecorgn_ukey",
+    ply_key = ecorgn_ukey) |> 
+  select(ply_fld, ply_key, sp_key, sp_km2, sp_suit) |> 
+  sql_render()
+  
+tic("ply_spp: ecorgn")
+q <- glue("
+  INSERT INTO ply_spp (ply_fld, ply_key, sp_key, sp_km2, sp_suit)
+  {q_sel}")
+dbExecute(con, q)
+toc()
+```
+
+- [ ] TODO: iucnRedListCategory, group_gmbi, group_simple1
+
 ## Make `*_ukey` for er, pa, pd, bk
 
 ```{r}
@@ -701,7 +922,7 @@ https://oceanhealthindex.org/images/htmls/Supplement.html#62_Biodiversity
 
 ```{r}
 librarian::shelf(
-  dplyr, ggplot2)
+  dplyr, ggiraph, ggplot2)
 
 # Function to create the flower plot
 plot_flower <- function(
@@ -766,11 +987,11 @@ plot_flower <- function(
       alpha = 0.5) +
     coord_polar(theta = "y") +
     # Create donut hole
-    xlim(c(-0.1, max(data |> pull({{ fld_height }})))) +
+    xlim(c(-10, max(data |> pull({{ fld_height }})))) +
     # Add center score
     annotate(
-      "text", x = -0.1, y = 0, 
-      label = round(score, 2), 
+      "text", x = -10, y = 0, 
+      label = round(score), 
       size = 8, 
       fontface = "bold") +
     # Customize appearance
@@ -785,13 +1006,29 @@ plot_flower <- function(
   girafe(ggobj = g)
 }
 
-g <- d_spp_iucn |> 
+i = 1
+pa <- unique(d_pa$planarea_ukey)[i]
+d_fl <- d_pa |> 
+  filter(planarea_ukey == !!pa) |> 
+  mutate(
+    score_new = score_raw * 10000000,
+    even = 1) |> 
+  select(taxa, n_spp, score_raw, score_new, even)
+
+d_fl |> 
+  arrange(desc(taxa)) |> 
   plot_flower(
-    taxa,
-    iucn_score,
-    n_spp,
-    tooltip_expr = "{taxa}: {round(iucn_score, 2)} (n_spp: {n_spp})")
-g
+    fld_category = taxa,
+    fld_height   = score_new,
+    fld_width    = even,
+    tooltip_expr = "{taxa}: {round(score_new, 2)} (n_spp: {n_spp})")
+
+d_fl |> 
+  plot_flower(
+    fld_category = taxa,
+    fld_height   = score_new,
+    fld_width    = n_spp,
+    tooltip_expr = "{taxa}: {round(score_new, 2)} (n_spp: {n_spp})")
 ```
 
 
@@ -1033,9 +1270,103 @@ for (i in 1:length(keys)){ # i <- which(keys == "brAK_erGOA_paGEO") # (n = 7 blo
   
   dbWriteTable(con, "ply_scores", d_pa, append = T)
 }
+```
+
+```{r}
+#| label: ply_scores_duckdb
+
+librarian::shelf(
+  marinebon/aquamapsduckdb, exactextractr, mapview, sf, sfarrow, terra, tibble)
+# devtools::load_all("~/Github/marinebon/aquamapsduckdb/")
+
+source("~/Github/marinebon/aquamapsduckdb/inst/app/functions.R")
+
+# ecoblock_pq      <- here("data/ecoblks/ecoblock.parquet")
+# amcell_pq        <- here("data/ecoblks/amcell.parquet")
+ecoblock_gpkg      <- here("data/ecoblks/ecoblock.parquet")
+amcell_pq        <- here("data/ecoblks/amcell.parquet")
+analysis_duckdb  <- here("data/ecoblks/analysis.duckdb")
+
+# If an existing layer already exists, to overwrite the LAYER add: ( layer_options = "OVERWRITE=YES" )
+st_write(ports, dsn="data/gpkg_in_R_example.gpkg", layer='ports', layer_options = "OVERWRITE=YES" )
+
+
+if (!file.exists(ecoblock_pq)){
+  ecoblock <- st_read(con, "ply_ecoblks") |> 
+    select(-br_er_pa_pd_bk_key) # 309,229 features, 14 fields
+  st_write_parquet(ecoblock, ecoblock_pq)
+}
+ecoblock <- st_read_parquet(eb_pq)
+
+if (!file.exists(amcell_pq)){
+  amcell <- st_read(con, "cells")
+  
+  st_write_parquet(amcell, amcell_pq)
+}
+amcell <- st_read_parquet(amcell_pq)
+
+con_dd <- dbConnect(duckdb::duckdb(), dbdir = ":memory:")
+dbExecute(con_dd, "INSTALL spatial; LOAD spatial; LOAD parquet; INSTALL postgres; LOAD postgres;")
+
+# https://duckdb.org/docs/extensions/postgres.html
+dbExecute(con_dd, glue("ATTACH 'dbname=msens user=admin host=127.0.0.1 password={readLines(db_pass_txt)}' AS pg_am (TYPE POSTGRES, SCHEMA 'aquamaps');"))
+dbExecute(con_dd, glue("ATTACH 'dbname=msens user=admin host=127.0.0.1 password={readLines(db_pass_txt)}' AS pg (TYPE POSTGRES, SCHEMA 'public');"))
+
+
+cells_sl <- dbGetQuery(con_dd, "SELECT * FROM pg_am.cells LIMIT 3")
+dbGetQuery(con_dd, "SELECT * FROM ST_Drivers();") |> View()
+
+# https://github.com/duckdb/duckdb-spatial/blob/main/docs/example.md
+dbExecute(con_dd, glue("COPY pg_am.cells TO '{amcell_pq}'"))
+dbExecute(con_dd, glue("COPY pg.ply_ecoblks TO '{ecoblock_pq}'"))
+
+# https://medium.com/radiant-earth-insights/duckdb-the-indispensable-geospatial-tool-you-didnt-know-you-were-missing-5fe11c5633e5
+
+dbExecute(con_dd, glue("CREATE TABLE amcell AS (SELECT * EXCLUDE geom, ST_GeomFromWKB(geom) AS geom from '{amcell_pq}')"))
+dbExecute(con_dd, glue("CREATE TABLE ecoblock AS SELECT * FROM '{ecoblock_pq}'"))
+
+dbGetQuery(con_dd, glue("DESCRIBE SELECT * FROM amcell LIMIT 2"))
+
+# dbExecute(conn = con, "INSTALL httpfs")
+
+duckdb::
+
+p_eb_sl <- p_eb |> 
+  slice(1:100)
+mapView(p_eb_10)
+
+r <- am_rast_template(values="cell_idx")
+
+d_w <- extract(r, p_eb_sl, ID=F, weights=T)  # nrow(d_w): 80
+
+# Calculate vector of mean December precipitation amount for each municipality
+brazil$mean_dec_prec <- exact_extract(r, p_eb_sl, 'mean')
 
 
 ```
+
+```{r}
+#| label: faster pa ply_scores
+
+pa <- "brAK_erCBS_paBFT"
+
+dbGetQuery(con, "SELECT count(*) AS nrow FROM public.ply_species")
+# 279,226,334
+dbGetQuery(con, "SELECT reltuples::bigint AS estimate FROM pg_class where relname = 'ply_species'")
+
+tbl(con, "ply_ecoblks") |> 
+  filter(planarea_ukey == pa) |> 
+  select(planarea_ukey, blk_ukey, area_km2) |> 
+  left_join(
+    tbl(con, "ply_scores"), 
+    by = c("blk_ukey" = "ply_key")) |> 
+  group_by(planarea_ukey, taxa) |> 
+  summarize(
+    
+  )
+
+```
+
 
 ```{r}
 #| label: calc scores from score_raw
@@ -1045,8 +1376,66 @@ tbl(con, "ply_scores") |>
   group_by(ply_fld) |> 
   summarize(n = n())
 
-tbl(con, "ply_") |> 
+er <- "brAK_erCBS"
+d_eb <- tbl(con, "ply_ecoblks") |> 
+  filter(ecorgn_ukey == er) |> 
+  select(ecorgn_ukey, blk_ukey) |> 
+  left_join(
+    tbl(con, "ply_scores") |> 
+      filter(ply_fld == "blk_ukey"), 
+    by = c("blk_ukey" = "ply_key")) |> 
+  group_by(ecorgn_ukey, taxa) |> 
+  summarize(
+    # er_n         = n(),
+    er_score_min = min(score_raw),
+    er_score_max = max(score_raw),
+    # er_score_avg = mean(score_raw),
+    # er_score_sd  = sd(score_raw),
+    .groups = "drop")
 
+tbl(con, "ply_eb_planareas") |> 
+  filter(ecorgn_ukey == "brAK_erCBS") |> 
+  pull(planarea_ukey)
+# "brAK_erCBS_paBFT" "brAK_erCBS_paCHU" "brAK_erCBS_paHOP" "brAK_erCBS_paNOR"
+
+d_pa <- tbl(con, "ply_eb_planareas") |> 
+  filter(ecorgn_ukey == !!er) |> 
+  select(ecorgn_ukey, planarea_ukey) |> 
+  left_join(
+    tbl(con, "ply_scores") |> 
+      filter(ply_fld == "planarea_ukey"), 
+    by = c("planarea_ukey" = "ply_key")) |> 
+  left_join(
+    tbl(con, "ply_ecoblks") |> 
+      filter(ecorgn_ukey == er) |> 
+      select(ecorgn_ukey, blk_ukey) |> 
+      left_join(
+        tbl(con, "ply_scores") |> 
+          filter(ply_fld == "blk_ukey"), 
+        by = c("blk_ukey" = "ply_key")) |> 
+      group_by(ecorgn_ukey, taxa) |> 
+      summarize(
+        # er_n         = n(),
+        er_score_min = min(score_raw),
+        er_score_max = max(score_raw),
+        # er_score_avg = mean(score_raw),
+        # er_score_sd  = sd(score_raw),
+        .groups = "drop"),
+    by = c("ecorgn_ukey", "taxa")) |> 
+  collect()
+
+library(scales)
+library(purrr)
+d_pa |> 
+  arrange(taxa, planarea_ukey) |> 
+  mutate(
+    score = pmap_dbl(
+      list(score_raw, er_score_min, er_score_max), 
+      \(s, s_min, s_max) rescale(s, to = c(s_min, s_max)))) |> 
+  select(taxa, planarea_ukey, score_raw, er_score_min, er_score_max, score)
+
+  
+  
 ```
 
 
