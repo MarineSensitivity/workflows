@@ -1,0 +1,360 @@
+---
+title: "ingest_regions"
+editor_options: 
+  chunk_output_type: console
+---
+
+## Goal
+
+See: 
+
+* [inject fine scale aliquots into database and use vector tile service · Issue #14 · MarineSensitivity/workflows](https://github.com/MarineSensitivity/workflows/issues/14)
+* [README - Google Docs](https://docs.google.com/document/d/1jpW3As6sve5LkI7r8Os3YpDk8zyBMz2r3_2irFHzorc/edit)
+
+## Load into PostGIS database
+
+```{r}
+#| label: setup
+
+librarian::shelf(
+  dplyr, fs, glue, here, janitor, leaflet, leaflet.extras, mapview, 
+  marinesensitivity/msens, 
+  purrr, readr, rmapshaper, sf, stringr, tibble, tidyr, units,
+  quiet = T)
+options(readr.show_col_types = F)
+source(here("libs/db.R")) # define: con
+
+# paths ----
+b_csv        <- here("data/ingest_blocks_spatial-paths_v2.csv")
+dir_data     <- "/Users/bbest/My Drive/projects/msens/data"
+dir_ecorgn   <- glue("{dir_data}/raw/boem.gov/Ecoregion GIS files")
+ecorgn_shps  <- list(
+  AK  = glue("{dir_ecorgn}/Alaska/Area_Alaska_scd.shp"),
+  ATL = glue("{dir_ecorgn}/Atlantic/Area_Atlantic_scd.shp"),
+  GOM = glue("{dir_ecorgn}/GOM/Area_GOM_scd.shp"),
+  PAC = glue("{dir_ecorgn}/Pacific/Area_Pacific_scd.shp") )
+dir_blks   <- glue("{dir_data}/raw/boem.gov/blocks")
+prot_shps  <- list(
+  AK  = glue("{dir_blks}/AK/protclip/AK_PROTCLP.shp"),
+  ATL = glue("{dir_blks}/ATL/ATL_PROTCLP/ATL_PROTCLP.shp"),
+  GOM = glue("{dir_blks}/GOM/ProtractionPolygonsClipped.gdb"),
+  PAC = glue("{dir_blks}/PC/PC_PROT_CLIP/PC_PROT_CLIP.shp") )
+
+redo  <- T
+
+# helper functions ----
+
+set_geom_ctr_area <- function(x){
+  x |>
+    st_set_geometry("geom") |>
+    mutate(
+      ctr      = st_centroid(geom),
+      ctr_lon  = ctr |> st_coordinates() %>% .[,"X"],
+      ctr_lat  = ctr |> st_coordinates() %>% .[,"Y"],
+      area_km2 = st_area(geom) |>
+        set_units(km^2) |>
+        as.numeric() ) |>
+    select(-ctr)
+}
+
+drop_ctr_area <- function(x){
+  x |>
+    select(-ctr_lon, -ctr_lat, -area_km2)
+}
+```
+
+```{r}
+#| label: mk_ply_ecoprot
+
+# ply_ecorgns: Ecoregions ----
+ecorgns_rds <- here(glue("data/ecoblks/ply_ecorgns.rds"))
+if (!file.exists(ecorgns_rds)){
+  ply_ecorgns <- ecorgn_shps |>
+    imap(
+      ~read_sf(.x) |>
+        mutate(
+          boemrgn_key = .y) |>   #
+        rename(any_of(c(
+          ecorgn_name = "Name",
+          ecorgn_name = "LABEL",
+          ecorgn_key  = "CODE",
+          ecorgn_key  = "MMS_PLAN_A"))) |>
+        st_transform(4326)) |>
+    bind_rows() |>
+    mutate(
+      boemrgn_name = case_match(
+        boemrgn_key,
+        "AK"  ~ "Alaska",
+        "ATL" ~ "Atlantic",
+        "GOM" ~ "Gulf of Mexico",
+        "PAC" ~ "Pacific"),
+      ecorgn_key = case_match(
+        ecorgn_name,
+        "California Current"          ~ "CAC",
+        "Chukchi and Beaufort Seas"   ~ "CBS",
+        "East Bering Sea"             ~ "EBS",
+        "Eastern GOM"                 ~ "EGOM",
+        "Gulf of Alaska"              ~ "GOA",
+        "Northeast Continental Shelf" ~ "NECS",
+        "Southeast Continental Shelf" ~ "SECS",
+        "Washington/Oregon"           ~ "WAOR",
+        "Western and Central GOM"     ~ "WCGOM") ) |>
+    relocate(boemrgn_key, boemrgn_name) |>
+    st_make_valid() |>
+    st_shift_longitude() |>   # shift to -180 to 180 for "East Bering Sea" spanning antimeridian
+    set_geom_ctr_area()
+  # mapView(ply_ecorgns); ply_ecorgns |> st_drop_geometry() |> View()
+  saveRDS(ply_ecorgns,  ecorgns_rds)  # 309,842 
+}
+ply_ecorgns <- readRDS(ecorgns_rds)
+
+# ply_prot: Protraction Diagrams ----
+prot_rds <- here(glue("data/ecoblks/ply_prot.rds"))
+if (!file.exists(prot_rds)){
+  ply_prot <- prot_shps |> 
+    enframe(name = "boemrgn_key", value = "path") |> 
+    mutate(
+      path = unlist(path),
+      sf   = map2(boemrgn_key, path, \(br, path){
+        
+        # br = "ATL"; path = prot_shps[[br]]
+        # br = "AK"; path = prot_shps[[br]]
+        # br = "GOM"; path = prot_shps[[br]]
+        o <- read_sf(path) |>
+          st_transform(4326)
+        st_geometry(o) <- "geom"
+        
+        # get fieldnames (ie columns) from source shapefile
+        ns <- names(o)
+        # f_pa    <- ns[ns %in% c("MMS_PLAN_A","MMS_PLAN_AREA_CD","PLAN_CODE")]
+        f_pd    <- ns[ns %in% c("PROT_NUMBE","PROT_NUMBER")]
+        f_pd_nm <- ns[ns %in% c("OPD_Name","PROT_NAME")]
+        f_pd_dt <- ns[ns %in% c("PROT_APRV_","PROT_APRV_DATE")]
+        message(glue("
+        {br}: {basename(path)}
+          {paste(ns, collapse = ', ')}
+          f_pd:    {paste(f_pd, collapse=', ')}
+          f_pd_nm: {paste(f_pd_nm, collapse=', ')}
+          f_pd_dt: {paste(f_pd_dt, collapse=', ')}"))
+        
+        o |>
+          mutate(
+            # boemrgn_key      = case_match(
+            #   br,
+            #   "Alaska"         ~ "AK",
+            #   "Atlantic"       ~ "ATL",
+            #   "Gulf of Mexico" ~ "GOM",
+            #   "Pacific"        ~ "PAC"),
+            # planarea_key     = glue(glue("{{boemrgn_key}}-pa{{{f_pa}}}")),
+            # prodiag_key      = glue(glue("{{planarea_key}}-pd{{{f_pd}}}")),
+            # blk_key          = glue(glue("{{prodiag_key}}-bk{{{f_bk}}}")),
+            boemrgn_key   = br,
+            # planarea_key     = glue(glue("{{{f_pa}}}")),
+            prot_key      = glue(glue("{{{f_pd}}}")),
+            prot_name     = glue(glue("{{{f_pd_nm}}}")),
+            prot_aprvdate = as.Date(get(f_pd_dt), tryFormats = c("%d-%b-%Y"))) |>
+          filter(!is.na(prot_key)) |> 
+          select(boemrgn_key, prot_key, prot_name, prot_aprvdate)
+      })) |> 
+    pull(sf) |> 
+    bind_rows() |> 
+    st_make_valid() |>
+    st_shift_longitude() |>   # shift to -180 to 180 for "East Bering Sea" spanning antimeridian
+    set_geom_ctr_area()
+  # mapView(ply_prot); ply_prot |> st_drop_geometry() |> View()
+  saveRDS(ply_prot,  prot_rds)  # 522 × 8
+}
+ply_prot <- readRDS(prot_rds)
+
+# ply_ecoprot: EcoProt (EcoAreas x Protraction Diagrams: ply_ecoareas x ply_prot) ----
+ply_ecoareas <- st_read(con, "ply_ecoareas") |> 
+    mutate(
+      # fix old style keys
+      boemrgn_key  = str_replace(boemrgn_key,  "^br", ""),
+      ecorgn_key   = str_replace(ecorgn_key,   "^er", ""),
+      planarea_key = str_replace(planarea_key, "^pa", "")) |> 
+    select(-ecoarea_key, -ecoarea_name)
+
+ply_ecoprot <- st_intersection(
+  ply_ecoareas |> 
+    drop_ctr_area(),
+  ply_prot |>
+    select(-boemrgn_key) |> 
+    drop_ctr_area()) |>   
+  arrange(boemrgn_key, ecorgn_key, planarea_key, prot_key) |> 
+  mutate(
+      ecorgn_ukey   = glue("br{boemrgn_key}_er{ecorgn_key}"),
+      planarea_ukey = glue("br{boemrgn_key}_er{ecorgn_key}_pa{planarea_key}"),
+      prodiag_ukey  = glue("br{boemrgn_key}_er{ecorgn_key}_pa{planarea_key}_pd{prot_key}")) |> 
+  # names(ply_ecoprot) |> paste(collapse = ", ")
+  # boemrgn_key, boemrgn_name, ecorgn_key, ecorgn_name, planarea_key, planarea_name, prot_key, prot_name, prot_aprvdate, geom
+  select(
+    boemrgn_key, boemrgn_name, 
+    ecorgn_ukey, ecorgn_key, ecorgn_name, 
+    planarea_ukey, planarea_key, planarea_name, 
+    prodiag_ukey, prodiag_key = prot_key, prodiag_name = prot_name, prodiag_aprvdate = prot_aprvdate) |> 
+  st_make_valid(model = "closed") |> 
+  st_shift_longitude() |> # OR st_wrap_dateline() for R vs PostGIS?
+  set_geom_ctr_area()
+# mapView(ply_ecoprot, zcol = "planarea_key")
+
+# TODO: 
+# - [ ] look for missing slivers
+
+prodiag_ukeys <- ply_ecoprot$prodiag_ukey[duplicated(ply_ecoprot$prodiag_ukey)]
+ply_ecoprot_dupes <- ply_ecoprot |> 
+  filter(prodiag_ukey %in% prodiag_ukeys)
+sf_use_s2(F)
+ply_ecoprot_dupes_fix <- ply_ecoprot_dupes |> 
+  group_by(
+    boemrgn_key, boemrgn_name, 
+    ecorgn_ukey, ecorgn_key, ecorgn_name, 
+    planarea_ukey, planarea_key, planarea_name, 
+    prodiag_ukey, prodiag_key, prodiag_name) |> 
+  summarize(
+    prodiag_aprvdate = first(prodiag_aprvdate))
+
+ply_ecoprot <- ply_ecoprot |> 
+  filter(!prodiag_ukey %in% prodiag_ukeys) |> 
+  bind_rows(
+    ply_ecoprot_dupes_fix)
+stopifnot(sum(duplicated(ply_ecoprot$prodiag_ukey)) == 0)
+
+source(here("libs/db.R")) # define: con
+
+tbl <- "ply_ecoprot"
+ply_ecoprot <- ply_ecoprot |> 
+  st_wrap_dateline()
+
+ply_ecoprot |> 
+  st_write(
+  dsn           = con,
+  layer         = tbl,
+  driver        = "PostgreSQL",
+  layer_options = "OVERWRITE=true")
+
+# enforce SRID so shows up in tile.marinesensivity.org
+dbExecute(con, glue(
+  "SELECT UpdateGeometrySRID('{tbl}','geom',4326);"))
+    
+# fix any invalid geometries
+dbExecute(con, glue("UPDATE {tbl} SET geom = ST_MakeValid(geom) WHERE NOT ST_IsValid(geom)"))
+
+# recalculate area for consistency
+dbExecute(con, glue("
+  UPDATE {tbl}
+    SET area_km2 = ST_AREA(geom::geography) / (1000 * 1000)"))
+
+# add spatial index for faster queries
+dbExecute(con, glue(
+  "CREATE INDEX IF NOT EXISTS {tbl}_geom_idx ON {tbl} USING gist(geom);"))
+
+# add unique index on prodiag_ukey
+dbExecute(con, "ALTER TABLE ply_ecoprot ADD PRIMARY KEY (prodiag_ukey)")
+
+# flds <- names(ply_ecoblks)[2:6]
+# dbExecute(con, glue(
+#   "CREATE INDEX IF NOT EXISTS 
+#     {tbl}_{paste(flds, collapse = '_')}_idx 
+#     ON {tbl} ({paste(flds, collapse = ', ')});"))
+
+```
+
+## Dissolve db ply `ecoprot` to `planarea` < `ecorgn` < `boemrgn`
+
+```{r}
+# label: dissolve_ecoblks
+
+ply_ep <- st_read(con, "ply_ecoprot") |> 
+  drop_ctr_area()
+
+sf_use_s2(F) # sf_use_s2(T)
+
+ply_pa <- ply_ep |> 
+  group_by(planarea_ukey) |> 
+  summarize(.groups = "drop") |> 
+  left_join(
+    ply_ep |> 
+      st_drop_geometry() |> 
+      distinct(
+        boemrgn_key, boemrgn_name, 
+        ecorgn_ukey, ecorgn_key, ecorgn_name, 
+        planarea_ukey, planarea_key, planarea_name),
+    by = "planarea_ukey") |> 
+  st_make_valid() |> 
+  set_geom_ctr_area()
+ 
+ply_er <- ply_ep |> 
+  group_by(ecorgn_ukey) |> 
+  summarize(.groups = "drop") |> 
+  left_join(
+    ply_ep |> 
+      st_drop_geometry() |> 
+      distinct(
+        boemrgn_key, boemrgn_name, 
+        ecorgn_ukey, ecorgn_key, ecorgn_name),
+    by = "ecorgn_ukey") |> 
+  st_make_valid() |> 
+  set_geom_ctr_area()
+ 
+ply_br <- ply_ep |> 
+  group_by(boemrgn_key) |> 
+  summarize(.groups = "drop") |> 
+  left_join(
+    ply_ep |> 
+      st_drop_geometry() |> 
+      distinct(
+        boemrgn_key, boemrgn_name),
+    by = "boemrgn_key") |> 
+  st_make_valid() |> 
+  set_geom_ctr_area()
+# mapView(ply_br)
+
+tbl_ply <- list(
+  "ply_ep_planareas" = ply_pa,
+  "ply_ep_ecorgns"   = ply_er,
+  "ply_ep_boemrgns"  = ply_br)
+
+for (tbl in names(tbl_ply)){ # tbl = names(tbl_ply)[1]
+
+  message(glue("{tbl}  ~ {Sys.time()}"))
+  
+  d <- tbl_ply[[tbl]]
+# 
+#   st_write(
+#     obj           = d,
+#     dsn           = con,
+#     layer         = tbl,
+#     driver        = "PostgreSQL",
+#     layer_options = "OVERWRITE=true")
+# 
+#   # enforce SRID so shows up in tile.marinesensivity.org
+#   dbExecute(con, glue(
+#     "SELECT UpdateGeometrySRID('{tbl}','geom',4326);"))
+# 
+#   # fix any invalid geometries
+#   dbExecute(con, glue("UPDATE {tbl} SET geom = ST_MakeValid(geom) WHERE NOT ST_IsValid(geom)"))
+# 
+#   # recalculate area for consistency
+#   dbExecute(con, glue("
+#     UPDATE {tbl}
+#       SET area_km2 = ST_AREA(geom::geography) / (1000 * 1000)"))
+# 
+#   # add spatial index for faster queries
+#   dbExecute(con, glue(
+#     "CREATE INDEX IF NOT EXISTS {tbl}_geom_idx ON {tbl} USING gist(geom);"))
+  
+  # add unique index on br_er_pa_pd_bk_key
+  fld <- names(d)[1]
+  # dbExecute(con, glue(
+  #   "CREATE UNIQUE INDEX IF NOT EXISTS idx_{tbl}_{fld} ON {tbl} USING btree({fld});"))
+  dbExecute(con, glue("ALTER TABLE {tbl} ADD PRIMARY KEY ({fld})"))
+  
+  # flds <- names(ply_ecoblks)[2:6]
+  # dbExecute(con, glue(
+  #   "CREATE INDEX IF NOT EXISTS 
+  #   {tbl}_{paste(flds, collapse = '_')}_idx 
+  #   ON {tbl} ({paste(flds, collapse = ', ')});"))
+}
+
+```
