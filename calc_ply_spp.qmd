@@ -320,7 +320,7 @@ dbExecute(
 ```
 
 ```{r}
-#| label: NEWEST ply_spp vs OLD ply_species
+#| label: NEWEST ply_spp with ecoprot_cell
 
 dbExecute(con, "DROP TABLE IF EXISTS public.ply_spp")
 dbExecute(con, "CREATE TABLE IF NOT EXISTS public.ply_spp (
@@ -330,7 +330,7 @@ dbExecute(con, "CREATE TABLE IF NOT EXISTS public.ply_spp (
     sp_km2 double precision,
     sp_suit double precision)")
 
-# ply_spp by blk ----
+# ply_spp by prot ----
 # DEBUG: subset
 # d <- tbl(con, "ply_ecoblks") |> 
 #   filter(prodiag_ukey == "brAK_erEBS_paALA_pdNM01-08") |>  # DEBUG
@@ -365,40 +365,15 @@ q <- glue("
   {q_sel}") # 384,432: brAK_erEBS_paALA_pdNM01-08
 # message(q)
 dbExecute(con, q)
-toc()
-
-# ply_spp by prodiag ----
-q_sel <- tbl(con, "ply_ecoblks") |>
-  select(prodiag_ukey, blk_ukey) |> 
-  left_join(
-    tbl(con, "ecoblk_cell") |> 
-      select(blk_ukey, cell_id, area_km2),
-    by = "blk_ukey") |> 
-  left_join(
-    tbl(con, "spp_cells") |> 
-      select(cell_id, sp_key, probability),
-    by = "cell_id") |> 
-  group_by(prodiag_ukey, sp_key) |> 
-  summarize(
-    sp_km2  = sum(area_km2),
-    sp_suit = sum(probability * area_km2) / sum(area_km2),
-    .groups = "drop") |> 
-  mutate(
-    ply_fld = "prodiag_ukey",
-    ply_key = prodiag_ukey) |> 
-  select(ply_fld, ply_key, sp_key, sp_km2, sp_suit) |> 
-  sql_render()
-
-tic("ply_spp: prodiag")
-q <- glue("
-  INSERT INTO ply_spp (ply_fld, ply_key, sp_key, sp_km2, sp_suit)
-  {q_sel}")
-dbExecute(con, q)
-toc()
+toc() # 71.33 sec
 
 # ply_spp by planarea ----
-q_sel <- tbl(con, "ply_ecoblks") |>
-  select(planarea_ukey, blk_ukey, cell_id, area_km2) |> 
+q_sel <- tbl(con, "ecoprot_cell") |> 
+  select(prodiag_ukey, cell_id, area_km2) |> 
+  left_join(
+    tbl(con, "ply_ecoprot") |>
+      select(prodiag_ukey, planarea_ukey),
+    by = "prodiag_ukey") |> 
   left_join(
     tbl(con, "spp_cells") |> 
       select(cell_id, sp_key, probability),
@@ -418,16 +393,16 @@ tic("ply_spp: planarea")
 q <- glue("
   INSERT INTO ply_spp (ply_fld, ply_key, sp_key, sp_km2, sp_suit)
   {q_sel}")
-dbExecute(con, q)
-toc()
+dbExecute(con, q) # 99,834
+toc() # 61.051 sec
 
 # ply_spp by ecorgn ----
-q_sel <- tbl(con, "ply_ecoblks") |>
-  select(ecorgn_ukey, blk_ukey, area_km2) |> 
+q_sel <- tbl(con, "ecoprot_cell") |> 
+  select(prodiag_ukey, cell_id, area_km2) |> 
   left_join(
-    tbl(con, "ply_ecoblks") |> 
-      select(blk_ukey, ecorgn_ukey),
-    by = "blk_ukey") |> 
+    tbl(con, "ply_ecoprot") |>
+      select(prodiag_ukey, ecorgn_ukey),
+    by = "prodiag_ukey") |> 
   left_join(
     tbl(con, "spp_cells") |> 
       select(cell_id, sp_key, probability),
@@ -447,8 +422,8 @@ tic("ply_spp: ecorgn")
 q <- glue("
   INSERT INTO ply_spp (ply_fld, ply_key, sp_key, sp_km2, sp_suit)
   {q_sel}")
-dbExecute(con, q)
-toc()
+dbExecute(con, q) # 42,763
+toc() # 41.193 sec
 ```
 
 - [ ] TODO: iucnRedListCategory, group_gmbi, group_simple1
@@ -1551,7 +1526,6 @@ dbListTables(con_dd)
 # "ecoblk_cell" "ply_ecoblks" "ply_spp"     "spp_cells"
 ```
 
-
 ```{r}
 #| label: duckdb_ply_area
 
@@ -1692,6 +1666,167 @@ pa1 <- st_read(con, "ply_eb_planareas") |>
 #   hist()
 
 ```
+
+```{r}
+#| label: pgprot_ply_area
+
+d_ply_area <- bind_rows(
+  tbl(con, "ply_ep_ecorgns") |> 
+    mutate(
+      ply_fld = "ecorgn_ukey") |> 
+    select(ply_fld, ply_key = ecorgn_ukey, area_km2) |> 
+    collect(),
+  tbl(con, "ply_ep_planareas") |> 
+    mutate(
+      ply_fld = "planarea_ukey") |> 
+    select(ply_fld, ply_key = planarea_ukey, area_km2) |> 
+    collect(),
+  tbl(con, "ply_ecoprot") |> 
+    mutate(
+      ply_fld = "prodiag_ukey") |> 
+    select(ply_fld, ply_key = prodiag_ukey, area_km2) |> 
+    collect()) |> 
+  arrange(ply_fld, ply_key)
+
+dbWriteTable(con, "ply_area", d_ply_area)
+# dbListTables(con_dd)
+# "ecoblk_cell" "ply_area"    "ply_ecoblks" "ply_spp"     "spp"         "spp_cells"  
+```
+
+```{r}
+#| label: pgprot_ply_taxa
+
+d_ply_taxa <- tbl(con, "ply_spp") |> 
+  filter(!is.na(sp_key)) |> 
+  select(ply_fld, ply_key, sp_key, sp_km2, sp_suit) |> 
+  left_join(
+    tbl(con, "ply_area") |> 
+      rename(ply_km2 = area_km2),
+    by = c("ply_fld", "ply_key")) |> 
+  mutate(
+    sp_pct_ply = ifelse(sp_km2 / ply_km2 > 1, 1, sp_km2 / ply_km2)) |> 
+  left_join(
+    tbl(con, "spp") |> 
+      select(sp_key = sp_key_am, taxa = group_gmbi, iucn_cat = iucnRedListCategory),
+    by = "sp_key") |> 
+  mutate(
+    iucn_score = case_match(
+      iucn_cat,
+      # skipped: EX (extinct), NE (not evaluated), DD (data deficient), <NA> (not available)
+      # https://oceanhealthindex.org/images/htmls/Supplement.html#62_Biodiversity
+      "CR" ~ 1,       #  - CR: Critically Endangered	
+      "EN" ~ 0.8,     #  - EN: Endangered	
+      "VU" ~ 0.6,     #  - VU: Vulnerable
+      "NT" ~ 0.4,     #  - NT: Near Threatened
+      "LC" ~ 0.2)) |> #  - LC: Least Concern
+  # TODO: show species in app before filtering
+  filter(!is.na(iucn_score)) |> 
+  group_by(ply_fld, ply_key, taxa) |> 
+  summarize(
+    n_spp      = n(),
+    sp_pct     = mean(sp_pct_ply),
+    sp_suit    = mean(sp_suit),
+    sp_iucn    = mean(iucn_score),
+    score_raw  = sum(sp_pct_ply * sp_suit * iucn_score) / n(),
+    .groups = "drop") |>
+  arrange(ply_fld, ply_key, taxa) |> 
+  collect()
+
+d_ply_taxa$ply_fld |> table()
+# ecorgn_ukey planarea_ukey  prodiag_ukey 
+#          98           298          4852
+
+librarian::shelf(purrr, scales)
+
+d_ply_refs <- d_ply_taxa |> 
+  mutate(
+    ecorgn_ukey = str_extract(ply_key, "br[A-Z]+_er[A-Z]+")) |> 
+  select(ecorgn_ukey, ply_key, taxa, score_raw) |> 
+  group_by(ecorgn_ukey, taxa) |> 
+  summarize(
+    score_min = min(score_raw),
+    score_max = max(score_raw),
+    ply_key_min = ply_key[which.min(score_raw)],
+    ply_key_max = ply_key[which.max(score_raw)],
+    .groups = 'drop')
+
+d_ply_taxa_scores <- d_ply_taxa |> 
+  mutate(
+    ecorgn_ukey = str_extract(ply_key, "br[A-Z]+_er[A-Z]+")) |> 
+  left_join(
+    d_ply_refs,
+    by = c("ecorgn_ukey", "taxa")) |> 
+  mutate(
+    score = pmap_dbl(
+      list(score_raw, score_min, score_max), 
+      \(v, v_min, v_max) scales::rescale(v, to = c(0,1), from = c(v_min, v_max))))
+# table(d_ply_taxa_scores$ply_fld)
+#   ecorgn_ukey planarea_ukey  prodiag_ukey 
+#            98           298          4852
+dbWriteTable(con, "ply_taxa_scores", d_ply_taxa_scores)
+
+d_ply_scores <- d_ply_taxa_scores |>
+  group_by(ply_fld, ply_key) |> 
+  summarize(
+    score_nspp = sum(score * n_spp) / sum(n_spp),
+    score_even = mean(score),
+    .groups = "drop")
+# table(d_ply_scores$ply_fld)
+#   ecorgn_ukey planarea_ukey  prodiag_ukey 
+#            10            35           669
+# dbExecute(con, "ALTER TABLE ply_scores RENAME TO ply_scores_preprot")
+dbWriteTable(con, "ply_scores", d_ply_scores)
+```
+
+```{r}
+#| label: pgprot_scores_to_ply
+
+tbls <- c(
+  "ply_ecoprot"      = "prodiag_ukey",
+  "ply_ep_planareas" = "planarea_ukey",
+  "ply_ep_ecorgns"   = "ecorgn_ukey")
+
+for (tbl in names(tbls)){ # tbl = names(tbls)[2]
+  fld <- tbls[[tbl]]
+  
+  dbExecute(con, glue("ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS score_nspp FLOAT8"))
+  dbExecute(con, glue("ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS score_even FLOAT8"))
+  dbExecute(con, glue("
+    UPDATE {tbl} p
+    SET score_nspp = s.score_nspp,
+        score_even = s.score_even
+    FROM ply_scores s
+    WHERE p.{fld} = s.ply_key"))
+}
+
+d_ply_scores |> 
+  filter(ply_fld == "planarea_ukey") |> 
+  # pull(score_nspp) # TODO: fix all 0s!
+  pull(score_even)s
+p_pa <- st_read(con, "ply_ep_planareas")
+p_pa |> 
+  select(planarea_ukey, score_even)
+
+p_pa |> 
+  st_shift_longitude() |> 
+  mapView(zcol = "score_even")
+
+
+tbl(con, "ply_ep_planareas") |> 
+  select(planarea_ukey, score_even)
+
+p_pa |> 
+  select(planarea_ukey) |> 
+  left_join(
+    d_ply_scores |> 
+      select(ply_key, score_even),
+    by = c("planarea_ukey" = "ply_key")) |> 
+  # st_wrap_dateline() |> 
+  st_shift_longitude() |> 
+  mapView(zcol = "score_even")
+
+```
+
 
 ```{sql}
 
