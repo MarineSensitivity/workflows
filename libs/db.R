@@ -1,8 +1,8 @@
 # packages ----
-if (!require("librarian")){
-  install.packages("librarian")
-  library(librarian)
-}
+# if (!require("librarian")){
+#   install.packages("librarian")
+#   library(librarian)
+# }
 librarian::shelf(
   DBI, dbplyr, dplyr, glue, here, RPostgres,
   quiet = T)
