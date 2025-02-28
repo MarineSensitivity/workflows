@@ -5,44 +5,283 @@ editor_options:
   chunk_output_type: console
 ---
 
-
-Latest
-
-- [ERDDAP - search "productivity_viirs_snpp"](https://coastwatch.pfeg.noaa.gov/erddap/search/index.html?page=1&itemsPerPage=1000&searchFor=productivity_viirs_snpp)
-
-- monthly has lots of cloud cover -- see [WMS map](https://coastwatch.pfeg.noaa.gov/erddap/wms/productivity_viirs_snpp_monthly/index.html)
-
-- [Arctic Ocean Primary Productivity: The Response of Marine Algae to Climate Warming and Sea Ice Decline - NOAA Arctic](https://arctic.noaa.gov/report-card/report-card-2023/arctic-ocean-primary-productivity-the-response-of-marine-algae-to-climate-warming-and-sea-ice-decline-2023/#methods_data)
-![](https://arctic.noaa.gov/wp-content/uploads/2023/11/ARC23-PrimaryProductivity-frey-Fig3-878x1024.png)
-
-
 ```{r}
+#| label: setup
+
 librarian::shelf(
-  glue, here, jsonlite, leaflet, rerddap, sf, terra)
-source("libs/db.R")
+  cmocean, DT, fs, glue, here, htmltools, janitor, jsonlite, leaflet, mapview, 
+  rerddap, R.utils, sf, stringr, terra, units)
 
-hdf <- "/Users/bbest/My Drive/projects/msens/data/raw/oregonstate.edu/vgpm.2024001.hdf"
+source(here("libs/db.R")) # define: database connection (con)
 
-r <- rast(hdf)
-ext(r) <- c(-180, 180, -90, 90)
-crs(r) <- "EPSG:4326"
-r[r==-9999] <- NA
-plot(r)
-
-
-r_p <- r |> 
-  crop(p)
-plot(r_p)
-p
-
-leaflet() |> 
-  addProviderTiles(providers$Esri.OceanBasemap) |> 
-  addRasterImage(r_p) |> 
-  addPolygons(data = p)
+yr               <- 2023  # vgpm-viirs most recent complete year
+url_tar          <- glue("http://orca.science.oregonstate.edu/data/1x2/monthly/vgpm.r2022.v.chl.v.sst/hdf/vgpm.v.{yr}.tar")
+file_tar         <- glue("/Users/bbest/My Drive/projects/msens/data/raw/oregonstate.edu/vgpm.v.{yr}.tar")
+dir_out          <- "/Users/bbest/My Drive/projects/msens/data/derived"
+dir_raw          <- "/Users/bbest/My Drive/projects/msens/data/raw/boem.gov"
+vgpm_tif         <- glue("{dir_out}/vgpm-viirs_{yr}-daily-avg.tif")
+oa_new_geo       <- glue("{dir_raw}/OCS_Area_Polygons.geojson")
+pa_new_geo       <- glue("{dir_raw}/OCS_Proposed_Planning_Area_Polygons.geojson")
+pa_oa_geo        <- glue("{dir_out}/pa_oa_2025.geojson")
+verbose          <- F
 ```
 
+## Vertically Generalized Production Model (VGPM), VIIRS `r yr` | OregonState
+
+Source:
+
+- [Ocean Productivity from Oregon State](http://sites.science.oregonstate.edu/ocean.productivity)
+  - [Standara VGPM: 1080 by 2160 Monthly HDF files from VIIRS R2022](http://orca.science.oregonstate.edu/1080.by.2160.monthly.hdf.vgpm.v.chl.v.sst.php)
+  - [Frequently Asked Questions](http://orca.science.oregonstate.edu/faq01.php)
+
+Calculated sum of `r yr` monthly net primary production (NPP) from VIIRS data.
+
+> Community guidance for developing this website was to provide a single productivity product as a Standard product. For this, we initially chose the original Vertically Generalized Production Model (VGPM) (Behrenfeld and Falkowski, 1997a) as the standard algorithm. The VGPM is a "chlorophyll-based" model that estimate net primary production from chlorophyll using a temperature-dependent description of chlorophyll-specific photosynthetic efficiency. For the VGPM, net primary production is a function of chlorophyll, available light, and the photosynthetic efficiency.
+>
+> Standard products are based on chlorophyll, temperature and PAR data from SeaWiFS, MODIS and VIIRS satellites, along with estimates of euphotic zone depth from a model developed by Morel and Berthon (1989) and based on chlorophyll concentration.
+
+Units: mg C / m^2^ / day
+
+Citation: [Behrenfeld and Falkowski, 1997a](http://science.oregonstate.edu/ocean.productivity/references.php#Behrenfeld.1997a)
 
 ```{r}
+#| label: get_vgpm
+
+if (!file.exists(vgpm_tif)) {
+  if(!file.exists(file_tar))
+    download.file(url_tar, file_tar)
+  
+  dir_untar <- path_ext_remove(file_tar)
+  dir.create(dir_untar, showWarnings = F)
+  untar(file_tar, exdir = dir_untar)
+  
+  # Get list of compressed files
+  files_gz <- dir_ls(dir_untar, glob = "*.gz")
+  
+  dir_unzip <- file.path(dir_untar, "unzipped")
+  dir.create(dir_unzip, showWarnings = F)
+  
+  # Unzip all files
+  for (file_gz in files_gz) { # file_gz = files_gz[1]
+    file_hdf <- file.path(dir_unzip, sub("\\.gz$", "", basename(file_gz)))
+    
+    if (!file.exists(file_hdf))
+      gunzip(file_gz, destname = file_hdf)
+  }
+  
+  # Get list of unzipped HDF files
+  files_hdf <- dir_ls(dir_unzip, glob = "*.hdf") # length(files_hdf) = 12
+  
+  # Function to read VGPM data from HDF file
+  read_vgpm_hdf <- function(file_hdf) { # file_hdf <- files_hdf[1]
+    # First, query the HDF file to see the subdatasets
+    sds_info <- terra::describe(file_hdf)
+    if (verbose)
+      print(sds_info)
+    
+    tryCatch({
+      r <- terra::rast(file_hdf, noflip=T)
+      
+      # Standard VGPM product is typically 1/6 degree global grid (-180 to 180, -90 to 90)
+      ext(r) <- c(-180, 180, -90, 90)
+      crs(r) <- "EPSG:4326"
+      r[r==-9999] <- NA
+      # plot(r)
+      
+      return(r)
+    }, error = function(e) {
+      warning("Error reading", file_hdf, ":", e$message, "\n")
+      return(NULL)
+    })
+  }
+  
+  # Initialize a list to store all monthly rasters
+  monthly_rasters <- list()
+  
+  # Read all monthly files
+  for (i in seq_along(files_hdf)) {
+    if (verbose)
+      message("Processing file", i, "of", length(files_hdf), ":", files_hdf[i], "\n")
+    r <- read_vgpm_hdf(files_hdf[i])
+    
+    if (!is.null(r)) {
+      monthly_rasters[[i]] <- r
+    }
+  }
+  
+  # Create a SpatRaster collection from all the monthly rasters
+  
+  s_vgpm <- rast(monthly_rasters)
+  
+  r <- app(s_vgpm, mean, na.rm = TRUE)
+  names(r) <- "npp_daily_avg"
+  
+  writeRaster(r, vgpm_tif, overwrite = TRUE)
+  
+  message(glue(
+    "Annual products created and saved.
+    - daily avg for {yr}: {vgpm_tif}"))
+}
+
+r <- rast(vgpm_tif) # |> 
+  # rotate(left=F) # -180 to 180 -> 0 to 360
+  # shift(dx = 0.0001) # problem with -180 extent
+plet(r)
+mapView(r, col.regions = cmocean("algae"))
+```
+
+## NEW Proposed Planning Areas
+
+BOEM internal:
+
+- [Marine Ecoregions](https://boem.maps.arcgis.com/home/item.html?id=b00a15d7e4224ef98e496542d9a9d25f)
+- [OCS Areas](https://boem.maps.arcgis.com/home/item.html?id=8dbc5e97fc3346f58466c2de7b2fc870)
+- [Proposed Planning Areas](https://boem.maps.arcgis.com/home/item.html?id=b833761e456f4cbfb227a4b5a9632b89)
+
+```{r}
+#| label: get_pa
+
+set_geom_ctr_area <- function(x){
+  x |>
+    st_set_geometry("geom") |>
+    mutate(
+      ctr      = st_centroid(geom),
+      ctr_lon  = ctr |> st_coordinates() %>% .[,"X"],
+      ctr_lat  = ctr |> st_coordinates() %>% .[,"Y"],
+      area_km2 = st_area(geom) |>
+        set_units(km^2) |>
+        as.numeric() ) |>
+    select(-ctr)
+}
+
+drop_ctr_area <- function(x){
+  x |>
+    select(-ctr_lon, -ctr_lat, -area_km2)
+}
+
+if (!file.exists(pa_oa_geo)){
+  pa0 <- st_read(con, "ply_planareas_s05") |> 
+    st_drop_geometry() |> 
+    select(planarea_key, planarea_name) |> 
+    mutate(
+      planarea_name = str_replace(planarea_name, "Gulf of Mexico", "Gulf of America"),
+      planarea_key = str_replace(planarea_key, "pa", ""),
+      planarea_key = case_match(
+        planarea_key, 
+        "CGM" ~ "CGA",
+        "EGM" ~ "EGA",
+        "WGM" ~ "WGA",
+        .default = planarea_key))
+  
+  pa <- read_sf(pa_new_geo) |> 
+    clean_names() |> 
+    rename(
+      region_name  = region,
+      planarea_key = planning_area) |>
+    mutate(
+      region_name = str_replace(region_name, "Gulf of Mexico", "Gulf of America"),
+      region_key = case_match(
+        region_name,
+        "Alaska"          ~ "AK",
+        "Atlantic"        ~ "AT",
+        "Gulf of America" ~ "GA",
+        "Pacific"         ~ "PA"),
+      planarea_key = case_match(
+        planarea_key, 
+        "CG" ~ "CGA",
+        "EG" ~ "EGA",
+        "WG" ~ "WGA",
+        .default = planarea_key)) |> 
+    left_join(
+      pa0, by = "planarea_key") |> 
+    mutate(
+      planarea_name = case_match(
+        planarea_key,
+        "HAR" ~ "HAR TODO Rename",
+        .default = planarea_name)) # TODO: planarea_name for HAR is ...?
+  
+  oa <- read_sf(oa_new_geo) |> 
+    clean_names() |> 
+    rename(
+      region_name   = region,
+      planarea_name = area_name) |> 
+    filter(!planarea_name %in% c("Alaska", "Pacific Coast", "Atlantic Coast", "Gulf of Mexico")) |> 
+    mutate(
+      region_key = case_match(
+        region_name,
+        "Atlantic" ~ "AT",
+        "Pacific"  ~ "PA"),
+      planarea_key = case_match(
+        planarea_name,
+        "American Samoa"                                        ~ "AMS",
+        "Guam and Commonwealth of the Northern Mariana Islands" ~ "GUA",
+        "Hawaiian Islands and Midway Atoll"                     ~ "HAW",
+        "Howland and Baker Islands"                             ~ "HOW",
+        "Jarvis Island"                                         ~ "JAR",
+        "Johnston Atoll"                                        ~ "JOH",
+        "Palmyra Atoll and Kingman Reef"                        ~ "PAL",
+        "Puerto Rico and U.S. Virgin Islands"                   ~ "PUR",
+        "Wake Island"                                           ~ "WAK"))
+  
+  pa_oa <- bind_rows(
+    pa,
+    oa) |>
+    select(region_key, region_name, planarea_key, planarea_name) |>
+    st_make_valid() |> 
+    set_geom_ctr_area() |> 
+    st_shift_longitude() |> 
+    arrange(region_key, planarea_key)
+  
+  write_sf(pa_oa, pa_oa_geo)
+}
+
+pa_oa <- read_sf(pa_oa_geo)
+
+mapView(pa_oa)
+
+pa_oa |> 
+  st_drop_geometry() |> 
+  datatable()
+```
+
+## VGPM in Proposed Planning Areas
+
+Extract daily average net primary production (NPP) values across all cells within the proposed planning areas.
+
+```{r}
+#| label: get_pa_vgpm
+
+r <- rast(vgpm_tif)
+r_r <- r |> 
+  rotate(left=F) # -180 to 180 -> 0 to 360
+  # shift(dx = 0.0001) # problem with -180 extent
+
+pa_oa_npp <- pa_oa |>
+  mutate(
+    npp_cellavg = zonal(r_r, pa_oa |> vect(), fun = "mean", na.rm = T) |>
+      pull(monthly_npp_mean))
+
+(mapView(r, col.regions = cmocean("algae"), layer.name = "raster") + 
+  mapView(pa_oa_npp, zcol = "npp_cellavg", col.regions = cmocean("algae"), layer.name = "planning areas")) |> 
+  slot("map") |> 
+   addControl(tags$div(HTML("units: mg C / m<sup>2</sup> / day")), position = "bottomright")
+
+pa_oa_npp |> 
+  st_drop_geometry()
+```
+ 
+```{r}
+#| label: old_br_east_west
+#| eval: false
+
+# Latest
+# 
+# -   [ERDDAP - search "productivity_viirs_snpp"](https://coastwatch.pfeg.noaa.gov/erddap/search/index.html?page=1&itemsPerPage=1000&searchFor=productivity_viirs_snpp)
+# 
+# -   monthly has lots of cloud cover -- see [WMS map](https://coastwatch.pfeg.noaa.gov/erddap/wms/productivity_viirs_snpp_monthly/index.html)
+# 
+# -   [Arctic Ocean Primary Productivity: The Response of Marine Algae to Climate Warming and Sea Ice Decline - NOAA Arctic](https://arctic.noaa.gov/report-card/report-card-2023/arctic-ocean-primary-productivity-the-response-of-marine-algae-to-climate-warming-and-sea-ice-decline-2023/#methods_data) ![](https://arctic.noaa.gov/wp-content/uploads/2023/11/ARC23-PrimaryProductivity-frey-Fig3-878x1024.png)
+
 dir_nc <- here("data/productivity")
 dates  <- c("2023-01-16", "2023-12-16")
 
@@ -80,6 +319,9 @@ p_br |>
 ```
 
 ```{r}
+#| label: old_erddap_fetch
+#| eval: false
+
 # iterate over polygon chunks ----
 for (i in 1:nrow(p_br)){ # p = p_br[3,]
   
@@ -139,42 +381,45 @@ r_cefi_rf <- r_cefi_r |>
 plet(
   r_cefi_rf[[1]],
   tiles = "Esri.OceanBasemap")
-
-
-
 ```
+
+<!--
 
 ## CopernicusMarine
 
-- [Add layer to map | Copernicus Marine MyOcean Viewer](https://data.marine.copernicus.eu/viewer/expert?view=layers&dataset=GLOBAL_ANALYSISFORECAST_BGC_001_028)
+-   [Add layer to map \| Copernicus Marine MyOcean Viewer](https://data.marine.copernicus.eu/viewer/expert?view=layers&dataset=GLOBAL_ANALYSISFORECAST_BGC_001_028)
 
-- Product ID: GLOBAL_ANALYSISFORECAST_BGC_001_028
-- Spatial extent: Global OceanLat -80° to 90°Lon -180° to 179.75°
-- Spatial resolution: 0.25° × 0.25°
-- Temporal extent: 30 Sep 2021 to 27 Feb 2025
-- Temporal resolution: DailyMonthly
-- Elevation (depth) levels: 50
+-   Product ID: GLOBAL_ANALYSISFORECAST_BGC_001_028
 
-- [User Manual](https://documentation.marine.copernicus.eu/PUM/CMEMS-GLO-PUM-001-028.pdf)
+-   Spatial extent: Global OceanLat -80° to 90°Lon -180° to 179.75°
 
-`cmems_mod_glo_bgc-bio_anfc_0.25deg_P1M-m`
-- `nppv`: Net primary production of biomass expressed as carbon per unit volume in sea water[mg/m3/day]
-- `o2`: Mole concentration of dissolved molecular oxygen in sea water [mmol/m3]
+-   Spatial resolution: 0.25° × 0.25°
 
-- [Global Ocean Biogeochemistry Analysis and Forecast | Copernicus Marine Service](https://data.marine.copernicus.eu/product/GLOBAL_ANALYSISFORECAST_BGC_001_028/download?dataset=cmems_mod_glo_bgc-bio_anfc_0.25deg_P1M-m_202311)
-- Choose start and end times within this range:10/01/2021, 00:00 → 01/01/2025, 00:00
-- Choose start and end depths within this range:0.5 m → 5727.9 m
+-   Temporal extent: 30 Sep 2021 to 27 Feb 2025
+
+-   Temporal resolution: DailyMonthly
+
+-   Elevation (depth) levels: 50
+
+-   [User Manual](https://documentation.marine.copernicus.eu/PUM/CMEMS-GLO-PUM-001-028.pdf)
+
+`cmems_mod_glo_bgc-bio_anfc_0.25deg_P1M-m` - `nppv`: Net primary production of biomass expressed as carbon per unit volume in sea water\[mg/m3/day\] - `o2`: Mole concentration of dissolved molecular oxygen in sea water \[mmol/m3\]
+
+-   [Global Ocean Biogeochemistry Analysis and Forecast \| Copernicus Marine Service](https://data.marine.copernicus.eu/product/GLOBAL_ANALYSISFORECAST_BGC_001_028/download?dataset=cmems_mod_glo_bgc-bio_anfc_0.25deg_P1M-m_202311)
+-   Choose start and end times within this range:10/01/2021, 00:00 → 01/01/2025, 00:00
+-   Choose start and end depths within this range:0.5 m → 5727.9 m
 
 OR
 
-- [Global Ocean Colour (Copernicus-GlobColour), Bio-Geo-Chemical, L4 (monthly and interpolated) from Satellite Observations (1997-ongoing) | Copernicus Marine Service](https://data.marine.copernicus.eu/product/OCEANCOLOUR_GLO_BGC_L4_MY_009_104/download?dataset=cmems_obs-oc_glo_bgc-pp_my_l4-multi-4km_P1M_202311)
-- Choose start and end times within this range:09/01/1997, 00:00→01/01/2025, 00:00
-Primary productivity of biomass expressed as carbonPP [mg/m2/day]
-Primary Productivity - Uncertainty estimationPP_uncertainty [%]
-also cuts off
+-   [Global Ocean Colour (Copernicus-GlobColour), Bio-Geo-Chemical, L4 (monthly and interpolated) from Satellite Observations (1997-ongoing) \| Copernicus Marine Service](https://data.marine.copernicus.eu/product/OCEANCOLOUR_GLO_BGC_L4_MY_009_104/download?dataset=cmems_obs-oc_glo_bgc-pp_my_l4-multi-4km_P1M_202311)
+-   Choose start and end times within this range:09/01/1997, 00:00→01/01/2025, 00:00 Primary productivity of biomass expressed as carbonPP \[mg/m2/day\] Primary Productivity - Uncertainty estimationPP_uncertainty \[%\] also cuts off
 
+-->
 
 ```{r}
+#| label: old_copernicus_setup
+#| eval: false
+
 librarian::shelf(
   dplyr, DT, ggplot2, glue, here, jsonlite, leaflet, mapview, ncdf4, readr, reticulate, 
   sf, stringr, terra, tidyr,
@@ -211,7 +456,8 @@ datasets |>
 ```
 
 ```{r}
-#| label: get_cm
+#| label: old_copernicus_fetch
+#| eval: false
 
 dir_cm <- here("data/productivity/copernicus")
 dir.create(dir_cm, showWarnings = F, recursive = F)
@@ -261,8 +507,10 @@ message(glue("{nrow(p_br)}/{nrow(p_br)} done: {basename(nc)}  ~ {Sys.time()}"))
 
 ```
 
-
 ```{r}
+#| label: old_copernicus_nc
+#| eval: false
+
 o <- nc_open(nc)
 o
 
@@ -290,9 +538,9 @@ plet(
 
 ```
 
-
 ```{r}
-#| label: summarize_r
+#| label: old_copernicus_summarize
+#| eval: false
 
 for (i in 1:nrow(p_br)){ # i = 1
   
@@ -341,4 +589,3 @@ plet(
     data        = p,
     fillOpacity = 0.2)
 ```
-
