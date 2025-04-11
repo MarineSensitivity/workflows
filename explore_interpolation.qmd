@@ -1,0 +1,394 @@
+---
+title: "Explore Interpolation of SDMs"
+editor: visual
+execute:
+  warning: false
+editor_options: 
+  chunk_output_type: console
+---
+
+-   Get a few species with different geographic traits, starting with species in Gulf of America:
+    -   small range, high density
+    -   large range, low density
+-   Int
+
+
+Background:
+
+- [MarineSDMs - Explorations](https://marinebon.github.io/MarineSDMs/explorations.html)
+- [MarineSDMs - AquaMaps Downscaled](https://marinebon.github.io/MarineSDMs/explorations/am-fine.html)
+- [marinebon/aquamaps-downscaled: initial attempt to downscale AquaMaps species distribution models to finer spatial resolution a la GEBCO bathymetry (15 arc second)](https://github.com/marinebon/aquamaps-downscaled/tree/main)
+- [aquamaps-downscaled/index.qmd at main · marinebon/aquamaps-downscaled](https://github.com/marinebon/aquamaps-downscaled/blob/503c62f39552c4ad2417413b13c49d4d4405f3ab/index.qmd)
+- [Downscaling AquaMaps](https://marinebon.github.io/aquamaps-downscaled/)
+- [aquamaps-downscaled/am-env\_to\_ee.qmd at main · marinebon/aquamaps-downscaled](https://github.com/marinebon/aquamaps-downscaled/blob/main/am-env_to_ee.qmd)
+
+## AquaMaps duckdb database
+
+```{r}
+#| label: setup
+
+librarian::shelf(
+  cmocean, DBI, dplyr, DT, duckdb, fs, glue, here, htmltools, janitor, knitr,
+  leaflet, librarian, mapview,
+  # raquamaps/raquamaps,
+  marinesensitivity/msens,
+  RColorBrewer, readr, sf, stringr, terra, tibble, tidyr,
+  quiet = T)  # zeallot
+mapviewOptions(basemaps = "Esri.OceanBasemap")
+
+dir_data <- "~/My Drive/projects/msens/data"
+path_dd  <- glue("{dir_data}/derived/aquamaps/am.duckdb")
+
+con_dd   <- dbConnect(
+  duckdb(
+    dbdir     = path_dd,
+    read_only = T))
+# dbDisconnect(con_dd, shutdown = T)
+# dbListTables(con_dd)
+#   "_tbl_fld_renames" "cells" "spp" "spp_cells" "spp_occs" "spp_prefs"
+tbl(con_dd, "_tbl_fld_renames") |> 
+  collect() |> 
+  datatable()
+```
+
+## Gulf of America
+
+R package [`msens`](https://marinesensitivity.org/msens/news/index.html#msens-020): `ply_boemrgns` \> `ply_ecorgns` \| `ply_planareas` \> `ply_ecoareas`
+
+TODO:
+
+-   [ ] Rename Gulf of Mexico to Gulf of America
+    -   `boemrgn_key`: "brGOM" -\> "brGOA"
+    -   `boemrgn_name`: "Gulf of Mexico" -\> "Gulf of America"
+
+```{r}
+#| label: spp_goa
+
+# st_bbox(msens::ply_boemrgns)
+#      xmin      ymin      xmax      ymax 
+# 166.95776  23.78077 295.89167  74.99636
+#   so [0,360], not [-180, 180]
+
+goa <- msens::ply_boemrgns |> 
+  filter(boemrgn_key == "brGOM") |> 
+  st_wrap_dateline()    # [   0, 360] -> [-180, 180]
+# st_shift_longitude()  # [-180, 180] -> [    0,360]
+
+# st_bbox(goa)
+# xmin      ymin      xmax      ymax 
+# -97.23899  23.78077 -81.17011  30.28910
+mapView(goa)
+```
+
+## Get species in Gulf of America
+
+```{r}
+# get cells within goa
+pt_cell <- tbl(con_dd, "cells") |> 
+  collect() |> 
+  st_as_sf(
+    coords = c("center_long", "center_lat"), crs = 4326, remove = F)
+pt_cell_goa <- st_intersection(pt_cell, goa)
+
+# get species in gom
+d_sp_goa <- tbl(con_dd, "spp_cells") |> 
+  filter(cell_id %in% pt_cell_goa$cell_id) |>
+  group_by(sp_key) |>
+  collect()
+
+# get species ranges by n_cells
+d_sp_goa_rng <- tbl(con_dd, "spp_cells") |> 
+  filter(sp_key %in% d_sp_goa$sp_key) |> 
+  group_by(sp_key) |>
+  summarize(
+    n_cells = n(), .groups = "drop") |>
+  left_join(
+    tbl(con_dd, "spp"), 
+    by = "sp_key") |>
+  arrange(n_cells) |> 
+  collect()
+
+bind_rows(
+  slice(d_sp_goa_rng, 1:100),
+  slice(d_sp_goa_rng, (n() - 99):n())) |> 
+  datatable(
+    caption = htmltools::tags$caption(
+      style = 'caption-side: top; text-align: left;',
+      withTags(div(HTML(
+        glue("
+      Table. <i>Species in Gulf of America (n = {format(nrow(d_sp_goa_rng), big.mark=",")}), 
+      subset to first 100 species and last 100 species
+      sorted by range size (n_cells).</i>"))))))
+```
+
+## Get AquaMaps env data
+
+```{r}
+#| label: am_hcaf_env
+
+# source: https://github.com/marinebon/aquamaps-downscaled/blob/main/am-env_to_ee.qmd
+
+h_tif  <- here("data/am-hcaf.tif")
+
+if (!file.exists(h_tif)){
+  # get aquamaps table of env values ----
+  # d_cells <- tbl(con_dd, "cells") |> 
+  #   collect()
+  
+  # raster template ----
+  # range(d$ctr_lon)  # -179.75  179.75
+  # range(d$ctr_lat)  # - 78.25   89.75
+  # r_template <- rast(
+  #   xmin       = min(d_cells$center_long) - 0.25,
+  #   xmax       = max(d_cells$center_long) + 0.25,
+  #   ymin       = min(d_cells$center_lat) - 0.25,
+  #   ymax       = max(d_cells$center_lat) + 0.25,
+  #   resolution = c(0.5, 0.5),
+  #   crs = "epsg:4326")
+  
+  # Create the global template raster
+  xmin <- -180; xmax <- 180
+  ymin <-  -90; ymax <-  90
+  res  <-    0.5  # Half-degree resolution
+  
+  r_g <- rast(
+    nrows = (ymax - ymin) / res,
+    ncols = (xmax - xmin) / res,
+    xmin = xmin,
+    xmax = xmax,
+    ymin = ymin,
+    ymax = ymax,
+    crs = "EPSG:4326")
+  
+  # data frame to points ----
+  p <- tbl(con_dd, "cells") |> 
+    collect() |>
+    st_as_sf(
+      coords = c("center_long", "center_lat"),
+      remove = F,
+      crs    = 4326) |> 
+    arrange(center_long, center_lat)
+
+  # points to raster ----
+  get_r <- function(v){
+    r <- rasterize(p, r_g, field = v)
+    names(r) <- v
+    r
+  }
+  
+  r_h <- NULL
+  for (v in setdiff(names(p), "geometry")){
+    message(glue("v: {v}"))
+    
+    if (is.null(r_h)){
+      r_h <- get_r(v)
+    } else {
+      r_h <- rast(list(r_h, get_r(v)))
+    }
+  }
+  
+  writeRaster(r_h, h_tif, overwrite=T)
+}
+r_h <- rast(h_tif)
+
+# names(r_h)
+#  [1] "cell_id"            "cell_idx"           "csquare_code"       "loiczid"           
+#  [5] "n_limit"            "s_limit"            "w_limit"            "e_limit"           
+#  [9] "center_lat"         "center_long"        "cell_area"          "ocean_area"        
+# [13] "p_water"            "clim_zone_code"     "fao_area_m"         "fao_area_in"       
+# [17] "country_main"       "country_second"     "country_third"      "country_sub_main"  
+# [21] "country_sub_second" "country_sub_third"  "eez"                "lme"               
+# [25] "lme_border"         "meow"               "ocean_basin"        "islands_no"        
+# [29] "area0_20"           "area20_40"          "area40_60"          "area60_80"         
+# [33] "area80_100"         "area_below100"      "elevation_min"      "elevation_max"     
+# [37] "elevation_mean"     "elevation_sd"       "depth_min"          "depth_max"         
+# [41] "depth_mean"         "depth_sd"           "sst_an_mean"        "sbt_an_mean"       
+# [45] "salinity_mean"      "salinity_b_mean"    "prim_prod_mean"     "ice_con_ann"       
+# [49] "oxy_mean"           "oxy_b_mean"         "land_dist"          "shelf"             
+# [53] "slope"              "abyssal"            "tidal_range"        "coral"             
+# [57] "estuary"            "seamount"           "mpa"
+
+# plot to check
+#  static:
+#    plot(r_h[["center_lat"]])
+#    plot(r_h[["center_long"]])
+#  dynamic:
+#    plet(r_h[["center_lat"]])
+#    plet(r_h[["center_long"]])
+
+lyr <- "depth_mean"; clr <- "dense"
+mapView(
+  r_h[[lyr]], layer.name = lyr,
+  col.regions = cmocean(clr),
+  alpha.regions = 0.9)
+
+lyr <- "prim_prod_mean"; clr <- "algae"
+mapView(
+  r_h[[lyr]], layer.name = lyr,
+  col.regions = cmocean(clr),
+  alpha.regions = 0.9)
+
+lyr <- "sst_an_mean"; clr <- "thermal"
+mapView(
+  r_h[[lyr]], layer.name = lyr,
+  col.regions = cmocean(clr),
+  alpha.regions = 0.9)
+
+lyr <- "sbt_an_mean"; clr <- "thermal"
+mapView(
+  r_h[[lyr]], layer.name = lyr,
+  col.regions = cmocean(clr),
+  alpha.regions = 0.9)
+```
+
+## Interpolate smallest range species in GoA
+
+- [Computer Generated Native Distribution Map for _Crepidula depressa_](https://aquamaps.org/preMap2.php?cache=1&SpecID=W-Msc-419703)
+  ![](https://www.aquamaps.org/imagethumb/file_destination/pic_W-Msc-419703.jpg)
+- [Mapping Parameters](https://www.aquamaps.org/ShowMapParam.php?SpecID=W-Msc-419703&graph=&user_session=1&bp=-1)
+
+- `"W-Msc-419703"`: _Crepidula depressa_ (class = Gastropoda) n_cells = 50
+
+```{r}
+#| label: get_sp_pref
+
+sp_key <- "W-Msc-419703"
+
+d_sp_pref <- tbl(con_dd, "spp_prefs") |> 
+  filter(sp_key == !!sp_key) |> 
+  collect()
+
+d_sp_pref |> 
+  mutate(across(everything(), as.character)) |> 
+  pivot_longer(everything()) |> 
+  kable()
+```
+
+[Content - Introduction to aquamapsdata • aquamapsdata](https://raquamaps.github.io/aquamapsdata/articles/intro.html#content)
+-   `depth/temp/salinity/prim_prod/ice_con/oxy/land_dist_yn`: Is the depth/temperature/salinity primary production/ice concentration/oxygen/distance to land parameter used in computing map data? 0=No, 1=Yes
+
+-   `layer`: Indicates whether the **temperature** and **salinity** parameters are based on ***bottom*** (=b) or ***surface*** (=s) values of half-degree cells used to compute the envelope.
+
+-   `spp_prefs.map_opt`: Indicates how native map (predicted probabilities) is plotted: 1 = area covered by both species’ bounding box and FAO areas, 2 = area covered by species’ FAO areas only, 3 = area covered by species’ bounding box only.
+
+    -   `spp_prefs.extn_rule_yn`: Was the FAO extension rule applied in the generation of the species envelope? 0=No, 1=Yes, null
+
+    -   `spp_cells.fao_area_yn`: Does this cell fall within an FAO area where the species is known to occur (endemic/native)? 0=No, 1=Yes
+
+    -   `spp_cells.bound_box_yn`: Does this cell fall within the geographical bounding box known for the species? 0=No, 1=Yes
+
+
+```{r}
+d_sp_cell <- tbl(con_dd, "spp_cells") |> 
+  filter(sp_key == !!sp_key) |> 
+  collect()
+
+# table(d_sp_cell$fao_area_yn, d_sp_cell$bound_box_yn, useNA = "always")
+#         1 <NA>
+#   1    50    0
+#   <NA>  0    0
+
+# get_sp(sp_key) ----
+r_sp_p <- with(
+  d_sp_cell,
+  subst(
+    r_h[["cell_id"]], 
+    from   = cell_id,
+    to     = probability,
+    others = NA)) |> 
+  trim()
+names(r_sp_p) <- "probability"
+plet(
+  r_sp_p, 
+  col   = "YlOrRd",
+  tiles = "Esri.OceanBasemap")
+
+r_sp_ph <- c(
+  r_sp_p,
+  r_h |>
+    crop(r_sp_p) |> 
+    mask(r_sp_p))
+
+p_sp_ph <- terra::as.polygons(
+  r_sp_ph[["cell_id"]]) |> 
+  st_as_sf() |> 
+  left_join(
+    as.data.frame(r_sp_ph),
+    by = "cell_id") |> 
+  relocate(probability) |> 
+  as_tibble() |> st_as_sf()
+
+# apply yellow to red color ramp to probability
+mapView(
+  p_sp_ph, zcol = "probability", 
+  col.regions = colorRampPalette(
+    brewer.pal(n=5, name="YlOrRd")),
+  at = c(0, 0.2, 0.4, 0.6, 0.8, 1),
+  alpha.regions = 0.9)
+```
+
+## Get Bio-Oracle v3 higher resolution data
+
+- [Bio-ORACLE : Marine data layers for ecological modelling](https://www.bio-oracle.org/documentation.php)
+- [Bio-ORACLE : Marine data layers for ecological modelling](https://www.bio-oracle.org/downloads-to-email.php)
+- [bio-oracle/biooracler: R package to access Bio-Oracle data via ERDDAP](https://github.com/bio-oracle/biooracler)
+- [ERDDAP - List of All Datasets](https://erddap.bio-oracle.org/erddap/info/index.html?page=1&itemsPerPage=1000)
+- [Copernicus Marine Data Store | Copernicus Marine Service](https://data.marine.copernicus.eu/products)
+
+
+```{r}
+#| label: bio-oracle
+#| eval: false
+
+librarian::shelf(
+  bio-oracle/biooracler)
+
+biooracler:::erddap.bio_oracle.org()
+biooracler::list_layers(c("Ocean Temperature", "Baseline")) |> 
+  View()
+
+4320 = 360 / (1/12) (0.08333333)
+7200 = 360 / (1/20) (0.05)
+
+```
+
+
+## Taxonomic comparisons
+
+- Aquamaps: [Computer Generated Native Distribution Map for _Crepidula depressa_](https://aquamaps.org/preMap2.php?cache=1&SpecID=W-Msc-419703)
+  - [Mapping Parameters](https://www.aquamaps.org/ShowMapParam.php?SpecID=W-Msc-419703&graph=&user_session=1&bp=-1)
+  - `"W-Msc-419703"`: _Crepidula depressa_ (class = Gastropoda) n_cells = 50
+
+
+```{r}
+sp_key <- "W-Msc-419703"
+
+tbl(con_dd, "spp") |> 
+  filter(sp_key == !!sp_key) |> 
+  collect() |> 
+  mutate(across(everything(), as.character)) |> 
+  pivot_longer(everything()) |> 
+  kable()
+```
+
+- [Crepidula depressa | **SeaLifebase.se**](https://www.sealifebase.se/summary/Crepidula-depressa.html)
+  - [**Ecology**](https://www.sealifebase.se/Ecology/SpeciesEcologySummary.php?StockCode=92041&GenusName=Crepidula&SpeciesName=depressa)
+    - `Substrate`: Benthic: mobile;
+    - `Feeding habit`: filtering plankton
+  - [**Ecosystems**](https://www.sealifebase.se/trophiceco/EcosysList.php?ID=151110&GenusName=Crepidula&SpeciesName=depressa)
+    - Ecosystem: Atlantic Ocean, Gulf of Mexico, ...; Type: Sea/Bay/Gulf
+  - [**Synonyms**](https://www.sealifebase.se/Nomenclature/SynonymsList.php?ID=151110&SynCode=179777&GenusName=Crepidula&SpeciesName=depressa)
+  
+    Synonym	| Author	| CoL | Status | Valid | Synonymy | Combination
+    ----|----|----|----|----|----|----
+    [Crepidula depressa](https://www.sealifebase.se/Nomenclature/SynonymSummary.php?ID=179777&CAS_SPC=&Status=accepted%20name&Synonymy=senior%20synonym&Combination=original%20combination&GenusName=Crepidula&SpeciesName=depressa&SpecCode=151110&SynonymsRef=83435&Author=Say,%201822&Misspelling=0) |	Say, 1822	| accepted name	| Yes	| senior synonym | original combination
+
+- [WoRMS - World Register of Marine Species - Crepidula depressa Say, 1822](https://www.marinespecies.org/aphia.php?p=taxdetails&id=419703)
+  - unaccepted: [WoRMS - World Register of Marine Species - Crepidula depressa Deshayes, 1830](https://www.marinespecies.org/aphia.php?p=taxdetails&id=572470)
+- [Crepidula depressa - Wikipedia](https://en.wikipedia.org/wiki/Crepidula_depressa)
+- [Search "Crepidula depressa" | GBIF.org](https://www.gbif.org/search?q=Crepidula%20depressa)
+  - [Crepidula depressa Say, 1822](https://www.gbif.org/species/5856498)
+    - [Crepidula depressa Say, 1822](https://www.gbif.org/species/155138324)\
+      This is the interpretation of the species as published in World Register of Marine Species.
+  - [Crepidula depressa Deshayes, 1830](https://www.gbif.org/species/8275070)
+- [Crepidula depressa Say, 1822 - OBIS.org](https://obis.org/taxon/419703)
