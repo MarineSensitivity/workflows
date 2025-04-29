@@ -137,8 +137,8 @@ bind_rows(
       style = 'caption-side: top; text-align: left;',
       withTags(div(HTML(
         glue("
-      Table. <i>Species in Gulf of America (n = {format(nrow(d_sp_goa_rng), big.mark=",")}), 
-      subset to first 100 species and last 100 species
+      Table. <i>Species in Gulf of America (n = {format(nrow(d_sp_goa_rng), big.mark=',')}), 
+      subset to first 100 species and last 100 species,
       sorted by range size (n_cells).</i>"))))))
 ```
 
@@ -262,7 +262,7 @@ mapView(
   alpha.regions = 0.9)
 ```
 
-## Interpolate smallest range species in GoA
+## Get species attributes
 
 - [Computer Generated Native Distribution Map for _Crepidula depressa_](https://aquamaps.org/preMap2.php?cache=1&SpecID=W-Msc-419703)
   ![](https://www.aquamaps.org/imagethumb/file_destination/pic_W-Msc-419703.jpg)
@@ -309,10 +309,20 @@ TODO:
     -   `highseas`: Is the species an open ocean fish species (i.e. tagged as pelagic-oceanic in FishBase)? 0=No, 1=Yes
 -   `diving`: Is the species found on a dive (i.e. where DepthPrefMin in HSPEN < 20 meters)? 0=No, 1=Yes    
     
+## Get species raster
+
 ```{r}
 d_sp_cell <- tbl(con_dd, "spp_cells") |> 
   filter(sp_key == !!sp_key) |> 
   collect()
+# d_sp_cell
+# # A tibble: 50 × 5
+#    sp_key       probability fao_area_yn bound_box_yn cell_id
+#    <chr>              <dbl>       <int>        <int>   <int>
+#  1 W-Msc-419703        0.18           1            1  211899
+#  2 W-Msc-419703        0.96           1            1  211900
+#  3 W-Msc-419703        0.85           1            1  211901
+#  4 W-Msc-419703        1              1            1  211902
 
 # table(d_sp_cell$fao_area_yn, d_sp_cell$bound_box_yn, useNA = "always")
 #         1 <NA>
@@ -320,43 +330,213 @@ d_sp_cell <- tbl(con_dd, "spp_cells") |>
 #   <NA>  0    0
 
 # get_sp(sp_key) ----
-r_sp_p <- with(
+r_sp <- with(
   d_sp_cell,
-  subst(
+  subst(  # substitute cell_id with probability
     r_h[["cell_id"]], 
     from   = cell_id,
     to     = probability,
     others = NA)) |> 
   trim()
-names(r_sp_p) <- "probability"
-plet(
-  r_sp_p, 
-  col   = "YlOrRd",
-  tiles = "Esri.OceanBasemap")
+names(r_sp) <- "probability"
 
-r_sp_ph <- c(
-  r_sp_p,
+pal_col   <- "YlOrRd"
+pal_rmp   <- colorRampPalette(brewer.pal(n=5, name=pal_col))
+pal_at    <- c(0, 0.2, 0.4, 0.6, 0.8, 1)
+pal_alpha <- 0.9
+
+plet(r_sp, col = pal_col, tiles = "Esri.OceanBasemap")
+```
+
+## Get species raster with env as diagnostic polygons
+
+```{r}
+r_sp_h <- c(
+  r_sp,
   r_h |>
-    crop(r_sp_p) |> 
-    mask(r_sp_p))
+    crop(r_sp) |> 
+    mask(r_sp))
 
-p_sp_ph <- terra::as.polygons(
-  r_sp_ph[["cell_id"]]) |> 
+p_sp_h <- terra::as.polygons(
+  r_sp_h[["cell_id"]]) |> 
   st_as_sf() |> 
   left_join(
-    as.data.frame(r_sp_ph),
+    as.data.frame(r_sp_h),
     by = "cell_id") |> 
   relocate(probability) |> 
   as_tibble() |> st_as_sf()
 
 # apply yellow to red color ramp to probability
 mapView(
-  p_sp_ph, zcol = "probability", 
-  col.regions = colorRampPalette(
-    brewer.pal(n=5, name="YlOrRd")),
-  at = c(0, 0.2, 0.4, 0.6, 0.8, 1),
-  alpha.regions = 0.9)
+  p_sp_h, zcol = "probability", 
+  col.regions = pal_rmp, at = pal_at, alpha.regions = pal_alpha)
 ```
+
+TODO:
+
+- [ ] Limit ply attrs to relevant fields, esp env values and RES min/max
+
+## Develop raster topology
+
+- 1/12° (`r round(1/12, 4)`°: `r 360 * 1/12` x `r 90 * 1/12`) -- Copernicus Marine
+- 1/20° (`r round(1/20, 4)`°: `r 360 * 1/20` x `r 90 * 1/20`) -- Bio-Oracle (new sdmpredictors)
+
+```{r}
+#| label: topo_raster
+
+res <- 1/12
+r_g <- rast(
+  xmin = -180, xmax = 180, 
+  ymin = -90,  ymax = 90, 
+  resolution = res, 
+  crs = "EPSG:4326")
+r_g
+```
+
+## Resample nearest
+
+Use `terra::resample(method = "near")` to get the higher resolution data using nearest neighbor.
+
+```{r}
+r_sp_n <- resample(
+  r_sp, r_g, 
+  method = "near") |> 
+  trim()
+names(r_sp_n) <- "pr_near"
+
+plet(r_sp_n, col = pal_col, tiles = "Esri.OceanBasemap")
+```
+
+## Resample bilinear
+
+Use `terra::resample(method = "bilinear")` to get the higher resolution data using bilinear interpolation.
+
+```{r}
+r_sp_b <- resample(
+  r_sp, r_g, 
+  method = "bilinear") |> 
+  trim()
+names(r_sp_b) <- "pr_bilinear"
+
+plet(r_sp_b, col = pal_col, tiles = "Esri.OceanBasemap")
+```
+
+## Reinterpolate
+
+Get a smooth interpolation to nearly original extent by:
+
+- 
+
+```{r}
+pts_sp <- as.points(r_sp) |> 
+  st_as_sf()
+# mapView(pts_sp, cex = 2)
+
+ply_sp <- as.polygons(r_sp > 0) |> 
+  st_as_sf()
+# mapView(ply_sp, cex = 2)
+
+w <- res(r_sp)[1]
+r_0 <- setValues(r_sp |> extend(1), 0)
+
+sf_use_s2(F)
+ply_0 <- ply_sp |> 
+  st_buffer(w) |>
+  st_union() |> 
+  st_make_valid() |> 
+  st_as_sf() |> 
+  st_difference(ply_sp)
+sf_use_s2(T)
+# mapView(ply_0, cex = 2)
+
+pts_0 <- r_0 |> 
+  crop(ply_0) |>
+  mask(ply_0) |> 
+  as.points() |> 
+  st_as_sf()
+names(pts_0)[1] <- names(pts_sp)[1]
+
+# mapView(pts_sp, cex = 4) +
+#   mapView(pts_0, cex = 2, col.regions = "gray")
+
+pts_sp0 <- bind_rows(
+  pts_sp,
+  pts_0)
+
+pwr <- 2; rad <- w # *(5/6)
+r_idw <- interpIDW(
+  x      = r_g |> crop(r_0), 
+  y      = pts_sp0 |> vect(), 
+  field  = names(pts_sp0)[1],
+  radius = rad, # 2/3,
+  power  = pwr) # /2)
+r_idw <- mask(r_idw, r_idw > 0.01, maskvalue = F)
+# plot(
+#   r_idw, 
+#   main = glue("idw(radius = {rad}, power = {pwr})"))
+mapView(r_idw) + 
+  mapView(pts_sp, cex = 4) +
+  mapView(pts_0, cex = 2, col.regions = "gray")
+```
+
+## Mask by land
+
+Use rnaturalearth
+
+```{r}
+librarian::shelf(
+  rnaturalearth,
+  rnaturalearthdata,
+  quiet = T)
+
+# if (!requireNamespace("rnaturalearthhires", quietly = TRUE)) {
+#   install.packages(
+#     "rnaturalearthhires",
+#     repos = "https://ropensci.r-universe.dev",
+#     type = "source")
+# }
+# library(rnaturalearthhires)
+
+# ne_states_x <- rnaturalearthhires::states10 |>
+ne_states_x <- rnaturalearthdata::states50 |>
+# ne_states_x <- rnaturalearth::ne_states() |>
+  st_make_valid() |> 
+  st_filter(
+    ext(r_idw) |> vect() |> st_as_sf() |> st_set_crs(4326),
+    .predicate = st_intersects) |> 
+  tibble() |> 
+  st_as_sf()
+# ne_states_x_0 <- ne_states_x
+# ne_states_x <- ne_states_x |> 
+#   st_transform(st_crs(r_idw)) |> 
+#   tibble() |> 
+#   st_as_sf()
+
+pct_land <- 0.95
+r_land <- rasterize(
+  ne_states_x |> 
+    mutate(one = 1),
+  r_idw, "one", 
+  cover = T)
+# r_land <- mask(
+#   r_land,
+#   r_land > pct_land, 
+#   maskvalue = F)
+# plot(r_land) #, main = glue("land (pct = {pct_land})"))
+# plot(r_land >= pct_land) #, main = glue("land (pct = {pct_land})"))
+
+r_idw_m <- mask(
+  r_idw, 
+  r_land > pct_land, 
+  maskvalue = T)
+# plot(r_idw_m)
+# plot(r_idw)
+
+# mapView(r_idw) + 
+mapView(r_idw_m) + 
+  mapView(ne_states_x, col.regions = "gray", alpha = 0)
+```
+
 
 ## Get Bio-Oracle v3 higher resolution data
 
@@ -372,15 +552,12 @@ mapView(
 #| eval: false
 
 librarian::shelf(
-  bio-oracle/biooracler)
+  bio-oracle/biooracler,
+  quiet = T)
 
 biooracler:::erddap.bio_oracle.org()
-biooracler::list_layers(c("Ocean Temperature", "Baseline")) |> 
-  View()
-
-4320 = 360 / (1/12) (0.08333333)
-7200 = 360 / (1/20) (0.05)
-
+biooracler::list_layers() |> 
+  DT::datatable()
 ```
 
 
