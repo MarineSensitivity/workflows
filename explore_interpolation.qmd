@@ -50,7 +50,7 @@ Background:
 
 librarian::shelf(
   cmocean, DBI, dplyr, DT, duckdb, fs, glue, here, htmltools, janitor, knitr,
-  leaflet, librarian, mapview,
+  leaflet, leaflet.extras, librarian, mapview,
   # raquamaps/raquamaps,
   marinesensitivity/msens,
   RColorBrewer, readr, sf, stringr, terra, tibble, tidyr,
@@ -285,6 +285,45 @@ d_sp_pref |>
   kable()
 ```
 
+TODO:
+
+- [ ] Reconcile differences in bbox and FAO areas vs online.
+
+## Compare with native `aquamapsdata`
+
+```{r}
+# dependency for aquamapsdata:
+#  - Terminal: brew install gnupg
+librarian::shelf(
+  cran/rcrypt,
+  raquamaps/aquamapsdata,
+  dplyr)
+
+# initial run-once step required to install remote db locally
+# download_db(force = TRUE)
+
+default_db("sqlite")
+
+# get the identifier for the species
+ras <- am_raster(sp_key)
+b <- ext(ras) |> as.vector()
+
+# show the native habitat map
+am_map_leaflet(ras, title = sp_key) |> 
+  leaflet::fitBounds(
+    lng1 = b[[1]], lat1 = b[[3]], lng2 = b[[2]], lat2 = b[[4]])
+#   xmin   xmax   ymin   ymax 
+# -97.75 -76.75  26.25  29.75
+  
+# use one or more keys for species
+am_hspen() |> 
+  filter(SpeciesID == sp_key) |> 
+  head(1) |> 
+  collapse() |> 
+  glimpse()
+```
+
+
 [Content - Introduction to aquamapsdata • aquamapsdata](https://raquamaps.github.io/aquamapsdata/articles/intro.html#content)
 -   `depth/temp/salinity/prim_prod/ice_con/oxy/land_dist_yn`: Is the depth/temperature/salinity primary production/ice concentration/oxygen/distance to land parameter used in computing map data? 0=No, 1=Yes
 
@@ -463,25 +502,32 @@ pts_sp0 <- bind_rows(
   pts_sp,
   pts_0)
 
-pwr <- 2; rad <- w # *(5/6)
+pwr     = 2
+rad     = w    # to include cardinal neighbors, w * sqrt(2) ~= w * 1.4 
+val_min =  0.1 # 10% min
+
 r_idw <- interpIDW(
   x      = r_g |> crop(r_0), 
   y      = pts_sp0 |> vect(), 
   field  = names(pts_sp0)[1],
   radius = rad, # 2/3,
   power  = pwr) # /2)
-r_idw <- mask(r_idw, r_idw > 0.01, maskvalue = F)
+r_idw <- mask(r_idw, r_idw >= val_min, maskvalue = F) |> 
+  trim()
 # plot(
 #   r_idw, 
 #   main = glue("idw(radius = {rad}, power = {pwr})"))
-mapView(r_idw) + 
+m <- mapView(r_idw) + 
   mapView(pts_sp, cex = 4) +
   mapView(pts_0, cex = 2, col.regions = "gray")
+
+m@map |> 
+  addFullscreenControl()
 ```
 
 ## Mask by land
 
-Use rnaturalearth
+Use rnaturalearth medium resolution and mask by a percent of land.
 
 ```{r}
 librarian::shelf(
@@ -512,7 +558,8 @@ ne_states_x <- rnaturalearthdata::states50 |>
 #   tibble() |> 
 #   st_as_sf()
 
-pct_land <- 0.95
+pct_land = 0.95
+
 r_land <- rasterize(
   ne_states_x |> 
     mutate(one = 1),
@@ -537,6 +584,134 @@ mapView(r_idw_m) +
   mapView(ne_states_x, col.regions = "gray", alpha = 0)
 ```
 
+## Replicate AquaMaps species Probability from env layers
+
+```{r}
+names(r_h)
+
+
+# parameters
+# sp_key: 
+
+# TODO: fetch d_sp_pref based on sp_key
+
+env_yes <- d_sp_pref |> 
+  select(ends_with("_yn")) |> 
+  # names() |> 
+  #  |> 
+  pivot_longer(everything()) |> 
+  filter(value == 1) |> 
+  pull(name) |> 
+  str_replace("_yn", "")
+# "depth"     "temp"      "salinity"  "prim_prod" "ice_con"   "oxy"       "land_dist" "extn_rule"
+
+r_env <- r_h
+
+bbox_yes <- d_sp_pref$map_opt %in% c(1,3)
+if (bbox_yes){
+  bbox <- d_sp_pref |> 
+    # 45	-28	-95	-33
+    select(w_most_long, e_most_long, s_most_lat, n_most_lat) |> 
+    mutate(
+      w_most_long = w_most_long * -1,
+      e_most_long = e_most_long * -1) |> 
+    pivot_longer(everything()) |> 
+    deframe()
+  
+  r_env <- crop(
+    r_env, ext(as.vector(bbox)))
+}
+
+r_env <- mask(
+  r_h[["cell_id"]][r_h[["fao_area_yn"]] == 1], 
+  maskvalue = T)
+
+
+ramp_env <- function(v, min, min_pref, max, max_pref){
+  
+  x <- c(min, min_pref, max, max_pref)
+  y <- c(  0,        1,   1,        0)
+
+  approx(
+    x, y, 
+    xout   = v, 
+    yleft  = 0,
+    yright = 0,
+    rule   = 2,
+    method = "linear")$y
+}
+
+r_sp_env <- list()
+# for (env in env_yes){ # env = "depth"
+
+# OLD
+# p <- d |> 
+#   filter(var == !!var)
+# p <- setNames(p$var_value, p$prob_name) |> as.list()
+# p
+#   Min PrefMin PrefMax     Max 
+#     0    1000    4000    8000
+# 
+# x_pref <- c(p$Min, p$PrefMin, p$PrefMax, p$Max)
+# y_pref <- c(  0,        1,   1,        0)
+# x_new <- seq(-200, 10000, by=100)
+# y_new <- ramp_env(x_new, p$Min, p$PrefMin, p$PrefMax, p$Max)
+# 
+# plot(
+#   x_pref,
+#   y_pref, 
+#   xlim = range(c(x_pref, x_new), na.rm=T), 
+#   ylim = range(c(y_pref, y_new), na.rm=T),
+#   xlab = var,
+#   ylab = sp_term)
+# points(x_new, y_new, col = 2, pch = "*")
+
+
+# get Relative Env Suitability (res) parameters
+p <- d_sp_pref |> 
+  select(sprintf("%s_%s", env, c("min", "pref_min", "pref_max", "max"))) |> 
+  pivot_longer(everything()) |> 
+  deframe()
+
+
+r_var <- r_env[[glue("{env}_mean")]]
+
+
+# TODO: when to crop to FAO areas, bbox?
+r_sp_env[[env]] <- terra::app(
+  x        = , 
+  fun      = ramp_env, 
+  min      = p[[1]], 
+  min_pref = p[[2]], 
+  max_pref = p[[3]],
+  max      = p[[4]]) |> 
+  raster()
+r_sp_env
+mapView(r_sp_env[[env]])
+
+  
+# }
+
+
+
+if (d_sp_pref$depth_yn == 1)
+  sp_env[["depth"]] <- r_h[["depth_mean"]]
+
+
+
+m <- leaflet() |> 
+  add_ocean_basemap() |> 
+  add_am_raster(
+    r                = r_sp_depth_bb, 
+    title            = glue("{sp_term}, {var} only"))
+m 
+
+```
+
+- `fao_area_m`: Code number of FAO statistical area to which the cell belongs, for all oceanic and coastal cells. `r # range(values(r_h[["fao_area_m"]], na.rm = T))` [18, 88]
+
+- `fao_area_in`: Code number of FAO statistical area to which the cell belongs, for all inland and coastal cells. `r # range(values(r_h[["fao_area_in"]], na.rm = T))` [1, 8]
+
 
 ## Get Bio-Oracle v3 higher resolution data
 
@@ -549,17 +724,35 @@ mapView(r_idw_m) +
 
 ```{r}
 #| label: bio-oracle
-#| eval: false
 
 librarian::shelf(
   bio-oracle/biooracler,
   quiet = T)
 
-biooracler:::erddap.bio_oracle.org()
+# biooracler:::erddap.bio_oracle.org()
+# http://erddap.bio-oracle.org/erddap/
+
 biooracler::list_layers() |> 
   DT::datatable()
 ```
 
+## Match AquaMaps env to Bio-Oracle layers
+
+```{r}
+librarian::shelf(
+  dplyr, 
+  quiet = T)
+
+d_sp_pref |> 
+  select(ends_with("_yn")) |> 
+  names() |> 
+  str_replace("_yn", "")
+
+# "depth"     "temp"      "salinity"  "prim_prod" "ice_con"   "oxy"       "land_dist" "extn_rule"
+```
+
+
+- `depth`: terrain_characteristics.bathymetry_min|mean|max
 
 ## Taxonomic comparisons
 
