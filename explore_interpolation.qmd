@@ -289,6 +289,147 @@ TODO:
 
 - [ ] Reconcile differences in bbox and FAO areas vs online.
 
+```{r}
+librarian::shelf(
+  ggplot2, listviewer, scales)
+
+get_sp_info <- function(sp_key){
+# source: https://github.com/marinebon/aquamaps-downscaled/blob/503c62f39552c4ad2417413b13c49d4d4405f3ab/sp-map/functions.R#L92C5-L93C30
+
+  d_prefs <- tbl(con_dd, "spp_prefs") |> 
+      filter(sp_key == !!sp_key) |>
+      collect()
+
+  vars_yes <- d_prefs |> 
+    select(ends_with("_yn")) |> 
+    pivot_longer(
+      everything()) |> 
+    filter(value == 1) |> 
+    pull(name) |> 
+    str_replace("_yn$","") |> 
+    setdiff("extn_rule")
+  
+  d_probs <- tribble(
+    ~prob_name, ~prob_value,
+    "min"     , 0,
+    "pref_min", 1,
+    "pref_max", 1,
+    "max"     , 0)
+  
+  # browser()
+  d_env <- d_prefs |> 
+    select(starts_with(vars_yes)) |>
+    select(!ends_with("_yn")) |> 
+    pivot_longer(
+      everything(),
+      values_to = "var_value") |> 
+    separate_wider_regex(
+      name,
+      c(var       = paste(vars_yes, collapse = "|"),
+        "_",
+        prob_name = paste(d_probs$prob_name, collapse = "|"))) |> 
+    left_join(
+      d_probs,
+      by = "prob_name")
+  
+  l_env <- d_env |> 
+    group_by(var) |> 
+    summarise(
+      vec = list(var_value)) |> 
+    deframe()
+  
+  sp_info <- list()
+  
+  d_sp <- tbl(con_dd, "spp") |> 
+    filter(sp_key == !!sp_key) |> 
+    collect() |> 
+    mutate(
+      sp_sci = glue("{genus} {species}"))
+  sp_info["sp_scientific"] <- list(d_sp$sp_sci)
+  sp_info["sp_key"]        <- list(d_sp$sp_key)
+  sp_info["sp_int"]        <- list(d_sp$sp_int)
+  
+  sp_info["fao_areas"] <- d_prefs$fao_areas |> 
+    str_split(",\\s*") |> 
+    str_trim() |> 
+    unlist() |> 
+    as.numeric() |> 
+    sort()
+  
+  sp_info["env"] <- list(l_env)
+  
+  sp_info$taxa <- d_sp |> 
+      select(kingdom, phylum, class, order, family) |> 
+      pivot_longer(everything()) |> 
+      deframe() |> 
+      as.list()
+  
+  sp_info$attr <- d_sp |> 
+    select(
+      deepwater, angling, diving, dangerous, m_invertebrates, 
+      highseas, invasive, resilience) |> 
+    mutate(across(everything(), as.character)) |> 
+    pivot_longer(everything()) |> 
+    deframe() |> 
+    as.list()
+  
+  sp_info$iucn <- d_sp |> 
+    select(
+      iucn_id, iucn_code, iucn_version, provider) |> 
+    mutate(across(everything(), as.character)) |> 
+    pivot_longer(everything()) |> 
+    deframe() |> 
+    as.list()
+  
+  # deepwater,        # Does the species occur in the deep-sea (i.e. tagged bathypelagic or bathydemersal in FishBase or SeaLifeBase)? 0=No, 1=Yes
+  # angling,          # Is the species a sport fish (i.e. tagged as a GameFish in FishBase)? 0=No, 1=Yes
+  # diving,           # Is the species found on a dive (i.e. where DepthPrefMin in HSPEN < 20 meters)? 0=No, 1=Yes
+  # dangerous,        # Is the species dangerous (i.e. tagged as ‘traumatogenic or venonous’ in FishBase or SeaLifeBase)? 0=No, 1=Yes
+  # m_invertebrates,  # Is the species a marine invertebrate? 0=No, 1=Yes
+  # highseas,         # Is the species an open ocean fish species (i.e. tagged as pelagic-oceanic in FishBase)? 0=No, 1=Yes
+  # invasive,         # Is the species recorded to be invasive (i.e. in FishBase or SeaLifeBase)? 0=No, 1=Yes
+  # resilience,       # Resilience of the species (i.e. as recorded in FishBase/SeaLifeBase) [varchar]
+  # iucn_id,          # IUCN species identifier	[int]
+  # iucn_code,        # IUCN Red list classification assigned to the species [varchar]
+  # iucn_version,     # IUCN version [varchar]
+  # provider) |>      # FishBase (FB) or SeaLifeBase (SLB)? [varchar]
+  
+  sp_info
+}
+
+sp_info <- get_sp_info(sp_key)
+
+plot_sp_env <- function(sp_info){
+
+    d <- sp_info$env |> 
+      enframe(name = "variable") |> 
+      mutate(
+        suitability = list(c(0,1,1,0))) |> 
+      unnest(c(value, suitability))
+    
+    g <- ggplot(d, aes(value, suitability)) +
+      geom_area() +
+      scale_y_continuous(labels = percent) +
+      facet_wrap(
+        vars(variable), 
+        scales = "free") +
+      labs(
+        title    = sp_info$sp_scientific,
+        subtitle = "environmental envelope",
+        x        = NULL,
+        y        = "Suitability") +
+      theme_gray()
+    
+    g
+}
+
+plot_sp_env(sp_info)
+
+jsonedit(
+  sp_info, mode = "view", modes = c("view","code"))
+```
+
+
 ## Compare with native `aquamapsdata`
 
 ```{r}
@@ -306,12 +447,12 @@ default_db("sqlite")
 
 # get the identifier for the species
 ras <- am_raster(sp_key)
-b <- ext(ras) |> as.vector()
+b <- ext(ras) |> as.vector() |> as.numeric()
 
 # show the native habitat map
 am_map_leaflet(ras, title = sp_key) |> 
   leaflet::fitBounds(
-    lng1 = b[[1]], lat1 = b[[3]], lng2 = b[[2]], lat2 = b[[4]])
+    lng1 = b[1], lat1 = b[3], lng2 = b[2], lat2 = b[4])
 #   xmin   xmax   ymin   ymax 
 # -97.75 -76.75  26.25  29.75
   
@@ -321,7 +462,151 @@ am_hspen() |>
   head(1) |> 
   collapse() |> 
   glimpse()
+# $ FAOAreas        <chr> "31"
+# $ FAOComplete     <int> NA
+# $ NMostLat        <dbl> 30
+# $ SMostLat        <dbl> 26
+# $ WMostLong       <dbl> 97
+# $ EMostLong       <dbl> 80
 ```
+
+## Custom Leaflet functions
+
+```{r}
+#| label: custom leaflet functions
+
+add_ocean_basemap <- function(m){
+  # m: leaflet() map
+  
+  m |>
+    # add base: blue bathymetry and light brown/green topography
+    addProviderTiles(
+      "Esri.OceanBasemap",
+      options = providerTileOptions(
+        variant = "Ocean/World_Ocean_Base")) |>
+    # add reference: placename labels and borders
+    addProviderTiles(
+      "Esri.OceanBasemap",
+      options = providerTileOptions(
+        variant = "Ocean/World_Ocean_Reference"))
+}
+
+
+# show the native habitat map
+add_am_rast <- function(
+    m, 
+    r,
+    id = "am_rast",
+    title,
+    cols = c("#FEB24C", "#FD8D3C", "#FC4E2A", "#E31A1C", "#B10026"),
+    truncate_to_zero = T){
+  # m: leaflet() map
+  # r: raster 
+  # TODO: migrate to terra::rast()
+  
+  # r     = r_gebco_bb
+  # title = "GEBCO depth (m)"
+  # cols  = RColorBrewer::brewer.pal(7, "Blues")
+  
+  r   <- leaflet::projectRasterForLeaflet(r, method = "bilinear")
+  
+  # truncate to 0 to prevent negative values 
+  #   that were generated by projecting the raster 
+  #   from geographic projection (decimal degrees) to Web Mercator (meters)
+  if (truncate_to_zero){
+    v <- values(r)
+    v[v<0] <- 0
+    values(r) <- v
+  }
+  
+  pal <- leaflet::colorBin(
+    cols, na.omit(unique(values(r))), 
+    bins = length(cols), pretty = TRUE, na.color = "#00000000")
+  
+  e <- terra::ext(r) |> 
+    sf::st_bbox() |> 
+    st_as_sfc() |> 
+    st_as_sf(crs=3857) |> 
+    st_transform(4326) |> 
+    st_bbox()
+    
+  m |> 
+    leaflet::addRasterImage(
+      r, 
+      layerId = id, group = id,
+      project = F, colors = pal, opacity = 0.8) |> 
+    leaflet::addLegend(
+      values = raster::values(r), 
+      title = title, pal = pal) |> 
+    leaflet::fitBounds(
+      lng1 = e[["xmin"]], 
+      lat1 = e[["ymin"]], 
+      lng2 = e[["xmax"]], 
+      lat2 = e[["ymax"]]) |> 
+    addImageQuery(
+      r,
+      layerId = id, 
+      project = F) |> 
+    addLayersControl(overlayGroups = id)
+}
+```
+
+```{r}
+librarian::shelf(
+  leaflet.extras2)
+
+compare_sp <- function(
+  r_left, r_right,
+  lbl_left = "native →", lbl_right = "← replicated",
+  legend_title = "AquaMaps<br>suitability"){
+  
+  cols = RColorBrewer::brewer.pal(5, "YlOrRd")
+  pal <- leaflet::colorBin(
+    cols, c(0, 1), 
+    bins = length(cols), pretty = TRUE, na.color = "transparent")
+  
+  leaflet(
+    options = leafletOptions(
+      attributionControl = F,
+      zoomControl = F)) |> 
+    addMapPane("left",  zIndex = 1) |> 
+    addMapPane("right", zIndex = 1) |> 
+    addProviderTiles(
+      providers$Esri.OceanBasemap,
+      group = "base", layerId = "base_left", 
+      options = pathOptions(pane = "left")) |> 
+    addProviderTiles(
+      providers$Esri.OceanBasemap,
+      group = "base", layerId = "base_right", 
+      options = pathOptions(pane = "right")) |> 
+    addRasterImage(
+      r_left, colors = pal, opacity = 0.8, 
+      options = leafletOptions(pane = "left"), 
+      group = lbl_left) |> 
+    addRasterImage(
+      r_right, colors = pal, opacity = 0.8, 
+      options = leafletOptions(pane = "right"), 
+      group = lbl_right) |> 
+    addLegend(
+      values    = seq(0, 1, length.out = 10), 
+      pal       = pal,
+      title     = legend_title,
+      position  = "bottomright",
+      labFormat = \(x, type){
+        b <- x[1:length(x)-1]*100
+        e <- x[2:length(x)]*100
+        glue("{str_pad(b,2)} - {e}%")}) |> 
+    addControl(lbl_left, position = "topleft") |> 
+    addControl(lbl_right, position = "topright") |> 
+    # addLayersControl(
+    #   overlayGroups = c(lbl_left, lbl_right)) |>
+    addSidebyside(
+      layerId = "sidecontrols",
+      rightId = "base_right",
+      leftId  = "base_left")
+}
+```
+
 
 
 [Content - Introduction to aquamapsdata • aquamapsdata](https://raquamaps.github.io/aquamapsdata/articles/intro.html#content)
@@ -339,6 +624,8 @@ am_hspen() |>
 
 - `mean_depth`: Is mean depth used to fit the depth envelope? By default, marine mammals use mean depth. 0=No, 1=Yes
 
+
+FAOComplete	Are the FAO areas listed in FAOAreas complete for this species? 0=No, 1=Yes
 
 TODO:
 
@@ -368,6 +655,16 @@ d_sp_cell <- tbl(con_dd, "spp_cells") |>
 #   1    50    0
 #   <NA>  0    0
 
+d <- tbl(con_dd, "cells") |> 
+  filter(cell_id %in% d_sp_cell$cell_id) |> 
+  collect()
+  # View(d)
+
+# range(d_sp_cell$probability)
+#   0.03 1.00
+# c(min(d$w_limit), max(d$e_limit), min(d$s_limit), max(d$n_limit))
+#   -98.0 -76.5  26.0  30.0
+
 # get_sp(sp_key) ----
 r_sp <- with(
   d_sp_cell,
@@ -378,6 +675,7 @@ r_sp <- with(
     others = NA)) |> 
   trim()
 names(r_sp) <- "probability"
+# ext(r_sp) # -98, -76.5, 26, 30 (xmin, xmax, ymin, ymax)
 
 pal_col   <- "YlOrRd"
 pal_rmp   <- colorRampPalette(brewer.pal(n=5, name=pal_col))
@@ -587,15 +885,12 @@ mapView(r_idw_m) +
 ## Replicate AquaMaps species Probability from env layers
 
 ```{r}
-names(r_h)
-
-
 # parameters
 # sp_key: 
 
 # TODO: fetch d_sp_pref based on sp_key
 
-env_yes <- d_sp_pref |> 
+vars_yes <- d_sp_pref |> 
   select(ends_with("_yn")) |> 
   # names() |> 
   #  |> 
@@ -607,106 +902,291 @@ env_yes <- d_sp_pref |>
 
 r_env <- r_h
 
+# bbox ----
 bbox_yes <- d_sp_pref$map_opt %in% c(1,3)
 if (bbox_yes){
-  bbox <- d_sp_pref |> 
-    # 45	-28	-95	-33
-    select(w_most_long, e_most_long, s_most_lat, n_most_lat) |> 
-    mutate(
-      w_most_long = w_most_long * -1,
-      e_most_long = e_most_long * -1) |> 
-    pivot_longer(everything()) |> 
-    deframe()
   
-  r_env <- crop(
-    r_env, ext(as.vector(bbox)))
+  # OLD bbox: off
+  # bbox_ext <- d_sp_pref |> 
+  #   # 45	-28	-95	-33
+  #   select(w_most_long, e_most_long, s_most_lat, n_most_lat) |>
+  #   mutate(
+  #     w_most_long = w_most_long * -1,
+  #     e_most_long = e_most_long * -1) |> 
+  #   pivot_longer(everything()) |> 
+  #   deframe() |> 
+  #   as.vector() |> 
+  #   ext()
+  
+  # NEW bbox: from species occurrences
+  #   goal: approximate native r_sp_old vs r_sp_new; using spp_occs
+  # r_sp_old: -98   , -76.5 ,  26  , 30    (xmin, xmax, ymin, ymax)
+  # r_sp_new: -97   , -80   ,  26  , 30
+  # pts_occs: -97.25, -77.25, 23.25, 30.25
+  # pts_good: -97.25, -77.25, 26.25, 29.25
+  # pts_ibnd: -97.25, -77.25, 26.25, 29.25
+  #  bb_occs: -97.5 , -77.0 , 26.0 , 29.5
+  #   bb_pad: -98.0,  -76.5 , 25.5 , 30.0 
+  pad <- 0.5   # bb_pad
+  bbox_ext <- tbl(con_dd, "spp_occs") |> 
+    filter(
+      sp_key    == !!sp_key,
+      good_cell == 1) |>
+    left_join(
+      tbl(con_dd, "cells"),
+      by = "cell_id") |>
+    summarize(
+      xmin = min(w_limit, na.rm = T) - pad,
+      xmax = max(e_limit, na.rm = T) + pad,
+      # ymin = min(s_limit, na.rm = T) - pad,
+      ymin = min(s_limit, na.rm = T),
+      ymax = max(n_limit, na.rm = T) + pad) |> 
+    collect() |>
+    pivot_longer(everything()) |>
+    deframe() |> 
+    as.vector() |> 
+    ext()
+  
+  r_env <- crop(r_env, bbox_ext)
 }
 
-r_env <- mask(
-  r_h[["cell_id"]][r_h[["fao_area_yn"]] == 1], 
-  maskvalue = T)
-
-
-ramp_env <- function(v, min, min_pref, max, max_pref){
+# fao ----
+if ((
+  "extn_rule" %in% vars_yes | 
+  d_sp_pref$map_opt %in% c(1,2)) &&
+  !is.na(d_sp_pref$fao_areas)){
   
-  x <- c(min, min_pref, max, max_pref)
-  y <- c(  0,        1,   1,        0)
+  # d_fao <- tbl(con_dd, "spp_prefs") |> 
+  #   distinct(fao_areas) |> 
+  #   collect() |> 
+  #   mutate(
+  #     n = str_split(fao_areas, ",\\s*") |> 
+  #       purrr::map_dbl(length)) |>
+  #   arrange(n)
+  # View(d_fao)
+  # Conclusion: all species have at least 1 FAO area
+  
+  # example: fao_areas = "57, 61, 71"
+  fao_areas <- d_sp_pref$fao_areas |> 
+    str_split(",\\s*") |> 
+    str_trim() |> 
+    unlist() |> 
+    as.numeric() |> 
+    sort()
+  
+  r_fao <- r_env[["fao_area_m"]] %in% fao_areas
+  r_env <- mask(
+    r_env,
+    r_fao,
+    maskvalue = F)
+}
+vars_yes <- setdiff(vars_yes, "extn_rule")
 
+ramp_env <- function(v, p){
+  # p = c(-1, 0, 0, 0) # dput(p) for var = "ice_con"; sp_key = "W-Msc-419703"
+  # v = 0
+  
   approx(
-    x, y, 
+    x      = p,  # c(min, min_pref, max, max_pref)
+    y      = c(0, 1, 1, 0), 
     xout   = v, 
-    yleft  = 0,
-    yright = 0,
-    rule   = 2,
-    method = "linear")$y
+    # yleft  = 0,  # v < y_min -> 0
+    # yright = 0,  # v > y_max -> 0
+    # rule   = 2,  # 2: return nearest vs 1: NA
+    rule   = 1,  # return NA if outside range
+    method = "linear",
+    ties   = max)$y
+    # ties   = "ordered")$y  # assume x is ordered
 }
+
+# match species preference var to AquaMaps env raster layers
+is_surface <- d_sp_pref$layer == "s" # vs "b" bottom
+var_lyr <- list(
+  "depth"     = "depth_mean",
+  # TODO: use depth_min, depth_max, depth_sd?
+  "temp"      = ifelse(
+    is_surface,
+    "sst_an_mean",
+    "sbt_an_mean"),
+  "salinity"  = ifelse(
+    is_surface,
+    "salinity_mean",
+    "salinity_b_mean"),
+  # "oxy"       = ifelse(
+  #   is_surface,
+  #   "oxy_mean",
+  #   "oxy_b_mean"),
+  "oxy"       = "oxy_b_mean",
+  "prim_prod" = "prim_prod_mean",
+  "ice_con"   = "ice_con_ann",
+  "land_dist" = "land_dist")
 
 r_sp_env <- list()
-# for (env in env_yes){ # env = "depth"
+for (var in vars_yes){ # var = vars_yes[1] # var = "depth" # var = "prim_prod"
 
-# OLD
-# p <- d |> 
-#   filter(var == !!var)
-# p <- setNames(p$var_value, p$prob_name) |> as.list()
-# p
-#   Min PrefMin PrefMax     Max 
-#     0    1000    4000    8000
-# 
-# x_pref <- c(p$Min, p$PrefMin, p$PrefMax, p$Max)
-# y_pref <- c(  0,        1,   1,        0)
-# x_new <- seq(-200, 10000, by=100)
-# y_new <- ramp_env(x_new, p$Min, p$PrefMin, p$PrefMax, p$Max)
-# 
-# plot(
-#   x_pref,
-#   y_pref, 
-#   xlim = range(c(x_pref, x_new), na.rm=T), 
-#   ylim = range(c(y_pref, y_new), na.rm=T),
-#   xlab = var,
-#   ylab = sp_term)
-# points(x_new, y_new, col = 2, pch = "*")
-
-
-# get Relative Env Suitability (res) parameters
-p <- d_sp_pref |> 
-  select(sprintf("%s_%s", env, c("min", "pref_min", "pref_max", "max"))) |> 
-  pivot_longer(everything()) |> 
-  deframe()
-
-
-r_var <- r_env[[glue("{env}_mean")]]
-
-
-# TODO: when to crop to FAO areas, bbox?
-r_sp_env[[env]] <- terra::app(
-  x        = , 
-  fun      = ramp_env, 
-  min      = p[[1]], 
-  min_pref = p[[2]], 
-  max_pref = p[[3]],
-  max      = p[[4]]) |> 
-  raster()
-r_sp_env
-mapView(r_sp_env[[env]])
-
+  # get Relative Env Suitability (res) parameters
+  p <- d_sp_pref |> 
+    select(
+      sprintf(
+        "%s_%s", var, 
+        c("min", "pref_min", "pref_max", "max"))) |> 
+    pivot_longer(everything()) |> 
+    deframe() |> 
+    as.vector()
   
-# }
+  # check that p is ordered
+  stopifnot(
+    length(p) == 4,
+    all(is.finite(p)),
+    all(diff(p) >= 0))
+  
+  lyr   <- var_lyr[[var]]
+  r_var <- r_env[[lyr]]
+  # plot(r_var)
+  r_sp_env[[var]] <- terra::app(
+    x   = r_var, 
+    fun = ramp_env, 
+    p   = p)
+  # plot(r_sp_env[[var]])
+  # mapView(r_sp_env[[var]])
+  
+  if (var == "depth"){
+    # pad depth with 0s if within depth_min/max
+    r_depth <- r_sp_env[["depth"]]
+    r_ok <- r_env[["depth_min"]] < p[4] &
+      r_env[["depth_max"]] > p[1]
+    r_sp_env[["depth"]] <- ifel(
+      is.na(r_depth),
+      ifel(r_ok, 0, NA),
+      r_depth)
+  }
+}
 
+r_sp_env <- rast(r_sp_env)
 
+# show env layers transformed by species preferences
+plet(
+  r_sp_env,
+  y        = 1:nlyr(r_sp_env), 
+  col      = rev(RColorBrewer::brewer.pal(11, "Spectral")),
+  shared   = T, # shared legend
+  collapse = F, 
+  tiles    = "Esri.OceanBasemap")
 
-if (d_sp_pref$depth_yn == 1)
-  sp_env[["depth"]] <- r_h[["depth_mean"]]
+r_sp_old <- r_sp
+# summary(values(r_sp_old, na.rm = T, mat = F))
+#   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+# 0.0300  0.6750  0.9000  0.7968  1.0000  1.0000
 
+r_sp_new <- app(r_sp_env, fun = mean)
+# summary(values(r_sp_new, na.rm = T, mat = F))
+#   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+# 0.5776  0.7355  0.7837  0.7769  0.8000  1.0000
 
+# without ice_con
+# r_sp_new <- r_sp_env |> 
+#   terra::subset(
+#     setdiff(
+#       names(r_sp_env),
+#       "ice_con")) |>
+#   app(fun = mean)
+# summary(values(r_sp_new, na.rm = T, mat = F))
+#   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+# 0.4719  0.6694  0.7297  0.7211  0.7500  1.0000 
+ 
+# as product
+# r_sp_new <- app(r_sp_env, fun = prod)
+# summary(values(r_sp_new, na.rm = T, mat = F))
+#    Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+# 0.00000 0.00000 0.00000 0.09531 0.00000 1.00000 
 
-m <- leaflet() |> 
-  add_ocean_basemap() |> 
-  add_am_raster(
-    r                = r_sp_depth_bb, 
-    title            = glue("{sp_term}, {var} only"))
-m 
+compare_sp(
+  r_sp_old, r_sp_new)
 
+mapView(r_sp_new - r_sp_old, layer.name = "new - old")
 ```
+
+
+```{r}
+#| label: ck_prim_prod
+#| eval: false
+
+# https://github.com/marinebon/aquamaps-downscaled/blob/503c62f39552c4ad2417413b13c49d4d4405f3ab/sp-map/functions.R#L92C5-L93C30
+# if (b == "PrimProd")
+#     im <- im$multiply(1000)
+
+tbl(con_dd, "spp_prefs") |> 
+  select(prim_prod_max) |> 
+  collect() |> 
+  pull(prim_prod_max) |> 
+  summary()
+#   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#   1.62   27.19   43.27   52.55   69.46  253.40 
+
+# names(r_h)
+summary(values(r_h[["prim_prod_mean"]], na.rm = T, mat = F))
+#  Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+# 0.089   1.145   2.668   4.284   5.348 250.926
+```
+
+
+```{r}
+#| label: get sp occurrences
+#| eval: false
+
+# dbListTables(con_dd)
+# tbl(con_dd, "_tbl_fld_renames") |> 
+#   group_by(tbl_old, tbl_new) |>
+#   summarize(n = n(), .groups = "drop") |> 
+#   collect()
+#
+#   tbl_old             tbl_new       n
+#   <chr>               <chr>     <dbl>
+# 1 hspen_r             spp_prefs    56
+# 2 speciesoccursum_r   spp          25
+# 3 occurrencecells_r   spp_occs     17
+# 4 hcaf_r              cells        58
+# 5 hcaf_species_native spp_cells     7
+
+pts_occs <- tbl(con_dd, "spp_occs") |> 
+  filter(sp_key == !!sp_key) |> 
+  collect() |> 
+  st_as_sf(
+    coords = c("center_long", "center_lat"), 
+    remove = F,
+    crs    = 4326)
+
+# r_sp_old: -98   , -76.5 ,  26  , 30   
+# r_sp_new: -97   , -80   ,  26  , 30
+# pts_occs: -97.25, -77.25, 23.25, 30.25 (xmin, xmax, ymin, ymax)
+# pts_good: -97.25, -77.25, 26.25, 29.25
+# pts_ibnd: -97.25, -77.25, 26.25, 29.25
+#  bb_occs: -97.5 , -77.0 , 26.0 , 29.5
+#   bb_pad: -98.0,  -76.5 , 25.5 , 30.0 
+
+pts_occs |> ext() 
+pts_occs |> filter(good_cell == 1) |> ext() 
+pts_occs |> filter(in_bound_box == 1) |> ext()
+
+# pad <- 0   # bb_occs
+pad <- 0.5   # bb_pad
+bb_occs <- tbl(con_dd, "spp_occs") |> 
+  filter(
+    sp_key    == !!sp_key,
+    good_cell == 1) |>
+  left_join(
+    tbl(con_dd, "cells"),
+    by = "cell_id") |>
+  summarize(
+    xmin = min(w_limit, na.rm = T) - pad,
+    xmax = max(e_limit, na.rm = T) + pad,
+    ymin = min(s_limit, na.rm = T) - pad,
+    ymax = max(n_limit, na.rm = T) + pad) |> 
+  collect() |>
+  pivot_longer(everything()) |>
+  deframe()
+```
+
 
 - `fao_area_m`: Code number of FAO statistical area to which the cell belongs, for all oceanic and coastal cells. `r # range(values(r_h[["fao_area_m"]], na.rm = T))` [18, 88]
 
