@@ -12,16 +12,18 @@ editor_options:
 
 librarian::shelf(
   cmocean, DBI, dplyr, DT, duckdb, fs, glue, here, htmltools, janitor, knitr,
-  leaflet, leaflet.extras, librarian, mapview, ggplot2, listviewer, scales,
-  marinesensitivity/msens,
-  RColorBrewer, readr, sf, stringr, terra, tibble, tidyr,
+  leaflet, leaflet.extras, leaflet.extras2, librarian, mapview, ggplot2, 
+  listviewer, scales, marinesensitivity/msens, RColorBrewer, readr, sf, stringr, 
+  terra, tibble, tidyr,
   quiet = T)
 mapviewOptions(basemaps = "Esri.OceanBasemap")
 
-dir_data <- "~/My Drive/projects/msens/data"
-path_dd  <- glue("{dir_data}/derived/aquamaps/am.duckdb")
+dir_data  <- "~/My Drive/projects/msens/data"
+path_dd   <- glue("{dir_data}/derived/aquamaps/am.duckdb")
+dir_cache <- here("data/replicate_aquamaps")
+dir.create(dir_cache, showWarnings = FALSE, recursive = TRUE)
 
-con_dd   <- dbConnect(
+con_dd    <- dbConnect(
   duckdb(
     dbdir     = path_dd,
     read_only = T))
@@ -31,6 +33,26 @@ con_dd   <- dbConnect(
 
 ```{r}
 #| label: replication_functions
+
+# Helper function to generate cache paths
+get_cache_path <- function(type, id = NULL, dir_cache = here("data/replicate_aquamaps")) {
+  # Create cache directory if it doesn't exist
+  dir.create(dir_cache, showWarnings = FALSE, recursive = TRUE)
+  
+  # Generate path based on type and optional id
+  if (is.null(id)) {
+    return(file.path(dir_cache, glue("{type}.tif")))
+  } else {
+    # Create subdirectory for specific types if needed
+    if (type %in% c("species", "replicated")) {
+      subdir <- file.path(dir_cache, type)
+      dir.create(subdir, showWarnings = FALSE, recursive = TRUE)
+      return(file.path(subdir, glue("{id}.tif")))
+    } else {
+      return(file.path(dir_cache, glue("{type}_{id}.tif")))
+    }
+  }
+}
 
 get_sp_info <- function(sp_key, con_dd) {
   # Get species preferences and key attributes
@@ -123,11 +145,13 @@ get_sp_info <- function(sp_key, con_dd) {
   return(sp_info)
 }
 
-get_hcaf_raster <- function(con_dd) {
+get_hcaf_raster <- function(con_dd, dir_cache = here("data/replicate_aquamaps")) {
   # Get the HCAF (Half-degree Cell Authority File) raster
-  h_tif <- here("data/am-hcaf.tif")
+  h_tif <- get_cache_path("hcaf", dir_cache = dir_cache)
   
   if (!file.exists(h_tif)) {
+    message(glue("Generating HCAF raster and caching to {h_tif}"))
+    
     # Create the global template raster
     xmin <- -180; xmax <- 180
     ymin <- -90; ymax <- 90
@@ -169,19 +193,30 @@ get_hcaf_raster <- function(con_dd) {
       }
     }
     
-    writeRaster(r_h, h_tif, overwrite=T)
+    # Save to cache
+    writeRaster(r_h, h_tif, overwrite=TRUE)
+  } else {
+    message(glue("Loading HCAF raster from cache: {h_tif}"))
   }
   
   return(rast(h_tif))
 }
 
-get_species_raster <- function(sp_key, con_dd) {
+get_species_raster <- function(sp_key, con_dd, dir_cache = here("data/replicate_aquamaps")) {
   # Get the original species probability raster
+  cache_path <- get_cache_path("species", sp_key, dir_cache = dir_cache)
+  
+  if (file.exists(cache_path)) {
+    message(glue("Loading species raster from cache: {cache_path}"))
+    return(rast(cache_path))
+  }
+  
+  message(glue("Generating species raster for {sp_key} and caching to {cache_path}"))
   d_sp_cell <- tbl(con_dd, "spp_cells") |> 
     filter(sp_key == !!sp_key) |> 
     collect()
   
-  r_h <- get_hcaf_raster(con_dd)
+  r_h <- get_hcaf_raster(con_dd, dir_cache = dir_cache)
   
   r_sp <- with(
     d_sp_cell,
@@ -194,14 +229,25 @@ get_species_raster <- function(sp_key, con_dd) {
   
   names(r_sp) <- "probability"
   
+  # Cache the result
+  writeRaster(r_sp, cache_path, overwrite = TRUE)
+  
   return(r_sp)
 }
 
-replicate_sp_raster <- function(sp_key, con_dd, r_h = NULL) {
+replicate_sp_raster <- function(sp_key, con_dd, r_h = NULL, dir_cache = here("data/replicate_aquamaps")) {
   # Replicate the species probability raster based on environmental preferences
+  cache_path <- get_cache_path("replicated", sp_key, dir_cache = dir_cache)
+  
+  if (file.exists(cache_path)) {
+    message(glue("Loading replicated species raster from cache: {cache_path}"))
+    return(rast(cache_path))
+  }
+  
+  message(glue("Generating replicated raster for {sp_key} and caching to {cache_path}"))
   
   if (is.null(r_h)) {
-    r_h <- get_hcaf_raster(con_dd)
+    r_h <- get_hcaf_raster(con_dd, dir_cache = dir_cache)
   }
   
   # Get species info
@@ -340,6 +386,9 @@ replicate_sp_raster <- function(sp_key, con_dd, r_h = NULL) {
   # Mask zero values
   r_sp_new <- mask(r_sp_new, r_sp_new, maskvalues = 0)
   
+  # Cache the result
+  writeRaster(r_sp_new, cache_path, overwrite = TRUE)
+  
   return(r_sp_new)
 }
 
@@ -370,7 +419,7 @@ compare_rasters <- function(r_old, r_new) {
   return(matches)
 }
 
-validate_aquamaps_species <- function(sp_keys, con_dd) {
+validate_aquamaps_species <- function(sp_keys, con_dd, dir_cache = here("data/replicate_aquamaps")) {
   # Validate multiple species
   results <- tibble(
     sp_key = character(),
@@ -378,17 +427,17 @@ validate_aquamaps_species <- function(sp_keys, con_dd) {
   )
   
   # Get HCAF raster once
-  r_h <- get_hcaf_raster(con_dd)
+  r_h <- get_hcaf_raster(con_dd, dir_cache = dir_cache)
   
   for (sp_key in sp_keys) {
     cat(glue("Processing species {sp_key}...\n"))
     
     tryCatch({
       # Get original raster
-      r_sp_old <- get_species_raster(sp_key, con_dd)
+      r_sp_old <- get_species_raster(sp_key, con_dd, dir_cache = dir_cache)
       
       # Replicate raster
-      r_sp_new <- replicate_sp_raster(sp_key, con_dd, r_h)
+      r_sp_new <- replicate_sp_raster(sp_key, con_dd, r_h, dir_cache = dir_cache)
       
       # Compare rasters
       matches <- compare_rasters(r_sp_old, r_sp_new)
@@ -426,10 +475,10 @@ validate_aquamaps_species <- function(sp_keys, con_dd) {
 test_sp_key <- "W-Msc-419703"  # Crepidula depressa
 
 # Get original raster
-r_sp_old <- get_species_raster(test_sp_key, con_dd)
+r_sp_old <- get_species_raster(test_sp_key, con_dd, dir_cache = dir_cache)
 
 # Replicate raster
-r_sp_new <- replicate_sp_raster(test_sp_key, con_dd)
+r_sp_new <- replicate_sp_raster(test_sp_key, con_dd, dir_cache = dir_cache)
 
 # Compare original and replicated rasters
 matches <- compare_rasters(r_sp_old, r_sp_new)
@@ -518,7 +567,7 @@ if (!is.null(max_species)) {
 }
 
 # Validate species
-results <- validate_aquamaps_species(all_sp_keys, con_dd)
+results <- validate_aquamaps_species(all_sp_keys, con_dd, dir_cache = dir_cache)
 
 # Save results to CSV
 write_csv(results, here("data/aquamaps_validation_results.csv"))
@@ -591,8 +640,8 @@ if (sum(!results$r_matches, na.rm=TRUE) > 0) {
   
   for (sp in sample_sp) {
     # Get original and replicated rasters
-    r_old <- get_species_raster(sp, con_dd)
-    r_new <- replicate_sp_raster(sp, con_dd)
+    r_old <- get_species_raster(sp, con_dd, dir_cache = dir_cache)
+    r_new <- replicate_sp_raster(sp, con_dd, dir_cache = dir_cache)
     
     # Create comparison map
     cat(glue("\nExample non-matching species: {sp}\n"))
