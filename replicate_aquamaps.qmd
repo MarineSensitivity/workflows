@@ -1,0 +1,615 @@
+---
+title: "Replicate AquaMaps"
+description: "Compare replicated AquaMaps species distributions against the original"
+execute:
+  warning: false
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+#| label: setup
+
+librarian::shelf(
+  cmocean, DBI, dplyr, DT, duckdb, fs, glue, here, htmltools, janitor, knitr,
+  leaflet, leaflet.extras, librarian, mapview, ggplot2, listviewer, scales,
+  marinesensitivity/msens,
+  RColorBrewer, readr, sf, stringr, terra, tibble, tidyr,
+  quiet = T)
+mapviewOptions(basemaps = "Esri.OceanBasemap")
+
+dir_data <- "~/My Drive/projects/msens/data"
+path_dd  <- glue("{dir_data}/derived/aquamaps/am.duckdb")
+
+con_dd   <- dbConnect(
+  duckdb(
+    dbdir     = path_dd,
+    read_only = T))
+```
+
+## Functions for AquaMaps Replication
+
+```{r}
+#| label: replication_functions
+
+get_sp_info <- function(sp_key, con_dd) {
+  # Get species preferences and key attributes
+  d_prefs <- tbl(con_dd, "spp_prefs") |> 
+    filter(sp_key == !!sp_key) |>
+    collect()
+  
+  vars_yes <- d_prefs |> 
+    select(ends_with("_yn")) |> 
+    pivot_longer(everything()) |> 
+    filter(value == 1) |> 
+    pull(name) |> 
+    str_replace("_yn$","") |> 
+    setdiff("extn_rule")
+  
+  d_probs <- tribble(
+    ~prob_name, ~prob_value,
+    "min"     , 0,
+    "pref_min", 1,
+    "pref_max", 1,
+    "max"     , 0)
+  
+  d_env <- d_prefs |> 
+    select(starts_with(vars_yes)) |>
+    select(!ends_with("_yn")) |> 
+    pivot_longer(
+      everything(),
+      values_to = "var_value") |> 
+    separate_wider_regex(
+      name,
+      c(var       = paste(vars_yes, collapse = "|"),
+        "_",
+        prob_name = paste(d_probs$prob_name, collapse = "|"))) |> 
+    left_join(
+      d_probs,
+      by = "prob_name")
+  
+  l_env <- d_env |> 
+    group_by(var) |> 
+    summarise(
+      vec = list(var_value)) |> 
+    deframe()
+  
+  sp_info <- list()
+  
+  d_sp <- tbl(con_dd, "spp") |> 
+    filter(sp_key == !!sp_key) |> 
+    collect() |> 
+    mutate(
+      sp_sci = glue("{genus} {species}"))
+  
+  sp_info[["sp_scientific"]] <- d_sp$sp_sci
+  sp_info[["sp_key"]]        <- d_sp$sp_key
+  sp_info[["sp_int"]]        <- d_sp$sp_int
+  sp_info[["pelagic"]]       <- d_prefs$pelagic
+  
+  sp_info[["fao_areas"]] <- d_prefs$fao_areas |> 
+    str_split(",\\s*") %>%
+    unlist() |> 
+    str_trim() |> 
+    as.numeric() |> 
+    sort()
+  
+  sp_info[["env"]] <- l_env
+  
+  sp_info[["taxa"]] <- d_sp |> 
+    select(kingdom, phylum, class, order, family) |> 
+    pivot_longer(everything()) |> 
+    deframe() |> 
+    as.list()
+  
+  sp_info[["attr"]] <- d_sp |> 
+    select(
+      deepwater, angling, diving, 
+      dangerous, m_invertebrates, 
+      highseas, invasive, resilience) |> 
+    mutate(across(everything(), as.character)) |> 
+    pivot_longer(everything()) |> 
+    deframe() |> 
+    as.list()
+  
+  sp_info$iucn <- d_sp |> 
+    select(
+      iucn_id, iucn_code, iucn_version, provider) |> 
+    mutate(across(everything(), as.character)) |> 
+    pivot_longer(everything()) |> 
+    deframe() |> 
+    as.list()
+  
+  return(sp_info)
+}
+
+get_hcaf_raster <- function(con_dd) {
+  # Get the HCAF (Half-degree Cell Authority File) raster
+  h_tif <- here("data/am-hcaf.tif")
+  
+  if (!file.exists(h_tif)) {
+    # Create the global template raster
+    xmin <- -180; xmax <- 180
+    ymin <- -90; ymax <- 90
+    res  <- 0.5  # Half-degree resolution
+    
+    r_g <- rast(
+      nrows = (ymax - ymin) / res,
+      ncols = (xmax - xmin) / res,
+      xmin = xmin,
+      xmax = xmax,
+      ymin = ymin,
+      ymax = ymax,
+      crs = "EPSG:4326")
+    
+    # data frame to points
+    p <- tbl(con_dd, "cells") |> 
+      collect() |>
+      st_as_sf(
+        coords = c("center_long", "center_lat"),
+        remove = F,
+        crs = 4326) |> 
+      arrange(center_long, center_lat)
+    
+    # points to raster
+    get_r <- function(v) {
+      r <- rasterize(p, r_g, field = v)
+      names(r) <- v
+      r
+    }
+    
+    r_h <- NULL
+    for (v in setdiff(names(p), "geometry")) {
+      message(glue("v: {v}"))
+      
+      if (is.null(r_h)) {
+        r_h <- get_r(v)
+      } else {
+        r_h <- rast(list(r_h, get_r(v)))
+      }
+    }
+    
+    writeRaster(r_h, h_tif, overwrite=T)
+  }
+  
+  return(rast(h_tif))
+}
+
+get_species_raster <- function(sp_key, con_dd) {
+  # Get the original species probability raster
+  d_sp_cell <- tbl(con_dd, "spp_cells") |> 
+    filter(sp_key == !!sp_key) |> 
+    collect()
+  
+  r_h <- get_hcaf_raster(con_dd)
+  
+  r_sp <- with(
+    d_sp_cell,
+    subst(  # substitute cell_id with probability
+      r_h[["cell_id"]], 
+      from   = cell_id,
+      to     = probability,
+      others = NA)) |> 
+    trim()
+  
+  names(r_sp) <- "probability"
+  
+  return(r_sp)
+}
+
+replicate_sp_raster <- function(sp_key, con_dd, r_h = NULL) {
+  # Replicate the species probability raster based on environmental preferences
+  
+  if (is.null(r_h)) {
+    r_h <- get_hcaf_raster(con_dd)
+  }
+  
+  # Get species info
+  sp_info <- get_sp_info(sp_key, con_dd)
+  
+  # Get species preferences
+  d_sp_pref <- tbl(con_dd, "spp_prefs") |> 
+    filter(sp_key == !!sp_key) |> 
+    collect()
+  
+  # Get variables used for this species
+  vars_yes <- d_sp_pref |> 
+    select(ends_with("_yn")) |> 
+    pivot_longer(everything()) |> 
+    filter(value == 1) |> 
+    pull(name) |> 
+    str_replace("_yn", "") |> 
+    sort()
+  
+  # Prepare environment layers
+  r_env <- r_h  
+  
+  # Apply bounding box if needed
+  bbox_yes <- d_sp_pref$map_opt %in% c(1,3)
+  if (bbox_yes) {
+    # Get revised bounding box from spp_cells
+    d_spp_bbox <- tbl(con_dd, "spp_cells") |> 
+      filter(sp_key == !!sp_key) |>
+      left_join(
+        tbl(con_dd, "cells"),
+        by = "cell_id") |>
+      summarize(
+        w_most_long = min(w_limit, na.rm = T),
+        e_most_long = max(e_limit, na.rm = T),
+        s_most_lat  = min(s_limit, na.rm = T),
+        n_most_lat  = max(n_limit, na.rm = T),
+        .groups = "drop") |> 
+      collect()
+    
+    bbox_ext <- d_spp_bbox |>
+      select(w_most_long, e_most_long, s_most_lat, n_most_lat) |>
+      pivot_longer(everything()) |>
+      deframe() |>
+      as.vector() |>
+      ext()
+    
+    r_env <- crop(r_env, bbox_ext)
+  }
+  
+  # Apply FAO areas if needed
+  if (("extn_rule" %in% vars_yes) && !is.na(d_sp_pref$fao_areas)) {
+    # Get FAO areas
+    fao_areas <- d_sp_pref$fao_areas |> 
+      str_split(",\\s*") |>
+      unlist() |> 
+      as.integer()
+    
+    r_fao <- r_env[["fao_area_m"]] %in% fao_areas
+    r_env <- mask(
+      r_env,
+      r_fao,
+      maskvalue = F)
+  }
+  
+  # Remove extn_rule from vars_yes
+  vars_yes <- setdiff(vars_yes, "extn_rule")
+  
+  # Function to ramp environmental variable based on species preference
+  ramp_env <- function(v, p) {
+    approx(
+      x      = p,  # c(min, min_pref, max_pref, max)
+      y      = c(0, 1, 1, 0), 
+      xout   = v, 
+      rule   = 1,  # return NA if outside range
+      method = "linear",
+      ties   = max)$y
+  }
+  
+  # Match species preference vars to AquaMaps env raster layers
+  is_surface <- d_sp_pref$layer == "s" # vs "b" bottom
+  var_lyr <- list(
+    "depth"     = "depth_min", # Using depth_min instead of depth_mean
+    "temp"      = ifelse(
+      is_surface,
+      "sst_an_mean",
+      "sbt_an_mean"),
+    "salinity"  = ifelse(
+      is_surface,
+      "salinity_mean",
+      "salinity_b_mean"),
+    "oxy"       = "oxy_b_mean",
+    "prim_prod" = "prim_prod_mean",
+    "ice_con"   = "ice_con_ann",
+    "land_dist" = "land_dist")
+  
+  r_sp_env <- list()
+  
+  # Process each environmental variable
+  for (var in vars_yes) {
+    # Skip depth if pelagic
+    if (var == "depth" && sp_info$pelagic == 1)
+      next
+    
+    # Get RES parameters
+    p <- d_sp_pref |> 
+      select(
+        sprintf(
+          "%s_%s", var, 
+          c("min", "pref_min", "pref_max", "max"))) |> 
+      pivot_longer(everything()) |> 
+      deframe() |> 
+      as.vector()
+    
+    # Check parameters
+    stopifnot(
+      length(p) == 4,
+      all(is.finite(p)),
+      all(diff(p) >= 0))
+    
+    # Get appropriate layer and apply RES
+    lyr <- var_lyr[[var]]
+    r_var <- r_env[[lyr]]
+    
+    r_sp_env[[var]] <- terra::app(
+      x   = r_var, 
+      fun = ramp_env, 
+      p   = p)
+  }
+  
+  # Convert to raster stack
+  r_sp_env <- rast(r_sp_env)
+  
+  # Multiply all layers to get final probability
+  r_sp_new <- app(r_sp_env, fun = prod) |> round(2)
+  
+  # Mask zero values
+  r_sp_new <- mask(r_sp_new, r_sp_new, maskvalues = 0)
+  
+  return(r_sp_new)
+}
+
+compare_rasters <- function(r_old, r_new) {
+  # Check if rasters match
+  # Return TRUE if they are identical within 0.01 tolerance
+  # Return FALSE otherwise
+  
+  # Prepare rasters for comparison by aligning them
+  r_union <- ext(c(r_old, r_new))
+  r_old_ext <- extend(r_old, r_union)
+  r_new_ext <- extend(r_new, r_union)
+  
+  # Calculate difference
+  r_diff <- r_new_ext - r_old_ext
+  
+  # Check if all values are within tolerance
+  diff_values <- values(r_diff, na.rm = TRUE)
+  
+  if (length(diff_values) == 0) {
+    # No overlap between rasters
+    return(FALSE)
+  }
+  
+  tolerance <- 0.01
+  matches <- all(abs(diff_values) < tolerance)
+  
+  return(matches)
+}
+
+validate_aquamaps_species <- function(sp_keys, con_dd) {
+  # Validate multiple species
+  results <- tibble(
+    sp_key = character(),
+    r_matches = logical()
+  )
+  
+  # Get HCAF raster once
+  r_h <- get_hcaf_raster(con_dd)
+  
+  for (sp_key in sp_keys) {
+    cat(glue("Processing species {sp_key}...\n"))
+    
+    tryCatch({
+      # Get original raster
+      r_sp_old <- get_species_raster(sp_key, con_dd)
+      
+      # Replicate raster
+      r_sp_new <- replicate_sp_raster(sp_key, con_dd, r_h)
+      
+      # Compare rasters
+      matches <- compare_rasters(r_sp_old, r_sp_new)
+      
+      # Add to results
+      results <- bind_rows(
+        results,
+        tibble(
+          sp_key = sp_key,
+          r_matches = matches
+        )
+      )
+    }, error = function(e) {
+      cat(glue("Error processing {sp_key}: {e$message}\n"))
+      results <- bind_rows(
+        results,
+        tibble(
+          sp_key = sp_key,
+          r_matches = NA
+        )
+      )
+    })
+  }
+  
+  return(results)
+}
+```
+
+## Test Functions with a Single Species
+
+```{r}
+#| label: test_single_species
+
+# Test with a single species
+test_sp_key <- "W-Msc-419703"  # Crepidula depressa
+
+# Get original raster
+r_sp_old <- get_species_raster(test_sp_key, con_dd)
+
+# Replicate raster
+r_sp_new <- replicate_sp_raster(test_sp_key, con_dd)
+
+# Compare original and replicated rasters
+matches <- compare_rasters(r_sp_old, r_sp_new)
+cat(glue("Rasters match: {matches}\n"))
+
+# Visual comparison
+pal_col <- "YlOrRd"
+pal_rmp <- colorRampPalette(brewer.pal(n=5, name=pal_col))
+pal_at <- c(0, 0.2, 0.4, 0.6, 0.8, 1)
+pal_alpha <- 0.9
+
+# Function for side-by-side comparison
+compare_sp <- function(
+  r_left, r_right,
+  lbl_left = "native →", lbl_right = "← replicated",
+  legend_title = "AquaMaps<br>suitability") {
+  
+  cols = RColorBrewer::brewer.pal(5, "YlOrRd")
+  pal <- leaflet::colorBin(
+    cols, c(0, 1), 
+    bins = length(cols), pretty = TRUE, na.color = "transparent")
+  
+  leaflet(
+    options = leafletOptions(
+      attributionControl = F,
+      zoomControl = F)) |> 
+    addMapPane("left",  zIndex = 1) |> 
+    addMapPane("right", zIndex = 1) |> 
+    addProviderTiles(
+      providers$Esri.OceanBasemap,
+      group = "base", layerId = "base_left", 
+      options = pathOptions(pane = "left")) |> 
+    addProviderTiles(
+      providers$Esri.OceanBasemap,
+      group = "base", layerId = "base_right", 
+      options = pathOptions(pane = "right")) |> 
+    addRasterImage(
+      r_left, colors = pal, opacity = 0.8, 
+      options = leafletOptions(pane = "left"), 
+      group = lbl_left) |> 
+    addRasterImage(
+      r_right, colors = pal, opacity = 0.8, 
+      options = leafletOptions(pane = "right"), 
+      group = lbl_right) |> 
+    addLegend(
+      values    = seq(0, 1, length.out = 10), 
+      pal       = pal,
+      title     = legend_title,
+      position  = "bottomright",
+      labFormat = \(x, type){
+        b <- x[1:length(x)-1]*100
+        e <- x[2:length(x)]*100
+        glue("{str_pad(b,2)} - {e}%")}) |> 
+    addControl(lbl_left, position = "topleft") |> 
+    addControl(lbl_right, position = "topright") |> 
+    addSidebyside(
+      layerId = "sidecontrols",
+      rightId = "base_right",
+      leftId  = "base_left")
+}
+
+# Show comparison
+compare_sp(r_sp_old, r_sp_new)
+```
+
+## Validate Multiple Species
+
+```{r}
+#| label: validate_multiple_species
+
+# Define regions
+all_regions <- msens::ply_boemrgns
+
+# Get all unique species in the database
+all_sp_keys <- tbl(con_dd, "spp_cells") |>
+  group_by(sp_key) |>
+  summarize(n = n(), .groups = "drop") |>
+  collect() |>
+  pull(sp_key)
+
+# Option to limit number of species for testing
+max_species <- 100  # Set to NULL for all species
+if (!is.null(max_species)) {
+  set.seed(123)  # For reproducibility
+  all_sp_keys <- sample(all_sp_keys, min(max_species, length(all_sp_keys)))
+}
+
+# Validate species
+results <- validate_aquamaps_species(all_sp_keys, con_dd)
+
+# Save results to CSV
+write_csv(results, here("data/aquamaps_validation_results.csv"))
+
+# Display summary
+cat(glue("Total species processed: {nrow(results)}\n"))
+cat(glue("Species with matching rasters: {sum(results$r_matches, na.rm=TRUE)}\n"))
+cat(glue("Species with non-matching rasters: {sum(!results$r_matches, na.rm=TRUE)}\n"))
+cat(glue("Species with errors: {sum(is.na(results$r_matches))}\n"))
+
+# Show results table
+results |>
+  DT::datatable(
+    caption = "AquaMaps Validation Results",
+    options = list(pageLength = 25))
+```
+
+## Analyze Results
+
+```{r}
+#| label: analyze_results
+
+# Load results if previously saved
+if (file.exists(here("data/aquamaps_validation_results.csv"))) {
+  results <- read_csv(here("data/aquamaps_validation_results.csv"))
+}
+
+# Get details about species that don't match
+if (sum(!results$r_matches, na.rm=TRUE) > 0) {
+  non_matching_sp <- results |>
+    filter(!r_matches) |>
+    pull(sp_key)
+  
+  # Get species information
+  non_matching_info <- tbl(con_dd, "spp") |>
+    filter(sp_key %in% non_matching_sp) |>
+    collect() |>
+    left_join(
+      tbl(con_dd, "spp_prefs") |>
+        filter(sp_key %in% non_matching_sp) |>
+        select(sp_key, pelagic, map_opt, layer) |>
+        collect(),
+      by = "sp_key"
+    )
+  
+  # Analyze patterns in non-matching species
+  non_matching_info |>
+    group_by(class) |>
+    summarize(count = n(), .groups = "drop") |>
+    arrange(desc(count)) |>
+    DT::datatable(caption = "Non-matching species by class")
+  
+  non_matching_info |>
+    group_by(pelagic) |>
+    summarize(count = n(), .groups = "drop") |>
+    DT::datatable(caption = "Non-matching species by pelagic status")
+  
+  non_matching_info |>
+    group_by(map_opt) |>
+    summarize(count = n(), .groups = "drop") |>
+    DT::datatable(caption = "Non-matching species by map option")
+  
+  non_matching_info |>
+    group_by(layer) |>
+    summarize(count = n(), .groups = "drop") |>
+    DT::datatable(caption = "Non-matching species by layer (s=surface, b=bottom)")
+  
+  # Examine a sample of non-matching species in detail
+  sample_sp <- sample(non_matching_sp, min(5, length(non_matching_sp)))
+  
+  for (sp in sample_sp) {
+    # Get original and replicated rasters
+    r_old <- get_species_raster(sp, con_dd)
+    r_new <- replicate_sp_raster(sp, con_dd)
+    
+    # Create comparison map
+    cat(glue("\nExample non-matching species: {sp}\n"))
+    print(compare_sp(r_old, r_new))
+  }
+}
+```
+
+## Conclusion
+
+This document validates the replication process for AquaMaps species distribution models. It compares the original AquaMaps rasters with our replicated versions to ensure our environmental envelope approach correctly reproduces the original rasters.
+
+The key modifications from the exploratory work in `explore_interpolation.qmd` include:
+
+1. Using `depth_min` instead of `depth_mean` for depth-based environmental envelopes
+2. Deriving bounding boxes and FAO areas directly from the species occurrence data
+3. Streamlining the replication process into reusable functions
+4. Adding functionality to validate all species across all BOEM regions
+
+The validation report helps identify any discrepancies between the original and replicated models, which can inform further refinements to the replication approach.
