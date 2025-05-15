@@ -16,6 +16,7 @@ librarian::shelf(
   listviewer, scales, marinesensitivity/msens, RColorBrewer, readr, sf, stringr, 
   terra, tibble, tidyr,
   quiet = T)
+options(readr.show_col_types = F)
 mapviewOptions(basemaps = "Esri.OceanBasemap")
 
 dir_data  <- "~/My Drive/projects/msens/data"
@@ -236,6 +237,7 @@ get_species_raster <- function(sp_key, con_dd, dir_cache = here("data/replicate_
 }
 
 replicate_sp_raster <- function(sp_key, con_dd, r_h = NULL, dir_cache = here("data/replicate_aquamaps")) {
+  
   # Replicate the species probability raster based on environmental preferences
   cache_path <- get_cache_path("replicated", sp_key, dir_cache = dir_cache)
   
@@ -270,34 +272,37 @@ replicate_sp_raster <- function(sp_key, con_dd, r_h = NULL, dir_cache = here("da
   # Prepare environment layers
   r_env <- r_h  
   
-  # Apply bounding box if needed
-  bbox_yes <- d_sp_pref$map_opt %in% c(1,3)
-  if (bbox_yes) {
-    # Get revised bounding box from spp_cells
-    d_spp_bbox <- tbl(con_dd, "spp_cells") |> 
-      filter(sp_key == !!sp_key) |>
-      left_join(
-        tbl(con_dd, "cells"),
-        by = "cell_id") |>
-      summarize(
-        w_most_long = min(w_limit, na.rm = T),
-        e_most_long = max(e_limit, na.rm = T),
-        s_most_lat  = min(s_limit, na.rm = T),
-        n_most_lat  = max(n_limit, na.rm = T),
-        .groups = "drop") |> 
-      collect()
-    
-    bbox_ext <- d_spp_bbox |>
-      select(w_most_long, e_most_long, s_most_lat, n_most_lat) |>
-      pivot_longer(everything()) |>
-      deframe() |>
-      as.vector() |>
-      ext()
-    
-    r_env <- crop(r_env, bbox_ext)
-  }
+  # Apply bounding box ----
+  # IDEAL: if needed
+  #   bbox_yes <- d_sp_pref$map_opt %in% c(1,3)
+  #   if (bbox_yes) {
+  # DEBUG: apply bounding box regardless, to be able to compare
   
-  # Apply FAO areas if needed
+  # Get revised bounding box from spp_cells
+  d_spp_bbox <- tbl(con_dd, "spp_cells") |> 
+    filter(sp_key == !!sp_key) |>
+    left_join(
+      tbl(con_dd, "cells"),
+      by = "cell_id") |>
+    summarize(
+      w_most_long = min(w_limit, na.rm = T),
+      e_most_long = max(e_limit, na.rm = T),
+      s_most_lat  = min(s_limit, na.rm = T),
+      n_most_lat  = max(n_limit, na.rm = T),
+      .groups = "drop") |> 
+    collect()
+  
+  bbox_ext <- d_spp_bbox |>
+    select(w_most_long, e_most_long, s_most_lat, n_most_lat) |>
+    pivot_longer(everything()) |>
+    deframe() |>
+    as.vector() |>
+    ext()
+  
+  r_env <- crop(r_env, bbox_ext)
+  # }
+  
+  # Apply FAO areas if needed ----
   if (("extn_rule" %in% vars_yes) && !is.na(d_sp_pref$fao_areas)) {
     # Get FAO areas
     fao_areas <- d_sp_pref$fao_areas |> 
@@ -419,18 +424,18 @@ compare_rasters <- function(r_old, r_new) {
   return(matches)
 }
 
-validate_aquamaps_species <- function(sp_keys, con_dd, dir_cache = here("data/replicate_aquamaps")) {
+validate_aquamaps_species <- function(sp_keys, con_dd, dir_cache = here("data/replicate_aquamaps"), verbose = F) {
   # Validate multiple species
   results <- tibble(
-    sp_key = character(),
-    r_matches = logical()
-  )
+    sp_key    = character(),
+    r_matches = logical() )
   
   # Get HCAF raster once
   r_h <- get_hcaf_raster(con_dd, dir_cache = dir_cache)
   
   for (sp_key in sp_keys) {
-    cat(glue("Processing species {sp_key}...\n"))
+    if (verbose)
+      cat(glue("Processing species {sp_key}...\n")) # sp_key = "ITS-206881"
     
     tryCatch({
       # Get original raster
@@ -464,37 +469,19 @@ validate_aquamaps_species <- function(sp_keys, con_dd, dir_cache = here("data/re
   
   return(results)
 }
-```
-
-## Test Functions with a Single Species
-
-```{r}
-#| label: test_single_species
-
-# Test with a single species
-test_sp_key <- "W-Msc-419703"  # Crepidula depressa
-
-# Get original raster
-r_sp_old <- get_species_raster(test_sp_key, con_dd, dir_cache = dir_cache)
-
-# Replicate raster
-r_sp_new <- replicate_sp_raster(test_sp_key, con_dd, dir_cache = dir_cache)
-
-# Compare original and replicated rasters
-matches <- compare_rasters(r_sp_old, r_sp_new)
-cat(glue("Rasters match: {matches}\n"))
-
-# Visual comparison
-pal_col <- "YlOrRd"
-pal_rmp <- colorRampPalette(brewer.pal(n=5, name=pal_col))
-pal_at <- c(0, 0.2, 0.4, 0.6, 0.8, 1)
-pal_alpha <- 0.9
 
 # Function for side-by-side comparison
 compare_sp <- function(
-  r_left, r_right,
-  lbl_left = "native →", lbl_right = "← replicated",
-  legend_title = "AquaMaps<br>suitability") {
+  r_left, 
+  r_right,
+  sp_key, 
+  lbl_left     = "native →", 
+  lbl_right    = "← replicated",
+  legend_title = glue("{sp_key}<br>AquaMaps<br>suitability"),
+  pal_col      = "YlOrRd",
+  pal_rmp      = colorRampPalette(brewer.pal(n=5, name=pal_col)),
+  pal_at       = c(0, 0.2, 0.4, 0.6, 0.8, 1),
+  pal_alpha    = 0.9) {
   
   cols = RColorBrewer::brewer.pal(5, "YlOrRd")
   pal <- leaflet::colorBin(
@@ -539,9 +526,28 @@ compare_sp <- function(
       rightId = "base_right",
       leftId  = "base_left")
 }
+```
 
-# Show comparison
-compare_sp(r_sp_old, r_sp_new)
+## Test Functions with a Single Species
+
+```{r}
+#| label: test_single_species
+
+# Test with a single species
+test_sp_key <- "W-Msc-419703"  # Crepidula depressa
+
+# Get original raster
+r_sp_old <- get_species_raster(test_sp_key, con_dd, dir_cache = dir_cache)
+
+# Replicate raster
+r_sp_new <- replicate_sp_raster(test_sp_key, con_dd, dir_cache = dir_cache)
+
+# Compare original and replicated rasters
+matches <- compare_rasters(r_sp_old, r_sp_new)
+cat(glue("Rasters match: {matches}\n"))
+
+# Visual comparison
+compare_sp(r_sp_old, r_sp_new, test_sp_key)
 ```
 
 ## Validate Multiple Species
@@ -560,7 +566,7 @@ all_sp_keys <- tbl(con_dd, "spp_cells") |>
   pull(sp_key)
 
 # Option to limit number of species for testing
-max_species <- 100  # Set to NULL for all species
+max_species <- 50  # Set to NULL for all species
 if (!is.null(max_species)) {
   set.seed(123)  # For reproducibility
   all_sp_keys <- sample(all_sp_keys, min(max_species, length(all_sp_keys)))
@@ -610,8 +616,7 @@ if (sum(!results$r_matches, na.rm=TRUE) > 0) {
         filter(sp_key %in% non_matching_sp) |>
         select(sp_key, pelagic, map_opt, layer) |>
         collect(),
-      by = "sp_key"
-    )
+      by = "sp_key")
   
   # Analyze patterns in non-matching species
   non_matching_info |>
@@ -638,14 +643,14 @@ if (sum(!results$r_matches, na.rm=TRUE) > 0) {
   # Examine a sample of non-matching species in detail
   sample_sp <- sample(non_matching_sp, min(5, length(non_matching_sp)))
   
-  for (sp in sample_sp) {
+  for (sp in sample_sp) { # sp = sample_sp[1]
     # Get original and replicated rasters
     r_old <- get_species_raster(sp, con_dd, dir_cache = dir_cache)
     r_new <- replicate_sp_raster(sp, con_dd, dir_cache = dir_cache)
     
     # Create comparison map
     cat(glue("\nExample non-matching species: {sp}\n"))
-    print(compare_sp(r_old, r_new))
+    compare_sp(r_old, r_new, sp)
   }
 }
 ```
