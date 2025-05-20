@@ -1,4 +1,4 @@
-## 2025-05-20.b Bio-Oracle replication
+## 2025-05-20.b + Bio-Oracle replication
 
 Add argument `env_layers = "HCAF_v4"` (default) or "BioOracle_v3" to 
 `replicate_sp_raster()` in @libs/am_functions.R to use the 
@@ -7,6 +7,80 @@ File (HCAF). Include a cross-walk between the original HCAF layers and the
 new BioOracle layers by investigating the `bio-oracle_layers` R chunk in 
 @replicate_aquamaps.qmd, @data/aquamaps_meta_layers.csv, and 
 @data/bio-oracle_datasets_relevant.csv.
+
+Excellent, except for the following:
+- Continue to download the required BioOracle data layers in the 
+  `bio-oracle_layers` R chunk of @replicate_aquamaps.qmd.
+- Use these downloaded netcdf files to be read by `terra::rast()` in the 
+  `get_sp_env()` function in @libs/am_functions.R with the additional argument 
+  of using HCAF_v4 or BioOracle_v3.
+- Apply similar logic to the rest of the functions in @libs/am_functions.R and
+  their usage in @replicate_aquamaps.qmd with explicit R chunks added for
+  generating individual and en masse species distributions alternatively using
+  BioOracle.
+
+### Response
+
+⏺ Update Todos
+  ⎿  ☒ Analyze existing replicate_sp_raster function in am_functions.R
+     ☒ Identify BioOracle v3 equivalent layers for AquaMaps environmental variables
+     ☒ Modify replicate_sp_raster function to accept env_layers parameter
+     ☒ Create BioOracle to AquaMaps layer crosswalk mapping
+     ☒ Add documentation notes about layer sources in replicate_aquamaps.qmd
+
+⏺ I've implemented the requested changes:
+
+  1. Modified the replicate_sp_raster() function in am_functions.R to accept an optional env_layers parameter with values
+  "HCAF_v4" (default) or "BioOracle_v3"
+  2. Created a mapping between AquaMaps environmental variables and their BioOracle v3 equivalents:
+    - depth → terrain_characteristics.bathymetry_min/mean/max
+    - temp (surface) → thetao_baseline_*_depthsurf
+    - temp (bottom) → thetao_baseline_*_depthmax
+    - salinity → so_baseline layers
+    - oxygen → o2_baseline layers
+    - primary production → phyc_baseline
+    - ice concentration → siconc_baseline
+  3. Added proper caching with a suffix for BioOracle results
+  4. Documented the changes in the replicate_aquamaps.qmd file with a detailed crosswalk table and usage examples
+
+  The new feature allows for reproducing AquaMaps species distributions with higher resolution (1/20 degree) environmental data
+  instead of the default half-degree resolution.
+
+⏺ Update Todos
+  ⎿  ☒ Analyze existing replicate_sp_raster function in am_functions.R
+     ☒ Identify BioOracle v3 equivalent layers for AquaMaps environmental variables
+     ☒ Modify replicate_sp_raster function to accept env_layers parameter
+     ☒ Create BioOracle to AquaMaps layer crosswalk mapping
+     ☒ Update get_sp_env function to support BioOracle data sources
+     ☒ Add BioOracle layer download and loading in bio-oracle_layers chunk
+     ☒ Add documentation notes about layer sources in replicate_aquamaps.qmd
+     ☒ Create test chunks for BioOracle-based species distributions
+     ☒ Update conclusion section to mention BioOracle integration
+
+⏺ I've implemented all the requested changes to support using BioOracle v3 data for AquaMaps species distribution replication:
+
+  1. Modified replicate_sp_raster() function to accept an env_layers parameter with options "HCAF_v4" (default) or
+  "BioOracle_v3"
+  2. Updated get_sp_env() function to handle both data sources:
+    - Implemented loading of BioOracle v3 netCDF files
+    - Added error checking for required files
+    - Handled mapping between BioOracle variables and AquaMaps variables
+    - Added special handling for layers not in BioOracle (land distance, FAO areas)
+  3. Enhanced the BioOracle download chunk in replicate_aquamaps.qmd:
+    - Structured the downloads for all required datasets
+    - Added verification and testing of loaded layers
+    - Improved error handling and reporting
+  4. Added two comprehensive test chunks for BioOracle-based replication:
+    - Individual species testing with visual comparisons
+    - Batch processing with performance and accuracy metrics
+  5. Updated the documentation and conclusion section to highlight the benefits of BioOracle integration:
+    - Higher spatial resolution (1/20° vs 1/2°)
+    - More recent environmental data
+    - Better coastal detail representation
+    - Data source flexibility for sensitivity analysis
+
+  These changes allow for reproducing AquaMaps species distributions with either the original HCAF data or higher-resolution
+  BioOracle v3 data, providing additional options for marine spatial analysis.
 
 ## 2025-05-20.a mv fxns in replicate_aquamaps.qmd into libs/am_functions.R
 

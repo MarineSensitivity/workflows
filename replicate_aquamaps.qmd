@@ -217,21 +217,24 @@ sp_keys <- d_sp_br |>
   mutate(
     sp_repl_tif        = here(glue("data/replicate_aquamaps/replicated/{sp_key}.tif")),
     sp_repl_tif_exists = file.exists(sp_repl_tif)) |>  # 9,927
-  filter(!sp_repl_tif_exists) |> 
+  # filter(!sp_repl_tif_exists) |> 
   pull(sp_key)
 
 # Validate species
-results <- validate_aquamaps_species(sp_keys, con_dd, dir_cache = dir_cache, verbosity = 1, redo = F)
+results <- validate_aquamaps_species(sp_keys, con_dd, dir_cache = dir_cache, verbosity = 0, redo = F)
+# INFO [2025-05-20 10:31:10] 0001 of 5777: SLB-74929...
+# INFO [2025-05-20 10:31:35] 0008 of 5777: W-Msc-419475...
+# INFO [2025-05-20 17:42:27] 5777 of 5777: W-Por-171171...
 
 # Save results to CSV
 results_csv <- here("data/aquamaps_validation_results.csv")
 write_csv(results, results_csv)
 
 # Display summary
-cat(glue("Total species processed: {nrow(results)}\n"))
-cat(glue("Species with matching rasters: {sum(results$r_matches, na.rm=TRUE)}\n"))
-cat(glue("Species with non-matching rasters: {sum(!results$r_matches, na.rm=TRUE)}\n"))
-cat(glue("Species with errors: {sum(is.na(results$r_matches))}\n"))
+cat(glue("Total species processed: {nrow(results)}\n"))                                 # 9,927
+cat(glue("Species with matching rasters: {sum(results$r_matches, na.rm=TRUE)}\n"))      # 1,227 or 12.3%
+cat(glue("Species with non-matching rasters: {sum(!results$r_matches, na.rm=TRUE)}\n")) # 8,700
+cat(glue("Species with errors: {sum(is.na(results$r_matches))}\n"))                     #     0
 
 # Show results table
 results |>
@@ -354,20 +357,45 @@ if (sum(!results$r_matches, na.rm=TRUE) > 0) {
 -   [Copernicus Marine Data Store \| Copernicus Marine Service](https://data.marine.copernicus.eu/products)
 
 ```{r}
-#| label: bio-oracle_layers
+#| label: am-meta_bio-oracle_layers
 #| eval: false
 
 librarian::shelf(
-  bio-oracle/biooracler, janitor, terra,
+  bio-oracle/biooracler, janitor, terra, fs,
   quiet = T)
 
 # biooracler:::erddap.bio_oracle.org()
 # http://erddap.bio-oracle.org/erddap/
-bo_ds_csv      <- here("data/bio-oracle_datasets.csv")
-bo_ds_rel_csv  <- here("data/bio-oracle_datasets_relevant.csv")
-bo_ds_vars_csv <- here("data/bio-oracle_dataset_variables.csv")
+am_meta_lyrs_csv <- here("data/aquamaps_meta_layers.csv")
+bo_ds_csv        <- here("data/bio-oracle_datasets.csv")
+bo_ds_rel_csv    <- here("data/bio-oracle_datasets_relevant.csv")
+bo_ds_vars_csv   <- here("data/bio-oracle_dataset_variables.csv")
 
-if (!all(file.exists(bo_ds_csv, bo_ds_v_csv))) {
+# Create a list of AquaMaps environmental layers for reference
+env_lyrs <- c(
+  "depth_mean", 
+  "depth_min",
+  "depth_max",
+  "sst_an_mean",
+  "sbt_an_mean",
+  "salinity_mean",
+  "salinity_b_mean",
+  "oxy_b_mean",
+  "prim_prod_mean",
+  "ice_con_ann",
+  "land_dist")
+
+# Create and save metadata crosswalk table if it doesn't exist
+if (!file.exists(am_meta_lyrs_csv)) {
+  am_meta |> 
+    filter(
+      tbl_new == "cells",
+      fld_new %in% env_lyrs) |> 
+    write_csv(am_meta_lyrs_csv)
+}
+am_meta_lyrs <- read_csv(am_meta_lyrs_csv)
+
+if (!all(file.exists(bo_ds_csv, bo_ds_vars_csv))) {
   d_ds <- biooracler::list_layers(simplify = T)
   
   d_other <- tribble(
@@ -444,7 +472,7 @@ if (!all(file.exists(bo_ds_csv, bo_ds_v_csv))) {
   
   d_ds_vars <- d_ds |> 
     unnest(d_vars) |> 
-    select(dataset_id, variable,  attribute_name,  value) |> 
+    select(dataset_id, variable, attribute_name, value) |> 
     filter(attribute_name != "") |>
     pivot_wider(
       names_from  = attribute_name,
@@ -454,44 +482,92 @@ if (!all(file.exists(bo_ds_csv, bo_ds_v_csv))) {
   d_ds_vars |> 
     write_csv(bo_ds_vars_csv)
 }
+```
 
-# download bio-oracle layers for depth_mean|min|max: bathymetry
+```{r}
+#| label: download_bio-oracle
+
+# Directory for BioOracle data
 dir_bo <- '~/My Drive/projects/msens/data/raw/bio-oracle.org'
-r_nc <- glue("{dir_bo}/bathymetry.nc")
-r <- biooracler::download_layers(
-  dataset_id  = "terrain_characteristics",
-  variables   = c("bathymetry_mean", "bathymetry_min", "bathymetry_max"),
-  constraints = list(
-    longitude = c(-179.975, 179.975),
-    latitude  = c(- 89.975,  89.975) ),
-  fmt         = "nc",
-  directory   = dirname(r_nc))
-file_move(r$summary$filename, r_nc)
-r <- rast(r_nc)
+dir.create(dir_bo, showWarnings = FALSE, recursive = TRUE)
 
-env_lyrs <- c(
-  "depth_mean", 
-  "depth_min",
-  "depth_max",
-  "sst_an_mean",
-  "sbt_an_mean",
-  "salinity_mean",
-  "salinity_b_mean",
-  "oxy_b_mean",
-  "prim_prod_mean",
-  "ice_con_ann",
-  "land_dist")
+# Define BioOracle v3 layers needed for AquaMaps replication
+bo_layers <- list(
+  bathymetry = list(
+    dataset_id = "terrain_characteristics",
+    variables  = c("bathymetry_mean", "bathymetry_min", "bathymetry_max") ),
+  thetao_surf = list(
+    dataset_id = "thetao_baseline_2000_2019_depthsurf",
+    variables  = c("thetao_mean") ),
+  thetao_max = list(
+    dataset_id = "thetao_baseline_2000_2019_depthmax",
+    variables  = c("thetao_mean") ),
+  so_surf = list(
+    dataset_id = "so_baseline_2000_2019_depthsurf",
+    variables  = c("so_mean") ),
+  so_max = list(
+    dataset_id = "so_baseline_2000_2019_depthmax",
+    variables  = c("so_mean") ),
+  o2_max = list(
+    dataset_id = "o2_baseline_2000_2018_depthmax",
+    variables  = c("o2_mean") ),
+  phyc_surf = list(
+    dataset_id = "phyc_baseline_2000_2020_depthsurf",
+    variables  = c("phyc_mean") ),
+  siconc_surf = list(
+    dataset_id = "siconc_baseline_2000_2020_depthsurf",
+    variables  = c("siconc_mean") ) )
 
-am_meta_lyrs_csv <- here("data/aquamaps_meta_layers.csv")
-if (!file.exists(am_meta_lyrs_csv)) {
-  am_meta |> 
-  filter(
-    tbl_new == "cells",
-    fld_new %in% env_lyrs) |> 
-    write_csv(am_meta_lyrs_csv)
+# Download all required BioOracle layers
+for (layer in names(bo_layers)) { # layer = names(bo_layers)[2]
+  lyr <- bo_layers[[layer]]
+  r_nc <- glue("{dir_bo}/{layer}.nc")
+  
+  yr <- ifelse(layer == "bathymetry", 1970, 2010)
+  
+  # Skip if already downloaded
+  if (!file.exists(r_nc)) {
+    message(glue("Downloading {layer} data to {basename(r_nc)}"))
+    r <- biooracler::download_layers(
+      dataset_id  = lyr$dataset_id,
+      variables   = lyr$variables,
+      constraints = list(
+        time      = rep(glue("{yr}-01-01T00:00:00Z"), 2),
+        longitude = c(-179.975, 179.975),
+        latitude  = c(-89.975, 89.975)),
+      fmt         = "nc",
+      directory   = dirname(r_nc) )
+    # Move and rename the downloaded file
+    file_move(r$summary$filename, r_nc)
+    # Test loading
+    r <- rast(r_nc)
+    message(glue("Successfully downloaded {layer} with variables: {paste(names(r), collapse=', ')} ({paste(time(r), collapse=', ')})"))
+  } else {
+    message(glue("{layer} file already exists at {basename(r_nc)}"))
+  }
 }
-am_meta_lyrs <- read_csv(am_meta_lyrs_csv)
-View(am_meta_lyrs)
+
+# Test loading one of each layer type to verify
+r <- rast(
+  list.files(dir_bo, "\\.nc$", full.names = TRUE))
+tibble(
+  lyr      = names(r),
+  longname = longnames(r),
+  time     = time(r),
+  source   = basename(sources(r)))
+#    lyr              longname                         time               
+#    <chr>            <chr>                            <dttm>             
+# 1  bathymetry_mean Bathymetry Mean                  1970-01-01 00:00:00
+# 2  bathymetry_min  Bathymetry Min                   1970-01-01 00:00:00
+# 3  bathymetry_max  Bathymetry Max                   1970-01-01 00:00:00
+# 4  o2_mean         Average DissolvedMolecularOxygen 2010-01-01 00:00:00
+# 5  phyc_mean       Average TotalPhytoplankton       2010-01-01 00:00:00
+# 6  siconc_mean     Average SeaIceCover              2010-01-01 00:00:00
+# 7  so_mean         Average Salinity                 2010-01-01 00:00:00
+# 8  so_mean         Average Salinity                 2010-01-01 00:00:00
+# 9  thetao_mean     Average OceanTemperature         2010-01-01 00:00:00
+# 10 thetao_mean     Average OceanTemperature         2010-01-01 00:00:00
+
 ```
 
 ## Match AquaMaps env to Bio-Oracle layers
@@ -512,7 +588,239 @@ d_sp_pref |>
 # "depth"     "temp"      "salinity"  "prim_prod" "ice_con"   "oxy"       "land_dist" "extn_rule"
 ```
 
--   `depth`: terrain_characteristics.bathymetry_min\|mean\|max
+### AquaMaps to Bio-Oracle v3 Layer Mapping
+
+The following table shows the mapping between AquaMaps environmental variables and their Bio-Oracle v3 equivalents:
+
+| AquaMaps Variable | AquaMaps Layer | Bio-Oracle v3 Dataset | Bio-Oracle v3 Variable |
+|-------------------|----------------|------------------------|------------------------|
+| depth (min)       | depth_min      | terrain_characteristics | bathymetry_min |
+| depth (mean)      | depth_mean     | terrain_characteristics | bathymetry_mean |
+| depth (max)       | depth_max      | terrain_characteristics | bathymetry_max |
+| temp (surface)    | sst_an_mean    | thetao_baseline_2000-2019_depthsurf | thetao_mean |
+| temp (bottom)     | sbt_an_mean    | thetao_baseline_2000-2019_depthmax | thetao_mean |
+| salinity (surface)| salinity_mean  | so_baseline_2000-2019_depthsurf | so_mean |
+| salinity (bottom) | salinity_b_mean| so_baseline_2000-2019_depthmax | so_mean |
+| oxygen (bottom)   | oxy_b_mean     | o2_baseline_2000-2018_depthmax | o2_mean |
+| primary production| prim_prod_mean | phyc_baseline_2000-2020_depthsurf | phyc_mean |
+| ice concentration | ice_con_ann    | siconc_baseline_2000-2020_depthsurf | siconc_mean |
+| land distance     | land_dist      | (retain HCAF layer - not available in Bio-Oracle) | - |
+
+This mapping is implemented in the `replicate_sp_raster()` function, which now accepts an optional `env_layers` parameter that can be set to either "HCAF_v4" (default) or "BioOracle_v3".
+
+### Data Resolution Comparison
+
+- **HCAF**: 1/2 degree (approximately 55 km at the equator)
+- **Bio-Oracle v3**: 1/20 degree (approximately 5.5 km at the equator)
+
+The higher resolution of Bio-Oracle v3 allows for more detailed species distribution models, particularly in coastal regions where environmental gradients can change rapidly over short distances.
+
+### Using Bio-Oracle v3 Layers
+
+To use Bio-Oracle v3 layers for replication, call the `replicate_sp_raster()` function with the `env_layers` parameter set to "BioOracle_v3":
+
+```r
+# Example using Bio-Oracle v3 layers
+r_sp_new <- replicate_sp_raster(
+  sp_key = "Fis-22747",
+  con_dd = con_dd,
+  env_layers = "BioOracle_v3")
+```
+
+The function will cache the results with a suffix indicating the data source to differentiate between HCAF and Bio-Oracle based outputs.
+
+
+```{r}
+#| label: test_biooracle_replication
+#| eval: false
+
+# Test replication using BioOracle v3 data for a single species
+sp_key_test <- "Fis-22747"  # Basking shark (Cetorhinus maximus)
+
+# Get species information
+sp_info <- get_sp_info(sp_key_test, con_dd)
+
+# Get the original raster (HCAF-based)
+r_sp_old <- get_species_raster(sp_key_test, con_dd, dir_cache = dir_cache)
+
+# Replicate using BioOracle v3 data
+r_sp_new_bo <- replicate_sp_raster(
+  sp_key = sp_key_test,
+  con_dd = con_dd,
+  env_layers = "BioOracle_v3",
+  redo = TRUE,
+  verbose = TRUE)
+
+# Compare the two distributions visually
+compare_sp(
+  r_sp_old, 
+  r_sp_new_bo, 
+  sp_key_test,
+  lbl_left = "HCAF (1/2°) →",
+  lbl_right = "← BioOracle v3 (1/20°)",
+  legend_title = glue::glue("{sp_info$sp_scientific}<br>({sp_key_test})<br>Habitat Suitability"))
+
+# Test with multiple species
+test_species <- c(
+  "Fis-22747",    # Basking shark (Cetorhinus maximus)
+  "ITS-Mam-180527", # Fin whale (Balaenoptera physalus)
+  "W-Pol-129784"  # Branchiomma bairdi
+)
+
+# Process each species
+for (sp_key in test_species) {
+  # Get original raster
+  r_sp_old <- get_species_raster(sp_key, con_dd, dir_cache = dir_cache)
+  
+  # Get species info
+  sp_info <- get_sp_info(sp_key, con_dd)
+  
+  # Replicate with HCAF (default)
+  r_sp_new_hcaf <- replicate_sp_raster(
+    sp_key = sp_key,
+    con_dd = con_dd,
+    env_layers = "HCAF_v4",
+    redo = TRUE,
+    verbose = TRUE)
+  
+  # Replicate with BioOracle
+  r_sp_new_bo <- replicate_sp_raster(
+    sp_key = sp_key,
+    con_dd = con_dd,
+    env_layers = "BioOracle_v3",
+    redo = TRUE,
+    verbose = TRUE)
+  
+  # Visual comparison
+  cat(glue::glue("\nSpecies: {sp_info$sp_scientific} ({sp_key})\n"))
+  
+  # Compare original vs HCAF replication
+  cat("\nOriginal vs HCAF Replication:\n")
+  compare_sp(
+    r_sp_old, 
+    r_sp_new_hcaf, 
+    sp_key,
+    lbl_left = "Original →",
+    lbl_right = "← HCAF Replication",
+    legend_title = glue::glue("{sp_info$sp_scientific}<br>({sp_key})"))
+  
+  # Compare original vs BioOracle replication
+  cat("\nOriginal vs BioOracle Replication:\n")
+  compare_sp(
+    r_sp_old, 
+    r_sp_new_bo, 
+    sp_key,
+    lbl_left = "Original →",
+    lbl_right = "← BioOracle Replication",
+    legend_title = glue::glue("{sp_info$sp_scientific}<br>({sp_key})"))
+  
+  # Compare HCAF vs BioOracle replication
+  cat("\nHCAF vs BioOracle Replication:\n")
+  compare_sp(
+    r_sp_new_hcaf, 
+    r_sp_new_bo, 
+    sp_key,
+    lbl_left = "HCAF (1/2°) →",
+    lbl_right = "← BioOracle (1/20°)",
+    legend_title = glue::glue("{sp_info$sp_scientific}<br>({sp_key})"))
+}
+```
+
+```{r}
+#| label: batch_biooracle_replication
+#| eval: false
+
+# Process a batch of species with both HCAF and BioOracle replication
+# and compare performance, accuracy, and differences
+
+# Select a small sample of species for comparison
+batch_species <- c(
+  "Fis-22747",     # Basking shark (Cetorhinus maximus)
+  "ITS-Mam-180527", # Fin whale (Balaenoptera physalus)
+  "W-Pol-129784",  # Branchiomma bairdi
+  "ITS-Mam-180524", # Blue whale (Balaenoptera musculus)
+  "W-Msc-419703"   # Crepidula depressa
+)
+
+# Create comparison table
+bo_comparison <- tibble::tibble(
+  sp_key = character(),
+  sp_scientific = character(),
+  sp_class = character(),
+  hcaf_matches_original = logical(),
+  bo_matches_original = logical(),
+  hcaf_time_seconds = numeric(),
+  bo_time_seconds = numeric(),
+  resolution_difference = character()
+)
+
+# Get HCAF raster once for efficiency
+r_hcaf <- get_hcaf_raster(con_dd)
+
+# Process each species and record metrics
+for (sp_key in batch_species) {
+  # Get species info
+  sp_info <- get_sp_info(sp_key, con_dd)
+  
+  # Get original raster
+  r_sp_old <- get_species_raster(sp_key, con_dd, r_hcaf, dir_cache = dir_cache)
+  
+  # Time HCAF replication
+  hcaf_start_time <- Sys.time()
+  r_sp_hcaf <- replicate_sp_raster(
+    sp_key = sp_key,
+    con_dd = con_dd,
+    r_hcaf = r_hcaf,
+    env_layers = "HCAF_v4",
+    redo = TRUE)
+  hcaf_end_time <- Sys.time()
+  hcaf_time <- as.numeric(difftime(hcaf_end_time, hcaf_start_time, units = "secs"))
+  
+  # Time BioOracle replication
+  bo_start_time <- Sys.time()
+  r_sp_bo <- replicate_sp_raster(
+    sp_key = sp_key,
+    con_dd = con_dd,
+    r_hcaf = r_hcaf,  # Still needed for FAO areas and land distance
+    env_layers = "BioOracle_v3",
+    redo = TRUE)
+  bo_end_time <- Sys.time()
+  bo_time <- as.numeric(difftime(bo_end_time, bo_start_time, units = "secs"))
+  
+  # Compare results
+  hcaf_matches <- compare_rasters(r_sp_old, r_sp_hcaf)
+  bo_matches <- compare_rasters(r_sp_old, r_sp_bo, tolerance = 0.20)  # Higher tolerance for different source
+  
+  # Calculate resolution difference
+  hcaf_res <- mean(terra::res(r_sp_hcaf))
+  bo_res <- mean(terra::res(r_sp_bo))
+  res_diff <- hcaf_res / bo_res
+  
+  # Add to comparison table
+  bo_comparison <- bo_comparison |>
+    dplyr::bind_rows(
+      tibble::tibble(
+        sp_key = sp_key,
+        sp_scientific = sp_info$sp_scientific,
+        sp_class = sp_info$taxa$class,
+        hcaf_matches_original = hcaf_matches,
+        bo_matches_original = bo_matches,
+        hcaf_time_seconds = hcaf_time,
+        bo_time_seconds = bo_time,
+        resolution_difference = glue::glue("{round(res_diff, 1)}x finer")
+      )
+    )
+}
+
+# Display comparison results
+DT::datatable(
+  bo_comparison,
+  caption = "Comparison of HCAF vs BioOracle Replication",
+  options = list(scrollX = TRUE))
+
+# Save comparison to CSV
+write_csv(bo_comparison, here("data/biooracle_comparison.csv"))
+```
 
 
 ## Conclusion
@@ -527,5 +835,25 @@ The key enhancements from the previous version include:
 4. Comprehensive diagnostic table for comparing species properties
 5. Interactive diagnostic visualization for examining discrepancies
 6. Streamlined performance through caching and optimized functions
+7. Integration with Bio-Oracle v3 data for higher resolution (1/20° vs 1/2°) models
+8. Support for alternative environmental data sources via the `env_layers` parameter
 
-The validation report helps identify any discrepancies between the original and replicated models, which can inform further refinements to the replication approach.
+### BioOracle Integration Benefits
+
+The addition of Bio-Oracle v3 support provides several advantages:
+
+1. **Higher spatial resolution**: Bio-Oracle v3 provides data at 1/20° resolution (approximately 5.5 km at the equator) compared to AquaMaps HCAF's 1/2° resolution (approximately 55 km at the equator). This allows for more detailed species distribution models, especially in coastal areas where environmental gradients change rapidly.
+
+2. **More recent data**: Bio-Oracle v3 includes more recent environmental data (2000-2020) than the original AquaMaps layers, potentially providing more accurate representations of current conditions.
+
+3. **Data source flexibility**: The new implementation allows seamless switching between data sources, facilitating comparisons and sensitivity analyses with different environmental inputs.
+
+4. **Coastal detail**: The higher resolution captures fine-scale coastal features that are particularly important for species with narrow habitat ranges or specific coastal preferences.
+
+### Usage Recommendations
+
+- Use the default HCAF_v4 mode for direct replication of original AquaMaps models
+- Use BioOracle_v3 mode for higher resolution models that may better represent species distributions in complex coastal environments
+- Consider using both sources and comparing the results to evaluate sensitivity to environmental data resolution and source
+
+The validation report helps identify any discrepancies between the original and replicated models, which can inform further refinements to the replication approach. For BioOracle-based replications, a higher tolerance parameter might be necessary when comparing to original AquaMaps distributions due to the different underlying data sources and resolutions.
