@@ -12,7 +12,7 @@ editor_options:
 
 librarian::shelf(
   cmocean, DBI, dplyr, DT, duckdb, fs, glue, here, htmltools, janitor, knitr,
-  leaflet, leaflet.extras, leaflet.extras2, librarian, mapview, ggplot2, 
+  leaflet, leaflet.extras, leaflet.extras2, librarian, logger, mapview, ggplot2, 
   listviewer, purrr, scales, marinesensitivity/msens, RColorBrewer, readr, sf, stringr, 
   terra, tibble, tidyr,
   quiet = T)
@@ -321,7 +321,7 @@ get_sp_env <- function(sp_key, r_hcaf = NULL, d_sp_pref = NULL, vars_yes = NULL)
   
 }
 
-ramp_env <- function(v, p) {
+ramp_env <- function(v, p){ #}, digits = 10) { # 10: 1,174 8: 1,178 6: 1,178 5:1,199 4:1,405
   # Function to ramp environmental variable based on species preference
   
   approx(
@@ -330,7 +330,8 @@ ramp_env <- function(v, p) {
     xout   = v, 
     rule   = 1,  # return NA if outside range
     method = "linear",
-    ties   = max)$y
+    ties   = max)$y  # |> 
+    # round(digits)
 }
 
 get_sp_var_params <- function(sp_key, var, d_sp_pref = NULL, vars_yes = NULL){
@@ -415,6 +416,7 @@ replicate_sp_raster <- function(sp_key, con_dd, r_hcaf = NULL, dir_cache = here(
   # based on surface values, and conversely, on bottom values if Depth MinA > 200 m.
   
   is_surface <- d_sp_pref$layer == "s" # vs "b" bottom
+  message(glue("is_surface: {is_surface}"))
   var_lyr <- list(
     "depth"     = "depth_mean", # only for Mammalia, otherwise max of range depth_min, depth_max
     "temp"      = ifelse(
@@ -447,11 +449,13 @@ replicate_sp_raster <- function(sp_key, con_dd, r_hcaf = NULL, dir_cache = here(
     if (var == "depth"){
       
       if (sp_info$taxa$class == "Mammalia"){
+        message("Mammalia: depth_mean")
         r_depth_tx <- terra::app(
           x   = r_env[["depth_mean"]],
           fun = ramp_env,
           p   = p)
       } else {
+        message("Normal: max(depth_mean, depth_min, depth_max)")
         r_depth_min <- terra::app(
           x   = r_env[["depth_min"]],
           fun = ramp_env,
@@ -473,14 +477,20 @@ replicate_sp_raster <- function(sp_key, con_dd, r_hcaf = NULL, dir_cache = here(
         # plot(r_env[["depth_mean"]] > 200)
         # r_depth_tx[r_env[["depth_mean"]] >= p[2]] <- 1
         # r_depth_tx[r_env[["depth_mean"]] >= p[2]] <- 1
-        r_depth_tx[r_env[["depth_max"]] > p[2]] <- 1
+        if (sp_info$taxa$class == "Mammalia"){
+          message("pelagic Mammalia: depth ramp throughout")
+          # r_depth_tx[r_env[["depth_mean"]] > p[2]] <- 1
+        } else {
+          message("pelagic normal: 1 beyond depth_max at min pref")
+          r_depth_tx[r_env[["depth_max"]] > p[2]] <- 1
+        }
       }
-
+        
       r_sp_env[[var]] <- r_depth_tx
       next
     }
 
-    # Get appropriate layer and apply RES
+    # Get appropriate layer for var and apply RES
     lyr   <- var_lyr[[var]]
     r_var <- r_env[[lyr]]
     
@@ -505,7 +515,7 @@ replicate_sp_raster <- function(sp_key, con_dd, r_hcaf = NULL, dir_cache = here(
   return(r_sp_new)
 }
 
-compare_rasters <- function(r_old, r_new, return = "boolean", tolerance = 0.01) {
+compare_rasters <- function(r_old, r_new, return = "boolean", tolerance = 0.02) {
   # r_old <- r_sp_old; r_new <- r_sp_new; return = "tibble"; tolerance = 0.01
   # plet(r_old) # plet(r_new)
   # Check if rasters match
@@ -525,11 +535,11 @@ compare_rasters <- function(r_old, r_new, return = "boolean", tolerance = 0.01) 
   # where NAs mismatch add 1 or -1
   r_diff <- ifel(
     is.na(r_old_ext) & !is.na(r_new_ext),
-    -1,
+    r_new_ext,
     r_diff)
   r_diff <- ifel(
     is.na(r_new_ext) & !is.na(r_old_ext),
-    1,
+    r_old_ext,
     r_diff)
   
   # Convert 0 to NA
@@ -636,14 +646,16 @@ compare_rasters <- function(r_old, r_new, return = "boolean", tolerance = 0.01) 
       temp_b_tx     = ramp_env(temp_b, p_temp),
       # prod          = round(ice_con_tx * prim_prod_tx * salinity_tx * temp_tx, 2),
       # prod          = round(depth_min_tx * ice_con_tx * prim_prod_tx * salinity_tx * temp_tx, 2),
-      prod_nodepth    = round(ice_con_tx * prim_prod_tx * salinity_tx * temp_tx, 2),
-      prod_depth      = round(depth_tx_max * ice_con_tx * prim_prod_tx * salinity_tx * temp_tx, 2),
+      prod_nodepth    = round(               ice_con_tx * prim_prod_tx * salinity_tx * temp_tx, 2),
+      prod_depthmax   = round(depth_tx_max * ice_con_tx * prim_prod_tx * salinity_tx * temp_tx, 2),
+      prod_depthmean  = round(depth_tx     * ice_con_tx * prim_prod_tx * salinity_tx * temp_tx, 2),
       # prod          = round(
       #   round(ice_con_tx, 2) * round(prim_prod_tx, 2) * round(salinity_tx, 2) * round(temp_tx, 2), 2 ),
-      prod_nodepth_eq_old  = prod_nodepth == old,
-      prod_depth_eq_old    = prod_depth == old) |> 
+      prod_nodepth_eq_old   = prod_nodepth == old,
+      prod_depthmax_eq_old  = prod_depthmax == old,
+      prod_depthmean_eq_old = prod_depthmean == old) |> 
     # filter(!prod_eq_old) |> 
-    relocate(dif_abs, dif, prod_depth, prod_nodepth) |> 
+    relocate(dif_abs, dif, prod_nodepth_eq_old, prod_depthmax_eq_old, prod_depthmean_eq_old) |> 
     arrange(desc(dif_abs))
   # View(d_cmp)
   
@@ -659,9 +671,12 @@ validate_aquamaps_species <- function(sp_keys, con_dd, dir_cache = here("data/re
   # Get HCAF raster once
   r_hcaf <- get_hcaf_raster(con_dd, dir_cache = dir_cache)
   
-  for (sp_key in sp_keys) { # sp_key = "ITS-95923" # sp_key = "W-Pol-129898"
+  # for (sp_key in sp_keys) { # sp_key = "ITS-95923" # sp_key = "W-Pol-129898"
+  for (i in 1:length(sp_keys)) { # i = 1
+  
+    sp_key <- sp_keys[i]
     if (verbose)
-      message(glue("Processing species {sp_key}...\n")) # sp_key = "ITS-206881"
+      log_info("{sprintf('%04d', i)} of {length(sp_keys)}: {sp_key}...\n") # sp_key = "ITS-206881"
     
     tryCatch({
       # Get original raster
@@ -764,7 +779,10 @@ compare_sp <- function(
 # Test with a single species
 # sp_key <- "W-Msc-419703"  # Crepidula depressa
 # sp_key <- "ITS-Mam-180530"
-sp_key <- "Fis-22747"
+# sp_key <- "Fis-22747" # Cetorhinus maximus bbox inside issue
+# sp_key <- "ITS-Mam-180527" # fin whale sorted
+# sp_key <- "ITS-Mam-180524" # sorted with tolerance 0.01
+sp_key <- "W-Pol-129784"
 
 sp_info <- get_sp_info(sp_key, con_dd)
 jsonedit(sp_info)
@@ -775,6 +793,7 @@ r_sp_old <- get_species_raster(sp_key, con_dd, dir_cache = dir_cache)
 # Replicate raster
 r_sp_new <- replicate_sp_raster(sp_key, con_dd, dir_cache = dir_cache, redo = T)
 
+# d_cmp ----
 # Compare original and replicated rasters
 matches <- compare_rasters(r_sp_old, r_sp_new)
 cat(glue("Rasters match: {matches}\n"))
@@ -783,6 +802,37 @@ if (!matches){
   plet(r_dif)
   # plet(r_dif == 0)
   d_cmp <- compare_rasters(r_sp_old, r_sp_new, return = "tibble")
+  
+  # r_env <- get_hcaf_raster() |>
+  #   crop(r_sp_new)
+  # r_sp_new[r_env[["cell_id"]] == 239328]
+  # r_env[["depth_mean"]][r_env[["cell_id"]] == 239328]
+  #   names() |> sort()
+  #   mask(r_sp_new) |> 
+  #   subset("cell_id", "depth_mean", "depth_min", "depth_max")
+  # r_sp_new
+  
+  x <- d_cmp |>
+    # filter(dif_abs > 0.02) # |>
+    filter(c_id == 19451) # |>
+    # slice(1) 
+  # cid 35199 old 0.12 new 1
+  # View(d_cmp)
+  View(x)
+  
+  # |>
+    # glimpse()
+    # View()
+  # ITS-Mam-180527 fin whale cid=239328 old 0.09 -> new 0.98
+  
+  # detach(x)
+  
+  d_cmp |> 
+    summarize(
+      # get max of depth_min, depth_mean, depth_max
+      depth_min  = max(depth_min, na.rm = T),
+      depth      = max(depth, na.rm = T),
+      depth_max  = max(depth_max, na.rm = T))
   View(d_cmp)
 }
 
@@ -898,12 +948,21 @@ d_sp_br  <- read_csv(spp_br_csv)
 results <- d_sp_br |> 
   filter(n_cells_br > 1) |> # 648 / 10,575 species have n_cells_br == 1
   arrange(desc(n_cells_br), sp_key) |>
-  slice(1:100) |> 
+  # slice(1:100) |> 
   pull(sp_key) |> 
   validate_aquamaps_species(con_dd, dir_cache = dir_cache, verbose = T)
 
+# INFO [2025-05-20 01:18:36] 0101 of 9927:
+# INFO [2025-05-20 01:23:26] 0121 of 9927
+# 20/5 = 4 per min
+# 9927 / 4 / 60 = 41.4 hrs
+# INFO [2025-05-20 01:26:13] 0137 of 9927
+
 # Save results to CSV
-write_csv(results, here("data/aquamaps_validation_results.csv"))
+results_csv <- here("data/aquamaps_validation_results.csv")
+write_csv(results, results_csv)
+
+results <- read_csv(results_csv)
 
 # Display summary
 cat(glue("Total species processed: {nrow(results)}\n"))
@@ -913,6 +972,7 @@ cat(glue("Species with errors: {sum(is.na(results$r_matches))}\n"))
 
 # Show results table
 results |>
+  # filter(!r_matches) |>
   DT::datatable(
     caption = "AquaMaps Validation Results",
     options = list(pageLength = 25))
