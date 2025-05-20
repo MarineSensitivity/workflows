@@ -1016,6 +1016,7 @@ replicate_sp_raster <- function(sp_key, con_dd, r_hcaf = NULL,
 validate_aquamaps_species <- function(
     sp_keys, con_dd,
     dir_cache = here::here("data/replicate_aquamaps"),
+    redo = FALSE,
     verbosity = 0) {
 
   # Validate multiple species
@@ -1043,7 +1044,7 @@ validate_aquamaps_species <- function(
       r_sp_old <- get_species_raster(sp_key, con_dd, r_hcaf, dir_cache = dir_cache, verbose = verbose_funcs)
 
       # Replicate raster
-      r_sp_new <- replicate_sp_raster(sp_key, con_dd, r_hcaf, dir_cache = dir_cache, verbose = verbose_funcs)
+      r_sp_new <- replicate_sp_raster(sp_key, con_dd, r_hcaf, dir_cache = dir_cache, verbose = verbose_funcs, redo = redo)
 
       # Compare rasters
       matches <- compare_rasters(r_sp_old, r_sp_new, verbose = verbose_funcs)
