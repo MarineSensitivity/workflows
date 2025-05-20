@@ -1,3 +1,13 @@
+## 2025-05-20.b Bio-Oracle replication
+
+Add argument `env_layers = "HCAF_v4"` (default) or "BioOracle_v3" to 
+`replicate_sp_raster()` in @libs/am_functions.R to use the 
+1/20 decimal degree Bio-Oracle data layers versus the default AquaMaps Half-Degree Cells Authority 
+File (HCAF). Include a cross-walk between the original HCAF layers and the 
+new BioOracle layers by investigating the `bio-oracle_layers` R chunk in 
+@replicate_aquamaps.qmd, @data/aquamaps_meta_layers.csv, and 
+@data/bio-oracle_datasets_relevant.csv.
+
 ## 2025-05-20.a mv fxns in replicate_aquamaps.qmd into libs/am_functions.R
 
 Move all functions from @replicate_aquamaps.qmd into a new file `libs/am_functions.R`.

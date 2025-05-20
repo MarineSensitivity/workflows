@@ -32,6 +32,17 @@ con_dd    <- dbConnect(
     dbdir     = path_dd,
     read_only = T))
 
+am_meta_csv <- here("data/aquamaps_meta.csv")
+if (!file.exists(am_meta_csv)) {
+  tbl(con_dd, "_tbl_fld_renames") |> 
+    collect() |> 
+    left_join(
+      aquamapsdata::am_meta,
+      by = join_by(tbl_old == table, fld_old == field)) |> 
+    write_csv(am_meta_csv)
+}
+am_meta <- read_csv(am_meta_csv)
+
 # Load functions from libs/am_functions.R
 source(here("libs/am_functions.R"))
 ```
@@ -343,22 +354,144 @@ if (sum(!results$r_matches, na.rm=TRUE) > 0) {
 -   [Copernicus Marine Data Store \| Copernicus Marine Service](https://data.marine.copernicus.eu/products)
 
 ```{r}
-#| label: bio-oracle
+#| label: bio-oracle_layers
 #| eval: false
 
 librarian::shelf(
-  bio-oracle/biooracler,
+  bio-oracle/biooracler, janitor, terra,
   quiet = T)
 
 # biooracler:::erddap.bio_oracle.org()
 # http://erddap.bio-oracle.org/erddap/
-bo_lyrs_csv <- here("data/bio-oracle_layers.csv")
+bo_ds_csv      <- here("data/bio-oracle_datasets.csv")
+bo_ds_rel_csv  <- here("data/bio-oracle_datasets_relevant.csv")
+bo_ds_vars_csv <- here("data/bio-oracle_dataset_variables.csv")
 
-biooracler::list_layers() |> 
-  write_csv(bo_lyrs_scsv)
+if (!all(file.exists(bo_ds_csv, bo_ds_v_csv))) {
+  d_ds <- biooracler::list_layers(simplify = T)
+  
+  d_other <- tribble(
+    ~dataset_id, ~category, ~scenario, ~year_min, ~year_max, ~depth,
+    "kdpar_mean_baseline_2000_2020_depthsurf", "kdpar_mean", "baseline", 2000, 2020, "depthsurf",
+    "par_mean_baseline_2000_2020_depthsurf"  , "par_mean"  , "baseline", 2000, 2020, "depthsurf",
+    "terrain_characteristics", "terrain_characteristics", NA, NA, NA, NA)
+  
+  d_ds <- d_ds |>
+    filter(!dataset_id %in% d_other$dataset_id) |>
+    separate_wider_delim(
+      dataset_id, 
+      delim = "_",
+      names = c("category", "scenario", "year_min", "year_max", "depth"),
+      cols_remove = F) |> 
+    mutate(
+      year_min = as.integer(year_min),
+      year_max = as.integer(year_max) ) |> 
+    bind_rows(
+      d_other) |> 
+    relocate(dataset_id)
+  
+  # table(d_ds$category)
+  #    chl                     clt                     dfe              kdpar_mean 
+  #     10                       7                      28                       1 
+  # mlotst                     no3                      o2                par_mean 
+  #      7                      28                      28                       1 
+  #     ph                    phyc                     po4                      si 
+  #     28                      28                      28                      28 
+  # siconc                 sithick                      so                     swd 
+  #      7                       7                      28                      28 
+  #    sws                     tas terrain_characteristics                  thetao 
+  #     28                       7                       1                      28
+    
+  # table(d_ds$scenario)
+  # baseline   ssp119   ssp126   ssp245   ssp370   ssp460   ssp585 
+  #     55       50       50       50       50       50       50 
+  
+  # table(d_ds$year_min)
+  # 2000 2020 
+  #   55  300
+  
+  # table(d_ds$year_max)
+  # 2018 2019 2020 2100 
+  #   28   17   10  300
+  
+  # table(d_ds$depth)
+  # depthmax depthmean  depthmin depthsurf 
+  #       78        78        78       121
 
-bo_lyrs <- read_csv(bo_lyrs_csv)
-  DT::datatable()
+  # d_ds_0 <- d_ds
+  # nrow(d_ds) # 356
+  d_ds <- d_ds |> 
+    mutate(
+      d_vars = imap(dataset_id, \(x, i){
+        message(glue("{i}: {x}"))
+        Sys.sleep(0.1)
+        y <- biooracler::info_layer(x)
+        tibble(
+          variable = y$variables$variable_name) |> 
+          mutate(
+            d_var = map(variable, \(x) y$alldata[[x]]) ) |> 
+          unnest(d_var) } ),
+      variables = map_chr(d_vars, \(x) paste(sort(unique(x$variable)), collapse = ", ")) )
+
+  d_ds |> 
+    select(-d_vars) |>
+    write_csv(bo_ds_csv)
+  
+  d_ds |> 
+    select(-d_vars) |>
+    filter(scenario == "baseline") |>
+    write_csv(bo_ds_rel_csv)
+  
+  d_ds_vars <- d_ds |> 
+    unnest(d_vars) |> 
+    select(dataset_id, variable,  attribute_name,  value) |> 
+    filter(attribute_name != "") |>
+    pivot_wider(
+      names_from  = attribute_name,
+      values_from = value) |>
+    clean_names()
+  
+  d_ds_vars |> 
+    write_csv(bo_ds_vars_csv)
+}
+
+# download bio-oracle layers for depth_mean|min|max: bathymetry
+dir_bo <- '~/My Drive/projects/msens/data/raw/bio-oracle.org'
+r_nc <- glue("{dir_bo}/bathymetry.nc")
+r <- biooracler::download_layers(
+  dataset_id  = "terrain_characteristics",
+  variables   = c("bathymetry_mean", "bathymetry_min", "bathymetry_max"),
+  constraints = list(
+    longitude = c(-179.975, 179.975),
+    latitude  = c(- 89.975,  89.975) ),
+  fmt         = "nc",
+  directory   = dirname(r_nc))
+file_move(r$summary$filename, r_nc)
+r <- rast(r_nc)
+
+env_lyrs <- c(
+  "depth_mean", 
+  "depth_min",
+  "depth_max",
+  "sst_an_mean",
+  "sbt_an_mean",
+  "salinity_mean",
+  "salinity_b_mean",
+  "oxy_b_mean",
+  "prim_prod_mean",
+  "ice_con_ann",
+  "land_dist")
+
+am_meta_lyrs_csv <- here("data/aquamaps_meta_layers.csv")
+if (!file.exists(am_meta_lyrs_csv)) {
+  am_meta |> 
+  filter(
+    tbl_new == "cells",
+    fld_new %in% env_lyrs) |> 
+    write_csv(am_meta_lyrs_csv)
+}
+am_meta_lyrs <- read_csv(am_meta_lyrs_csv)
+View(am_meta_lyrs)
 ```
 
 ## Match AquaMaps env to Bio-Oracle layers

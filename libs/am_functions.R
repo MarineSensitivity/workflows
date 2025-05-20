@@ -884,9 +884,10 @@ ramp_env <- function(v, p) {
 #' @param redo Force regeneration of raster
 #' @param verbose Whether to print progress messages
 #' @return Replicated species probability raster
-replicate_sp_raster <- function(sp_key, con_dd, r_hcaf = NULL,
-                               dir_cache = here::here("data/replicate_aquamaps"),
-                               redo = FALSE, verbose = FALSE) {
+replicate_sp_raster <- function(
+    sp_key, con_dd, r_hcaf = NULL,
+    dir_cache = here::here("data/replicate_aquamaps"),
+    redo = FALSE, verbose = FALSE) {
 
   # Replicate the species probability raster based on environmental preferences
   cache_path <- get_cache_path("replicated", sp_key, dir_cache = dir_cache)
