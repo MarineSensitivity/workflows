@@ -59,7 +59,7 @@ compare_rasters <- function(r_old, r_new, return = "boolean", tolerance = 0.02,
   # For tibble return, we need species information
   if (is.null(sp_info)) {
     stopifnot(!is.null(sp_key) && !is.null(con_dd))
-    sp_info <- get_sp_info(sp_key, con_dd, verbose = verbose)
+    sp_info <- get_sp_info(sp_key, verbose = verbose)
   }
 
   # Get environmental raster for the species
@@ -301,7 +301,7 @@ create_diagnostic_table <- function(sp_keys, con_dd, verbose = FALSE) {
 
     tryCatch({
       # Get species info
-      sp_info <- get_sp_info(sp_key, con_dd, verbose = verbose) # jsonedit(sp_info)
+      sp_info <- get_sp_info(sp_key, verbose = verbose) # jsonedit(sp_info)
 
       # Get original and replicated rasters
       r_sp_old <- get_species_raster(sp_key, con_dd, r_hcaf, verbose = verbose)
@@ -371,7 +371,7 @@ create_diagnostic_table <- function(sp_keys, con_dd, verbose = FALSE) {
 #' @return Interactive leaflet map
 create_diagnostic_visual <- function(sp_key, con_dd, r_hcaf = NULL, show_diff = TRUE, verbose = FALSE) {
   # Get species info
-  sp_info <- get_sp_info(sp_key, con_dd, verbose = verbose)
+  sp_info <- get_sp_info(sp_key, verbose = verbose)
 
   # Get HCAF raster if needed
   if (is.null(r_hcaf)) {
@@ -472,6 +472,21 @@ create_diagnostic_visual <- function(sp_key, con_dd, r_hcaf = NULL, show_diff = 
   return(m)
 }
 
+get_bo_raster <- function(
+    bo_tif = NULL, verbose = F){
+
+  # TODO: translate replicate_aquamaps.qmd to generation function like in get_hcaf_raster()
+
+  if (is.null(bo_tif))
+    bo_tif <- ifelse(
+      Sys.info()[["sysname"]] == "Linux",
+      "/share/data/bio-oracle_v3.tif",
+      "~/My Drive/projects/msens/data/raw/bio-oracle.org/bio-oracle_v3.tif")
+
+  stopifnot(file.exists(bo_tif))
+  rast(bo_tif)
+}
+
 #' Generate cache paths for various file types
 #'
 #' @param type Type of cache file (e.g., "hcaf", "species", "replicated")
@@ -487,7 +502,7 @@ get_cache_path <- function(type, id = NULL, dir_cache = here::here("data/replica
     return(file.path(dir_cache, glue::glue("{type}.tif")))
   } else {
     # Create subdirectory for specific types if needed
-    if (type %in% c("species", "replicated")) {
+    if (type %in% c("species", "replicated", "replicated_bio-oracle")) {
       subdir <- file.path(dir_cache, type)
       dir.create(subdir, showWarnings = FALSE, recursive = TRUE)
       return(file.path(subdir, glue::glue("{id}.tif")))
@@ -503,14 +518,19 @@ get_cache_path <- function(type, id = NULL, dir_cache = here::here("data/replica
 #' @param dir_cache Directory for cached files
 #' @param verbose Whether to print progress messages
 #' @return HCAF raster
-get_hcaf_raster <- function(con_dd, dir_cache = here::here("data/replicate_aquamaps"), verbose = FALSE) {
-  # Get the HCAF (Half-degree Cell Authority File) raster
-  hcaf_tif <- get_cache_path("hcaf", dir_cache = dir_cache)
+get_hcaf_raster <- function(
+    hcaf_tif = here::here("data/replicate_aquamaps/hcaf.tif"),
+    verbose = FALSE) {
 
   if (!file.exists(hcaf_tif)) {
-    if (verbose) {
-      message(glue::glue("Generating HCAF raster and caching to {dir_cache}/{basename(hcaf_tif)}"))
-    }
+    if (verbose)
+      message(glue::glue("Generating HCAF raster to {hcaf_tif}"))
+
+    if (!exists("con_dd"))
+      con_dd    <- dbConnect(
+        duckdb(
+          dbdir     = path_dd,
+          read_only = T))
 
     # Create the global template raster
     xmin <- -180; xmax <- 180
@@ -570,164 +590,131 @@ get_hcaf_raster <- function(con_dd, dir_cache = here::here("data/replicate_aquam
 #'
 #' @param sp_key Species key
 #' @param sp_info Species information from get_sp_info
-#' @param r_hcaf HCAF raster
-#' @param con_dd DuckDB connection
-#' @param verbose Whether to print progress messages
 #' @param env_layers Which environmental layers to use: "HCAF_v4" (default) or "BioOracle_v3"
-#' @param dir_bo Directory where BioOracle data is stored
+#' @param verbose Whether to print progress messages
 #' @return Environmental raster layers for the species
 get_sp_env <- function(
-    sp_key, sp_info = NULL, r_hcaf = NULL, con_dd = NULL,
-    verbose = FALSE, env_layers = "HCAF_v4",
-    dir_bo = "~/My Drive/projects/msens/data/raw/bio-oracle.org") {
-  if (is.null(r_hcaf)) {
-    r_hcaf <- get_hcaf_raster(con_dd, verbose = verbose)
+    sp_key, sp_info = NULL,
+    env_layers = "HCAF_v4",
+    verbose = FALSE) {
+
+  # env_layers = "BioOracle_v3"; sp_key = "Fis-22747"
+  stopifnot(env_layers %in% c("HCAF_v4", "BioOracle_v3"))
+
+  # r_bo <- get_bo_raster(verbose = verbose)
+  r <- switch(
+    env_layers,
+    HCAF_v4      = get_hcaf_raster(verbose = verbose),
+    BioOracle_v3 = get_bo_raster(verbose = verbose))
+
+  if (is.null(sp_info))
+    sp_info <- get_sp_info(sp_key, verbose = verbose)
+
+  # Apply bounding box
+  bbox_ext <- sp_info$bbox_cells |>
+    unlist() |>
+    as.vector() |>
+    terra::ext()
+  r <- terra::crop(r, bbox_ext)
+
+  # Apply FAO areas if needed
+  if (sp_info$use_fao && length(sp_info$fao_cells) > 0) {
+    r_fao <- r[["fao_area_m"]] %in% sp_info$fao_cells
+    r <- terra::mask(
+      r,
+      r_fao,
+      maskvalue = FALSE)
   }
 
-  if (is.null(sp_info)) {
-    sp_info <- get_sp_info(sp_key, con_dd, verbose = verbose)
+  cat_lyrs <- list(
+    "depth"     = c(
+      "depth_mean",
+      "depth_min",
+      "depth_max"),
+    "temp"      = c(
+      "sst_an_mean",
+      "sbt_an_mean"),
+    "salinity"  = c(
+      "salinity_mean",
+      "salinity_b_mean"),
+    "oxy"       = c(
+      "oxy_mean",
+      "oxy_b_mean"), # TODO: oxygen at surface?
+    "prim_prod" = "prim_prod_mean",
+    "ice_con"   = "ice_con_ann",
+    "land_dist" = "land_dist")
+  lyrs_env <- c(
+    "cell_id", "center_long", "center_lat", "fao_area_m",
+    cat_lyrs |> unlist() |> unname())
+  r <- r |> subset(lyrs_env)
+
+  # TODO: apply ramp to all env vars for later debugging to see matching product,
+  # including different depth=1 handling (e.g. pelagic)
+
+  # Process each set of env parameters for all applicable layers
+  vars_yes <- setdiff(names(sp_info$env), "extn_rule")
+  for (var in vars_yes) { # var = "depth"
+    p <- get_sp_var_params(sp_key, var, sp_info, verbose = verbose)
+    lyrs_var <- cat_lyrs[[var]]
+    for (lyr in lyrs_var){
+      lyr_tx <- glue("{lyr}_tx")
+      r[[lyr_tx]] <- terra::app(
+        x   = r[[lyr]],
+        fun = ramp_env,
+        p   = p)
+    }
   }
+  # names(r)
 
-  vars_yes <- names(sp_info$env)
+  # plet(r[["depth_minmax_tx"]], main = "depth_minmax_tx")
+  r[["depth_minmax_tx"]] <- max(
+    r[["depth_min_tx"]],
+    r[["depth_max_tx"]], na.rm = TRUE)
 
-  # Choose environmental data source based on env_layers parameter
-  if (env_layers == "HCAF_v4") {
-    # Use default HCAF raster
-    r_env <- r_hcaf
+  # pelagic true/false
+  r[["depth_plmax_tf"]]  <- r[["depth_max"]] > p[3]
+  r[["depth_plmean_tf"]] <- r[["depth_mean"]] > p[3]
 
-    # Apply bounding box
-    bbox_ext <- sp_info$bbox_cells |>
-      unlist() |>
-      as.vector() |>
-      terra::ext()
+  # non-Mammalia pelagic
+  r[["depth_minmax_plmax_tx"]] <- ifel(
+    r[["depth_plmax_tf"]],
+    1,
+    r[["depth_minmax_tx"]])
+  # lyr="depth_minmax_plmax_tx"; plet(r[[lyr]], main=lyr)
 
-    r_env <- terra::crop(r_env, bbox_ext)
+  r[["depth_minmax_plmean_tx"]] <- ifel(
+    r[["depth_plmean_tf"]],
+    1,
+    r[["depth_minmax_tx"]])
 
-    # Apply FAO areas if needed
-    if (sp_info$use_fao && length(sp_info$fao_cells) > 0) {
-      r_fao <- r_env[["fao_area_m"]] %in% sp_info$fao_cells
-      r_env <- terra::mask(
-        r_env,
-        r_fao,
-        maskvalue = FALSE)
-    }
-  } else if (env_layers == "BioOracle_v3") {
-    # Use BioOracle v3 data
-    # First, ensure all the necessary files exist
-    required_files <- list(
-      bathymetry = file.path(dir_bo, "bathymetry.nc"),
-      thetao_surf = file.path(dir_bo, "thetao_baseline_2000-2019_depthsurf.nc"),
-      thetao_max = file.path(dir_bo, "thetao_baseline_2000-2019_depthmax.nc"),
-      so_surf = file.path(dir_bo, "so_baseline_2000-2019_depthsurf.nc"),
-      so_max = file.path(dir_bo, "so_baseline_2000-2019_depthmax.nc"),
-      o2_max = file.path(dir_bo, "o2_baseline_2000-2018_depthmax.nc"),
-      phyc_surf = file.path(dir_bo, "phyc_baseline_2000-2020_depthsurf.nc"),
-      siconc_surf = file.path(dir_bo, "siconc_baseline_2000-2020_depthsurf.nc")
-    )
+  # Mammalia pelagic
+  r[["depth_mean_plmean_tx"]] <- ifel(
+    r[["depth_plmean_tf"]],
+    1,
+    r[["depth_mean_tx"]])
 
-    missing_files <- required_files[!sapply(required_files, file.exists)]
-    if (length(missing_files) > 0) {
-      missing_names <- paste(names(missing_files), collapse = ", ")
-      stop(glue::glue("Missing required BioOracle v3 files: {missing_names}. Run the bio-oracle_layers chunk in replicate_aquamaps.qmd to download them."))
-    }
+  r[["depth_mean_plmax_tx"]] <- ifel(
+    r[["depth_plmax_tf"]],
+    1,
+    r[["depth_mean_tx"]])
 
-    # Load BioOracle data
-    bo_layers <- list()
-
-    # Bathymetry (depth)
-    r_bath <- terra::rast(required_files$bathymetry)
-    # Rename to match HCAF layer names
-    lyrs_depth <- c("bathymetry_mean", "bathymetry_min", "bathymetry_max")
-    names(r_bath) <- c("depth_mean", "depth_min", "depth_max")
-    bo_layers[["depth"]] <- r_bath
-
-    # Temperature
-    r_temp_surf <- terra::rast(required_files$thetao_surf)
-    r_temp_max <- terra::rast(required_files$thetao_max)
-    names(r_temp_surf)[names(r_temp_surf) == "thetao_mean"] <- "sst_an_mean"
-    names(r_temp_max)[names(r_temp_max) == "thetao_mean"] <- "sbt_an_mean"
-    bo_layers[["temp_surf"]] <- r_temp_surf
-    bo_layers[["temp_max"]] <- r_temp_max
-
-    # Salinity
-    r_sal_surf <- terra::rast(required_files$so_surf)
-    r_sal_max <- terra::rast(required_files$so_max)
-    names(r_sal_surf)[names(r_sal_surf) == "so_mean"] <- "salinity_mean"
-    names(r_sal_max)[names(r_sal_max) == "so_mean"] <- "salinity_b_mean"
-    bo_layers[["sal_surf"]] <- r_sal_surf
-    bo_layers[["sal_max"]] <- r_sal_max
-
-    # Oxygen
-    r_oxy_max <- terra::rast(required_files$o2_max)
-    names(r_oxy_max)[names(r_oxy_max) == "o2_mean"] <- "oxy_b_mean"
-    bo_layers[["oxy_max"]] <- r_oxy_max
-
-    # Primary production
-    r_pp_surf <- terra::rast(required_files$phyc_surf)
-    names(r_pp_surf)[names(r_pp_surf) == "phyc_mean"] <- "prim_prod_mean"
-    bo_layers[["pp_surf"]] <- r_pp_surf
-
-    # Ice concentration
-    r_ice_surf <- terra::rast(required_files$siconc_surf)
-    names(r_ice_surf)[names(r_ice_surf) == "siconc_mean"] <- "ice_con_ann"
-    bo_layers[["ice_surf"]] <- r_ice_surf
-
-    # Land distance - Use HCAF as BioOracle doesn't have it
-    r_land_dist <- r_hcaf[["land_dist"]]
-    bo_layers[["land_dist"]] <- r_land_dist
-
-    # FAO areas - Use HCAF as BioOracle doesn't have it
-    r_fao_area <- r_hcaf[["fao_area_m"]]
-    bo_layers[["fao_area"]] <- r_fao_area
-
-    # Combine all layers into a single raster stack
-    r_env <- terra::rast(bo_layers)
-
-    # Get bounding box extent
-    bbox_ext <- sp_info$bbox_cells |>
-      unlist() |>
-      as.vector() |>
-      terra::ext()
-
-    # Crop to bounding box
-    # Use a buffer for higher-resolution data
-    buffer_degrees <- 0.5  # Half degree buffer
-    bbox_ext_buffered <- terra::ext(
-      bbox_ext[1] - buffer_degrees, bbox_ext[2] + buffer_degrees,
-      bbox_ext[3] - buffer_degrees, bbox_ext[4] + buffer_degrees
-    )
-
-    r_env <- terra::crop(r_env, bbox_ext_buffered)
-
-    # Apply FAO areas if needed (using HCAF FAO data)
-    if (sp_info$use_fao && length(sp_info$fao_cells) > 0) {
-      if ("fao_area_m" %in% names(r_env)) {
-        r_fao <- r_env[["fao_area_m"]] %in% sp_info$fao_cells
-        r_env <- terra::mask(
-          r_env,
-          r_fao,
-          maskvalue = FALSE)
-      } else {
-        warning("Cannot apply FAO area mask with BioOracle data")
-      }
-    }
-  } else {
-    stop(glue::glue("Invalid env_layers parameter: {env_layers}. Must be 'HCAF_v4' or 'BioOracle_v3'."))
-  }
-
-  return(r_env)
+  return(r)
 }
 
 #' Get species information
 #'
 #' @param sp_key Species key
-#' @param con_dd DuckDB connection
 #' @param verbose Whether to print progress messages
 #' @return List of species information
-get_sp_info <- function(sp_key, con_dd, verbose = FALSE) {
-  if (verbose) {
+get_sp_info <- function(sp_key, verbose = FALSE) {
+  if (verbose)
     message(glue::glue("Getting species info for {sp_key}"))
-  }
+
+  if (!exists("con_dd"))
+    con_dd    <- dbConnect(
+      duckdb(
+        dbdir     = path_dd,
+        read_only = T))
 
   # Get species preferences and key attributes
   d_prefs <- dplyr::tbl(con_dd, "spp_prefs") |>
@@ -890,7 +877,7 @@ get_sp_info <- function(sp_key, con_dd, verbose = FALSE) {
 #' @return Vector of parameter values
 get_sp_var_params <- function(sp_key, var, sp_info = NULL, con_dd = NULL, verbose = FALSE) {
   if (is.null(sp_info) && !is.null(con_dd)) {
-    sp_info <- get_sp_info(sp_key, con_dd, verbose = verbose)
+    sp_info <- get_sp_info(sp_key, verbose = verbose)
   }
 
   stopifnot(!is.null(sp_info) || !is.null(con_dd))
@@ -980,7 +967,7 @@ ramp_env <- function(v, p) {
     x      = p,  # c(min, min_pref, max_pref, max)
     y      = c(0, 1, 1, 0),
     xout   = v,
-    rule   = 1,  # return NA if outside range
+    rule   = 2,  # return 0 if outside range
     method = "linear",
     ties   = max)$y
 }
@@ -996,142 +983,83 @@ ramp_env <- function(v, p) {
 #' @param env_layers Which environmental layers to use: "HCAF_v4" (default) or "BioOracle_v3"
 #' @return Replicated species probability raster
 replicate_sp_raster <- function(
-    sp_key, con_dd, r_hcaf = NULL,
+    sp_key, con_dd,
+    env_layers = "HCAF_v4",
     dir_cache = here::here("data/replicate_aquamaps"),
-    redo = FALSE, verbose = FALSE,
-    env_layers = "HCAF_v4") {
+    redo = FALSE, verbose = FALSE) {
+
+  # env_layers = "HCAF_v4" # env_layers = "BioOracle_v3"
+  # sp_key = "Fis-22747"
+
+  stopifnot(env_layers %in% c("HCAF_v4","BioOracle_v3"))
 
   # Replicate the species probability raster based on environmental preferences
-  cache_path <- get_cache_path("replicated", sp_key, dir_cache = dir_cache)
+  sp_tif <- get_cache_path(
+    ifelse(env_layers == "BioOracle_v3", "replicated_bio-oracle", "replicated"),
+    sp_key, dir_cache = dir_cache)
 
-  # Add env_layers suffix to cache path if using BioOracle
-  if (env_layers == "BioOracle_v3") {
-    cache_path <- gsub("\\.tif$", "_biooracle.tif", cache_path)
+  if (!redo && file.exists(sp_tif)) {
+    if (verbose)
+      message(glue::glue("Loading species raster from cache: {basename(dirname(sp_tif))}/{basename(sp_tif)}"))
+    return(terra::rast(sp_tif))
   }
 
-  if (!redo && file.exists(cache_path)) {
-    if (verbose) {
-      message(glue::glue("Loading replicated species raster from cache: {dir_cache}/{basename(cache_path)}"))
-    }
-    return(terra::rast(cache_path))
-  }
-
-  if (verbose) {
-    message(glue::glue("Generating replicated raster for {sp_key} using {env_layers} and caching to {dir_cache}/{basename(cache_path)}"))
-  }
-
-  if (is.null(r_hcaf)) {
-    r_hcaf <- get_hcaf_raster(con_dd, dir_cache = dir_cache, verbose = verbose)
-  }
+  if (verbose)
+    message(glue::glue("Replicating species raster for {sp_key} using {env_layers} and caching to {basename(dirname(sp_tif))}/{basename(sp_tif)}"))
 
   # Get species info
-  sp_info <- get_sp_info(sp_key, con_dd, verbose = verbose)
+  sp_info <- get_sp_info(sp_key, verbose = verbose)
 
   # Get environment layers
-  r_env <- get_sp_env(sp_key, sp_info, r_hcaf, verbose = verbose)
+  r_env <- get_sp_env(sp_key, sp_info, env_layers = env_layers, verbose = verbose)
 
-  # Remove extn_rule from vars_yes
-  vars_yes <- setdiff(names(sp_info$env), "extn_rule")
+  # beg TODO ----
+  lyr_depth <- ifelse(
+    sp_info$taxa$class == "Mammalia",
+    "depth_mean_tx",
+    "depth_minmax_tx")
 
-  # Match species preference vars to environmental raster layers based on selected source
-  if (env_layers == "HCAF_v4") {
-    # Default AquaMaps HCAF layer mapping
-    var_lyr <- list(
-      "depth"     = "depth_mean", # only for Mammalia, otherwise max of range depth_min, depth_max
-      "temp"      = ifelse(
-        sp_info$is_surface,
-        "sst_an_mean",
-        "sbt_an_mean"),
-      "salinity"  = ifelse(
-        sp_info$is_surface,
-        "salinity_mean",
-        "salinity_b_mean"),
-      "oxy"       = "oxy_b_mean",
-      "prim_prod" = "prim_prod_mean",
-      "ice_con"   = "ice_con_ann",
-      "land_dist" = "land_dist")
-  } else if (env_layers == "BioOracle_v3") {
-    # BioOracle v3 layer mapping
-    var_lyr <- list(
-      "depth"     = "depth_mean", # Uses terrain_characteristics.bathymetry_mean|min|max
-      "temp"      = ifelse(
-        sp_info$is_surface,
-        "thetao_mean", # From thetao_baseline_*_depthsurf dataset
-        "thetao_mean"), # From thetao_baseline_*_depthmax dataset
-      "salinity"  = ifelse(
-        sp_info$is_surface,
-        "so_mean", # From so_baseline_*_depthsurf dataset
-        "so_mean"), # From so_baseline_*_depthmax dataset
-      "oxy"       = ifelse(
-        sp_info$is_surface,
-        "o2_mean", # From o2_baseline_*_depthsurf dataset
-        "o2_mean"), # From o2_baseline_*_depthmax dataset
-      "prim_prod" = "phyc_mean", # From phyc_baseline_*_depthsurf dataset or chl_mean
-      "ice_con"   = "siconc_mean", # From siconc_baseline_*_depthsurf dataset
-      "land_dist" = "land_dist") # Uses original HCAF layer as not available in BioOracle
-  } else {
-    stop(glue::glue("Invalid env_layers parameter: {env_layers}. Must be 'HCAF_v4' or 'BioOracle_v3'."))
-  }
+  # Default AquaMaps HCAF layer mapping
+  var_lyr <- list(
+    "depth"     = "depth_mean", # only for Mammalia, otherwise max of range depth_min, depth_max
+    "temp"      = ifelse(
+      sp_info$is_surface,
+      "sst_an_mean",
+      "sbt_an_mean"),
+    "salinity"  = ifelse(
+      sp_info$is_surface,
+      "salinity_mean",
+      "salinity_b_mean"),
+    "oxy"       = "oxy_b_mean", # TODO: oxygen at surface?
+    "prim_prod" = "prim_prod_mean",
+    "ice_con"   = "ice_con_ann",
+    "land_dist" = "land_dist")
 
-  r_sp_env <- list()
-
-  # Process each environmental variable
-  for (var in vars_yes) {
-
+  eqn <- ifelse(
+    sp_info$taxa$class == "Mammalia",
+    "depth_mean_plmax_tx",
+    "depth_minmax_plmax_tx")
+  for (var in vars_yes) { # var = "depth"
     p <- get_sp_var_params(sp_key, var, sp_info, verbose = verbose)
-
-    # Handle depth differently
-    if (var == "depth") {
-
-      if (sp_info$taxa$class == "Mammalia") {
-        if (verbose) {
-          message("Mammalia: depth_mean")
-        }
-        r_depth_tx <- terra::app(
-          x   = r_env[["depth_mean"]],
-          fun = ramp_env,
-          p   = p)
-      } else {
-        if (verbose) {
-          message("Normal: max(depth_min, depth_max)")
-        }
-        r_depth_min <- terra::app(
-          x   = r_env[["depth_min"]],
-          fun = ramp_env,
-          p   = p)
-        r_depth_max <- terra::app(
-          x   = r_env[["depth_max"]],
-          fun = ramp_env,
-          p   = p)
-        r_depth_tx <- max(r_depth_min, r_depth_max, na.rm = TRUE)
-      }
-
-      if (sp_info$is_pelagic) {
-        if (sp_info$taxa$class == "Mammalia") {
-          if (verbose) {
-            message("pelagic Mammalia: depth ramp throughout")
-          }
-        } else {
-          if (verbose) {
-            message("pelagic normal: 1 beyond depth_max at min pref")
-          }
-          r_depth_tx[r_env[["depth_max"]] > p[2]] <- 1
-        }
-      }
-
-      r_sp_env[[var]] <- r_depth_tx
-      next
+    lyrs_var <- cat_lyrs[[var]]
+    for (lyr in lyrs_var){
+      lyr_tx <- glue("{lyr}_tx")
+      r_env[[lyr_tx]] <- terra::app(
+        x   = r_env[[lyr]],
+        fun = ramp_env,
+        p   = p)
     }
-
-    # Get appropriate layer for var and apply RES
-    lyr   <- var_lyr[[var]]
-    r_var <- r_env[[lyr]]
-
-    r_sp_env[[var]] <- terra::app(
-      x   = r_var,
-      fun = ramp_env,
-      p   = p)
   }
+
+  # Get appropriate layer for var and apply RES
+  lyr   <- var_lyr[[var]]
+  r_var <- r_env[[lyr]]
+
+  r_sp_env[[var]] <- terra::app(
+    x   = r_var,
+    fun = ramp_env,
+    p   = p)
+  # end TODO ----
 
   # Convert to raster stack
   r_sp_env <- terra::rast(r_sp_env)

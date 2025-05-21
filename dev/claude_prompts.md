@@ -1,3 +1,8 @@
+## 2025-05-2a.a r_env
+
+The Update the AquaMaps species environment variables in `r_env` to use the
+
+
 ## 2025-05-20.b + Bio-Oracle replication
 
 Add argument `env_layers = "HCAF_v4"` (default) or "BioOracle_v3" to 

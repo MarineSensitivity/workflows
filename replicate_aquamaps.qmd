@@ -12,9 +12,9 @@ editor_options:
 
 librarian::shelf(
   cmocean, DBI, dplyr, DT, duckdb, fs, glue, here, htmltools, janitor, knitr,
-  leaflet, leaflet.extras, leaflet.extras2, librarian, logger, mapview, ggplot2, 
-  listviewer, purrr, scales, marinesensitivity/msens, RColorBrewer, readr, sf, stringr, 
-  terra, tibble, tidyr,
+  leaflet, leaflet.extras, leaflet.extras2, librarian, logger, lubridate,
+  mapview, ggplot2, listviewer, purrr, scales, marinesensitivity/msens, 
+  RColorBrewer, readr, sf, stringr, terra, tibble, tidyr,
   quiet = T)
 options(readr.show_col_types = F)
 mapviewOptions(basemaps = "Esri.OceanBasemap")
@@ -64,7 +64,7 @@ source(here("libs/am_functions.R"))
 sp_key <- "Fis-22747"
 
 # Get species information with enhanced details
-sp_info <- get_sp_info(sp_key, con_dd)
+sp_info <- get_sp_info(sp_key)
 jsonedit(sp_info)
 
 # Get original raster
@@ -489,6 +489,8 @@ if (!all(file.exists(bo_ds_csv, bo_ds_vars_csv))) {
 
 # Directory for BioOracle data
 dir_bo <- '~/My Drive/projects/msens/data/raw/bio-oracle.org'
+bo_tif <- glue("{dir_bo}/bio-oracle_v3.tif")
+
 dir.create(dir_bo, showWarnings = FALSE, recursive = TRUE)
 
 # Define BioOracle v3 layers needed for AquaMaps replication
@@ -499,16 +501,19 @@ bo_layers <- list(
   thetao_surf = list(
     dataset_id = "thetao_baseline_2000_2019_depthsurf",
     variables  = c("thetao_mean") ),
-  thetao_max = list(
+  thetao_btm = list(
     dataset_id = "thetao_baseline_2000_2019_depthmax",
     variables  = c("thetao_mean") ),
   so_surf = list(
     dataset_id = "so_baseline_2000_2019_depthsurf",
     variables  = c("so_mean") ),
-  so_max = list(
+  so_btm = list(
     dataset_id = "so_baseline_2000_2019_depthmax",
     variables  = c("so_mean") ),
-  o2_max = list(
+  o2_surf = list(
+    dataset_id = "o2_baseline_2000_2018_depthmax",
+    variables  = c("o2_mean") ),
+  o2_btm = list(
     dataset_id = "o2_baseline_2000_2018_depthmax",
     variables  = c("o2_mean") ),
   phyc_surf = list(
@@ -547,28 +552,191 @@ for (layer in names(bo_layers)) { # layer = names(bo_layers)[2]
   }
 }
 
+# View(d_bo_ds_rel)
+d_bo_ds      <- read_csv(bo_ds_csv)
+d_bo_ds_vars <- read_csv(
+  bo_ds_vars_csv, 
+  col_types = cols(
+    color_bar_palette = "c"))
+
 # Test loading one of each layer type to verify
 r <- rast(
   list.files(dir_bo, "\\.nc$", full.names = TRUE))
-tibble(
-  lyr      = names(r),
-  longname = longnames(r),
-  time     = time(r),
-  source   = basename(sources(r)))
-#    lyr              longname                         time               
-#    <chr>            <chr>                            <dttm>             
-# 1  bathymetry_mean Bathymetry Mean                  1970-01-01 00:00:00
-# 2  bathymetry_min  Bathymetry Min                   1970-01-01 00:00:00
-# 3  bathymetry_max  Bathymetry Max                   1970-01-01 00:00:00
-# 4  o2_mean         Average DissolvedMolecularOxygen 2010-01-01 00:00:00
-# 5  phyc_mean       Average TotalPhytoplankton       2010-01-01 00:00:00
-# 6  siconc_mean     Average SeaIceCover              2010-01-01 00:00:00
-# 7  so_mean         Average Salinity                 2010-01-01 00:00:00
-# 8  so_mean         Average Salinity                 2010-01-01 00:00:00
-# 9  thetao_mean     Average OceanTemperature         2010-01-01 00:00:00
-# 10 thetao_mean     Average OceanTemperature         2010-01-01 00:00:00
+d_r <- tibble(
+  variable   = names(r),
+  # longname   = longnames(r),
+  time       = time(r),
+  layer      = path_ext_remove(basename(sources(r))),
+  dataset_id = map_chr(layer, \(x) bo_layers[[x]]$dataset_id)) |> 
+  left_join(
+    d_bo_ds,
+    by = join_by(dataset_id)) |> 
+  left_join(
+    d_bo_ds_vars,
+    by = join_by(dataset_id, variable)) |> 
+  mutate(
+    year_min   = year(time),
+    depth_str  = case_match(
+      depth,
+      "depthmax"  ~ " at bottom",
+      "depthsurf" ~ " at surface",
+      .default    = ""),
+    year_str  = if_else(
+      !is.na(year_min),
+      glue(" for {year_min} to {year_max}"),
+      "" ),
+    longname  = glue("{long_name}{depth_str}{year_str} ({units}) [{dataset_id}.{variable}.{year_min}]"),
+    shortname = if_else(
+      layer == "bathymetry",
+      variable,
+      layer ) ) |> 
+  select(
+    name = shortname, 
+    longname, 
+    dataset_id, variable, 
+    category, scenario,
+    year_min, year_max,
+    depth, units,
+    ioos_category, standard_name)
+# d_r |>
+#   # select(shortname, longname) |>
+#   View()
+
+names(r) <- d_r$name
+for (lyr in names(r)){ # lyr = "so_btm"
+  metags(r, layer = lyr) <- d_r |> 
+    rename(layer = name) |> 
+    filter(layer == lyr) |>
+    pivot_longer(
+      -layer, 
+      names_to  = "name", 
+      values_to = "value",
+      values_transform = as.character) |>
+    select(-layer)
+}
+# metags(r, layer = "salinity_mean") |> 
+#   tibble()
+# metags(r) |> 
+#   tibble() |> 
+#   View()
+
+crs(r) <- "epsg:4326"
+
+lyrs_bo_to_hcaf <- c(
+  "bathymetry_mean" = "depth_mean",
+  "bathymetry_min"  = "depth_min",
+  "bathymetry_max"  = "depth_max",
+  "thetao_surf"     = "sst_an_mean",
+  "thetao_btm"      = "sbt_an_mean",
+  "so_surf"         = "salinity_mean",
+  "so_btm"          = "salinity_b_mean",
+  "o2_surf"         = "oxy_mean",
+  "o2_btm"          = "oxy_b_mean",
+  "phyc_surf"       = "prim_prod_mean",
+  "siconc_surf"     = "ice_con_ann")
+names(r) <- lyrs_bo_to_hcaf[names(r)]
+
+# Convert depth units to positive to match AquaMaps
+r <- rast(bo_tif)
+for (lyr in names(r)[2:3]){ # lyr = "depth_mean"
+  r[[lyr]] <- r[[lyr]] * -1
+}
+tmp_tif <- tempfile(fileext = ".tif")
+writeRaster(r, tmp_tif)
+file_delete(bo_tif)
+file_move(tmp_tif, bo_tif)
+
+# units(r)
+# [1] "m"          "m"          "m"          "MMol' 'M-3" "MMol' 'M-3" "MMol' 'M-3"
+#  [7] "1"          "PSU"        "PSU"        "degree_C"   "degree_C"  
+
+file.size(bo_tif) / (1000^3) # 1.3 GB
+
+# plet(r[["bathymetry_mean"]])
+# plet(r[["thetao_surf"]])
+# # crop to California coast
+# r_ca <- crop(r, ext(-130, -120, 30, 40))
+# plet(r_ca[["bathymetry_mean"]])
+# # crop to SF bay
+# r_sf <- crop(r, ext(-123.5, -122.5, 37.5, 38.5))
+# plet(r_sf[["bathymetry_mean"]])
+```
+
+```{r}
+#| label: add_fao_to_bio-oracle_raster
+
+librarian::shelf(
+  sf, terra, here,
+  quiet = T)
+source("libs/am_functions.R")
+
+fao_shp <- "~/My Drive/projects/msens/data/raw/marineregions.org/fao/World_Fao_Zones.shp"
+
+ply_fao <- read_sf(fao_shp) # zone
+
+r_bo <- get_bo_raster()
+
+# rasterize to same topology as BioOracle
+r_fao <- rasterize(
+  ply_fao, 
+  r_bo, 
+  field = "zone")
+names(r_fao) <- "fao_area_m"
+
+r_bo <- c(r_bo, r_fao)
+names(r_bo)
+
+tmp_tif <- tempfile(fileext = ".tif")
+writeRaster(r_bo, tmp_tif)
+file_delete(bo_tif)
+file_move(tmp_tif, bo_tif)
+
+plet(r_fao)
+
 
 ```
+
+
+```{r}
+#| label: add_land-dist_to_bio-oracle_raster
+
+librarian::shelf(
+  sf, terra, here,
+  quiet = T)
+source("libs/am_functions.R")
+
+# r <- get_hcaf_raster()
+r <- get_bo_raster()
+bo_tif <- sources(r)
+
+r_land <- is.na(r[["depth_mean"]])
+# plot(r_land)
+
+system.time({
+  r_dist <- distance(
+    r_land, target = FALSE, unit = "km", method = "haversine") }) # hcaf: 45.961 sec
+# TODO: on server later for more accuracy
+system.time({
+  r_dist <- distance(
+    r_land, target = FALSE, unit = "km", method = "geo") }) # SLOW
+# ?terra::distance
+# - method: character. One of "geo", "cosine" or "haversine". With "geo" the most precise but slower method of Karney (2003) is used. The other two methods are faster but less precise
+# plot(r_dist)
+
+names(r_land) <- "land_dist"
+
+if("land_dist" %in% names(r))
+  stop("TODO: land_dist already exists in raster")
+
+r <- c(r, r_land)
+
+tmp_tif <- tempfile(fileext = ".tif")
+writeRaster(r, tmp_tif)
+file_delete(bo_tif)
+file_move(tmp_tif, bo_tif)
+```
+
+
 
 ## Match AquaMaps env to Bio-Oracle layers
 
@@ -592,19 +760,20 @@ d_sp_pref |>
 
 The following table shows the mapping between AquaMaps environmental variables and their Bio-Oracle v3 equivalents:
 
-| AquaMaps Variable | AquaMaps Layer | Bio-Oracle v3 Dataset | Bio-Oracle v3 Variable |
-|-------------------|----------------|------------------------|------------------------|
-| depth (min)       | depth_min      | terrain_characteristics | bathymetry_min |
-| depth (mean)      | depth_mean     | terrain_characteristics | bathymetry_mean |
-| depth (max)       | depth_max      | terrain_characteristics | bathymetry_max |
-| temp (surface)    | sst_an_mean    | thetao_baseline_2000-2019_depthsurf | thetao_mean |
-| temp (bottom)     | sbt_an_mean    | thetao_baseline_2000-2019_depthmax | thetao_mean |
-| salinity (surface)| salinity_mean  | so_baseline_2000-2019_depthsurf | so_mean |
-| salinity (bottom) | salinity_b_mean| so_baseline_2000-2019_depthmax | so_mean |
-| oxygen (bottom)   | oxy_b_mean     | o2_baseline_2000-2018_depthmax | o2_mean |
-| primary production| prim_prod_mean | phyc_baseline_2000-2020_depthsurf | phyc_mean |
-| ice concentration | ice_con_ann    | siconc_baseline_2000-2020_depthsurf | siconc_mean |
-| land distance     | land_dist      | (retain HCAF layer - not available in Bio-Oracle) | - |
+| AquaMaps Variable | AquaMaps Layer | Bio-Oracle v3 Dataset | Bio-Oracle v3 Variable | Bio-Oracle v3 Layer |
+|-------------------|----------------|-----------------------|------------------------|---------------------|
+| depth (min)       | depth_min      | terrain_characteristics | bathymetry_min | bathymetry_min |
+| depth (mean)      | depth_mean     | terrain_characteristics | bathymetry_mean | bathymetry_mean |
+| depth (max)       | depth_max      | terrain_characteristics | bathymetry_max | bathymetry_max |
+| temp (surface)    | sst_an_mean    | thetao_baseline_2000-2019_depthsurf | thetao_mean | thetao_surf |
+| temp (bottom)     | sbt_an_mean    | thetao_baseline_2000-2019_depthmax | thetao_mean | thetao_max |
+| salinity (surface)| salinity_mean  | so_baseline_2000-2019_depthsurf | so_mean | so_surf |
+| salinity (bottom) | salinity_b_mean| so_baseline_2000-2019_depthmax | so_mean | so_max |
+| oxygen (bottom)   | oxy_b_mean     | o2_baseline_2000-2018_depthmax | o2_mean | o2_max |
+| oxygen (surface)  | oxy_mean       | o2_baseline_2000-2018_depthsurf | o2_mean | o2_max |
+| primary production| prim_prod_mean | phyc_baseline_2000-2020_depthsurf | phyc_mean | phyc_surf |
+| ice concentration | ice_con_ann    | siconc_baseline_2000-2020_depthsurf | siconc_mean | siconc_surf |
+| land distance     | land_dist      | (retain HCAF layer - not available in Bio-Oracle) | - | - |
 
 This mapping is implemented in the `replicate_sp_raster()` function, which now accepts an optional `env_layers` parameter that can be set to either "HCAF_v4" (default) or "BioOracle_v3".
 
@@ -638,7 +807,7 @@ The function will cache the results with a suffix indicating the data source to 
 sp_key_test <- "Fis-22747"  # Basking shark (Cetorhinus maximus)
 
 # Get species information
-sp_info <- get_sp_info(sp_key_test, con_dd)
+sp_info <- get_sp_info(sp_key_test)
 
 # Get the original raster (HCAF-based)
 r_sp_old <- get_species_raster(sp_key_test, con_dd, dir_cache = dir_cache)
@@ -673,7 +842,7 @@ for (sp_key in test_species) {
   r_sp_old <- get_species_raster(sp_key, con_dd, dir_cache = dir_cache)
   
   # Get species info
-  sp_info <- get_sp_info(sp_key, con_dd)
+  sp_info <- get_sp_info(sp_key)
   
   # Replicate with HCAF (default)
   r_sp_new_hcaf <- replicate_sp_raster(
@@ -760,7 +929,7 @@ r_hcaf <- get_hcaf_raster(con_dd)
 # Process each species and record metrics
 for (sp_key in batch_species) {
   # Get species info
-  sp_info <- get_sp_info(sp_key, con_dd)
+  sp_info <- get_sp_info(sp_key)
   
   # Get original raster
   r_sp_old <- get_species_raster(sp_key, con_dd, r_hcaf, dir_cache = dir_cache)
@@ -821,6 +990,8 @@ DT::datatable(
 # Save comparison to CSV
 write_csv(bo_comparison, here("data/biooracle_comparison.csv"))
 ```
+
+
 
 
 ## Conclusion
