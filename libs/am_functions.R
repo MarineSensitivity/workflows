@@ -374,9 +374,8 @@ create_diagnostic_visual <- function(sp_key, con_dd, r_hcaf = NULL, show_diff = 
   sp_info <- get_sp_info(sp_key, verbose = verbose)
 
   # Get HCAF raster if needed
-  if (is.null(r_hcaf)) {
-    r_hcaf <- get_hcaf_raster(con_dd, verbose = verbose)
-  }
+  if (is.null(r_hcaf))
+    r_hcaf <- get_hcaf_raster(verbose = verbose)
 
   # Get original and replicated rasters
   r_sp_old <- get_species_raster(sp_key, con_dd, r_hcaf, verbose = verbose)
@@ -602,23 +601,32 @@ get_sp_env <- function(
   stopifnot(env_layers %in% c("HCAF_v4", "BioOracle_v3"))
 
   # r_bo <- get_bo_raster(verbose = verbose)
+  if (verbose)
+    message(glue("Getting environmental layers: {env_layers}"))
   r <- switch(
     env_layers,
     HCAF_v4      = get_hcaf_raster(verbose = verbose),
     BioOracle_v3 = get_bo_raster(verbose = verbose))
 
-  if (is.null(sp_info))
+  if (is.null(sp_info)){
+    if (verbose)
+      message(glue("Getting species information: {sp_key}"))
     sp_info <- get_sp_info(sp_key, verbose = verbose)
+  }
 
   # Apply bounding box
   bbox_ext <- sp_info$bbox_cells |>
     unlist() |>
     as.vector() |>
     terra::ext()
+  if (verbose)
+    message(glue("Cropping to bounding box: {bbox_ext}"))
   r <- terra::crop(r, bbox_ext)
 
   # Apply FAO areas if needed
   if (sp_info$use_fao && length(sp_info$fao_cells) > 0) {
+    if (verbose)
+      message(glue("Masking to FAO areas: {paste(sp_info$fao_cells, collapse = ',')}"))
     r_fao <- r[["fao_area_m"]] %in% sp_info$fao_cells
     r <- terra::mask(
       r,
@@ -641,15 +649,18 @@ get_sp_env <- function(
       "oxy_mean",
       "oxy_b_mean"), # TODO: oxygen at surface?
     "prim_prod" = "prim_prod_mean",
-    "ice_con"   = "ice_con_ann",
-    "land_dist" = "land_dist")
-  lyrs_env <- c(
-    "cell_id", "center_long", "center_lat", "fao_area_m",
-    cat_lyrs |> unlist() |> unname())
+    "ice_con"   = "ice_con_ann")
+    # "land_dist" = "land_dist")
+  lyrs <- cat_lyrs |> unlist() |> unname()
+  if (env_layers == "HCAF_v4"){
+    lyrs_env <- c(
+      "cell_id", "center_long", "center_lat", # TODO: add these layers to bo_tif (BioOracle_v3)
+      lyrs,
+      "fao_area_m", "land_dist")
+  } else {
+    lyrs_env <- c(lyrs, "fao_area_m")
+  }
   r <- r |> subset(lyrs_env)
-
-  # TODO: apply ramp to all env vars for later debugging to see matching product,
-  # including different depth=1 handling (e.g. pelagic)
 
   # Process each set of env parameters for all applicable layers
   vars_yes <- setdiff(names(sp_info$env), "extn_rule")
@@ -988,7 +999,7 @@ replicate_sp_raster <- function(
     dir_cache = here::here("data/replicate_aquamaps"),
     redo = FALSE, verbose = FALSE) {
 
-  # env_layers = "HCAF_v4" # env_layers = "BioOracle_v3"
+  # env_layers = "HCAF_v4" # env_layers = "BioOracle_v3" # verbose = T
   # sp_key = "Fis-22747"
 
   stopifnot(env_layers %in% c("HCAF_v4","BioOracle_v3"))
@@ -1012,68 +1023,56 @@ replicate_sp_raster <- function(
 
   # Get environment layers
   r_env <- get_sp_env(sp_key, sp_info, env_layers = env_layers, verbose = verbose)
+  # names(r_env)
 
   # beg TODO ----
-  lyr_depth <- ifelse(
-    sp_info$taxa$class == "Mammalia",
-    "depth_mean_tx",
-    "depth_minmax_tx")
+  sp_vars    <- names(sp_info$env)
+  is_mammal  <- sp_info$taxa$class == "Mammalia"
+  is_pelagic <- sp_info$is_pelagic
+  is_surface <- sp_info$is_surface
+  if (verbose)
+    message(glue::glue("is_mammal: {is_mammal}, is_pelagic: {is_pelagic}, is_surface: {is_surface}"))
 
-  # Default AquaMaps HCAF layer mapping
-  var_lyr <- list(
-    "depth"     = "depth_mean", # only for Mammalia, otherwise max of range depth_min, depth_max
-    "temp"      = ifelse(
-      sp_info$is_surface,
-      "sst_an_mean",
-      "sbt_an_mean"),
-    "salinity"  = ifelse(
-      sp_info$is_surface,
-      "salinity_mean",
-      "salinity_b_mean"),
-    "oxy"       = "oxy_b_mean", # TODO: oxygen at surface?
-    "prim_prod" = "prim_prod_mean",
-    "ice_con"   = "ice_con_ann",
-    "land_dist" = "land_dist")
+  eqn_vars <- list(
+    depth       = case_when(
+      is_mammal  ~ "depth_mean_tx",
+      is_pelagic ~ "depth_minmax_plmax_tx",
+      .default   = "depth_minmax_tx"),
+    temp        = ifelse(
+      is_surface,
+      "sst_an_mean_tx",
+      "sbt_an_mean_tx"),
+    salinity  = ifelse(
+      is_surface,
+      "salinity_mean_tx",
+      "salinity_b_mean_tx"),
+    oxy       = ifelse(
+      is_surface,
+      "oxy_mean_tx",
+      "oxy_b_mean_tx"),
+    prim_prod = "prim_prod_mean_tx",
+    ice_con   = "ice_con_ann_tx",
+    land_dist = "land_dist_tx")
+  eqn_vars <- eqn_vars[sp_vars] |> unlist() # |> unname()
 
-  eqn <- ifelse(
-    sp_info$taxa$class == "Mammalia",
-    "depth_mean_plmax_tx",
-    "depth_minmax_plmax_tx")
-  for (var in vars_yes) { # var = "depth"
-    p <- get_sp_var_params(sp_key, var, sp_info, verbose = verbose)
-    lyrs_var <- cat_lyrs[[var]]
-    for (lyr in lyrs_var){
-      lyr_tx <- glue("{lyr}_tx")
-      r_env[[lyr_tx]] <- terra::app(
-        x   = r_env[[lyr]],
-        fun = ramp_env,
-        p   = p)
-    }
-  }
-
-  # Get appropriate layer for var and apply RES
-  lyr   <- var_lyr[[var]]
-  r_var <- r_env[[lyr]]
-
-  r_sp_env[[var]] <- terra::app(
-    x   = r_var,
-    fun = ramp_env,
-    p   = p)
-  # end TODO ----
-
-  # Convert to raster stack
-  r_sp_env <- terra::rast(r_sp_env)
+  if (verbose)
+    message(glue("equation: {paste(eqn_vars, collapse = ' * ')}"))
 
   # Multiply all layers to get final probability
-  r_sp_new <- terra::app(r_sp_env, fun = prod) |> round(2)
+  r_sp <- r_env |>
+    subset(eqn_vars) |>
+    app(fun = prod) |>
+      round(2)
 
   # Mask zero values
-  r_sp_new <- terra::mask(r_sp_new, r_sp_new, maskvalues = 0)
+  r_sp <- r_sp |>
+    mask(r_sp, maskvalues = 0)
 
   # Cache the result
-  terra::writeRaster(r_sp_new, cache_path, overwrite = TRUE)
+  writeRaster(r_sp, sp_tif, overwrite = TRUE)
+  r_sp <- rast(r_sp)
 
-  return(r_sp_new)
+  return(r_sp)
 }
 
 #' Validate AquaMaps species replication

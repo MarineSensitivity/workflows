@@ -61,7 +61,7 @@ source(here("libs/am_functions.R"))
 # sp_key <- "ITS-Mam-180527" # fin whale sorted
 # sp_key <- "ITS-Mam-180524" # sorted with tolerance 0.01
 # sp_key <- "W-Pol-129784"
-sp_key <- "Fis-22747"
+# sp_key <- "Fis-22747"
 
 # Get species information with enhanced details
 sp_info <- get_sp_info(sp_key)
@@ -71,10 +71,7 @@ jsonedit(sp_info)
 r_sp_old <- get_species_raster(sp_key, con_dd, dir_cache = dir_cache)
 
 # Replicate raster using enhanced species info
-r_sp_new <- replicate_sp_raster(sp_key, con_dd, dir_cache = dir_cache, redo = T)
-
-ext(r_sp_old)
-ext(r_sp_new)
+r_sp_new <- replicate_sp_raster(sp_key, con_dd, dir_cache = dir_cache, redo = T, verbose = T)
 
 # Compare rasters
 matches <- compare_rasters(r_sp_old, r_sp_new)
@@ -84,6 +81,8 @@ if (!matches) {
   # Get difference raster
   r_dif <- compare_rasters(r_sp_old, r_sp_new, return = "rast")
   plet(r_dif)
+  
+  # r_env <- get_sp_env(sp_key, sp_info)
   
   # Get detailed comparison data
   d_cmp <- compare_rasters(r_sp_old, r_sp_new, return = "tibble", sp_key = sp_key, con_dd = con_dd)
@@ -99,7 +98,7 @@ if (!matches) {
 compare_sp(r_sp_old, r_sp_new, sp_key)
 
 # Interactive diagnostic visualization
-create_diagnostic_visual(sp_key, con_dd)
+# create_diagnostic_visual(sp_key, con_dd)
 ```
 
 ## Create Diagnostic Table
@@ -138,6 +137,7 @@ ply_br_a_geo     <- glue("{dir_cache}/ply_boemrgns_antimeridian.geojson")
 ply_cells_br_geo <- glue("{dir_cache}/ply_cells_boemrgns.geojson")
 spp_br_csv       <- glue("{dir_cache}/spp_boemrgns.csv")
 do_map_br        <- F
+results_csv      <- here("data/aquamaps_validation_results.csv")
 
 # get regions, breaking on antimeridan
 if (!file.exists(ply_br_a_geo)) {
@@ -227,10 +227,10 @@ results <- validate_aquamaps_species(sp_keys, con_dd, dir_cache = dir_cache, ver
 # INFO [2025-05-20 17:42:27] 5777 of 5777: W-Por-171171...
 
 # Save results to CSV
-results_csv <- here("data/aquamaps_validation_results.csv")
 write_csv(results, results_csv)
 
 # Display summary
+results <- read_csv(results_csv)
 cat(glue("Total species processed: {nrow(results)}\n"))                                 # 9,927
 cat(glue("Species with matching rasters: {sum(results$r_matches, na.rm=TRUE)}\n"))      # 1,227 or 12.3%
 cat(glue("Species with non-matching rasters: {sum(!results$r_matches, na.rm=TRUE)}\n")) # 8,700
@@ -804,21 +804,241 @@ The function will cache the results with a suffix indicating the data source to 
 #| eval: false
 
 # Test replication using BioOracle v3 data for a single species
-sp_key_test <- "Fis-22747"  # Basking shark (Cetorhinus maximus)
+# sp_key_test <- "Fis-22747"      # Basking shark (Cetorhinus maximus)
+sp_key <- "ITS-Mam-180530"  # Basking shark (Cetorhinus maximus)
 
 # Get species information
-sp_info <- get_sp_info(sp_key_test)
+sp_info <- get_sp_info(sp_key)
+jsonedit(sp_info)
 
 # Get the original raster (HCAF-based)
-r_sp_old <- get_species_raster(sp_key_test, con_dd, dir_cache = dir_cache)
+r_sp_old <- get_species_raster(sp_key)
 
 # Replicate using BioOracle v3 data
-r_sp_new_bo <- replicate_sp_raster(
-  sp_key = sp_key_test,
-  con_dd = con_dd,
+# source("libs/am_functions.R")
+r_sp_bo <- replicate_sp_raster(
+  sp_key     = sp_key,
   env_layers = "BioOracle_v3",
-  redo = TRUE,
-  verbose = TRUE)
+  redo       = TRUE,
+  verbose    = TRUE)
+
+r_br <- msens::ply_boemrgns |>
+  st_wrap_dateline() |> 
+  rasterize(r_sp_bo, field = "boemrgn_key") |> 
+  trim()
+plet(r_br)
+r_br_km2 <- cellSize(r_br, unit = "km") |> 
+  mask(r_br)
+r_br_km2 <- cellSize(r_br, unit = "km") |> 
+  mask(r_br)
+
+# expanse(r_br, byValue = T) |> 
+#   arrange(area)
+
+r_gom_km2 <- r_br_km2 |> 
+  mask(r_br == "brGOM", maskvalues = F) |> 
+  trim()
+plet(r_br_km2) |> 
+  leaflet::addPolygons(
+    data = msens::ply_boemrgns |> 
+      filter(boemrgn_key == "brGOM"), 
+    col = "red", fill = F)
+
+r_br_km2_tr <- trim(r_br_km2)
+plet(r_br_km2_tr) |> 
+  leaflet::addPolygons(
+    data = msens::ply_boemrgns |> 
+      filter(boemrgn_key == "brGOM"), 
+    col = "red", fill = F)
+
+leaflet() |> 
+  addProviderTiles("Esri.OceanBasemap") |>
+  addRasterImage(r_br_km2_tr) |> 
+  addPolygons(
+    data = msens::ply_boemrgns |> 
+      filter(boemrgn_key == "brGOM"), 
+    col = "red", fill = F)
+
+plet(r_br_km2)
+
+m <- plet(r_br_km2)
+m |> 
+  leaflet.extras::addDrawToolbar()
+
+m %>%
+  # setView(0, 0, 2) %>%
+  # addProviderTiles(providers$CartoDB.Positron) %>%
+  addDrawToolbar(
+    targetGroup = "draw",
+    editOptions = editToolbarOptions(
+      selectedPathOptions = selectedPathOptions() ) ) %>%
+  addLayersControl(
+    overlayGroups = c("draw"),
+    options = layersControlOptions(collapsed = FALSE) ) %>%
+  addStyleEditor()
+
+summary(sqrt(values(r_br_km2, na.rm=T)))
+# pixels: ~4 km; 2.8 to 5.3 km width
+# Min.   :2.842  
+# 1st Qu.:4.005  
+# Median :4.281  
+# Mean   :4.262  
+# 3rd Qu.:4.797  
+# Max.   :5.311
+r_br_m <- sqrt(r_br_km2)
+plet(r_br_m)
+
+d_br_areas <- terra::expanse(
+  r_br, 
+  byValue  = T,
+  usenames = T)
+
+
+area(r_sp_bo)
+
+bo_tif <- sources(r_sp_bo)
+# bo_tif <- here(glue("data/replicate_aquamaps/replicated_bio-oracle/{sp_key}.tif"))
+```
+
+```{r}
+#| label: create_cog
+
+# Mac
+# python3 -m venv ~/py_venv_rasterio
+# source ~/py_venv_rasterio/bin/activate
+# python3 -m pip install rio-cogeo
+
+bo_tif <- sources(r_sp_bo)
+bo_cog <- glue("{dirname(bo_tif)}_cog/{basename(bo_tif)}")
+py_init <- "source ~/py_venv_rasterio/bin/activate"
+# is_cog <- system(glue("{py_init}; rio cogeo validate '{bo_tif}'"), intern=T) |> 
+#   str_detect(" is a valid cloud optimized GeoTIFF")
+# 
+# if (!is_cog){
+out <- system(glue("{py_init}; rio cogeo create '{bo_tif}' '{bo_cog}'"))
+if (out!= 0)
+  stop("Error creating COG")
+# }
+```
+
+```{r map-cog}
+librarian::shelf(
+  httr2,
+  quiet = T)
+
+# map COG ----
+sp_key         = "ITS-Mam-180530"
+cog_url        = glue("https://file.marinesensitivity.org/cog/sdm/derived/aquamaps_bio-oracle/{sp_key}.tif")
+cog_method     = "bilinear"
+cog_palette    = "spectral_r"
+lgnd_palette   = "Spectral"
+lgnd_palette_r = T
+bidx           = 1
+
+# * plot locally ----
+cog_tif <- here(glue("data/replicate_aquamaps/replicated_bio-oracle/{sp_key}.tif"))
+stopifnot(file.exists(cog_tif))
+r <- rast(cog_tif, lyrs=bidx)
+plot(r) # plot native terra
+
+# * plot via terra::plet() ----
+plet(
+  r, 
+  col = RColorBrewer::brewer.pal(
+    11, "Spectral") |> rev(),
+  tiles = "Esri.OceanBasemap")
+
+# * plot via leaflet ----
+library(leaflet)
+
+r_mer <- leaflet::projectRasterForLeaflet(
+  r, method = "bilinear")
+pal <- colorNumeric("Spectral", values(r_mer),
+  na.color = "transparent", reverse = T)
+
+leaflet() |> 
+  addProviderTiles("Esri.OceanBasemap") |> 
+  addRasterImage(r_mer, colors = pal, opacity = 0.8) |>
+  addLegend(pal = pal, values = values(r_mer),
+    title = names(r_mer))
+
+# * get bounding box via titiler ----
+
+titiler_endpoint = "https://titiler.marinesensitivity.org"
+
+cog_bb <- request(titiler_endpoint) |> 
+  req_url_path_append("cog", "bounds") |> 
+  req_url_query(
+    url = cog_url,
+    bidx = bidx) |> 
+  req_perform() |> 
+  resp_body_json() |> 
+  unlist() |> 
+  as.numeric()
+cog_bb
+
+# * get range of values via titiler ----
+cog_rng <- request(titiler_endpoint) |> 
+  req_url_path_append("cog", "statistics") |> 
+  req_url_query(
+    url  = cog_url,
+    bidx = bidx) |> 
+  req_perform() |> 
+  resp_body_json() |>
+  pluck(glue("b{bidx}")) |> 
+  keep_at(~ .x %in% c("min", "max")) |> 
+  as.numeric()
+cog_rng
+
+# set cog_rng manually
+# cog_rng <- range(values(r, na.rm=T))
+
+tile_opts <- glue(
+  "bidx={bidx}&expression=b{bidx}&
+  unscale=false&
+  resampling={cog_method}&reproject={cog_method}&return_mask=true&
+  rescale={paste(cog_rng, collapse=',')}&
+  colormap_name={cog_palette}") |> str_replace_all("\\s+", "")
+sdm_tile_url  <- glue(
+  "{titiler_endpoint}/cog/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}@2x.png?url={cog_url}&{tile_opts}")
+
+# OLD: https://api.cogeo.xyz/docs#/Cloud%20Optimized%20GeoTIFF/tile_cog_tiles__TileMatrixSetId___z___x___y___scale_x__format__get
+# 
+# TODO: cogeo.xyz (bidx = 1,2,3) VS titiler.xyz (bidx = List [ 1, 2, 3]) ?
+#
+# NEW: https://titiler.xyz/api.html#/Cloud%20Optimized%20GeoTIFF/tile_cog_tiles__tileMatrixSetId___z___x___y___scale_x__format__get
+
+library(rdeck)
+
+dir_private <- switch(
+  Sys.info()[["sysname"]],
+  "Darwin" = "~/My Drive/private",
+  "Linux"  = "/share/private")
+
+mb_token_txt <- glue("{dir_private}/mapbox_token_bdbest.txt")
+mb_token <- readLines(mb_token_txt)
+options(rdeck.mapbox_access_token = mb_token)
+
+bb <- cog_bb
+
+rdeck(
+  map_style      = mapbox_dark(),
+  theme          = "light",
+  initial_bounds = st_bbox(
+    c(xmin=bb[1], ymin=bb[2], xmax=bb[3], ymax=bb[4]),
+    crs = st_crs(4326) ) )  |>
+  add_tile_layer(
+    id                = "sdm",
+    name              = "sdm",
+    # visible           = F,
+    # visibility_toggle = T,
+    opacity           = 0.5,
+    data              = sdm_tile_url)
+```
+
+
+```{r}
+#| label: compare_biooracle_replication
 
 # Compare the two distributions visually
 compare_sp(
