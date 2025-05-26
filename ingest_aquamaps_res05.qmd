@@ -1,5 +1,7 @@
 ---
 title: "Ingest AquaMaps in USA BOEM regions interpolated to 0.05 degree cells"
+editor_options: 
+  chunk_output_type: console
 ---
 
 ## Setup
@@ -48,11 +50,13 @@ ply_pa |>
 ## AquaMaps cells in Planning Areas
 
 ```{r}
+#| label: rast_am-cellids_in_planareas
+
 source("libs/am_functions.R")
 
 pa_cid_tif <- glue("{dir_data}/derived/pa-2025_am-cid.tif")
 
-if (!file.exists(pa_am_cid_tif)){
+if (!file.exists(pa_cid_tif)){
   r_hcaf <- get_hcaf_raster()
   
   # plot(r_hcaf[["cell_id"]])
@@ -82,17 +86,14 @@ mapView(r_pa_cid) +
 
 
 ```{r}
-#| label: get_species_in_planareas
+#| label: species_in_planareas
 
-# get species in planning areas
-spp_pa_csv   <- glue("{dir_data}/derived/aquamaps/spp_boem-planareas-2025.csv")
-do_map_br    <- F
-# results_csv  <- here("data/aquamaps_validation_results.csv")
+spp_pa_csv   <- glue("{dir_data}/derived/aquamaps.org/spp_boem-planareas-2025.csv")
 
 if (!file.exists(spp_pa_csv)) {
   pa_cids <- values(r_pa_cid, na.rm = T, mat = F)
   
-  # get species in boem regions with number of cells
+  # get species in BOEM planning areas with number of cells
   d_spp_pa <- tbl(con_dd, "spp_cells") |> 
     filter(cell_id %in% pa_cids) |>
     group_by(sp_key) |>
@@ -106,10 +107,10 @@ if (!file.exists(spp_pa_csv)) {
 }
 d_spp_pa <- read_csv(spp_pa_csv)  # 17,550 x 2
 
-d_spp_pa |> 
-  filter(n_cells_pa < 10) |> 
-  pull(n_cells_pa) |> 
-  table()
+# d_spp_pa |> 
+#   filter(n_cells_pa < 10) |> 
+#   pull(n_cells_pa) |> 
+#   table()
 #  1     2    3    4    5    6    7    8    9 
 # 62 1,277   53   68   76   45  104   88  102
 ```
@@ -117,44 +118,58 @@ d_spp_pa |>
 ```{r}
 #| label: iterate_species_in_planareas
 
-r_hcaf <- get_hcaf_raster()
-r_bo   <- get_bo_raster() # Bio-Oracle
-r_land <- is.na(r_bo[["depth_mean"]])
+if (!all(sapply(c("r_hcaf", "r_bo", "r_land"), exists))){
+  r_hcaf <- get_hcaf_raster()
+  r_bo   <- get_bo_raster() # Bio-Oracle
+  r_land <- is.na(r_bo[["depth_mean"]])
+}
 
 dir_am_spp <- glue("{dir_data}/raw/aquamaps.org/spp_cells")
-dir_b_spp  <- glue("{dir_data}/derived/aquamaps.org/spp_cells0.05")
+dir_ds_spp <- glue("{dir_data}/derived/aquamaps.org/spp_cells0.05_cog") # downsized
+
+# prep server:
+#   mkdir -p /share/data/derived/aquamaps.org/spp_cells0.05
+#   mkdir -p /share/data/raw/aquamaps.org
+#   cp -R /share/github/MarineSensitivity/workflows/data/replicate_aquamaps/species \
+#     /share/data/raw/aquamaps.org/spp_cells
+
+# TODO: convert raw/aquamaps.org/spp_cells/*.tif  [0-1] FLOAT64 to [1-100] INTU1
 
 d_spp_pa_tif <- d_spp_pa |> 
   arrange(desc(n_cells_pa)) |> 
   mutate(
     sp_am_tif        = glue("{dir_am_spp}/{sp_key}.tif"),
-    sp_b_tif         = glue("{dir_b_spp}/{sp_key}.tif"),
+    sp_ds_tif         = glue("{dir_ds_spp}/{sp_key}.tif"),
     sp_am_tif_exists = file.exists(sp_am_tif),
-    sp_b_tif_exists  = file.exists(sp_b_tif) )
+    sp_ds_tif_exists  = file.exists(sp_ds_tif) )
   
-# d_spp_pa_tif |> 
-#   select(sp_am_tif_exists, sp_b_tif_exists) |> 
+# d_spp_pa_tif |>
+#   select(sp_am_tif_exists, sp_ds_tif_exists) |>
 #   table(useNA = "ifany")
-#                  sp_b_tif_exists
-# sp_am_tif_exists     FALSE  TRUE
-#            FALSE     7,518     1
-#            TRUE     10,031     0
+#
+#                 sp_ds_tif_exists
+# sp_am_tif_exists FALSE TRUE
+#            FALSE  7518    1
+#            TRUE   9818  213
            
 sp_keys_todo <- d_spp_pa_tif |> 
-  filter(!sp_b_tif_exists) |> 
+  filter(
+    !sp_am_tif_exists |
+    !sp_ds_tif_exists) |> 
   pull(sp_key)
 n <- length(sp_keys_todo)
 
 for (i in 1:n){  # i = 1
   
-  sp_key   <- sp_keys_todo[i]
-  sp_b_tif <- glue("{dir_b_spp}/{sp_key}.tif")
+  sp_key    <- sp_keys_todo[i]
+  sp_ds_tif <- glue("{dir_ds_spp}/{sp_key}.tif")
   log_info(
     "Processing {format(i, big.mark=',')} / {format(n, big.mark=',')}: {sp_key}")
   
   r_sp_am <- get_species_raster(sp_key, con_dd, r_hcaf, dir_cache = dir_am_spp)
+  # TODO: fix to write COG
   
-  r_sp_b <- resample(
+  r_sp_ds <- resample(
     ifel(
       is.na(r_sp_am), 
       0, 
@@ -166,14 +181,129 @@ for (i in 1:n){  # i = 1
     trim()
   
   # convert to integer percentage for smaller file size
-  r_sp_b <- as.int(round(r_sp_b * 100)) %>%
+  r_sp_ds <- as.int(round(r_sp_ds * 100)) %>%
     ifel(. == 0, NA, .) |> 
     trim()
   
   writeRaster(
-    r_sp_b, sp_b_tif, overwrite = T, datatype = "INT1U")
+    r_sp_ds, sp_ds_tif, datatype = "INT1U", filetype = "COG")
+}
+# INFO [2025-05-26 11:31:47] Processing 1 / 17,370: Fis-29291
+# INFO [2025-05-26 11:36:19] Processing 7 / 17,370: Fis-33821
+
+# sp_key = "W-Ant-103323"
+# sp_ds_tif <- glue("{dir_ds_spp}/{sp_key}.tif")
+# rast(sp_ds_tif) |> datatype() # "INT1U"
+```
+
+```{r}
+#| label: tif_to_cog
+#| eval: false
+
+librarian::shelf(
+  fs, glue, logger, terra, tibble)
+
+# dir_tif <- glue("{dir_data}/derived/aquamaps.org/spp_cells0.05")
+# dir_cog <- glue("{dir_data}/derived/aquamaps.org/spp_cells0.05_cog")
+dir_tif <- glue("{dir_data}/raw/aquamaps.org/spp_cells")
+dir_cog <- glue("{dir_data}/raw/aquamaps.org/spp_cells_cog")
+
+stopifnot(dir_exists(dir_tif))
+dir_create(dir_cog)
+
+tifs <- tibble(
+  tif = dir_ls(dir_tif, glob = "*.tif"),
+  cog = path(dir_cog, basename(tif)) ) |> 
+  mutate(
+    cog_exists = file_exists(cog) ) |> 
+  filter(!cog_exists) |> 
+  pull(tif)
+
+for (i in seq_along(tifs)){ # i = 1
+  tif <- tifs[i]
+  log_info("{format(i, big.mark=',')} / {format(length(tifs), big.mark=',')}: {basename(tif)}")
+  rast(tif) |> 
+    writeRaster(
+    path(dir_cog, basename(tif)), 
+    datatype = "INT1U", 
+    filetype = "COG")
 }
 ```
+
+```{r}
+library("terra")
+gdal() # "3.7.2"
+
+# Size is 10980, 10980
+# Overviews: 5490x5490, 2745x2745, 1373x1373, 687x687
+url = "/vsicurl/https://sentinel-cogs.s3.us-west-2.amazonaws.com/sentinel-s2-l2a-cogs/55/G/DM/2023/12/S2A_55GDM_20231230_0_L2A/B02.tif"
+
+x = terra::rast(url)
+system.time(plot(x, maxcell = 10000))
+#> user  system elapsed
+#> 7.09    3.91   50.50
+
+y = stars::read_stars(url, proxy = TRUE)
+system.time(plot(y, downsample = 10))
+#> user  system elapsed
+#> 0.42    0.03    3.03
+
+
+# https://r-spatial.github.io/leafem/reference/addCOG.html
+librarian::shelf(
+  leafem, leaflet)
+
+base_url = "https://sentinel-cogs.s3.us-west-2.amazonaws.com"
+image_url = "sentinel-s2-l2a-cogs/46/X/DG/2022/8/S2B_46XDG_20220829_0_L2A/L2A_PVI.tif"
+url = sprintf("%s/%s", base_url, image_url)
+
+leaflet() |> 
+  addTiles() |> 
+  addCOG(
+    url = url, 
+    group = "COG", 
+    resolution = 512, 
+    autozoom   = T,
+    imagequery = T)
+```
+
+
+```{r}
+url <- 'https://chelsa-chile.s3.amazonaws.com/monthly/pet/CHELSA_pet_v2.1_19790201.tif'
+
+min_scale = 0; max_scale = 1
+js_scale = paste0("function (values) {
+                    var scale = chroma.scale(['white', '#22c7e8']).domain([", min_scale, ",", max_scale, "]);
+                    var val = values[0];
+                    if (val === 0) return;
+                    if (val < 0) return;
+                    return scale(val).hex();
+                    }")
+
+leaflet(options = leafletOptions(attributionControl = FALSE)) %>% 
+  setView(lng =-70.09635, lat =  -33.01703, zoom = 4) %>% 
+  addProviderTiles("Esri.WorldImagery", group = "esri") %>%
+  addMapPane("cog", zIndex = 500) %>%
+  leafem:::addCOG(
+    url = url
+    , group = "PET"
+    , opacity = 0.7
+    , options = list(pane = "cog")
+    # , resolution = 96
+    , autozoom = FALSE
+    , colorOptions = colorOptions(
+      palette = terrain.colors(256)
+    )
+    , pixelValuesToColorFn = JS(js_scale)
+  ) %>%
+  addMouseCoordinates() %>%
+  addLayersControl(
+    baseGroups = c("esri")
+    , overlayGroups =  c("PET")
+  )
+```
+
+
 
 
 # OLD replicate_aquamaps.qmd ... 

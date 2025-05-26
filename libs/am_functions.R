@@ -479,7 +479,7 @@ get_bo_raster <- function(
   if (is.null(bo_tif))
     bo_tif <- ifelse(
       Sys.info()[["sysname"]] == "Linux",
-      "/share/data/bio-oracle_v3.tif",
+      "/share/data/raw/bio-oracle.org/bio-oracle_v3.tif",
       "~/My Drive/projects/msens/data/raw/bio-oracle.org/bio-oracle_v3.tif")
 
   stopifnot(file.exists(bo_tif))
