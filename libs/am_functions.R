@@ -948,8 +948,13 @@ get_species_raster <- function(sp_key, con_dd, r_hcaf = NULL, dir_cache = here::
 
   names(r_sp) <- "probability"
 
-  # Cache the result
-  terra::writeRaster(r_sp, cache_path, overwrite = TRUE)
+  # convert to integer percentage for smaller file size
+  r_sp <- as.int(round(r_sp * 100)) %>%
+    ifel(. == 0, NA, .) |>
+    trim()
+
+  writeRaster(
+    r_sp, cache_path, datatype = "INT1U", filetype = "COG")
 
   return(r_sp)
 }
