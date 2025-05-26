@@ -9,7 +9,7 @@ title: "Ingest AquaMaps in USA BOEM regions interpolated to 0.05 degree cells"
 
 librarian::shelf(
   cmocean, DBI, dplyr, DT, duckdb, fs, glue, here, htmltools, janitor, knitr,
-  leaflet, leaflet.extras, librarian, mapview,
+  leaflet, leaflet.extras, librarian, logger, mapview,
   # raquamaps/raquamaps,
   marinesensitivity/msens,
   RColorBrewer, readr, sf, stringr, terra, tibble, tidyr,
@@ -82,7 +82,7 @@ mapView(r_pa_cid) +
 
 
 ```{r}
-#| label: get_species
+#| label: get_species_in_planareas
 
 # get species in planning areas
 spp_pa_csv   <- glue("{dir_data}/derived/aquamaps/spp_boem-planareas-2025.csv")
@@ -115,7 +115,64 @@ d_spp_pa |>
 ```
 
 ```{r}
+#| label: iterate_species_in_planareas
 
+r_hcaf <- get_hcaf_raster()
+r_bo   <- get_bo_raster() # Bio-Oracle
+r_land <- is.na(r_bo[["depth_mean"]])
+
+dir_am_spp <- glue("{dir_data}/raw/aquamaps.org/spp_cells")
+dir_b_spp  <- glue("{dir_data}/derived/aquamaps.org/spp_cells0.05")
+
+d_spp_pa_tif <- d_spp_pa |> 
+  arrange(desc(n_cells_pa)) |> 
+  mutate(
+    sp_am_tif        = glue("{dir_am_spp}/{sp_key}.tif"),
+    sp_b_tif         = glue("{dir_b_spp}/{sp_key}.tif"),
+    sp_am_tif_exists = file.exists(sp_am_tif),
+    sp_b_tif_exists  = file.exists(sp_b_tif) )
+  
+# d_spp_pa_tif |> 
+#   select(sp_am_tif_exists, sp_b_tif_exists) |> 
+#   table(useNA = "ifany")
+#                  sp_b_tif_exists
+# sp_am_tif_exists     FALSE  TRUE
+#            FALSE     7,518     1
+#            TRUE     10,031     0
+           
+sp_keys_todo <- d_spp_pa_tif |> 
+  filter(!sp_b_tif_exists) |> 
+  pull(sp_key)
+n <- length(sp_keys_todo)
+
+for (i in 1:n){  # i = 1
+  
+  sp_key   <- sp_keys_todo[i]
+  sp_b_tif <- glue("{dir_b_spp}/{sp_key}.tif")
+  log_info(
+    "Processing {format(i, big.mark=',')} / {format(n, big.mark=',')}: {sp_key}")
+  
+  r_sp_am <- get_species_raster(sp_key, con_dd, r_hcaf, dir_cache = dir_am_spp)
+  
+  r_sp_b <- resample(
+    ifel(
+      is.na(r_sp_am), 
+      0, 
+      r_sp_am), 
+    r_land, 
+    method = "bilinear") |> 
+    mask(r_land, maskvalue = T) %>%
+    ifel(. == 0, NA, .) |> 
+    trim()
+  
+  # convert to integer percentage for smaller file size
+  r_sp_b <- as.int(round(r_sp_b * 100)) %>%
+    ifel(. == 0, NA, .) |> 
+    trim()
+  
+  writeRaster(
+    r_sp_b, sp_b_tif, overwrite = T, datatype = "INT1U")
+}
 ```
 
 
