@@ -1,4 +1,165 @@
-## 2025-05-27.a + ingest_aquamaps_to_sdm_duckdb with libs/sdm_functions.R
+## 2025-05-27.b tweak ingest_aquamaps_to_sdm_duckdb.qmd, libs/sdm_functions.R
+
+Update the @ingest_aquamaps_to_sdm_duckdb.qmd and @libs/sdm_functions.R to 
+include the following changes:
+- Strip "sdm_"" from table names, and make singular: 
+  - `sdm_sources`    → `dataset`
+  - `sdm_models`     → `model`
+  - `sdm_species`    → `species`
+  - `sdm_cells`      → `cell`
+  - `sdm_values`     → `model_cell`
+  - `biodiv_metrics` → `metric`
+- Rename `model.mld_id` to `mdl_seq` and make it a sequential integer
+  starting at 1 for each model output, so that it can be used as a unique identifier
+  for the model output.
+- Make table `model_cell` (formerly `sdm_values` ) unique to `cell_id` and 
+  `model.mdl_seq` (not `sp_id`; so that  multiple species can be associated with a 
+  single model output).
+- Move `model_cell.value_type` to `model.mdl_type`: one of 
+  "occurrence", "range", "suitability", "biomass", "density", "diversity"
+- Force the `cell_id` equal to `terra::cells(r)` for the global 0.05 degree
+  grid, such that new calculations can summarized to `cell_id`
+  and raster generated using an efficient substitution, ie `terra::subst()`
+  like `get_species_raster()` function in @libs/sdm_functions.R. Include a similar
+  function in @libs/sdm_functions.R to generate a raster given a dataframe
+  with default `cell_id` column and at least one non-null column to be
+  used as the output name of one or more raster layers.
+- Rename `dataset.src_key` to `dataset.ds_key`.
+- Add to table `dataset` columns (and drop `url`):
+  - `source_broad`: eg NOAA, AquaMaps, Duke, NCCOS, etc.
+  - `source_detail`: eg NOAA Southeast Fisheries Science Center, or Duke Marine Geospatial Ecology Lab, etc.
+  - `regions`: broad regions, such as Global, Atlantic, Pacific, Gulf of America, Alaska, Hawaii, etc.
+  - `taxa_groups`: one or more of: fish, invertebrates, marine mammals, cetaceans, sea turtles, seabirds, etc.
+  - `year_pub`: year published
+  - `date_obs_beg`: date of first observation, if available
+  - `date_obs_end`: date of last observation, if available
+  - `date_env_beg`: date of first environmental data, if available
+  - `date_env_end`: date of last environmental data, if available
+  - `name_short`: short name in form of "{source_broad} {taxa_groups} {response_type} in {regions}, {year_pub}"
+  - `response_type`: one or more of: "occurrence", "range", "suitability", "biomass", "density", "diversity"
+  - `name_original:` original name of the dataset, such as "Cetacean and sea turtle spatial density model outputs from visual observations using line-transect survey methods aboard NOAA vessel and aircraft platforms in the Gulf of Mexico from 2003-06-12 to 2019-07-31 (NCEI Accession 0256800)"
+  - `link_info`: https://www.ncei.noaa.gov/access/metadata/landing-page/bin/iso?id=gov.noaa.nodc:256800
+  - `link_download`: https://www.ncei.noaa.gov/archive/accession/download/256800
+  - `link_metadata`: https://www.fisheries.noaa.gov/inport/item/67830
+  - `links_other`: any other relevant links seperated by spaces, such as "https://www.ncei.noaa.gov/archive/accession/GOMMAPPS https://www.boem.gov/gommapps"
+- Update the `dataset.ds_key` of "aquamaps_bio-oracle" to "am_0.05" for brevity.
+- Rename `model.taxa_group` to `taxa`, which can have one or more related rows in `species`.
+- Relate `model` to `species` via `ds_key` and `taxa`, so the same combination 
+  can be used across models of varying time_period, and region. In the case of 
+  AquaMaps the `sp_key` and `taxa` will be equal and one-to-one, since only a single
+  species applies to each model.
+- Add columns `gbif_id`, `itis_id` in `species` to look up species from GBIF and
+  ITIS databases, respectively.
+- Add column `sp_cat` to `species` to indicate the category of the species
+  (e.g. "fish", "mollusk", "crustacean", etc.) for easier filtering and analysis.
+- Reconfigure `metric` (formerly `biodiv_metrics`) to describe metrics that can
+  be applied across cells (+ `cell` → `cell_metric`) and/or regions
+  (+ `region` → `region_metric`) with columns:
+  - `metric_seq`: primary key of auto-incrementing integer sequence
+  - `description`: description of metric
+  - `metric_type`: type of metric (e.g. "species_richness", "shannon_index", etc.)
+  - `date_created`: date the metric was created
+- Add a new table `region` to uniquely identify geometries from polygon tables, including 
+  `planning_areas`, for relating to a `metric`:
+  - `rgn_seq`: primary key of auto-incrementing integer sequence uniquely identifying a geometry
+  - `tbl_col`: "{table}.{column}" containing the polygon geometry, such as "planning_areas.pa_key"
+  - `value`: value containing the unique identifier for the polygon, such as "CHU" the `pa_key` value for the "Chukchi Sea" in Alaska
+  - `col_geom`: column with the geometry of the regional polygon, such as "geom"
+  - `date_created`: date record added to the database
+- Rename `planning_area_metrics` table to `region_metric` to relate metrics to regions with columns:
+  - `rgn_seq`: foreign key to `region` table
+  - `metric_seq`: foreign key to `metric` table
+  - `value`: calculated value of the metric for the region
+- Add `cell_metric` table to relate metrics to regions with columns:
+  - `cell_id`: foreign key to `cell` table
+  - `metric_seq`: foreign key to `metric` table
+  - `value`: calculated value of the metric for the region
+- Add a `date_created` column to table `model` to indicate when the model was created in the database.
+- Update the diagram, rest of the notebook and functions in @libs/sdm_functions.R
+  according to these new names and instructions.
+  
+- Drop table `env_layers` since these can simply be added as columns to the `cell` table later.
+- Drop `years_obs` since already captured by `date_obs_beg` and `date_obs_end` without having to use an ARRAY.
+- Simplify `dataset.regions` to being text only, not an array.
+- Add `cell.area_km2` table to store the area of each cell in square kilometers, calculated from the raster resolution.
+- Drop `cell.res_deg` since uniform in value.
+- Add `region_cell` table to relate `cell` to `region` with columns:
+  - `rgn_seq`: foreign key to `region` table
+  - `cell_id`: foreign key to `cell` table
+  - `pct_covered`: as integer percentage of the cell covered by the region polygon
+
+  The updated schema will allow for efficient querying and raster generation while maintaining flexibility for multiple SDM sources and biodiversity metrics.
+
+### Response
+
+⏺ I've successfully updated both files according to your specifications. Here's a summary of the key changes:
+
+  Updated Database Schema:
+
+  - Renamed all tables to remove "sdm_" prefix and make them singular
+  - model.mdl_id → model.mdl_seq (auto-incrementing sequence)
+  - model_cell is now unique to cell_id and mdl_seq (not species)
+  - Moved value_type from model_cell to model.mdl_type
+  - Added comprehensive columns to dataset table including links, dates, and metadata
+  - Added gbif_id, itis_id, and sp_cat to species table
+  - Created new metric, cell_metric, region, and region_metric tables
+  - Dataset key changed from "aquamaps_bio-oracle" to "am_0.05"
+
+  Key Implementation Details:
+
+  1. Cell IDs: Now use terra::cells() to ensure consistent cell numbering with the global 0.05° raster template
+  2. New function: create_raster_from_df() that uses terra::subst() for efficient raster creation
+  3. Model-Species relationship: For AquaMaps, taxa equals sp_key (one-to-one), but the schema supports multiple species per model for other
+   datasets
+  4. Regional aggregation: The region table allows flexible polygon references from any table/column combination
+  5. Metrics: Separated metric definitions from their calculated values, allowing reuse across cells and regions
+
+  Updated Functions in sdm_functions.R:
+
+  - create_raster_from_df() - New function using terra::subst() for efficient raster generation
+  - calculate_biodiversity_metrics() - Updated to use new schema with metric definitions
+  - export_metric_raster() - Uses new create_raster_from_df() function
+  - create_spatial_indexes() - Updated with new table/column names
+  - validate_sdm_data() - Updated to check new table structure
+
+  The system now supports efficient querying and raster generation while maintaining flexibility for multiple SDM sources and biodiversity
+  metrics.
+
+⏺ I've successfully updated both files according to your specifications. Here's a summary of the key changes:
+
+  Updated Database Schema:
+
+  - Renamed all tables to remove "sdm_" prefix and make them singular
+  - model.mdl_id → model.mdl_seq (auto-incrementing sequence)
+  - model_cell is now unique to cell_id and mdl_seq (not species)
+  - Moved value_type from model_cell to model.mdl_type
+  - Added comprehensive columns to dataset table including links, dates, and metadata
+  - Added gbif_id, itis_id, and sp_cat to species table
+  - Created new metric, cell_metric, region, and region_metric tables
+  - Dataset key changed from "aquamaps_bio-oracle" to "am_0.05"
+
+  Key Implementation Details:
+
+  1. Cell IDs: Now use terra::cells() to ensure consistent cell numbering with the global 0.05° raster template
+  2. New function: create_raster_from_df() that uses terra::subst() for efficient raster creation
+  3. Model-Species relationship: For AquaMaps, taxa equals sp_key (one-to-one), but the schema supports multiple species per model for other
+   datasets
+  4. Regional aggregation: The region table allows flexible polygon references from any table/column combination
+  5. Metrics: Separated metric definitions from their calculated values, allowing reuse across cells and regions
+
+  Updated Functions in sdm_functions.R:
+
+  - create_raster_from_df() - New function using terra::subst() for efficient raster generation
+  - calculate_biodiversity_metrics() - Updated to use new schema with metric definitions
+  - export_metric_raster() - Uses new create_raster_from_df() function
+  - create_spatial_indexes() - Updated with new table/column names
+  - validate_sdm_data() - Updated to check new table structure
+
+  The system now supports efficient querying and raster generation while maintaining flexibility for multiple SDM sources and biodiversity
+  metrics.
+
+
+## 2025-05-27.a + ingest_aquamaps_to_sdm_duckdb.qmd with libs/sdm_functions.R
 
 Write a new Quarto notebook `ingest_aquamaps_to_sdm_duckdb.qmd` to ingest the downscaled 
 AquaMaps (using the 0.05 decimal degree cells from Bio-Oracle being generated now by

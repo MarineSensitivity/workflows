@@ -33,6 +33,64 @@ batch_insert_values <- function(con, df, table_name, batch_size = 10000, verbose
   return(n_rows)
 }
 
+#' Create raster from dataframe using terra::subst
+#'
+#' @param df Data frame with cell_id column and value columns
+#' @param r_template Terra raster template (default: global 0.05 degree)
+#' @param cell_col Name of cell ID column (default: "cell_id")
+#' @param value_cols Names of value columns to rasterize
+#' @param na_value Value to use for NA cells (default: NA)
+#' @return Terra SpatRaster object with one layer per value column
+#' @export
+create_raster_from_df <- function(df, r_template = NULL, cell_col = "cell_id", 
+                                  value_cols = NULL, na_value = NA) {
+  
+  # load global template if not provided
+  if (is.null(r_template)) {
+    # try to load from standard location
+    r_template_file <- here::here("data/derived/r_global_0.05.rds")
+    if (file.exists(r_template_file)) {
+      r_template <- readRDS(r_template_file)
+    } else {
+      # create default global 0.05 degree template
+      r_template <- terra::rast(
+        xmin = -180, xmax = 180,
+        ymin = -90,  ymax = 90,
+        resolution = 0.05,
+        crs = "EPSG:4326"
+      )
+    }
+  }
+  
+  # determine value columns if not specified
+  if (is.null(value_cols)) {
+    value_cols <- setdiff(names(df), cell_col)
+  }
+  
+  # create raster for each value column
+  rasters <- list()
+  
+  for (val_col in value_cols) {
+    # use terra::subst for efficient substitution
+    r <- terra::subst(
+      r_template,
+      from   = df[[cell_col]],
+      to     = df[[val_col]],
+      others = na_value
+    )
+    
+    names(r) <- val_col
+    rasters[[val_col]] <- r
+  }
+  
+  # combine into multi-layer raster if multiple columns
+  if (length(rasters) == 1) {
+    return(rasters[[1]])
+  } else {
+    return(terra::rast(rasters))
+  }
+}
+
 #' Create raster from point data
 #'
 #' @param df Data frame with lon, lat, and value columns
@@ -128,21 +186,49 @@ calculate_biodiversity_metrics <- function(con,
   
   n_metrics <- 0
   
+  # first ensure metrics exist in metric table
+  for (metric_type in metrics) {
+    metric_exists <- DBI::dbGetQuery(con, glue::glue("
+      SELECT COUNT(*) as n FROM metric WHERE metric_type = '{metric_type}'
+    "))$n > 0
+    
+    if (!metric_exists) {
+      description <- switch(metric_type,
+        species_richness = "Number of species with value > threshold",
+        shannon_index = "Shannon diversity index",
+        simpson_index = "Simpson diversity index",
+        weighted_endemism = "Weighted endemism index",
+        "User-defined metric"
+      )
+      
+      DBI::dbExecute(con, glue::glue("
+        INSERT INTO metric (metric_type, description)
+        VALUES ('{metric_type}', '{description}')
+      "))
+    }
+  }
+  
+  # get metric IDs
+  metric_ids <- DBI::dbGetQuery(con, "SELECT metric_seq, metric_type FROM metric")
+  
   # species richness
   if ("species_richness" %in% metrics) {
     if (verbose) message("Calculating species richness...")
     
+    metric_seq <- metric_ids$metric_seq[metric_ids$metric_type == "species_richness"]
+    
     DBI::dbExecute(con, glue::glue("
-      DELETE FROM biodiv_metrics WHERE metric_type = 'species_richness';
+      DELETE FROM cell_metric WHERE metric_seq = {metric_seq};
       
-      INSERT INTO biodiv_metrics (cell_id, metric_type, value)
+      INSERT INTO cell_metric (cell_id, metric_seq, value)
       SELECT 
-        cell_id,
-        'species_richness' as metric_type,
-        COUNT(DISTINCT sp_id) as value
-      FROM sdm_values
-      WHERE value > {threshold}
-      GROUP BY cell_id
+        mc.cell_id,
+        {metric_seq} as metric_seq,
+        COUNT(DISTINCT m.taxa) as value
+      FROM model_cell mc
+      JOIN model m ON mc.mdl_seq = m.mdl_seq
+      WHERE mc.value > {threshold}
+      GROUP BY mc.cell_id
     "))
     
     n_metrics <- n_metrics + 1
@@ -152,24 +238,26 @@ calculate_biodiversity_metrics <- function(con,
   if ("shannon_index" %in% metrics) {
     if (verbose) message("Calculating Shannon diversity index...")
     
-    DBI::dbExecute(con, "
-      DELETE FROM biodiv_metrics WHERE metric_type = 'shannon_index';
+    metric_seq <- metric_ids$metric_seq[metric_ids$metric_type == "shannon_index"]
+    
+    DBI::dbExecute(con, glue::glue("
+      DELETE FROM cell_metric WHERE metric_seq = {metric_seq};
       
-      INSERT INTO biodiv_metrics (cell_id, metric_type, value)
+      INSERT INTO cell_metric (cell_id, metric_seq, value)
       SELECT 
         cell_id,
-        'shannon_index' as metric_type,
+        {metric_seq} as metric_seq,
         -SUM(p * LN(p)) as value
       FROM (
         SELECT 
-          cell_id,
-          value / SUM(value) OVER (PARTITION BY cell_id) as p
-        FROM sdm_values
-        WHERE value > 0
+          mc.cell_id,
+          mc.value / SUM(mc.value) OVER (PARTITION BY mc.cell_id) as p
+        FROM model_cell mc
+        WHERE mc.value > 0
       ) t
       WHERE p > 0
       GROUP BY cell_id
-    ")
+    "))
     
     n_metrics <- n_metrics + 1
   }
@@ -178,23 +266,25 @@ calculate_biodiversity_metrics <- function(con,
   if ("simpson_index" %in% metrics) {
     if (verbose) message("Calculating Simpson diversity index...")
     
-    DBI::dbExecute(con, "
-      DELETE FROM biodiv_metrics WHERE metric_type = 'simpson_index';
+    metric_seq <- metric_ids$metric_seq[metric_ids$metric_type == "simpson_index"]
+    
+    DBI::dbExecute(con, glue::glue("
+      DELETE FROM cell_metric WHERE metric_seq = {metric_seq};
       
-      INSERT INTO biodiv_metrics (cell_id, metric_type, value)
+      INSERT INTO cell_metric (cell_id, metric_seq, value)
       SELECT 
         cell_id,
-        'simpson_index' as metric_type,
+        {metric_seq} as metric_seq,
         1 - SUM(p * p) as value
       FROM (
         SELECT 
-          cell_id,
-          value / SUM(value) OVER (PARTITION BY cell_id) as p
-        FROM sdm_values
-        WHERE value > 0
+          mc.cell_id,
+          mc.value / SUM(mc.value) OVER (PARTITION BY mc.cell_id) as p
+        FROM model_cell mc
+        WHERE mc.value > 0
       ) t
       GROUP BY cell_id
-    ")
+    "))
     
     n_metrics <- n_metrics + 1
   }
@@ -203,33 +293,37 @@ calculate_biodiversity_metrics <- function(con,
   if ("weighted_endemism" %in% metrics) {
     if (verbose) message("Calculating weighted endemism...")
     
-    # first calculate species ranges
-    DBI::dbExecute(con, "
-      CREATE TEMP TABLE species_ranges AS
+    metric_seq <- metric_ids$metric_seq[metric_ids$metric_type == "weighted_endemism"]
+    
+    # first calculate taxa ranges
+    DBI::dbExecute(con, glue::glue("
+      CREATE TEMP TABLE taxa_ranges AS
       SELECT 
-        sp_id,
-        COUNT(DISTINCT cell_id) as range_size
-      FROM sdm_values
-      WHERE value > {threshold}
-      GROUP BY sp_id
-    ")
+        m.taxa,
+        COUNT(DISTINCT mc.cell_id) as range_size
+      FROM model_cell mc
+      JOIN model m ON mc.mdl_seq = m.mdl_seq
+      WHERE mc.value > {threshold}
+      GROUP BY m.taxa
+    "))
     
     # then calculate weighted endemism
     DBI::dbExecute(con, glue::glue("
-      DELETE FROM biodiv_metrics WHERE metric_type = 'weighted_endemism';
+      DELETE FROM cell_metric WHERE metric_seq = {metric_seq};
       
-      INSERT INTO biodiv_metrics (cell_id, metric_type, value)
+      INSERT INTO cell_metric (cell_id, metric_seq, value)
       SELECT 
-        v.cell_id,
-        'weighted_endemism' as metric_type,
-        SUM(1.0 / r.range_size) as value
-      FROM sdm_values v
-      JOIN species_ranges r ON v.sp_id = r.sp_id
-      WHERE v.value > {threshold}
-      GROUP BY v.cell_id
+        mc.cell_id,
+        {metric_seq} as metric_seq,
+        SUM(1.0 / tr.range_size) as value
+      FROM model_cell mc
+      JOIN model m ON mc.mdl_seq = m.mdl_seq
+      JOIN taxa_ranges tr ON m.taxa = tr.taxa
+      WHERE mc.value > {threshold}
+      GROUP BY mc.cell_id
     "))
     
-    DBI::dbExecute(con, "DROP TABLE species_ranges")
+    DBI::dbExecute(con, "DROP TABLE taxa_ranges")
     
     n_metrics <- n_metrics + 1
   }
@@ -325,36 +419,43 @@ summarize_by_planning_areas <- function(con,
 export_metric_raster <- function(con, metric_type, extent = NULL, 
                                  res = 0.05, output_file = NULL, cog = TRUE) {
   
+  # get metric ID
+  metric_seq <- DBI::dbGetQuery(con, glue::glue("
+    SELECT metric_seq FROM metric WHERE metric_type = '{metric_type}'
+  "))$metric_seq
+  
+  if (length(metric_seq) == 0) {
+    stop(glue::glue("Metric type '{metric_type}' not found in database"))
+  }
+  
   # build query
   query <- glue::glue("
     SELECT 
-      c.lon, 
-      c.lat, 
-      COALESCE(m.value, 0) as value
-    FROM sdm_cells c
-    LEFT JOIN biodiv_metrics m 
-      ON c.cell_id = m.cell_id 
-      AND m.metric_type = '{metric_type}'
+      cm.cell_id,
+      cm.value
+    FROM cell_metric cm
+    WHERE cm.metric_seq = {metric_seq}
   ")
   
   # add extent filter if provided
   if (!is.null(extent)) {
     query <- glue::glue("{query}
-      WHERE c.lon BETWEEN {extent[1]} AND {extent[2]}
-        AND c.lat BETWEEN {extent[3]} AND {extent[4]}
+      AND cm.cell_id IN (
+        SELECT cell_id FROM cell 
+        WHERE lon BETWEEN {extent[1]} AND {extent[2]}
+          AND lat BETWEEN {extent[3]} AND {extent[4]}
+      )
     ")
   }
   
   # get data
   df <- DBI::dbGetQuery(con, query)
   
-  # create raster
-  r <- create_raster_from_points(
+  # create raster using the new function
+  r <- create_raster_from_df(
     df, 
-    value_col = "value",
-    res = res,
-    crs = "EPSG:4326",
-    extent = extent
+    cell_col = "cell_id",
+    value_cols = "value"
   )
   
   # set name
@@ -380,10 +481,13 @@ export_metric_raster <- function(con, metric_type, extent = NULL,
 create_spatial_indexes <- function(con, verbose = TRUE) {
   
   indexes <- list(
-    "idx_sdm_cells_geom" = "CREATE SPATIAL INDEX idx_sdm_cells_geom ON sdm_cells(geom)",
+    "idx_cell_geom" = "CREATE SPATIAL INDEX idx_cell_geom ON cell(geom)",
     "idx_planning_areas_geom" = "CREATE SPATIAL INDEX idx_planning_areas_geom ON planning_areas(geom)",
-    "idx_sdm_values_cell_sp" = "CREATE INDEX idx_sdm_values_cell_sp ON sdm_values(cell_id, sp_id)",
-    "idx_biodiv_metrics_cell_type" = "CREATE INDEX idx_biodiv_metrics_cell_type ON biodiv_metrics(cell_id, metric_type)"
+    "idx_model_cell_cell_mdl" = "CREATE INDEX idx_model_cell_cell_mdl ON model_cell(cell_id, mdl_seq)",
+    "idx_cell_metric_cell_metric" = "CREATE INDEX idx_cell_metric_cell_metric ON cell_metric(cell_id, metric_seq)",
+    "idx_region_metric_rgn_metric" = "CREATE INDEX idx_region_metric_rgn_metric ON region_metric(rgn_seq, metric_seq)",
+    "idx_species_taxa" = "CREATE INDEX idx_species_taxa ON species(ds_key, taxa)",
+    "idx_model_taxa" = "CREATE INDEX idx_model_taxa ON model(ds_key, taxa)"
   )
   
   for (idx_name in names(indexes)) {
@@ -410,10 +514,10 @@ validate_sdm_data <- function(con, verbose = TRUE) {
   results <- list()
   
   # check for orphaned records
-  results$orphaned_values <- DBI::dbGetQuery(con, "
+  results$orphaned_model_cells <- DBI::dbGetQuery(con, "
     SELECT COUNT(*) as n_orphaned
-    FROM sdm_values v
-    LEFT JOIN sdm_cells c ON v.cell_id = c.cell_id
+    FROM model_cell mc
+    LEFT JOIN cell c ON mc.cell_id = c.cell_id
     WHERE c.cell_id IS NULL
   ")$n_orphaned
   
@@ -422,16 +526,16 @@ validate_sdm_data <- function(con, verbose = TRUE) {
     SELECT 
       MIN(value) as min_value,
       MAX(value) as max_value
-    FROM sdm_values
+    FROM model_cell
   ")
   
   # check for duplicate entries
   results$duplicates <- DBI::dbGetQuery(con, "
     SELECT COUNT(*) as n_duplicates
     FROM (
-      SELECT cell_id, sp_id, COUNT(*) as n
-      FROM sdm_values
-      GROUP BY cell_id, sp_id
+      SELECT cell_id, mdl_seq, COUNT(*) as n
+      FROM model_cell
+      GROUP BY cell_id, mdl_seq
       HAVING COUNT(*) > 1
     ) t
   ")$n_duplicates
@@ -439,17 +543,20 @@ validate_sdm_data <- function(con, verbose = TRUE) {
   # count records
   results$record_counts <- DBI::dbGetQuery(con, "
     SELECT 
-      (SELECT COUNT(*) FROM sdm_sources) as n_sources,
-      (SELECT COUNT(*) FROM sdm_models) as n_models,
-      (SELECT COUNT(*) FROM sdm_species) as n_species,
-      (SELECT COUNT(*) FROM sdm_cells) as n_cells,
-      (SELECT COUNT(*) FROM sdm_values) as n_values,
-      (SELECT COUNT(*) FROM biodiv_metrics) as n_metrics
+      (SELECT COUNT(*) FROM dataset) as n_datasets,
+      (SELECT COUNT(*) FROM model) as n_models,
+      (SELECT COUNT(*) FROM species) as n_species,
+      (SELECT COUNT(*) FROM cell) as n_cells,
+      (SELECT COUNT(*) FROM model_cell) as n_model_cells,
+      (SELECT COUNT(*) FROM metric) as n_metrics,
+      (SELECT COUNT(*) FROM cell_metric) as n_cell_metrics,
+      (SELECT COUNT(*) FROM region) as n_regions,
+      (SELECT COUNT(*) FROM region_metric) as n_region_metrics
   ")
   
   if (verbose) {
     message("=== SDM Data Validation Results ===")
-    message(glue::glue("Orphaned values: {results$orphaned_values}"))
+    message(glue::glue("Orphaned model_cell records: {results$orphaned_model_cells}"))
     message(glue::glue("Value range: [{results$value_range$min_value}, {results$value_range$max_value}]"))
     message(glue::glue("Duplicate entries: {results$duplicates}"))
     message("\nRecord counts:")
