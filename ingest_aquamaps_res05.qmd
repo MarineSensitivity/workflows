@@ -36,9 +36,33 @@ con_dd   <- dbConnect(    # con_dd to AquaMaps duckdb
 ## New Planning Areas
 
 ```{r}
-pa_geo <- glue("{dir_data}/derived/pa_oa_2025.geojson") # created in: ingest_productivity.qmd
+#| label: planareas_2025
 
-ply_pa <- st_read(pa_geo)
+pa_geo <- glue("{dir_data}/derived/pa_oa_2025.geojson") # created in: ingest_productivity.qmd
+# tbl_pa <- Id(schema = "public", table = "ply_planareas_2025")
+tbl_pa <- "ply_planareas_2025"
+
+# ply_pa_0 <- st_read(pa_geo)
+# st_bbox(ply_pa_0) |> 
+#   st_as_sfc() |>
+#   st_as_sf() |>
+#   st_centroid() |> 
+#   st_wrap_dateline()
+# -141.3457 13.43637
+ply_pa <- st_read(pa_geo) |> 
+  st_wrap_dateline()    # [   0, 360] -> [-180, 180]
+  # st_shift_longitude()  # [-180, 180] -> [    0,360]
+st_geometry(ply_pa) = "geom" # rename  
+
+mapView(ply_pa)
+
+if (!tbl_pa %in% dbListTables(con)){
+  st_write(ply_pa, con, tbl_pa, delete_layer = T)
+  
+  # enforce SRID so shows up in tile.marinesensivity.org
+  dbExecute(con, glue(
+    "SELECT UpdateGeometrySRID('public','ply_planareas_2025','geom',4326);"))
+}
 
 mapView(ply_pa)
 
@@ -124,7 +148,7 @@ if (!all(sapply(c("r_hcaf", "r_bo", "r_land"), exists))){
   r_land <- is.na(r_bo[["depth_mean"]])
 }
 
-dir_am_spp <- glue("{dir_data}/raw/aquamaps.org/spp_cells_cog")
+dir_am_spp <- glue("{dir_data}/raw/aquamaps.org/spp_cells")
 dir_ds_spp <- glue("{dir_data}/derived/aquamaps.org/spp_cells0.05_cog") # downsized
 
 # prep server:
@@ -138,14 +162,15 @@ dir_ds_spp <- glue("{dir_data}/derived/aquamaps.org/spp_cells0.05_cog") # downsi
 d_spp_pa_tif <- d_spp_pa |> 
   arrange(desc(n_cells_pa)) |> 
   mutate(
-    sp_am_tif         = glue("{dir_am_spp}/{sp_key}.tif"),
+    sp_am_tif        = glue("{dir_am_spp}/{sp_key}.tif"),
     sp_ds_tif         = glue("{dir_ds_spp}/{sp_key}.tif"),
-    sp_am_tif_exists  = file.exists(sp_am_tif),
+    sp_am_tif_exists = file.exists(sp_am_tif),
     sp_ds_tif_exists  = file.exists(sp_ds_tif) )
   
-d_spp_pa_tif |>
-  select(sp_am_tif_exists, sp_ds_tif_exists) |>
-  table(useNA = "ifany")
+# d_spp_pa_tif |>
+#   select(sp_am_tif_exists, sp_ds_tif_exists) |>
+#   table(useNA = "ifany")
+#
 #                 sp_ds_tif_exists
 # sp_am_tif_exists FALSE TRUE
 #            FALSE  7518    1
@@ -166,7 +191,9 @@ for (i in 1:n){  # i = 1
     "Processing {format(i, big.mark=',')} / {format(n, big.mark=',')}: {sp_key}")
   
   r_sp_am <- get_species_raster(sp_key, con_dd, r_hcaf, dir_cache = dir_am_spp)
-  # TODO: fix to write COG
+  
+  if (file_exists(sp_ds_tif))
+    next
   
   r_sp_ds <- resample(
     ifel(
@@ -189,6 +216,22 @@ for (i in 1:n){  # i = 1
 }
 # INFO [2025-05-26 11:31:47] Processing 1 / 17,370: Fis-29291
 # INFO [2025-05-26 11:36:19] Processing 7 / 17,370: Fis-33821
+#
+# INFO [2025-05-26 22:24:29] Processing 1  / 17,259: W-Scy-135294
+# INFO [2025-05-26 22:26:11] Processing 4  / 17,259: ITS-Mam-612597
+# INFO [2025-05-26 22:38:25] Processing 23 / 17,259: Fis-32354
+# INFO [2025-05-26 23:07:38] Processing 75 / 17,259: Fis-55519
+#
+# INFO [2025-05-27 00:20:26] Processing 1 / 17,095: Fis-26569
+# INFO [2025-05-27 00:20:26] Processing 2 / 17,095: Fis-28955
+# INFO [2025-05-27 00:20:57] Processing 3 / 17,095: Fis-50030
+#
+# INFO [2025-05-27 00:47:44] Processing  1 / 17,095: Fis-26569
+# INFO [2025-05-27 00:47:44] Processing  6 / 17,095: Fis-134025
+# INFO [2025-05-27 00:47:55] Processing  7 / 17,095: Fis-149908
+# INFO [2025-05-27 00:48:29] Processing  8 / 17,095: Fis-26536
+# INFO [2025-05-27 01:16:42] Processing 78 / 17,095: Fis-29879
+# INFO [2025-05-27 01:31:29] Processing 118 / 17,095: W-Pol-130324
 
 # sp_key = "W-Ant-103323"
 # sp_ds_tif <- glue("{dir_ds_spp}/{sp_key}.tif")
@@ -196,7 +239,7 @@ for (i in 1:n){  # i = 1
 ```
 
 ```{r}
-#| label: tif_to_int-cog
+#| label: tif_to_cog
 #| eval: false
 
 librarian::shelf(
@@ -221,21 +264,18 @@ tifs <- tibble(
 for (i in seq_along(tifs)){ # i = 1
   tif <- tifs[i]
   log_info("{format(i, big.mark=',')} / {format(length(tifs), big.mark=',')}: {basename(tif)}")
-  
-  cog <- path(dir_cog, basename(tif))
-  r <- rast(tif)
-
-  # convert to integer percentage for smaller file size
-  r <- as.int(round(r * 100)) %>%
-    ifel(. == 0, NA, .) |> 
-    trim()
-  
-  writeRaster(
-    r, cog, datatype = "INT1U", filetype = "COG")
+  rast(tif) |> 
+    writeRaster(
+    path(dir_cog, basename(tif)), 
+    datatype = "INT1U", 
+    filetype = "COG")
 }
 ```
 
 ```{r}
+#| label: addCOG
+#| eval: false
+
 library("terra")
 gdal() # "3.7.2"
 
@@ -272,42 +312,442 @@ leaflet() |>
     imagequery = T)
 ```
 
+On server:
+
+```sh
+cd /share/public/cog
+ln -s /share/data/raw/aquamaps.org/spp_cells_cog \
+      /share/public/cog/sdm/raw/aquamaps
+ln -s /share/data//derived/aquamaps.org/spp_cells0.05_cog \
+      /share/public/cog/sdm/derived/aquamaps_0.05dd
+```
 
 ```{r}
-url <- 'https://chelsa-chile.s3.amazonaws.com/monthly/pet/CHELSA_pet_v2.1_19790201.tif'
+#| label: addCOG2
+#| eval: false
 
-min_scale = 0; max_scale = 1
-js_scale = paste0("function (values) {
-                    var scale = chroma.scale(['white', '#22c7e8']).domain([", min_scale, ",", max_scale, "]);
-                    var val = values[0];
-                    if (val === 0) return;
-                    if (val < 0) return;
-                    return scale(val).hex();
-                    }")
+librarian::shelf(
+  leafem, leaflet)
+
+url <- 'https://chelsa-chile.s3.amazonaws.com/monthly/pet/CHELSA_pet_v2.1_19790201.tif'
+url <- "https://file.marinesensitivity.org/cog/sdm/derived/aquamaps_bio-oracle/ITS-Mam-180530.tif"
+
+sp_key <- "Fis-114088"
+src    <- "derived/aquamaps_0.05dd"
+# src    <- "raw/aquamaps"
+url <- glue("https://file.marinesensitivity.org/cog/sdm/{src}/{sp_key}.tif")
+# url <- "https://file.marinesensitivity.org/cog/sdm/raw/aquamaps/Fis-114088.tif"
+# url <- "https://file.marinesensitivity.org/cog/sdm/raw/aquamaps/Fis-136946.tif"
+r <- rast(url)
+plet(r)
+# terra::summary(r)
+
+# min_scale = "0.0"; max_scale = "1.0"
+min_scale = 0; max_scale = 100
+js_scale = paste0(
+  "function (values) {
+    var scale = chroma.scale(['white', 'red', 'yellow', '#22c7e8'])
+      .domain([", min_scale, ",", max_scale, "]);
+    var val = values[0];
+    if (val === 0) return;
+    if (val === 255) return;
+    if (val < 0) return;
+    return scale(val).hex();
+    }")
+cat(js_scale)
 
 leaflet(options = leafletOptions(attributionControl = FALSE)) %>% 
-  setView(lng =-70.09635, lat =  -33.01703, zoom = 4) %>% 
+  # setView(lng =-70.09635, lat =  -33.01703, zoom = 4) %>% 
   addProviderTiles("Esri.WorldImagery", group = "esri") %>%
   addMapPane("cog", zIndex = 500) %>%
   leafem:::addCOG(
+    url = url, 
+    group = "PET", 
+    # opacity = 0.7, 
+    opacity = 1, 
+    options = list(pane = "cog"),
+    # resolution = 96, 
+    autozoom = FALSE, 
+    # colorOptions = colorOptions(
+    #   palette = terrain.colors(256) ),
+    colorOptions = colorOptions(
+      palette = grDevices::hcl.colors(3, "Inferno"), 
+      breaks   = seq(0, 1, 0.2) , 
+      domain   = c(0, 100), 
+      na.color = "#ff00ff88"),
+    pixelValuesToColorFn = JS(js_scale) ) %>%
+  addMouseCoordinates() %>%
+  addLayersControl(
+    baseGroups = c("esri"), 
+    overlayGroups =  c("PET") ) |> 
+  addScaleBar(
+    position = "bottomleft",
+    options = scaleBarOptions(
+      # maxWidth = 100,
+      metric   = T,
+      imperial = T))
+```
+
+
+```{r}
+#| label: mapgl_vect
+
+library(mapgl)
+
+maplibre(
+  style = maptiler_style("basic"),
+  center = c(-74.0066, 40.7135),
+  zoom = 15.5,
+  pitch = 45,
+  bearing = -17.6) |>
+  add_vector_source(
+    id = "openmaptiles",
+    url = paste0(
+      "https://api.maptiler.com/tiles/v3/tiles.json?key=",
+      Sys.getenv("MAPTILER_API_KEY")) ) |>
+  add_fill_extrusion_layer(
+    id = "3d-buildings",
+    source = 'openmaptiles',
+    source_layer = 'building',
+    fill_extrusion_color = interpolate(
+      column = 'render_height',
+      values = c(0, 200, 400),
+      stops = c('lightgray', 'royalblue', 'lightblue') ),
+    fill_extrusion_height = list(
+      'interpolate',
+      list('linear'),
+      list('zoom'),
+      15,
+      0,
+      16,
+      list('get', 'render_height') ) )
+```
+
+
+```{r}
+#| label: mapgl_cog_mvt
+
+librarian::shelf(
+  glue, httr2, mapgl, purrr, stringr)
+
+sp_key <- "Fis-114088"
+src    <- "derived/aquamaps_0.05dd"
+# src    <- "raw/aquamaps"
+cog_url <- glue("https://file.marinesensitivity.org/cog/sdm/{src}/{sp_key}.tif")
+
+titiler_endpoint = "https://titiler.marinesensitivity.org"
+# cog_method     = "bilinear"
+cog_method     = "nearest"
+cog_palette    = "spectral_r"
+lgnd_palette   = "Spectral"
+lgnd_palette_r = T
+bidx           = 1
+
+cog_bb <- request(titiler_endpoint) |> 
+  req_url_path_append("cog", "bounds") |> 
+  req_url_query(
+    url = cog_url,
+    bidx = bidx) |> 
+  req_perform() |> 
+  resp_body_json() |> 
+  unlist() |> 
+  as.numeric()
+cog_bb
+
+# * get range of values via titiler ----
+cog_rng <- request(titiler_endpoint) |> 
+  req_url_path_append("cog", "statistics") |> 
+  req_url_query(
+    url  = cog_url,
+    bidx = bidx) |> 
+  req_perform() |> 
+  resp_body_json() |>
+  pluck(glue("b{bidx}")) |> 
+  keep_at(~ .x %in% c("min", "max")) |> 
+  as.numeric()
+cog_rng # 0 254
+cog_rng = c(1, 100)
+
+# set cog_rng manually
+# cog_rng <- range(values(r, na.rm=T))
+
+tile_opts <- glue(
+  "bidx={bidx}&expression=b{bidx}&
+  unscale=false&
+  resampling={cog_method}&reproject={cog_method}&return_mask=true&
+  rescale={paste(cog_rng, collapse=',')}&
+  colormap_name={cog_palette}") |> str_replace_all("\\s+", "")
+sdm_tile_url  <- glue(
+  "{titiler_endpoint}/cog/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}@2x.png?url={cog_url}&{tile_opts}")
+
+# https://tile.marinesensitivity.org/public.ply_planareas.json
+# pa_url <- "https://tile.marinesensitivity.org/public.ply_planareas/{z}/{x}/{y}.pbf"
+# pa_url <- "https://tile.marinesensitivity.org/public.ply_planareas.json"
+pa_url <- "https://tile.marinesensitivity.org/public.sdm_geometries.json"
+
+# Sys.setenv(MAPTILER_API_KEY = "5raPGHaCnQ8fXTv0whrb")
+# usethis::edit_r_environ(scope = c("user"))
+
+# maplibre(
+#   style = maptiler_style("ocean"),
+#   center = c(-43.23412, -22.91370),
+#   zoom = 14) |> 
+#   add_fullscreen_control(position = "top-left") |> 
+#   add_navigation_control()
+
+mapboxgl(
+  style = mapbox_style("dark"),
+# maplibre(
+#   style = maptiler_style("toner"), # ocean
+  zoom = 5,
+  # center = c(-119.6982, 34.4208)) |>
+  center = c(-89.11, 24.45)) |>
+  add_raster_source(
+    "rast-src",
+    tiles = sdm_tile_url) |>
+  add_raster_layer(
+    id     = 'rast-lyr',
+    source = 'rast-src') |>
+  add_vector_source(
+    id  = "vect_src", 
+    url = 'https://file.marinesensitivity.org/_public.ply_planareas_2025.json') |> 
+  add_fill_layer(
+    id           = "vect_lyr",
+    source       = "vect_src",
+    source_layer = "public.ply_planareas_2025",
+    # fill_outline_color = "gray")
+    # fill_color = '#0080ff',
+    # fill_color   = 'transparent',
+    fill_color   = mapgl::interpolate(
+      column   = "area_km2",
+      values   = c(21575.9, 1066334.4),
+      stops    = c("lightblue", "darkblue"),
+      na_color = "lightgrey"),
+    popup        = "area_km2",
+    tooltip      = "planarea_name", 
+    # fill_outline_color = 'white',
+    fill_opacity = 0.9) |> 
+  mapgl::add_legend(
+    "Suitability",
+    values = c(1, 100),
+    colors = rev(RColorBrewer::brewer.pal(11, "Spectral")))
+```
+
+
+```{r}
+#| label: mapgl_rast
+
+librarian::shelf(
+  fs, glue, httr2, mapgl, purrr, stringr, terra)
+
+dir_ds_spp <- glue("{dir_data}/derived/aquamaps.org/spp_cells0.05_cog")
+
+ply_pa
+
+d_tifs <- tibble(
+  tif = dir_ls(dir_ds_spp, glob = "*.tif")[1:10] ) |> 
+  mutate(
+    r = map(
+      tif, ~ rast(.x) |> 
+        extend(ext(-180, 180, -90, 90))) )
+r_all <- rast(d_tifs$r)
+names(r_all) <- names(r_all) |> basename() |> path_ext_remove()
+
+r_sum <- sum(r_all, na.rm = T)    # plot(r_sum)
+r_sum_pa <- r_sum |> 
+  mask(ply_pa, touches = F) |> 
+  trim() # plot(r_sum_pa)
+rng_sum_pa <- minmax(r_sum_pa) |> as.numeric()
+
+cols_r <- rev(RColorBrewer::brewer.pal(11, "Spectral"))
+
+mapboxgl(
+  style = mapbox_style("dark"),
+  zoom = 2,
+  center = c(-141.3, 13.4)) |>  # ply_pa centroid
+  add_image_source(
+    id     = "rast_sum_pa",
+    data   = r_sum_pa,
+    colors = cols_r) |> 
+   add_raster_layer(
+    id                = "lyr_sum_pa",
+    source            = "rast_sum_pa",
+    raster_resampling = "nearest") |> 
+  mapgl::add_legend(
+    "Colorscale",
+    values = rng_sum_pa,
+    colors = cols_r,
+    position = "bottom-right") |> 
+  add_fullscreen_control(position = "top-left") |>
+  add_navigation_control()
+
+
+# TODO:
+# - [ ] Shiny input$MAPID_click https://walker-data.com/mapgl/articles/shiny.html
+#   - [ ] /cog/point/{lon},{lat} https://titiler.marinesensitivity.org/api.html#/Cloud%20Optimized%20GeoTIFF/point_cog_point__lon___lat__get
+# - [ ] [Building story maps with mapgl • mapgl](https://walker-data.com/mapgl/articles/story-maps.html)
+# - [ ] [Getting started with mapgl • mapgl](https://walker-data.com/mapgl/articles/getting-started.html)
+
+```
+
+```{r}
+librarian::shelf(
+  leafem, leaflet)
+
+cog_url = "https://raster-tiles-data.s3.eu-central-1.amazonaws.com/natearth_3857_cog.tif"
+# cog_url = "https://storage.googleapis.com/pdd-stac/disasters/hurricane-harvey/0831/20170831_172754_101c_3b_Visual.tif"
+url_depoints = "https://vector-tiles-data.s3.eu-central-1.amazonaws.com/depoints.pmtiles"
+url = "https://sentinel-cogs.s3.us-west-2.amazonaws.com/sentinel-s2-l2a-cogs/46/X/DG/2022/8/S2B_46XDG_20220829_0_L2A/L2A_PVI.tif"
+
+m = leaflet() %>%
+  # setView(lng =-70.09841, lat = -33.037, zoom = 13) %>%
+  addTiles(group = "osm") %>%
+  # addMapPane("cog", zIndex = 500) %>%
+  leafem:::addCOG(
     url = url
-    , group = "PET"
+    , group = "RGB"
+    , layerId = "test"
+    , opacity = 1
+    # , options = list(pane = "cog")
+    , resolution = 256
+    , autozoom = TRUE
+    , colorOptions = colorOptions(
+      palette = grDevices::hcl.colors(3, "Inferno")
+      , breaks = seq(0, 1, 0.2)
+      , domain = c(0, 100)
+      , na.color = "#ff00ff88"
+    )
+    # , pixelValuesToColorFn = JS(js_scale)
+  ) %>%
+  # leafem:::addPMPoints(
+  #   url = url_depoints
+  #   , layerId = "depoints"
+  #   , group = "depoints"
+  #   , style = paintRules(
+  #     layer = "depoints"
+  #     , fillColor = "pink"
+  #     , stroke = "green"
+  #   )
+  # ) %>%
+  # addMouseCoordinates() %>%
+  addLayersControl(
+    baseGroups = c("esri")
+    , overlayGroups =  c("RGB")
+  )
+
+mapview::mapshot(
+  m
+  , url = "/home/tim/Downloads/cogmap/index.html"
+)
+
+servr::httd("/home/tim/Downloads/cogmap/")
+
+
+# library(leafem)
+# library(leaflet)
+#
+# # url of images ####
+ndsi <- 'https://storage.googleapis.com/public-cog/NDSI_S2SR_T19HCD_2019-01-01.tif'
+sr <- 'https://storage.googleapis.com/public-cog/SR_S2SR_T19HCD_2019-01-01.tif'
+# Test NDSI ####
+
+min_scale = 0; max_scale = 1
+js_scale = paste0(
+  "function (values) {
+    var scale = chroma.scale(['white', '#22c7e8']).domain([", min_scale, ",", max_scale, "]);
+    var val = values[0];
+    if (val === 0) return;
+    if (val < 0) return;
+    return scale(val).hex();
+    }")
+
+leaflet(options = leafletOptions(attributionControl = FALSE)) %>%
+  setView(lng =-70.09635, lat =  -33.01703, zoom = 13) %>%
+  # addProviderTiles("Esri.WorldImagery", group = "esri") %>%
+  addMapPane("cog", zIndex = 500) %>%
+  leafem:::addCOG(
+    url = ndsi
+    , group = "NDSI"
     , opacity = 0.7
     , options = list(pane = "cog")
     # , resolution = 96
     , autozoom = FALSE
     , colorOptions = colorOptions(
-      palette = terrain.colors(256)
+      palette = grDevices::hcl.colors(3, "Inferno")
+      , breaks = seq(0, 1, 0.2)
+      , domain = c(0, 100)
+      , na.color = "#ff00ff88"
     )
     , pixelValuesToColorFn = JS(js_scale)
   ) %>%
   addMouseCoordinates() %>%
   addLayersControl(
     baseGroups = c("esri")
-    , overlayGroups =  c("PET")
+    , overlayGroups =  c("NDSI")
+  )
+
+# Try with surface reflectance ####
+
+m = leaflet(options = leafletOptions(attributionControl = FALSE)) %>%
+  setView(lng =-70.09635, lat =  -33.01703, zoom = 13) %>%
+  addTiles(group = "osm") %>%
+  addMapPane("cog", zIndex = 500) %>%
+  leafem:::addCOG(
+    url = sr,
+    group = "RGB", #opacity = 0.7,
+    options = list(pane = "cog"),
+    resolution = 2,
+    autozoom = FALSE,
+    rgb = TRUE
+  ) %>%
+  addLayersControl(
+    baseGroups = c("esri")
+    , overlayGroups =  c("RGB")
+  )
+
+mapview::mapshot(
+  m
+  , url = "/home/tim/Downloads/cogmap/index.html"
+)
+
+servr::httd("/home/tim/Downloads/cogmap/")
+
+
+# Together RGB and NDSI
+
+leaflet(options = leafletOptions(attributionControl = FALSE)) %>%
+  setView(lng =-70.09635, lat =  -33.01703, zoom = 13) %>%
+  addProviderTiles("Esri.WorldImagery", group = "esri") %>%
+  addMapPane("cog", zIndex = 500) %>%
+  leafem:::addCOG(
+    url = ndsi
+    , group = "NDSI"
+    , opacity = 0.7
+    , options = list(pane = "cog")
+    # , resolution = 96
+    , autozoom = FALSE
+    , colorOptions = colorOptions(
+      palette = grDevices::hcl.colors(3, "Inferno")
+      , breaks = seq(0, 1, 0.2)
+      , domain = c(0, 100)
+      , na.color = "#ff00ff88"
+    )
+    , pixelValuesToColorFn = JS(js_scale)
+  ) %>%
+  leafem:::addCOG(
+    url = sr,
+    group = "RGB", opacity = 0.7,
+    options = list(pane = "cog"),
+    #resolution = 2,
+    autozoom = FALSE,
+    rgb = TRUE
+  ) %>%
+  addMouseCoordinates() %>%
+  addLayersControl(
+    baseGroups = c("esri")
+    , overlayGroups =  c("NDSI",'RGB')
   )
 ```
-
 
 
 
