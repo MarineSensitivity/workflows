@@ -1,7 +1,55 @@
-## 2025-05-2a.a r_env
+## 2025-05-27.a + ingest_aquamaps_to_sdm_duckdb with libs/sdm_functions.R
 
-The Update the AquaMaps species environment variables in `r_env` to use the
+Write a new Quarto notebook `ingest_aquamaps_to_sdm_duckdb.qmd` to ingest the downscaled 
+AquaMaps (using the 0.05 decimal degree cells from Bio-Oracle being generated now by
+"iterate_species_in_planareas" R chunk in @ingest_aquamaps_res05.qmd) into a new 
+DuckDB database `msens_sdm` one model output at a time, for then efficiently querying 
+and generating biodiversity metrics per cell (i.e. pixel) 
+in the database and outputting to a raster for display in a map (using mapgl; 
+see mapgl_rast R chunk in @ingest_aquamaps_res05.qmd). We also want to summarize 
+by planning area polygons (`ply_pa` in R chunk "planareas_2025" of 
+@ingest_aquamaps_res05.qmd). Include a database diagram in mermaid 2format like 
+the "erDiagram" in @create_sdm-tables.qmd, except allow multiple species for a 
+single model output, and add functions so any species distribution model (raster or vector) will 
+get transformed into the same 0.05 degree resolution as the transformed AquaMaps 
+data (see also @libs/am_functions.R, @ingest_sdm-gm.qmd, @ingest_sdm-nc.qmd).
+Allow inclusion of other biodiversity metrics such as primary productivity, per
+@ingest_productivity.qmd. Write duckdb to parquet files, store in most efficient order and add indexes as 
+needed. Write helper functions in a new `libs/sdm_functions.R` file with
+Roxygen2 documentation (for adding into an R package later).
 
+### Response
+
+⏺ I've created two files:
+
+  1. ingest_aquamaps_to_sdm_duckdb.qmd - A comprehensive Quarto notebook that:
+    - Sets up a DuckDB database with an extended schema supporting multiple species per model
+    - Creates spatial tables with proper geometry support
+    - Includes functions to ingest downscaled AquaMaps data at 0.05° resolution
+    - Calculates biodiversity metrics (species richness, Shannon index, etc.)
+    - Generates rasters for map display using the existing mapgl setup
+    - Summarizes metrics by planning areas
+    - Exports data to Parquet files for efficient storage
+  2. libs/sdm_functions.R - Helper functions with Roxygen2 documentation including:
+    - batch_insert_values() - Efficient batch insertion into DuckDB
+    - create_raster_from_points() - Convert point data to rasters
+    - transform_sdm_to_resolution() - Standardize SDM rasters to 0.05° resolution
+    - calculate_biodiversity_metrics() - Calculate various biodiversity indices
+    - summarize_by_planning_areas() - Aggregate metrics by planning polygons
+    - export_metric_raster() - Export metrics as COG rasters
+    - create_spatial_indexes() - Set up database indexes
+    - validate_sdm_data() - Check data integrity
+
+  Key features:
+  - The database schema includes a Mermaid ERD showing relationships
+  - Supports multiple SDM sources (AquaMaps, NOAA GoMex, NCCOS, etc.)
+  - Efficient spatial queries using DuckDB's spatial extension
+  - Integration with existing Bio-Oracle environmental layers
+  - Compatible with the mapgl visualization from ingest_aquamaps_res05.qmd
+  - Parquet export for archival and sharing
+
+  The code follows the style guidelines with proper indentation, snake_case naming, and lowercase comments. The functions are documented
+  with Roxygen2 for future R package integration.
 
 ## 2025-05-20.b + Bio-Oracle replication
 

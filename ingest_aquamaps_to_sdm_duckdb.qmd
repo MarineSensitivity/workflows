@@ -1,0 +1,621 @@
+---
+title: "Ingest AquaMaps to SDM DuckDB"
+subtitle: "Transform downscaled AquaMaps data into DuckDB for efficient biodiversity analysis"
+format:
+  html:
+    code-fold: true
+    code-tools: true
+editor_options: 
+  chunk_output_type: console
+---
+
+## Overview
+
+This notebook ingests downscaled AquaMaps species distribution models (0.05° resolution) into a DuckDB database (`msens_sdm`) for efficient querying and biodiversity metric calculation. The database schema supports multiple SDM sources and includes spatial functions for raster generation and polygon summarization.
+
+```{r setup}
+#| message: false
+#| warning: false
+
+librarian::shelf(
+  DBI, dbplyr, dplyr, duckdb, fs, glue, here, leaflet, mapgl, purrr, 
+  sf, terra, tibble, tidyr, quiet = T
+)
+
+source(here("libs/db.R"))
+source(here("libs/am_functions.R"))
+source(here("libs/sdm_functions.R"))
+
+# database setup
+db_path <- here("data/msens_sdm.duckdb")
+con_sdm <- dbConnect(duckdb(), dbdir = db_path, read_only = FALSE)
+
+# register spatial extension
+dbExecute(con_sdm, "INSTALL spatial; LOAD spatial;")
+```
+
+## Database Schema
+
+The database schema extends the original SDM tables design to support multiple species per model and includes biodiversity metrics.
+
+```{mermaid}
+erDiagram
+%% https://mermaid.js.org/syntax/entityRelationshipDiagram.html
+
+%% tables
+sdm_sources {
+  str src_key        PK  "source key"
+  str name
+  str description
+  str citation
+  str url
+  str spatial_res_deg    "spatial resolution in decimal degrees"
+  str temporal_res       "temporal resolution"
+  date date_created
+}
+
+sdm_models {
+  int mdl_id         PK  "model ID"
+  str src_key        FK  "source key"
+  str taxa_group         "taxonomic group"
+  str time_period        "time period"
+  str region             "geographic region"
+  str description
+}
+
+sdm_species {
+  int sp_id          PK  "species ID"
+  int mdl_id         FK  "model ID"
+  str sp_key             "species key"
+  int aphia_id           "WoRMS Aphia ID"
+  str scientific_name
+  str common_name
+}
+
+sdm_cells {
+  int cell_id        PK  "cell ID"
+  dbl lon                "longitude"
+  dbl lat                "latitude"
+  dbl res_deg            "resolution in decimal degrees"
+  geo geom               "cell geometry"
+}
+
+sdm_values {
+  int cell_id        FK  "cell ID"
+  int sp_id          FK  "species ID"
+  dbl value              "SDM value (0-1)"
+  str value_type         "type: probability, suitability, etc."
+}
+
+biodiv_metrics {
+  int cell_id        FK  "cell ID"
+  str metric_type        "species_richness, shannon_index, etc."
+  dbl value
+  date date_calculated
+}
+
+env_layers {
+  int cell_id        FK  "cell ID"
+  str var_name           "variable name"
+  dbl value
+  str units
+  date date_measured
+}
+
+planning_areas {
+  str pa_key         PK  "planning area key"
+  str pa_name
+  geo geom               "planning area geometry"
+}
+
+planning_area_metrics {
+  str pa_key         FK  "planning area key"
+  str metric_type
+  dbl value
+  date date_calculated
+}
+
+%% relationships
+sdm_sources ||--o{ sdm_models : src_key
+sdm_models ||--o{ sdm_species : mdl_id
+sdm_species ||--o{ sdm_values : sp_id
+sdm_cells ||--o{ sdm_values : cell_id
+sdm_cells ||--o{ biodiv_metrics : cell_id
+sdm_cells ||--o{ env_layers : cell_id
+planning_areas ||--o{ planning_area_metrics : pa_key
+```
+
+## Create Database Tables
+
+```{r create_tables}
+#| message: false
+
+# drop existing tables if needed
+if (dbExistsTable(con_sdm, "sdm_values")) {
+  tables_to_drop <- c(
+    "planning_area_metrics", "env_layers", "biodiv_metrics", 
+    "sdm_values", "sdm_species", "sdm_models", "sdm_sources", 
+    "sdm_cells", "planning_areas"
+  )
+  
+  for (tbl in tables_to_drop) {
+    if (dbExistsTable(con_sdm, tbl))
+      dbExecute(con_sdm, glue("DROP TABLE {tbl} CASCADE"))
+  }
+}
+
+# create tables
+dbExecute(con_sdm, "
+CREATE TABLE sdm_sources (
+  src_key VARCHAR PRIMARY KEY,
+  name VARCHAR NOT NULL,
+  description TEXT,
+  citation TEXT,
+  url VARCHAR,
+  spatial_res_deg DOUBLE,
+  temporal_res VARCHAR,
+  date_created DATE DEFAULT CURRENT_DATE
+)")
+
+dbExecute(con_sdm, "
+CREATE TABLE sdm_models (
+  mdl_id INTEGER PRIMARY KEY,
+  src_key VARCHAR REFERENCES sdm_sources(src_key),
+  taxa_group VARCHAR,
+  time_period VARCHAR,
+  region VARCHAR,
+  description TEXT
+)")
+
+dbExecute(con_sdm, "
+CREATE TABLE sdm_species (
+  sp_id INTEGER PRIMARY KEY,
+  mdl_id INTEGER REFERENCES sdm_models(mdl_id),
+  sp_key VARCHAR NOT NULL,
+  aphia_id INTEGER,
+  scientific_name VARCHAR,
+  common_name VARCHAR
+)")
+
+dbExecute(con_sdm, "
+CREATE TABLE sdm_cells (
+  cell_id INTEGER PRIMARY KEY,
+  lon DOUBLE NOT NULL,
+  lat DOUBLE NOT NULL,
+  res_deg DOUBLE NOT NULL,
+  geom GEOMETRY
+)")
+
+dbExecute(con_sdm, "
+CREATE TABLE sdm_values (
+  cell_id INTEGER REFERENCES sdm_cells(cell_id),
+  sp_id INTEGER REFERENCES sdm_species(sp_id),
+  value DOUBLE,
+  value_type VARCHAR DEFAULT 'probability',
+  PRIMARY KEY (cell_id, sp_id)
+)")
+
+dbExecute(con_sdm, "
+CREATE TABLE biodiv_metrics (
+  cell_id INTEGER REFERENCES sdm_cells(cell_id),
+  metric_type VARCHAR,
+  value DOUBLE,
+  date_calculated DATE DEFAULT CURRENT_DATE,
+  PRIMARY KEY (cell_id, metric_type)
+)")
+
+dbExecute(con_sdm, "
+CREATE TABLE env_layers (
+  cell_id INTEGER REFERENCES sdm_cells(cell_id),
+  var_name VARCHAR,
+  value DOUBLE,
+  units VARCHAR,
+  date_measured DATE,
+  PRIMARY KEY (cell_id, var_name)
+)")
+
+dbExecute(con_sdm, "
+CREATE TABLE planning_areas (
+  pa_key VARCHAR PRIMARY KEY,
+  pa_name VARCHAR,
+  geom GEOMETRY
+)")
+
+dbExecute(con_sdm, "
+CREATE TABLE planning_area_metrics (
+  pa_key VARCHAR REFERENCES planning_areas(pa_key),
+  metric_type VARCHAR,
+  value DOUBLE,
+  date_calculated DATE DEFAULT CURRENT_DATE,
+  PRIMARY KEY (pa_key, metric_type)
+)")
+
+# create indexes
+dbExecute(con_sdm, "CREATE INDEX idx_sdm_values_cell_id ON sdm_values(cell_id)")
+dbExecute(con_sdm, "CREATE INDEX idx_sdm_values_sp_id ON sdm_values(sp_id)")
+dbExecute(con_sdm, "CREATE INDEX idx_sdm_cells_coords ON sdm_cells(lon, lat)")
+dbExecute(con_sdm, "CREATE SPATIAL INDEX idx_sdm_cells_geom ON sdm_cells(geom)")
+dbExecute(con_sdm, "CREATE SPATIAL INDEX idx_planning_areas_geom ON planning_areas(geom)")
+```
+
+## Ingest AquaMaps Source
+
+```{r ingest_source}
+# add AquaMaps as a source
+aquamaps_source <- tibble(
+  src_key         = "aquamaps_bio-oracle",
+  name            = "AquaMaps with Bio-Oracle v3",
+  description     = "AquaMaps species distribution models downscaled to 0.05° using Bio-Oracle v3 environmental layers",
+  citation        = "Kaschner et al. (2023) AquaMaps: Predicted range maps for aquatic species",
+  url             = "https://www.aquamaps.org",
+  spatial_res_deg = 0.05,
+  temporal_res    = "static"
+)
+
+dbWriteTable(con_sdm, "sdm_sources", aquamaps_source, append = TRUE)
+```
+
+## Load Planning Areas
+
+```{r load_planning_areas}
+# read planning areas from existing database
+con_pg <- db_connect()
+ply_pa <- st_read(con_pg, "ply_planareas_s05")
+dbDisconnect(con_pg)
+
+# simplify and load into DuckDB
+planning_areas <- ply_pa |>
+  select(pa_key = planarea_key, pa_name = planarea_name, geom) |>
+  st_transform(4326)
+
+# write to DuckDB (convert geometry to WKT first)
+pa_df <- planning_areas |>
+  mutate(geom_wkt = st_as_text(geom)) |>
+  st_drop_geometry()
+
+dbExecute(con_sdm, "DELETE FROM planning_areas")
+for (i in 1:nrow(pa_df)) {
+  dbExecute(con_sdm, glue("
+    INSERT INTO planning_areas (pa_key, pa_name, geom)
+    VALUES ('{pa_df$pa_key[i]}', '{pa_df$pa_name[i]}', 
+            ST_GeomFromText('{pa_df$geom_wkt[i]}'))
+  "))
+}
+```
+
+## Create 0.05° Grid Cells
+
+```{r create_grid}
+#| message: false
+
+# create global 0.05 degree grid
+res <- 0.05
+lon_seq <- seq(-180 + res/2, 180 - res/2, by = res)
+lat_seq <- seq(-90 + res/2, 90 - res/2, by = res)
+
+# create grid cells (this will be large!)
+grid_cells <- expand_grid(
+  lon = lon_seq,
+  lat = lat_seq
+) |>
+  mutate(
+    cell_id = row_number(),
+    res_deg = res
+  )
+
+# batch insert cells
+batch_size <- 10000
+n_batches <- ceiling(nrow(grid_cells) / batch_size)
+
+message(glue("Inserting {nrow(grid_cells)} grid cells in {n_batches} batches..."))
+
+for (i in 1:n_batches) {
+  start_idx <- (i - 1) * batch_size + 1
+  end_idx <- min(i * batch_size, nrow(grid_cells))
+  
+  batch <- grid_cells[start_idx:end_idx, ]
+  
+  # create WKT points for geometries
+  batch <- batch |>
+    mutate(
+      geom_wkt = glue("POINT({lon} {lat})")
+    )
+  
+  # insert batch
+  for (j in 1:nrow(batch)) {
+    dbExecute(con_sdm, glue("
+      INSERT INTO sdm_cells (cell_id, lon, lat, res_deg, geom)
+      VALUES ({batch$cell_id[j]}, {batch$lon[j]}, {batch$lat[j]}, 
+              {batch$res_deg[j]}, ST_GeomFromText('{batch$geom_wkt[j]}'))
+    "))
+  }
+  
+  if (i %% 10 == 0) {
+    message(glue("  Completed batch {i}/{n_batches}"))
+  }
+}
+```
+
+## Process Species from iterate_species_in_planareas
+
+```{r process_species}
+#| eval: false
+
+# this chunk assumes the iterate_species_in_planareas chunk from 
+# ingest_aquamaps_res05.qmd has been run and produced species rasters
+
+# get list of species rasters
+species_dir <- here("data/aquamaps/bio-oracle")
+species_files <- list.files(species_dir, pattern = "*.tif$", full.names = TRUE)
+
+# create model for this batch
+model_info <- tibble(
+  mdl_id      = 1,
+  src_key     = "aquamaps_bio-oracle",
+  taxa_group  = "mixed",
+  time_period = "2020-2024",
+  region      = "US EEZ",
+  description = "AquaMaps species downscaled to Bio-Oracle resolution for US waters"
+)
+
+dbWriteTable(con_sdm, "sdm_models", model_info, append = TRUE)
+
+# process each species
+sp_id_counter <- 1
+
+for (sp_file in species_files[1:10]) { # process first 10 for testing
+  
+  sp_key <- tools::file_path_sans_ext(basename(sp_file))
+  message(glue("Processing species: {sp_key}"))
+  
+  # read species raster
+  r_sp <- rast(sp_file)
+  
+  # get species info from original database
+  con_pg <- db_connect()
+  sp_info <- tbl(con_pg, "spp") |>
+    filter(sp_key == !!sp_key) |>
+    collect()
+  dbDisconnect(con_pg)
+  
+  # add species to database
+  species_info <- tibble(
+    sp_id           = sp_id_counter,
+    mdl_id          = 1,
+    sp_key          = sp_key,
+    aphia_id        = sp_info$aphia_id[1],
+    scientific_name = glue("{sp_info$genus[1]} {sp_info$species[1]}"),
+    common_name     = sp_info$common_name[1]
+  )
+  
+  dbWriteTable(con_sdm, "sdm_species", species_info, append = TRUE)
+  
+  # extract values and insert into database
+  r_df <- as.data.frame(r_sp, xy = TRUE) |>
+    filter(!is.na(probability)) |>
+    mutate(
+      # match to nearest grid cell
+      cell_lon = round(x / res) * res,
+      cell_lat = round(y / res) * res
+    )
+  
+  # get cell IDs for these coordinates
+  cell_matches <- dbGetQuery(con_sdm, glue("
+    SELECT cell_id, lon, lat
+    FROM sdm_cells
+    WHERE lon IN ({paste(unique(r_df$cell_lon), collapse = ',')})
+      AND lat IN ({paste(unique(r_df$cell_lat), collapse = ',')})
+  "))
+  
+  # join and prepare values
+  values_df <- r_df |>
+    inner_join(
+      cell_matches, 
+      by = c("cell_lon" = "lon", "cell_lat" = "lat")
+    ) |>
+    select(
+      cell_id,
+      value = probability
+    ) |>
+    mutate(
+      sp_id = sp_id_counter,
+      value = value / 100,  # convert from percentage to probability
+      value_type = "probability"
+    )
+  
+  # batch insert values
+  batch_insert_values(con_sdm, values_df, "sdm_values")
+  
+  sp_id_counter <- sp_id_counter + 1
+}
+```
+
+## Calculate Biodiversity Metrics
+
+```{r calc_biodiv_metrics}
+#| eval: false
+
+# calculate species richness per cell
+message("Calculating species richness...")
+
+dbExecute(con_sdm, "
+INSERT INTO biodiv_metrics (cell_id, metric_type, value)
+SELECT 
+  cell_id,
+  'species_richness' as metric_type,
+  COUNT(DISTINCT sp_id) as value
+FROM sdm_values
+WHERE value > 0.5  -- presence threshold
+GROUP BY cell_id
+")
+
+# calculate Shannon diversity index
+message("Calculating Shannon diversity...")
+
+dbExecute(con_sdm, "
+INSERT INTO biodiv_metrics (cell_id, metric_type, value)
+SELECT 
+  cell_id,
+  'shannon_index' as metric_type,
+  -SUM(p * LOG(p)) as value
+FROM (
+  SELECT 
+    cell_id,
+    value / SUM(value) OVER (PARTITION BY cell_id) as p
+  FROM sdm_values
+  WHERE value > 0
+) t
+GROUP BY cell_id
+")
+```
+
+## Generate Biodiversity Raster
+
+```{r generate_raster}
+#| eval: false
+
+# query species richness
+richness_df <- dbGetQuery(con_sdm, "
+SELECT 
+  c.lon, 
+  c.lat, 
+  COALESCE(m.value, 0) as richness
+FROM sdm_cells c
+LEFT JOIN biodiv_metrics m 
+  ON c.cell_id = m.cell_id 
+  AND m.metric_type = 'species_richness'
+WHERE c.lon BETWEEN -180 AND -60  -- limit to a region for testing
+  AND c.lat BETWEEN 20 AND 50
+")
+
+# convert to raster
+r_richness <- create_raster_from_points(
+  richness_df, 
+  value_col = "richness",
+  res = 0.05,
+  crs = "EPSG:4326"
+)
+
+# display with mapgl
+mapgl_rast <- function(r, palette = "viridis", layer_name = "SDM") {
+  # convert raster to data frame
+  r_df <- as.data.frame(r, xy = TRUE) |>
+    rename(value = 3)
+  
+  # create mapgl visualization
+  mapgl() |>
+    add_raster_tile_layer(
+      id = "sdm_raster",
+      source = r,
+      source_layer = layer_name,
+      color_palette = palette
+    )
+}
+
+# visualize
+mapgl_rast(r_richness, palette = "YlOrRd", layer_name = "Species Richness")
+```
+
+## Summarize by Planning Area
+
+```{r summarize_planning_areas}
+#| eval: false
+
+# calculate average species richness per planning area
+message("Calculating planning area metrics...")
+
+dbExecute(con_sdm, "
+INSERT INTO planning_area_metrics (pa_key, metric_type, value)
+SELECT 
+  p.pa_key,
+  'avg_species_richness' as metric_type,
+  AVG(m.value) as value
+FROM planning_areas p
+JOIN sdm_cells c ON ST_Within(c.geom, p.geom)
+JOIN biodiv_metrics m ON c.cell_id = m.cell_id
+WHERE m.metric_type = 'species_richness'
+GROUP BY p.pa_key
+")
+
+# query results
+pa_metrics <- dbGetQuery(con_sdm, "
+SELECT 
+  p.pa_key,
+  p.pa_name,
+  m.value as avg_richness
+FROM planning_areas p
+JOIN planning_area_metrics m ON p.pa_key = m.pa_key
+WHERE m.metric_type = 'avg_species_richness'
+ORDER BY m.value DESC
+")
+
+print(pa_metrics)
+```
+
+## Add Environmental Layers
+
+```{r add_env_layers}
+#| eval: false
+
+# example: add primary productivity from ingest_productivity.qmd
+npp_tif <- here("data/derived/vgpm-viirs_2023-daily-avg.tif")
+
+if (file.exists(npp_tif)) {
+  r_npp <- rast(npp_tif)
+  
+  # resample to 0.05 degree resolution
+  r_template <- rast(
+    extent = ext(-180, 180, -90, 90),
+    resolution = 0.05,
+    crs = "EPSG:4326"
+  )
+  
+  r_npp_res <- resample(r_npp, r_template, method = "bilinear")
+  
+  # extract values
+  npp_df <- as.data.frame(r_npp_res, xy = TRUE) |>
+    filter(!is.na(npp_daily_avg)) |>
+    mutate(
+      cell_lon = round(x / 0.05) * 0.05,
+      cell_lat = round(y / 0.05) * 0.05
+    )
+  
+  # insert into env_layers
+  # (similar process as species values)
+}
+```
+
+## Export to Parquet
+
+```{r export_parquet}
+#| eval: false
+
+# export tables to parquet for efficient storage
+output_dir <- here("data/sdm_parquet")
+dir_create(output_dir)
+
+# export each table
+tables_to_export <- c(
+  "sdm_sources", "sdm_models", "sdm_species", 
+  "sdm_cells", "sdm_values", "biodiv_metrics",
+  "env_layers", "planning_areas", "planning_area_metrics"
+)
+
+for (tbl in tables_to_export) {
+  message(glue("Exporting {tbl} to parquet..."))
+  
+  df <- dbGetQuery(con_sdm, glue("SELECT * FROM {tbl}"))
+  
+  arrow::write_parquet(
+    df, 
+    file.path(output_dir, glue("{tbl}.parquet")),
+    compression = "snappy"
+  )
+}
+```
+
+## Close Connection
+
+```{r cleanup}
+dbDisconnect(con_sdm)
+```
