@@ -18,8 +18,14 @@ This notebook ingests downscaled AquaMaps species distribution models (0.05° re
 #| warning: false
 
 librarian::shelf(
-  DBI, dbplyr, dplyr, duckdb, fs, glue, here, leaflet, mapgl, purrr, 
-  sf, terra, tibble, tidyr, quiet = T )
+  DBI, dbplyr, dplyr, duckdb, fs, glue, here, leaflet, logger, mapgl, purrr, readr,
+  sf, stringr, terra, tibble, tidyr, quiet = T )
+options(readr.show_col_types = F)
+
+# b/c: [rotate() shifts cells of non-global spatRast](https://github.com/rspatial/terra/issues/1831)
+# remotes::install_github("rspatial/terra")
+# devtools::session_info()  # 2025-05-28 [1] Github (rspatial/terra@06ee3b1)
+stopifnot(packageVersion("terra") >= "1.8.53")
 
 source(here("libs/db.R"))
 source(here("libs/am_functions.R"))
@@ -33,24 +39,22 @@ dir_data <- ifelse(
   "~/My Drive/projects/msens/data")
 
 # database setup
-db_path <- glue("{dir_data}/derived/msens_sdm.duckdb")
-con_sdm <- dbConnect(duckdb(), dbdir = db_path, read_only = FALSE)
-# dbDisconnect(con_sdm)
+# db_path <- glue("{dir_data}/derived/msens_sdm.duckdb") # OLD: 10 GB with indexes, unvacuumed data, etc
 
-# Check if spatial extension is already loaded
-check_spatial <- function(con) {
-  tryCatch({
-    # Try to use a spatial function - if it works, extension is loaded
-    dbGetQuery(con, "SELECT ST_Point(0, 0)")
-    return(TRUE)
-  }, error = function(e) {
-    return(FALSE)
-  })
-}
-# Only install/load if not already available
-if (!check_spatial(con_sdm)) {
-  dbExecute(con_sdm, "INSTALL spatial; LOAD spatial;")
-}
+# file_delete(sdm_dd)
+sdm_dd <- glue("{dir_data}/derived/sdm.duckdb")
+con_sdm <- dbConnect(duckdb(), dbdir = sdm_dd, read_only = F) |> 
+  load_duckdb_extensions()
+# dbDisconnect(con_sdm, shutdown = T)
+# duckdb_shutdown(duckdb())
+# dbListTables(con_sdm)
+dbExecute(con_sdm, "SET threads = 6;")
+dbExecute(con_sdm, "SET memory_limit = '10GB';")
+
+con_am   <- dbConnect(    # con_dd to AquaMaps duckdb
+  duckdb(
+    dbdir     = glue("{dir_data}/derived/aquamaps/am.duckdb"),
+    read_only = T))
 ```
 
 ## Database Schema
@@ -70,7 +74,7 @@ dataset {
   str citation
   str source_broad        "e.g. NOAA, AquaMaps, Duke, NCCOS"
   str source_detail       "e.g. NOAA Southeast Fisheries Science Center"
-  arr regions             "e.g. Global, Atlantic, Pacific, Gulf of America"
+  str regions             "e.g. Global, Atlantic, Pacific, Gulf of America"
   str response_type       "occurrence, range, suitability, biomass, density, diversity"
   str taxa_groups         "fish, invertebrates, marine mammals, cetaceans, sea turtles, seabirds"
   int year_pub            "year published"
@@ -78,7 +82,6 @@ dataset {
   date date_obs_end       "last observation date"
   date date_env_beg       "first environmental data date"
   date date_env_end       "last environmental data date"
-  arr years_obs           "years observed (integer list)"
   str link_info           "primary information URL"
   str link_download       "download URL"
   str link_metadata       "metadata URL"
@@ -100,7 +103,7 @@ model {
 }
 
 species {
-  int sp_id           PK  "species ID"
+  int sp_seq          PK  "sequential species ID"
   str ds_key          FK  "dataset key"
   str taxa            FK  "links to model.taxa"
   str sp_key              "species key"
@@ -116,7 +119,7 @@ cell {
   int cell_id         PK  "cell ID"
   dbl lon                 "longitude"
   dbl lat                 "latitude"
-  dbl res_deg             "resolution in decimal degrees"
+  dbl area_km2            "cell area in square kilometers"
   geo geom                "cell geometry"
 }
 
@@ -153,12 +156,10 @@ region_metric {
   dbl value               "calculated metric value"
 }
 
-env_layers {
+region_cell {
+  int rgn_seq         FK  "region ID"
   int cell_id         FK  "cell ID"
-  str var_name            "variable name"
-  dbl value
-  str units
-  date date_measured
+  int pct_covered         "percentage of cell covered by region"
 }
 
 planning_areas {
@@ -174,25 +175,25 @@ model ||--|{ species : "ds_key,taxa"
 model ||--o{ model_cell : mdl_seq
 cell ||--o{ model_cell : cell_id
 cell ||--o{ cell_metric : cell_id
-cell ||--o{ env_layers : cell_id
+cell ||--o{ region_cell : cell_id
 metric ||--o{ cell_metric : metric_seq
 metric ||--o{ region_metric : metric_seq
 region ||--o{ region_metric : rgn_seq
-```
-
-```{r tmp_not_evel, include=FALSE}
-knitr::opts_chunk$set(eval = F)
+region ||--o{ region_cell : rgn_seq
 ```
 
 ## Create Database Tables
 
 ```{r create_tables}
 #| message: false
+#| eval: false
+
+# DO NOT run this chunk if the database already exists
 
 # drop existing tables if needed
 if (dbExistsTable(con_sdm, "model_cell") || dbExistsTable(con_sdm, "sdm_values")) {
   tables_to_drop <- c(
-    "region_metric", "cell_metric", "env_layers", 
+    "region_metric", "region_cell", "cell_metric", "env_layers", 
     "model_cell", "sdm_values", "species", "model", "dataset", 
     "cell", "sdm_cells", "metric", "region", "planning_areas",
     "biodiv_metrics", "planning_area_metrics", "sdm_species", 
@@ -207,232 +208,181 @@ if (dbExistsTable(con_sdm, "model_cell") || dbExistsTable(con_sdm, "sdm_values")
 
 # create tables
 dbExecute(con_sdm, "
-CREATE TABLE dataset (
-  ds_key VARCHAR PRIMARY KEY,
-  name_short VARCHAR NOT NULL,
-  name_original VARCHAR,
-  description TEXT,
-  citation TEXT,
-  source_broad VARCHAR,
-  source_detail VARCHAR,
-  regions VARCHAR[],
-  response_type VARCHAR,
-  taxa_groups VARCHAR,
-  year_pub INTEGER,
-  date_obs_beg DATE,
-  date_obs_end DATE,
-  date_env_beg DATE,
-  date_env_end DATE,
-  years_obs INTEGER[],
-  link_info VARCHAR,
-  link_download VARCHAR,
-  link_metadata VARCHAR,
-  links_other VARCHAR,
-  spatial_res_deg DOUBLE,
-  temporal_res VARCHAR,
-  date_created DATE DEFAULT CURRENT_DATE
-)")
+  CREATE TABLE dataset (
+    ds_key VARCHAR PRIMARY KEY,
+    name_short VARCHAR NOT NULL,
+    name_original VARCHAR,
+    description TEXT,
+    citation TEXT,
+    source_broad VARCHAR,
+    source_detail VARCHAR,
+    regions VARCHAR,
+    response_type VARCHAR,
+    taxa_groups VARCHAR,
+    year_pub INTEGER,
+    date_obs_beg DATE,
+    date_obs_end DATE,
+    date_env_beg DATE,
+    date_env_end DATE,
+    link_info VARCHAR,
+    link_download VARCHAR,
+    link_metadata VARCHAR,
+    links_other VARCHAR,
+    spatial_res_deg DOUBLE,
+    temporal_res VARCHAR,
+    date_created DATE DEFAULT CURRENT_DATE )")
+
+# dbExecute(con_sdm, "DROP TABLE model")
+# dbExecute(con_sdm, "DROP SEQUENCE model_mdl_seq_seq CASCADE")
+dbExecute(con_sdm, "
+  CREATE SEQUENCE model_mdl_seq_seq START 1")
 
 dbExecute(con_sdm, "
-CREATE SEQUENCE model_mdl_seq_seq START 1")
+  CREATE TABLE model (
+    mdl_seq INTEGER PRIMARY KEY DEFAULT nextval('model_mdl_seq_seq'),
+    ds_key VARCHAR REFERENCES dataset(ds_key),
+    taxa VARCHAR,
+    time_period VARCHAR,
+    region VARCHAR,
+    mdl_type VARCHAR,
+    description TEXT,
+    date_created DATE DEFAULT CURRENT_DATE )")
+
+# dbExecute(con_sdm, "DROP TABLE species")
 
 dbExecute(con_sdm, "
-CREATE TABLE model (
-  mdl_seq INTEGER PRIMARY KEY DEFAULT nextval('model_mdl_seq_seq'),
-  ds_key VARCHAR REFERENCES dataset(ds_key),
-  taxa VARCHAR,
-  time_period VARCHAR,
-  region VARCHAR,
-  mdl_type VARCHAR,
-  description TEXT,
-  date_created DATE DEFAULT CURRENT_DATE
-)")
+  CREATE SEQUENCE species_sp_seq_seq START 1")
 
 dbExecute(con_sdm, "
-CREATE TABLE species (
-  sp_id INTEGER PRIMARY KEY,
-  ds_key VARCHAR REFERENCES dataset(ds_key),
-  taxa VARCHAR,
-  sp_key VARCHAR NOT NULL,
-  aphia_id INTEGER,
-  gbif_id INTEGER,
-  itis_id INTEGER,
-  scientific_name VARCHAR,
-  common_name VARCHAR,
-  sp_cat VARCHAR
-)")
+  CREATE TABLE species (
+    sp_seq INTEGER PRIMARY KEY DEFAULT nextval('species_sp_seq_seq'),
+    ds_key VARCHAR REFERENCES dataset(ds_key),
+    taxa VARCHAR,
+    sp_key VARCHAR NOT NULL,
+    aphia_id INTEGER,
+    gbif_id INTEGER,
+    itis_id INTEGER,
+    scientific_name VARCHAR,
+    common_name VARCHAR,
+    sp_cat VARCHAR)")
 
 dbExecute(con_sdm, "
-CREATE TABLE cell (
-  cell_id INTEGER PRIMARY KEY,
-  lon DOUBLE NOT NULL,
-  lat DOUBLE NOT NULL,
-  res_deg DOUBLE NOT NULL,
-  geom GEOMETRY
-)")
+  CREATE SEQUENCE metric_metric_seq_seq START 1")
 
 dbExecute(con_sdm, "
-CREATE TABLE model_cell (
-  cell_id INTEGER REFERENCES cell(cell_id),
-  mdl_seq INTEGER REFERENCES model(mdl_seq),
-  value DOUBLE,
-  PRIMARY KEY (cell_id, mdl_seq)
-)")
+  CREATE TABLE metric (
+    metric_seq INTEGER PRIMARY KEY DEFAULT nextval('metric_metric_seq_seq'),
+    metric_type VARCHAR NOT NULL,
+    description TEXT,
+    date_created DATE DEFAULT CURRENT_DATE)")
 
 dbExecute(con_sdm, "
-CREATE SEQUENCE metric_metric_seq_seq START 1")
+  CREATE TABLE region (
+    rgn_seq INTEGER PRIMARY KEY DEFAULT nextval('region_rgn_seq_seq'),
+    tbl_col VARCHAR NOT NULL,
+    value VARCHAR NOT NULL,
+    col_geom VARCHAR NOT NULL,
+    date_created DATE DEFAULT CURRENT_DATE )")
 
 dbExecute(con_sdm, "
-CREATE TABLE metric (
-  metric_seq INTEGER PRIMARY KEY DEFAULT nextval('metric_metric_seq_seq'),
-  metric_type VARCHAR NOT NULL,
-  description TEXT,
-  date_created DATE DEFAULT CURRENT_DATE
-)")
+  CREATE SEQUENCE region_rgn_seq_seq START 1")
+
+dbExecute(con_sdm, "
+  CREATE TABLE region_metric (
+    rgn_seq INTEGER REFERENCES region(rgn_seq),
+    metric_seq INTEGER REFERENCES metric(metric_seq),
+    value DOUBLE,
+    PRIMARY KEY (rgn_seq, metric_seq) )")
+
+# dbExecute(con_sdm, "
+# CREATE TABLE cell (
+#   cell_id INTEGER PRIMARY KEY,
+#   lon DOUBLE NOT NULL,
+#   lat DOUBLE NOT NULL,
+#   area_km2 DOUBLE NOT NULL,
+#   geom GEOMETRY)")
 
 dbExecute(con_sdm, "
 CREATE TABLE cell_metric (
   cell_id INTEGER REFERENCES cell(cell_id),
   metric_seq INTEGER REFERENCES metric(metric_seq),
   value DOUBLE,
-  PRIMARY KEY (cell_id, metric_seq)
-)")
+  PRIMARY KEY (cell_id, metric_seq))")
 
-dbExecute(con_sdm, "
-CREATE SEQUENCE region_rgn_seq_seq START 1")
+# dbExecute(con_sdm, "DROP TABLE model_cell")
+# dbExecute(con_sdm, "DROP TABLE cell_metric")
+# dbExecute(con_sdm, "DROP TABLE region_cell")
+# dbExecute(con_sdm, "DROP TABLE cell")
 
-dbExecute(con_sdm, "
-CREATE TABLE region (
-  rgn_seq INTEGER PRIMARY KEY DEFAULT nextval('region_rgn_seq_seq'),
-  tbl_col VARCHAR NOT NULL,
-  value VARCHAR NOT NULL,
-  col_geom VARCHAR NOT NULL,
-  date_created DATE DEFAULT CURRENT_DATE
-)")
-
-dbExecute(con_sdm, "
-CREATE TABLE region_metric (
-  rgn_seq INTEGER REFERENCES region(rgn_seq),
-  metric_seq INTEGER REFERENCES metric(metric_seq),
-  value DOUBLE,
-  PRIMARY KEY (rgn_seq, metric_seq)
-)")
-
-dbExecute(con_sdm, "
-CREATE TABLE env_layers (
-  cell_id INTEGER REFERENCES cell(cell_id),
-  var_name VARCHAR,
-  value DOUBLE,
-  units VARCHAR,
-  date_measured DATE,
-  PRIMARY KEY (cell_id, var_name)
-)")
-
-dbExecute(con_sdm, "
-CREATE TABLE planning_areas (
-  pa_key VARCHAR PRIMARY KEY,
-  pa_name VARCHAR,
-  geom GEOMETRY
-)")
-
-# create indexes
-dbExecute(con_sdm, "CREATE INDEX idx_model_cell_cell_id ON model_cell(cell_id)")
-dbExecute(con_sdm, "CREATE INDEX idx_model_cell_mdl_seq ON model_cell(mdl_seq)")
-dbExecute(con_sdm, "CREATE INDEX idx_cell_coords ON cell(lon, lat)")
-dbExecute(con_sdm, "CREATE INDEX idx_species_taxa ON species(ds_key, taxa)")
-dbExecute(con_sdm, "CREATE INDEX idx_model_taxa ON model(ds_key, taxa)")
-dbExecute(con_sdm, "CREATE SPATIAL INDEX idx_cell_geom ON cell(geom)")
-dbExecute(con_sdm, "CREATE SPATIAL INDEX idx_planning_areas_geom ON planning_areas(geom)")
+# dbExecute(con_sdm, "
+# CREATE TABLE planning_areas (
+#   pa_key VARCHAR PRIMARY KEY,
+#   pa_name VARCHAR,
+#   geom GEOMETRY
+# )")
 ```
 
 ## Ingest AquaMaps Source
 
 ```{r ingest_source}
+
 # add AquaMaps as a source
 aquamaps_dataset <- tibble(
   ds_key          = "am_0.05",
-  name_short      = "AquaMaps fish suitability in Global, 2023",
+  name_short      = "AquaMaps suitability for all marine taxa (except birds) globally, 2019",
   name_original   = "AquaMaps: Predicted range maps for aquatic species",
-  description     = "AquaMaps species distribution models downscaled to 0.05° using Bio-Oracle v3 environmental layers",
-  citation        = "Kaschner et al. (2023) AquaMaps: Predicted range maps for aquatic species. Version 10/2019. www.aquamaps.org",
+  description     = "AquaMaps species distribution models downscaled from 0.5° to 0.05° cells",
+  citation        = "Kaschner, K., K. Kesner-Reyes, C. Garilao, J. Segschneider, J. Rius-Barile, T. Rees, and R. Froese. 2019. AquaMaps: Predicted range maps for aquatic species. World wide web electronic publication, www.aquamaps.org, Version 10/2019. Content from AquaMaps as provided in this R package is licensed under a Creative Commons Attribution-NonCommercial 3.0 UnportedLicense, please see http://creativecommons.org/licenses/by-nc/3.0/",
   source_broad    = "AquaMaps",
-  source_detail   = "AquaMaps.org collaborative project",
-  regions         = list(c("Global")),
+  source_detail   = "AquaMaps.org",
+  regions         = "Global",
   response_type   = "suitability",
-  taxa_groups     = "fish",
+  taxa_groups     = "all taxa, except birds",
   year_pub        = 2023,
-  date_obs_beg    = as.Date("1990-01-01"),
-  date_obs_end    = as.Date("2020-12-31"),
-  date_env_beg    = as.Date("2000-01-01"),
-  date_env_end    = as.Date("2020-12-31"),
-  years_obs       = list(as.integer(1990:2020)),
+  date_obs_beg    = NA,
+  date_obs_end    = as.Date("2019-01-01"),
+  date_env_beg    = NA,
+  date_env_end    = as.Date("2019-01-01"),
   link_info       = "https://www.aquamaps.org",
-  link_download   = "https://www.aquamaps.org/download/main.php",
-  link_metadata   = "https://www.aquamaps.org/main/alg_2019.php",
-  links_other     = "https://www.fishbase.org https://www.sealifebase.org",
+  link_download   = "https://raquamaps.github.io/aquamapsdata",
+  link_metadata   = "https://raquamaps.github.io/aquamapsdata/articles/intro.html#data-scope-and-content-1",
+  links_other     = NA,
   spatial_res_deg = 0.05,
-  temporal_res    = "static"
-)
+  temporal_res    = "static" )
 
-# convert lists to arrays for DuckDB
-dbExecute(con_sdm, glue("
-  INSERT INTO dataset (
-    ds_key, name_short, name_original, description, citation,
-    source_broad, source_detail, regions, response_type, taxa_groups,
-    year_pub, date_obs_beg, date_obs_end, date_env_beg, date_env_end,
-    years_obs, link_info, link_download, link_metadata, links_other,
-    spatial_res_deg, temporal_res
-  ) VALUES (
-    '{aquamaps_dataset$ds_key}',
-    '{aquamaps_dataset$name_short}',
-    '{aquamaps_dataset$name_original}',
-    '{aquamaps_dataset$description}',
-    '{aquamaps_dataset$citation}',
-    '{aquamaps_dataset$source_broad}',
-    '{aquamaps_dataset$source_detail}',
-    ARRAY['{paste(aquamaps_dataset$regions[[1]], collapse = \"','\")}''],
-    '{aquamaps_dataset$response_type}',
-    '{aquamaps_dataset$taxa_groups}',
-    {aquamaps_dataset$year_pub},
-    '{aquamaps_dataset$date_obs_beg}',
-    '{aquamaps_dataset$date_obs_end}',
-    '{aquamaps_dataset$date_env_beg}',
-    '{aquamaps_dataset$date_env_end}',
-    ARRAY[{paste(aquamaps_dataset$years_obs[[1]], collapse = ',')}],
-    '{aquamaps_dataset$link_info}',
-    '{aquamaps_dataset$link_download}',
-    '{aquamaps_dataset$link_metadata}',
-    '{aquamaps_dataset$links_other}',
-    {aquamaps_dataset$spatial_res_deg},
-    '{aquamaps_dataset$temporal_res}'
-  )
-"))
+if (dbExistsTable(con_sdm, "dataset"))
+  dbExecute(con_sdm, "DELETE FROM dataset WHERE ds_key = 'am_0.05'")
+
+dbWriteTable(con_sdm, "dataset", aquamaps_dataset, append = TRUE)
+```
+
+```{r tmp_not_evel, include=FALSE}
+knitr::opts_chunk$set(eval = F)
 ```
 
 ## Load Planning Areas
 
+Created in PostGIS db `ply_planareas_2025` in "planareas_2025" R chunk of `ingest_aquamaps_res05.qmd`.
+
 ```{r load_planning_areas}
-# read planning areas from existing database
-ply_pa <- st_read(con, "ply_planareas_2025")
+# dbExecute(con_sdm, "DROP TABLE planning_areas")
+#| eval: false
 
-# simplify and load into DuckDB
-planning_areas <- ply_pa |>
-  select(pa_key = planarea_key, pa_name = planarea_name, geom) |> # TODO: keep original
-  st_transform(4326)
+librarian::shelf(
+  Cidree/duckspatial, mapview)
 
-# write to DuckDB (convert geometry to WKT first)
-pa_df <- planning_areas |>
-  mutate(geom_wkt = st_as_text(geom)) |>
-  st_drop_geometry()
-
-dbExecute(con_sdm, "DELETE FROM planning_areas")
-for (i in 1:nrow(pa_df)) {
-  dbExecute(con_sdm, glue("
-    INSERT INTO planning_areas (pa_key, pa_name, geom)
-    VALUES ('{pa_df$pa_key[i]}', '{pa_df$pa_name[i]}', 
-            ST_GeomFromText('{pa_df$geom_wkt[i]}'))
-  "))
+if (!dbExistsTable(con_sdm, "ply_planareas")) {
+  # read planning areas from existing database
+  ply_pa <- st_read(con, "ply_planareas_2025") |> 
+    st_break_antimeridian()
+  
+  ddbs_write_vector(con_sdm, ply_pa, "ply_planareas")
+  # dbExecute(con_sdm, "CREATE INDEX idx_ply_planareas_geom ON ply_planareas(geom)")
+  # key size of 313193 bytes exceeds the maximum size of 122880 bytes for this ART
+  dbExecute(con_sdm, "CREATE INDEX idx_ply_planareas_geom ON ply_planareas USING RTREE (geom)") # TODO: redo with USING RTREE
 }
+
+ply_pa <- ddbs_read_vector(con_sdm, "ply_planareas")
 ```
 
 ## Create 0.05° Grid Cells
@@ -440,62 +390,100 @@ for (i in 1:nrow(pa_df)) {
 ```{r create_grid}
 #| message: false
 
-# create global 0.05 degree raster template
-res <- 0.05
-r_global <- terra::rast(
-  xmin = -180, xmax = 180,
-  ymin = -90,  ymax = 90,
-  resolution = res,
-  crs = "EPSG:4326"
-)
+cell_tif <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
 
-# get cell IDs and coordinates using terra
-cell_ids <- terra::cells(r_global)
-coords <- terra::xyFromCell(r_global, cell_ids)
-
-# create grid cells dataframe
-grid_cells <- tibble(
-  cell_id = cell_ids,
-  lon     = coords[, 1],
-  lat     = coords[, 2],
-  res_deg = res
-)
-
-# batch insert cells
-batch_size <- 10000
-n_batches <- ceiling(nrow(grid_cells) / batch_size)
-
-message(glue("Inserting {nrow(grid_cells)} grid cells in {n_batches} batches..."))
-
-for (i in 1:n_batches) {
-  start_idx <- (i - 1) * batch_size + 1
-  end_idx <- min(i * batch_size, nrow(grid_cells))
+ply_pa_buf <- ply_pa |> 
+  st_buffer(10*1000) |>    # 10 km 
+  # st_wrap_dateline()     # [   0, 360] -> [-180, 180]
+  st_shift_longitude()     # [-180, 180] -> [    0,360]
   
-  batch <- grid_cells[start_idx:end_idx, ]
-  
-  # create WKT points for geometries
-  batch <- batch |>
-    mutate(
-      geom_wkt = glue("POINT({lon} {lat})")
-    )
-  
-  # insert batch
-  for (j in 1:nrow(batch)) {
-    dbExecute(con_sdm, glue("
-      INSERT INTO cell (cell_id, lon, lat, res_deg, geom)
-      VALUES ({batch$cell_id[j]}, {batch$lon[j]}, {batch$lat[j]}, 
-              {batch$res_deg[j]}, ST_GeomFromText('{batch$geom_wkt[j]}'))
-    "))
-  }
-  
-  if (i %% 10 == 0) {
-    message(glue("  Completed batch {i}/{n_batches}"))
-  }
-}
+r_bo   <- get_bo_raster() # Bio-Oracle
 
-# save the global raster template for later use
-saveRDS(r_global, glue("{dir_data}/derived/r_global_0.05.rds"))
+r_cell <- r_bo |>                    
+  rotate(left=F) |>                # 3600 x 7200 = 25,920,000
+  mask(ply_pa_buf, touches = F) |> # 2006 x 3103 =  6,224,618
+  trim()
+r_cell$area_km2  <- terra::cellSize(r_cell$depth_mean, mask = T, unit = "km")
+r_cell$width_km2 <- sqrt(r_cell$area_km2)
+# minmax(r_cell$width_km2)
+# min  2.007380
+# max  5.547313
+r_cell$cell_id   <- 1:ncell(r_cell) # assign cell IDs
+r_cell <- r_cell |> 
+  subset(c(
+    "cell_id",
+    setdiff(names(r_cell), "cell_id") ))
+r_cell <- mask(r_cell, r_cell$depth_mean)
+
+pt_cell <- terra::as.data.frame(r_cell, cells = F, xy = T, na.rm = F) |> 
+  filter(!is.na(depth_mean)) |>
+  rename(
+    lon_360 = x,
+    lat     = y) |> 
+  mutate(
+    cell_id = as.integer(cell_id),
+    lon     = ifelse(lon_360 > 180, lon_360 - 360, lon_360) ) |>
+  relocate(lon, .before = lon_360) |>
+  tibble() |> # nrow: 661,372
+  st_as_sf(
+    coords = c("lon", "lat"),
+    crs    = "EPSG:4326",
+    remove = F)
+st_geometry(pt_cell) <- "geom"
+
+# dbExecute(con_sdm, "DROP TABLE cell")
+ddbs_write_vector(con_sdm, pt_cell, "cell")
+
+# Add primary key constraint to existing column
+dbExecute(con_sdm, "
+  ALTER TABLE cell ADD CONSTRAINT pk_constraint PRIMARY KEY (cell_id)")
+# Add index to geometry column
+dbExecute(con_sdm, "
+  CREATE INDEX idx_cell_geom ON cell USING RTREE (geom)") # TODO: redo with USING RTREE
+
+# save the planarea raster template for later use
+writeRaster(
+  r_cell,
+  cell_tif,
+  filetype = "COG",
+  overwrite = T,
+  verbose   = T)
 ```
+
+```{r}
+#| label: post_cell_tables
+#| eval: false
+
+# dbExecute(con_sdm, "DROP TABLE model_cell")
+dbExecute(con_sdm, "
+  CREATE TABLE model_cell (
+    mdl_seq INTEGER REFERENCES model(mdl_seq),
+    cell_id INTEGER REFERENCES cell(cell_id),
+    value DOUBLE,
+    PRIMARY KEY (cell_id, mdl_seq) )")
+
+# dbExecute(con_sdm, "DROP TABLE cell_metric")
+dbExecute(con_sdm, "
+  CREATE TABLE cell_metric (
+    cell_id INTEGER REFERENCES cell(cell_id),
+    metric_seq INTEGER REFERENCES metric(metric_seq),
+    value DOUBLE,
+    PRIMARY KEY (cell_id, metric_seq) )")
+
+# dbExecute(con_sdm, "DROP TABLE region_cell")
+dbExecute(con_sdm, "
+  CREATE TABLE region_cell (
+    rgn_seq INTEGER REFERENCES region(rgn_seq),
+    cell_id INTEGER REFERENCES cell(cell_id),
+    pct_covered INTEGER,
+    PRIMARY KEY (rgn_seq, cell_id) )")
+
+# dbExecute(con_sdm, "DROP INDEX idx_model_cell_cell_id")
+# dbExecute(con_sdm, "DROP INDEX idx_model_cell_mdl_seq")
+dbExecute(con_sdm, "CREATE INDEX idx_region_cell_rgn ON region_cell(rgn_seq)")
+dbExecute(con_sdm, "CREATE INDEX idx_region_cell_cell ON region_cell(cell_id)")
+```
+
 
 ## Process Aquamaps downsized models
 
@@ -504,32 +492,89 @@ saveRDS(r_global, glue("{dir_data}/derived/r_global_0.05.rds"))
 
 # this chunk assumes the iterate_species_in_planareas chunk from 
 # ingest_aquamaps_res05.qmd has been run and produced species rasters
+# Doh! The first one Chn-013ca97e-46a8-4c5e-b398-8bb4f340f88b.tif shows values > 100, and whack compared to
+#  https://aquamaps.org/preMap2.php?cache=1&SpecID=Chn-013ca97e-46a8-4c5e-b398-8bb4f340f88b, 
+# so retrying just for PA extent and directly starting with AquaMaps normal resolution
 
-# get list of species rasters
-dir_tifs <- glue("{dir_data}/derived/aquamaps.org/spp_cells0.05_cog")
-spp_tifs <- list.files(species_dir, pattern = "*.tif$", full.names = TRUE)
+cell_tif   <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
+spp_pa_csv <- glue("{dir_data}/derived/aquamaps.org/spp_boem-planareas-2025.csv")
 
-# load global raster template
-r_global <- readRDS(glue("{dir_data}/derived/r_global_0.05.rds"))
+spp_keys_done <- tbl(con_sdm, "model") |> 
+  filter(ds_key == "am_0.05") |> 
+  pull(taxa)
+stopifnot(sum(duplicated(spp_keys_done)) == 0)
 
-# process each species
-sp_id_counter <- 1
+d_spp_pa <- read_csv(spp_pa_csv) |>  # 17,550 x 2
+  arrange(desc(n_cells_pa), sp_key) |> 
+  filter(!sp_key %in% spp_keys_done)
 
-for (sp_tif in spp_tifs[1:10]) { # process first 10 for testing
+if (!all(sapply(c("r_hcaf", "r_cell"), exists))){
+  r_hcaf  <- get_hcaf_raster()
+  r_cell  <- rast(cell_tif)
+}
+
+# dbExecute(con_sdm, glue("TRUNCATE model"))
+# dbExecute(con_sdm, glue("TRUNCATE model_cell"))
+# dbExecute(con_sdm, glue("TRUNCATE species"))
+
+# INFO [2025-05-28 04:28:49] Processing 1/17,540: Fis-29877
+# INFO [2025-05-28 04:33:48] Processing 85/17,540: Fis-25165
+# 17540 / (85/5) / 60 = 17 hrs
+# INFO [2025-05-28 06:30:59] Processing 1,175/17,540: Fis-34595
+# 17540 / (1175/122) / 60 = 30 hrs
+# redo with fast processing on raster[idx] <- val; terra::rotate() upgrade; no indexes on model_cell
+# INFO [2025-05-28 15:11:33] Processing 1/17,549: ITS-Mam-180530
+# INFO [2025-05-28 15:12:33] Processing 37/17,549: Fis-162326
+# 17549 / 37 / 60 = 7.9 hrs
+# INFO [2025-05-28 15:13:33] Processing 71/17,549: Fis-23454
+# 17549 / (71/2) / 60 = 8.2 hrs
+# INFO [2025-05-28 15:16:33] Processing 178/17,549: ITS-Mam-180417
+# 17549 / (178/5) / 60 = 8.2 hrs
+# INFO [2025-05-28 15:24:33] Processing 471/17,549: Fis-21671
+# 17549 / (471/13) / 60 = 8.1 hrs
+# INFO [2025-05-28 16:38:34] Processing 3,355/17,549: Fis-163781
+# 17549 / (3355/130) / 60 = 11.3 hrs
+# INFO [2025-05-28 18:26:33] Processing 8,016/17,549: W-Bry-111513
+# 17549 / (8016/195) / 60 = 7.1 hrs
+# INFO [2025-05-28 18:31:44] Processing 8,239/17,549: Fis-28234
+
+n <- nrow(d_spp_pa)
+tic <- Sys.time()
+for (i in 1:n){  # i = 10 # i = 1175
+# for (i in 1:10){  # i = 2
+  sp_key     <- d_spp_pa$sp_key[i]      # sp_key = "ITS-Mam-180528" # sp_key = "Fis-34595"
+  n_cells_pa <- d_spp_pa$n_cells_pa[i]
+
+  toc <- Sys.time()
+  dt <- difftime(toc, tic, units = "mins") # |> as.numeric()
+  eta <- tic + (dt / i) * n
   
-  sp_key <- basename(sp_file) |> path_ext_remove()
-  message(glue("Processing species: {sp_key}"))
-  
-  # read species raster
-  r_sp <- rast(sp_tif)
-  
+  log_info(
+    "Processing {format(i, big.mark=',')}/{format(nrow(d_spp_pa), big.mark=',')}: {sp_key} ~ ETA: {eta}")
+
+  # source(here("libs/am_functions.R"))
+  # source(here("libs/sdm_functions.R"))
+  r_am <- am_sp_rast(sp_key, con_am, r_hcaf) |> 
+    rotate()  # [rotate() shifts cells of non-global spatRast](https://github.com/rspatial/terra/issues/1831)
+  r_ds <- downsample_sp_rast(r_am, r_cell$depth_mean)
+
   # get species info from original database
-  sp_info <- tbl(con, "spp") |>
+  sp_info <- tbl(con_am, "spp") |>
     filter(sp_key == !!sp_key) |>
     collect()
-
+  
+  # delete existing model
+  mdl_seqs <- tbl(con_sdm, "model") |> 
+    filter(ds_key == "am_0.05", taxa == !!sp_key) |> 
+    pull(mdl_seq)
+  if (length(mdl_seqs > 0)) {
+    dbExecute(con_sdm, glue("DELETE FROM model WHERE ds_key = 'am_0.05' AND taxa = '{sp_key}'"))
+    dbExecute(con_sdm, glue("DELETE FROM model_cell WHERE mdl_seq IN ({paste(mdl_seqs, collapse = ',')})"))
+    dbExecute(con_sdm, glue("DELETE FROM species WHERE ds_key = 'am_0.05' AND taxa = '{sp_key}'"))
+  }
+  
   # create model for this species (one model per species for AquaMaps)
-  model_info <- tibble(
+  d_model <- tibble(
     ds_key      = "am_0.05",
     taxa        = sp_key,  # for AquaMaps, taxa equals sp_key
     time_period = "2019",
@@ -537,14 +582,13 @@ for (sp_tif in spp_tifs[1:10]) { # process first 10 for testing
     mdl_type    = "suitability",
     description = glue(
       "AquaMaps suitability for {sp_info$genus[1]} {sp_info$species[1]}, interpolated to 0.05° resolution") )
-  
-  dbWriteTable(con_sdm, "model", model_info, append = TRUE)
+  dbWriteTable(con_sdm, "model", d_model, append = TRUE)
   
   # get the mdl_seq that was just created
   mdl_seq <- dbGetQuery(con_sdm, glue("
     SELECT mdl_seq FROM model 
-    WHERE ds_key = '{model_info$ds_key}' 
-      AND taxa = '{model_info$taxa}'
+    WHERE ds_key = '{d_model$ds_key}' 
+      AND taxa = '{d_model$taxa}'
     ORDER BY mdl_seq DESC LIMIT 1 "))$mdl_seq
   
   # determine species category
@@ -554,47 +598,47 @@ for (sp_tif in spp_tifs[1:10]) { # process first 10 for testing
     sp_info$class[1] == "Mammalia" ~ "marine mammal",
     sp_info$class[1] == "Reptilia" ~ "sea turtle",
     sp_info$phylum[1] == "Mollusca" ~ "mollusk",
-    sp_info$phylum[1] == "Arthropoda" && sp_info$subphylum[1] == "Crustacea" ~ "crustacean",
-    TRUE ~ "other"
-  )
+    # sp_info$phylum[1] == "Arthropoda" && sp_info$subphylum[1] == "Crustacea" ~ "crustacean",
+    sp_info$phylum[1] == "Arthropoda" ~ "crustacean",
+    TRUE ~ "other")
   
   # add species to database
-  species_info <- tibble(
-    sp_id           = sp_id_counter,
+  d_species <- tibble(
     ds_key          = "am_0.05",
     taxa            = sp_key,
     sp_key          = sp_key,
-    aphia_id        = sp_info$aphia_id[1],
+    aphia_id        = NA_integer_,  # TODO: lookup from WoRMS
     gbif_id         = NA_integer_,  # TODO: lookup from GBIF
     itis_id         = NA_integer_,  # TODO: lookup from ITIS
     scientific_name = glue("{sp_info$genus[1]} {sp_info$species[1]}"),
     common_name     = sp_info$common_name[1],
     sp_cat          = sp_cat)
-  
-  dbWriteTable(con_sdm, "species", species_info, append = TRUE)
-  
-  # extract values using terra::cells to ensure matching
-  # get cell IDs that have values
-  cell_values <- terra::values(r_sp, mat = FALSE, dataframe = TRUE, na.rm = TRUE)
-  cell_numbers <- terra::cells(r_sp)[!is.na(terra::values(r_sp))]
-  
-  # create model_cell records
-  model_cell_df <- tibble(
-    cell_id = cell_numbers,
-    mdl_seq = mdl_seq,
-    value   = cell_values[[1]] / 100  # convert from percentage to probability
-  )
-  
-  # batch insert values
-  batch_insert_values(con_sdm, model_cell_df, "model_cell")
-  
-  sp_id_counter <- sp_id_counter + 1
+  dbWriteTable(con_sdm, "species", d_species, append = T)
+
+  d_mdl_cell <- as.data.frame(r_ds, cells = T, na.rm = T) |> 
+    tibble() |> 
+    mutate(
+      mdl_seq = mdl_seq,
+      value   = as.integer(suitability) ) |> 
+    select(cell_id = cell, mdl_seq, value) |> 
+    arrange(cell_id)
+  dbWriteTable(con_sdm, "model_cell", d_mdl_cell, append = T)
 }
 ```
 
+## Add model_cell indexes after mass insert
+
+```{r}
+dbExecute(con_sdm, "CREATE INDEX idx_model_cell_cell_id ON model_cell(cell_id)")
+dbExecute(con_sdm, "CREATE INDEX idx_model_cell_mdl_seq ON model_cell(mdl_seq)")
+dbExecute(con_sdm, "CREATE INDEX idx_species_taxa ON species(ds_key, taxa)")
+dbExecute(con_sdm, "CREATE INDEX idx_model_taxa ON model(ds_key, taxa)")
+```
+
+
 ## Calculate Biodiversity Metrics
 
-```{r calc_biodiv_metrics}
+```{r calc_metrics}
 #| eval: false
 
 # first create metric definitions
@@ -619,6 +663,9 @@ metric_ids <- dbGetQuery(con_sdm, "SELECT metric_seq, metric_type FROM metric")
 message("Calculating species richness...")
 
 richness_metric_seq <- metric_ids$metric_seq[metric_ids$metric_type == "species_richness"]
+
+
+# dbExecute(con_sdm, "TRUNCATE cell_metric")
 
 dbExecute(con_sdm, glue("
 INSERT INTO cell_metric (cell_id, metric_seq, value)
@@ -661,33 +708,33 @@ GROUP BY cell_id
 #| eval: false
 
 # load global raster template
-r_global <- readRDS(glue("{dir_data}/derived/r_global_0.05.rds"))
+# r_global <- readRDS(glue("{dir_data}/derived/r_global_0.05.rds"))
+cell_tif <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
+
+r_cell <- rast(cell_tif)
 
 # get species richness metric ID
 richness_metric_seq <- dbGetQuery(con_sdm, "
-  SELECT metric_seq FROM metric WHERE metric_type = 'species_richness'
-")$metric_seq
+  SELECT metric_seq FROM metric WHERE metric_type = 'species_richness'")$metric_seq
 
 # query species richness for a region
 richness_df <- dbGetQuery(con_sdm, glue("
-SELECT 
-  cm.cell_id,
-  cm.value as species_richness
-FROM cell_metric cm
-WHERE cm.metric_seq = {richness_metric_seq}
-  AND cm.cell_id IN (
-    SELECT cell_id FROM cell 
-    WHERE lon BETWEEN -180 AND -60  -- limit to a region for testing
-      AND lat BETWEEN 20 AND 50
-  )
-"))
+  SELECT 
+    cm.cell_id,
+    cm.value as species_richness
+  FROM cell_metric cm
+  WHERE cm.metric_seq = {richness_metric_seq}
+    AND cm.cell_id IN (
+      SELECT cell_id FROM cell 
+      WHERE lon BETWEEN -180 AND -60  -- limit to a region for testing
+        AND lat BETWEEN 20 AND 50)")) |> 
+  tibble()
 
 # convert to raster using the new function
 r_richness <- create_raster_from_df(
   richness_df, 
-  r_template = r_global,
-  value_cols = "species_richness"
-)
+  r_template = r_cell,
+  value_col = "species_richness")
 
 # display with mapgl
 mapgl_rast <- function(r, palette = "viridis", layer_name = "SDM") {
@@ -703,6 +750,41 @@ mapgl_rast <- function(r, palette = "viridis", layer_name = "SDM") {
       source_layer = layer_name,
       color_palette = palette
     )
+}
+
+# display with mapgl
+# TODO:
+mapgl_rast2<- function(r, palette = "viridis", layer_name = "SDM") {
+  
+  # r <- r_pa[["depth_mean"]]
+  # r <- r_ds
+  r <- r_richness
+  # plot(r_am)
+  # plot(r_ds)
+  
+  rng_r <- minmax(r) |> as.numeric()
+  cols_r <- rev(RColorBrewer::brewer.pal(11, "Spectral"))
+  
+  mapboxgl(
+    style = mapbox_style("dark"),
+    zoom = 2,
+    center = c(-141.3, 13.4)) |>  # ply_pa centroid
+    add_image_source(
+      id     = "r_src",
+      data   = r,
+      colors = cols_r) |> 
+    add_raster_layer(
+      id                = "r_lyr",
+      source            = "r_src",
+      raster_resampling = "nearest") |> 
+    mapgl::add_legend(
+      "Colorscale",
+      values = rng_r,
+      colors = cols_r,
+      position = "bottom-right") |> 
+    add_fullscreen_control(position = "top-left") |>
+    add_navigation_control() |> 
+    add_scale_control()
 }
 
 # visualize
@@ -814,34 +896,97 @@ if (file.exists(npp_tif)) {
 
 ```{r export_parquet}
 #| eval: false
+# TODO: model_cell: PARTITION BY (mdl_seq);") # https://duckdb.org/docs/stable/data/parquet/overview
 
-# export tables to parquet for efficient storage
-output_dir <- glue("{dir_data}/derived/sdm_parquet")
-dir_create(output_dir)
+sdm_dd <- glue("{dir_data}/derived/sdm.duckdb")
 
-# export each table
-tables_to_export <- c(
-  "dataset", "model", "species", 
-  "cell", "model_cell", "metric",
-  "cell_metric", "region", "region_metric",
-  "env_layers", "planning_areas"
-)
+# source(here("libs/sdm_functions.R"))
+con_sdm <- dbConnect(duckdb(dbdir = sdm_dd, read_only = F)) |> 
+  load_duckdb_extensions()
+ 
+# dbListTables(con_sdm)
+dbExecute(con_sdm, "SET threads = 8;")
+dbExecute(con_sdm, "SET memory_limit = '20GB';")
 
-for (tbl in tables_to_export) {
-  message(glue("Exporting {tbl} to parquet..."))
-  
-  df <- dbGetQuery(con_sdm, glue("SELECT * FROM {tbl}"))
-  
-  arrow::write_parquet(
-    df, 
-    file.path(output_dir, glue("{tbl}.parquet")),
-    compression = "snappy"
-  )
+dir_pq <- glue("{dir_data}/derived/sdm_parquet")
+dir_create(dir_pq)
+
+dbExecute(con_sdm, glue(
+  "EXPORT DATABASE '{normalizePath(dir_pq)}' (
+    FORMAT parquet,
+    COMPRESSION zstd,
+    ROW_GROUP_SIZE 1_000_000 );")) # 3 secs
+```
+
+## Import from Parquet
+
+```{r import_parquet}
+dbDisconnect(con_sdm, shutdown = T)
+duckdb_shutdown(duckdb())
+if (exists("con_sdm"))
+  dbDisconnect(con_sdm, shutdown = T)
+
+sdm_dd <- glue("{dir_data}/derived/sdm.duckdb")
+if (file_exists(sdm_dd))
+  file_delete(sdm_dd)
+
+# source(here("libs/sdm_functions.R"))
+con_sdm <- dbConnect(duckdb(dbdir = sdm_dd, read_only = F)) |> 
+  load_duckdb_extensions()
+ 
+# dbListTables(con_sdm)
+dbExecute(con_sdm, "SET threads = 8;")
+dbExecute(con_sdm, "SET memory_limit = '20GB';")
+
+# dbExecute(con_sdm, glue("IMPORT DATABASE '{normalizePath(dir_pq)}'"))
+# dbListTables(con_sdm)
+
+for (pq in dir_ls(dir_pq, glob = "*.parquet")) { # pq = dir_ls(dir_pq, glob = "*.parquet")[1]
+  tbl <- path_file(pq) |> str_remove("\\.parquet$")
+  if (!dbExistsTable(con_sdm, tbl)) {
+    message(glue("Importing {tbl} from {basename(pq)}"))
+    dbExecute(con_sdm, glue("CREATE TABLE {tbl} AS SELECT * FROM '{pq}'"))
+  }
+}
+
+# dbExecute(con_sdm, "ALTER TABLE cell ADD PRIMARY KEY (cell_id);")
+# dbExecute(con_sdm, "ALTER TABLE dataset ALTER COLUMN date_created SET DEFAULT CURRENT_DATE;")
+# dbExecute(con_sdm, "ALTER TABLE metric ALTER COLUMN metric_seq SET DEFAULT nextval('metric_metric_seq_seq');")
+# dbExecute(con_sdm, "ALTER TABLE metric ADD PRIMARY KEY (metric_seq);")
+# dbExecute(con_sdm, "ALTER TABLE model ALTER COLUMN mdl_seq SET DEFAULT nextval('model_mdl_seq_seq');")
+# dbExecute(con_sdm, "ALTER TABLE model ADD PRIMARY KEY (mdl_seq);")
+
+## -- CREATE TABLE metric(metric_seq INTEGER DEFAULT(nextval('metric_metric_seq_seq')) PRIMARY KEY, metric_type VARCHAR NOT NULL, description VARCHAR, date_created DATE DEFAULT(CURRENT_DATE));;
+## -- CREATE TABLE model(mdl_seq INTEGER DEFAULT(nextval('model_mdl_seq_seq')) PRIMARY KEY, ds_key VARCHAR, taxa VARCHAR, time_period VARCHAR, region VARCHAR, mdl_type VARCHAR, description VARCHAR, date_created DATE DEFAULT(CURRENT_DATE), FOREIGN KEY (ds_key) REFERENCES dataset(ds_key));;
+
+seqs_exist <- dbGetQuery(con_sdm, "SELECT * FROM duckdb_sequences()") |> pull(sequence_name)
+
+schema_sql <- glue("{dir_pq}/schema.sql")
+for (ln in readLines(schema_sql)){ # ln = readLines(schema_sql)[1]
+  if (str_detect(ln, "CREATE TABLE")) {
+    # tbl <- str_extract(ln, "(?<=CREATE TABLE )[a-z_]+")
+    # if (!dbExistsTable(con_sdm, tbl))
+    #   dbExecute(con_sdm, ln)
+    next
+  } else if (str_detect(ln, "CREATE INDEX")) {
+    # dbExecute(con_sdm, ln)
+    next
+  } else if (str_detect(ln, "CREATE SEQUENCE")) {
+    seq <- str_extract(ln, "(?<=CREATE SEQUENCE )[a-z_]+")
+    tbl <- str_replace(seq, "([[:alnum:]]+)_.*", "\\1")
+    col <- str_replace(seq, glue("{tbl}_([[:alnum:]]+)_seq"), "\\1")
+    
+    if (!seq %in% seqs_exist)
+        dbExecute(con_sdm, ln)
+    
+    dbExecute(con_sdm, glue("ALTER TABLE {tbl} ALTER COLUMN {col} SET DEFAULT nextval('{seq}');"))
+  }
 }
 ```
+
 
 ## Close Connection
 
 ```{r cleanup}
-dbDisconnect(con_sdm)
+dbDisconnect(con_sdm, shutdown = T)
 ```
