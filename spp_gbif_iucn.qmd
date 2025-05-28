@@ -1,0 +1,189 @@
+---
+title: "spp_gbif_iucn"
+editor_options: 
+  chunk_output_type: console
+---
+
+- [db_download_gbif() in db_download.R · ropensci/taxizedb](https://github.com/ropensci/taxizedb/blob/83488da50a01a3ad41d05e9c2a50d3ed4986cc5b/R/db_download.R#L459)
+- [GBIF Backbone Taxonomy](https://www.gbif.org/dataset/d7dddbf4-2cf0-4f39-9b2a-bb099caae36c)
+- [The IUCN Red List of Threatened Species](https://www.gbif.org/dataset/19491596-35ae-4a91-9a98-85cf505f1bd3)
+
+```{r}
+#| label: server
+
+# libraries
+librarian::shelf(
+  dplyr, duckdb, fs, glue, here, readr, ropensci/rredlist, stringr, tibble, 
+  tidyr, vroom, xml2, 
+  quiet = T)
+
+# paths
+is_server    <- Sys.info()[["sysname"]] == "Linux"
+dir_private  <- ifelse(is_server, "/share/private", "~/My Drive/private")
+iucn_tkn_txt <- glue("{dir_private}/iucnredlist.org_api_token_v4.txt")
+dir_data     <- ifelse(is_server, "/share/data"   , "~/My Drive/projects/msens/data")
+dir_gbif     <- glue("{dir_data}/raw/gbif.org")
+spp_dd       <- glue("{dir_data}/derived/spp.duckdb")
+gbif_tsv     <- glue("{dir_gbif}/GBIF Backbone Taxonomy/Taxon.tsv")
+gbif_vrn     <- glue("{dir_gbif}/GBIF Backbone Taxonomy/VernacularName.tsv")
+iucn_tsv     <- glue("{dir_gbif}/iucn-2025-1/taxon.txt")
+iucn_xml     <- glue("{dir_gbif}/iucn-2025-1/meta.xml")
+iucn_vrn     <- glue("{dir_gbif}/iucn-2025-1/vernacularname.txt")
+
+Sys.setenv(IUCN_REDLIST_KEY = readLines(iucn_tkn_txt))
+
+# file_delete(spp_db)
+con_spp <- dbConnect(duckdb(dbdir = spp_dd, read_only = F))
+# dbDisconnect(con_spp, shutdown = T)
+# dbListTables(con_spp)
+```
+
+```{r}
+#| label: load_gbif_iucn_taxon
+
+if (!"gbif" %in% dbListTables(con_spp)){
+  d_gbif <- vroom(
+    gbif_tsv,
+    delim     = "\t",
+    col_types = "icccccccccccccccccccccc",
+    progress  = F) # 6,312,410 × 23
+  
+  dbWriteTable(con_spp, "gbif", d_gbif, append = T, batch_rows = 10000)
+  
+  dbExecute(con_spp, "CREATE UNIQUE INDEX gbif_taxonID_idx on gbif (taxonID)")
+  dbExecute(con_spp, "CREATE INDEX gbif_canonicalName_idx on gbif (canonicalName)")
+  dbExecute(con_spp, "CREATE INDEX gbif_scientificName_idx on gbif (scientificName)")
+  dbExecute(con_spp, "CREATE INDEX gbif_parentNameUsageID_idx on gbif (parentNameUsageID)")
+}
+
+if (!"gbif_vernacular" %in% dbListTables(con_spp)){
+  d_gbif_vrn <- read_tsv(gbif_vrn) # 1,325,248 × 8
+  
+  # dbExecute(con_spp, "DROP TABLE IF EXISTS gbif_vernacular")
+  dbWriteTable(con_spp, "gbif_vernacular", d_gbif_vrn, append = T, batch_rows = 10000)
+  
+  dbExecute(con_spp, "CREATE INDEX gbif_vernacular_taxonID_idx on gbif (taxonID)")
+}
+
+if (!"iucn" %in% dbListTables(con_spp)){
+  d_iucn <- read_tsv(
+    iucn_tsv,
+    col_names = c(
+      "taxonID",
+      "scientificName", "kingdom", "phylum", "class", "order", "family", "genus",
+      "specificEpithet", "scientificNameAuthorship", "taxonRank", 
+      "infraspecificEpithet", "taxonomicStatus", "acceptedNameUsageID", 
+      "bibliographicCitation", "references"))
+  
+  dbWriteTable(con_spp, "iucn", d_gbif, append = T, batch_rows = 10000)
+  
+  dbExecute(con_spp, "CREATE UNIQUE INDEX iucn_taxonID_idx on iucn (taxonID)")
+  dbExecute(con_spp, "CREATE INDEX iucn_canonicalName_idx on iucn (canonicalName)")
+  dbExecute(con_spp, "CREATE INDEX iucn_scientificName_idx on iucn (scientificName)")
+  dbExecute(con_spp, "CREATE INDEX iucn_parentNameUsageID_idx on iucn (parentNameUsageID)")
+}
+
+if (!"iucn_vernacular" %in% dbListTables(con_spp)){
+  d_iucn_vrn <- read_tsv(
+    iucn_vrn,
+    col_names = c(
+      "taxonID", "isPreferredName", "language", "vernacularName"))
+
+  dbWriteTable(con_spp, "iucn_vernacular", d_iucn_vrn, append = T, batch_rows = 10000)
+  
+  dbExecute(con_spp, "CREATE INDEX iucn_vernacular_taxonID_idx on iucn_vernacular (taxonID)")
+}
+```
+
+```{r}
+#| label: iucn_redlist
+
+# Marine code
+sys_marine <- rl_systems()$systems |> 
+  filter(description == "Marine") |>
+  pull(code)
+
+# Marine assessments
+rl_marine <- rl_systems(sys_marine) # (n=362 pages; 36,019 records)
+
+d_all <- rl_marine$assessments |>
+  unnest(scopes, names_sep = "_") |>
+  mutate(
+    scopes_description = unlist(scopes_description),
+    red_list_category_code = factor(
+      red_list_category_code,
+      levels = c("NE", "DD", "LC", "LR/lc", "LR/nt", "NT", "VU", "EN", "CR", "RE", "EW", "EX"),
+      ordered = T))
+d_all$scopes_description |> table()
+#         Arabian Sea           Caribbean 
+#                  58                 315 
+#      Central Africa      Eastern Africa 
+#                  46                   3 
+#              Europe            **Global** 
+#                2003               32394 
+#    **Gulf of Mexico**     Mediterranean 
+#                 956                 785 
+# Northeastern Africa     Northern Africa 
+#                  11                   5 
+#          Pan-Africa        Persian Gulf 
+#                 114                 490 
+#        S. Africa FW      Western Africa 
+#                  13                  31 
+d_gl <- d_all |> 
+  filter(
+    scopes_description == "Global") |> 
+  arrange(sis_taxon_id, year_published, latest, assessment_id) |> 
+  group_by(sis_taxon_id) |>
+  summarise(across(everything(), last), .groups = "drop")
+# 19,678 × 13
+# table(d_gl$red_list_category_code)
+#  CR    DD    EN    EX    LC LR/lc LR/nt    NE    NT    VU 
+# 300  4332   661    22 13068     4     8     3   515   765
+
+d_gom <- d_all |>
+  filter(
+    scopes_description == "Gulf of Mexico") |> 
+  arrange(sis_taxon_id, year_published, latest, assessment_id) |> 
+  group_by(sis_taxon_id) |>
+  summarise(across(everything(), last), .groups = "drop")
+# 938 × 13
+# table(d_goa$red_list_category_code)
+# CR  DD  EN  LC  NT  VU 
+#  1  87  13 807  10  20
+
+# setdiff(d_goa$sis_taxon_id, d_gl$sis_taxon_id) # al GoM species are also global
+
+d_gl_gom <- d_gl |> 
+  select(
+    sis_taxon_id, taxon_scientific_name, red_list_category_code, year_published, assessment_id) |>
+  left_join(
+    d_gom |> 
+      select(
+        sis_taxon_id, red_list_category_code, year_published, assessment_id),
+    by = "sis_taxon_id",
+    suffix = c("", "_gom")) |> 
+  filter(
+    !is.na(red_list_category_code_gom),
+    red_list_category_code != red_list_category_code_gom) |> 
+  arrange(
+    red_list_category_code_gom, 
+    red_list_category_code, 
+    taxon_scientific_name, 
+    year_published, 
+    year_published_gom)
+
+# redlist with all relevant global and some GoM categories where differ
+d_rl <- d_gl |> 
+  left_join(
+    d_gl_gom |> 
+      select(
+        sis_taxon_id, red_list_category_code_gom, year_published_gom, assessment_id_gom),
+    by = "sis_taxon_id") 
+
+dbWriteTable(con_spp, "iucn_redlist", d_rl, append = T)
+
+dbExecute(con_spp, "CREATE UNIQUE INDEX iucn_redlist_sis_taxon_id_idx on iucn_redlist (sis_taxon_id)")
+
+
+dbDisconnect(con_spp, shutdown = T)
+```
