@@ -1,0 +1,512 @@
+---
+title: "spp_gbif_iucn"
+editor_options: 
+  chunk_output_type: console
+---
+
+- [db_download_gbif() in db_download.R · ropensci/taxizedb](https://github.com/ropensci/taxizedb/blob/83488da50a01a3ad41d05e9c2a50d3ed4986cc5b/R/db_download.R#L459)
+- [GBIF Backbone Taxonomy](https://www.gbif.org/dataset/d7dddbf4-2cf0-4f39-9b2a-bb099caae36c)
+- [The IUCN Red List of Threatened Species](https://www.gbif.org/dataset/19491596-35ae-4a91-9a98-85cf505f1bd3)
+
+## Setup
+
+```{r}
+#| label: server
+
+# libraries
+librarian::shelf(
+  dplyr, duckdb, fs, glue, here, readr, ropensci/rredlist, stringr, tibble, 
+  tidyr, vroom, xml2, 
+  quiet = T)
+
+# paths
+is_server    <- Sys.info()[["sysname"]] == "Linux"
+dir_private  <- ifelse(is_server, "/share/private", "~/My Drive/private")
+iucn_tkn_txt <- glue("{dir_private}/iucnredlist.org_api_token_v4.txt")
+dir_data     <- ifelse(is_server, "/share/data"   , "~/My Drive/projects/msens/data")
+dir_gbif     <- glue("{dir_data}/raw/gbif.org")
+spp_dd       <- glue("{dir_data}/derived/spp.duckdb")
+gbif_tsv     <- glue("{dir_gbif}/GBIF Backbone Taxonomy/Taxon.tsv")
+gbif_vrn     <- glue("{dir_gbif}/GBIF Backbone Taxonomy/VernacularName.tsv")
+iucn_tsv     <- glue("{dir_gbif}/iucn-2025-1/taxon.txt")
+iucn_xml     <- glue("{dir_gbif}/iucn-2025-1/meta.xml")
+iucn_vrn     <- glue("{dir_gbif}/iucn-2025-1/vernacularname.txt")
+worms_tsv    <- glue("{dir_gbif}/World Register of Marine Species 2025-05-01 dataset-2011/taxon.txt")
+worms_vrn    <- glue("{dir_gbif}/World Register of Marine Species 2025-05-01 dataset-2011/vernacularname.txt")
+
+Sys.setenv(IUCN_REDLIST_KEY = readLines(iucn_tkn_txt))
+
+# file_delete(spp_db)
+con_spp <- dbConnect(duckdb(dbdir = spp_dd, read_only = F))
+# dbDisconnect(con_spp, shutdown = T)
+# dbListTables(con_spp)
+```
+
+## Load taxonomic databases
+
+```{r}
+#| label: load_taxons_vernaculars
+
+# gbif ----
+if (!"gbif" %in% dbListTables(con_spp)){
+  d_gbif <- vroom(
+    gbif_tsv,
+    delim     = "\t",
+    col_types = "icccccccccccccccccccccc",
+    progress  = F) # 6,312,410 × 23
+  
+  dbWriteTable(con_spp, "gbif", d_gbif, append = T, batch_rows = 10000)
+  
+  dbExecute(con_spp, "CREATE UNIQUE INDEX gbif_taxonID_idx on gbif (taxonID)")
+  dbExecute(con_spp, "CREATE INDEX gbif_canonicalName_idx on gbif (canonicalName)")
+  dbExecute(con_spp, "CREATE INDEX gbif_scientificName_idx on gbif (scientificName)")
+  dbExecute(con_spp, "CREATE INDEX gbif_parentNameUsageID_idx on gbif (parentNameUsageID)")
+}
+
+# gbif_vernacular ----
+if (!"gbif_vernacular" %in% dbListTables(con_spp)){
+  d_gbif_vrn <- read_tsv(gbif_vrn) # 1,325,248 × 8
+  
+  # dbExecute(con_spp, "DROP TABLE IF EXISTS gbif_vernacular")
+  dbWriteTable(con_spp, "gbif_vernacular", d_gbif_vrn, append = T, batch_rows = 10000)
+  
+  dbExecute(con_spp, "CREATE INDEX gbif_vernacular_taxonID_idx on gbif (taxonID)")
+}
+
+# worms ----
+if (!"worms" %in% dbListTables(con_spp)){
+  d_worms <- vroom(
+    worms_tsv,
+    delim     = "\t",
+    col_types = c("c", rep("c", 31)) |> paste(collapse=""),
+    progress  = F) |> 
+    mutate(across(
+      c(taxonID, 
+        scientificNameID, 
+        acceptedNameUsageID, 
+        parentNameUsageID, 
+        datasetID),
+      ~ str_replace(.x, "urn:lsid:marinespecies.org:taxname:", "") |> 
+        as.integer() )) # 1,475,582 x 32
+
+  # dbExecute(con_spp, "DROP TABLE IF EXISTS worms")
+  dbWriteTable(con_spp, "worms", d_worms, append = T, batch_rows = 10000)
+
+  dbExecute(con_spp, "CREATE UNIQUE INDEX worms_taxonID_idx on worms (taxonID)")
+  dbExecute(con_spp, "CREATE INDEX worms_acceptedNameUsageID_idx on worms (acceptedNameUsageID)")
+  dbExecute(con_spp, "CREATE INDEX worms_scientificName_idx on worms (scientificName)")
+  dbExecute(con_spp, "CREATE INDEX worms_parentNameUsageID_idx on worms (parentNameUsageID)")
+}
+
+# worms_vernacular ----
+if (!"worms_vernacular" %in% dbListTables(con_spp)){
+  d_worms_vrn <- read_tsv(worms_vrn) |> 
+    mutate(
+      taxonID = str_replace(taxonID, "urn:lsid:marinespecies.org:taxname:", "") |> 
+        as.integer() )  # 105,729 × 5
+  
+  # dbExecute(con_spp, "DROP TABLE IF EXISTS worms_vernacular")
+  dbWriteTable(con_spp, "worms_vernacular", d_worms_vrn, append = T, batch_rows = 10000)
+  
+  dbExecute(con_spp, "CREATE INDEX worms_vernacular_taxonID_idx on worms (taxonID)")
+}
+
+# iucn ----
+if (!"iucn" %in% dbListTables(con_spp)){
+  d_iucn <- read_tsv(
+    iucn_tsv,
+    col_names = c(
+      "taxonID",
+      "scientificName", "kingdom", "phylum", "class", "order", "family", "genus",
+      "specificEpithet", "scientificNameAuthorship", "taxonRank", 
+      "infraspecificEpithet", "taxonomicStatus", "acceptedNameUsageID", 
+      "bibliographicCitation", "references"))
+  
+  # dbExecute(con_spp, "DROP TABLE IF EXISTS iucn")
+  dbWriteTable(con_spp, "iucn", d_iucn)
+  
+  dbExecute(con_spp, "CREATE UNIQUE INDEX iucn_taxonID_idx on iucn (taxonID)")
+  dbExecute(con_spp, "CREATE INDEX iucn_canonicalName_idx on iucn (canonicalName)")
+  dbExecute(con_spp, "CREATE INDEX iucn_scientificName_idx on iucn (scientificName)")
+  dbExecute(con_spp, "CREATE INDEX iucn_parentNameUsageID_idx on iucn (parentNameUsageID)")
+}
+
+# iucn_vernacular ----
+if (!"iucn_vernacular" %in% dbListTables(con_spp)){
+  d_iucn_vrn <- read_tsv(
+    iucn_vrn,
+    col_names = c(
+      "taxonID", "isPreferredName", "language", "vernacularName"))
+
+  dbWriteTable(con_spp, "iucn_vernacular", d_iucn_vrn, append = T, batch_rows = 10000)
+  
+  dbExecute(con_spp, "CREATE INDEX iucn_vernacular_taxonID_idx on iucn_vernacular (taxonID)")
+}
+```
+
+## Load redlist
+
+```{r}
+#| label: iucn_redlist
+
+if (!"iucn_redlist" %in% dbListTables(con_spp)){
+  # Marine code
+  sys_marine <- rl_systems()$systems |> 
+    filter(description == "Marine") |>
+    pull(code)
+  
+  # Marine assessments
+  rl_marine <- rl_systems(sys_marine) # (n=362 pages; 36,019 records)
+  
+  d_all <- rl_marine$assessments |>
+    unnest(scopes, names_sep = "_") |>
+    mutate(
+      scopes_description = unlist(scopes_description),
+      red_list_category_code = factor(
+        red_list_category_code,
+        levels = c("NE", "DD", "LC", "LR/lc", "LR/nt", "NT", "VU", "EN", "CR", "RE", "EW", "EX"),
+        ordered = T))
+  d_all$scopes_description |> table()
+  #         Arabian Sea           Caribbean 
+  #                  58                 315 
+  #      Central Africa      Eastern Africa 
+  #                  46                   3 
+  #              Europe            **Global** 
+  #                2003               32394 
+  #    **Gulf of Mexico**     Mediterranean 
+  #                 956                 785 
+  # Northeastern Africa     Northern Africa 
+  #                  11                   5 
+  #          Pan-Africa        Persian Gulf 
+  #                 114                 490 
+  #        S. Africa FW      Western Africa 
+  #                  13                  31 
+  d_gl <- d_all |> 
+    filter(
+      scopes_description == "Global") |> 
+    arrange(sis_taxon_id, year_published, latest, assessment_id) |> 
+    group_by(sis_taxon_id) |>
+    summarise(across(everything(), last), .groups = "drop")
+  # 19,678 × 13
+  # table(d_gl$red_list_category_code)
+  #  CR    DD    EN    EX    LC LR/lc LR/nt    NE    NT    VU 
+  # 300  4332   661    22 13068     4     8     3   515   765
+  
+  d_gom <- d_all |>
+    filter(
+      scopes_description == "Gulf of Mexico") |> 
+    arrange(sis_taxon_id, year_published, latest, assessment_id) |> 
+    group_by(sis_taxon_id) |>
+    summarise(across(everything(), last), .groups = "drop")
+  # 938 × 13
+  # table(d_goa$red_list_category_code)
+  # CR  DD  EN  LC  NT  VU 
+  #  1  87  13 807  10  20
+  
+  # setdiff(d_goa$sis_taxon_id, d_gl$sis_taxon_id) # al GoM species are also global
+  
+  # TODO: apply Gulf of Mexico where year >= year_global and specific to region
+  d_gl_gom <- d_gl |> 
+    select(
+      sis_taxon_id, taxon_scientific_name, red_list_category_code, year_published, assessment_id) |>
+    left_join(
+      d_gom |> 
+        select(
+          sis_taxon_id, red_list_category_code, year_published, assessment_id),
+      by = "sis_taxon_id",
+      suffix = c("", "_gom")) |> 
+    filter(
+      !is.na(red_list_category_code_gom),
+      red_list_category_code != red_list_category_code_gom) |> 
+    arrange(
+      red_list_category_code_gom, 
+      red_list_category_code, 
+      taxon_scientific_name, 
+      year_published, 
+      year_published_gom)
+  
+  # redlist with all relevant global and some GoM categories where differ
+  d_rl <- d_gl |> 
+    left_join(
+      d_gl_gom |> 
+        select(
+          sis_taxon_id, red_list_category_code_gom, year_published_gom, assessment_id_gom),
+      by = "sis_taxon_id") 
+  
+  if (F){
+    # FIX: rm duplicate scientific_names, since sis_taxon_id can change
+    # TODO: redo from begin with group_by(taxon_scientific_name), since might've lost GoM information
+    con_spp <- dbConnect(duckdb(dbdir = spp_db, read_only = F))
+    d_rl <- tbl(con_spp, "iucn_redlist") |>                    # 19,678 × 16
+      collect() |> 
+      arrange(taxon_scientific_name, year_published, latest, assessment_id) |> 
+      group_by(taxon_scientific_name) |>
+      summarise(across(everything(), last), .groups = "drop")  # 19,530 × 16
+    dbExecute(con_spp, "DROP TABLE IF EXISTS iucn_redlist;")
+  }
+  
+  dbWriteTable(con_spp, "iucn_redlist", d_rl, append = T)
+  
+  dbExecute(con_spp, "CREATE UNIQUE INDEX iucn_redlist_sis_taxon_id_idx on iucn_redlist (sis_taxon_id)")
+}
+
+dbDisconnect(con_spp, shutdown = T)
+
+# TODO:
+# - get IDs for existing species, borrowing from:
+#   - [taxadb](https://docs.ropensci.org/taxadb/articles/intro.html)
+#   - [taxizedb](https://docs.ropensci.org/taxizedb/articles/taxizedb.html)
+# - use colors for extinction risk categories:
+#   [IUCN Red List color scales — scale_color_iucn • rredlist](https://docs.ropensci.org/rredlist/reference/scale_iucn.html)
+```
+
+## Match sdm to spp
+
+### Alter sdm.species
+
+Differentiate names (`scientific_name`, `common_name`) from:
+
+- `_dataset`: original dataset; versus 
+- `_accepted`: taxonomic authority (*)
+
+```{r}
+# check if species.scientific_name has been split already
+if ("scientific_name" %in% dbListFields(con_sdm, "species")) {
+
+  sdm_species_csv <- glue("{dir_data}/derived/sdm_species.csv")
+  dbExecute(con_sdm, glue(
+    "COPY species TO '{sdm_species_csv}' (HEADER, DELIMITER ',');"))
+  d_species <- read_csv(sdm_species_csv) |> 
+    rename(
+      scientific_name_dataset  = scientific_name,
+      common_name_dataset      = common_name) |> 
+    mutate(
+      scientific_name_accepted = NA_character_,
+      common_name_accepted     = NA_character_)
+  dbExecute(con_sdm, "DROP TABLE IF EXISTS species;")
+  dbWriteTable(con_sdm, "species", d_species)
+  unlink(sdm_species_csv)
+  
+}
+
+if (F){
+  # do once since creating species table in ingest_aquamaps_to_sdm_duckdb.qmd
+  dbExecute(con_sdm, "ALTER TABLE species ADD COLUMN IF NOT EXISTS redlist_code VARCHAR;")
+  dbExecute(con_sdm, "ALTER TABLE species ADD COLUMN IF NOT EXISTS redlist_year INTEGER;")
+  dbExecute(con_sdm, "ALTER TABLE species ADD COLUMN IF NOT EXISTS iucn_id INTEGER;")
+  dbExecute(con_sdm, "ALTER TABLE species RENAME COLUMN aphia_id TO worms_id;")
+  dbExecute(con_sdm, "ALTER TABLE species ALTER worms_id SET DATA TYPE INTEGER;")
+  dbExecute(con_sdm, "ALTER TABLE species ALTER gbif_id SET DATA TYPE INTEGER;")
+  dbExecute(con_sdm, "ALTER TABLE species ALTER itis_id SET DATA TYPE INTEGER;")
+}
+```
+
+```{r}
+#| label: match_sdm_spp
+
+# match sdm datasets to species in spp_gbif_iucn
+librarian::shelf(
+  DBI, dbplyr, dplyr, duckdb, fs, glue, here, logger, purrr, readr,
+  stringr, tibble, tidyr, quiet = T )
+options(readr.show_col_types = F)
+
+# source(here("libs/db.R"))
+# source(here("libs/am_functions.R"))
+# source(here("libs/sdm_functions.R"))
+
+# set up directories
+is_server <-  Sys.info()[["sysname"]] == "Linux"
+dir_data <- ifelse(
+  is_server,
+  "/share/data",
+  "~/My Drive/projects/msens/data")
+
+sdm_db <- glue("{dir_data}/derived/sdm.duckdb")
+spp_db <- glue("{dir_data}/derived/spp.duckdb")
+
+# file_delete(sdm_dd)
+con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F))
+# dbDisconnect(con_sdm, shutdown = T)
+# dbDisconnect(con_spp, shutdown = T)
+# duckdb_shutdown(duckdb())
+# dbListTables(con_sdm)
+# dbExecute(con_sdm, "SET threads = 6;")
+# dbExecute(con_sdm, "SET memory_limit = '10GB';")
+
+# attach spp database for querying matches
+dbExecute(con_sdm, glue("ATTACH DATABASE '{spp_db}' AS spp (READ_ONLY);"))
+# dbListTables(con_sdm)
+# tbl(con_sdm, "spp.iucn_redlist")
+
+# d_sp <- tbl(con_sdm, "species") |> 
+#   collect() # 17,550 × 15
+
+# update species.redlist_code|year ----
+d_sp_rl <- dbGetQuery(
+  con_sdm, 
+  "SELECT 
+    species.scientific_name_dataset, 
+    spp.iucn_redlist.taxon_scientific_name,
+    spp.iucn_redlist.red_list_category_code,
+    spp.iucn_redlist.year_published
+  FROM species, spp.iucn_redlist
+  -- WHERE spp.iucn_redlist.taxon_scientific_name ILIKE species.scientific_name_dataset || '%' -- too many matches
+  WHERE spp.iucn_redlist.taxon_scientific_name = species.scientific_name_dataset;") |> 
+  tibble() |> 
+  mutate(
+    red_list_category_code = factor(
+      red_list_category_code,
+      levels = c("NE", "DD", "LC", "LR/lc", "LR/nt", "NT", "VU", "EN", "CR", "RE", "EW", "EX"),
+      ordered = T))  # 6,490 × 3
+# table(d_sp_rl$red_list_category_code, useNA = "ifany")
+ # NE    DD    LC LR/lc LR/nt    NT    VU    EN    CR    RE    EW    EX 
+ #  0   357  5609     0     0   112   158   219    47     0     0     1
+
+duckdb_register(con_sdm, "temp_redlist", d_sp_rl)
+dbExecute(
+  con_sdm, 
+  "UPDATE species SET 
+    redlist_code = temp_redlist.red_list_category_code,
+    redlist_year = temp_redlist.year_published
+  FROM temp_redlist 
+  WHERE species.scientific_name_dataset = temp_redlist.scientific_name_dataset;")  # 6490
+duckdb::duckdb_unregister(con_sdm, "temp_redlist")
+
+# update species.worms_id ----
+
+# d_worms10 <- dbGetQuery(
+#   con_sdm, 
+#   "SELECT * FROM spp.worms WHERE kingdom = 'Animalia' LIMIT 10") |> 
+#   tibble()
+# names(d_worms10)
+# View(d_worms10)
+
+d_sp_worms <- tbl(con_sdm, "species") |> 
+  select(scientific_name_dataset) |> 
+  left_join(
+    tbl(con_sdm, "spp.worms"),
+    by = c("scientific_name_dataset" = "scientificName")) |> 
+  collect() # 17,841 × 32
+# is.na(d_sp_worms$taxonID) |>
+#   table(useNA = "ifany") # 17,540 × 23
+#  FALSE  TRUE 
+# 17,414   427
+# sum(duplicated(d_sp_worms$scientific_name_dataset))
+# 291
+
+d_sp_worms_dupes <- d_sp_worms |> 
+  filter(
+    scientific_name_dataset %in% 
+      scientific_name_dataset[duplicated(d_sp_worms$scientific_name_dataset)]) |> 
+  arrange(scientific_name_dataset, taxonomicStatus) |> 
+  relocate(scientific_name_dataset, taxonomicStatus)
+
+# TODO: add WoRMS duplicates (n = 270), excluding for now
+# d_sp_worms_dupes_sum <- d_sp_worms_dupes |>
+#   group_by(scientific_name_dataset) |>
+#   summarise(
+#     n = n(),
+#     taxonomic_statuses = paste(sort(taxonomicStatus), collapse = ", "),
+#     n_accepted   = sum(taxonomicStatus == "accepted"),
+#     n_unaccepted = sum(taxonomicStatus == "unaccepted"),
+#     .groups = "drop") |>
+#   arrange(desc(n)) # 270 × 5
+# table(d_sp_worms_dupes_sum$n_accepted, useNA = "ifany")
+#  0   1   2 
+# 32 229   9
+# View(d_sp_worms_dupes_sum)
+# 
+# table(is.na(d_sp_worms$acceptedNameUsageID))
+# FALSE  TRUE 
+# 16829    24
+
+d_sp_worms <- d_sp_worms |> 
+  filter(
+    !is.na(taxonID),
+    !taxonID %in% d_sp_worms_dupes$taxonID) |>  # 16,853 × 32
+  mutate(
+    worms_id = ifelse(
+      is.na(acceptedNameUsageID),
+      taxonID,
+      acceptedNameUsageID)) |> 
+  select(scientific_name_dataset, worms_id)
+  
+duckdb_register(con_sdm, "temp_worms", d_sp_worms)
+dbExecute(
+  con_sdm, 
+  "UPDATE species SET 
+    worms_id = temp_worms.worms_id,
+  FROM temp_worms 
+  WHERE species.scientific_name_dataset = temp_worms.scientific_name_dataset;")  # 16,853
+duckdb::duckdb_unregister(con_sdm, "temp_worms")
+
+# update species.gbif_id ----
+
+# dbExecute(con_sdm, "UPDATE species SET iucn_id = NULL")
+
+# d_gbif10 <- dbGetQuery(
+#   con_sdm, 
+#   "SELECT * FROM spp.gbif WHERE kingdom = 'Animalia' AND canonicalName != genericName LIMIT 10") |> 
+#   tibble()
+# names(d_gbif10)
+# View(d_gbif10)
+
+d_sp_gbif <- tbl(con_sdm, "species") |> 
+  select(scientific_name_dataset) |> 
+  left_join(
+    tbl(con_sdm, "spp.gbif"),
+    by = c("scientific_name_dataset" = "canonicalName")) |> 
+  collect() # 17,907 × 23
+# is.na(d_sp_gbif$taxonID) |> 
+#   table(useNA = "ifany") # 17,540 × 23
+#  FALSE   TRUE 
+# 14,312  3,595 
+# sum(duplicated(d_sp_gbif$scientific_name_dataset))
+# 357
+sp_gbif_dupes <- d_sp_gbif |> 
+  filter(duplicated(d_sp_gbif$scientific_name_dataset)) |> 
+  distinct(scientific_name_dataset) |>
+  pull(scientific_name_dataset)
+# length(sp_gbif_dupes) # 325
+# TODO: add GBIF duplicates (n = 325), excluding for now
+d_sp_gbif <- d_sp_gbif |> 
+  filter(
+    scientific_name_dataset %in% sp_gbif_dupes) # 682 × 23
+
+d_sp_gbif |> 
+  mutate(
+    taxonID_isna = is.na(taxonID),
+    acceptedNameUsageID_isna = is.na(acceptedNameUsageID)) |> 
+  select(taxonID_isna, acceptedNameUsageID_isna) |> 
+  table()
+#             acceptedNameUsageID_isna
+# taxonID_isna FALSE TRUE
+#        FALSE   239  443
+d_sp_gbif <- d_sp_gbif |> 
+  mutate(
+    gbif_id = ifelse(
+      is.na(acceptedNameUsageID),
+      taxonID,
+      acceptedNameUsageID)) |> 
+  select(scientific_name_dataset, gbif_id)
+
+# dbExecute(con_sdm, "UPDATE species SET gbif_id = NULL")
+duckdb_register(con_sdm, "temp_gbif", d_sp_gbif)
+dbExecute(
+  con_sdm, 
+  "UPDATE species SET 
+    gbif_id = temp_gbif.gbif_id
+  FROM temp_gbif 
+  WHERE species.scientific_name_dataset = temp_gbif.scientific_name_dataset;")  # 682
+duckdb::duckdb_unregister(con_sdm, "temp_gbif")
+
+# add taxa ----
+flds_gbif  <- dbGetQuery(con_sdm, "SELECT * FROM spp.gbif LIMIT 1;") |> names()
+flds_worms <- dbGetQuery(con_sdm, "SELECT * FROM spp.worms LIMIT 1;") |> names()
+
+flds_x <- intersect(flds_gbif, flds_worms)
+# TODO: write sdm.taxa table; use gbif.canonicalName & worms.scientificName for scientific_name; janitor::clean_names()
+setdiff(flds_gbif, flds_worms)
+setdiff(flds_worms, flds_gbif)
+```
+

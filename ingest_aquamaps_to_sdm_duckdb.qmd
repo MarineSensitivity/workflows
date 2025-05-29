@@ -377,8 +377,6 @@ if (!dbExistsTable(con_sdm, "ply_planareas")) {
     st_break_antimeridian()
   
   ddbs_write_vector(con_sdm, ply_pa, "ply_planareas")
-  # dbExecute(con_sdm, "CREATE INDEX idx_ply_planareas_geom ON ply_planareas(geom)")
-  # key size of 313193 bytes exceeds the maximum size of 122880 bytes for this ART
   dbExecute(con_sdm, "CREATE INDEX idx_ply_planareas_geom ON ply_planareas USING RTREE (geom)") # TODO: redo with USING RTREE
 }
 
@@ -629,12 +627,13 @@ for (i in 1:n){  # i = 10 # i = 1175
 ## Add model_cell indexes after mass insert
 
 ```{r}
-dbExecute(con_sdm, "CREATE INDEX idx_model_cell_cell_id ON model_cell(cell_id)")
-dbExecute(con_sdm, "CREATE INDEX idx_model_cell_mdl_seq ON model_cell(mdl_seq)")
 dbExecute(con_sdm, "CREATE INDEX idx_species_taxa ON species(ds_key, taxa)")
 dbExecute(con_sdm, "CREATE INDEX idx_model_taxa ON model(ds_key, taxa)")
+dbExecute(con_sdm, "CREATE INDEX idx_model_cell_mdl_seq ON model_cell(mdl_seq)")
+# dbExecute(con_sdm, "CREATE INDEX idx_model_cell_cell_id ON model_cell(cell_id)")
+# Out of Memory Error: could not allocate block of size 256.0 KiB (9.3 GiB/9.3 GiB used)
+# TODO: order by cell_id in first column and save as parquet
 ```
-
 
 ## Calculate Biodiversity Metrics
 
@@ -664,20 +663,22 @@ message("Calculating species richness...")
 
 richness_metric_seq <- metric_ids$metric_seq[metric_ids$metric_type == "species_richness"]
 
-
 # dbExecute(con_sdm, "TRUNCATE cell_metric")
 
-dbExecute(con_sdm, glue("
-INSERT INTO cell_metric (cell_id, metric_seq, value)
-SELECT 
-  mc.cell_id,
-  {richness_metric_seq} as metric_seq,
-  COUNT(DISTINCT m.taxa) as value
-FROM model_cell mc
-JOIN model m ON mc.mdl_seq = m.mdl_seq
-WHERE mc.value > 0.5  -- presence threshold
-GROUP BY mc.cell_id
-"))
+# dbExecute(con_sdm, glue("DELETE FROM cell_metric WHERE metric_seq = {richness_metric_seq}"))
+
+system.time({
+  dbExecute(con_sdm, glue("
+  INSERT INTO cell_metric (cell_id, metric_seq, value)
+  SELECT 
+    mc.cell_id,
+    {richness_metric_seq} as metric_seq,
+    COUNT(DISTINCT m.taxa) as value
+  FROM model_cell mc
+  JOIN model m ON mc.mdl_seq = m.mdl_seq
+  WHERE mc.value > 0.5  -- presence threshold
+  GROUP BY mc.cell_id"))
+}) # 34.346 sec
 
 # calculate Shannon diversity index
 message("Calculating Shannon diversity...")
@@ -700,6 +701,74 @@ FROM (
 WHERE p > 0
 GROUP BY cell_id
 "))
+```
+
+## Calculate Extinction Risk Metrics by Class
+
+```{r calc_metrics_redlist}
+#| eval: false
+
+# tbl(con_sdm, "species") |> 
+#   pull(sp_cat) |> 
+#   table(useNA = "ifany")
+#  crustacean           fish marine mammal        mollusk          other    sea turtle 
+#       3,025          6,328            85          3,920          4,159            33  
+sp_cats <- tbl(con_sdm, "species") |> distinct(sp_cat) |> pull(sp_cat)
+for (sp_cat in sp_cats[-1]){ # sp_cat = sp_cats[1]
+  
+  message(glue("Calculating extinction risk metrics for {sp_cat}..."))
+  
+  metric_type <- glue("extrisk_{str_replace(sp_cat, ' ', '_')}")
+  description <- "Extinction risk for {sp_cat}"
+  # TODO: rename metric_type -> metric_key, description
+  
+  dbExecute(con_sdm, glue("
+    INSERT INTO metric (metric_type, description)
+    VALUES ('{metric_type}', '{description}')" ))
+
+  metric_seq <- dbGetQuery(con_sdm, glue(
+    "SELECT max(metric_seq) AS metric_seq FROM metric WHERE metric_type = '{metric_type}'"))
+  
+  # get species in this category
+  d_sp <- tbl(con_sdm, "species") |> 
+    filter(sp_cat == !!sp_cat) |> 
+    select(taxa, sp_key, redlist_code) |> 
+    filter(is.na(redlist_code)) |> 
+    collect()
+  
+  d_rl <- tbl(con_sdm, "species") |> 
+    # filter(sp_cat == !!sp_cat) |> 
+    select(taxa, sp_key, redlist_code) |> 
+    filter(
+      !is.na(redlist_code),
+      !redlist_code %in% c("DD","EX")) |> 
+    collect() |> 
+    mutate(
+      rl_score = case_match(
+        redlist_code,
+        # skipped: EX (extinct), NE (not evaluated), DD (data deficient), <NA> (not available)
+        # https://oceanhealthindex.org/images/htmls/Supplement.html#62_Biodiversity
+        "CR" ~ 1,       #  - CR: Critically Endangered	
+        "EN" ~ 0.8,     #  - EN: Endangered	
+        "VU" ~ 0.6,     #  - VU: Vulnerable
+        "NT" ~ 0.4,     #  - NT: Near Threatened
+        "LC" ~ 0.2))    #  - LC: Least Concern
+  
+  # dbListTables(con_sdm)
+  duckdb_register(con_sdm, "temp_rl", d_rl)
+  dbExecute(con_sdm, glue("
+    INSERT INTO cell_metric (cell_id, metric_seq, value)
+    SELECT 
+      mc.cell_id,
+      {metric_seq} as metric_seq,
+      SUM(rl.rl_score * mc.value)
+    FROM model_cell mc
+    JOIN model m ON mc.mdl_seq = m.mdl_seq
+    JOIN temp_rl rl ON m.taxa = rl.taxa
+    GROUP BY mc.cell_id"))  # 662,075
+  duckdb::duckdb_unregister(con_sdm, "temp_rl")
+}
+
 ```
 
 ## Generate Biodiversity Raster
@@ -798,8 +867,7 @@ mapgl_rast(r_richness, palette = "YlOrRd", layer_name = "Species Richness")
 
 # first, register planning areas as regions
 planning_area_regions <- dbGetQuery(con_sdm, "
-  SELECT pa_key, pa_name FROM planning_areas
-")
+  SELECT pa_key, pa_name FROM planning_areas")
 
 for (i in 1:nrow(planning_area_regions)) {
   dbExecute(con_sdm, glue("
@@ -894,6 +962,36 @@ if (file.exists(npp_tif)) {
 
 ## Export to Parquet
 
+```{r}
+d <- dbGetQuery(con_sdm, "SELECT * FROM duckdb_tables() WHERE table_name = 'model_cell';") 
+glimpse(d) # 604,449,630 rows
+# $ database_name          <chr> "sdm"
+# $ database_oid           <dbl> 546
+# $ schema_name            <chr> "main"
+# $ schema_oid             <dbl> 548
+# $ table_name             <chr> "model_cell"
+# $ table_oid              <dbl> 605
+# $ comment                <chr> NA
+# $ tags                   <list> [<data.frame[0 x 2]>]
+# $ internal               <lgl> FALSE
+# $ temporary              <lgl> FALSE
+# $ has_primary_key        <lgl> FALSE
+# $ estimated_size         <dbl> 604449630
+# $ column_count           <dbl> 3
+# $ index_count            <dbl> 1
+# $ check_constraint_count <dbl> 0
+# $ sql                    <chr> "CREATE TABLE model_cell(cell_id INTEGER, mdl_seq INTEGER, \"value\" INTEGER…
+
+
+tbl(con_sdm, "model_cell")
+#    cell_id mdl_seq value
+#      <int>   <int> <int>
+#  1     990       1     1
+#  2     991       1     1
+#  3     992       1     1
+```
+
+
 ```{r export_parquet}
 #| eval: false
 # TODO: model_cell: PARTITION BY (mdl_seq);") # https://duckdb.org/docs/stable/data/parquet/overview
@@ -916,15 +1014,36 @@ dbExecute(con_sdm, glue(
     FORMAT parquet,
     COMPRESSION zstd,
     ROW_GROUP_SIZE 1_000_000 );")) # 3 secs
+
+mdl_cell_pq <- glue("{dir_pq}/model_cell.parquet")
+
+mdl_cell_pq <- glue("{dir_data}/derived/sdm_model_cell.parquet")
+
+# Write sorted parquet -- note that this is not a partitioned table, not faster than native
+# dbExecute(con_sdm, glue(
+#   "COPY (
+#     SELECT cell_id, mdl_seq, value 
+#     FROM model_cell 
+#     ORDER BY cell_id, mdl_seq ) TO '{mdl_cell_pq}' 
+#   (FORMAT 'parquet', COMPRESSION 'zstd') "))
+# 
+# # Read back as external table or view
+# dbExecute(con_sdm, glue(
+#   "CREATE VIEW model_cell_view AS SELECT * FROM '{mdl_cell_pq}' " ))
+# dbExecute(con_sdm, "DROP VIEW IF EXISTS model_cell_view;")
+# TODO: use VIEWs for read-only duckdb later for chunking out files, 
+#   but doesn't seem faster than native duckdb table
+
 ```
 
 ## Import from Parquet
 
 ```{r import_parquet}
-dbDisconnect(con_sdm, shutdown = T)
-duckdb_shutdown(duckdb())
-if (exists("con_sdm"))
+if (exists("con_sdm")){
   dbDisconnect(con_sdm, shutdown = T)
+  rm(con_sdm)
+}
+duckdb_shutdown(duckdb())
 
 sdm_dd <- glue("{dir_data}/derived/sdm.duckdb")
 if (file_exists(sdm_dd))
@@ -982,6 +1101,7 @@ for (ln in readLines(schema_sql)){ # ln = readLines(schema_sql)[1]
     dbExecute(con_sdm, glue("ALTER TABLE {tbl} ALTER COLUMN {col} SET DEFAULT nextval('{seq}');"))
   }
 }
+
 ```
 
 
