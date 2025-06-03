@@ -131,7 +131,7 @@ model_cell {
 
 metric {
   int metric_seq      PK  "auto-incrementing metric ID"
-  str metric_type         "species_richness, shannon_index, etc."
+  str metric_key         "species_richness, shannon_index, etc."
   str description
   date date_created       "date metric was created"
 }
@@ -272,7 +272,7 @@ dbExecute(con_sdm, "
 dbExecute(con_sdm, "
   CREATE TABLE metric (
     metric_seq INTEGER PRIMARY KEY DEFAULT nextval('metric_metric_seq_seq'),
-    metric_type VARCHAR NOT NULL,
+    metric_key VARCHAR NOT NULL,
     description TEXT,
     date_created DATE DEFAULT CURRENT_DATE)")
 
@@ -678,7 +678,7 @@ dbExecute(con_sdm, "CREATE INDEX idx_model_cell_mdl_seq ON model_cell(mdl_seq)")
 
 # first create metric definitions
 metrics_to_create <- tibble::tribble(
-  ~metric_type,         ~description,
+  ~metric_key,         ~description,
   "species_richness",   "Number of species with suitability > 0.5",
   "shannon_index",      "Shannon diversity index based on suitability values",
   "simpson_index",      "Simpson diversity index based on suitability values"
@@ -686,18 +686,18 @@ metrics_to_create <- tibble::tribble(
 
 for (i in 1:nrow(metrics_to_create)) {
   dbExecute(con_sdm, glue("
-    INSERT INTO metric (metric_type, description)
-    VALUES ('{metrics_to_create$metric_type[i]}', '{metrics_to_create$description[i]}')
+    INSERT INTO metric (metric_key, description)
+    VALUES ('{metrics_to_create$metric_key[i]}', '{metrics_to_create$description[i]}')
   "))
 }
 
 # get metric IDs
-metric_ids <- dbGetQuery(con_sdm, "SELECT metric_seq, metric_type FROM metric")
+metric_ids <- dbGetQuery(con_sdm, "SELECT metric_seq, metric_key FROM metric")
 
 # calculate species richness per cell
 message("Calculating species richness...")
 
-richness_metric_seq <- metric_ids$metric_seq[metric_ids$metric_type == "species_richness"]
+richness_metric_seq <- metric_ids$metric_seq[metric_ids$metric_key == "species_richness"]
 
 # dbExecute(con_sdm, "TRUNCATE cell_metric")
 
@@ -719,7 +719,7 @@ system.time({
 # calculate Shannon diversity index
 message("Calculating Shannon diversity...")
 
-shannon_metric_seq <- metric_ids$metric_seq[metric_ids$metric_type == "shannon_index"]
+shannon_metric_seq <- metric_ids$metric_seq[metric_ids$metric_key == "shannon_index"]
 
 dbExecute(con_sdm, glue("
 INSERT INTO cell_metric (cell_id, metric_seq, value)
@@ -749,6 +749,8 @@ GROUP BY cell_id
 #   table(useNA = "ifany")
 #  crustacean           fish marine mammal        mollusk          other    sea turtle 
 #       3,025          6,328            85          3,920          4,159            33  
+
+# dbGetQuery(con_sdm, "SELECT count(*) FROM cell_metric")
 sp_cats <- c(
   "all",  # 17,550
   tbl(con_sdm, "species") |> distinct(sp_cat) |> pull(sp_cat))
@@ -756,19 +758,27 @@ for (sp_cat in sp_cats){ # sp_cat = sp_cats[1]
   
   message(glue("Calculating extinction risk metrics for {sp_cat}..."))
   
-  metric_type <- glue("extrisk_{str_replace(sp_cat, ' ', '_')}")
+  metric_key <- glue("extrisk_{str_replace(sp_cat, ' ', '_')}")
   description <- glue("Extinction risk for {sp_cat}")
-  # TODO: rename metric_type -> metric_key, description
+  # TODO: rename metric_key -> metric_key, description
 
+  # Get metric_seq first, then delete/insert
+  existing_seq <- dbGetQuery(con_sdm, glue(
+    "SELECT metric_seq FROM metric WHERE metric_key = '{metric_key}'"))
+  
+  if (nrow(existing_seq) > 0) {
+    metric_seq <- existing_seq$metric_seq
+    dbExecute(con_sdm, glue("DELETE FROM cell_metric WHERE metric_seq = {metric_seq}"))
+    dbExecute(con_sdm, glue("DELETE FROM zone_metric WHERE metric_seq = {metric_seq}"))
+    dbExecute(con_sdm, glue("DELETE FROM metric WHERE metric_seq = {metric_seq}"))
+  } 
+  
   dbExecute(con_sdm, glue("
-    DELETE FROM metric WHERE metric_type = '{metric_type}'" ))
-    
-  dbExecute(con_sdm, glue("
-    INSERT INTO metric (metric_type, description)
-    VALUES ('{metric_type}', '{description}')" ))
+    INSERT INTO metric (metric_key, description)
+    VALUES ('{metric_key}', '{description}')" ))
 
   metric_seq <- dbGetQuery(con_sdm, glue(
-    "SELECT max(metric_seq) AS metric_seq FROM metric WHERE metric_type = '{metric_type}'"))
+    "SELECT max(metric_seq) AS metric_seq FROM metric WHERE metric_key = '{metric_key}'"))
   
   d_rl <- tbl(con_sdm, "species") |> # 17,550
     filter(if (!!sp_cat == "all") T else sp_cat == !!sp_cat) |> 
@@ -807,7 +817,7 @@ for (sp_cat in sp_cats){ # sp_cat = sp_cats[1]
 
 ## Create new EcoRegions for 2025 Planning Areas
 
-```{r calc_metrics_planning_areas}
+```{r new_ecoregions_2025}
 librarian::shelf(
   mapview, units)
 source(here("libs/db.R")) # con
@@ -834,11 +844,14 @@ drop_ctr_area <- function(x){
     select(-ctr_lon, -ctr_lat, -area_km2)
 }
 
-ply_pa <- st_read(pa_geo) |>                # [    0,360]
-  st_wrap_dateline()   # [   0, 360] -> [-180, 180]
-  # st_shift_longitude() # [-180, 180] -> [    0,360]
-ply_er <- msens::ply_ecorgns |>         # [-180, 180]
-  # st_shift_longitude() |>               # [    0,360]
+ply_pa <- st_read(pa_geo) |>              # [    0,360]
+  st_wrap_dateline() |>    # [   0, 360] -> [-180, 180]
+  # st_shift_longitude()   # [-180, 180] -> [    0,360]
+  drop_ctr_area()
+st_geometry(ply_pa) <- "geom" # rename
+
+ply_er <- msens::ply_ecorgns |>           # [-180, 180]
+  # st_shift_longitude()     # |>         # [    0,360]
   # match names to https://tile.marinesensitivity.org/public.ply_planareas_2025.html
   rename(
     region_key     = boemrgn_key,
@@ -848,31 +861,58 @@ ply_er <- msens::ply_ecorgns |>         # [-180, 180]
   mutate(
     ecoregion_key = str_replace(ecoregion_key, "er", ""),
     region_key    = str_replace(region_key,    "br", ""),
-    region_name   = case_match(
-      region_name,
-      "Gulf of Mexico" ~ "Gulf of America",
-      .default = region_name),
+    # change region_keys to two-letter to match planareas_2025
     region_key   = case_match(
       region_key,
       "GOM" ~ "GA",
       "PAC" ~ "PA",
       "ATL" ~ "AT",
       .default = region_key),
+    # move sliver of Gulf of Mexico in Atlantic to Gulf of America
+    region_key   = case_when(
+      region_key == "AT" & ecoregion_key == "EGOM" ~ "GA", # Gulf of America
+      .default = region_key),
+    # change Gulf of Mexico to Gulf of America
+    region_name   = case_match(
+      region_key,
+      "GA" ~ "Gulf of America",
+      .default = region_name),
+    # change ecoregion_names with GOM to Gulf of America
     ecoregion_name   = case_match(
       ecoregion_name,
       "Eastern GOM"             ~ "Eastern Gulf of America",
       "Western and Central GOM" ~ "Western and Central Gulf of America",
       .default = ecoregion_name),
+    # change ecoregion_keys with *GOM to *GOA and since prefixed by east/west,
+    #    not conflicting with Gulf of Alaska GOA
     ecoregion_key = case_match(
       ecoregion_key,
       "EGOM"  ~ "EGOA",
       "WCGOM" ~ "WCGOA",
       .default = ecoregion_key) ) |> 
-  filter(
-    !(region_key == "ATL" & ecoregion_key == "EGOA"))
-  
-mapView(ply_pa, zcol = "planarea_key") +
-  mapView(ply_er, zcol = "ecoregion_key")
+  drop_ctr_area() |> 
+  # consolidate EGOA from Atlantic and Gulf
+  group_by(
+    region_key, region_name, ecoregion_key, ecoregion_name) |>
+  summarize(.groups = "drop")
+
+# seperate data from key,geom in ecoregions and planning areas for later rejoining
+d_pa <- ply_pa |> 
+  st_drop_geometry() |>
+  select(region_key, region_name, planarea_key, planarea_name)
+ply_pa <- ply_pa |>
+  select(planarea_key)
+d_er <- ply_er |> 
+  st_drop_geometry() |> 
+  select(region_key, region_name, ecoregion_key, ecoregion_name)
+ply_er <- ply_er |>
+  select(ecoregion_key)
+# check for duplicates
+stopifnot(sum(duplicated(ply_pa$planarea_key)) == 0)
+stopifnot(sum(duplicated(ply_er$ecoregion_key)) == 0)
+
+# mapView(ply_pa, zcol = "planarea_key") +
+#   mapView(ply_er, zcol = "ecoregion_key")
 
 lst_ernew <- list(
   "HAR" = "HAR",
@@ -891,25 +931,53 @@ d_ernew <- lst_ernew |>
       "PUR" ~ "Puerto Rico and U.S. Virgin Islands",
       "PIS" ~ "Pacific Island Territories" ) )
 
-ply_er_new <- ply_pa |> 
+ply_pa_new_er <- ply_pa |> 
   filter(
     planarea_key %in% ernew) |> 
   left_join(
     d_ernew,
     by = "planarea_key") |> 
-  select(region_key, region_name, ecoregion_key, ecoregion_name)
+  select(ecoregion_key) |> 
+  group_by(ecoregion_key) |> 
+  summarize(.groups = "drop")
 
 ply_pa_haser <- ply_pa |> 
   filter(
-    !planarea_key %in% ernew) |> 
-    drop_ctr_area()
-mapView(ply_pa_haser)
+    !planarea_key %in% ernew)
+# mapView(ply_pa_haser)
 
 x <- st_intersection(
   ply_pa_haser,
-  ply_er |> 
-    drop_ctr_area()) |> 
-  st_make_valid()
+  ply_er) |> 
+  st_make_valid() |> 
+  set_geom_ctr_area()
+  
+# switch pa_er slivers (area_km2 < 2) to largest er of same pa
+x_big <- x |> 
+  filter(area_km2 >= 2) |> 
+  group_by(planarea_key) |> 
+  mutate(
+    n_er = n())
+x_sliver <- x |> 
+  filter(area_km2 < 2)
+stopifnot(all(
+  !x_sliver$planarea_key %in% (x_big |> 
+    filter(n_er > 1) |> pull(planarea_key) ) ))
+x_sliver <- x_sliver |> 
+  mutate(
+    ecoregion_key = map2_chr(planarea_key, ecoregion_key ,\(pa, er_old, i){
+      er_new <- x_big |> 
+        filter(planarea_key == pa) |>
+        pull(ecoregion_key)
+      # message(glue("{pa}: {er_old} -> {er_new}"))
+      er_new } ) )
+x <- bind_rows(
+  x_big |> 
+    select(-n_er),
+  x_sliver) |> 
+  drop_ctr_area() |> 
+  group_by(planarea_key, ecoregion_key) |>
+  summarize(.groups = "drop")
 
 x_u <- x |> 
   st_union() |> 
@@ -923,10 +991,6 @@ y <- st_difference(
   set_geom_ctr_area() |> 
   filter(area_km2 > 2)
 sf_use_s2(T)
-
-# st_shift_longitude() # |> 
-# write_sf(
-#   glue("{dir_data}/derived/er_pa2025-slivers.geojson"))
 
 yp <- y |> 
   drop_ctr_area() |> 
@@ -947,33 +1011,48 @@ ypi <- yp |>
       2 ~ "NECS",
       3 ~ "NECS",
       4 ~ "NECS",
-      5 ~ "CAC") ) |> 
-  select(ecoregion_key) |> 
-  left_join(
-    ply_er |> 
-      st_drop_geometry() |> 
-      select(region_key, region_name, ecoregion_key, ecoregion_name),
-    by = "ecoregion_key") 
+      5 ~ "CAC") )
 
 ply_er_new <- bind_rows(
-  x |> 
-    select(region_key, region_name, ecoregion_key, ecoregion_name),
-  ply_er_new,
+  x,
+  ply_pa_new_er,
   ypi) |> 
-  group_by(region_key, region_name, ecoregion_key, ecoregion_name) |> 
+  select(ecoregion_key) |> 
+  group_by(ecoregion_key) |> 
   summarize(.groups = "drop") |> 
+  left_join(
+    bind_rows(
+      d_er,
+      d_ernew |> 
+        distinct(ecoregion_key, ecoregion_name) |> 
+        mutate(
+          region_key    = case_match(
+            ecoregion_key,
+            "HAR" ~ "AK",
+            "PUR" ~ "AT",
+            "PIS" ~ "PA" ) ) |> 
+        left_join(
+          ply_pa |> 
+            distinct(region_key, region_name),
+          by = "region_key") ),
+    by = "ecoregion_key") |> 
+  select(
+    region_key,    region_name,
+    ecoregion_key, ecoregion_name) |> 
+  st_make_valid() |> 
+  set_geom_ctr_area() |>
   st_shift_longitude()
 
-mapView(ply_er_new, zcol = "ecoregion_key")
+mapView(ply_pa |> st_shift_longitude(), col.regions = "gray") +
+  mapView(ply_er_new, zcol = "ecoregion_key")
 
-st_write(ply_er_new, er_geo)
+st_write(ply_er_new, er_geo, delete_dsn = T)
 
 ply_er <- st_read(er_geo) |> 
-  st_wrap_dateline()    # [   0, 360] -> [-180, 180]
+  st_wrap_dateline()      # [   0, 360] -> [-180, 180]
   # st_shift_longitude()  # [-180, 180] -> [    0,360]
 st_geometry(ply_er) = "geom" # rename  
 
-mapView(ply_er)
 
 tbl_er <- "ply_ecoregions_2025"
 if (!tbl_er %in% dbListTables(con)){
@@ -985,9 +1064,11 @@ if (!tbl_er %in% dbListTables(con)){
 }
 ```
 
-## Calculate Extinction Risk by Planning Area, EcoRegion
+## Register PlanningAreas, EcoRegions as Zones
 
 ```{r zone_stats}
+# TODO: combine rasterize, register_zones(), insert_zone_cell_data() into a single function
+
 cell_tif <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
 pa_geo   <- glue("{dir_data}/derived/pa_oa_2025.geojson") # created in: ingest_productivity.qmd
 er_geo   <- glue("{dir_data}/derived/er_oa_2025.geojson") # created above
@@ -1011,7 +1092,6 @@ r_er <- rasterize(
   touches = T, 
   cover   = T, 
   by      = "ecoregion_key")
-unique(names(r_er))
 
 # convert to data frame
 d_pa <- terra::as.data.frame(
@@ -1028,6 +1108,10 @@ d_er <- terra::as.data.frame(
 register_zones <- function(ply, tbl, fld) {
   # register zones in the database
   dbExecute(con_sdm, glue("DELETE FROM zone WHERE tbl = '{tbl}' AND fld = '{fld}'"))
+  
+  # check that fld is unique in tbl
+  stopifnot(sum(duplicated(ply[[fld]])) == 0)
+  
   for (i in 1:nrow(ply)) { # i = 1
     dbExecute(con_sdm, glue("
       INSERT INTO zone (tbl, fld, value)
@@ -1035,12 +1119,18 @@ register_zones <- function(ply, tbl, fld) {
   }
 }
 
-# tbl(con_sdm, "zone") |> 
-#   group_by(tbl, fld) |> 
+# tbl(con_sdm, "zone") |>
+#   group_by(tbl, fld) |>
 #   summarize(n = n())
+# 
+# ply_pa$planarea_key[duplicated(ply_er$planarea_key)]
+# ply_er$ecoregion_key[duplicated(ply_er$ecoregion_key)]
+# length(ply_er$ecoregion_key)
+# length(unique(ply_er$ecoregion_key))
 
-insert_zone_data <- function(df, tbl, fld) {
+insert_zone_cell_data <- function(df, tbl, fld) {
   # df = d_pa; tbl = "ply_planareas_2025"; fld = "planarea_key"
+  # df = d_er; tbl = "ply_ecoregions_2025"; fld = "ecoregion_key"
   
   # get zone and metric IDs
   d_zone <- dbGetQuery(con_sdm, glue("
@@ -1064,21 +1154,69 @@ insert_zone_data <- function(df, tbl, fld) {
 }
 
 # register zones and insert zone data
+dbExecute(con_sdm, "TRUNCATE zone")
 dbExecute(con_sdm, "TRUNCATE zone_cell")
 register_zones(ply_pa, "ply_planareas_2025", "planarea_key")
-insert_zone_data(d_pa, "ply_planareas_2025", "planarea_key")
+insert_zone_cell_data(d_pa, "ply_planareas_2025", "planarea_key")
 
 register_zones(ply_er, "ply_ecoregions_2025", "ecoregion_key")
-insert_zone_data(d_er, "ply_ecoregions_2025", "ecoregion_key")
+insert_zone_cell_data(d_er, "ply_ecoregions_2025", "ecoregion_key")
+
 ```
+
+## Delete Orphan rows
+
+```{r delete_orphan_rows}
+
+# delete orphans in model_cell without a model
+dbExecute(con_sdm, "
+  DELETE FROM model_cell 
+  WHERE mdl_seq NOT IN (SELECT mdl_seq FROM model)")
+
+# delete orphans in zone_cell without a zone
+dbExecute(con_sdm, "
+  DELETE FROM zone_cell 
+  WHERE zone_seq NOT IN (SELECT zone_seq FROM zone)")
+
+# delete orphans in zone_metric without a zone
+dbExecute(con_sdm, "
+  DELETE FROM zone_metric 
+  WHERE zone_seq NOT IN (SELECT zone_seq FROM zone)")
+
+# delete orphans in cell_metric without a metric
+dbExecute(con_sdm, "
+  DELETE FROM cell_metric 
+  WHERE metric_seq NOT IN (SELECT metric_seq FROM metric)")
+```
+
+## Rename metric.`metric_type` to `metric_key`
+
+```{r rename_metric_type}
+#| eval: false
+
+# rename metric_type to metric_key
+dbExecute(con_sdm, "
+  ALTER TABLE metric 
+  RENAME COLUMN metric_type TO metric_key")
+```
+
 
 ## Create min|max ExtinctionRisk per SpeciesCategory and Ecoregion
 
 ```{r calc_ecoregion_minmax}
 #| eval: false
 
+# TODO: delete orphans, like zone_cell without zone, zone_metric without zone & metric,...
+#  - [DuckDB Raster Data Metric Sequence Insertion - Claude](https://claude.ai/chat/748f00aa-d2f6-46a5-91d9-fb56b27e3ebe)
+#    1. [ ] Use transactions
+#    2. [x] Get the sequence BEFORE deletion
+#    3. [x] Do rename `metric_type` to `metric_key`
+
 # create metric per sp_cat and min|max
-tbl(con_sdm, "metric")
+# dbExecute(con_sdm, "DELETE FROM metric WHERE metric_key LIKE '%ecoregion%'")
+# tbl(con_sdm, "metric") |>
+#   collect() |>
+#   View()
 
 sp_cats <- c(
   "all",
@@ -1087,26 +1225,34 @@ sp_cats <- c(
 for (sp_cat in sp_cats){ # sp_cat = sp_cats[1]
   for (fxn in c("min","max")){ # fxn = "min"
     
-    m_type <- glue("ecoregion_extrisk_{fxn}_{str_replace(sp_cat, ' ', '_')}")
+    sp_cat_u <- str_replace(sp_cat, " ", "_")
+    m_key   <- glue("extrisk_{sp_cat_u}_ecoregion_{fxn}")
+    message(glue("m_key: {m_key}"))
+    
+    # Get metric_seq first, then delete/insert
+    existing_seq <- dbGetQuery(con_sdm, glue(
+      "SELECT metric_seq FROM metric WHERE metric_key = '{metric_key}'"))
+    if (nrow(existing_seq) > 0) {
+      metric_seq <- existing_seq$metric_seq
+      dbExecute(con_sdm, glue("DELETE FROM metric      WHERE metric_seq = {metric_seq}"))
+      dbExecute(con_sdm, glue("DELETE FROM cell_metric WHERE metric_seq = {metric_seq}"))
+      dbExecute(con_sdm, glue("DELETE FROM zone_metric WHERE metric_seq = {metric_seq}"))
+    } 
     
     dbExecute(con_sdm, glue(
-      "DELETE FROM metric WHERE metric_type = '{m_type}'"))
-    
-    dbExecute(con_sdm, glue(
-      "INSERT INTO metric (metric_type, description)
-      VALUES ('{m_type}', 'Ecoregion {fxn} extinction risk for {sp_cat}')" ) )
+      "INSERT INTO metric (metric_key, description)
+      VALUES ('{m_key}', 'Extinction risk for {sp_cat} Ecoregional {fxn}')" ) )
     
     # get metric ID
     m_seq <- dbGetQuery(con_sdm, glue(
-      "SELECT metric_seq FROM metric WHERE metric_type = '{m_type}'"))$metric_seq
-      
+      "SELECT metric_seq FROM metric WHERE metric_key = '{m_key}'"))$metric_seq
+    
     # calculate min/max extinction risk per ecoregion
-    dbExecute(con_sdm, glue(
-      "DELETE FROM zone_metric WHERE metric_seq = {m_seq}"))
     dbExecute(con_sdm, glue(
       "INSERT INTO zone_metric (zone_seq, metric_seq, value)
       SELECT 
         z.zone_seq,
+        -- z.tbl, z.fld, z.value AS tbl_fld_val,
         {m_seq} as metric_seq,
         {fxn}(cm.value) as value
       FROM zone z
@@ -1115,13 +1261,85 @@ for (sp_cat in sp_cats){ # sp_cat = sp_cats[1]
       WHERE
         z.fld = 'ecoregion_key'
         AND cm.metric_seq IN (
-          SELECT metric_seq FROM metric WHERE metric_type = 'extrisk_{str_replace(sp_cat, ' ', '_')}')
-      GROUP BY z.zone_seq" ))
+          SELECT metric_seq FROM metric WHERE metric_key = 'extrisk_{sp_cat_u}')
+      -- GROUP BY z.zone_seq, z.tbl, z.fld, z.value
+      GROUP BY z.zone_seq " ) )
   } }
+```
 
-tbl(con_sdm, "zone")
+## Calculate rescaled ExtinctionRisk per cell based on EcoregionMinMax per SpeciesCategory
+
+```{r extrisk_spcat_ecoregion_rescaled}
+
+sp_cats <- c(
+  "all",
+  tbl(con_sdm, "species") |> distinct(sp_cat) |> pull(sp_cat))
+for (sp_cat in sp_cats){ # sp_cat = sp_cats[1]
+  
+  sp_cat_u      <- str_replace(sp_cat, " ", "_")
+  m_key         <- glue("extrisk_{sp_cat_u}_ecoregion_rescaled")
+  m_description <- glue("Extinction risk for {sp_cat}, rescaled to [0,100] based on Ecoregional min/max values")
+  
+  # Get metric_seq first, then delete/insert
+  existing_seq <- dbGetQuery(con_sdm, glue(
+    "SELECT metric_seq FROM metric WHERE metric_key = '{m_key}'"))
+  if (nrow(existing_seq) > 0) {
+    m_seq <- existing_seq$metric_seq
+    dbExecute(con_sdm, glue("DELETE FROM metric      WHERE metric_seq = {m_seq}"))
+    dbExecute(con_sdm, glue("DELETE FROM cell_metric WHERE metric_seq = {m_seq}"))
+    dbExecute(con_sdm, glue("DELETE FROM zone_metric WHERE metric_seq = {m_seq}"))
+  } 
+  
+  dbExecute(con_sdm, glue("
+      INSERT INTO metric (metric_key, description)
+      VALUES ('{m_key}', '{m_description}')"))
+  m_seq <- dbGetQuery(con_sdm, glue("
+      SELECT metric_seq FROM metric WHERE metric_key = '{m_key}'"))$metric_seq
+
+  m_keys_minmax <- glue("extrisk_{sp_cat_u}_ecoregion_{c('min','max')}")
+  tbl(con_sdm, "metric") |> 
+    filter(metric_key %in% m_keys_minmax) |> 
+    left_join(
+      tbl(con_sdm, "zone_metric"),
+      by = "metric_seq") |> 
+    group_by(metric_seq, metric_key) |> 
+    summarize(n= n())
+
+  dbExecute(con_sdm, glue("
+      INSERT INTO cell_metric (cell_id, metric_seq, value)
+      SELECT 
+        cm.cell_id,
+        {m_seq} as metric_seq,
+        --CASE WHEN zc.value IS NULL THEN NULL
+        (cm.value - zm.min_value) / (zm.max_value - zm.min_value) AS value
+      FROM cell_metric cm
+      LEFT JOIN (
+        SELECT 
+          z.zone_seq,
+          MIN(zm.value) as min_value,
+          MAX(zm.value) as max_value
+        FROM zone z
+        JOIN zone_metric zm ON z.zone_seq = zm.zone_seq
+        WHERE z.fld = 'ecoregion_key'
+          AND zm.metric_seq IN (
+            SELECT metric_seq FROM metric WHERE metric_key = 'ecoregion_extrisk_{fxn}_{sp_cat_u}')
+        GROUP BY z.zone_seq
+      ) zc ON cm.cell_id IN (
+        SELECT cell_id FROM zone_cell WHERE zone_seq = zc.zone_seq)
+      WHERE cm.metric_seq IN (
+        SELECT metric_seq FROM metric WHERE metric_key = 'extrisk_{sp_cat_u}')
+      AND cm.value IS NOT NULL
+      AND zc.min_value IS NOT NULL
+      AND zc.max_value IS NOT NULL
+    "))
+}
+
+
+
+
 
 ```
+
 
 ## Generate Biodiversity Raster
 
@@ -1136,7 +1354,7 @@ r_cell <- rast(cell_tif)
 
 # get species richness metric ID
 richness_metric_seq <- dbGetQuery(con_sdm, "
-  SELECT metric_seq FROM metric WHERE metric_type = 'species_richness'")$metric_seq
+  SELECT metric_seq FROM metric WHERE metric_key = 'species_richness'")$metric_seq
 
 # query species richness for a region
 richness_df <- dbGetQuery(con_sdm, glue("
@@ -1234,7 +1452,7 @@ region_ids <- dbGetQuery(con_sdm, "
 ")
 
 richness_metric_seq <- dbGetQuery(con_sdm, "
-  SELECT metric_seq FROM metric WHERE metric_type = 'species_richness'
+  SELECT metric_seq FROM metric WHERE metric_key = 'species_richness'
 ")$metric_seq
 
 # calculate average species richness per planning area
@@ -1272,7 +1490,7 @@ FROM region r
 JOIN region_metric rm ON r.rgn_seq = rm.rgn_seq
 JOIN planning_areas p ON r.value = p.pa_key
 WHERE r.tbl_col = 'planning_areas.pa_key'
-  AND rm.metric_seq = (SELECT metric_seq FROM metric WHERE metric_type = 'species_richness')
+  AND rm.metric_seq = (SELECT metric_seq FROM metric WHERE metric_key = 'species_richness')
 ORDER BY rm.value DESC
 ")
 
@@ -1432,7 +1650,7 @@ for (pq in dir_ls(dir_pq, glob = "*.parquet")[-1]) { # pq = dir_ls(dir_pq, glob 
 # dbExecute(con_sdm, "ALTER TABLE model ALTER COLUMN mdl_seq SET DEFAULT nextval('model_mdl_seq_seq');")
 # dbExecute(con_sdm, "ALTER TABLE model ADD PRIMARY KEY (mdl_seq);")
 
-## -- CREATE TABLE metric(metric_seq INTEGER DEFAULT(nextval('metric_metric_seq_seq')) PRIMARY KEY, metric_type VARCHAR NOT NULL, description VARCHAR, date_created DATE DEFAULT(CURRENT_DATE));;
+## -- CREATE TABLE metric(metric_seq INTEGER DEFAULT(nextval('metric_metric_seq_seq')) PRIMARY KEY, metric_key VARCHAR NOT NULL, description VARCHAR, date_created DATE DEFAULT(CURRENT_DATE));;
 ## -- CREATE TABLE model(mdl_seq INTEGER DEFAULT(nextval('model_mdl_seq_seq')) PRIMARY KEY, ds_key VARCHAR, taxa VARCHAR, time_period VARCHAR, region VARCHAR, mdl_type VARCHAR, description VARCHAR, date_created DATE DEFAULT(CURRENT_DATE), FOREIGN KEY (ds_key) REFERENCES dataset(ds_key));;
 
 seqs_exist <- dbGetQuery(con_sdm, "SELECT * FROM duckdb_sequences()") |> pull(sequence_name)
