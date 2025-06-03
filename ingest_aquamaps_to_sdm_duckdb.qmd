@@ -1270,7 +1270,6 @@ for (sp_cat in sp_cats){ # sp_cat = sp_cats[1]
 ## Calculate rescaled ExtinctionRisk per cell based on EcoregionMinMax per SpeciesCategory
 
 ```{r extrisk_spcat_ecoregion_rescaled}
-
 sp_cats <- c(
   "all",
   tbl(con_sdm, "species") |> distinct(sp_cat) |> pull(sp_cat))
@@ -1295,49 +1294,78 @@ for (sp_cat in sp_cats){ # sp_cat = sp_cats[1]
       VALUES ('{m_key}', '{m_description}')"))
   m_seq <- dbGetQuery(con_sdm, glue("
       SELECT metric_seq FROM metric WHERE metric_key = '{m_key}'"))$metric_seq
-
-  m_keys_minmax <- glue("extrisk_{sp_cat_u}_ecoregion_{c('min','max')}")
-  tbl(con_sdm, "metric") |> 
-    filter(metric_key %in% m_keys_minmax) |> 
-    left_join(
-      tbl(con_sdm, "zone_metric"),
-      by = "metric_seq") |> 
-    group_by(metric_seq, metric_key) |> 
-    summarize(n= n())
-
+  
   dbExecute(con_sdm, glue("
-      INSERT INTO cell_metric (cell_id, metric_seq, value)
-      SELECT 
-        cm.cell_id,
-        {m_seq} as metric_seq,
-        --CASE WHEN zc.value IS NULL THEN NULL
-        (cm.value - zm.min_value) / (zm.max_value - zm.min_value) AS value
-      FROM cell_metric cm
-      LEFT JOIN (
+      WITH
+      -- get ecoregion_minmax from zone_metric
+      ecoregion_minmax AS (
         SELECT 
           z.zone_seq,
           MIN(zm.value) as min_value,
           MAX(zm.value) as max_value
         FROM zone z
-        JOIN zone_metric zm ON z.zone_seq = zm.zone_seq
-        WHERE z.fld = 'ecoregion_key'
-          AND zm.metric_seq IN (
-            SELECT metric_seq FROM metric WHERE metric_key = 'ecoregion_extrisk_{fxn}_{sp_cat_u}')
+        JOIN zone_metric zm USING (zone_seq)
+        WHERE 
+          z.fld = 'ecoregion_key' AND 
+          zm.metric_seq IN (
+            SELECT metric_seq FROM metric WHERE metric_key IN (
+              'extrisk_{sp_cat_u}_ecoregion_min',
+              'extrisk_{sp_cat_u}_ecoregion_max') )
         GROUP BY z.zone_seq
-      ) zc ON cm.cell_id IN (
-        SELECT cell_id FROM zone_cell WHERE zone_seq = zc.zone_seq)
+      ),
+      -- get cell_ecoregion from zone_cell with pct_covered
+      cell_ecoregion_raw AS (
+        SELECT 
+          cell_id, 
+          z.zone_seq, 
+          zone_cell.pct_covered
+        FROM zone_cell
+        JOIN zone z ON zone_cell.zone_seq = z.zone_seq
+        WHERE z.fld = 'ecoregion_key'
+      ),
+      -- calculate total coverage per cell for normalization
+      cell_coverage_total AS (
+        SELECT 
+          cell_id, 
+          SUM(pct_covered) as total_coverage
+        FROM cell_ecoregion_raw
+        GROUP BY cell_id
+      ),
+      -- normalize coverage percentages
+      -- for cells with only one ecoregion, use 100% regardless of actual coverage
+      -- for cells with multiple ecoregions, rescale to ensure percentages sum to 100
+      cell_ecoregion AS (
+        SELECT 
+          ce.cell_id, 
+          ce.zone_seq,
+          CASE 
+            WHEN COUNT(*) OVER (PARTITION BY ce.cell_id) = 1 THEN 100
+            ELSE ce.pct_covered * 100.0 / ct.total_coverage
+          END as normalized_pct
+        FROM cell_ecoregion_raw ce
+        JOIN cell_coverage_total ct ON ce.cell_id = ct.cell_id
+      )
+      -- insert rescaled extinction risk values
+      INSERT INTO cell_metric (cell_id, metric_seq, value)
+      SELECT 
+        cm.cell_id,
+        {m_seq} as metric_seq,
+        SUM(
+          (cm.value     - er.min_value) / 
+          (er.max_value - er.min_value) * 
+          (ce.normalized_pct / 100.0) ) * 100 AS value  -- scale to 0-100 range
+      FROM cell_metric      cm
+      JOIN cell_ecoregion   ce ON cm.cell_id  = ce.cell_id
+      JOIN ecoregion_minmax er ON ce.zone_seq = er.zone_seq
       WHERE cm.metric_seq IN (
         SELECT metric_seq FROM metric WHERE metric_key = 'extrisk_{sp_cat_u}')
       AND cm.value IS NOT NULL
-      AND zc.min_value IS NOT NULL
-      AND zc.max_value IS NOT NULL
+      AND er.min_value IS NOT NULL
+      AND er.max_value IS NOT NULL
+      AND er.min_value < er.max_value  -- avoid division by zero
+      GROUP BY cm.cell_id
     "))
 }
-
-
-
-
-
 ```
 
 
@@ -1352,62 +1380,45 @@ cell_tif <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
 
 r_cell <- rast(cell_tif)
 
+d_metric <- tbl(con_sdm, "metric") |> collect()
+View(d_metric)
+# TODO: add sequences for date_created post-export-parquet
+
 # get species richness metric ID
-richness_metric_seq <- dbGetQuery(con_sdm, "
-  SELECT metric_seq FROM metric WHERE metric_key = 'species_richness'")$metric_seq
+m_key <- "extrisk_all_ecoregion_rescaled"
+m_seq <- dbGetQuery(con_sdm, glue("
+  SELECT metric_seq FROM metric WHERE metric_key = '{m_key}'") ) |>
+  pull(metric_seq)
 
 # query species richness for a region
-richness_df <- dbGetQuery(con_sdm, glue("
-  SELECT 
+d_m <- dbGetQuery(con_sdm, glue("
+  SELECT
     cm.cell_id,
-    cm.value as species_richness
+    cm.value
   FROM cell_metric cm
-  WHERE cm.metric_seq = {richness_metric_seq}
-    AND cm.cell_id IN (
-      SELECT cell_id FROM cell 
-      WHERE lon BETWEEN -180 AND -60  -- limit to a region for testing
-        AND lat BETWEEN 20 AND 50)")) |> 
+  WHERE cm.metric_seq = (
+    SELECT metric_seq
+    FROM metric
+    WHERE metric_key = '{m_key}' )")) |> 
   tibble()
+stopifnot(sum(duplicated(d_m$cell_id)) == 0)
 
-# convert to raster using the new function
-r_richness <- create_raster_from_df(
-  richness_df, 
-  r_template = r_cell,
-  value_col = "species_richness") # plot(r_richness)
+# convert to raster
+r_m <- create_raster_from_df(d_m, r_cell, value_col = "value")
 
 # display with mapgl
-mapgl_rast <- function(r, palette = "viridis", layer_name = "SDM") {
-  # convert raster to data frame
-  r_df <- as.data.frame(r, xy = TRUE) |>
-    rename(value = 3)
+# TODO: make into function in msens R package
+mapgl_rast <- function(
+    r, 
+    cols_r     = rev(RColorBrewer::brewer.pal(11, "Spectral")),
+    layer_name = "SDM") {
   
-  # create mapgl visualization
-  mapgl() |>
-    add_raster_tile_layer(
-      id = "sdm_raster",
-      source = r,
-      source_layer = layer_name,
-      color_palette = palette
-    )
-}
-
-# display with mapgl
-# TODO:
-mapgl_rast2<- function(r, palette = "viridis", layer_name = "SDM") {
-  
-  # r <- r_pa[["depth_mean"]]
-  # r <- r_ds
-  r <- r_richness
-  # plot(r_am)
-  # plot(r_ds)
-  
-  rng_r <- minmax(r) |> as.numeric()
-  cols_r <- rev(RColorBrewer::brewer.pal(11, "Spectral"))
+  rng_r  <- minmax(r) |> as.numeric()
   
   mapboxgl(
     style = mapbox_style("dark"),
-    zoom = 2,
-    center = c(-141.3, 13.4)) |>  # ply_pa centroid
+    zoom   = 3.5,
+    center = c(-106, 40.1)) |>  # ply_pa centroid
     add_image_source(
       id     = "r_src",
       data   = r,
@@ -1417,7 +1428,7 @@ mapgl_rast2<- function(r, palette = "viridis", layer_name = "SDM") {
       source            = "r_src",
       raster_resampling = "nearest") |> 
     mapgl::add_legend(
-      "Colorscale",
+      layer_name,
       values = rng_r,
       colors = cols_r,
       position = "bottom-right") |> 
@@ -1427,7 +1438,7 @@ mapgl_rast2<- function(r, palette = "viridis", layer_name = "SDM") {
 }
 
 # visualize
-mapgl_rast(r_richness, palette = "YlOrRd", layer_name = "Species Richness")
+mapgl_rast(r_m, layer_name = m_key)
 ```
 
 ## Summarize by Planning Area
