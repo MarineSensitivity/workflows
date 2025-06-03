@@ -1,3 +1,24 @@
+## 2025-06-03.b msens summary for nat'l program
+
+[BOEM Marine Environmental Sensitivity | Claude Project](https://claude.ai/project/01973657-e3c3-709c-a90a-a781a615e140)
+
+Write a summary of the current project's methods and status, similar to the old 
+"ch 8 Env - 2024-2029_NationalOCSProgram_PFP_Sept_2023.pdf", using the rest of 
+the Project documents.  Write this as a Quarto document with chunks of R code to 
+extract statistics and generate tables and figures. Use mermaid diagrams where 
+applicable to explain and cross-references with figures and tables. Include a 
+bibliography.
+
+Other Project documents:
+
+- Marine-Sensitivity_docs.pdf (882 lines)
+- process.mmd (49 lines)
+- flowchart.mmd (9 lines)
+- architecture.mmd (20 lines)
+- ingest_aquamaps_to_sdm_duckdb.qmd (2,154 lines)
+
+https://claude.ai/share/6d042ddd-beaa-4c56-b8e1-fa88e88cdb85
+
 ## 2025-06-03.a species contributions to cell score
 
 In @ingest_aquamaps_to_sdm_duckdb.qmd, fill out the R chunks:
