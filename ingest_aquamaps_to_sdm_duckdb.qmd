@@ -1594,35 +1594,324 @@ dbExecute(con_sdm, glue("
 ## Calculate Score per PlanArea
 
 ```{r calc_planarea_score}
+# calculate score per planning area
 m_key  <- "score_extriskspcat_primprod_ecoregionrescaled_equalweights"
+
+# get metric_seq for the score metric
+m_seq <- tbl(con_sdm, "metric") |> 
+  filter(metric_key == !!m_key) |> 
+  pull(metric_seq)
+
+# get zone_seqs for planning areas
 z_seqs <- tbl(con_sdm, "zone") |> 
   filter(
     tbl   == "ply_planareas_2025") |> 
-  pull(zone_seq)  # 134
+  pull(zone_seq)
 
+# delete existing zone_metric values for this metric and planning areas
+if (length(z_seqs) > 0) {
+  dbExecute(con_sdm, glue(
+    "DELETE FROM zone_metric 
+    WHERE metric_seq = {m_seq} 
+      AND zone_seq IN ({paste(z_seqs, collapse = ',')})"))
+}
 
+# calculate average score per planning area weighted by cell coverage
+dbExecute(con_sdm, glue("
+  INSERT INTO zone_metric (zone_seq, metric_seq, value)
+  SELECT 
+    zc.zone_seq,
+    {m_seq} as metric_seq,
+    SUM(cm.value * zc.pct_covered) / SUM(zc.pct_covered) as value
+  FROM zone_cell zc
+  JOIN cell_metric cm ON zc.cell_id = cm.cell_id
+  WHERE 
+    cm.metric_seq = {m_seq} 
+    AND zc.zone_seq IN ({paste(z_seqs, collapse = ',')})
+    AND cm.value IS NOT NULL
+  GROUP BY zc.zone_seq"))
+
+# display results
+results <- dbGetQuery(con_sdm, glue("
+  SELECT 
+    z.value as planarea_key,
+    zm.value as score
+  FROM zone_metric zm
+  JOIN zone z ON zm.zone_seq = z.zone_seq
+  WHERE 
+    zm.metric_seq = {m_seq}
+    AND z.tbl = 'ply_planareas_2025'
+  ORDER BY zm.value DESC
+  LIMIT 10"))
+
+print(results)
 ```
 
 ## Table of Species Contributions to Score per Cell
 
 ```{r species_contributions_to_cell_table}
+# calculate species contributions to cell score
 m_key <- "score_extriskspcat_primprod_ecoregionrescaled_equalweights"
-cell_id <- 1772473
+cell_id <- 1772473  # example cell
 
+# get all component metrics that make up the score
+sp_cats <- tbl(con_sdm, "species") |> distinct(sp_cat) |> pull(sp_cat)
+metric_keys <- c(
+  sapply(sp_cats, \(sc) glue("extrisk_{str_replace(sc, ' ', '_')}_ecoregion_rescaled"), USE.NAMES=F),
+  "primprod_ecoregion_rescaled" )
 
+# get redlist codes and scores for species
+d_rl <- tbl(con_sdm, "species") |> 
+  select(taxa, sp_key, sp_cat, scientific_name, common_name, redlist_code) |> 
+  filter(
+    !is.na(redlist_code),
+    !redlist_code %in% c("DD","EX")) |> 
+  collect() |> 
+  mutate(
+    rl_score = case_match(
+      redlist_code,
+      "CR" ~ 1,      # Critically Endangered  
+      "EN" ~ 0.8,    # Endangered  
+      "VU" ~ 0.6,    # Vulnerable
+      "NT" ~ 0.4,    # Near Threatened
+      "LC" ~ 0.2))   # Least Concern
+
+# get species-level contributions to extinction risk for this cell
+# first, get the ecoregion rescaling factor for this cell
+ecoregion_rescale <- dbGetQuery(con_sdm, glue("
+  WITH
+  -- get ecoregion min/max for all species categories
+  ecoregion_minmax AS (
+    SELECT 
+      z.zone_seq,
+      m.metric_key,
+      MIN(zm.value) as min_value,
+      MAX(zm.value) as max_value
+    FROM zone z
+    JOIN zone_metric zm USING (zone_seq)
+    JOIN metric m ON zm.metric_seq = m.metric_seq
+    WHERE 
+      z.fld = 'ecoregion_key' AND 
+      m.metric_key LIKE '%_ecoregion_min' OR m.metric_key LIKE '%_ecoregion_max'
+    GROUP BY z.zone_seq, m.metric_key
+  ),
+  -- get cell ecoregion coverage
+  cell_ecoregion AS (
+    SELECT 
+      zc.cell_id, 
+      z.zone_seq,
+      z.value as ecoregion_key,
+      zc.pct_covered
+    FROM zone_cell zc
+    JOIN zone z ON zc.zone_seq = z.zone_seq
+    WHERE z.fld = 'ecoregion_key' AND zc.cell_id = {cell_id}
+  )
+  SELECT * FROM cell_ecoregion"))
+
+# get raw species contributions (suitability * rl_score)
+species_contributions <- dbGetQuery(con_sdm, glue("
+  SELECT 
+    m.taxa,
+    mc.value as suitability
+  FROM model_cell mc
+  JOIN model m ON mc.mdl_seq = m.mdl_seq
+  WHERE mc.cell_id = {cell_id} AND mc.value > 0")) |> 
+  left_join(d_rl, by = "taxa") |> 
+  mutate(
+    contribution = suitability * rl_score / 100)  # suitability is 0-100
+
+# calculate total extinction risk per species category
+sp_cat_totals <- species_contributions |> 
+  group_by(sp_cat) |> 
+  summarize(
+    extrisk_raw = sum(contribution, na.rm = TRUE),
+    n_species = n(),
+    .groups = "drop")
+
+# get primary productivity value for this cell
+prim_prod <- dbGetQuery(con_sdm, glue("
+  SELECT prim_prod_mean 
+  FROM cell 
+  WHERE cell_id = {cell_id}"))$prim_prod_mean
+
+# get the actual metric values for this cell
+cell_metrics <- dbGetQuery(con_sdm, glue("
+  SELECT 
+    m.metric_key,
+    cm.value
+  FROM cell_metric cm
+  JOIN metric m ON cm.metric_seq = m.metric_seq
+  WHERE 
+    cm.cell_id = {cell_id}
+    AND m.metric_key IN ({paste(shQuote(c(metric_keys, m_key)), collapse=', ')})"))
+
+# calculate percent contribution of each component to the final score
+score_value <- cell_metrics |> filter(metric_key == m_key) |> pull(value)
+component_values <- cell_metrics |> filter(metric_key != m_key)
+component_contributions <- component_values |> 
+  mutate(
+    percent_contribution = round(value / nrow(component_values) / score_value * 100, 1))
+
+# create detailed species table  
+species_table <- species_contributions |> 
+  filter(!is.na(rl_score)) |> 
+  arrange(desc(contribution)) |> 
+  mutate(
+    percent_of_total_extrisk = round(contribution / sum(contribution) * 100, 2)) |> 
+  select(
+    taxa, 
+    scientific_name,
+    common_name,
+    sp_cat,
+    redlist_code,
+    rl_score,
+    suitability,
+    contribution,
+    percent_of_total_extrisk) |> 
+  head(20)  # top 20 species
+
+print("Component contributions to cell score:")
+print(component_contributions)
+
+print("\nTop species contributions to extinction risk:")
+print(species_table)
 ```
 
 ## Table of Species Contributions to Score per PlanArea
 
 ```{r species_contributions_to_zone_table}
+# calculate species contributions to zone (planning area) score  
 m_key <- "score_extriskspcat_primprod_ecoregionrescaled_equalweights"
+planarea_key <- "ALA"  # example planning area
+
+# get zone_seq for the planning area
 z_seq <- tbl(con_sdm, "zone") |> 
   filter(
     tbl   == "ply_planareas_2025",
-    value == "ALA") |> 
-  pull(zone_seq)  # 134
+    value == !!planarea_key) |> 
+  pull(zone_seq)
 
+# get all cells in this planning area with their coverage percentages
+cells_in_zone <- dbGetQuery(con_sdm, glue("
+  SELECT 
+    cell_id,
+    pct_covered
+  FROM zone_cell
+  WHERE zone_seq = {z_seq}"))
 
+# get species categories and metric keys
+sp_cats <- tbl(con_sdm, "species") |> distinct(sp_cat) |> pull(sp_cat)
+metric_keys <- c(
+  sapply(sp_cats, \(sc) glue("extrisk_{str_replace(sc, ' ', '_')}_ecoregion_rescaled"), USE.NAMES=F),
+  "primprod_ecoregion_rescaled" )
+
+# get redlist codes and scores for species
+d_rl <- tbl(con_sdm, "species") |> 
+  select(taxa, sp_key, sp_cat, scientific_name, common_name, redlist_code) |> 
+  filter(
+    !is.na(redlist_code),
+    !redlist_code %in% c("DD","EX")) |> 
+  collect() |> 
+  mutate(
+    rl_score = case_match(
+      redlist_code,
+      "CR" ~ 1,      # Critically Endangered  
+      "EN" ~ 0.8,    # Endangered  
+      "VU" ~ 0.6,    # Vulnerable
+      "NT" ~ 0.4,    # Near Threatened
+      "LC" ~ 0.2))   # Least Concern
+
+# get species contributions across all cells in the zone
+# weighted by cell coverage percentage
+species_zone_contributions <- dbGetQuery(con_sdm, glue("
+  WITH zone_cells AS (
+    SELECT cell_id, pct_covered
+    FROM zone_cell
+    WHERE zone_seq = {z_seq}
+  )
+  SELECT 
+    m.taxa,
+    SUM(mc.value * zc.pct_covered) / SUM(zc.pct_covered) as avg_suitability,
+    COUNT(DISTINCT mc.cell_id) as n_cells
+  FROM zone_cells zc
+  JOIN model_cell mc ON zc.cell_id = mc.cell_id
+  JOIN model m ON mc.mdl_seq = m.mdl_seq
+  WHERE mc.value > 0
+  GROUP BY m.taxa")) |> 
+  left_join(d_rl, by = "taxa") |> 
+  mutate(
+    contribution = avg_suitability * rl_score / 100)  # suitability is 0-100
+
+# calculate total extinction risk per species category for the zone
+sp_cat_zone_totals <- species_zone_contributions |> 
+  group_by(sp_cat) |> 
+  summarize(
+    extrisk_weighted = sum(contribution, na.rm = TRUE),
+    n_species = n(),
+    avg_n_cells = mean(n_cells),
+    .groups = "drop")
+
+# get average primary productivity for the zone
+avg_prim_prod <- dbGetQuery(con_sdm, glue("
+  SELECT 
+    SUM(c.prim_prod_mean * zc.pct_covered) / SUM(zc.pct_covered) as avg_prim_prod
+  FROM zone_cell zc
+  JOIN cell c ON zc.cell_id = c.cell_id
+  WHERE zc.zone_seq = {z_seq}
+    AND c.prim_prod_mean IS NOT NULL"))$avg_prim_prod
+
+# get the zone metric values
+zone_metrics <- dbGetQuery(con_sdm, glue("
+  SELECT 
+    z.value as planarea_key,
+    m.metric_key,
+    zm.value
+  FROM zone_metric zm
+  JOIN zone z ON zm.zone_seq = z.zone_seq
+  JOIN metric m ON zm.metric_seq = m.metric_seq
+  WHERE 
+    z.zone_seq = {z_seq}
+    AND m.metric_key IN ({paste(shQuote(c(metric_keys, m_key)), collapse=', ')})"))
+
+# calculate percent contribution of each component to the final score
+score_value <- zone_metrics |> filter(metric_key == m_key) |> pull(value)
+component_values <- zone_metrics |> filter(metric_key != m_key)
+component_contributions <- component_values |> 
+  mutate(
+    percent_contribution = round(value / nrow(component_values) / score_value * 100, 1))
+
+# create detailed species table  
+species_zone_table <- species_zone_contributions |> 
+  filter(!is.na(rl_score)) |> 
+  arrange(desc(contribution)) |> 
+  mutate(
+    percent_of_total_extrisk = round(contribution / sum(contribution) * 100, 2)) |> 
+  select(
+    taxa, 
+    scientific_name,
+    common_name,
+    sp_cat,
+    redlist_code,
+    rl_score,
+    avg_suitability = avg_suitability,
+    n_cells,
+    contribution,
+    percent_of_total_extrisk) |> 
+  head(20)  # top 20 species
+
+print(glue("Planning Area: {planarea_key}"))
+print(glue("Zone score: {round(score_value, 1)}"))
+print(glue("Number of cells: {nrow(cells_in_zone)}"))
+print(glue("Average primary productivity: {round(avg_prim_prod, 1)}"))
+
+print("\nComponent contributions to zone score:")
+print(component_contributions)
+
+print("\nSpecies category summary:")
+print(sp_cat_zone_totals)
+
+print("\nTop species contributions to extinction risk:")
+print(species_zone_table)
 ```
 
 ## Map raster
