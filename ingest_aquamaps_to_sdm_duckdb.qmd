@@ -1200,8 +1200,7 @@ dbExecute(con_sdm, "
   RENAME COLUMN metric_type TO metric_key")
 ```
 
-
-## Create min|max ExtinctionRisk per SpeciesCategory and Ecoregion
+## Calculate ExtinctionRisk min/max per SpeciesCategory and Ecoregion
 
 ```{r calc_ecoregion_minmax}
 #| eval: false
@@ -1227,21 +1226,22 @@ for (sp_cat in sp_cats){ # sp_cat = sp_cats[1]
     
     sp_cat_u <- str_replace(sp_cat, " ", "_")
     m_key   <- glue("extrisk_{sp_cat_u}_ecoregion_{fxn}")
+    m_description <- glue("Extinction risk for {sp_cat} Ecoregional {fxn}")
     message(glue("m_key: {m_key}"))
     
     # Get metric_seq first, then delete/insert
     existing_seq <- dbGetQuery(con_sdm, glue(
-      "SELECT metric_seq FROM metric WHERE metric_key = '{metric_key}'"))
+      "SELECT metric_seq FROM metric WHERE metric_key = '{m_key}'"))
     if (nrow(existing_seq) > 0) {
-      metric_seq <- existing_seq$metric_seq
-      dbExecute(con_sdm, glue("DELETE FROM metric      WHERE metric_seq = {metric_seq}"))
-      dbExecute(con_sdm, glue("DELETE FROM cell_metric WHERE metric_seq = {metric_seq}"))
-      dbExecute(con_sdm, glue("DELETE FROM zone_metric WHERE metric_seq = {metric_seq}"))
+      m_seq <- existing_seq$metric_seq
+      dbExecute(con_sdm, glue("DELETE FROM metric      WHERE metric_seq = {m_seq}"))
+      dbExecute(con_sdm, glue("DELETE FROM cell_metric WHERE metric_seq = {m_seq}"))
+      dbExecute(con_sdm, glue("DELETE FROM zone_metric WHERE metric_seq = {m_seq}"))
     } 
     
     dbExecute(con_sdm, glue(
       "INSERT INTO metric (metric_key, description)
-      VALUES ('{m_key}', 'Extinction risk for {sp_cat} Ecoregional {fxn}')" ) )
+      VALUES ('{m_key}', '{m_description}')" ) )
     
     # get metric ID
     m_seq <- dbGetQuery(con_sdm, glue(
@@ -1289,6 +1289,7 @@ for (sp_cat in sp_cats){ # sp_cat = sp_cats[1]
     dbExecute(con_sdm, glue("DELETE FROM zone_metric WHERE metric_seq = {m_seq}"))
   } 
   
+  # insert new metric
   dbExecute(con_sdm, glue("
       INSERT INTO metric (metric_key, description)
       VALUES ('{m_key}', '{m_description}')"))
@@ -1368,10 +1369,181 @@ for (sp_cat in sp_cats){ # sp_cat = sp_cats[1]
 }
 ```
 
+## Calculate PrimProd min/max by Ecoregion
 
-## Generate Biodiversity Raster
+```{r primprod_ecoregion_minmax}
+#| eval: false
 
-```{r generate_raster}
+for (fxn in c("min","max")){ # fxn = "min"
+
+  # Get existing primprod_ecoregion_rescaled metric_seq
+  m_key         <- glue("primprod_ecoregion_{fxn}")
+  m_description <- glue("Primary productivity Ecoregional {fxn}")
+                        
+  # Check if metric exists and delete if it does
+  existing_seq <- dbGetQuery(con_sdm, glue(
+    "SELECT metric_seq FROM metric WHERE metric_key = '{m_key}'"))
+  if (nrow(existing_seq) > 0) {
+    m_seq <- existing_seq$metric_seq
+    dbExecute(con_sdm, glue("DELETE FROM metric      WHERE metric_seq = {m_seq}"))
+    dbExecute(con_sdm, glue("DELETE FROM cell_metric WHERE metric_seq = {m_seq}"))
+    dbExecute(con_sdm, glue("DELETE FROM zone_metric WHERE metric_seq = {m_seq}"))
+  } 
+  
+  # insert new metric
+  dbExecute(con_sdm, glue(
+    "INSERT INTO metric (metric_key, description) VALUES ('{m_key}', '{m_description}')"))
+  
+  # get metric_seq
+  m_seq <- dbGetQuery(con_sdm, glue(
+    "SELECT metric_seq FROM metric WHERE metric_key = '{m_key}'")) |> 
+    pull(metric_seq)
+  
+  # Calculate min/max primary productivity per ecoregion
+  dbExecute(con_sdm, glue(
+    "INSERT INTO zone_metric (zone_seq, metric_seq, value)
+    SELECT 
+      z.zone_seq,
+      -- z.tbl, z.fld, z.value AS tbl_fld_val,
+      {m_seq} as metric_seq,
+      {fxn}(c.prim_prod_mean) as value
+    FROM zone z
+    LEFT JOIN zone_cell zc ON z.zone_seq = zc.zone_seq
+    LEFT JOIN cell c ON zc.cell_id = c.cell_id
+    WHERE
+      z.fld = 'ecoregion_key'
+    GROUP BY z.zone_seq" ) )
+}
+```
+
+## Calculate rescaled PrimProd per cell based on EcoregionMinMax
+
+```{r primprod_ecoregion_rescaled}
+#| eval: false
+
+# Create new metric for rescaled primary productivity
+m_key         <- "primprod_ecoregion_rescaled"
+m_description <- "Primary productivity rescaled to [0,100] based on Ecoregional min/max values"
+# TODO: consider log rescaling PrimaryProductivity
+
+# Check if metric exists and delete if it does
+existing_seq <- dbGetQuery(con_sdm, glue(
+  "SELECT metric_seq FROM metric WHERE metric_key = '{m_key}'"))
+if (nrow(existing_seq) > 0) {
+  m_seq <- existing_seq$metric_seq
+  dbExecute(con_sdm, glue("DELETE FROM metric      WHERE metric_seq = {m_seq}"))
+  dbExecute(con_sdm, glue("DELETE FROM cell_metric WHERE metric_seq = {m_seq}"))
+  dbExecute(con_sdm, glue("DELETE FROM zone_metric WHERE metric_seq = {m_seq}"))
+} 
+
+# Create new metric
+dbExecute(con_sdm, glue("
+    INSERT INTO metric (metric_key, description)
+    VALUES ('{m_key}', '{m_description}')" ) )
+m_seq <- dbGetQuery(con_sdm, glue("
+    SELECT metric_seq FROM metric WHERE metric_key = '{m_key}'")) |> 
+  pull(metric_seq)
+
+# DEBUG BEG ----
+
+# d_metric <- tbl(con_sdm, "metric") |> collect()
+# View(d_metric)
+# 
+# d_ecoregion_minmax <- dbGetQuery(con_sdm, "
+#   SELECT 
+#     z.zone_seq,
+#     MIN(zm.value) as min_value,
+#     MAX(zm.value) as max_value
+#   FROM zone z
+#   JOIN zone_metric zm USING (zone_seq)
+#   WHERE 
+#     z.fld = 'ecoregion_key' AND 
+#     zm.metric_seq IN (
+#       SELECT metric_seq FROM metric WHERE metric_key IN (
+#         'primprod_ecoregion_min',
+#         'primprod_ecoregion_max') )
+#   GROUP BY z.zone_seq")
+  
+# DEBUG END ----
+      
+# Rescale primary productivity by ecoregion
+dbExecute(con_sdm, glue("
+    WITH
+    -- get ecoregion_minmax from cell_metric for primary productivity
+    ecoregion_minmax AS (
+      SELECT 
+        z.zone_seq,
+        MIN(zm.value) as min_value,
+        MAX(zm.value) as max_value
+      FROM zone z
+      JOIN zone_metric zm USING (zone_seq)
+      WHERE 
+        z.fld = 'ecoregion_key' AND 
+        zm.metric_seq IN (
+          SELECT metric_seq FROM metric WHERE metric_key IN (
+            'primprod_ecoregion_min',
+            'primprod_ecoregion_max') )
+      GROUP BY z.zone_seq ),
+    -- get cell_ecoregion from zone_cell with pct_covered
+    cell_ecoregion_raw AS (
+      SELECT 
+        cell_id, 
+        z.zone_seq, 
+        zone_cell.pct_covered
+      FROM zone_cell
+      JOIN zone z ON zone_cell.zone_seq = z.zone_seq
+      WHERE z.fld = 'ecoregion_key'
+    ),
+    -- calculate total coverage per cell for normalization
+    cell_coverage_total AS (
+      SELECT 
+        cell_id, 
+        SUM(pct_covered) as total_coverage
+      FROM cell_ecoregion_raw
+      GROUP BY cell_id
+    ),
+    -- normalize coverage percentages
+    cell_ecoregion AS (
+      SELECT 
+        ce.cell_id, 
+        ce.zone_seq,
+        CASE 
+          WHEN COUNT(*) OVER (PARTITION BY ce.cell_id) = 1 THEN 100
+          ELSE ce.pct_covered * 100.0 / ct.total_coverage
+        END as normalized_pct
+      FROM cell_ecoregion_raw ce
+      JOIN cell_coverage_total ct ON ce.cell_id = ct.cell_id
+    )
+    -- insert rescaled primary productivity values
+    INSERT INTO cell_metric (cell_id, metric_seq, value)
+    SELECT 
+      c.cell_id,
+      {m_seq} as metric_seq,
+      SUM(
+        (c.prim_prod_mean - er.min_value) / 
+        (er.max_value     - er.min_value) * 
+        (ce.normalized_pct / 100.0) ) * 100 AS value  -- scale to 0-100 range
+    FROM cell c
+    JOIN cell_ecoregion   ce ON c.cell_id   = ce.cell_id
+    JOIN ecoregion_minmax er ON ce.zone_seq = er.zone_seq
+    WHERE 
+    c.prim_prod_mean IS NOT NULL AND 
+    ce.zone_seq IS NOT NULL AND
+    er.min_value IS NOT NULL AND 
+    er.max_value IS NOT NULL AND 
+    er.min_value < er.max_value  -- avoid division by zero
+    GROUP BY c.cell_id
+"))
+
+
+```
+
+## Combine Metrics: ExtinctionRiskSpCatEcoregionRescaled, PrimProdEcoregionRescaled
+
+
+## Map raster
+
+```{r map_raster}
 #| eval: false
 
 # load global raster template
