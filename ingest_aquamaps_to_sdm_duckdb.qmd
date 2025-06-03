@@ -150,13 +150,13 @@ region {
   date date_created       "date added to database"
 }
 
-region_metric {
+zone_metric {
   int rgn_seq         FK  "region ID"
   int metric_seq      FK  "metric ID"
   dbl value               "calculated metric value"
 }
 
-region_cell {
+zone_cell {
   int rgn_seq         FK  "region ID"
   int cell_id         FK  "cell ID"
   int pct_covered         "percentage of cell covered by region"
@@ -175,11 +175,11 @@ model ||--|{ species : "ds_key,taxa"
 model ||--o{ model_cell : mdl_seq
 cell ||--o{ model_cell : cell_id
 cell ||--o{ cell_metric : cell_id
-cell ||--o{ region_cell : cell_id
+cell ||--o{ zone_cell : cell_id
 metric ||--o{ cell_metric : metric_seq
-metric ||--o{ region_metric : metric_seq
-region ||--o{ region_metric : rgn_seq
-region ||--o{ region_cell : rgn_seq
+metric ||--o{ zone_metric : metric_seq
+region ||--o{ zone_metric : rgn_seq
+region ||--o{ zone_cell : rgn_seq
 ```
 
 ## Create Database Tables
@@ -193,7 +193,7 @@ region ||--o{ region_cell : rgn_seq
 # drop existing tables if needed
 if (dbExistsTable(con_sdm, "model_cell") || dbExistsTable(con_sdm, "sdm_values")) {
   tables_to_drop <- c(
-    "region_metric", "region_cell", "cell_metric", "env_layers", 
+    "zone_metric", "zone_cell", "cell_metric", "env_layers", 
     "model_cell", "sdm_values", "species", "model", "dataset", 
     "cell", "sdm_cells", "metric", "region", "planning_areas",
     "biodiv_metrics", "planning_area_metrics", "sdm_species", 
@@ -290,6 +290,7 @@ dbExecute(con_sdm, "
 dbExecute(con_sdm, "
   CREATE SEQUENCE zone_zone_seq_seq START 1")
 
+# dbExecute(con_sdm, "DROP TABLE IF EXISTS region")
 # dbExecute(con_sdm, "DROP TABLE IF EXISTS zone")
 dbExecute(con_sdm, "
   CREATE TABLE zone (
@@ -327,6 +328,7 @@ dbExecute(con_sdm, "
 #   area_km2 DOUBLE NOT NULL,
 #   geom GEOMETRY)")
 
+# dbExecute(con_sdm, "DROP TABLE IF EXISTS region_metric")
 dbExecute(con_sdm, "
 CREATE TABLE cell_metric (
   cell_id INTEGER REFERENCES cell(cell_id),
@@ -336,7 +338,7 @@ CREATE TABLE cell_metric (
 
 # dbExecute(con_sdm, "DROP TABLE model_cell")
 # dbExecute(con_sdm, "DROP TABLE cell_metric")
-# dbExecute(con_sdm, "DROP TABLE region_cell")
+# dbExecute(con_sdm, "DROP TABLE zone_cell")
 # dbExecute(con_sdm, "DROP TABLE cell")
 
 # dbExecute(con_sdm, "
@@ -496,7 +498,7 @@ dbExecute(con_sdm, "
     value DOUBLE,
     PRIMARY KEY (cell_id, metric_seq) )")
 
-# dbExecute(con_sdm, "DROP TABLE region_cell")
+# dbExecute(con_sdm, "DROP TABLE IF EXISTS region_cell")
 # dbExecute(con_sdm, "
 #   CREATE TABLE region_cell (
 #     rgn_seq INTEGER REFERENCES region(rgn_seq),
@@ -512,8 +514,6 @@ dbExecute(con_sdm, "
 
 # dbExecute(con_sdm, "DROP INDEX idx_model_cell_cell_id")
 # dbExecute(con_sdm, "DROP INDEX idx_model_cell_mdl_seq")
-# dbExecute(con_sdm, "CREATE INDEX idx_region_cell_rgn ON region_cell(rgn_seq)")
-# dbExecute(con_sdm, "CREATE INDEX idx_region_cell_cell ON region_cell(cell_id)")
 dbExecute(con_sdm, "CREATE INDEX idx_zone_cell_rgn ON zone_cell(zone_seq)")
 dbExecute(con_sdm, "CREATE INDEX idx_zone_cell_cell ON zone_cell(cell_id)")
 ```
@@ -1662,7 +1662,7 @@ metric_keys <- c(
 
 # get redlist codes and scores for species
 d_rl <- tbl(con_sdm, "species") |> 
-  select(taxa, sp_key, sp_cat, scientific_name, common_name, redlist_code) |> 
+  select(taxa, sp_key, sp_cat, scientific_name_dataset, common_name_dataset, redlist_code) |> 
   filter(
     !is.na(redlist_code),
     !redlist_code %in% c("DD","EX")) |> 
@@ -1760,8 +1760,8 @@ species_table <- species_contributions |>
     percent_of_total_extrisk = round(contribution / sum(contribution) * 100, 2)) |> 
   select(
     taxa, 
-    scientific_name,
-    common_name,
+    scientific_name_dataset,
+    common_name_dataset,
     sp_cat,
     redlist_code,
     rl_score,
@@ -1807,7 +1807,7 @@ metric_keys <- c(
 
 # get redlist codes and scores for species
 d_rl <- tbl(con_sdm, "species") |> 
-  select(taxa, sp_key, sp_cat, scientific_name, common_name, redlist_code) |> 
+  select(taxa, sp_key, sp_cat, scientific_name_dataset, common_name_dataset, redlist_code) |> 
   filter(
     !is.na(redlist_code),
     !redlist_code %in% c("DD","EX")) |> 
@@ -1888,8 +1888,8 @@ species_zone_table <- species_zone_contributions |>
     percent_of_total_extrisk = round(contribution / sum(contribution) * 100, 2)) |> 
   select(
     taxa, 
-    scientific_name,
-    common_name,
+    scientific_name_dataset,
+    common_name_dataset,
     sp_cat,
     redlist_code,
     rl_score,
@@ -1988,106 +1988,6 @@ mapgl_rast <- function(
 mapgl_rast(r_m, layer_name = m_key)
 ```
 
-## OLD: Summarize by Planning Area
-
-```{r summarize_planning_areas}
-#| eval: false
-
-# first, register planning areas as regions
-planning_area_regions <- dbGetQuery(con_sdm, "
-  SELECT pa_key, pa_name FROM planning_areas")
-
-for (i in 1:nrow(planning_area_regions)) {
-  dbExecute(con_sdm, glue("
-    INSERT INTO region (tbl_col, value, col_geom)
-    VALUES ('planning_areas.pa_key', '{planning_area_regions$pa_key[i]}', 'geom')
-  "))
-}
-
-# get region and metric IDs
-region_ids <- dbGetQuery(con_sdm, "
-  SELECT rgn_seq, value FROM region WHERE tbl_col = 'planning_areas.pa_key'
-")
-
-richness_metric_seq <- dbGetQuery(con_sdm, "
-  SELECT metric_seq FROM metric WHERE metric_key = 'species_richness'
-")$metric_seq
-
-# calculate average species richness per planning area
-message("Calculating planning area metrics...")
-
-for (i in 1:nrow(region_ids)) {
-  pa_key <- region_ids$value[i]
-  rgn_seq <- region_ids$rgn_seq[i]
-  
-  # calculate metric for this region
-  result <- dbGetQuery(con_sdm, glue("
-    SELECT AVG(cm.value) as avg_value
-    FROM planning_areas p
-    JOIN cell c ON ST_Within(c.geom, p.geom)
-    JOIN cell_metric cm ON c.cell_id = cm.cell_id
-    WHERE p.pa_key = '{pa_key}'
-      AND cm.metric_seq = {richness_metric_seq}
-  "))
-  
-  if (!is.na(result$avg_value[1])) {
-    dbExecute(con_sdm, glue("
-      INSERT INTO region_metric (rgn_seq, metric_seq, value)
-      VALUES ({rgn_seq}, {richness_metric_seq}, {result$avg_value[1]})
-    "))
-  }
-}
-
-# query results
-pa_metrics <- dbGetQuery(con_sdm, "
-SELECT 
-  p.pa_key,
-  p.pa_name,
-  rm.value as avg_richness
-FROM region r
-JOIN region_metric rm ON r.rgn_seq = rm.rgn_seq
-JOIN planning_areas p ON r.value = p.pa_key
-WHERE r.tbl_col = 'planning_areas.pa_key'
-  AND rm.metric_seq = (SELECT metric_seq FROM metric WHERE metric_key = 'species_richness')
-ORDER BY rm.value DESC
-")
-
-print(pa_metrics)
-```
-
-## Add Environmental Layers
-
-```{r add_env_layers}
-#| eval: false
-
-# example: add primary productivity from ingest_productivity.qmd
-npp_tif <- here("data/derived/vgpm-viirs_2023-daily-avg.tif")
-
-if (file.exists(npp_tif)) {
-  r_npp <- rast(npp_tif)
-  
-  # resample to 0.05 degree resolution
-  r_template <- rast(
-    extent = ext(-180, 180, -90, 90),
-    resolution = 0.05,
-    crs = "EPSG:4326"
-  )
-  
-  r_npp_res <- resample(r_npp, r_template, method = "bilinear")
-  
-  # extract values
-  npp_df <- as.data.frame(r_npp_res, xy = TRUE) |>
-    filter(!is.na(npp_daily_avg)) |>
-    mutate(
-      cell_lon = round(x / 0.05) * 0.05,
-      cell_lat = round(y / 0.05) * 0.05
-    )
-  
-  # insert into env_layers
-  # (similar process as species values)
-}
-```
-
 ## Export to Parquet
 
 ```{r ck_model_cell}
@@ -2136,6 +2036,8 @@ dbExecute(con_sdm, "SET threads = 8;")
 dbExecute(con_sdm, "SET memory_limit = '20GB';")
 
 dir_pq <- glue("{dir_data}/derived/sdm_parquet")
+if (dir_exists(dir_pq))
+  dir_delete(dir_pq)
 dir_create(dir_pq)
 
 dbExecute(con_sdm, glue(
