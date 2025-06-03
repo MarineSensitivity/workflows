@@ -1534,12 +1534,96 @@ dbExecute(con_sdm, glue("
     er.min_value < er.max_value  -- avoid division by zero
     GROUP BY c.cell_id
 "))
+```
+
+## Calculate cell_metric score: ExtinctionRisk + PrimProd (already EcoregionRescaled), equal weight
+
+```{r calc_score_eqwts}
+#| eval: false
+
+# Create combined metric for extinction risk and primary productivity
+m_key         <- "score_extriskspcat_primprod_ecoregionrescaled_equalweights"
+m_description <- "Combined score of extinction risk per species category and primary productivity, equally weighted (and each previously rescaled [0,100] based on Ecoregional min/max values)"
+
+# Check if metric exists and delete if it does
+existing_seq <- dbGetQuery(con_sdm, glue(
+  "SELECT metric_seq FROM metric WHERE metric_key = '{m_key}'"))
+if (nrow(existing_seq) > 0) {
+  m_seq <- existing_seq$metric_seq
+  dbExecute(con_sdm, glue("DELETE FROM metric      WHERE metric_seq = {m_seq}"))
+  dbExecute(con_sdm, glue("DELETE FROM cell_metric WHERE metric_seq = {m_seq}"))
+  dbExecute(con_sdm, glue("DELETE FROM zone_metric WHERE metric_seq = {m_seq}"))
+} 
+
+# Create new metric
+dbExecute(con_sdm, glue("
+  INSERT INTO metric (metric_key, description)
+  VALUES ('{m_key}', '{m_description}')"))
+m_seq <- dbGetQuery(con_sdm, glue("
+  SELECT metric_seq FROM metric WHERE metric_key = '{m_key}'")) |> 
+  pull(metric_seq)
+
+# Combine all species category metrics with primary productivity (equal weights)
+sp_cats <- tbl(con_sdm, "species") |> distinct(sp_cat) |> pull(sp_cat)
+# sp_cats <- c("all", sp_cats)  # Add "all" category
+
+# Get all metric_seqs for extinction risk metrics and primary productivity
+metric_keys <- c(
+  sapply(sp_cats, \(sc) glue("extrisk_{str_replace(sc, ' ', '_')}_ecoregion_rescaled"), USE.NAMES=F),
+  "primprod_ecoregion_rescaled" )
+
+# Create SQL to join all metrics with equal weights
+dbExecute(con_sdm, glue("
+  WITH metric_values AS (
+    SELECT 
+      cm.cell_id,
+      m.metric_key,
+      cm.value
+    FROM cell_metric cm
+    JOIN metric m ON cm.metric_seq = m.metric_seq
+    WHERE m.metric_key IN ({paste(shQuote(metric_keys), collapse=', ')}) )
+  INSERT INTO cell_metric (cell_id, metric_seq, value)
+  SELECT 
+    cell_id,
+    {m_seq} as metric_seq,
+    ROUND(AVG(value)) AS value
+  FROM metric_values
+  GROUP BY cell_id"))
+```
+
+## Calculate Score per PlanArea
+
+```{r calc_planarea_score}
+m_key  <- "score_extriskspcat_primprod_ecoregionrescaled_equalweights"
+z_seqs <- tbl(con_sdm, "zone") |> 
+  filter(
+    tbl   == "ply_planareas_2025") |> 
+  pull(zone_seq)  # 134
 
 
 ```
 
-## Combine Metrics: ExtinctionRiskSpCatEcoregionRescaled, PrimProdEcoregionRescaled
+## Table of Species Contributions to Score per Cell
 
+```{r species_contributions_to_cell_table}
+m_key <- "score_extriskspcat_primprod_ecoregionrescaled_equalweights"
+cell_id <- 1772473
+
+
+```
+
+## Table of Species Contributions to Score per PlanArea
+
+```{r species_contributions_to_zone_table}
+m_key <- "score_extriskspcat_primprod_ecoregionrescaled_equalweights"
+z_seq <- tbl(con_sdm, "zone") |> 
+  filter(
+    tbl   == "ply_planareas_2025",
+    value == "ALA") |> 
+  pull(zone_seq)  # 134
+
+
+```
 
 ## Map raster
 
@@ -1552,14 +1636,15 @@ cell_tif <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
 
 r_cell <- rast(cell_tif)
 
-d_metric <- tbl(con_sdm, "metric") |> collect()
-View(d_metric)
+# d_metric <- tbl(con_sdm, "metric") |> collect()
+# View(d_metric)
 # TODO: add sequences for date_created post-export-parquet
 
 # get species richness metric ID
-m_key <- "extrisk_all_ecoregion_rescaled"
-m_seq <- dbGetQuery(con_sdm, glue("
-  SELECT metric_seq FROM metric WHERE metric_key = '{m_key}'") ) |>
+# m_key <- "extrisk_all_ecoregion_rescaled"
+m_key <- "score_extriskspcat_primprod_ecoregionrescaled_equalweights"
+m_seq <- tbl(con_sdm, "metric") |> 
+  filter(metric_key == !!m_key) |>
   pull(metric_seq)
 
 # query species richness for a region
@@ -1584,8 +1669,9 @@ mapgl_rast <- function(
     r, 
     cols_r     = rev(RColorBrewer::brewer.pal(11, "Spectral")),
     layer_name = "SDM") {
+  # r = r_m; cols_r = cols_r; layer_name = m_key
   
-  rng_r  <- minmax(r) |> as.numeric()
+  rng_r  <- minmax(r) |> as.numeric() |> signif(digits = 2) 
   
   mapboxgl(
     style = mapbox_style("dark"),
@@ -1613,7 +1699,7 @@ mapgl_rast <- function(
 mapgl_rast(r_m, layer_name = m_key)
 ```
 
-## Summarize by Planning Area
+## OLD: Summarize by Planning Area
 
 ```{r summarize_planning_areas}
 #| eval: false
