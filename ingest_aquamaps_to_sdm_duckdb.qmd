@@ -1269,7 +1269,7 @@ for (sp_cat in sp_cats){ # sp_cat = sp_cats[1]
 
 ## Calculate rescaled ExtinctionRisk per cell based on EcoregionMinMax per SpeciesCategory
 
-```{r extrisk_spcat_ecoregion_rescaled}
+```{r extrisk_spcat_ecoregion_rescaled_cell}
 sp_cats <- c(
   "all",
   tbl(con_sdm, "species") |> distinct(sp_cat) |> pull(sp_cat))
@@ -1416,6 +1416,47 @@ for (fxn in c("min","max")){ # fxn = "min"
 }
 ```
 
+## Transfer raw PrimProd into cell_metric
+
+```{r primprod_cell_metric}
+#| eval: false
+
+# Create new metric for rescaled primary productivity
+m_key         <- "primprod"
+m_description <- "Primary productivity: Average Total Surface Phytoplankton 2010-2020 (mmol/m^3; Bio-Oracle dataset ID: phyc_baseline_2000_2020_depthsurf)"
+# TODO: consider log rescaling PrimaryProductivity
+
+# Check if metric exists and delete if it does
+existing_seq <- dbGetQuery(con_sdm, glue(
+  "SELECT metric_seq FROM metric WHERE metric_key = '{m_key}'"))
+if (nrow(existing_seq) > 0) {
+  m_seq <- existing_seq$metric_seq
+  dbExecute(con_sdm, glue("DELETE FROM metric      WHERE metric_seq = {m_seq}"))
+  dbExecute(con_sdm, glue("DELETE FROM cell_metric WHERE metric_seq = {m_seq}"))
+  dbExecute(con_sdm, glue("DELETE FROM zone_metric WHERE metric_seq = {m_seq}"))
+} 
+
+# Create new metric
+dbExecute(con_sdm, glue("
+    INSERT INTO metric (metric_key, description)
+    VALUES ('{m_key}', '{m_description}')" ) )
+m_seq <- dbGetQuery(con_sdm, glue("
+    SELECT metric_seq FROM metric WHERE metric_key = '{m_key}'")) |> 
+  pull(metric_seq)
+      
+# Rescale primary productivity by ecoregion
+dbExecute(con_sdm, glue("
+    INSERT INTO cell_metric (cell_id, metric_seq, value)
+    SELECT 
+      cell_id,
+      {m_seq} as metric_seq,
+      prim_prod_mean AS value
+    FROM cell c
+    WHERE 
+    prim_prod_mean IS NOT NULL
+"))
+```
+
 ## Calculate rescaled PrimProd per cell based on EcoregionMinMax
 
 ```{r primprod_ecoregion_rescaled}
@@ -1536,9 +1577,70 @@ dbExecute(con_sdm, glue("
 "))
 ```
 
+## NEW: Calculate PlanArea metrics contributing to score based on cell metrics
+
+```{r cell_metrics_to_planarea_metrics}
+# get zone_seqs for planning areas
+z_seqs <- tbl(con_sdm, "zone") |> 
+  filter(
+    tbl   == "ply_planareas_2025") |> 
+  pull(zone_seq)
+
+tbl(con_sdm, "metric") |> 
+  pull(metric_key) |> sort()
+
+sp_cats_u <- tbl(con_sdm, "species") |> 
+  distinct(sp_cat) |>
+  pull(sp_cat) |> 
+  str_replace(" ", "_")
+metrics <- c(
+  glue("extrisk_{sp_cats_u}"),
+  glue("extrisk_{sp_cats_u}_ecoregion_rescaled"),
+  "primprod",
+  "primprod_ecoregion_rescaled")
+
+for (m_key in metrics){ # m_key = metrics[1]
+
+  # get existing metric_seq
+  m_seq <- tbl(con_sdm, "metric") |> 
+    filter(metric_key == !!m_key) |> 
+    pull(metric_seq)
+  stopifnot(length(m_seq) == 1)
+
+  # delete existing zone_metric values for this metric and planning areas
+  dbExecute(con_sdm, glue(
+    "DELETE FROM zone_metric 
+    WHERE metric_seq = {m_seq} 
+      AND zone_seq IN ({paste(z_seqs, collapse = ',')})"))
+
+  # stop if no cell_metric found
+  n_cm <- tbl(con_sdm, "cell_metric") |> 
+    filter(
+      metric_seq == !!m_seq) |> 
+    tally() |>
+    pull(n)
+  stopifnot(n_cm > 0)
+  
+  # calculate average score per planning area weighted by cell coverage
+  dbExecute(con_sdm, glue("
+    INSERT INTO zone_metric (zone_seq, metric_seq, value)
+    SELECT 
+      zc.zone_seq,
+      {m_seq} as metric_seq,
+      SUM(cm.value * zc.pct_covered) / SUM(zc.pct_covered) as value
+    FROM zone_cell zc
+    JOIN cell_metric cm ON zc.cell_id = cm.cell_id
+    WHERE 
+      cm.metric_seq = {m_seq} 
+      AND zc.zone_seq IN ({paste(z_seqs, collapse = ',')})
+      AND cm.value IS NOT NULL
+    GROUP BY zc.zone_seq"))
+}
+```
+
 ## Calculate cell_metric score: ExtinctionRisk + PrimProd (already EcoregionRescaled), equal weight
 
-```{r calc_score_eqwts}
+```{r cell_metric_score}
 #| eval: false
 
 # Create combined metric for extinction risk and primary productivity
@@ -1591,9 +1693,72 @@ dbExecute(con_sdm, glue("
   GROUP BY cell_id"))
 ```
 
-## Calculate Score per PlanArea
+## NEW: Calculate Score per PlanArea from PlanArea metrics
 
-```{r calc_planarea_score}
+```{r new_calc_planarea_score_from_planarea_metrics}
+
+# metric: calculate score per planning area
+m_key <- "score_extriskspcat_primprod_ecoregionrescaled_equalweights"
+m_seq <- tbl(con_sdm, "metric") |> 
+  filter(metric_key == !!m_key) |> 
+  pull(metric_seq)
+
+# contributing metrics
+sp_cats_u <- tbl(con_sdm, "species") |> 
+  distinct(sp_cat) |>
+  pull(sp_cat) |> 
+  str_replace(" ", "_")
+metric_input_keys <- c(
+  glue("extrisk_{sp_cats_u}_ecoregion_rescaled"),
+  "primprod_ecoregion_rescaled")
+m_input_seqs <- tbl(con_sdm, "metric") |> 
+  filter(metric_key %in% metric_input_keys) |> 
+  pull(metric_seq)
+stopifnot(length(metric_input_keys) == length(m_input_seqs))
+
+# get zone_seqs for planning areas
+z_seqs <- tbl(con_sdm, "zone") |> 
+  filter(
+    tbl   == "ply_planareas_2025") |> 
+  pull(zone_seq)
+
+# DEBUG check
+# tbl(con_sdm, "zone_metric") |>
+#   filter(
+#     metric_seq == !!m_seq,
+#     zone_seq %in% z_seqs) |>
+#   arrange(desc(value)) |>
+#   pull(value) |>
+#   range()
+# 5.704735 61.050130
+#   View()
+#   nrow() -> n_existing_zm
+# z_seq == 134 # (ALA)
+
+# delete existing zone_metric values for this metric and planning areas
+dbExecute(con_sdm, glue(
+  "DELETE FROM zone_metric 
+  WHERE metric_seq = {m_seq} 
+    AND zone_seq IN ({paste(z_seqs, collapse = ',')})"))
+
+# calculate average score per planning area weighted by cell coverage
+dbExecute(con_sdm, glue("
+  INSERT INTO zone_metric (zone_seq, metric_seq, value)
+  SELECT 
+    zone_seq,
+    {m_seq} as metric_seq,
+    SUM(value) / COUNT(value) as value
+  FROM zone_metric zm
+  WHERE 
+    metric_seq IN ({paste(m_input_seqs, collapse = ',')}) 
+    AND zone_seq IN ({paste(z_seqs, collapse = ',')})
+    AND value IS NOT NULL
+  GROUP BY zone_seq"))
+```
+
+## OLD: Calculate Score per PlanArea from cell_metric
+
+```{r old_calc_planarea_score_from_cell_metrics}
 # calculate score per planning area
 m_key  <- "score_extriskspcat_primprod_ecoregionrescaled_equalweights"
 
@@ -1678,35 +1843,36 @@ d_rl <- tbl(con_sdm, "species") |>
 
 # get species-level contributions to extinction risk for this cell
 # first, get the ecoregion rescaling factor for this cell
-ecoregion_rescale <- dbGetQuery(con_sdm, glue("
-  WITH
-  -- get ecoregion min/max for all species categories
-  ecoregion_minmax AS (
-    SELECT 
-      z.zone_seq,
-      m.metric_key,
-      MIN(zm.value) as min_value,
-      MAX(zm.value) as max_value
-    FROM zone z
-    JOIN zone_metric zm USING (zone_seq)
-    JOIN metric m ON zm.metric_seq = m.metric_seq
-    WHERE 
-      z.fld = 'ecoregion_key' AND 
-      m.metric_key LIKE '%_ecoregion_min' OR m.metric_key LIKE '%_ecoregion_max'
-    GROUP BY z.zone_seq, m.metric_key
-  ),
-  -- get cell ecoregion coverage
-  cell_ecoregion AS (
-    SELECT 
-      zc.cell_id, 
-      z.zone_seq,
-      z.value as ecoregion_key,
-      zc.pct_covered
-    FROM zone_cell zc
-    JOIN zone z ON zc.zone_seq = z.zone_seq
-    WHERE z.fld = 'ecoregion_key' AND zc.cell_id = {cell_id}
-  )
-  SELECT * FROM cell_ecoregion"))
+# TODO: include ecoregion_rescale later -- too complicated for now
+# ecoregion_rescale <- dbGetQuery(con_sdm, glue("
+#   WITH
+#   -- get ecoregion min/max for all species categories
+#   ecoregion_minmax AS (
+#     SELECT 
+#       z.zone_seq,
+#       m.metric_key,
+#       MIN(zm.value) as min_value,
+#       MAX(zm.value) as max_value
+#     FROM zone z
+#     JOIN zone_metric zm USING (zone_seq)
+#     JOIN metric m ON zm.metric_seq = m.metric_seq
+#     WHERE 
+#       z.fld = 'ecoregion_key' AND 
+#       m.metric_key LIKE '%_ecoregion_min' OR m.metric_key LIKE '%_ecoregion_max'
+#     GROUP BY z.zone_seq, m.metric_key
+#   ),
+#   -- get cell ecoregion coverage
+#   cell_ecoregion AS (
+#     SELECT 
+#       zc.cell_id, 
+#       z.zone_seq,
+#       z.value as ecoregion_key,
+#       zc.pct_covered
+#     FROM zone_cell zc
+#     JOIN zone z ON zc.zone_seq = z.zone_seq
+#     WHERE z.fld = 'ecoregion_key' AND zc.cell_id = {cell_id}
+#   )
+#   SELECT * FROM cell_ecoregion"))
 
 # get raw species contributions (suitability * rl_score)
 species_contributions <- dbGetQuery(con_sdm, glue("
@@ -1718,7 +1884,10 @@ species_contributions <- dbGetQuery(con_sdm, glue("
   WHERE mc.cell_id = {cell_id} AND mc.value > 0")) |> 
   left_join(d_rl, by = "taxa") |> 
   mutate(
-    contribution = suitability * rl_score / 100)  # suitability is 0-100
+    contribution = suitability * rl_score / 100) |>   # suitability is 0-100
+  tibble() |> 
+  relocate(contribution)
+species_contributions
 
 # calculate total extinction risk per species category
 sp_cat_totals <- species_contributions |> 
@@ -1754,11 +1923,14 @@ component_contributions <- component_values |>
 
 # create detailed species table  
 species_table <- species_contributions |> 
-  filter(!is.na(rl_score)) |> 
-  arrange(desc(contribution)) |> 
+  # filter(!is.na(rl_score)) |> 
   mutate(
-    percent_of_total_extrisk = round(contribution / sum(contribution) * 100, 2)) |> 
+    pct_total_extrisk = round(contribution / sum(contribution, na.rm = T) * 100, 2),
+    is_pct_na         = is.na(pct_total_extrisk)) |> 
+  arrange(is_pct_na, desc(pct_total_extrisk), scientific_name_dataset) |> 
   select(
+    is_pct_na,
+    pct_total_extrisk,
     taxa, 
     scientific_name_dataset,
     common_name_dataset,
@@ -1766,9 +1938,13 @@ species_table <- species_contributions |>
     redlist_code,
     rl_score,
     suitability,
-    contribution,
-    percent_of_total_extrisk) |> 
-  head(20)  # top 20 species
+    contribution)
+
+table(species_table$is_pct_na)
+table(is.na(species_table$contribution))
+
+    # pct_total_extrisk) # |> 
+  # head(20)  # top 20 species
 
 print("Component contributions to cell score:")
 print(component_contributions)
@@ -2145,6 +2321,121 @@ for (ln in readLines(schema_sql)){ # ln = readLines(schema_sql)[1]
 
 ```
 
+
+## Update Zone Tables in PostGIS with Metrics
+
+
+```{r pg_update_planarea_ecoregion_metrics}
+source(here("libs/db.R")) # con
+# dbListTables(con)
+
+d_pa_metrics <- tbl(con_sdm, "zone") |> 
+  filter(tbl == "ply_planareas_2025") |>
+  select(planarea_key = value, zone_seq) |> 
+  left_join(
+    tbl(con_sdm, "zone_metric") |> 
+      mutate(
+        value = round(value, 1)), 
+    by = "zone_seq") |> 
+  left_join(
+    tbl(con_sdm, "metric") |> 
+      select(metric_seq, metric_key), 
+    by = "metric_seq") |> 
+  select(planarea_key, metric_key, value) |>
+  pivot_wider(
+    names_from  = metric_key, 
+    values_from = value) |> 
+  collect()
+
+# check
+# d_pa_metrics$score_extriskspcat_primprod_ecoregionrescaled_equalweights |> range()
+# tbl(con, "ply_planareas_2025") |> 
+#   pull(score_extriskspcat_primprod_ecoregionrescaled_equalweights) |> 
+#   range()
+# var_pa <- "score_extriskspcat_primprod_ecoregionrescaled_equalweights"
+# tbl(con, "ply_planareas_2025") |>
+#   pull({{ var_pa }}) |>
+#   range() # |> signif(digits = 3)
+
+
+d_er_metrics <- tbl(con_sdm, "zone") |> 
+  filter(tbl == "ply_ecoregions_2025") |>
+  select(ecoregion_key = value, zone_seq) |> 
+  left_join(
+    tbl(con_sdm, "zone_metric") |> 
+      mutate(
+        value = round(value, 1)), 
+    by = "zone_seq") |> 
+  left_join(
+    tbl(con_sdm, "metric") |> 
+      select(metric_seq, metric_key), 
+    by = "metric_seq") |> 
+  select(ecoregion_key, metric_key, value) |>
+  pivot_wider(
+    names_from  = metric_key, 
+    values_from = value) |> 
+  collect()
+
+update_table_with_clear <- function(con, df, tbl, key_col = "planarea_key") {
+  
+  stopifnot(dbExistsTable(con, tbl))
+  existing_cols <- dbListFields(con, tbl)
+  stopifnot(key_col %in% existing_cols)
+  stopifnot(key_col %in% names(df))
+  source_cols   <- setdiff(names(df), key_col)
+  
+  # Add missing columns
+  for (col in source_cols) {
+    if (!col %in% existing_cols) {
+      add_col_query <- glue("ALTER TABLE {tbl} ADD COLUMN {col} DOUBLE PRECISION")
+      dbExecute(con, add_col_query)
+      message("Added column: ", col)
+    }
+  }
+  
+  # Clear existing values for columns we're updating
+  existing_source_cols <- intersect(source_cols, existing_cols)
+  if (length(existing_source_cols) > 0) {
+    clear_clauses <- paste0(existing_source_cols, " = NULL", collapse = ", ")
+    clear_query <- glue("UPDATE {tbl} SET {clear_clauses}")
+    dbExecute(con, clear_query)
+    message("Cleared existing values for: ", paste(existing_source_cols, collapse = ", "), "\n")
+  }
+  
+  # Now update with new values
+  dbWriteTable(con, "temp_metrics_update", df, temporary = TRUE, overwrite = TRUE)
+  
+  set_clauses <- paste0(source_cols, " = temp.", source_cols, collapse = ", ")
+  update_query <- glue("
+    UPDATE {tbl} 
+    SET {set_clauses}
+    FROM temp_metrics_update temp
+    WHERE {tbl}.{key_col} = temp.{key_col}
+  ")
+  
+  rows_affected <- dbExecute(con, update_query)
+  message("Updated ", rows_affected, " rows")
+  
+  dbRemoveTable(con, "temp_metrics_update", force = TRUE)
+  
+  return(rows_affected)
+}
+
+# For complete refresh (clears existing values first)
+update_table_with_clear(con, d_pa_metrics, "ply_planareas_2025" , "planarea_key")
+update_table_with_clear(con, d_er_metrics, "ply_ecoregions_2025", "ecoregion_key")
+```
+
+## Add index for vector tiles
+
+per [Feature id | pg_tileserv](https://github.com/CrunchyData/pg_tileserv?tab=readme-ov-file#feature-id)
+
+```{r}
+# add auto-incrementing primary key planarea_id to postgres ply_planareas_2025 table
+dbExecute(con, "ALTER TABLE public.ply_planareas_2025 ADD COLUMN planarea_id SERIAL PRIMARY KEY;")
+
+dbExecute(con, "ALTER TABLE public.ply_ecoregions_2025 ADD COLUMN ecoregion_id SERIAL PRIMARY KEY;")
+```
 
 ## Close Connection
 

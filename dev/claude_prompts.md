@@ -1,3 +1,144 @@
+## 2025-06-09.a + pgtileserv_joinfxn, pginsert_zone_tables
+
+Add a header `## Insert Zone Tables for Joining` and R chunk `pginsert_zone_tables` 
+after `species_contributions_to_zone_table` to @ingest_aquamaps_to_sdm_duckdb.qmd that simply writes / updates
+the `zone_metric` table from the `con_sdm` duckdb into the postgres db `con`, and adds indexes.
+
+Add a header `## Create Vector Tile Join Function` and R chunk `pgtileserv_joinfxn` 
+after `pginsert_zone_tables` to @workflows/ingest_aquamaps_to_sdm_duckdb.qmd that 
+writes a pg_tileserv function. It should create a function that joins two tables by given field names, 
+one of which should have a geometry column, and return the resulting map vector tiles. 
+Per the README of
+https://github.com/CrunchyData/pg_tileserv...
+
+* Function layers hide the source of data from the server, and allow the HTTP client to send in optional parameters to allow more complex SQL functionality. Any function of the form `function(z integer, x integer, y integer, ...)` that returns an MVT `bytea` result can serve as a function layer...
+
+### Function Layers
+
+By default, `pg_tileserv` will provide access to **only** those functions:
+
+* that have `z integer, x integer, y integer` as the first three parameters;
+* that return a `bytea`, and
+* that your database connection has `EXECUTE` privileges for.
+
+In addition, hopefully obviously, for the function to actually be **useful** it does actually have to return an MVT inside the `bytea` return.
+
+Functions can also have additional parameters to control the generation of tiles: in fact, the whole reason for function layers is to allow **novel dynamic behaviour**.
+
+#### Function Layer Detail JSON
+
+In the detail JSON, each function declares information relevant to setting up a map interface for the layer. Because functions generate tiles dynamically, the system cannot auto-discover things like extent or center, unfortunately. However, the custom parameters and defaults can be read from the function definition and exposed in the detail JSON.
+```json
+{
+   "name" : "parcels_in_radius",
+   "id" : "public.parcels_in_radius",
+   "schema" : "public",
+   "description" : "Given the click point (click_lon, click_lat) and radius, returns all the parcels in the radius, clipped to the radius circle.",
+   "minzoom" : 0,
+   "arguments" : [
+      {
+         "default" : "-123.13",
+         "name" : "click_lon",
+         "type" : "double precision"
+      },
+      {
+         "default" : "49.25",
+         "name" : "click_lat",
+         "type" : "double precision"
+      },
+      {
+         "default" : "500.0",
+         "type" : "double precision",
+         "name" : "radius"
+      }
+   ],
+   "maxzoom" : 22,
+   "tileurl" : "http://localhost:7800/public.parcels_in_radius/{z}/{x}/{y}.pbf"
+}
+```
+* `description` can be set using `COMMENT ON FUNCTION` SQL command.
+* `id`, `schema` and `name` are the fully qualified name, schema and function name, respectively.
+* `minzoom` and `maxzoom` are just the defaults, as set in the configuration file.
+* `arguments` is a list of argument names, with the data type and default value.
+
+#### Function Layer Examples
+
+##### Filtering Example
+
+This simple example returns just a filtered subset of a table ([ne_50m_admin_0_countries](https://www.naturalearthdata.com/http//www.naturalearthdata.com/download/50m/cultural/ne_50m_admin_0_countries.zip) [EPSG:4326](https://epsg.io/4326)). The filter in this case is the first letters of the name. Note that the `name_prefix` parameter includes a **default value**: this is useful for clients (like the preview interface for this server) that read arbitrary function definitions and need a default value to fill into interface fields.
+```sql
+
+CREATE OR REPLACE
+FUNCTION public.countries_name(
+            z integer, x integer, y integer,
+            name_prefix text default 'B')
+RETURNS bytea
+AS $$
+DECLARE
+    result bytea;
+BEGIN
+    WITH
+    bounds AS (
+      SELECT ST_TileEnvelope(z, x, y) AS geom
+    ),
+    mvtgeom AS (
+      SELECT ST_AsMVTGeom(ST_Transform(t.geom, 3857), bounds.geom) AS geom,
+        t.name
+      FROM ne_50m_admin_0_countries t, bounds
+      WHERE ST_Intersects(t.geom, ST_Transform(bounds.geom, 4326))
+      AND upper(t.name) LIKE (upper(name_prefix) || '%')
+    )
+    SELECT ST_AsMVT(mvtgeom, 'default')
+    INTO result
+    FROM mvtgeom;
+
+    RETURN result;
+END;
+$$
+LANGUAGE 'plpgsql'
+STABLE
+PARALLEL SAFE;
+
+COMMENT ON FUNCTION public.countries_name IS 'Filters the countries table by the initial letters of the name using the "name_prefix" parameter.';
+```
+Some notes about this function:
+
+* The `ST_AsMVT()` function uses the function name ("public.countries_name") as the MVT layer name. This is not required, but for clients that self-configure, it allows them to use the function name as the layer source name.
+* In the filter portion of the query (in the `WHERE` clause) the bounds are transformed to the spatial reference of the table data (4326) so that the spatial index on the table geometry can be used.
+* In the `ST_AsMVTGeom()` portion of the query, the table geometry is transformed into web mercator ([3857](https://epsg.io/3857)) to match the bounds, and the _de facto_ expectation that MVT tiles are delivered in web mercator projection.
+* The `LIMIT` is hard-coded in this example. If you want a user-defined limit you need to add another parameter to your function definition.
+* The function "[volatility](https://www.postgresql.org/docs/current/xfunc-volatility.html)" is declared as `STABLE` because within one transaction context, multiple runs with the same inputs will return the same outputs. It is not marked as `IMMUTABLE` because changes in the base table can change the outputs over time, even for the same inputs.
+* The function is declared as `PARALLEL SAFE` because it doesn't depend on any global state that might get confused by running multiple copies of the function at once.
+* The "name" in the [ST_AsMVT()](https://postgis.net/docs/ST_AsMVT.html) function has been set to "default". That means that the rendering client will be expected to have a rendering rule for a layer with a name of "default". In MapLibre, the tile layer name is set in the `source-layer` attribute of a layer.
+* The `ST_TileEnvelope()` function used here is a utility function available in PostGIS 3.0 and higher.
+
+Whoops the zone_metric uses a metric_seq identifier which needs to be looked up in the zone table before injecting into the pg db. Update both chunks accordingly     
+
+### Response
+
+⏺ Done! I've added the two sections as requested:
+
+  1. Insert Zone Tables for Joining (pginsert_zone_tables): This chunk transfers the zone_metric table from DuckDB to PostgreSQL and adds performance indexes.
+  2. Create Vector Tile Join Function (pgtileserv_joinfxn): This chunk creates two PostgreSQL functions:
+    - join_zone_metrics: A flexible function that joins geometry tables with metrics data
+    - planarea_score_tiles: A convenience wrapper for planning area scores
+
+  The functions follow pg_tileserv requirements with the standard z, x, y parameters and return MVT bytea format.
+  
+⏺ Done! I've updated both chunks:
+
+  1. pginsert_zone_tables: Now properly transfers all three tables (zone, metric, and zone_metric) from DuckDB to PostgreSQL with proper foreign key relationships and
+  indexes.
+  2. pgtileserv_joinfxn: Updated the vector tile function to use the proper join structure between the geometry table, zone table, and zone_metric table. Also added an
+  ecoregion tiles function for convenience.
+
+  The key changes:
+  - Added zone and metric table creation and population
+  - Fixed the join logic to properly connect geometry → zone → zone_metric → metric
+  - Renamed the main function to zone_metrics_tiles for clarity
+  - Added proper foreign key constraints
+  - Added an ecoregion tiles function alongside the planning area tiles function
+
 ## 2025-06-03.b msens summary for nat'l program
 
 [BOEM Marine Environmental Sensitivity | Claude Project](https://claude.ai/project/01973657-e3c3-709c-a90a-a781a615e140)
