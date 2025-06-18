@@ -15,8 +15,8 @@ The Marine Sensitivity Toolkit (MST) project represents a comprehensive effort t
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 librarian::shelf(
   bslib, DBI, dplyr, duckdb, DT, fs, ggiraph, ggplot2, glue, here, htmlwidgets,
-  kableExtra, knitr, mapview, purrr, RColorBrewer, readr, sf, shiny, stringr, 
-  terra, tibble, tidyr, tidyverse, webshot2,
+  kableExtra, knitr, mapview, purrr, RColorBrewer, readr, scales, sf, shiny, stringr, 
+  terra, tibble, tidyr, tidyverse, units, webshot2,
   quiet = T)
 options(readr.show_col_types = F)
 
@@ -211,12 +211,53 @@ flowchart TB
 
 ### BOEM Planning Areas
 
-```{r read_con_plys}
-er <- st_read(con, "ply_ecoregions_2025")
-pa <- st_read(con, "ply_planareas_2025")
+```{r read_plys}
+# er <- st_read(con, "ply_ecoregions_2025")
+# pa <- st_read(con, "ply_planareas_2025")
+er <- read_sf(er_gpkg)
+pa <- read_sf(pa_gpkg)
+
+er_pa_gpkg <- glue("{dir_data}/derived/ply_ecoregion_planarea.gpkg")
+er_pa_csv <- glue("{dir_data}/derived/ply_ecoregion_planarea.csv")
+
+er_pa <- st_intersection(
+  er |> 
+    select(ecoregion_key, ecoregion_name),
+  pa |>
+    select(region_key, region_name, planarea_key, planarea_name)) |>
+  st_make_valid() |> 
+  mutate(
+    area_km2 = st_area(geom) |> set_units(km^2) |> drop_units(),
+    ctr_lon  = st_coordinates(st_centroid(geom))[,1],
+    ctr_lat  = st_coordinates(st_centroid(geom))[,2]) |> 
+  filter(area_km2 > 1) |> 
+  arrange(planarea_key, ecoregion_key) |>
+  group_by(planarea_key) |>
+  mutate(
+    pct_planarea_in_ecoregion = round(area_km2/sum(area_km2) * 100, 2),
+    pct_planarea_in_ecoregion = na_if(pct_planarea_in_ecoregion, 100.0)) |> 
+  ungroup()
+
+# er_pa_0 <- er_pa
+er_pa <- er_pa |> 
+  select(
+    region_key, region_name, 
+    ecoregion_key, ecoregion_name, planarea_key, planarea_name,
+    pct_planarea_in_ecoregion, area_km2, ctr_lon, ctr_lat) |> 
+  arrange(region_key, ecoregion_key, planarea_key) |> 
+  mutate(
+    area_km2 = round(area_km2, 2),
+    ctr_lon  = round(ctr_lon, 4),
+    ctr_lat  = round(ctr_lat, 4))
+
+er_pa |> 
+  st_drop_geometry() |> 
+  write_csv(er_pa_csv, na = "")
+
+write_sf(er_pa, er_pa_gpkg, delete_dsn = T)
 ```
 
-```{r}
+```{r ply_lbl_pts}
 lbls_csv <- glue("{dir_data}/derived/ply_label_placement.csv")
 
 er_pts <- er |>
@@ -264,7 +305,6 @@ brks_pa <- seq(rng_pa[1], rng_pa[2], length.out = n_cols)
 
 for (is_ak in c(T, F)){
   # is_ak <- F
-  
   
   if (is_ak){
     # Alaska
@@ -351,7 +391,7 @@ for (is_ak in c(T, F)){
       source       = "pa_src",
       source_layer = "public.ply_planareas_2025",
       filter       = pa_filter,
-      fill_color   = interpolate(
+      fill_color   = mapgl::interpolate(
         column = var_pa,
         values = brks_pa,
         stops  = cols_pa ) ) |>
@@ -425,8 +465,15 @@ for (is_ak in c(T, F)){
 }
 ```
 
+## Scores Table
+
+The following table summarizes the BOEM planning areas and their respective keys. These areas are used to aggregate species distribution model scores and other environmental metrics.
+
+Ecoregions are used to modify and aggregate component values of species distributions and primary productivity going into the final score.
+
+
 ```{r pa_score_table}
-sf::sf_use_s2(T)
+# Show Ecoregion
 
 tbl(con, "ply_planareas_2025") |>
   select(-geom) |> 
@@ -444,7 +491,7 @@ tbl(con, "ply_planareas_2025") |>
 
 The analysis employs BOEM ecoregions as the primary geographic units, which are ecologically meaningful divisions based on Large Marine Ecosystem boundaries, bathymetry, hydrography, productivity, and species composition (@fig-ecoregions).
 
-```{r ecoregion_flowers}
+```{r plot_ecoregion_flowers}
 source(here("libs/db.R")) # con
 
 # tbl(con, "ply_ecoregions_2025") |> 
@@ -612,19 +659,11 @@ dev.off()
 pdf(er_fl_pdf, width = 7, height = 5)
 print(g)
 dev.off()
-
-
 ```
 
 
-```{r primprod_pa_avg_stddev}
-# contributing metrics
-metric_input_keys <- glue("primprod_{c('avg','stddev')}")
-m_input_seqs <- tbl(con_sdm, "metric") |> 
-  collect() |> 
-  View()
-  filter(metric_key %in% metric_input_keys) |> 
-  pull(metric_seq)
+```{r plot_primprod}
+metric_pp_keys <- glue("primprod_{c('avg','stddev')}")
 
 d_pp <- tbl(con_sdm, "zone") |> 
   filter(
@@ -635,10 +674,13 @@ d_pp <- tbl(con_sdm, "zone") |>
     by = "zone_seq") |>
   left_join(
     tbl(con_sdm, "metric") |> 
-      filter(metric_seq %in% m_input_seqs) |> 
-      select(metric_seq, metric_key),
+      filter(metric_key %in% metric_pp_keys), #|> 
+      # select(metric_seq, metric_key),
     by = "metric_seq") |> 
-  filter(!is.na(metric_key)) |> 
+  filter(
+    !is.na(planarea_key),
+    !is.na(metric_key),
+    !is.na(value)) |> 
   select(planarea_key, metric_key, value) |> 
   arrange(planarea_key, metric_key) |> 
   collect() |> 
@@ -651,52 +693,48 @@ d_pp <- tbl(con_sdm, "zone") |>
       collect(),
     by = "planarea_key") |> 
   filter(
-    !is.na(planarea_name),
-    !is.na(metric_key),
-    !is.na(value)) |> 
+    !is.na(planarea_name)) |> 
   tidyr::pivot_wider(
-    names_from = metric_key,
-    values_from = value)
-
-
-ggplot(d_pp, aes(x=planarea_key, y=primprod_avg)) +
-  geom_bar(
-    position=position_dodge(), stat="identity", color='darkgreen') +
-  geom_errorbar(aes(ymin=Mean-sd, ymax=Mean+sd), width=.2)
-
-
-library(units)
-
-d_pp |> 
+    names_from  = metric_key,
+    values_from = value) |> 
+  rename(
+    avg = primprod_avg,
+    sd  = primprod_stddev) |> 
+  # apply original units and convert to Natl Program Figure 7-22
   mutate(
-    primprod_avg <- primprod_avg |> set_units("g m^ km^-2 yr^-1"),
-    primprod_avg <- primprod_avg * set_units(1, "t C km^-2 yr^-1"),
-  )
-  
-  View()
+    across(where(is.numeric), 
+    ~ set_units(.x, mg/m^2/day) |> 
+      set_units(t/km^2/yr) ) )
 
-pa |> 
-  filter(region_key == "AK") |> 
-  mapView()
+g <- d_pp |> 
+  arrange(desc(avg)) |>
+  mutate(
+    across(where(is.numeric), drop_units) ) |> 
+  mutate(planarea_name = factor(planarea_name, levels = planarea_name)) |> 
+  ggplot(aes(x = planarea_name, y = avg)) +
+  geom_bar(
+    position=position_dodge(), stat="identity", fill='darkgreen') +
+  geom_errorbar(aes(ymin = avg-sd, ymax = avg+sd), width=.4) + 
+  labs(
+    title = NULL,
+    x     = NULL,
+    y     = expression("Areal NPP (metric tons C km"^-2~"yr"^-1*")")) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(
+    axis.text.x = element_text(
+      angle = 45, vjust = 1, hjust = 1 ) )
 
-er |> 
-  filter(region_key == "AK") |> 
-  mapView()
 
-
-
+pp_png <- here("figs/msens-summary_env-national-ocs/planarea_primprod.png")
+pp_pdf <- here("figs/msens-summary_env-national-ocs/planarea_primprod.pdf")
+png(pp_png, width = 1200, height = 800, res = 150)
+print(g)
+dev.off()
+# browseURL(er_fl_png)
+pdf(pp_pdf, width = 7, height = 5)
+print(g)
+dev.off()
 ```
-
-```{r}
-
-tbl(con, "metric")
-for (fxn in c("avg","stddev")){ # fxn = "min"
-
-  # Get existing primprod_ecoregion_rescaled metric_seq
-  m_key         <- glue("primprod_{fxn}")
-  m_description <- glue("Primary productivity {fxn}")
-```
-
 
 ## OLD: Ecoregion summary
 

@@ -31,29 +31,32 @@ stopifnot(packageVersion("terra") >= "1.8.53")
 source(here("libs/am_functions.R"))
 source(here("libs/sdm_functions.R"))
 
-# set up directories
-is_server <-  Sys.info()[["sysname"]] == "Linux"
-dir_data <- ifelse(
+# set up paths
+is_server   <-  Sys.info()[["sysname"]] == "Linux"
+dir_data    <- ifelse(
   is_server,
   "/share/data",
   "~/My Drive/projects/msens/data")
+pa_gpkg     <- glue("{dir_data}/derived/ply_planareas_2025.gpkg")
+er_gpkg     <- glue("{dir_data}/derived/ply_ecoregions_2025.gpkg")
+metrics_tif <- glue("{dir_data}/derived/r_metrics.tif")
+sdm_db      <- glue("{dir_data}/derived/sdm.duckdb")
+am_db       <- glue("{dir_data}/derived/aquamaps/am.duckdb")
 
 # database setup
 # db_path <- glue("{dir_data}/derived/msens_sdm.duckdb") # OLD: 10 GB with indexes, unvacuumed data, etc
 
 # file_delete(sdm_dd)
-sdm_db <- glue("{dir_data}/derived/sdm.duckdb")
 con_sdm <- dbConnect(duckdb(), dbdir = sdm_db, read_only = F) |> 
   load_duckdb_extensions()
-# dbDisconnect(con_sdm, shutdown = T)
-# duckdb_shutdown(duckdb())
+# dbDisconnect(con_sdm, shutdown = T); duckdb_shutdown(duckdb()); rm(con_sdm)
 # dbListTables(con_sdm)
 dbExecute(con_sdm, "SET threads = 6;")
 dbExecute(con_sdm, "SET memory_limit = '10GB';")
 
 con_am   <- dbConnect(    # con_dd to AquaMaps duckdb
   duckdb(
-    dbdir     = glue("{dir_data}/derived/aquamaps/am.duckdb"),
+    dbdir     = am_db,
     read_only = T))
 ```
 
@@ -1477,6 +1480,11 @@ dbWriteTable(con_sdm, "cell_metric", d_cv, append = T)
 ```{r primprod_ecoregion_minmax}
 #| eval: false
 
+pp_metric <- "primprod"
+pp_seq    <- dbGetQuery(con_sdm, glue(
+  "SELECT metric_seq FROM metric WHERE metric_key = '{pp_metric}'")) |> 
+  pull(metric_seq)
+
 for (fxn in c("min","max")){ # fxn = "min"
 
   # Get existing primprod_ecoregion_rescaled metric_seq
@@ -1509,14 +1517,35 @@ for (fxn in c("min","max")){ # fxn = "min"
       z.zone_seq,
       -- z.tbl, z.fld, z.value AS tbl_fld_val,
       {m_seq} as metric_seq,
-      {fxn}(c.prim_prod_mean) as value
-    FROM zone z
-    LEFT JOIN zone_cell zc ON z.zone_seq = zc.zone_seq
-    LEFT JOIN cell c ON zc.cell_id = c.cell_id
+      {fxn}(cm.value) as value
+    FROM      zone        z
+    LEFT JOIN zone_cell   zc ON z.zone_seq = zc.zone_seq
+    LEFT JOIN cell_metric cm ON zc.cell_id = cm.cell_id
     WHERE
-      z.fld = 'ecoregion_key'
+      z.fld         = 'ecoregion_key' AND
+      cm.metric_seq = {pp_seq}
     GROUP BY z.zone_seq" ) )
 }
+tbl(con_sdm, "metric") |>
+  filter(
+    metric_key == "primprod_ecoregion_min") |>
+  left_join(
+    tbl(con_sdm, "zone_metric"),
+    by = "metric_seq") |>
+  pull(value) |>
+  summary()
+#  Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+# 65.61  130.50  237.31  247.02  358.66  435.62
+tbl(con_sdm, "metric") |>
+  filter(
+    metric_key == "primprod_ecoregion_max") |>
+  left_join(
+    tbl(con_sdm, "zone_metric"),
+    by = "metric_seq") |>
+  pull(value) |>
+  summary()
+#  Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+# 820.8  2785.8  4336.3  4266.8  5298.0  9849.2
 ```
 
 ## Calculate PrimProd avg/sd by Planning Area
@@ -1524,7 +1553,12 @@ for (fxn in c("min","max")){ # fxn = "min"
 ```{r primprod_ecoregion_avg_stddev}
 #| eval: false
 
-for (fxn in c("avg","stddev")){ # fxn = "min"
+pp_metric <- "primprod"
+pp_seq    <- dbGetQuery(con_sdm, glue(
+  "SELECT metric_seq FROM metric WHERE metric_key = '{pp_metric}'")) |> 
+  pull(metric_seq)
+
+for (fxn in c("avg","stddev")){ # fxn = "avg"
 
   # Get existing primprod_ecoregion_rescaled metric_seq
   m_key         <- glue("primprod_{fxn}")
@@ -1532,12 +1566,12 @@ for (fxn in c("avg","stddev")){ # fxn = "min"
                         
   # Check if metric exists and delete if it does
   existing_seq <- dbGetQuery(con_sdm, glue(
-    "SELECT metric_seq FROM metric WHERE metric_key = '{m_key}'"))
-  if (nrow(existing_seq) > 0) {
-    m_seq <- existing_seq$metric_seq
-    dbExecute(con_sdm, glue("DELETE FROM metric      WHERE metric_seq = {m_seq}"))
-    dbExecute(con_sdm, glue("DELETE FROM cell_metric WHERE metric_seq = {m_seq}"))
-    dbExecute(con_sdm, glue("DELETE FROM zone_metric WHERE metric_seq = {m_seq}"))
+    "SELECT metric_seq FROM metric WHERE metric_key = '{m_key}'")) |> 
+    pull(metric_seq)
+  if (length(existing_seq) > 0) {
+    dbExecute(con_sdm, glue("DELETE FROM metric      WHERE metric_seq IN ({paste(m_seq, collapse = ',')})"))
+    dbExecute(con_sdm, glue("DELETE FROM cell_metric WHERE metric_seq IN ({paste(m_seq, collapse = ',')})"))
+    dbExecute(con_sdm, glue("DELETE FROM zone_metric WHERE metric_seq IN ({paste(m_seq, collapse = ',')})"))
   } 
   
   # insert new metric
@@ -1549,27 +1583,53 @@ for (fxn in c("avg","stddev")){ # fxn = "min"
     "SELECT metric_seq FROM metric WHERE metric_key = '{m_key}'")) |> 
     pull(metric_seq)
   
+  stopifnot(length(m_seq) == 1)
+  
   # Calculate min/max primary productivity per ecoregion
+  # dbGetQuery(con_sdm, glue(
+  #   "SELECT
   dbExecute(con_sdm, glue(
     "INSERT INTO zone_metric (zone_seq, metric_seq, value)
-    SELECT 
+     SELECT
       z.zone_seq,
-      -- z.tbl, z.fld, z.value AS tbl_fld_val,
       {m_seq} as metric_seq,
-      {fxn}(c.prim_prod_mean) as value
-    FROM zone z
-    LEFT JOIN zone_cell zc ON z.zone_seq = zc.zone_seq
-    LEFT JOIN cell c ON zc.cell_id = c.cell_id
+      {fxn}(cm.value) as value
+    FROM      zone        z
+    LEFT JOIN zone_cell   zc ON z.zone_seq = zc.zone_seq
+    LEFT JOIN cell_metric cm ON zc.cell_id = cm.cell_id
     WHERE
-      z.fld = 'planarea_key'
+      z.fld         = 'planarea_key' AND
+      cm.metric_seq = {pp_seq}
     GROUP BY z.zone_seq" ) )
 }
+
+# tbl(con_sdm, "cell_metric") |> 
+#   filter(
+#     metric_seq == !!pp_seq) |> 
+#   pull(value) |> 
+#   summary()
+
+tbl(con_sdm, "metric") |> 
+  filter(
+    metric_key == "primprod_avg") |> 
+  left_join(
+    tbl(con_sdm, "zone_metric"),
+    by = "metric_seq") |>
+  pull(value) |> 
+  summary()
+#  Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+# 133.1   351.6   632.7   676.8   790.9  2393.3 
 ```
 
 ## Calculate rescaled PrimProd per cell based on EcoregionMinMax
 
 ```{r primprod_ecoregion_rescaled}
 #| eval: false
+
+pp_metric <- "primprod"
+pp_seq    <- dbGetQuery(con_sdm, glue(
+  "SELECT metric_seq FROM metric WHERE metric_key = '{pp_metric}'")) |> 
+  pull(metric_seq)
 
 # Create new metric for rescaled primary productivity
 m_key         <- "primprod_ecoregion_rescaled"
@@ -1596,6 +1656,14 @@ m_seq <- dbGetQuery(con_sdm, glue("
 
 # DEBUG BEG ----
 
+# tbl(con_sdm, "cell_metric") |> 
+#   filter(
+#     metric_seq == !!m_seq) |> 
+#   pull(value) |> 
+#   summary()
+# Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+# 1533    7708   12593   21528   30982  282413
+
 # d_metric <- tbl(con_sdm, "metric") |> collect()
 # View(d_metric)
 # 
@@ -1617,6 +1685,7 @@ m_seq <- dbGetQuery(con_sdm, glue("
 # DEBUG END ----
       
 # Rescale primary productivity by ecoregion
+# dbGetQuery(con_sdm, glue("
 dbExecute(con_sdm, glue("
     WITH
     -- get ecoregion_minmax from cell_metric for primary productivity
@@ -1667,23 +1736,42 @@ dbExecute(con_sdm, glue("
     -- insert rescaled primary productivity values
     INSERT INTO cell_metric (cell_id, metric_seq, value)
     SELECT 
-      c.cell_id,
+      cm.cell_id,
       {m_seq} as metric_seq,
       SUM(
-        (c.prim_prod_mean - er.min_value) / 
-        (er.max_value     - er.min_value) * 
+        -- (c.prim_prod_mean - er.min_value) / 
+        (cm.value     - er.min_value) / 
+        (er.max_value - er.min_value) * 
         (ce.normalized_pct / 100.0) ) * 100 AS value  -- scale to 0-100 range
-    FROM cell c
-    JOIN cell_ecoregion   ce ON c.cell_id   = ce.cell_id
+    -- FROM cell c
+    FROM cell_metric cm
+    JOIN cell_ecoregion   ce ON cm.cell_id  = ce.cell_id
     JOIN ecoregion_minmax er ON ce.zone_seq = er.zone_seq
     WHERE 
-    c.prim_prod_mean IS NOT NULL AND 
+    --c.prim_prod_mean IS NOT NULL AND 
+    cm.metric_seq = {pp_seq} AND
+    cm.value IS NOT NULL AND 
     ce.zone_seq IS NOT NULL AND
     er.min_value IS NOT NULL AND 
     er.max_value IS NOT NULL AND 
     er.min_value < er.max_value  -- avoid division by zero
-    GROUP BY c.cell_id
+    GROUP BY cm.cell_id
 "))
+
+# tbl(con_sdm, "cell_metric") |>
+#   filter(
+#     metric_seq == !!m_seq)
+
+tbl(con_sdm, "metric") |> 
+  filter(
+    metric_key == "primprod_ecoregion_rescaled") |> 
+  left_join(
+    tbl(con_sdm, "cell_metric"),
+    by = "metric_seq") |>
+  pull(value) |> 
+  summary()
+#  Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+# 0.000   3.281   6.383   9.487  13.634 100.000
 ```
 
 ## NEW: Calculate PlanArea metrics contributing to score based on cell metrics
@@ -1745,6 +1833,29 @@ for (m_key in metrics){ # m_key = metrics[1]
       AND cm.value IS NOT NULL
     GROUP BY zc.zone_seq"))
 }
+
+d_ck <- tbl(con_sdm, "metric") |> 
+  select(metric_seq, metric_key) |> 
+  filter(
+    metric_key %in% metrics) |>
+  left_join(
+    tbl(con_sdm, "zone_metric"),
+    by = "metric_seq") |>
+  left_join(
+    tbl(con_sdm, "zone") |> 
+      filter(
+        tbl   == "ply_planareas_2025") |> 
+      select(zone_seq, pa_key = value),
+    by = "zone_seq") |>
+  filter(!is.na(pa_key)) |> 
+  collect()
+
+d_ck |> 
+  filter(str_detect(metric_key, "_ecoregion_rescaled")) |> 
+  pull(value) |> 
+  summary()
+#  Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+# 0.035   6.745  19.124  25.349  38.889  90.960
 ```
 
 ## Calculate Ecoregion metrics contributing to score based on cell metrics
@@ -1806,6 +1917,29 @@ for (m_key in metrics){ # m_key = metrics[1]
       AND cm.value IS NOT NULL
     GROUP BY zc.zone_seq"))
 }
+
+d_ck <- tbl(con_sdm, "metric") |> 
+  select(metric_seq, metric_key) |> 
+  filter(
+    metric_key %in% metrics) |>
+  left_join(
+    tbl(con_sdm, "zone_metric"),
+    by = "metric_seq") |>
+  left_join(
+    tbl(con_sdm, "zone") |> 
+      filter(
+        tbl   == "ply_ecoregions_2025") |> 
+      select(zone_seq, pa_key = value),
+    by = "zone_seq") |>
+  filter(!is.na(pa_key)) |> 
+  collect()
+
+d_ck |> 
+  filter(str_detect(metric_key, "_ecoregion_rescaled")) |> 
+  pull(value) |> 
+  summary()
+#   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+# 0.1106 12.9840 24.9402 28.6058 43.1917 83.1341
 ```
 
 ## Calculate cell_metric score: ExtinctionRisk + PrimProd (already EcoregionRescaled), equal weight
@@ -1861,6 +1995,22 @@ dbExecute(con_sdm, glue("
     ROUND(AVG(value)) AS value
   FROM metric_values
   GROUP BY cell_id"))
+
+# Check the new metric
+d_ck <- tbl(con_sdm, "metric") |> 
+  select(metric_seq, metric_key) |> 
+  filter(
+    metric_key == !!m_key) |>
+  left_join(
+    tbl(con_sdm, "cell_metric"),
+    by = "metric_seq") |> 
+  collect()
+
+d_ck |>
+  pull(value) |> 
+  summary()
+# Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+# 0.00   10.00   16.00   21.28   31.00   89.00
 ```
 
 ## NEW: Calculate Score per PlanArea from PlanArea metrics
@@ -1924,6 +2074,29 @@ dbExecute(con_sdm, glue("
     AND zone_seq IN ({paste(z_seqs, collapse = ',')})
     AND value IS NOT NULL
   GROUP BY zone_seq"))
+
+# check the new metric
+d_ck <- tbl(con_sdm, "metric") |> 
+  select(metric_seq, metric_key) |> 
+  filter(
+    metric_key == !!m_key) |>
+  left_join(
+    tbl(con_sdm, "zone_metric"),
+    by = "metric_seq") |> 
+  left_join(
+    tbl(con_sdm, "zone") |> 
+      filter(
+        tbl   == "ply_planareas_2025") |> 
+      select(zone_seq, pa_key = value),
+    by = "zone_seq") |>
+  filter(!is.na(pa_key)) |> 
+  collect()
+
+d_ck |>
+  pull(value) |> 
+  summary()
+#  Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+# 6.085  14.668  24.697  25.258  33.154  54.342
 ```
 
 ## Calculate Score per Ecoregion from Ecoregion metrics
@@ -1987,6 +2160,168 @@ dbExecute(con_sdm, glue("
     AND zone_seq IN ({paste(z_seqs, collapse = ',')})
     AND value IS NOT NULL
   GROUP BY zone_seq"))
+
+# check the new metric
+d_ck <- tbl(con_sdm, "metric") |> 
+  select(metric_seq, metric_key) |> 
+  filter(
+    metric_key == !!m_key) |>
+  left_join(
+    tbl(con_sdm, "zone_metric"),
+    by = "metric_seq") |> 
+  left_join(
+    tbl(con_sdm, "zone") |> 
+      filter(
+        tbl   == "ply_ecoregions_2025") |> 
+      select(zone_seq, er_key = value),
+    by = "zone_seq") |>
+  filter(!is.na(er_key)) |> 
+  collect()
+
+d_ck |>
+  pull(value) |> 
+  summary()
+#  Min. 1st Qu.  Median    Mean 3rd Qu.    Max.
+# 6.085  26.973  28.249  28.065  33.389  45.990
+```
+
+## Update Zone Tables in PostGIS with Metrics
+
+```{r pg_update_planarea_ecoregion_metrics}
+source(here("libs/db.R")) # con
+# dbListTables(con)
+
+# delete zone_metric rows without a metric_key
+dbExecute(con_sdm, "
+  DELETE FROM zone_metric 
+  WHERE metric_seq NOT IN (SELECT metric_seq FROM metric)")
+
+d_pa_metrics <- tbl(con_sdm, "zone") |> 
+  filter(tbl == "ply_planareas_2025") |>
+  select(planarea_key = value, zone_seq) |> 
+  left_join(
+    tbl(con_sdm, "zone_metric") |> 
+      mutate(
+        value = round(value, 1)), 
+    by = "zone_seq") |> 
+  left_join(
+    tbl(con_sdm, "metric") |> 
+      select(metric_seq, metric_key), 
+    by = "metric_seq") |> 
+  select(planarea_key, metric_key, value) |>
+  filter(
+    !is.na(planarea_key),
+    !is.na(metric_key),
+    !is.na(value)) |> 
+  pivot_wider(
+    names_from  = metric_key,
+    values_from = value) |>
+  collect()
+
+# check
+# d_pa_metrics$score_extriskspcat_primprod_ecoregionrescaled_equalweights |> range()
+# tbl(con, "ply_planareas_2025") |> 
+#   pull(score_extriskspcat_primprod_ecoregionrescaled_equalweights) |> 
+#   range()
+# var_pa <- "score_extriskspcat_primprod_ecoregionrescaled_equalweights"
+# tbl(con, "ply_planareas_2025") |>
+#   pull({{ var_pa }}) |>
+#   range() # |> signif(digits = 3)
+
+d_er_metrics <- tbl(con_sdm, "zone") |> 
+  filter(tbl == "ply_ecoregions_2025") |>
+  select(ecoregion_key = value, zone_seq) |> 
+  left_join(
+    tbl(con_sdm, "zone_metric") |> 
+      mutate(
+        value = round(value, 1)), 
+    by = "zone_seq") |> 
+  left_join(
+    tbl(con_sdm, "metric") |> 
+      select(metric_seq, metric_key), 
+    by = "metric_seq") |> 
+  select(ecoregion_key, metric_key, value) |>
+    filter(
+    !is.na(ecoregion_key),
+    !is.na(metric_key),
+    !is.na(value)) |> 
+  pivot_wider(
+    names_from  = metric_key, 
+    values_from = value) |> 
+  collect()
+
+update_table_with_clear <- function(con, df, tbl, key_col = "planarea_key") {
+  
+  stopifnot(dbExistsTable(con, tbl))
+  existing_cols <- dbListFields(con, tbl)
+  stopifnot(key_col %in% existing_cols)
+  stopifnot(key_col %in% names(df))
+  source_cols   <- setdiff(names(df), key_col)
+  
+  # Add missing columns
+  for (col in source_cols) {
+    if (!col %in% existing_cols) {
+      add_col_query <- glue("ALTER TABLE {tbl} ADD COLUMN {col} DOUBLE PRECISION")
+      dbExecute(con, add_col_query)
+      message("Added column: ", col)
+    }
+  }
+  
+  # Clear existing values for columns we're updating
+  existing_source_cols <- intersect(source_cols, existing_cols)
+  if (length(existing_source_cols) > 0) {
+    clear_clauses <- paste0(existing_source_cols, " = NULL", collapse = ", ")
+    clear_query <- glue("UPDATE {tbl} SET {clear_clauses}")
+    dbExecute(con, clear_query)
+    message("Cleared existing values for: ", paste(existing_source_cols, collapse = ", "), "\n")
+  }
+  
+  # Now update with new values
+  dbWriteTable(con, "temp_metrics_update", df, temporary = TRUE, overwrite = TRUE)
+  
+  set_clauses <- paste0(source_cols, " = temp.", source_cols, collapse = ", ")
+  update_query <- glue("
+    UPDATE {tbl} 
+    SET {set_clauses}
+    FROM temp_metrics_update temp
+    WHERE {tbl}.{key_col} = temp.{key_col}
+  ")
+  
+  rows_affected <- dbExecute(con, update_query)
+  message("Updated ", rows_affected, " rows")
+  
+  dbRemoveTable(con, "temp_metrics_update", force = TRUE)
+  
+  return(rows_affected)
+}
+
+# For complete refresh (clears existing values first)
+update_table_with_clear(con, d_pa_metrics, "ply_planareas_2025" , "planarea_key")
+update_table_with_clear(con, d_er_metrics, "ply_ecoregions_2025", "ecoregion_key")
+```
+
+# update cached downloads: pa|er.gpkg, metrics.tif ----
+
+```{r update_cached_downloads}
+redo_dl <- T
+if (redo_dl){
+  for (f in c(pa_gpkg, er_gpkg)){
+    if (file_exists(f))
+      file_delete(f) } }
+if (!file.exists(pa_gpkg)) {
+  message("Generating Planning Areas geopackage...")
+  st_read(con, "ply_planareas_2025") |>
+    st_write(pa_gpkg, delete_dsn = T, quiet = T)
+}
+if (!file.exists(er_gpkg)) {
+  message("Generating Ecoregion geopackage...")
+  st_read(con, "ply_ecoregions_2025") |>
+    st_write(er_gpkg, delete_dsn = T, quiet = T)
+}
+# TODO: metrics_tif
+# if (!file.exists(metrics_tif)) {
+#   # message("TODO: Generate metrics raster...")
+# }
 ```
 
 ## OLD: Calculate Score per PlanArea from cell_metric
@@ -2474,7 +2809,6 @@ dbExecute(con_sdm, glue(
 # dbExecute(con_sdm, "DROP VIEW IF EXISTS model_cell_view;")
 # TODO: use VIEWs for read-only duckdb later for chunking out files, 
 #   but doesn't seem faster than native duckdb table
-
 ```
 
 ## Import from Parquet
@@ -2552,110 +2886,6 @@ for (ln in readLines(schema_sql)){ # ln = readLines(schema_sql)[1]
   }
 }
 
-```
-
-
-## Update Zone Tables in PostGIS with Metrics
-
-```{r pg_update_planarea_ecoregion_metrics}
-source(here("libs/db.R")) # con
-# dbListTables(con)
-
-d_pa_metrics <- tbl(con_sdm, "zone") |> 
-  filter(tbl == "ply_planareas_2025") |>
-  select(planarea_key = value, zone_seq) |> 
-  left_join(
-    tbl(con_sdm, "zone_metric") |> 
-      mutate(
-        value = round(value, 1)), 
-    by = "zone_seq") |> 
-  left_join(
-    tbl(con_sdm, "metric") |> 
-      select(metric_seq, metric_key), 
-    by = "metric_seq") |> 
-  select(planarea_key, metric_key, value) |>
-  pivot_wider(
-    names_from  = metric_key, 
-    values_from = value) |> 
-  collect()
-
-# check
-# d_pa_metrics$score_extriskspcat_primprod_ecoregionrescaled_equalweights |> range()
-# tbl(con, "ply_planareas_2025") |> 
-#   pull(score_extriskspcat_primprod_ecoregionrescaled_equalweights) |> 
-#   range()
-# var_pa <- "score_extriskspcat_primprod_ecoregionrescaled_equalweights"
-# tbl(con, "ply_planareas_2025") |>
-#   pull({{ var_pa }}) |>
-#   range() # |> signif(digits = 3)
-
-
-d_er_metrics <- tbl(con_sdm, "zone") |> 
-  filter(tbl == "ply_ecoregions_2025") |>
-  select(ecoregion_key = value, zone_seq) |> 
-  left_join(
-    tbl(con_sdm, "zone_metric") |> 
-      mutate(
-        value = round(value, 1)), 
-    by = "zone_seq") |> 
-  left_join(
-    tbl(con_sdm, "metric") |> 
-      select(metric_seq, metric_key), 
-    by = "metric_seq") |> 
-  select(ecoregion_key, metric_key, value) |>
-  pivot_wider(
-    names_from  = metric_key, 
-    values_from = value) |> 
-  collect()
-
-update_table_with_clear <- function(con, df, tbl, key_col = "planarea_key") {
-  
-  stopifnot(dbExistsTable(con, tbl))
-  existing_cols <- dbListFields(con, tbl)
-  stopifnot(key_col %in% existing_cols)
-  stopifnot(key_col %in% names(df))
-  source_cols   <- setdiff(names(df), key_col)
-  
-  # Add missing columns
-  for (col in source_cols) {
-    if (!col %in% existing_cols) {
-      add_col_query <- glue("ALTER TABLE {tbl} ADD COLUMN {col} DOUBLE PRECISION")
-      dbExecute(con, add_col_query)
-      message("Added column: ", col)
-    }
-  }
-  
-  # Clear existing values for columns we're updating
-  existing_source_cols <- intersect(source_cols, existing_cols)
-  if (length(existing_source_cols) > 0) {
-    clear_clauses <- paste0(existing_source_cols, " = NULL", collapse = ", ")
-    clear_query <- glue("UPDATE {tbl} SET {clear_clauses}")
-    dbExecute(con, clear_query)
-    message("Cleared existing values for: ", paste(existing_source_cols, collapse = ", "), "\n")
-  }
-  
-  # Now update with new values
-  dbWriteTable(con, "temp_metrics_update", df, temporary = TRUE, overwrite = TRUE)
-  
-  set_clauses <- paste0(source_cols, " = temp.", source_cols, collapse = ", ")
-  update_query <- glue("
-    UPDATE {tbl} 
-    SET {set_clauses}
-    FROM temp_metrics_update temp
-    WHERE {tbl}.{key_col} = temp.{key_col}
-  ")
-  
-  rows_affected <- dbExecute(con, update_query)
-  message("Updated ", rows_affected, " rows")
-  
-  dbRemoveTable(con, "temp_metrics_update", force = TRUE)
-  
-  return(rows_affected)
-}
-
-# For complete refresh (clears existing values first)
-update_table_with_clear(con, d_pa_metrics, "ply_planareas_2025" , "planarea_key")
-update_table_with_clear(con, d_er_metrics, "ply_ecoregions_2025", "ecoregion_key")
 ```
 
 ## Add index for vector tiles
