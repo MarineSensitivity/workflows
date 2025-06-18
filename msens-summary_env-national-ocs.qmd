@@ -3,6 +3,8 @@ title: "Environmental Consideration Factors and Concerns [DRAFT]"
 subtitle: "for the _National Outer Continental Shelf Oil and Gas Leasing Proposed Final Program_"
 author: "Marine Sensitivity Toolkit Team"
 # bibliography: references.bib
+editor_options: 
+  chunk_output_type: console
 ---
 
 ## Executive Summary
@@ -12,7 +14,136 @@ The Marine Sensitivity Toolkit (MST) project represents a comprehensive effort t
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 librarian::shelf(
-  DBI, duckdb, kableExtra, knitr, tidyverse)
+  bslib, DBI, dplyr, duckdb, DT, fs, ggiraph, ggplot2, glue, here, htmlwidgets,
+  kableExtra, knitr, mapview, purrr, RColorBrewer, readr, sf, shiny, stringr, 
+  terra, tibble, tidyr, tidyverse, webshot2,
+  quiet = T)
+options(readr.show_col_types = F)
+
+# variables ----
+# init source: apps/mapgl/app.R
+verbose        <- F
+is_server      <-  Sys.info()[["sysname"]] == "Linux"
+dir_private    <- ifelse(
+  is_server,
+  "/share/private",
+  "~/My Drive/private")
+dir_data       <- ifelse(
+  is_server,
+  "/share/data",
+  "~/My Drive/projects/msens/data")
+mapbox_tkn_txt <- glue("{dir_private}/mapbox_token_bdbest.txt")
+cell_tif       <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
+sdm_dd         <- glue("{dir_data}/derived/sdm.duckdb")
+pa_gpkg        <- glue("{dir_data}/derived/ply_planareas_2025.gpkg")
+er_gpkg        <- glue("{dir_data}/derived/ply_ecoregions_2025.gpkg")
+metrics_tif    <- glue("{dir_data}/derived/r_metrics.tif")
+spp_global_csv <- here("mapgl/spp_global_cache.csv")
+
+Sys.setenv(MAPBOX_PUBLIC_TOKEN=readLines(mapbox_tkn_txt))
+librarian::shelf(
+  mapgl)
+
+# db connections ----
+source(here("../workflows/libs/db.R")) # con
+con_sdm <- dbConnect(duckdb(), dbdir = sdm_dd, read_only = T)
+
+# flower plot function ----
+plot_flower <- function(
+    data,
+    fld_category,
+    fld_height,
+    fld_width,
+    tooltip_expr = NULL,
+    score        = NULL,
+    title        = NULL,
+    colors       = "Set2",
+    interactive  = T){
+
+  stopifnot(is.numeric(data |> pull({{ fld_height }})))
+  stopifnot(is.numeric(data |> pull({{ fld_width }})))
+
+  if (is.null(score)){
+    score <- data |>
+      # ensure both are not just integer (weighted.mean goes to 0)
+      mutate(
+        "{{fld_height}}" := as.double({{ fld_height }}),
+        "{{fld_width}}"  := as.double({{ fld_width  }}) ) |>
+      summarize(
+        score = weighted.mean({{ fld_height }}, {{ fld_width }}, na.rm = T)) |>
+      pull(score)
+  }
+
+  # Calculate positions
+  d <- data |>
+    arrange({{ fld_category }}) |>
+    mutate(across(!where(is.character), as.double)) |>
+    mutate(
+      # Calculate angles for plotting
+      ymax    = cumsum({{ fld_width }}),
+      ymin    = lag(ymax, default=0), # ,  c(0, head(ymax, n=-1)),
+      xmax    = {{ fld_height }},
+      xmin    = 0)
+
+  sym_category <- ensym(fld_category)
+  sym_height   <- ensym(fld_height)
+  sym_width    <- ensym(fld_width)
+
+  if (!is.null(tooltip_expr)){
+    d <- d |>
+      mutate(
+        tooltip = glue(tooltip_expr))
+  } else {
+    d <- d |>
+      mutate(
+        tooltip = glue("{!!fld_category}"))
+  }
+
+  g <- ggplot(d) +
+    geom_rect_interactive(aes(
+      xmin    = xmin,
+      xmax    = xmax,
+      ymin    = ymin,
+      ymax    = ymax,
+      fill    = {{ fld_category }},
+      color   = "white",
+      data_id = {{ fld_category }},
+      tooltip = tooltip),
+      color = "white",
+      alpha = 0.5) +
+    coord_polar(theta = "y") +
+    # Create donut hole
+    xlim(c(-10, max(data |> pull({{ fld_height }})))) +
+    # Add center score
+    annotate(
+      "text", x = -10, y = 0,
+      label = round(score),
+      size = 8,
+      fontface = "bold") +
+    # scale_fill_brewer(
+    #   palette = colors) +
+    # scale_fill_brewer() +
+    theme_minimal() +
+    # theme_void() +
+    theme(
+      legend.position = "bottom",
+      plot.margin = unit(c(20, 20, 20, 20), "pt"))
+
+  if (!is.null(title))
+    g <- g +
+      ggtitle(title)
+
+  if (interactive)
+    g <- girafe(
+      ggobj = g,
+      options = list(
+        opts_sizing(
+          rescale = TRUE, width = 1),
+        opts_tooltip(
+          css = "background-color:white;color:black;padding:5px;border-radius:3px;")))
+  
+  g
+}
 ```
 
 ## Introduction
@@ -78,9 +209,496 @@ flowchart TB
 
 ## Geographic Scope and Analysis Units
 
+### BOEM Planning Areas
+
+```{r read_con_plys}
+er <- st_read(con, "ply_ecoregions_2025")
+pa <- st_read(con, "ply_planareas_2025")
+```
+
+```{r}
+lbls_csv <- glue("{dir_data}/derived/ply_label_placement.csv")
+
+er_pts <- er |>
+  st_drop_geometry() |> 
+  select(
+    ecoregion_key, ecoregion_name, region_name, region_key,
+    ctr_lon, ctr_lat) |>
+  st_as_sf(coords = c("ctr_lon", "ctr_lat"), crs = 4326)
+pa_pts <- pa |>
+  st_drop_geometry() |> 
+  select(
+    planarea_key, planarea_name, region_name, region_key, 
+    ctr_lon, ctr_lat) |>
+  st_as_sf(coords = c("ctr_lon", "ctr_lat"), crs = 4326)
+
+if (!file.exists(lbls_csv)){
+  bind_rows(
+    er_pts |> st_drop_geometry() |> select(ecoregion_key),
+    pa_pts |> st_drop_geometry() |> select(planarea_key)) |> 
+    arrange(ecoregion_key, planarea_key) |>
+    mutate(
+      text_anchor = ifelse(
+        !is.na(planarea_key),
+        "center",
+        "top" ),
+      text_justify  = "center",
+      text_offset_right = 0,
+      text_offset_down  = 0) |> 
+    write_csv(lbls_csv, na = "")
+}
+```
+
+
+```{r map_imgs_pa_l48_ak}
+
+d_lbls <- read_csv(lbls_csv)
+
+var_pa <- "score_extriskspcat_primprod_ecoregionrescaled_equalweights"
+n_cols <- 11
+rng_pa <- pa |>
+  pull({{ var_pa }}) |>
+  range()
+cols_pa <- rev(RColorBrewer::brewer.pal(n_cols, "Spectral"))
+brks_pa <- seq(rng_pa[1], rng_pa[2], length.out = n_cols)
+
+for (is_ak in c(T, F)){
+  # is_ak <- F
+  
+  
+  if (is_ak){
+    # Alaska
+    er_area  <- er |> 
+      filter(region_key == "AK") |> 
+      st_shift_longitude()
+    pa_area  <-  pa |> 
+      filter(region_key == "AK") |> 
+      st_shift_longitude()
+    
+    er_pts_area  <- er_pts |> 
+      filter(region_key == "AK") |> 
+      st_shift_longitude() |> 
+      left_join(
+        d_lbls |> select(-planarea_key), , 
+        by = "ecoregion_key")
+    pa_pts_area  <-  pa_pts |> 
+      filter(region_key == "AK") |> 
+      st_shift_longitude() |> 
+      left_join(
+        d_lbls |>  select(-ecoregion_key), 
+        by = "planarea_key")
+    
+    lgnd_pos <- "top-left"
+    # Issue: antimeridian line splits Alaska ecoregions & planareas
+    # tried: st_shift_longitude() |> st_union(); QGIS; [antimeridian](https://www.gadom.ski/antimeridian); ... to no avail
+    # TODO: try other fixes:
+    # - https://towardsdatascience.com/around-the-world-in-80-lines-crossing-the-antimeridian-with-python-and-shapely-c87c9b6e1513/
+    # - https://docs.mapbox.com/mapbox-gl-js/example/line-across-180th-meridian/
+  } else {
+    # lower 48 states
+    box_lower48 <- pa |> 
+      filter(planarea_key %in% c("WAO", "SOC", "FLS", "NOA")) |>
+      st_bbox() |> 
+      st_as_sfc()
+    
+    er_area <- er |> 
+      st_filter(box_lower48, .predicate = st_intersects)
+    # er_area$ecoregion_key |> paste(collapse = "','") 
+    # 'CAC','WAOR','SECS','WCGOA','EGOA','NECS'
+    pa_area <- pa |> 
+      st_filter(box_lower48, .predicate = st_intersects)
+    pa_area$planarea_key |> paste(collapse = "','") 
+    # 'CEC','SOA','NOC','CGA','EGA','WGA','SOC','FLS','MDA','NOA','WAO'
+    
+    er_pts_area  <- er_pts |> 
+      filter(ecoregion_key %in% er_area$ecoregion_key) |>
+      left_join(
+        d_lbls |> select(-planarea_key), 
+        by = "ecoregion_key")
+    pa_pts_area  <-  pa_pts |> 
+      filter(planarea_key %in% pa_area$planarea_key) |>
+      left_join(
+        d_lbls |>  select(-ecoregion_key), 
+        by = "planarea_key")
+    
+    lgnd_pos <- "bottom-left"
+  }
+  scale_pos <- "bottom-right"
+  
+  # mapView(pa_area) +
+  #   mapView(pa_pts_area)
+  # mapView(er_area) +
+  #   mapView(er_pts_area)
+  
+  er_url <- "https://api.marinesensitivity.org/tilejson?table=public.ply_ecoregions_2025&use_cache=FALSE"
+  pa_url <- "https://api.marinesensitivity.org/tilejson?table=public.ply_planareas_2025&use_cache=FALSE"
+  er_filter <- c("in", "ecoregion_key", er_area$ecoregion_key)
+  pa_filter <- c("in", "planarea_key",  pa_area$planarea_key)
+  
+  m <- mapboxgl(
+    style  = mapbox_style("dark"),
+    projection = "globe") |>
+    fit_bounds(
+      bbox = er_area) |>
+    add_vector_source(
+      id  = "pa_src",
+      url = pa_url) |>
+    add_vector_source(
+      id  = "er_src",
+      url = er_url) |>
+    add_fill_layer(
+      id           = "pa_fill",
+      source       = "pa_src",
+      source_layer = "public.ply_planareas_2025",
+      filter       = pa_filter,
+      fill_color   = interpolate(
+        column = var_pa,
+        values = brks_pa,
+        stops  = cols_pa ) ) |>
+    add_line_layer(
+      id           = "er_ln",
+      source       = "er_src",
+      source_layer = "public.ply_ecoregions_2025", # before_id    = "pa_ln",
+      filter       = er_filter,
+      line_color   = "lightgray",
+      line_opacity = 1,
+      line_width   = 5 ) |> 
+    add_line_layer(
+      id           = "pa_ln",
+      source       = "pa_src",
+      source_layer = "public.ply_planareas_2025",
+      filter       = pa_filter,
+      line_color   = "black",
+      line_opacity = 1,
+      line_width   = 1 ) |>
+    add_symbol_layer(
+      id                 = "pa_symbol",
+      source             = pa_pts_area,
+      filter             = pa_filter,
+      text_field         = get_column("planarea_key"),
+      text_allow_overlap = T,
+      text_anchor        = get_column("text_anchor"),
+      text_justify       = get_column("text_justify"),
+      text_offset        = list(
+        get_column("text_offset_right"), 
+        get_column("text_offset_down") ) ) |>
+    add_symbol_layer(
+      id                 = "er_symbol",
+      source             = er_pts_area,
+      filter             = er_filter,
+      text_field         = get_column("ecoregion_name"),
+      text_color         = "black",
+      text_allow_overlap = T,
+      text_anchor        = get_column("text_anchor"),
+      text_justify       = get_column("text_justify"),
+      text_offset        = list(
+        get_column("text_offset_right"), 
+        get_column("text_offset_down") ),
+      text_halo_color    = "lightgray",
+      text_halo_width    = 2,
+      text_halo_blur     = 2,
+      text_line_height   = 1.5,
+      text_size          = 20) |>
+    mapgl::add_legend(
+      "Score",
+      values   = rng_pa,
+      colors   = cols_pa,
+      position = lgnd_pos) |> 
+    add_scale_control(
+      position = scale_pos)
+  
+  b       <- here(glue("figs/msens-summary_env-national-ocs/map_pa_{ifelse(is_ak, 'ak','l48')}"))
+  b_html  <- glue("{b}.html")
+  b_files <- glue("{b}_files")
+  b_png   <- glue("{b}.png")
+  saveWidget(m, b_html, selfcontained = F, background = "transparent")
+  webshot(
+    b_html, b_png,
+    vwidth   = 1200, vheight = 800, zoom = 2,
+    selector = "#htmlwidget_container",
+    delay    = 2, quiet = T)
+  file_delete(b_html)
+  dir_delete(b_files)
+  
+  # m
+  # browseURL(b_png)
+}
+```
+
+```{r pa_score_table}
+sf::sf_use_s2(T)
+
+tbl(con, "ply_planareas_2025") |>
+  select(-geom) |> 
+  select(planarea_key, planarea_name) |>
+  collect() |>
+  arrange(planarea_key) |>
+  knitr::kable(
+    caption = "BOEM planning areas",
+    col.names = c("Key", "Name"),
+    format.args = list(big.mark = ",")) |>
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
 ### BOEM Ecoregions
 
 The analysis employs BOEM ecoregions as the primary geographic units, which are ecologically meaningful divisions based on Large Marine Ecosystem boundaries, bathymetry, hydrography, productivity, and species composition (@fig-ecoregions).
+
+```{r ecoregion_flowers}
+source(here("libs/db.R")) # con
+
+# tbl(con, "ply_ecoregions_2025") |> 
+#   select(-geom)
+
+# get data for planning area
+er_key  <- "EBS"
+er_name <- tbl(con, "ply_ecoregions_2025") |> 
+  filter(ecoregion_key == er_key) |>
+  pull(ecoregion_name)
+
+# contributing metrics
+sp_cats_u <- tbl(con_sdm, "species") |> 
+  distinct(sp_cat) |>
+  pull(sp_cat) |> 
+  str_replace(" ", "_")
+metric_input_keys <- c(
+  glue("extrisk_{sp_cats_u}_ecoregion_rescaled"),
+  "primprod_ecoregion_rescaled")
+m_input_seqs <- tbl(con_sdm, "metric") |> 
+  filter(metric_key %in% metric_input_keys) |> 
+  pull(metric_seq)
+
+d_fl <- tbl(con_sdm, "zone") |> 
+  filter(
+    tbl   == "ply_ecoregions_2025") |> 
+  select(ecoregion_key = value, zone_seq) |>
+  left_join(
+    tbl(con_sdm, "zone_metric"),
+    by = "zone_seq") |>
+  left_join(
+    tbl(con_sdm, "metric") |> 
+      filter(metric_seq %in% m_input_seqs) |> 
+      select(metric_seq, metric_key),
+    by = "metric_seq") |> 
+  filter(!is.na(metric_key)) |> 
+  select(ecoregion_key, metric_key, value) |> 
+  arrange(ecoregion_key, metric_key) |> 
+  collect() |> 
+  left_join(
+    tbl(con, "ply_ecoregions_2025") |> 
+      filter(
+        region_key == "AK" | 
+          ecoregion_key %in% c('CAC','WAOR','SECS','WCGOA','EGOA','NECS')) |> 
+      select(ecoregion_key, ecoregion_name) |> 
+      collect(),
+    by = "ecoregion_key") |> 
+  mutate(
+    component = metric_key |>
+      str_replace("extrisk_","") |>
+      str_replace("_ecoregion_rescaled","") |>
+      str_replace("_", " "),
+    even = 1) |>
+  filter(component != "all") |> 
+  filter(
+    !is.na(ecoregion_name),
+    !is.na(metric_key),
+    !is.na(value))
+
+# library(scales)
+components <- sort(unique(d_fl$component)) # |> paste(collapse = '","') |> cat()
+# # "crustacean","fish","marine mammal","mollusk","other","primprod","sea turtle"
+cols <- hue_pal()(length(components))
+cols <- setNames(
+  cols, 
+  c("fish", "crustacean", 
+    "primprod", # ensure green
+    "sea turtle", "marine mammal", "mollusk", "other"))
+# setNames(hex, c("red","brown","green","turquoise","blue", "purple","pink"))
+# show_col(hex)
+
+# d_fl <- d_fl |>
+#   mutate(
+#     component = factor(
+#       component,
+#       levels = c("fish", "crustacean", "primprod", "sea turtle", "marine mammal", "mollusk", "other"),
+#       ordered = T))
+
+# one flower ----
+d_fl |>
+  filter(ecoregion_key == "CAC") |> 
+  plot_flower(
+    fld_category = component,
+    fld_height   = value,
+    fld_width    = even,
+    tooltip_expr = "{component}: {round(score, 2)}",
+    title        = "CAC test",
+    interactive  = F)
+
+# all flowers ----
+# d_scores <- d_fl |> 
+#   group_by(ecoregion_key, ecoregion_name) |>
+#   summarize(
+#     score = weighted.mean(value, even, na.rm = T) |> round(),
+#     .groups = "drop")
+
+# Calculate positions
+d <- d_fl |>
+  group_by(ecoregion_name) |>
+  arrange(component) |>
+  mutate(across(!where(is.character), as.double)) |>
+  mutate(
+    # Calculate angles for plotting
+    ymax    = cumsum(even),
+    ymin    = lag(ymax, default=0), # ,  c(0, head(ymax, n=-1)),
+    xmax    = value,
+    xmin    = 0)
+
+d_scores <- d_fl |> 
+  group_by(ecoregion_key, ecoregion_name) |>
+  summarize(
+    score = weighted.mean(value, even, na.rm = T) |> round())
+
+g <- d |> 
+  # mutate(
+  #   ecoregion = str_wrap(ecoregion_name, width = 20)) |> 
+  # # View()
+  ggplot() +
+  geom_rect_interactive(aes(
+    xmin    = xmin,
+    xmax    = xmax,
+    ymin    = ymin,
+    ymax    = ymax,
+    fill    = component,
+    color   = "white",
+    data_id = component),
+    color = "white",
+    alpha = 0.5) +
+  scale_fill_manual(values = cols) +
+  facet_wrap(~ecoregion_key) +
+  coord_polar(theta = "y") +
+  # Create donut hole
+  xlim(c(-20, max(d_scores$score))) +
+  # Add center score
+  geom_text(
+    aes(x, y, label = score),
+    data = d_scores |> 
+      mutate(
+        x = -20, y = 0),
+    size = 4,
+    fontface = "bold") +
+  # scale_fill_brewer(
+  #   palette = colors) +
+  # scale_fill_brewer() +
+  theme_minimal() +
+  # theme_void() +
+  theme(
+    legend.position = "bottom",
+    plot.margin     = unit(c(20, 20, 20, 20), "pt"),
+    # panel.margin.y  = unit(-1, "lines"),
+    strip.text.x    = element_text(size = 8),
+    axis.title.x    = element_blank(),
+    axis.text.x     = element_blank(),
+    axis.ticks.x    = element_blank(),
+    axis.title.y    = element_blank(),
+    axis.text.y     = element_blank(),
+    axis.ticks.y    = element_blank())
+
+er_fl_png <- here("figs/msens-summary_env-national-ocs/ecoregion_flower-plot_scores.png")
+er_fl_pdf <- here("figs/msens-summary_env-national-ocs/ecoregion_flower-plot_scores.pdf")
+png(er_fl_png, width = 1200, height = 800, res = 150)
+print(g)
+dev.off()
+# browseURL(er_fl_png)
+pdf(er_fl_pdf, width = 7, height = 5)
+print(g)
+dev.off()
+
+
+```
+
+
+```{r primprod_pa_avg_stddev}
+# contributing metrics
+metric_input_keys <- glue("primprod_{c('avg','stddev')}")
+m_input_seqs <- tbl(con_sdm, "metric") |> 
+  collect() |> 
+  View()
+  filter(metric_key %in% metric_input_keys) |> 
+  pull(metric_seq)
+
+d_pp <- tbl(con_sdm, "zone") |> 
+  filter(
+    tbl   == "ply_planareas_2025") |> 
+  select(planarea_key = value, zone_seq) |>
+  left_join(
+    tbl(con_sdm, "zone_metric"),
+    by = "zone_seq") |>
+  left_join(
+    tbl(con_sdm, "metric") |> 
+      filter(metric_seq %in% m_input_seqs) |> 
+      select(metric_seq, metric_key),
+    by = "metric_seq") |> 
+  filter(!is.na(metric_key)) |> 
+  select(planarea_key, metric_key, value) |> 
+  arrange(planarea_key, metric_key) |> 
+  collect() |> 
+  left_join(
+    tbl(con, "ply_planareas_2025") |> 
+      filter(
+        region_key == "AK" | 
+          planarea_key %in% c('CEC','SOA','NOC','CGA','EGA','WGA','SOC','FLS','MDA','NOA','WAO')) |> 
+      select(planarea_key, planarea_name) |> 
+      collect(),
+    by = "planarea_key") |> 
+  filter(
+    !is.na(planarea_name),
+    !is.na(metric_key),
+    !is.na(value)) |> 
+  tidyr::pivot_wider(
+    names_from = metric_key,
+    values_from = value)
+
+
+ggplot(d_pp, aes(x=planarea_key, y=primprod_avg)) +
+  geom_bar(
+    position=position_dodge(), stat="identity", color='darkgreen') +
+  geom_errorbar(aes(ymin=Mean-sd, ymax=Mean+sd), width=.2)
+
+
+library(units)
+
+d_pp |> 
+  mutate(
+    primprod_avg <- primprod_avg |> set_units("g m^ km^-2 yr^-1"),
+    primprod_avg <- primprod_avg * set_units(1, "t C km^-2 yr^-1"),
+  )
+  
+  View()
+
+pa |> 
+  filter(region_key == "AK") |> 
+  mapView()
+
+er |> 
+  filter(region_key == "AK") |> 
+  mapView()
+
+
+
+```
+
+```{r}
+
+tbl(con, "metric")
+for (fxn in c("avg","stddev")){ # fxn = "min"
+
+  # Get existing primprod_ecoregion_rescaled metric_seq
+  m_key         <- glue("primprod_{fxn}")
+  m_description <- glue("Primary productivity {fxn}")
+```
+
+
+## OLD: Ecoregion summary
 
 ```{r ecoregions_summary, echo=FALSE}
 # Simulated data for demonstration

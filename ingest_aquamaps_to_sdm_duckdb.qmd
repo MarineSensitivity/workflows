@@ -1369,6 +1369,109 @@ for (sp_cat in sp_cats){ # sp_cat = sp_cats[1]
 }
 ```
 
+## OLD: Transfer raw PrimProd into cell_metric
+
+```{r old_primprod_cell_metric}
+#| eval: false
+
+# Create new metric for rescaled primary productivity
+m_key         <- "primprod"
+m_description <- "Primary productivity: Average Total Surface Phytoplankton 2010-2020 (mmol/m^3; Bio-Oracle dataset ID: phyc_baseline_2000_2020_depthsurf)"
+# TODO: consider log rescaling PrimaryProductivity
+
+# Check if metric exists and delete if it does
+existing_seq <- dbGetQuery(con_sdm, glue(
+  "SELECT metric_seq FROM metric WHERE metric_key = '{m_key}'"))
+if (nrow(existing_seq) > 0) {
+  m_seq <- existing_seq$metric_seq
+  dbExecute(con_sdm, glue("DELETE FROM metric      WHERE metric_seq = {m_seq}"))
+  dbExecute(con_sdm, glue("DELETE FROM cell_metric WHERE metric_seq = {m_seq}"))
+  dbExecute(con_sdm, glue("DELETE FROM zone_metric WHERE metric_seq = {m_seq}"))
+} 
+
+# Create new metric
+dbExecute(con_sdm, glue("
+    INSERT INTO metric (metric_key, description)
+    VALUES ('{m_key}', '{m_description}')" ) )
+m_seq <- dbGetQuery(con_sdm, glue("
+    SELECT metric_seq FROM metric WHERE metric_key = '{m_key}'")) |> 
+  pull(metric_seq)
+      
+# Rescale primary productivity by ecoregion
+dbExecute(con_sdm, glue("
+    INSERT INTO cell_metric (cell_id, metric_seq, value)
+    SELECT 
+      cell_id,
+      {m_seq} as metric_seq,
+      prim_prod_mean AS value
+    FROM cell c
+    WHERE 
+    prim_prod_mean IS NOT NULL
+"))
+```
+
+## NEW: Transfer raw PrimProd into cell_metric
+
+```{r primprod_cell_metric}
+#| eval: false
+
+# Create metric for primary productivity
+m_key         <- "primprod"
+m_description <- "Primary productivity: Oregon State Vertically Generalized Production Model (VGPM) from Visible Infrared Imaging Radiometer Suite (VIIRS) satellite data (mg C / m^2 / day)"
+# TODO: consider log rescaling PrimaryProductivity
+
+# workflow: ingest_productivity.qmd
+yr        <- 2023  # vgpm-viirs most recent complete year
+dir_out   <- "/Users/bbest/My Drive/projects/msens/data/derived"
+vgpm_tif  <- glue("{dir_out}/vgpm-viirs_{yr}-daily-avg.tif")
+cell_tif  <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
+
+r_cell <- rast(cell_tif) |> 
+  subset("cell_id")
+r_vgpm <- rast(vgpm_tif) |> 
+  rotate()
+plot(r_cell)
+
+r_v_c <- resample(
+    r_vgpm, 
+    r_cell, 
+    method = "bilinear") |> 
+    mask(r_cell) |> 
+    crop(r_cell)
+r_cv <- c(r_cell, r_v_c)
+d_cv <- values(r_cv, dataframe = T, na.rm = T) |> 
+  tibble() |> 
+  rename(
+    value = npp_daily_avg) |>
+  mutate(
+    cell_id    = as.integer(cell_id),
+    metric_seq = !!m_seq)
+
+# A tibble: 633,079 × 2
+#  cell_id | npp_daily_avg
+  
+# Check if metric exists and delete if it does
+existing_seq <- dbGetQuery(con_sdm, glue(
+  "SELECT metric_seq FROM metric WHERE metric_key = '{m_key}'"))
+if (nrow(existing_seq) > 0) {
+  m_seq <- existing_seq$metric_seq
+  dbExecute(con_sdm, glue("DELETE FROM metric      WHERE metric_seq = {m_seq}"))
+  dbExecute(con_sdm, glue("DELETE FROM cell_metric WHERE metric_seq = {m_seq}"))
+  dbExecute(con_sdm, glue("DELETE FROM zone_metric WHERE metric_seq = {m_seq}"))
+} 
+
+# Create new metric
+dbExecute(con_sdm, glue("
+    INSERT INTO metric (metric_key, description)
+    VALUES ('{m_key}', '{m_description}')" ) )
+m_seq <- dbGetQuery(con_sdm, glue("
+    SELECT metric_seq FROM metric WHERE metric_key = '{m_key}'")) |> 
+  pull(metric_seq)
+      
+dbWriteTable(con_sdm, "cell_metric", d_cv, append = T)
+```
+
+
 ## Calculate PrimProd min/max by Ecoregion
 
 ```{r primprod_ecoregion_minmax}
@@ -1416,45 +1519,51 @@ for (fxn in c("min","max")){ # fxn = "min"
 }
 ```
 
-## Transfer raw PrimProd into cell_metric
+## Calculate PrimProd avg/sd by Planning Area
 
-```{r primprod_cell_metric}
+```{r primprod_ecoregion_avg_stddev}
 #| eval: false
 
-# Create new metric for rescaled primary productivity
-m_key         <- "primprod"
-m_description <- "Primary productivity: Average Total Surface Phytoplankton 2010-2020 (mmol/m^3; Bio-Oracle dataset ID: phyc_baseline_2000_2020_depthsurf)"
-# TODO: consider log rescaling PrimaryProductivity
+for (fxn in c("avg","stddev")){ # fxn = "min"
 
-# Check if metric exists and delete if it does
-existing_seq <- dbGetQuery(con_sdm, glue(
-  "SELECT metric_seq FROM metric WHERE metric_key = '{m_key}'"))
-if (nrow(existing_seq) > 0) {
-  m_seq <- existing_seq$metric_seq
-  dbExecute(con_sdm, glue("DELETE FROM metric      WHERE metric_seq = {m_seq}"))
-  dbExecute(con_sdm, glue("DELETE FROM cell_metric WHERE metric_seq = {m_seq}"))
-  dbExecute(con_sdm, glue("DELETE FROM zone_metric WHERE metric_seq = {m_seq}"))
-} 
-
-# Create new metric
-dbExecute(con_sdm, glue("
-    INSERT INTO metric (metric_key, description)
-    VALUES ('{m_key}', '{m_description}')" ) )
-m_seq <- dbGetQuery(con_sdm, glue("
-    SELECT metric_seq FROM metric WHERE metric_key = '{m_key}'")) |> 
-  pull(metric_seq)
-      
-# Rescale primary productivity by ecoregion
-dbExecute(con_sdm, glue("
-    INSERT INTO cell_metric (cell_id, metric_seq, value)
+  # Get existing primprod_ecoregion_rescaled metric_seq
+  m_key         <- glue("primprod_{fxn}")
+  m_description <- glue("Primary productivity {fxn}")
+                        
+  # Check if metric exists and delete if it does
+  existing_seq <- dbGetQuery(con_sdm, glue(
+    "SELECT metric_seq FROM metric WHERE metric_key = '{m_key}'"))
+  if (nrow(existing_seq) > 0) {
+    m_seq <- existing_seq$metric_seq
+    dbExecute(con_sdm, glue("DELETE FROM metric      WHERE metric_seq = {m_seq}"))
+    dbExecute(con_sdm, glue("DELETE FROM cell_metric WHERE metric_seq = {m_seq}"))
+    dbExecute(con_sdm, glue("DELETE FROM zone_metric WHERE metric_seq = {m_seq}"))
+  } 
+  
+  # insert new metric
+  dbExecute(con_sdm, glue(
+    "INSERT INTO metric (metric_key, description) VALUES ('{m_key}', '{m_description}')"))
+  
+  # get metric_seq
+  m_seq <- dbGetQuery(con_sdm, glue(
+    "SELECT metric_seq FROM metric WHERE metric_key = '{m_key}'")) |> 
+    pull(metric_seq)
+  
+  # Calculate min/max primary productivity per ecoregion
+  dbExecute(con_sdm, glue(
+    "INSERT INTO zone_metric (zone_seq, metric_seq, value)
     SELECT 
-      cell_id,
+      z.zone_seq,
+      -- z.tbl, z.fld, z.value AS tbl_fld_val,
       {m_seq} as metric_seq,
-      prim_prod_mean AS value
-    FROM cell c
-    WHERE 
-    prim_prod_mean IS NOT NULL
-"))
+      {fxn}(c.prim_prod_mean) as value
+    FROM zone z
+    LEFT JOIN zone_cell zc ON z.zone_seq = zc.zone_seq
+    LEFT JOIN cell c ON zc.cell_id = c.cell_id
+    WHERE
+      z.fld = 'planarea_key'
+    GROUP BY z.zone_seq" ) )
+}
 ```
 
 ## Calculate rescaled PrimProd per cell based on EcoregionMinMax
@@ -1638,6 +1747,67 @@ for (m_key in metrics){ # m_key = metrics[1]
 }
 ```
 
+## Calculate Ecoregion metrics contributing to score based on cell metrics
+
+```{r cell_metrics_to_ecoregion_metrics}
+# get zone_seqs for planning areas
+z_seqs <- tbl(con_sdm, "zone") |> 
+  filter(
+    tbl   == "ply_ecoregions_2025") |> 
+  pull(zone_seq)
+
+tbl(con_sdm, "metric") |> 
+  pull(metric_key) |> sort()
+
+sp_cats_u <- tbl(con_sdm, "species") |> 
+  distinct(sp_cat) |>
+  pull(sp_cat) |> 
+  str_replace(" ", "_")
+metrics <- c(
+  glue("extrisk_{sp_cats_u}"),
+  glue("extrisk_{sp_cats_u}_ecoregion_rescaled"),
+  "primprod",
+  "primprod_ecoregion_rescaled")
+
+for (m_key in metrics){ # m_key = metrics[1]
+
+  # get existing metric_seq
+  m_seq <- tbl(con_sdm, "metric") |> 
+    filter(metric_key == !!m_key) |> 
+    pull(metric_seq)
+  stopifnot(length(m_seq) == 1)
+
+  # delete existing zone_metric values for this metric and planning areas
+  dbExecute(con_sdm, glue(
+    "DELETE FROM zone_metric 
+    WHERE metric_seq = {m_seq} 
+      AND zone_seq IN ({paste(z_seqs, collapse = ',')})"))
+
+  # stop if no cell_metric found
+  n_cm <- tbl(con_sdm, "cell_metric") |> 
+    filter(
+      metric_seq == !!m_seq) |> 
+    tally() |>
+    pull(n)
+  stopifnot(n_cm > 0)
+  
+  # calculate average score per planning area weighted by cell coverage
+  dbExecute(con_sdm, glue("
+    INSERT INTO zone_metric (zone_seq, metric_seq, value)
+    SELECT 
+      zc.zone_seq,
+      {m_seq} as metric_seq,
+      SUM(cm.value * zc.pct_covered) / SUM(zc.pct_covered) as value
+    FROM zone_cell zc
+    JOIN cell_metric cm ON zc.cell_id = cm.cell_id
+    WHERE 
+      cm.metric_seq = {m_seq} 
+      AND zc.zone_seq IN ({paste(z_seqs, collapse = ',')})
+      AND cm.value IS NOT NULL
+    GROUP BY zc.zone_seq"))
+}
+```
+
 ## Calculate cell_metric score: ExtinctionRisk + PrimProd (already EcoregionRescaled), equal weight
 
 ```{r cell_metric_score}
@@ -1720,6 +1890,69 @@ stopifnot(length(metric_input_keys) == length(m_input_seqs))
 z_seqs <- tbl(con_sdm, "zone") |> 
   filter(
     tbl   == "ply_planareas_2025") |> 
+  pull(zone_seq)
+
+# DEBUG check
+# tbl(con_sdm, "zone_metric") |>
+#   filter(
+#     metric_seq == !!m_seq,
+#     zone_seq %in% z_seqs) |>
+#   arrange(desc(value)) |>
+#   pull(value) |>
+#   range()
+# 5.704735 61.050130
+#   View()
+#   nrow() -> n_existing_zm
+# z_seq == 134 # (ALA)
+
+# delete existing zone_metric values for this metric and planning areas
+dbExecute(con_sdm, glue(
+  "DELETE FROM zone_metric 
+  WHERE metric_seq = {m_seq} 
+    AND zone_seq IN ({paste(z_seqs, collapse = ',')})"))
+
+# calculate average score per planning area weighted by cell coverage
+dbExecute(con_sdm, glue("
+  INSERT INTO zone_metric (zone_seq, metric_seq, value)
+  SELECT 
+    zone_seq,
+    {m_seq} as metric_seq,
+    SUM(value) / COUNT(value) as value
+  FROM zone_metric zm
+  WHERE 
+    metric_seq IN ({paste(m_input_seqs, collapse = ',')}) 
+    AND zone_seq IN ({paste(z_seqs, collapse = ',')})
+    AND value IS NOT NULL
+  GROUP BY zone_seq"))
+```
+
+## Calculate Score per Ecoregion from Ecoregion metrics
+
+```{r new_calc_ecoregion_score_from_ecoregion_metrics}
+
+# metric: calculate score per planning area
+m_key <- "score_extriskspcat_primprod_ecoregionrescaled_equalweights"
+m_seq <- tbl(con_sdm, "metric") |> 
+  filter(metric_key == !!m_key) |> 
+  pull(metric_seq)
+
+# contributing metrics
+sp_cats_u <- tbl(con_sdm, "species") |> 
+  distinct(sp_cat) |>
+  pull(sp_cat) |> 
+  str_replace(" ", "_")
+metric_input_keys <- c(
+  glue("extrisk_{sp_cats_u}_ecoregion_rescaled"),
+  "primprod_ecoregion_rescaled")
+m_input_seqs <- tbl(con_sdm, "metric") |> 
+  filter(metric_key %in% metric_input_keys) |> 
+  pull(metric_seq)
+stopifnot(length(metric_input_keys) == length(m_input_seqs))
+
+# get zone_seqs for ecoregions
+z_seqs <- tbl(con_sdm, "zone") |> 
+  filter(
+    tbl   == "ply_ecoregions_2025") |> 
   pull(zone_seq)
 
 # DEBUG check
@@ -2323,7 +2556,6 @@ for (ln in readLines(schema_sql)){ # ln = readLines(schema_sql)[1]
 
 
 ## Update Zone Tables in PostGIS with Metrics
-
 
 ```{r pg_update_planarea_ecoregion_metrics}
 source(here("libs/db.R")) # con
