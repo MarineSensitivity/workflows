@@ -14,7 +14,7 @@ The Marine Sensitivity Toolkit (MST) project represents a comprehensive effort t
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 librarian::shelf(
-  bslib, DBI, dplyr, duckdb, DT, fs, ggiraph, ggplot2, glue, here, htmlwidgets,
+  bslib, DBI, dplyr, duckdb, DT, fs, ggiraph, ggplot2, glue, gt, here, htmlwidgets,
   kableExtra, knitr, mapview, purrr, RColorBrewer, readr, scales, sf, shiny, stringr, 
   terra, tibble, tidyr, tidyverse, units, webshot2,
   quiet = T)
@@ -32,13 +32,16 @@ dir_data       <- ifelse(
   is_server,
   "/share/data",
   "~/My Drive/projects/msens/data")
+dir_figs       <- here("figs/msens-summary_env-national-ocs")
 mapbox_tkn_txt <- glue("{dir_private}/mapbox_token_bdbest.txt")
 cell_tif       <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
 sdm_dd         <- glue("{dir_data}/derived/sdm.duckdb")
 pa_gpkg        <- glue("{dir_data}/derived/ply_planareas_2025.gpkg")
 er_gpkg        <- glue("{dir_data}/derived/ply_ecoregions_2025.gpkg")
+er_pa_gpkg     <- glue("{dir_data}/derived/ply_ecoregion_planarea.gpkg")
+er_pa_csv      <- glue("{dir_data}/derived/ply_ecoregion_planarea.csv")
 metrics_tif    <- glue("{dir_data}/derived/r_metrics.tif")
-spp_global_csv <- here("mapgl/spp_global_cache.csv")
+spp_global_csv <- here("../apps/mapgl/spp_global_cache.csv")
 
 Sys.setenv(MAPBOX_PUBLIC_TOKEN=readLines(mapbox_tkn_txt))
 librarian::shelf(
@@ -217,9 +220,6 @@ flowchart TB
 er <- read_sf(er_gpkg)
 pa <- read_sf(pa_gpkg)
 
-er_pa_gpkg <- glue("{dir_data}/derived/ply_ecoregion_planarea.gpkg")
-er_pa_csv <- glue("{dir_data}/derived/ply_ecoregion_planarea.csv")
-
 er_pa <- st_intersection(
   er |> 
     select(ecoregion_key, ecoregion_name),
@@ -347,7 +347,7 @@ for (is_ak in c(T, F)){
     # 'CAC','WAOR','SECS','WCGOA','EGOA','NECS'
     pa_area <- pa |> 
       st_filter(box_lower48, .predicate = st_intersects)
-    pa_area$planarea_key |> paste(collapse = "','") 
+    # pa_area$planarea_key |> paste(collapse = "','") 
     # 'CEC','SOA','NOC','CGA','EGA','WGA','SOC','FLS','MDA','NOA','WAO'
     
     er_pts_area  <- er_pts |> 
@@ -447,7 +447,7 @@ for (is_ak in c(T, F)){
     add_scale_control(
       position = scale_pos)
   
-  b       <- here(glue("figs/msens-summary_env-national-ocs/map_pa_{ifelse(is_ak, 'ak','l48')}"))
+  b       <- glue("{dir_figs}/map_pa_{ifelse(is_ak, 'ak','l48')}")
   b_html  <- glue("{b}.html")
   b_files <- glue("{b}_files")
   b_png   <- glue("{b}.png")
@@ -473,7 +473,245 @@ Ecoregions are used to modify and aggregate component values of species distribu
 
 
 ```{r pa_score_table}
-# Show Ecoregion
+
+er_l48 <- c('CAC','WAOR','SECS','WCGOA','EGOA','NECS')
+pa_l48 <- c('CEC','SOA','NOC','CGA','EGA','WGA','SOC','FLS','MDA','NOA','WAO')
+
+pa_gpkg        <- glue("{dir_data}/derived/ply_planareas_2025.gpkg")
+er_gpkg        <- glue("{dir_data}/derived/ply_ecoregions_2025.gpkg")
+
+d_pa <- read_sf(pa_gpkg) |> 
+  st_drop_geometry()
+d_er <- read_sf(er_gpkg) |> 
+  st_drop_geometry()
+flds <- intersect(names(d_pa), names(d_er)) |> str_subset("rescaled") |> sort() |> rev()
+flds_rn <- flds |> 
+  str_replace(
+    "score_extriskspcat_primprod_ecoregionrescaled_equalweights", "score") |> 
+  str_replace(
+    "_ecoregion_rescaled", "") |> 
+  str_replace(
+    "extrisk_", "") |> 
+  setNames(flds)
+
+d_er_n <- read_csv(er_pa_csv) |> # names() |> paste(collapse = ", ") |> cat()
+  filter(
+    region_key == "AK" | ecoregion_key %in% er_l48) |> 
+  distinct(
+    region_key, region_name, 
+    ecoregion_key, ecoregion_name) |> 
+  left_join(
+    d_er |> 
+      select(all_of(c("ecoregion_key", "area_km2", flds))) |> 
+      rename_with(~ flds_rn[.x], all_of(flds)),
+    by = "ecoregion_key")
+
+d_pa_n <- read_csv(er_pa_csv) |> # names() |> paste(collapse = ", ") |> cat()
+  filter(
+    region_key == "AK" | planarea_key %in% pa_l48) |> 
+  select(
+    region_name, ecoregion_name, planarea_key, planarea_name, pct_planarea_in_ecoregion) |> 
+  left_join(
+    d_pa |> 
+      select(all_of(c("planarea_key", "area_km2", flds))) |> 
+      rename_with(~ flds_rn[.x], all_of(flds)),
+    by = "planarea_key")
+
+d_er_pa_n <- bind_rows(
+  d_er_n |>
+    mutate(
+      row_type = "ecoregion" ),
+  d_pa_n |>
+    mutate(
+      row_type = "planarea" ) ) |> 
+  relocate(row_type, planarea_key, planarea_name, pct_planarea_in_ecoregion, .after = ecoregion_name) |> 
+  arrange(region_name, ecoregion_name, row_type, planarea_name) |> 
+  mutate(
+    pct = ifelse(
+      !is.na(pct_planarea_in_ecoregion),
+      glue(" [{round(pct_planarea_in_ecoregion, 1)}%]", .trim = F),
+      ""),
+    row_lbl = case_match(
+      row_type,
+      "ecoregion" ~ glue("{region_name}: {ecoregion_name} ({ecoregion_key})"),
+      "planarea"  ~ glue("· {planarea_name} ({planarea_key}){pct}") ) ) |> 
+  relocate(row_lbl)
+
+# d_er_pa_n |> View()
+
+# Create the gt table
+gt_er_pa_n <- d_er_pa_n |> 
+  select(
+    row_lbl, row_type,
+    score, 
+    primprod, sea_turtle, other, mollusk, marine_mammal, fish, crustacean, 
+    area_km2) |> 
+  gt() |> 
+  sub_missing(
+  columns = everything(),
+  rows    = everything(),
+  missing_text = "") |> 
+  cols_align(
+  align   = "left",
+  columns = row_lbl) |> 
+  # Style ecoregion rows
+  tab_style(
+    style     = list(
+      cell_text(
+        weight = "bold", 
+        color  = "#2c3e50"),
+      cell_fill(
+        color  = "#ecf0f1") ),
+    locations = cells_body(
+      rows = row_type == "ecoregion" ) ) |>
+  # Style planning area rows
+  tab_style(
+    style     = cell_text(
+      color = "#34495e", 
+      size  = px(11)),
+    locations = cells_body(
+      rows = row_type == "planarea" ) ) |>
+  # Column labels
+  cols_label(
+    row_lbl       = "Area",
+    area_km2      = "area (1,000 km²)",
+    score         = "Score",
+    primprod      = "Primary Prod.",
+    sea_turtle    = "Sea Turtle",
+    other         = "Other",
+    mollusk       = "Mollusk",
+    marine_mammal = "Marine Mammal",
+    fish          = "Fish",
+    crustacean    = "Crustacean") |>
+  # Format numeric columns
+  fmt_number(
+    columns  = c(
+      score, primprod, sea_turtle, other, mollusk, marine_mammal, fish, crustacean),
+    decimals = 0) |>
+  fmt_number(
+    columns  = c(area_km2),
+    scale_by = 0.001, # convert to 1,000 km²
+    decimals = 1) |>
+  # Hide the row_type column
+  cols_hide(row_type) |>
+  # Table styling
+  tab_header(
+    title = "Ecoregion and Planning Area Results",
+    subtitle = "Ecoregions with nested Planning Areas and metrics") |>
+  tab_options(
+    table.font.size            = px(12),
+    heading.title.font.size    = px(16),
+    heading.subtitle.font.size = px(14),
+    column_labels.font.weight  = "bold",
+    row_group.font.weight      = "bold",
+    row_group.background.color = "#f8f9fa")
+
+# For RTF output to Word
+# tbl_rtf <- glue("{dir_figs}/table_ecoregion_planarea_scores.rtf")
+# gt_er_pa_n |>
+#   gtsave(tbl_rtf)
+
+# Display the table
+gt_er_pa_n
+```
+
+```{r flextable}
+librarian::shelf(
+  flextable, ftExtra)
+
+# flextable(mtcars) %>% 
+#   theme_vanilla() %>% 
+#   save_as_docx(path = "mytable.docx")
+
+tbl_docx <- glue("{dir_figs}/table_ecoregion_planarea_scores.docx")
+
+set_flextable_defaults(
+  font.family = "Arial", font.size = 10, 
+  border.color = "gray", big.mark = ",")
+
+d_er_pa_n |> 
+  mutate(
+    area_kkm2 = area_km2 / 1000) |>  # convert to 1,000 km²
+  mutate(across(where(is.numeric), round)) |>
+  mutate(
+    row_lbl = ifelse(
+      row_type == "ecoregion",
+      glue("**{row_lbl}**"),
+      row_lbl) ) |>
+  select(
+    Area                 = row_lbl, # row_type,
+    Score                = score, 
+    `Prim. Prod.`        = primprod,
+    Crustacean           = crustacean,  
+    Fish                 = fish, 
+    `Marine Mammal`      = marine_mammal,
+    Mollusk              = mollusk,
+    `Sea turtle`         = sea_turtle, 
+    Other                = other,
+    `area (1,000 km^2^)` = area_kkm2) |> 
+  flextable() |> 
+  ftExtra::colformat_md(part = "all") |> 
+  theme_vanilla() |> 
+  save_as_docx(path = tbl_docx)
+
+browseURL(tbl_docx)
+```
+
+
+```{r old}
+librarian::shelf(gt)
+
+d_er_pa |> 
+  mutate(
+    rg_er = glue("{region_name}: {ecoregion_name} ({ecoregion_key})"),
+    pct   = ifelse(
+      !is.na(pct_planarea_in_ecoregion),
+      glue("[{round(pct_planarea_in_ecoregion, 1)}%]"),
+      ""),
+    pa    = glue("\t{planarea_name} ({planarea_key}) {pct}")) |> 
+  relocate(rg_er, pa) |> 
+  select(
+    -region_name,    -region_key, 
+    -ecoregion_name, -ecoregion_key,
+    -planarea_name,  -planarea_key, -pct_planarea_in_ecoregion, -pct) |>
+  # names() |> paste(collapse = ", ") |> cat()
+  # area_km2,
+  # er_score, er_primprod, er_sea_turtle, er_other, er_mollusk,
+  # er_marine_mammal, er_fish, er_crustacean,
+  # pa_score, pa_primprod, pa_sea_turtle, pa_other, pa_mollusk,
+  # pa_marine_mammal, pa_fish, pa_crustacean
+  gt()
+
+  arrange(region_key, ecoregion_key, planarea_key) |>
+  knitr::kable(
+    caption = "BOEM planning areas and ecoregions",
+    col.names = c("Region Key", "Region Name", "Ecoregion Key", "Ecoregion Name", "Plan Area Key", "Plan Area Name", "Pct Plan Area in Ecoregion (%)", "Area (km²)", "Center Longitude", "Center Latitude"),
+    format.args = list(big.mark = ",")) |>
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover"))
+
+tbl(con, "ply_planareas_2025") |>
+  select(-geom) |> 
+  select(planarea_key, planarea_name) |>
+  collect() |>
+  arrange(planarea_key) |>
+  write_csv(
+    path = pa_gpkg,
+    na   = "") |> 
+  write_csv(
+    path = er_pa_csv,
+    na   = "") |> 
+  write_csv(
+    path = er_pa_gpkg,
+    na   = "") |> 
+  knitr::kable(
+    caption = "BOEM planning areas",
+    col.names = c("Key", "Name"),
+    format.args = list(big.mark = ",")) |>
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover"))
+
+
+'/Users/bbest/Library/CloudStorage/GoogleDrive-ben@ecoquants.com/My Drive/projects/msens/data/derived/ply_ecoregion_planarea.csv'
+
 
 tbl(con, "ply_planareas_2025") |>
   select(-geom) |> 
@@ -650,8 +888,8 @@ g <- d |>
     axis.text.y     = element_blank(),
     axis.ticks.y    = element_blank())
 
-er_fl_png <- here("figs/msens-summary_env-national-ocs/ecoregion_flower-plot_scores.png")
-er_fl_pdf <- here("figs/msens-summary_env-national-ocs/ecoregion_flower-plot_scores.pdf")
+er_fl_png <- glue("{dir_figs}/ecoregion_flower-plot_scores.png")
+er_fl_pdf <- glue("{dir_figs}/ecoregion_flower-plot_scores.pdf")
 png(er_fl_png, width = 1200, height = 800, res = 150)
 print(g)
 dev.off()
@@ -725,8 +963,8 @@ g <- d_pp |>
       angle = 45, vjust = 1, hjust = 1 ) )
 
 
-pp_png <- here("figs/msens-summary_env-national-ocs/planarea_primprod.png")
-pp_pdf <- here("figs/msens-summary_env-national-ocs/planarea_primprod.pdf")
+pp_png <- glue("{dir_figs}/planarea_primprod.png")
+pp_pdf <- glue("{dir_figs}/planarea_primprod.pdf")
 png(pp_png, width = 1200, height = 800, res = 150)
 print(g)
 dev.off()
