@@ -1,3 +1,8 @@
+## 2025-07-13 migrate to msens fxns
+
+Update the @README.md file with a new plan for 
+
+
 ## 2025-06-09.a + pgtileserv_joinfxn, pginsert_zone_tables
 
 Add a header `## Insert Zone Tables for Joining` and R chunk `pginsert_zone_tables` 

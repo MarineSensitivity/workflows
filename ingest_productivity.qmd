@@ -14,10 +14,10 @@ librarian::shelf(
   tidyr, units,
   quiet = T)
 
-yrs        <- 2014:2023  # vgpm-viirs most recent complete year
+yrs        <- 2014:2023  # vgpm-viirs most recent complete 10 years
 dir_data   <- "~/My Drive/projects/msens/data"
-dir_vgpm   <- glue("{dir_data}/raw/oregonstate.edu/cafe.viirs.r2022_2160x4320")
-vgpm_tif   <- glue("{dir_vgpm}_{min(yrs)}-{max(yrs)}_monthly.tif")
+dir_vgpm   <- glue("{dir_data}/raw/oregonstate.edu/vgpm.r2022.v.chl.v.sst.2160x4320")
+vgpm_tif   <- glue("{dir_vgpm}_{min(yrs)}-{max(yrs)}.avg.sd.tif")
 
 dir_raw    <- glue("{dir_data}/raw/boem.gov")
 dir_out    <- glue("{dir_data}/derived")
@@ -33,13 +33,17 @@ verbose    <- F
 
 ## Vertically Generalized Production Model (VGPM), CAFE VIIRS `r paste(range(yrs), collapse = " to ")` \| OregonState
 
+
+
 Source:
 
 -   [Ocean Productivity from Oregon State](http://sites.science.oregonstate.edu/ocean.productivity)
 
-  - [CAFE model description](https://orca.science.oregonstate.edu/cafe.model.php)
+  - [VIIRS R2022 - 2160 by 4320 Monthly HDF files](https://orca.science.oregonstate.edu/2160.by.4320.monthly.hdf.vgpm.v.chl.v.sst.php)
+
+  - old: [CAFE model description](https://orca.science.oregonstate.edu/cafe.model.php)
   
-  - [Online updated CAFE data](https://orca.science.oregonstate.edu/2160.by.4320.monthly.hdf.cafe.v.php)
+  - old: [Online updated CAFE data](https://orca.science.oregonstate.edu/2160.by.4320.monthly.hdf.cafe.v.php)
 
 - Silsbe et al (2025) [Global declines in net primary production in the ocean color era | Nature Communications](https://www.nature.com/articles/s41467-025-60906-y). _Nature Communications_
 
@@ -47,7 +51,7 @@ Source:
   
     > The Carbon, Absorption, and Fluorescence Euphotic-resolving (CAFE) net primary production model is an adaptable framework for advancing global ocean productivity assessments by exploiting state-of-the-art satellite ocean color analyses and addressing key physiological and ecological attributes of phytoplankton.
 
-    -   [Standara VGPM: 1080 by 2160 Monthly HDF files from VIIRS R2022](http://orca.science.oregonstate.edu/1080.by.2160.monthly.hdf.vgpm.v.chl.v.sst.php)
+    -   older: [Standara VGPM: 1080 by 2160 Monthly HDF files from VIIRS R2022](http://orca.science.oregonstate.edu/1080.by.2160.monthly.hdf.vgpm.v.chl.v.sst.php)
     -   [Frequently Asked Questions](http://orca.science.oregonstate.edu/faq01.php)
 
 Calculated sum of `r paste(range(yrs), collapse = " to ")` monthly net primary production (NPP) from VIIRS data.
@@ -67,15 +71,17 @@ Citation: [Behrenfeld and Falkowski, 1997a](http://science.oregonstate.edu/ocean
 
 if (!file.exists(vgpm_tif)) {
   
-  for (yr in yrs){ # yr = 2014
+  for (yr in yrs){ # yr = 2015
     
-    vgpm_yr_tif  <- glue("{dir_vgpm}/cafe.v.{yr}.tif")
+    # vgpm_yr_tif  <- glue("{dir_vgpm}/cafe.v.{yr}.tif")
+    vgpm_yr_tif  <- glue("{dir_vgpm}/vgpm.{yr}.tif")
     
     if (!file.exists(vgpm_yr_tif)) {
-      tar      <- glue("cafe.v.{yr}.tar")
-      url_tar  <- glue("https://orca.science.oregonstate.edu/data/2x4/monthly/cafe.viirs.r2022/hdf/{tar}")
+      tar      <- glue("vgpm.v.{yr}.tar")
+      url_tar  <- glue("https://orca.science.oregonstate.edu/data/2x4/monthly/vgpm.r2022.v.chl.v.sst/hdf/{tar}")
       path_tar <- file.path(dir_vgpm, tar)
       
+      dir_create(dirname(path_tar))
       if(!file_exists(path_tar))
         download.file(url_tar, path_tar, method = "curl", extra = "-k -L")
       
@@ -113,9 +119,9 @@ if (!file.exists(vgpm_tif)) {
         names(r) <- "npp" # set name for all layers
         
         time(r, tstep = "yearmonths") <- basename(file_hdf) |> 
-          str_replace("cafe.([0-9]+).hdf", "\\1") |>
+          str_replace("vgpm.([0-9]+).hdf", "\\1") |>
           as_date(format = "%Y%j")
-        # plet(r)
+        
         r
       }
       
@@ -134,85 +140,56 @@ if (!file.exists(vgpm_tif)) {
       }
       
       # Create a SpatRaster collection from all the monthly rasters
-      r_yr <- rast(monthly_rasters)
-      
+      r_yr <- rast(monthly_rasters) |> 
+        mean(na.rm = T)
+      names(r_yr) <- "npp"
+      time(r_yr, tstep = "years") <- yr
+
       writeRaster(r_yr, vgpm_yr_tif, overwrite = TRUE)
       
       dir_delete(dir_untar)
       file_delete(path_tar)
       
-      # r_yr <- rast(vgpm_yr_tif)
-      # plet(r_yr[[8]])
-      
       message(glue(
-        "Created monthlies for {yr}: {basename(vgpm_yr_tif)}"))
+        "Created annual for {yr}: {basename(vgpm_yr_tif)}"))
     }
   }
   
-  r_yrmo <- dir_ls(dir_vgpm, glob = "*.tif") |> 
+  # aggregate across years ----
+  r_yrs <- dir_ls(dir_vgpm, glob = "*.tif") |> 
     rast()
-  mos_r <- rep(1:12, 10)
   
-  # aggregate to months across years ----
-  r_mo   <- list()
-  for (mo in 1:12){  # mo = 2
-    r <- r_yrmo[[which(mos_r == mo)]]
-    
-    r_n   <- r |> 
-      not.na() |> 
-      sum() %>% 
-      mask(., ., maskvalues = 0)
-    
-    r_avg <- r |> 
-      mean(na.rm = T) %>%
-      mask(., ., maskvalues = 0)
-    
-    r_sd <- r |> 
-      stdev(na.rm = T) %>%
-      mask(., ., maskvalues = 0)
-    
-    r_mo[[mo]] <- c(r_avg, r_sd, r_n) |> 
-      setNames(glue("npp_mo{sprintf('%02d', mo)}_{c('avg','sd', 'n')}"))
-  }
-  r_mo <- rast(r_mo)
-  
-  # aggregate all ----
-  lyrs <- names(r_mo)
-  r_n   <- r_mo |> 
-    subset(str_detect(lyrs, "_n$")) |>
-    sum(na.rm = T) %>% 
-    mask(., ., maskvalues = 0)
+  r_avg <- r_yrs |> 
+    mean(na.rm = T)
 
-  r_avg <- r_mo |> 
-    subset(str_detect(lyrs, "_avg$")) |> 
-    mean(na.rm = T) %>%
-    mask(., ., maskvalues = 0)
-  
-  r_sd <- r_mo |> 
-    subset(str_detect(lyrs, "_avg$")) |> 
+  r_sd <- r_yrs |> 
     stdev(na.rm = T)
+    
+  r <- c(r_avg, r_sd) |> 
+    setNames(glue("npp_{c('avg','sd')}"))
   
-  r <- c(r_avg, r_sd, r_n) |> 
-    setNames(glue("npp_{c('avg','sd', 'n')}"))
-  
-  r <- c(r, r_mo)
-
   r |> 
     writeRaster(vgpm_tif, overwrite = T)
 }
 
-# mo <- 7
 r <- rast(vgpm_tif,  lyrs = "npp_avg")
 #   # rotate(left=F) # -180 to 180 -> 0 to 360
 #   # shift(dx = 0.0001) # problem with -180 extent
 
-mapView(
-  r, maxpixels = ncell(r), col.regions = cmocean("algae"),
-  layer.name = glue("NPP avg")) |> 
-  slot("map") |>
-  addFullscreenControl() |>
-  addControl(tags$div(HTML("units: mg C / m<sup>2</sup> / day")), position = "topright")
+vgpm_png <- here("figs/ingest_productivity/map_vgpm_avg.png")
+if (!file.exists(vgpm_png)){
+  m <- mapView(
+    r, maxpixels = ncell(r), col.regions = cmocean("algae"),
+    layer.name = glue("NPP avg")) |> 
+    slot("map") |>
+    # addFullscreenControl() |>
+    addControl(tags$div(HTML("units: mg C / m<sup>2</sup> / day")), position = "topright")
+  
+  mapshot2(m, file = vgpm_png)
+}
 ```
+
+![Static map (to limit file size) of Standard VGPM from VIIRS satellite, averaged across all months and years 2014 to 2023.](figs/ingest_productivity/map_vgpm_avg.png){#fig-vgpm .lightbox}
 
 ## NEW Proposed Planning Areas
 
@@ -334,8 +311,7 @@ pa_oa |>
 
 Extract daily average net primary production (NPP) values across all cells within the proposed planning areas.
 
-```{r}
-#| label: get_pa_vgpm
+```{r pa_zonal_plot}
 
 pa <- read_sf(pa_gpkg) |>
   # planning areas: Alaska and lower 48 states 
@@ -344,13 +320,11 @@ pa <- read_sf(pa_gpkg) |>
       planarea_key %in% c(
         'CEC','SOA','NOC','CGA','EGA','WGA','SOC','FLS','MDA','NOA','WAO')) 
 
-r <- rast(vgpm_tif)
-lyrs <- names(r)
-# plot(r_pa[["npp_avg"]])
+r_yrs <- dir_ls(dir_vgpm, glob = "*.tif") |> 
+    rast()
+names(r_yrs) <- glue("npp_{time(r_yrs)}")
 
-d_pa_npp <- r |> 
-  subset(
-    str_detect(lyrs, "^npp_mo[0-9]{2}_avg$")) |> 
+d_pa_npp <- r_yrs |> 
   zonal(
     pa |> 
       select(planarea_key, planarea_name) |>
@@ -360,13 +334,14 @@ d_pa_npp <- r |>
     as.polygons = T) |> 
   st_as_sf() |> 
   st_drop_geometry() |> 
-  tibble() |> 
+  tibble() |>
   pivot_longer(
-    cols      = npp_mo01_avg:npp_mo12_avg,
-    names_to  = "mo",
+    cols      = starts_with("npp_"),
+    names_to  = "year",
     values_to = "npp") |> 
   filter(!is.na(npp)) |> 
   mutate(
+    year = str_replace(year, "npp_", "") |> as.integer(),
     npp = set_units(npp, mg/m^2/day) |> 
       set_units(t/km^2/yr) ) |>
   group_by(planarea_key, planarea_name) |>
@@ -398,14 +373,14 @@ pp_pdf <- glue("{dir_figs}/planarea_primprod.pdf")
 png(pp_png, width = 1200, height = 800, res = 150)
 print(g)
 dev.off()
-browseURL(pp_png)
+# browseURL(pp_png)
 pdf(pp_pdf, width = 7, height = 5)
 print(g)
 dev.off()
-browseURL(pp_pdf)
+# browseURL(pp_pdf)
 ```
 
-![Primary productivity plot.](`r pp_png`)
+![Primary productivity of Planning Areas with average (green bar) and standard deviation (black error bars) for annual average Net Primary Production (NPP) from 2014 to 2023.](./figs/ingest_productivity/planarea_primprod.png)
 
 ```{r plot_bars}
 pa_npp <- pa |>
@@ -415,19 +390,12 @@ pa_npp <- pa |>
       select(planarea_key, npp_avg, npp_sd),
     by = "planarea_key")
 
-r_npp <- r[["npp_avg"]] |> 
-  mask(vect(pa_npp)) |> 
-  trim()
-
 mapviewOptions(
   basemaps = "Esri.OceanBasemap",
   raster.palette = \(n) hcl.colors(n, palette = "viridis"),
   vector.palette = \(n) hcl.colors(n, palette = "viridis"))
 
 (mapView(
-  r_npp, maxpixels = ncell(r_npp), 
-  layer.name = "raster") + 
-  mapView(
     pa_npp, zcol = "npp_avg", 
     layer.name = "planning areas")) |> 
   slot("map") |> 
@@ -437,337 +405,4 @@ mapviewOptions(
 d_pa_npp |> 
   datatable()
 ```
-
-## Discussion
-
-
-    
-## OLD code
-
-Other attempts in non-evaluated R code chunks below....
-
-```{r}
-#| label: old_br_east_west
-#| eval: false
-
-# Latest
-# 
-# -   [ERDDAP - search "productivity_viirs_snpp"](https://coastwatch.pfeg.noaa.gov/erddap/search/index.html?page=1&itemsPerPage=1000&searchFor=productivity_viirs_snpp)
-# 
-# -   monthly has lots of cloud cover -- see [WMS map](https://coastwatch.pfeg.noaa.gov/erddap/wms/productivity_viirs_snpp_monthly/index.html)
-# 
-# -   [Arctic Ocean Primary Productivity: The Response of Marine Algae to Climate Warming and Sea Ice Decline - NOAA Arctic](https://arctic.noaa.gov/report-card/report-card-2023/arctic-ocean-primary-productivity-the-response-of-marine-algae-to-climate-warming-and-sea-ice-decline-2023/#methods_data) ![](https://arctic.noaa.gov/wp-content/uploads/2023/11/ARC23-PrimaryProductivity-frey-Fig3-878x1024.png)
-
-dir_nc <- here("data/productivity")
-dates  <- c("2023-01-16", "2023-12-16")
-
-# https://tile.marinesensitivity.org/public.ply_boemrgns.html
-p_br <- read_sf(con, "ply_boemrgns")
-
-# chunk east and west of antimeridian for extraction ----
-bb_w <- st_bbox(c(xmin = 0, xmax = 180, ymin = -90, ymax = 90)) |> 
-  st_as_sfc() |> 
-  st_as_sf(crs = 4326)
-
-bb_e <- st_bbox(c(xmin = -180, xmax = 0, ymin = -90, ymax = 90)) |> 
-  st_as_sfc() |> 
-  st_as_sf(crs = 4326)
-
-p_br <- bind_rows(
-  p_br |> 
-    st_intersection(bb_w) |> 
-    mutate(
-      chunk = "w"),
-  p_br |> 
-    st_difference(bb_w) |> 
-    mutate(
-      chunk = "e")) |> 
-  relocate(chunk, .after = boemrgn_key) |> 
-  arrange(boemrgn_key, chunk)
-
-leaflet() |> 
-  addProviderTiles(providers$Esri.OceanBasemap) |> 
-  addPolygons(data = st_shift_longitude(p_br))
-
-p_br |> 
-  st_drop_geometry() |> 
-  datatable()
-```
-
-```{r}
-#| label: old_erddap_fetch
-#| eval: false
-
-librarian::shelf(rerddap)
-
-# iterate over polygon chunks ----
-for (i in 1:nrow(p_br)){ # p = p_br[3,]
-  
-  p  <- slice(p_br, i)
-  bb <- st_bbox(p)
-  
-  nc <- here(glue(
-    "data/productivity/{p$boemrgn_key}{p$chunk}_{paste(dates, collapse = '_')}.nc"))
-  
-  if (file.exists(nc)){
-    message(glue("{i}/{nrow(p_br)} skip: {basename(nc)} already exists"))
-    next()
-  }
-  
-  message(glue("{i}/{nrow(p_br)} fetch: {basename(nc)}  ~ {Sys.time()}"))
-  o <- griddap(
-    "productivity_viirs_snpp_monthly",
-    url = "https://coastwatch.pfeg.noaa.gov/erddap/",
-    time      = dates,
-    longitude = c(max(bb$xmin, -179.9792), min(bb$xmax, 179.9792)), 
-    # TODO: compare with actual min/max from fetching
-    latitude  = c(bb$ymin, bb$ymax),
-    fields    = "productivity",
-    store     = disk(path = dir_nc))
-  file.rename(o$summary$filename, nc)
-}
-message(glue("{nrow(p_br)}/{nrow(p_br)} done: {basename(nc)}  ~ {Sys.time()}"))
-
-boemrgn_key = "brAK"
-chunk       = "e"
-p <- p_br |> 
-  filter(
-    boemrgn_key == !!boemrgn_key,
-    chunk       == !!chunk)
-nc <- here(glue("data/productivity/{boemrgn_key}{chunk}_{paste(dates, collapse = '_')}.nc"))
-r <- rast(nc) |> 
-  flip() |> 
-  shift(dx = 0.0001) # problem with -180 extent
-
-leaflet() |> 
-  addProviderTiles(providers$Esri.OceanBasemap) |> 
-  addRasterImage(r[[6]]) |> 
-  addPolygons(data = p)
-
-r_cefi <- rast("/Users/bbest/Downloads/myplot.3189115.1740009451.8932478.nc")
-plot(r_cefi[[1]])
-terra::plot()
-
-# extent      : 0.5, 172.5, 0.7455357, 172.2545  (xmin, xmax, ymin, ymax)
-r_cefi_r <- r_cefi |> 
-  rotate()
-r_cefi_rf <- r_cefi_r |> 
-  flip()
-# dimensions  : 337, 172, 4  (nrow, ncol, nlyr)
-# resolution  : 1, 0.5089286  (x, y)
-# extent      : -85.5, 86.5, 0.7455357, 172.2545  (xmin, xmax, ymin, ymax)
-plet(
-  r_cefi_rf[[1]],
-  tiles = "Esri.OceanBasemap")
-```
-
-```{=html}
-<!--
-
-## CopernicusMarine
-
--   [Add layer to map \| Copernicus Marine MyOcean Viewer](https://data.marine.copernicus.eu/viewer/expert?view=layers&dataset=GLOBAL_ANALYSISFORECAST_BGC_001_028)
-
--   Product ID: GLOBAL_ANALYSISFORECAST_BGC_001_028
-
--   Spatial extent: Global OceanLat -80° to 90°Lon -180° to 179.75°
-
--   Spatial resolution: 0.25° × 0.25°
-
--   Temporal extent: 30 Sep 2021 to 27 Feb 2025
-
--   Temporal resolution: DailyMonthly
-
--   Elevation (depth) levels: 50
-
--   [User Manual](https://documentation.marine.copernicus.eu/PUM/CMEMS-GLO-PUM-001-028.pdf)
-
-`cmems_mod_glo_bgc-bio_anfc_0.25deg_P1M-m` - `nppv`: Net primary production of biomass expressed as carbon per unit volume in sea water\[mg/m3/day\] - `o2`: Mole concentration of dissolved molecular oxygen in sea water \[mmol/m3\]
-
--   [Global Ocean Biogeochemistry Analysis and Forecast \| Copernicus Marine Service](https://data.marine.copernicus.eu/product/GLOBAL_ANALYSISFORECAST_BGC_001_028/download?dataset=cmems_mod_glo_bgc-bio_anfc_0.25deg_P1M-m_202311)
--   Choose start and end times within this range:10/01/2021, 00:00 → 01/01/2025, 00:00
--   Choose start and end depths within this range:0.5 m → 5727.9 m
-
-OR
-
--   [Global Ocean Colour (Copernicus-GlobColour), Bio-Geo-Chemical, L4 (monthly and interpolated) from Satellite Observations (1997-ongoing) \| Copernicus Marine Service](https://data.marine.copernicus.eu/product/OCEANCOLOUR_GLO_BGC_L4_MY_009_104/download?dataset=cmems_obs-oc_glo_bgc-pp_my_l4-multi-4km_P1M_202311)
--   Choose start and end times within this range:09/01/1997, 00:00→01/01/2025, 00:00 Primary productivity of biomass expressed as carbonPP \[mg/m2/day\] Primary Productivity - Uncertainty estimationPP_uncertainty \[%\] also cuts off
-
--->
-```
-
-```{r}
-#| label: old_copernicus_setup
-#| eval: false
-
-librarian::shelf(
-  dplyr, DT, ggplot2, glue, here, jsonlite, leaflet, mapview, ncdf4, readr, reticulate, 
-  sf, stringr, terra, tidyr,
-  quiet = T)
-
-user        <- "bbest1"
-pass_txt    <- "~/My Drive/private/data.marine.copernicus.eu_bbest1-password.txt"
-dir_cm      <- here("data/copernicus")
-results_csv <- here("data/copernicus.csv")
-
-# do once: create virtual enviroment and install copernicusmarine Python module
-# virtualenv_create(envname = "CopernicusMarine")
-# virtualenv_install(envname = "CopernicusMarine", packages = c("copernicusmarine"))
-
-# use virtualenv and reticulate::import copernicusmarine Python module
-use_virtualenv(virtualenv = "CopernicusMarine", required = TRUE)
-cmt <- import("copernicusmarine")
-
-# login
-pass <- readLines(pass_txt)
-loggedin <- cmt$login(user, pass, skip_if_user_logged_in = T) # py_help(cmt$login)
-# writes to /Users/bbest/.copernicusmarine/.copernicusmarine-credentials
-
-datasets <- list(
-  # Product identifier: GLOBAL_ANALYSISFORECAST_BGC_001_028
-  # Product name: Global Ocean Biogeochemistry Analysis and Forecast
-  "cmems_mod_glo_bgc-bio_anfc_0.25deg_P1M-m" = list(   # Primary production and O2, monthly
-    vars      = list("nppv", "o2"),
-    date_rng  = c("2024-01-01","2024-12-01"),
-    depth_rng =  c(0.5, 5727.9) )) # get all depths
-
-datasets |> 
-  toJSON(auto_unbox = T, pretty=T)
-```
-
-```{r}
-#| label: old_copernicus_fetch
-#| eval: false
-
-dir_cm <- here("data/productivity/copernicus")
-dir.create(dir_cm, showWarnings = F, recursive = F)
-
-for (i in 1:nrow(p_br)){ # i = 1
-  
-  p  <- slice(p_br, i)
-  bb <- p |> 
-    # st_buffer(9.25*1000) |> # buffer by a pixel width 1/12° ~ 9.25 km at equator 
-    # but -180 goes global width
-    st_bbox()
-  
-  message(glue("{i}/{nrow(p_br)}: {p$boemrgn_key}"))
-  
-  for (j in 1:length(datasets)){ # j=1
-    
-    ds_id <- names(datasets)[j]
-    ds <- datasets[[j]]
-    
-    nc <- here(glue(
-      "{dir_cm}/{ds_id}_{paste(ds$date_rng, collapse = '_')}_{p$boemrgn_key}{p$chunk}.nc"))
-    
-    if (file.exists(nc)){
-      message(glue("{j}/{length(datasets)} skip: {basename(nc)} already exists"))
-      next()
-    }
-    
-    message(glue("  {j}/{length(datasets)}: fetch {basename(nc)}  ~ {Sys.time()}"))
-    
-    # py_help(cmt$subset)
-    out <- cmt$subset(
-      dataset_id            = ds_id,
-      # dataset_version     = "202309",
-      variables             = ds$vars,
-      minimum_longitude     = bb$xmin,
-      maximum_longitude     = bb$xmax,
-      minimum_latitude      = bb$ymin,
-      maximum_latitude      = bb$ymax,
-      start_datetime        = paste0(ds$date_rng[1], "T00:00:00"),
-      end_datetime          = paste0(ds$date_rng[2], "T00:00:00"),
-      minimum_depth         = ds$depth_rng[1],
-      maximum_depth         = ds$depth_rng[2],
-      output_filename       = nc,
-      force_download        = T)
-  } }
-message(glue("{nrow(p_br)}/{nrow(p_br)} done: {basename(nc)}  ~ {Sys.time()}"))
-
-```
-
-```{r}
-#| label: old_copernicus_nc
-#| eval: false
-
-o <- nc_open(nc)
-o
-
-r <- rast(nc) |>
-  crop(bb_e, snap = "in") # problem with -180 extent
-r
-
-i <- 1
-cat(glue("
-  index: {i}
-  name: {names(r)[i]}
-  time: {time(r[[i]])}
-  varname: {varnames(r[[i]])}
-  longname: {longnames(r[[i]])}"))
-
-# Plot the raster with the beomrgn
-plet(
-  r[[i]], 
-  main  = glue("{longnames(r[[i]])}\n{names(r)[i]}\n{time(r[[i]])}"),
-  # main  = glue("{longnames(r[[i]])}\nthetao_depth=0.5\n{time(r[[i]])}"), 
-  tiles = "Esri.OceanBasemap") |> 
-  addPolygons(
-    data        = p,
-    fillOpacity = 0.2)
-
-```
-
-```{r}
-#| label: old_copernicus_summarize
-#| eval: false
-
-for (i in 1:nrow(p_br)){ # i = 1
-  
-  p  <- slice(p_br, i)
-   
-  j = 1
-  ds_id <- names(datasets)[j]
-  ds <- datasets[[j]]
-  
-  nc <- here(glue(
-    "{dir_cm}/{ds_id}_{paste(ds$date_rng, collapse = '_')}_{p$boemrgn_key}{p$chunk}.nc"))
-  
-  r <- rast(nc)
-  
-  times <- time(r["nppv_"]) |> as.character()
-  for (m in 1:12){ # m = 1
-    
-    tif <- glue("{dir_cm}/nppv_{p$boemrgn_key}{p$chunk}_{sprintf('2024-%02d', m)}.tif")
-    if (file.exists(tif))
-      next()
-    
-    r["nppv_"] |> 
-      subset(times == sprintf("2024-%02d-01", m)) |> 
-      sum(na.rm = T) |> 
-      writeRaster(tif)
-  }
-  
-  tif <- glue("{dir_cm}/nppv_{p$boemrgn_key}{p$chunk}_2024_monthly-avg.tif")
-  if (file.exists(tif))
-    next()
-  
-  rast(list.files(dir_cm, glue("nppv_{p$boemrgn_key}{p$chunk}_2024-.*\\.tif$"), full.names = T)) |> 
-    mean(na.rm = T) |> 
-    writeRaster(tif)
-}
-
-
-r <- rast(tif)  # |>
-  # crop(bb_e, snap = "in") # problem with -180 extent
-
-plet(
-  r, 
-  main  = basename(tif),
-  tiles = "Esri.OceanBasemap") |> 
-  addPolygons(
-    data        = p,
-    fillOpacity = 0.2)
-```
-
 
