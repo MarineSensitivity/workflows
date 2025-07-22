@@ -42,6 +42,7 @@ er_pa_gpkg     <- glue("{dir_data}/derived/ply_ecoregion_planarea.gpkg")
 er_pa_csv      <- glue("{dir_data}/derived/ply_ecoregion_planarea.csv")
 metrics_tif    <- glue("{dir_data}/derived/r_metrics.tif")
 spp_global_csv <- here("../apps/mapgl/spp_global_cache.csv")
+er_pa_n_csv    <- glue("{dir_data}/derived/tbl_er_pa_scores.csv")
 
 Sys.setenv(MAPBOX_PUBLIC_TOKEN=readLines(mapbox_tkn_txt))
 librarian::shelf(
@@ -469,200 +470,231 @@ for (is_ak in c(T, F)){
 ```
 
 ```{r map_imgs_cell_l48_ak}
-metrics_tif    <- glue("{dir_data}/derived/r_metrics.tif")
+metrics_tif <- glue("{dir_data}/derived/r_metrics.tif")
+vgpm_tif    <- glue("{dir_data}/raw/oregonstate.edu/vgpm.r2022.v.chl.v.sst.2160x4320_2014-2023.avg.sd_planareas.tif")
 
 r_metrics <- rast(metrics_tif)
+r_vgpm    <- rast(vgpm_tif)
 d_lbls    <- read_csv(lbls_csv)
 
-lyr <- "score_extriskspcat_primprod_ecoregionrescaled_equalweights"
+lyr_score <- "score_extriskspcat_primprod_ecoregionrescaled_equalweights"
+lyr_npp   <- "npp_avg"
 
 er_ak  <-  er |> 
   filter(region_key == "AK") |> 
   pull(ecoregion_key)
 er_l48 <- c('CAC','WAOR','SECS','WCGOA','EGOA','NECS')
 
-r <- r_metrics[[lyr]] |> 
-  mask(r_metrics$ecoregion_key %in% c(er_l48, er_ak), maskvalues=F) |> 
-  trim() # plot(r)
+r_score <- r_metrics[[lyr_score]] |> 
+  mask(r_metrics$ecoregion_key %in% c(er_l48, er_ak), maskvalues=F) # |> 
+  # trim() # plot(r_score)
 
-rng_r <- range(values(r, na.rm=T))
+r_npp <- r_vgpm |> 
+  log() |> 
+  mask(r_metrics$ecoregion_key %in% c(er_l48, er_ak), maskvalues=F) # |> 
+  # trim() # plot(r)
+
 n_cols <- 11
-cols_r <- rev(RColorBrewer::brewer.pal(n_cols, "Spectral"))
-brks_r <- seq(rng_r[1], rng_r[2], length.out = n_cols)
+rng_r_score  <- range(values(r_score, na.rm=T))
+cols_r_score <- rev(RColorBrewer::brewer.pal(n_cols, "Spectral"))
+# show_col(cols_r_score)
+brks_r_score <- seq(rng_r_score[1], rng_r_score[2], length.out = n_cols)
 
-for (is_ak in c(T, F)){
-  # is_ak <- T
+rng_r_npp  <- range(values(r_npp, na.rm=T))
+cols_r_npp <- pal_viridis()(n_cols)
+# show_col(cols_r_npp)
+brks_r_npp <- seq(rng_r_npp[1], rng_r_npp[2], length.out = n_cols)
+
+for (is_vgpm in c(T, F)){  # is_vgpm = T
   
-  if (is_ak){
-    # Alaska
-    
-    r_area <- r_metrics[[lyr]] |> 
-      mask(r_metrics$ecoregion_key %in% er_ak, maskvalues=F) |> 
-      trim() # plot(r)
-    
-    er_area  <- er |> 
-      filter(region_key == "AK") |> 
-      st_shift_longitude()
-    pa_area  <-  pa |> 
-      filter(region_key == "AK") |> 
-      st_shift_longitude()
-    
-    er_pts_area  <- er_pts |> 
-      filter(region_key == "AK") |> 
-      st_shift_longitude() |> 
-      left_join(
-        d_lbls |> select(-planarea_key), , 
-        by = "ecoregion_key")
-    pa_pts_area  <-  pa_pts |> 
-      filter(region_key == "AK") |> 
-      st_shift_longitude() |> 
-      left_join(
-        d_lbls |>  select(-ecoregion_key), 
-        by = "planarea_key")
-    
-    lgnd_pos <- "top-left"
-    # Issue: antimeridian line splits Alaska ecoregions & planareas
-    # tried: st_shift_longitude() |> st_union(); QGIS; [antimeridian](https://www.gadom.ski/antimeridian); ... to no avail
-    # TODO: try other fixes:
-    # - https://towardsdatascience.com/around-the-world-in-80-lines-crossing-the-antimeridian-with-python-and-shapely-c87c9b6e1513/
-    # - https://docs.mapbox.com/mapbox-gl-js/example/line-across-180th-meridian/
+  if (is_vgpm){
+    r      <- r_npp
+    rng_r  <- round(rng_r_npp, 2)
+    cols_r <- cols_r_npp
+    brks_r <- brks_r_npp
+    lyr    <- lyr_npp
+    title  <- "Primary Productivity (log(NPP))"
   } else {
-    # lower 48 states
-    
-    r_area <- r_metrics[[lyr]] |> 
-      mask(r_metrics$ecoregion_key %in% er_l48, maskvalues=F) |> 
-      trim() # plot(r)
-
-    box_lower48 <- pa |> 
-      filter(planarea_key %in% c("WAO", "SOC", "FLS", "NOA")) |>
-      st_bbox() |> 
-      st_as_sfc()
-    
-    er_area <- er |> 
-      st_filter(box_lower48, .predicate = st_intersects)
-    # er_area$ecoregion_key |> paste(collapse = "','") 
-    # 'CAC','WAOR','SECS','WCGOA','EGOA','NECS'
-    pa_area <- pa |> 
-      st_filter(box_lower48, .predicate = st_intersects)
-    # pa_area$planarea_key |> paste(collapse = "','") 
-    # 
-    
-    er_pts_area  <- er_pts |> 
-      filter(ecoregion_key %in% er_area$ecoregion_key) |>
-      left_join(
-        d_lbls |> select(-planarea_key), 
-        by = "ecoregion_key")
-    pa_pts_area  <-  pa_pts |> 
-      filter(planarea_key %in% pa_area$planarea_key) |>
-      left_join(
-        d_lbls |>  select(-ecoregion_key), 
-        by = "planarea_key")
-    
-    lgnd_pos <- "bottom-left"
+    r      <- r_score
+    rng_r  <- rng_r_score
+    cols_r <- cols_r_score
+    brks_r <- brks_r_score
+    lyr    <- lyr_score
+    title  <- "Score"
   }
-  scale_pos <- "bottom-right"
   
-  # mapView(pa_area) +
-  #   mapView(pa_pts_area)
-  # mapView(er_area) +
-  #   mapView(er_pts_area)
-  
-  er_url <- "https://api.marinesensitivity.org/tilejson?table=public.ply_ecoregions_2025&use_cache=FALSE"
-  pa_url <- "https://api.marinesensitivity.org/tilejson?table=public.ply_planareas_2025&use_cache=FALSE"
-  er_filter <- c("in", "ecoregion_key", er_area$ecoregion_key)
-  pa_filter <- c("in", "planarea_key",  pa_area$planarea_key)
-  
-  m <- mapboxgl(
-    style  = mapbox_style("dark"),
-    projection = "globe") |>
-    fit_bounds(
-      bbox = er_area) |>
-    add_image_source(
-      id     = "r_src",
-      data   = r_area,
-      colors = cols_r) |>
-    add_vector_source(
-      id  = "pa_src",
-      url = pa_url) |>
-    add_vector_source(
-      id  = "er_src",
-      url = er_url) |>
-    add_raster_layer(
-      id                = "r_lyr",
-      source            = "r_src",
-      raster_opacity    = 0.9,
-      raster_resampling = "nearest" #,
-      # before_id         = "er_ln"
+  for (is_ak in c(T, F)){  # is_ak = T
+
+    if (is_ak){
+      # Alaska
+      
+      r_area <- r |> 
+        mask(r_metrics$ecoregion_key %in% er_ak, maskvalues=F) |> 
+        trim() # plot(r)
+      
+      er_area  <- er |> 
+        filter(region_key == "AK") |> 
+        st_shift_longitude()
+      pa_area  <-  pa |> 
+        filter(region_key == "AK") |> 
+        st_shift_longitude()
+      
+      er_pts_area  <- er_pts |> 
+        filter(region_key == "AK") |> 
+        st_shift_longitude() |> 
+        left_join(
+          d_lbls |> select(-planarea_key), , 
+          by = "ecoregion_key")
+      pa_pts_area  <-  pa_pts |> 
+        filter(region_key == "AK") |> 
+        st_shift_longitude() |> 
+        left_join(
+          d_lbls |>  select(-ecoregion_key), 
+          by = "planarea_key")
+      
+      lgnd_pos <- "top-left"
+      # Issue: antimeridian line splits Alaska ecoregions & planareas
+      # tried: st_shift_longitude() |> st_union(); QGIS; [antimeridian](https://www.gadom.ski/antimeridian); ... to no avail
+      # TODO: try other fixes:
+      # - https://towardsdatascience.com/around-the-world-in-80-lines-crossing-the-antimeridian-with-python-and-shapely-c87c9b6e1513/
+      # - https://docs.mapbox.com/mapbox-gl-js/example/line-across-180th-meridian/
+    } else {
+      # lower 48 states
+      
+      r_area <- r |> 
+        mask(r_metrics$ecoregion_key %in% er_l48, maskvalues=F) |> 
+        trim() # plot(r)
+      
+      box_lower48 <- pa |> 
+        filter(planarea_key %in% c("WAO", "SOC", "FLS", "NOA")) |>
+        st_bbox() |> 
+        st_as_sfc()
+      
+      er_area <- er |> 
+        st_filter(box_lower48, .predicate = st_intersects)
+      # er_area$ecoregion_key |> paste(collapse = "','") 
+      # 'CAC','WAOR','SECS','WCGOA','EGOA','NECS'
+      pa_area <- pa |> 
+        st_filter(box_lower48, .predicate = st_intersects)
+      # pa_area$planarea_key |> paste(collapse = "','") 
+      # 
+      
+      er_pts_area  <- er_pts |> 
+        filter(ecoregion_key %in% er_area$ecoregion_key) |>
+        left_join(
+          d_lbls |> select(-planarea_key), 
+          by = "ecoregion_key")
+      pa_pts_area  <-  pa_pts |> 
+        filter(planarea_key %in% pa_area$planarea_key) |>
+        left_join(
+          d_lbls |>  select(-ecoregion_key), 
+          by = "planarea_key")
+      
+      lgnd_pos <- "bottom-left"
+    }
+    scale_pos <- "bottom-right"
+    
+    # mapView(pa_area) +
+    #   mapView(pa_pts_area)
+    # mapView(er_area) +
+    #   mapView(er_pts_area)
+    
+    er_url <- "https://api.marinesensitivity.org/tilejson?table=public.ply_ecoregions_2025&use_cache=FALSE"
+    pa_url <- "https://api.marinesensitivity.org/tilejson?table=public.ply_planareas_2025&use_cache=FALSE"
+    er_filter <- c("in", "ecoregion_key", er_area$ecoregion_key)
+    pa_filter <- c("in", "planarea_key",  pa_area$planarea_key)
+    
+    m <- mapboxgl(
+      style  = mapbox_style("dark"),
+      projection = "globe") |>
+      fit_bounds(
+        bbox = er_area) |>
+      add_image_source(
+        id     = "r_src",
+        data   = r_area,
+        colors = cols_r) |>
+      add_vector_source(
+        id  = "pa_src",
+        url = pa_url) |>
+      add_vector_source(
+        id  = "er_src",
+        url = er_url) |>
+      add_raster_layer(
+        id                = "r_lyr",
+        source            = "r_src",
+        raster_opacity    = 0.9,
+        raster_resampling = "nearest" #,
+        # before_id         = "er_ln"
       ) |>
-    add_line_layer(
-      id           = "er_ln",
-      source       = "er_src",
-      source_layer = "public.ply_ecoregions_2025",
-      # before_id    = "pa_ln",
-      filter       = er_filter,
-      line_color   = "lightgray",
-      line_opacity = 1,
-      line_width   = 5 ) |> 
-    add_line_layer(
-      id           = "pa_ln",
-      source       = "pa_src",
-      source_layer = "public.ply_planareas_2025",
-      filter       = pa_filter,
-      line_color   = "black",
-      line_opacity = 1,
-      line_width   = 1 ) |>
-    add_symbol_layer(
-      id                 = "pa_symbol",
-      source             = pa_pts_area,
-      filter             = pa_filter,
-      text_field         = get_column("planarea_key"),
-      text_allow_overlap = T,
-      text_anchor        = get_column("text_anchor"),
-      text_justify       = get_column("text_justify"),
-      text_offset        = list(
-        get_column("text_offset_right"), 
-        get_column("text_offset_down") ) ) |>
-    add_symbol_layer(
-      id                 = "er_symbol",
-      source             = er_pts_area,
-      filter             = er_filter,
-      text_field         = get_column("ecoregion_name"),
-      text_color         = "black",
-      text_allow_overlap = T,
-      text_anchor        = get_column("text_anchor"),
-      text_justify       = get_column("text_justify"),
-      text_offset        = list(
-        get_column("text_offset_right"), 
-        get_column("text_offset_down") ),
-      text_halo_color    = "lightgray",
-      text_halo_width    = 2,
-      text_halo_blur     = 2,
-      text_line_height   = 1.5,
-      text_size          = 20) |>
-    mapgl::add_legend(
-      "Score",
-      values   = rng_r,
-      colors   = cols_r,
-      position = lgnd_pos) |> 
-    add_scale_control(
-      position = scale_pos)
-  
-  b       <- glue("{dir_figs}/map_cell_{ifelse(is_ak, 'ak','l48')}")
-  b_html  <- glue("{b}.html")
-  b_files <- glue("{b}_files")
-  b_png   <- glue("{b}.png")
-  saveWidget(m, b_html, selfcontained = F, background = "transparent")
-  webshot(
-    b_html, b_png,
-    vwidth   = 1200, vheight = 800, zoom = 2,
-    selector = "#htmlwidget_container",
-    delay    = 2, quiet = T)
-  file_delete(b_html)
-  dir_delete(b_files)
-  
-  # m
-  # browseURL(b_png)
-}
+      add_line_layer(
+        id           = "er_ln",
+        source       = "er_src",
+        source_layer = "public.ply_ecoregions_2025",
+        # before_id    = "pa_ln",
+        filter       = er_filter,
+        line_color   = "lightgray",
+        line_opacity = 1,
+        line_width   = 5 ) |> 
+      add_line_layer(
+        id           = "pa_ln",
+        source       = "pa_src",
+        source_layer = "public.ply_planareas_2025",
+        filter       = pa_filter,
+        line_color   = "black",
+        line_opacity = 1,
+        line_width   = 1 ) |>
+      add_symbol_layer(
+        id                 = "pa_symbol",
+        source             = pa_pts_area,
+        filter             = pa_filter,
+        text_field         = get_column("planarea_key"),
+        text_allow_overlap = T,
+        text_anchor        = get_column("text_anchor"),
+        text_justify       = get_column("text_justify"),
+        text_offset        = list(
+          get_column("text_offset_right"), 
+          get_column("text_offset_down") ) ) |>
+      add_symbol_layer(
+        id                 = "er_symbol",
+        source             = er_pts_area,
+        filter             = er_filter,
+        text_field         = get_column("ecoregion_name"),
+        text_color         = "black",
+        text_allow_overlap = T,
+        text_anchor        = get_column("text_anchor"),
+        text_justify       = get_column("text_justify"),
+        text_offset        = list(
+          get_column("text_offset_right"), 
+          get_column("text_offset_down") ),
+        text_halo_color    = "lightgray",
+        text_halo_width    = 2,
+        text_halo_blur     = 2,
+        text_line_height   = 1.5,
+        text_size          = 20) |>
+      mapgl::add_legend(
+        title,
+        values   = rng_r,
+        colors   = cols_r,
+        position = lgnd_pos) |> 
+      add_scale_control(
+        position = scale_pos)
+    
+    b       <- glue("{dir_figs}/map_cell_{ifelse(is_vgpm, 'npp','score')}_{ifelse(is_ak, 'ak','l48')}")
+    b_html  <- glue("{b}.html")
+    b_files <- glue("{b}_files")
+    b_png   <- glue("{b}.png")
+    saveWidget(m, b_html, selfcontained = F, background = "transparent")
+    webshot(
+      b_html, b_png,
+      vwidth   = 1200, vheight = 800, zoom = 2,
+      selector = "#htmlwidget_container",
+      delay    = 2, quiet = T)
+    file_delete(b_html)
+    dir_delete(b_files)
+    
+    # m
+    # browseURL(b_png)
+  }}
 ```
 
 ## Scores Table
@@ -673,7 +705,6 @@ Ecoregions are used to modify and aggregate component values of species distribu
 
 
 ```{r pa_score_table}
-
 er_l48 <- c('CAC','WAOR','SECS','WCGOA','EGOA','NECS')
 pa_l48 <- c('CEC','SOA','NOC','CGA','EGA','WGA','SOC','FLS','MDA','NOA','WAO')
 
@@ -737,12 +768,30 @@ d_er_pa_n <- bind_rows(
       "planarea"  ~ glue("· {planarea_name} ({planarea_key}){pct}") ) ) |> 
   relocate(row_lbl)
 
+# DEBUG ----
+# TODO: 
+d_er_pa_n |> 
+  # names() |> paste(collapse = ", ")
+  # row_lbl, region_key, region_name, ecoregion_key, ecoregion_name, row_type, planarea_key, planarea_name, pct_planarea_in_ecoregion, area_km2, score, primprod, sea_turtle, other, mollusk, marine_mammal, fish, crustacean, pct
+  # select(-region_key, -pct) |> 
+  select(
+    row_type, 
+    region_name, 
+    ecoregion_name, ecoregion_key, 
+    planarea_name, planarea_key, pct_planarea_in_ecoregion, 
+    row_lbl,
+    score,
+    primprod, crustacean, fish, marine_mammal, mollusk, sea_turtle, other,
+    area_km2) |>
+  # View()
+  write_excel_csv(er_pa_n_csv)
+
 # d_er_pa_n |>  distinct(ecoregion_name) |> pull() # 10
-pa_new <- d_er_pa_n |>  distinct(planarea_name) |> pull(planarea_name) |> na.omit()
-length(pa_new) # 27
-pa_old <- dbGetQuery(con, "SELECT planarea_name FROM ply_planareas_s05") |> pull(planarea_name)
-length(pa_old) # 26
-setdiff(pa_new, pa_old) # High Arctic
+# pa_new <- d_er_pa_n |>  distinct(planarea_name) |> pull(planarea_name) |> na.omit()
+# length(pa_new) # 27
+# pa_old <- dbGetQuery(con, "SELECT planarea_name FROM ply_planareas_s05") |> pull(planarea_name)
+# length(pa_old) # 26
+# setdiff(pa_new, pa_old) # High Arctic
 
 # d_er_pa_n |> View()
 
