@@ -1,0 +1,309 @@
+---
+title: "Ingest BirdLife.org's Birds of the World (BOTW)"
+format: html
+editor_options: 
+  chunk_output_type: console
+---
+
+## Overview
+
+This script ingests the Birds of the World (BOTW) dataset from BirdLife.org, which is available as a GeoPackage file. The dataset contains information about bird species, their distributions, and other relevant data.
+
+- Fix `terra::rotate()`: [`rotate()\` not working `[-180, 180]` to `[0, 360]`: adding only one pixel west · Issue #1876 · rspatial/terra](https://github.com/rspatial/terra/issues/1876)
+
+```{r setup}
+librarian::shelf(
+  DBI, dplyr, duckdb, glue, here, logger, mapview, sf, stringr,
+  rspatial/terra, # 1.8-61  2025-07-22
+  quiet = T)
+
+is_server <- Sys.info()[["sysname"]] == "Linux"
+dir_data  <- ifelse(is_server, "/share/data", "~/My Drive/projects/msens/data") |>
+  normalizePath()
+cell_tif  <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
+er_gpkg   <- glue("{dir_data}/derived/ply_ecoregions_2025.gpkg")
+sdm_db    <- glue("{dir_data}/derived/sdm.duckdb")
+dir_bl    <- glue("{dir_data}/raw/birdlife.org")
+dir_rast  <- glue("{dir_bl}/rast")
+botw_gpkg <- glue("{dir_bl}/BOTW_GPKG_2024_2/BOTW_2024_2.gpkg")
+```
+
+Layers: 
+
+- `main_BL_HBW_Checklist_V9`: data frame with species information
+- `all_species`: geometries (some species missing)...
+
+```
+ [1] "Caloenas maculata"          "Rhinoplax vigil"            "Tanygnathus everetti"
+ [4] "Cissa thalassina"           "Pycnonotus zeylanicus"      "Pycnonotus bimaculatus"
+ [7] "Zosterops flavus"           "Garrulax rufifrons"         "Garrulax bicolor"
+[10] "Pterorhinus courtoisi"      "Leucopsar rothschildi"      "Gracula robusta"
+[13] "Cyornis banyumas"           "Chloropsis cochinchinensis"
+```
+
+TODO:
+
+- [ ] Evaluate application of fields (`presence`, `origin`, `seasonal`) to
+      suitability value, based on descriptions in the documentation
+      (`Metadata_BirdLife_HBW_Bird_Maps_2024_2.docx`).
+
+```{r ck_botw_gpkg}
+# explore layers in the GeoPackage ----
+# (d_lyrs <- st_layers(botw_gpkg))
+#                 layer_name geometry_type features fields crs_name
+# 1              all_species Multi Polygon    17379     19   WGS 84
+# 2 main_BL_HBW_Checklist_V9            NA    11195     15     <NA>
+#
+# ply_all <- read_sf(botw_gpkg, d_lyrs$name[1])
+# Simple feature collection with 17379 features and 18 fields
+# Geometry type: GEOMETRY
+# Dimension:     XY
+# Bounding box:  xmin: -180 ymin: -85.58276 xmax: 180 ymax: 89.97895
+# Geodetic CRS:  WGS 84
+# # A tibble: 17,379 × 19
+#      sisid sci_name presence origin seasonal source compiler data_sens sens_comm dist_comm tax_comm
+#      <int> <chr>       <int>  <int>    <int> <chr>  <chr>        <int> <chr>     <chr>     <chr>   
+#  1  2.27e7 Accipit…        1      1        2 del H… Philip …         0 " "       " "       " "     
+#  2  2.27e7 Accipit…        1      1        4 Xeno … Hannah …         0 " "       " "       " "     
+#  3  2.27e7 Accipit…        1      1        3 del H… Philip …         0 " "       " "       " "     
+#  4  2.27e7 Acridot…        4      1        1 BirdL… Rob Mar…         0 " "       " "       " "     
+#  5  2.27e7 Acridot…        1      1        1 eBird… Rob Mar…         0 " "       " "       " "     
+#  6  2.27e7 Acridot…        1      5        1 eBird… Rob Mar…         0 " "       " "       " "     
+#  7  2.27e7 Acridot…        1      3        1 Seng … Rob Mar…         0 " "       " "       " "     
+#  8  2.27e7 Aegoliu…        1      1        1 Ding,… Rob Mar…         0 " "       " "       " "     
+#  9  2.27e7 Aegoliu…        1      1        3 Cramp… Rob Mar…         0 " "       " "       " "     
+# 10  2.27e7 Aepypod…        1      1        5 Mauro… Rob Mar…         0 " "       ""        ""      
+# # ℹ 17,369 more rows
+# # ℹ 8 more variables: generalisd <int>, citation <chr>, yrcompiled <int>, yrmodified <dbl>,
+# #   version <chr>, Shape_Length <dbl>, Shape_Area <dbl>, Shape <MULTIPOLYGON [°]>
+# # ℹ Use `print(n = ...)` to see more rows
+
+# ply_hbw <- read_sf(botw_gpkg, d_lyrs$name[2])
+#
+# sci_all <- unique(ply_all$sci_name)
+# sci_hbw <- unique(ply_hbw$ScientificName)
+#
+# (sci_all_not_hbw <- setdiff(sci_all, sci_hbw))
+# character(0)
+# (sci_hbw_not_all <- setdiff(sci_hbw, sci_all))
+#  [1] "Caloenas maculata"          "Rhinoplax vigil"            "Tanygnathus everetti"
+#  [4] "Cissa thalassina"           "Pycnonotus zeylanicus"      "Pycnonotus bimaculatus"
+#  [7] "Zosterops flavus"           "Garrulax rufifrons"         "Garrulax bicolor"
+# [10] "Pterorhinus courtoisi"      "Leucopsar rothschildi"      "Gracula robusta"
+# [13] "Cyornis banyumas"           "Chloropsis cochinchinensis"
+#
+# d_hbw_dupes <- ply_hbw |> 
+#   st_drop_geometry() |>
+#   group_by(ScientificName) |>
+#   summarize(
+#     n           = n(),
+#     common_name = first(CommonName),
+#     .groups     = "drop")
+# table(d_hbw_dupes$n)
+#     1 
+# 11195
+# 
+# CONCLUSION:
+# - `main_BL_HBW_Checklist_V9` is data frame,
+# - `all_species` the geometry (some species missing)
+```
+
+```{r setup_iter_spp_rast}
+d_spp <- read_sf(botw_gpkg, "main_BL_HBW_Checklist_V9")
+p_spp <- read_sf(botw_gpkg, "all_species")
+
+# table(d_spp$IUCN_RedList_Category_2024)
+#       CR  CR (PE) CR (PEW)       DD       EN       EW       EX       LC       NT       VU 
+#      204       18        1       38      395        5      164     8742      935      693
+
+er1 <- read_sf(er_gpkg) |> st_union()  # [-180, 180]
+
+# TODO: check Pink-footed Shearwater _Ardenna creatopus_ VU
+# https://datazone.birdlife.org/species/factsheet/pink-footed-shearwater-ardenna-creatopus
+
+# table(st_geometry_type(ply_spp))
+# MULTIPOLYGON MULTISURFACE
+#       17,212          167
+
+r_cell   <- rast(cell_tif, lyrs = "cell_id") # [   0, 360]
+r_cell_r <- rotate(r_cell)                   # [-180, 180]
+ext(r_cell_r) <- round(ext(r_cell_r), 3)
+
+spp <- unique(p_spp$sci_name) |> sort()
+```
+
+```{r iter_spp_rast}
+log_txt <- glue("{dir_rast}/_log {Sys.time()}.txt")
+log_appender(appender_file(log_txt))
+
+for (i in 1:length(spp)){ # i = 102 # Acrocephalus_familiaris
+  
+  sp <- spp[i] # sp <- "Acanthis flammea"
+  log_info("| INIT | {sp} | {i}/{length(spp)}")
+  
+  r_tif <- glue("{dir_rast}/{str_replace_all(sp, ' ', '_')}.tif")
+  if (file.exists(r_tif)){
+    log_info("| SKIP | {sp} | tif already exists")
+    next()
+  }
+
+  p <- p_spp |> 
+    filter(
+      sci_name               == !!sp,
+      presence               %in% c(1,2,3), 
+      # presence -- 1: Extant, 2: Probably Extant, 3: Possibly Extant
+      st_geometry_type(geom) != "MULTISURFACE") |> 
+    mutate(
+      value = 50L) # default value of 50%
+  if (nrow(p) == 0){
+    log_info("| SKIP | {sp} | no valid geometry for species")
+    next()
+  }
+  # mapView(p)
+  
+  p <- try(
+    p |> 
+      st_make_valid() |> 
+      st_filter(er1, .predicate = st_intersects),
+    silent = T)
+  # mapView(p)
+  if (inherits(p, "try-error")){
+    log_info("| SKIP | {sp} | error in st_make_valid(), st_filter(): {p}")
+    next()
+  }
+  if (nrow(p) == 0){
+    log_info("| SKIP | {sp} | not intersecting ecoregions")
+    next()
+  }
+  
+  r <- try(
+    rasterize(
+      p,
+      r_cell_r, 
+      field = "value") |> 
+      # trim() |> 
+      # mapView()
+      rotate() |> 
+      crop(r_cell) |> 
+      mask(r_cell),
+    silent = T)
+  # plot(trim(r))
+  if (inherits(r, "try-error")){
+    log_info("| SKIP | {sp} | error in rasterize(),...: {r}")
+    next()
+  }
+  n_cells <- length(values(r, na.rm = T))
+  if (n_cells == 0){
+    log_info("| SKIP | {sp} | rast has no values")
+    next()
+  }
+  names(r) <- sp
+  round(ext(r), 3)
+  # plet(rotate(r))
+  # as.polygons(rotate(r)) |> mapView()
+    
+  log_info("| WRITE | {sp} | {format(n_cells, big.mark=',')} cells")
+  writeRaster(
+    r, 
+    filename = r_tif,
+    overwrite = T)
+}
+# INFO [2025-07-23 00:26:20]   1/11181: Abeillia abeillei
+# INFO [2025-07-23 00:31:19] 261/11181: Agelaius xanthomus
+# (260/5) * 11181 / 60 = 4 hrs to completion
+ 
+# d <- as.data.frame(r, cells = T, na.rm = T) |>
+#   tibble() |>
+#   # cell | `Acanthis flammea`
+#   select(cell_id = cell, value = 2)
+# dbWriteTable(con_sdm, "species", d, append = TRUE)
+#     cell_id value
+#     <int> <int>
+# 1  276146     1
+# 2  276147     1
+# 3  276148     1
+
+# DEBUG: table of bird rl_cats within ecoregions ----
+# ply_spp_er |> 
+#   st_drop_geometry() |> 
+#   group_by(sci_name) |> 
+#   summarize(
+#     n_ply   = n(),
+#     .groups = "drop") |> 
+#   left_join(
+#     d_spp,
+#     by = c("sci_name" = "ScientificName")) |> 
+#   pull(IUCN_RedList_Category_2024) |> 
+#   table()
+
+# TODO: check out "Struthio camelus", "Aegolius funereus"
+# TODO: fill out other lookup fields
+# mutate(
+#   origin = case_when(
+#     origin == 1 ~ "Native",
+#     origin == 2 ~ "Reintroduced",
+#     origin == 3 ~ "Introduced",
+#     origin == 4 ~ "Vagrant",
+#     origin == 5 ~ "Origin Uncertain",
+#     origin == 6 ~ "Assisted Colonisation",
+#     TRUE ~ NA_character_))
+```
+
+## Setup Database
+
+```{r init_dbs}
+# con_spp <- dbConnect(duckdb(dbdir = spp_db, read_only = T))
+con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F))
+# dbListTables(con_sdm)
+# tbl(con_sdm, "species") |> 
+#   filter(common_name_dataset == "blue whale") |> 
+#   collect() |> 
+#   View()
+```
+
+
+### Add `dataset`
+
+```{r insert_dataset_row}
+ds_key      <- "bl"
+row_dataset <- tibble(
+  ds_key          = !!ds_key,
+  name_short      = "BirdLife Birds of the World, 2024",
+  name_original   = "BirdLife International and Handbook of the Birds of the World (2024)",
+  description     = "This dataset contains digital distribution information for the world’s birds. It is a joint product of BirdLife International and Handbook of the Birds of the World.",
+  citation        = "",
+  source_broad    = "BirdLife",
+  source_detail   = "http://datazone.birdlife.org",
+  # TODO: citation
+  # BirdLife International and Handbook of the Birds of the World (2024) Bird species distribution maps of the world. Version 2024.2. Available at http://datazone.birdlife.org/species/requestdis.
+  regions         = "Global",
+  response_type   = "binary",
+  taxa_groups     = "birds",
+  year_pub        = 2024,
+  date_obs_beg    = NA,
+  date_obs_end    = NA,
+  date_env_beg    = NA,
+  date_env_end    = NA,
+  link_info       = "http://datazone.birdlife.org/species/requestdis",
+  link_download   = "http://datazone.birdlife.org/species/requestdis",
+  link_metadata   = "https://www.fisheries.noaa.gov/inport/item/65207",
+  links_other     = "https://noaa.maps.arcgis.com/apps/webappviewer/index.html?id=68d8df16b39c48fe9f60640692d0e318",
+  spatial_res_deg = 0.05,
+  temporal_res    = "static" )
+
+if (dbExistsTable(con_sdm, "dataset"))
+  dbExecute(con_sdm, glue("DELETE FROM dataset WHERE ds_key = '{ds_key}'"))
+
+dbWriteTable(con_sdm, "dataset", row_dataset, append = TRUE)
+```
+
+
+::: {.callout-caution collapse="true"}
+
+## Session Info
+
+```{r session_info}
+devtools::session_info()
+```
+
+:::
