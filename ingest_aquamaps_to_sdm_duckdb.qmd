@@ -644,10 +644,10 @@ for (i in 1:n){  # i = 10 # i = 1175
     ds_key          = "am_0.05",
     taxa            = sp_key,
     sp_key          = sp_key,
-    aphia_id        = NA_integer_,  # TODO: lookup from WoRMS
+    worms_id        = NA_integer_,  # TODO: lookup from WoRMS
     gbif_id         = NA_integer_,  # TODO: lookup from GBIF
     itis_id         = NA_integer_,  # TODO: lookup from ITIS
-    scientific_name = glue("{sp_info$genus[1]} {sp_info$species[1]}"),
+    scientific_name = glue("{sp_info$genus[1]} {sp_info$species[1]}"), # TODO: scientific_name_data…¹ common_name_dataset
     common_name     = sp_info$common_name[1],
     sp_cat          = sp_cat)
   dbWriteTable(con_sdm, "species", d_species, append = T)
@@ -662,6 +662,101 @@ for (i in 1:n){  # i = 10 # i = 1175
   dbWriteTable(con_sdm, "model_cell", d_mdl_cell, append = T)
 }
 ```
+
+
+## TODO: 2025-07-24
+
+TODO:
+
+- [ ] ∆ sp_cat: marine mammal -> mammal; + coral; + invertebrate; + bird
+- [ ] combine 
+- [ ] include species without IUCN or ESA as LC 0.2
+- [ ] + TN "Threatened" 0.6
+- [ ] ensure both sp_wt and sp_suit are multiplied within same range, ie [0,1] or [0,100]
+
+```{r chg_sp_cat}
+# TODO: above
+
+# 2025-07-24: after adding am_0.05 and bl bird datasets, before ch_nmfs & ch_fws datasets
+d_species <- tbl(con_sdm, "species") |> 
+  collect() |> 
+  rename(sp_cat_old = sp_cat) |> 
+  left_join(
+    tbl(con_am, "spp") |>
+      select(
+        sp_key, 
+        class, 
+        m_invertebrates) |>
+      collect(),
+    by = "sp_key") |> 
+  mutate(
+    sp_cat = case_when(
+      ds_key == "am_0.05" & 
+        class %in% c(
+        "Actinopterygii", "Chondrichthyes", "Elasmobranchii", "Holocephali", 
+        "Cephalaspidomorphi", "Myxini") ~ "fish",
+      ds_key == "am_0.05" &
+        class == "Mammalia"               ~ "mammal",
+      ds_key == "am_0.05" &
+        class == "Reptilia"               ~ "turtle",
+      ds_key == "am_0.05" &
+        class == "Aves"                   ~ "bird",
+      ds_key == "am_0.05" &
+        class == "Anthozoa"               ~ "coral",
+      ds_key == "am_0.05" &
+        m_invertebrates == 1              ~ "invertebrate", 
+      .default = sp_cat_old))
+
+# d_species |> select(sp_cat_old, sp_cat) |> table()
+#                sp_cat
+# sp_cat_old      bird coral fish invertebrate mammal other turtle
+#   bird           504     0    0            0      0     0      0
+#   crustacean       0     0    0         3025      0     0      0
+#   fish             0     0 6328            0      0     0      0
+#   marine mammal    0     0    0            0     85     0      0
+#   mollusk          0     0    0         3920      0     0      0
+#   other            1   807  354         1580      0  1417      0
+#   sea turtle       0     0    0            0      0     0     33
+
+d_species_new <- d_species |> 
+  select(-sp_cat_old, -class, -m_invertebrates)
+dbWriteTable(con_sdm, "species", d_species_new, overwrite = T)
+
+# update sp_seq to be an integer sequence
+dbExecute(con_sdm, "ALTER TABLE species ALTER COLUMN sp_seq TYPE INTEGER;")
+dbExecute(con_sdm, "ALTER TABLE species ALTER COLUMN sp_seq SET default nextval('species_sp_seq_seq');")
+
+# tbl(con_sdm, "species") |> 
+#   pull(sp_cat) |> 
+#   table(useNA = "ifany")
+# bird        coral         fish invertebrate       mammal        other       turtle 
+#  505          807         6682         8525           85         1417           33 
+
+d_spp_am_other <- tbl(con_am, "spp") |>
+  collect() |> 
+  semi_join(
+    tbl(con_sdm, "species") |>
+      collect(),
+    by = "sp_key") |> 
+  filter(is.na(sp_cat)) |> 
+  group_by(class) |> 
+  summarise(n = n()) |> 
+  arrange(desc(n))
+# View(d_spp_am_other)
+#    class                n
+#    <chr>            <int>
+#  1 Polychaeta         575 # worms
+#  2 Ascidiacea         257 # sea squirts
+#  3 Gymnolaemata        98 # class of Bryozoans, sessile, grow on surfaces of rocks, kelp, and in some cases on animals, like fish.
+#  4 Florideophyceae     94 # red algae
+#  5 Not assigned        61
+#  6 Bryopsidophyceae    58
+#  7 Polythalamea        45
+#  8 Phaeophyceae        41
+#  9 Sipunculidea        32
+# 10 Ulvophyceae         30
+```
+
 
 ## Add model_cell indexes after mass insert
 
@@ -796,8 +891,9 @@ for (sp_cat in sp_cats){ # sp_cat = sp_cats[1]
         # skipped: EX (extinct), NE (not evaluated), DD (data deficient), <NA> (not available)
         # https://oceanhealthindex.org/images/htmls/Supplement.html#62_Biodiversity
         "CR" ~ 1,       #  - CR: Critically Endangered	
-        "EN" ~ 0.8,     #  - EN: Endangered	
+        "EN" ~ 0.8,     #  - EN: Endangered (+ESA)
         "VU" ~ 0.6,     #  - VU: Vulnerable
+        "TN" ~ 0.6,     #  - TN: Threatened (ESA only)
         "NT" ~ 0.4,     #  - NT: Near Threatened
         "LC" ~ 0.2))    #  - LC: Least Concern
   
