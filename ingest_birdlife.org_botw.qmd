@@ -13,9 +13,11 @@ This script ingests the Birds of the World (BOTW) dataset from BirdLife.org, whi
 
 ```{r setup}
 librarian::shelf(
-  DBI, dplyr, duckdb, glue, here, logger, mapview, sf, stringr,
+  DBI, dplyr, DT, duckdb, fs, glue, here, janitor, logger, mapview, readr, sf, stringr,
   rspatial/terra, # 1.8-61  2025-07-22
+  tibble,
   quiet = T)
+options(readr.show_col_types = F)
 
 is_server <- Sys.info()[["sysname"]] == "Linux"
 dir_data  <- ifelse(is_server, "/share/data", "~/My Drive/projects/msens/data") |>
@@ -26,6 +28,7 @@ sdm_db    <- glue("{dir_data}/derived/sdm.duckdb")
 dir_bl    <- glue("{dir_data}/raw/birdlife.org")
 dir_rast  <- glue("{dir_bl}/rast")
 botw_gpkg <- glue("{dir_bl}/BOTW_GPKG_2024_2/BOTW_2024_2.gpkg")
+log_txt   <- glue("{dir_rast}/_log 2025-07-23 01:04:17.350045.txt")
 ```
 
 Layers: 
@@ -109,6 +112,8 @@ TODO:
 ```
 
 ```{r setup_iter_spp_rast}
+#| eval: false
+
 d_spp <- read_sf(botw_gpkg, "main_BL_HBW_Checklist_V9")
 p_spp <- read_sf(botw_gpkg, "all_species")
 
@@ -133,6 +138,8 @@ spp <- unique(p_spp$sci_name) |> sort()
 ```
 
 ```{r iter_spp_rast}
+#| eval: false
+
 log_txt <- glue("{dir_rast}/_log {Sys.time()}.txt")
 log_appender(appender_file(log_txt))
 
@@ -223,7 +230,6 @@ for (i in 1:length(spp)){ # i = 102 # Acrocephalus_familiaris
 # 2  276147     1
 # 3  276148     1
 
-# DEBUG: table of bird rl_cats within ecoregions ----
 # ply_spp_er |> 
 #   st_drop_geometry() |> 
 #   group_by(sci_name) |> 
@@ -249,9 +255,96 @@ for (i in 1:length(spp)){ # i = 102 # Acrocephalus_familiaris
 #     TRUE ~ NA_character_))
 ```
 
-## Setup Database
+```{r tbl_log}
+d_log <- readLines(log_txt) |> 
+  str_subset("^INFO") |>    # remove extra lines from error output
+  paste(collapse = "\n") |> 
+  read_delim(
+    delim = " | ",
+    col_names = c("info", "type", "sp", "msg")) |> 
+  mutate(across(everything(), str_trim)) |>
+  mutate(
+    time = str_extract(info, "\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}") |> 
+      as.POSIXct(),
+    level = str_extract(info, "INFO|DEBUG|ERROR|WARN")) |> 
+  filter(type != "INIT") |> 
+  mutate(
+    msg = str_replace(msg, "error.+", "error reading geometry")) |>
+  mutate(
+    tif_created = case_when(
+      msg  == "tif already exists" ~ T, #  39
+      type == "WRITE" ~ T,              # 496
+      .default = F),                    # 535: sum
+    has_problem = case_when(
+      type == "SKIP" & !(msg %in% c(
+        "not intersecting ecoregions", 
+        "tif already exists")) ~ T,     # T:    443
+      .default = F))                    # F: 10,620
 
-```{r init_dbs}
+# DEBUG ----
+# summarize
+list(
+  `TIF created` = sum(d_log$tif_created),
+  `outside USA` = d_log |> filter(!tif_created, !has_problem) |> nrow(),
+  `has problem` = sum(d_log$has_problem)) |> 
+  enframe(name = "status", value = "count") |>
+  mutate(
+    count = unlist(count)) |> 
+  datatable(
+    caption = "Summary of TIF creation and issues",
+    options = list(dom = 't')) |> 
+  formatRound(columns = "count", digits = 0, mark = ",")
+
+d_log |> 
+  filter(tif_created) |> 
+  select(sp) |> 
+  arrange(sp) |> 
+  select(species = sp) |> 
+  datatable(
+    caption = "Species with created TIF files intersecting USA waters.")
+
+d_log |> 
+  filter(!tif_created, !has_problem) |> 
+  select(sp) |> 
+  arrange(sp) |> 
+  select(species = sp) |> 
+  datatable(
+    caption = "Species without TIF files not intersecting USA waters.")
+
+d_log |> 
+  filter(has_problem) |> 
+  arrange(sp) |> 
+  select(species = sp, problem = msg) |> 
+  datatable(
+    caption = "Species with problems encountered during processing.")
+
+d_log |> 
+  filter(has_problem) |> 
+  select(problem = msg) |> 
+  group_by(problem) |>
+  summarize(
+    count = n(),
+    .groups = "drop") |>
+  arrange(desc(count)) |>
+  datatable(
+    caption = "Problems encountered during processing",
+    options = list(dom = 't'))
+```
+
+- `error reading geometry`: even after applying `sf::st_make_valid()`, loops are detected when checking for intersection with ecoregions.
+- `no valid geometry for species`: no valid geometry after applying filter for
+  presence (`1`: Extant, `2`: Probably Extant, `3`: Possibly Extant), and removing
+  geometry types of `MULTISURFACE`.
+- `rast has no values`: the raster has no values after rasterizing the geometries,
+despite the geometry being valid and intersecting with ecoregions.
+
+```{r stop_eval}
+# knitr::opts_chunk$set(eval = F)
+```
+
+## Insert into Database
+
+```{r init_db}
 # con_spp <- dbConnect(duckdb(dbdir = spp_db, read_only = T))
 con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F))
 # dbListTables(con_sdm)
@@ -261,10 +354,9 @@ con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F))
 #   View()
 ```
 
-
 ### Add `dataset`
 
-```{r insert_dataset_row}
+```{r insert_dataset}
 ds_key      <- "bl"
 row_dataset <- tibble(
   ds_key          = !!ds_key,
@@ -297,6 +389,115 @@ if (dbExistsTable(con_sdm, "dataset"))
 dbWriteTable(con_sdm, "dataset", row_dataset, append = TRUE)
 ```
 
+### Add `species`
+
+```{r insert_species}
+r_spp <- rast(dir_ls(dir_rast, glob = "*.tif"))
+
+d_spp <- read_sf(botw_gpkg, "main_BL_HBW_Checklist_V9") |> 
+  clean_names() |> 
+  filter(scientific_name %in% names(r_spp)) |> 
+  arrange(scientific_name)
+stopifnot(nrow(d_spp) == nlyr(r_spp))
+
+for (i in 1:nrow(d_spp)){ # i = 1
+  
+  sp     <- d_spp$scientific_name[i]
+  d_sp   <- d_spp[i,]
+  sp_key <- glue("{ds_key}:{d_sp$spc_rec_id}")
+  r_sp   <- r_spp[[sp]]
+  
+  # delete: existing ----
+  mdl_seqs <- tbl(con_sdm, "model") |> 
+    filter(ds_key == !!ds_key, taxa == !!sp_key) |> 
+    pull(mdl_seq)
+  if (length(mdl_seqs > 0)) {
+    dbExecute(con_sdm, glue("DELETE FROM model WHERE ds_key = '{ds_key}' AND taxa = '{sp_key}'"))
+    dbExecute(con_sdm, glue("DELETE FROM species WHERE ds_key = '{ds_key}' AND taxa = '{sp_key}'"))
+    dbExecute(con_sdm, glue("DELETE FROM model_cell WHERE mdl_seq IN ({paste(mdl_seqs, collapse = ',')})"))
+  }
+  
+  # append: model ----
+  d_model <- tibble(
+    ds_key      = ds_key,
+    taxa        = sp_key,
+    time_period = "2025",
+    region      = "Global",
+    mdl_type    = "binary",
+    description = glue(
+      "BirdLife.org range map for {sp}, interpolated to 0.05° resolution") )
+  dbWriteTable(con_sdm, "model", d_model, append = TRUE)
+  
+  # get the mdl_seq that was just created
+  mdl_seq <- dbGetQuery(con_sdm, glue("
+    SELECT mdl_seq FROM model 
+    WHERE
+      ds_key = '{ds_key}' AND 
+      taxa   = '{sp_key}'
+    ORDER BY mdl_seq DESC LIMIT 1 "))$mdl_seq
+  
+  # set species category
+  sp_cat <- "bird"
+
+  # d_sp |> glimpse()
+  # Rows: 1
+  # Columns: 15
+  # $ seq                         <int> 76
+  # $ order                       <chr> "GALLIFORMES"
+  # $ family_name                 <chr> "Megapodiidae"
+  # $ family                      <chr> "Megapodes"
+  # $ subfamily                   <chr> NA
+  # $ tribe                       <chr> NA
+  # $ common_name                 <chr> "Micronesian Scrubfowl"
+  # $ scientific_name             <chr> "Megapodius laperouse"
+  # $ authority                   <chr> "Gaimard, 1823"
+  # $ iucn_red_list_category_2024 <chr> "NT"
+  # $ synonyms                    <chr> NA
+  # $ alternative_common_names    <chr> "Marianas Scrubfowl"
+  # $ taxonomic_sources           <chr> "del Hoyo, J., Collar, N.J., Christie, D.A., Elliott, A. and Fishpool, L.D.C.…
+  # $ sis_rec_id                  <int> 22678620
+  # $ spc_rec_id                  <int> 125
+  
+  # append: species ----
+  d_species <- tibble(
+    ds_key                   = ds_key,
+    taxa                     = sp_key,
+    sp_key                   = sp_key,
+    worms_id                 = NA_integer_,  # TODO: lookup from WoRMS
+    gbif_id                  = NA_integer_,  # TODO: lookup from GBIF
+    itis_id                  = NA_integer_,  # TODO: lookup from ITIS
+    scientific_name_dataset  = sp,
+    common_name_dataset      = d_sp$common_name,
+    # TODO: do lookup from WoRMS
+    scientific_name_accepted = sp,
+    common_name_accepted     = d_sp$common_name,
+    iucn_id                  = d_sp$sis_rec_id,
+    redlist_code             = d_sp$iucn_red_list_category_2024,
+    redlist_year             = NA_integer_,
+    sp_cat                   = sp_cat)
+  stopifnot(length(setdiff(names(d_species), dbListFields(con_sdm, "species"))) == 0)
+  stopifnot(setdiff(dbListFields(con_sdm, "species"), names(d_species)) == "sp_seq")
+  dbWriteTable(con_sdm, "species", d_species, append = T)
+  # tbl(con_sdm, "species") |> collect() |> tail()
+  # tbl(con_sdm, "model") |> collect() |> tail()
+  
+  # append: model_cell ----
+  d_mdl_cell <- as.data.frame(r_sp, cells = T, na.rm = T) |>
+    tibble() |>
+    select(cell_id = cell) |> 
+    mutate(
+      mdl_seq = mdl_seq,
+      value   = 50L) |> 
+    arrange(cell_id)
+  dbWriteTable(con_sdm, "model_cell", d_mdl_cell, append = T)
+}
+```
+
+## Close Database
+
+```{r close_db}
+dbDisconnect(con_sdm, shutdown = T); rm(con_sdm)
+```
 
 ::: {.callout-caution collapse="true"}
 
