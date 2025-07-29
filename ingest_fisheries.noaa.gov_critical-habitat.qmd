@@ -14,7 +14,7 @@ editor_options:
 ```{r setup}
 librarian::shelf(
   DBI, dplyr, DT, duckdb, fs, glue, here, knitr, janitor, leaflet, 
-  leaflet.extras2, mapview, purrr, sf, stringr, terra,
+  leaflet.extras2, mapview, purrr, sf, stringr, terra, tibble,
   quiet = T)
 
 mapviewOptions(
@@ -329,26 +329,11 @@ TODO:
 - [ ] sort different liststatus per species, e.g. Rice's whale has both "prop." and "fin." status
 
 ```{r setup_iterate}
+ds_key      <- "ch_nmfs"
 
-ply <- st_read(ply_geo, quiet = T) |> 
-  clean_names()
-# sum(duplicated(ply$sciename)) # 16
-
-# ply |> 
-#   st_drop_geometry() |> 
-#   glimpse()
-# Rows: 54
-# Columns: 7
-# $ taxon      <chr> "Baleen Whale", "Marine reptile", "Marine reptile", "Marine reptile", "bal…
-# $ cm_er_st   <chr> "Rice's Whale (EN) prop.", "Sea turtle, green (EN) prop.", "Sea turtle, gr…
-# $ sciename   <chr> "Balaenoptera ricei", "Chelonia mydas", "Chelonia mydas", "Chelonia mydas"…
-# $ comname    <chr> "Rice's Whale", "Sea turtle, green", "Sea turtle, green", "Sea turtle, gre…
-# $ liststatus <chr> "Endangered", "Endangered", "Threatened", "Threatened", "Endangered", "End…
-# $ habtype    <chr> "Marine, GOM waters between 100m and 400m isobaths", NA, " ", NA, "marine"…
-# $ n          <int> 1, 18, 5, 25, 2, 2, 11, 12, 510, 284, 20, 510, 22, 23, 1, 135, 9, 8, 2, 3,…
-
-# DEBUG ----
-ply_ch <- ply |> 
+ply <- read_sf(gdb, layer = "All_critical_habitat_poly_20230724", quiet = T) |> 
+  clean_names() |> 
+  st_make_valid() |> 
   mutate(
     taxon    = tolower(taxon),
     esa_code = case_match( # er: extinction risk
@@ -365,22 +350,43 @@ ply_ch <- ply |>
         "baleen whale", "toothed whale", "pinniped") ~ "mammal",
       str_detect(comname, "Coral")                   ~ "coral",
       taxon == "marine reptile"                      ~ "turtle",
-      .default = taxon)) |> 
-  # pull(sp_cat) |> table(useNA = "ifany")
-  # coral         fish invertebrate       mammal       turtle 
-  #     12           18            1           16            7
-  arrange(sp_cat, sciename, comname, esa_code) |> 
-  group_by(
-    sp_cat, sciename, comname) |>
+      .default = taxon))
+
+# ply |> pull(sp_cat) |> table(useNA = "ifany")
+# coral         fish invertebrate       mammal       turtle 
+#    64         1768           16          169           97 
+#
+# ply$liststatus |> table()
+# Endangered Threatened 
+#       1043       1071 
+# 
+# ply$esa_code |> table(useNA = "ifany")
+#   TN   EN 
+# 1071 1043
+# 
+# ply |> st_drop_geometry() |> select(liststatus, chstatus) |> table()
+#             chstatus
+# liststatus   Designated Final Proposed
+#   Endangered          0  1024       19
+#   Threatened         20   997       54
+
+d_spp <- ply |> 
+  st_drop_geometry() |> 
+  group_by(sp_cat, sciename, comname) |>
   summarize(
-    esa_code = last(esa_code), # use precautionary principle for now; 
-    # TODO: figure out way to have different esa_code in different regions -- affect other distributions?
-    .groups = "drop")
+    esa_code_max = max(esa_code),  # Get max esa_code to use for species weight. Precautionary principle
+    n_esa_tn     = sum(esa_code == "TN"),
+    n_esa_en     = sum(esa_code == "EN"),
+    .groups = "drop") |> 
+  rowid_to_column()
 
-stopifnot(sum(duplicated(ply_ch$sciename)) == 0)
-
-ply_ch |> 
-  mapView(alpha.regions = 0.5, zcol = "comname")
+d_spp |>
+  filter(n_esa_tn > 0 & n_esa_en > 0)
+#   rowid sp_cat sciename                 comname           esa_code_max n_esa_tn n_esa_en
+#   <int> <chr>  <chr>                    <chr>             <ord>           <int>    <int>
+# 1    18 fish   Oncorhynchus tshawytscha Salmon, Chinook   EN                135        1
+# 2    30 mammal Megaptera novaeangliae   Whale, humpback   EN                 12       11
+# 3    36 turtle Chelonia mydas           Sea turtle, green EN                 31       18
 
 r_cell   <- rast(cell_tif, lyrs = "cell_id") # [   0, 360]
 ext(r_cell) <- round(ext(r_cell), 3)
@@ -389,19 +395,22 @@ ext(r_cell_r) <- round(ext(r_cell_r), 3)
 ```
 
 ```{r iterate_rows}
-for (i in 1:nrow(ply_ch)){  # i = 1
+for (i in d_spp$rowid){  # i = 30 # Whale, humpback
   
-  p_sp   <- ply_ch |> slice(i) |> 
+  d_sp <- filter(d_spp, rowid == i)
+  sp   <- d_sp$sciename
+  p_sp <- ply |> 
+    filter(
+      sciename == sp) |> 
     mutate(
-      value = 75L) # assign 75% to critical habitat, TODO: use extinction risk
-  d_sp   <- ply_ch |> st_drop_geometry() |> slice(i)
-  sp     <- d_sp$sciename
+      value = case_match(
+        esa_code,
+        "TN" ~ 70L,    # assign 70% presence to Threatened habitat
+        "EN" ~ 90L ))  # assign 90% presence to Endangered habitat
+  # mapView(p_sp, zcol = "esa_code")
+        
   sp_key <- glue("{ds_key}:{d_sp$sciename}")
-  
-  # mapView(r_cell_r) +
-  #   mapView(r_sp) +
-  #   mapView(p_sp)
-  
+
   r_sp <- rasterize(
     p_sp,
     r_cell_r, 
@@ -409,9 +418,11 @@ for (i in 1:nrow(ply_ch)){  # i = 1
     rotate() |> 
     crop(r_cell) |> 
     mask(r_cell)
+  # mapView(r_sp) + mapView(p_sp, zcol = "esa_code")
+  
   n_cells <- length(values(r_sp, na.rm = T))
   if (n_cells == 0){
-    message(glue("No cells for {sp} ({i}/{nrow(ply_ch)})"))
+    message(glue("No cells for {sp} ({i}/{nrow(d_spp)})"))
     # No cells for Oncorhynchus keta    (16/38)
     # No cells for Oncorhynchus nerka   (17/38)
     # No cells for Sebastes paucispinis (21/38)
@@ -424,8 +435,8 @@ for (i in 1:nrow(ply_ch)){  # i = 1
     filter(ds_key == !!ds_key, taxa == !!sp_key) |> 
     pull(mdl_seq)
   if (length(mdl_seqs > 0)) {
-    dbExecute(con_sdm, glue("DELETE FROM model WHERE ds_key = '{ds_key}' AND taxa = '{sp_key}'"))
-    dbExecute(con_sdm, glue("DELETE FROM species WHERE ds_key = '{ds_key}' AND taxa = '{sp_key}'"))
+    dbExecute(con_sdm, glue("DELETE FROM model      WHERE ds_key = '{ds_key}' AND taxa = '{sp_key}'"))
+    dbExecute(con_sdm, glue("DELETE FROM species    WHERE ds_key = '{ds_key}' AND taxa = '{sp_key}'"))
     dbExecute(con_sdm, glue("DELETE FROM model_cell WHERE mdl_seq IN ({paste(mdl_seqs, collapse = ',')})"))
   }
   
@@ -471,7 +482,7 @@ for (i in 1:nrow(ply_ch)){  # i = 1
     # TODO: do lookup from WoRMS
     scientific_name_accepted = sp,
     common_name_accepted     = d_sp$comname,
-    redlist_code             = d_sp$esa_code,
+    redlist_code             = d_sp$esa_code_max,
     redlist_year             = NA_integer_,
     sp_cat                   = d_sp$sp_cat)
   stopifnot(length(setdiff(names(d_species), dbListFields(con_sdm, "species"))) == 0)
@@ -482,14 +493,280 @@ for (i in 1:nrow(ply_ch)){  # i = 1
   stopifnot(tbl(con_sdm, "species") |> filter(is.na(sp_seq)) |> collect() |> nrow() == 0)
 
   # append: model_cell ----
+  # plot(trim(r_sp))
   d_mdl_cell <- as.data.frame(r_sp, cells = T, na.rm = T) |>
     tibble() |>
-    select(cell_id = cell) |> 
+    select(cell_id = cell, value) |> 
     mutate(
-      mdl_seq = mdl_seq,
-      value   = 75L) |> 
+      mdl_seq = mdl_seq) |> 
     arrange(cell_id)
   dbWriteTable(con_sdm, "model_cell", d_mdl_cell, append = T)
 }
+```
+
+
+```{r}
+dbListTables(con_sdm)
+
+tbl(con_sdm, "dataset")
+tbl(con_sdm, "model") |> 
+  filter(ds_key %in% c("ch_nmfs"))
+```
+
+
+## Species Directory - ESA Threatened & Endangered | NOAA Fisheries
+
+- [Species Directory - ESA Threatened & Endangered | NOAA Fisheries](https://www.fisheries.noaa.gov/species-directory/threatened-endangered?oq=&field_species_categories_vocab=All&field_region_vocab=All&items_per_page=350)
+
+```{r}
+librarian::shelf(
+  chromote, rvest, tidyr)
+
+tbl_url <- "https://www.fisheries.noaa.gov/species-directory/threatened-endangered?oq=&field_species_categories_vocab=All&field_region_vocab=All&items_per_page=350"
+
+chrome <- chromote::default_chromote_object()
+chrome$default_timeout <- 60
+chromote::set_default_chromote_object(chrome)
+# b <- ChromoteSession$new()
+# b$default_timeout
+
+# d_tbl_0 <- d_tbl
+d_tbl_0 <- read_html_live(tbl_url) |> 
+d_tbl <- d_tbl_0 |> 
+  html_node("table") |> 
+  html_table() |> 
+  janitor::clean_names()
+
+# d_tbl |> 
+#   slice(1) |> 
+#   glimpse()
+# 
+# d_tbl$species_name[14] |> cat()
+# 
+# d_tbl$species_name[14] |> str_replace_all("\\n\\s*\\n+", "\\\n")
+# 
+# d_tbl$protected_status[1] |> str_replace_all("\\n\\s*\\n+", "\\\n") |> cat()
+# d_tbl$protected_status[2] |> str_replace_all("\\n\\s*\\n+", "\\\n") |> cat()
+
+d_tbl <- d_tbl |> 
+  rename(protected_status = listed_entity_protected_status_year_listed_recovery_plan_critical_habitat_region) |> 
+  mutate(
+    species_name     = str_replace_all(species_name,     "\\n\\s*\\n+", "\\\n"),
+    species_category = str_replace_all(species_category, "\\n\\s*\\n+", "\\\n"),
+    protected_status = str_replace_all(protected_status, "\\n\\s*\\n+", "\\\n")) |> 
+  separate_wider_delim(
+    species_name, 
+    delim       = "\n",
+    names       = c("sp_sci", "sp_cmn", "aka", "sp_aka"),
+    too_few     = "align_start",
+    too_many    = "merge",
+    cols_remove = T) |> 
+  separate_wider_delim(
+    species_category, 
+    delim       = "\n",
+    names       = c("sp_cat", "sp_cat1", "sp_cat2", "sp_cat3", "sp_cat4"),
+    too_few     = "align_start",
+    too_many    = "merge",
+    cols_remove = T) |> 
+  mutate(across(where(is.character), str_trim)) |> 
+  select(-aka, -sp_cat)
+
+# d_tbl |> filter(
+#   sp_sci == "Atlantic Sturgeon") |> 
+#   pull(protected_status) |> 
+#   cat()
+#     Name of DPS or Stock
+#               Carolina DPS
+#     Species Status
+#               ESA Endangered
+#     Year Listed
+#               2012
+#     Recovery Plan
+#               Under Development
+#     Critical Habitat
+#               Final
+#     Region
+#               New England/Mid-Atlantic
+#           Southeast
+#     Name of DPS or Stock
+#               Chesapeake Bay DPS
+#     Species Status
+#               ESA Endangered
+#     Year Listed
+#               2012
+#     Recovery Plan
+#               Under Development
+#     Critical Habitat
+#               Final
+#     Region
+#               New England/Mid-Atlantic
+#           Southeast
+#     Name of DPS or Stock
+#               New York Bight DPS
+#     Species Status
+#               ESA Endangered
+#     Year Listed
+#               2012
+#     Recovery Plan
+#               Under Development
+#     Critical Habitat
+#               Final
+#     Region
+#               New England/Mid-Atlantic
+#           Southeast
+#     Name of DPS or Stock
+#               South Atlantic DPS
+#     Species Status
+#               ESA Endangered
+#     Year Listed
+#               2012
+#     Recovery Plan
+#               Under Development
+#     Critical Habitat
+#               Final
+#     Region
+#               New England/Mid-Atlantic
+#           Southeast
+#     Name of DPS or Stock
+#               Gulf of Maine DPS
+#     Species Status
+#               ESA Threatened
+#     Year Listed
+#               2012
+#     Recovery Plan
+#               Under Development
+#     Critical Habitat
+#               Final
+#     Region
+#               New England/Mid-Atlantic
+#           Southeast
+```
+
+
+
+```{r}
+library(tidyverse)
+
+# Fixed function - remove the extra list() wrapper
+parse_protected_status <- function(status_text) {
+  if (is.na(status_text) || status_text == "") {
+    return(tibble())  # Return empty tibble, not list(tibble())
+  }
+  
+  # Clean up the text - remove extra whitespace and normalize newlines
+  clean_text <- status_text |>
+    str_replace_all("\\n\\s*", "\n") |>
+    str_replace_all("\\n+", "\n") |>
+    str_trim()
+  
+  # Split into blocks by "Name of DPS or Stock"
+  blocks <- str_split(clean_text, "(?=Name of DPS or Stock)")[[1]]
+  blocks <- blocks[blocks != ""] # Remove empty blocks
+  
+  # Parse each block
+  parsed_blocks <- map_dfr(blocks, function(block) {
+    # Initialize with NAs
+    result <- tibble(
+      name_of_dps_or_stock = NA_character_,
+      species_status = NA_character_,
+      year_listed = NA_character_,
+      recovery_plan = NA_character_,
+      critical_habitat = NA_character_,
+      region = NA_character_
+    )
+    
+    # Extract each field using regex
+    if (str_detect(block, "Name of DPS or Stock")) {
+      result$name_of_dps_or_stock <- str_extract(block, "(?<=Name of DPS or Stock\\n)([^\\n]+)") |> str_trim()
+    }
+    
+    if (str_detect(block, "Species Status")) {
+      # Handle multiple status lines
+      status_section <- str_extract(block, "Species Status\\n([^\\n]+(?:\\n[^\\n]+)*?)(?=\\n\\s*[A-Z]|$)")
+      if (!is.na(status_section)) {
+        status_lines <- str_extract_all(status_section, "(?<=Species Status\\n).*")[[1]]
+        result$species_status <- str_c(status_lines, collapse = "; ") |> str_trim()
+      }
+    }
+    
+    if (str_detect(block, "Year Listed")) {
+      result$year_listed <- str_extract(block, "(?<=Year Listed\\n)([^\\n]+)") |> str_trim()
+    }
+    
+    if (str_detect(block, "Recovery Plan")) {
+      result$recovery_plan <- str_extract(block, "(?<=Recovery Plan\\n)([^\\n]+)") |> str_trim()
+    }
+    
+    if (str_detect(block, "Critical Habitat")) {
+      result$critical_habitat <- str_extract(block, "(?<=Critical Habitat\\n)([^\\n]+)") |> str_trim()
+    }
+    
+    if (str_detect(block, "Region")) {
+      # Handle multiple region lines
+      region_section <- str_extract(block, "Region\\n([^\\n]+(?:\\n\\s*[^\\nA-Z][^\\n]*)*)")
+      if (!is.na(region_section)) {
+        region_lines <- str_extract_all(region_section, "(?<=Region\\n).*(?:\\n\\s*[^\\nA-Z].*)*")[[1]]
+        regions <- str_split(region_lines, "\\n") |> 
+          map(str_trim) |> 
+          unlist() |> 
+          keep(~ .x != "")
+        result$region <- str_c(regions, collapse = "; ")
+      }
+    }
+    
+    return(result)
+  })
+  
+  return(parsed_blocks)  # Return tibble directly, not list(tibble)
+}
+
+# Re-run the parsing
+d_tbl_parsed <- d_tbl |>
+  mutate(
+    protected_status_parsed = map(protected_status, parse_protected_status),
+    protected_status_n      = map_int(protected_status_parsed, nrow))
+```
+
+```{r}
+# d_tbl_parsed$protected_status_n |> table( useNA = "ifany")
+#  1  2  4  5  9 11 13 17 
+# 90  6  2  3  1  1  1  1
+
+d_tbl_parsed |>
+  unnest(protected_status_parsed) |>
+  pull(species_status) |>
+  table()
+#            ESA Candidate              ESA Endangered 
+#                        4                          40 
+# ESA Endangered - Foreign ESA Experimental Population
+#                       41                           6 
+#           ESA Threatened    ESA Threatened - Foreign 
+#                       56                          28
+# ESA Experimental Population: "These populations are treated as threatened, regardless of the species' status elsewhere in its range"
+# - - [Designating Experimental Populations under the Endangered Species Act: Section 10(j) | NOAA Fisheries](https://www.fisheries.noaa.gov/designating-experimental-populations-under-endangered-species-act-section-10j)
+
+# EN: 0.8 Endangered (IUCN, ESA)
+species_status %in% c(
+  "ESA Candidate", 
+  "ESA Endangered", 
+  "ESA Endangered - Foreign") ~ "EN",
+# TN: 0.6 Threatened (ESA)
+species_status %in% c(
+  "ESA Experimental Population",
+  "ESA Threatened", 
+  "ESA Threatened - Foreign") ~ "TN")
+
+
+# d_tbl_parsed |> slice(1) |> pluck("protected_status_tbl", 1, 1, "species_status")
+d_tbl_parsed |> 
+  map(pluck("protected_status_tbl", 1, 1, "species_status"))
+  # table(useNA = "ifany")
+
+
+# To view the parsed data for Atlantic Sturgeon:
+d_tbl_parsed |>
+  filter(sp_sci == "Atlantic Sturgeon") |>
+  pull(protected_status_parsed) |>
+  pluck(1)
 ```
 
