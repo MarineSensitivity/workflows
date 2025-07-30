@@ -4,6 +4,12 @@ editor_options:
   chunk_output_type: console
 ---
 
+## Overview
+
+Download the DarwinCore archive of each of the major taxonomic authorities found
+on GBIF.org (or elsewhere). Read the `meta.xml` to understand column headings
+and types for ingesting.
+
 - [db_download_gbif() in db_download.R · ropensci/taxizedb](https://github.com/ropensci/taxizedb/blob/83488da50a01a3ad41d05e9c2a50d3ed4986cc5b/R/db_download.R#L459)
 - [GBIF Backbone Taxonomy](https://www.gbif.org/dataset/d7dddbf4-2cf0-4f39-9b2a-bb099caae36c)
 - [The IUCN Red List of Threatened Species](https://www.gbif.org/dataset/19491596-35ae-4a91-9a98-85cf505f1bd3)
@@ -25,9 +31,12 @@ dir_private  <- ifelse(is_server, "/share/private", "~/My Drive/private")
 iucn_tkn_txt <- glue("{dir_private}/iucnredlist.org_api_token_v4.txt")
 dir_data     <- ifelse(is_server, "/share/data"   , "~/My Drive/projects/msens/data")
 dir_gbif     <- glue("{dir_data}/raw/gbif.org")
-spp_dd       <- glue("{dir_data}/derived/spp.duckdb")
+spp_db       <- glue("{dir_data}/derived/spp.duckdb")
+sdm_db       <- glue("{dir_data}/derived/sdm.duckdb")
 gbif_tsv     <- glue("{dir_gbif}/GBIF Backbone Taxonomy/Taxon.tsv")
 gbif_vrn     <- glue("{dir_gbif}/GBIF Backbone Taxonomy/VernacularName.tsv")
+itis_tsv     <- glue("{dir_gbif}/itis/taxon.txt")
+itis_vrn     <- glue("{dir_gbif}/itis/vernacularname.txt")
 iucn_tsv     <- glue("{dir_gbif}/iucn-2025-1/taxon.txt")
 iucn_xml     <- glue("{dir_gbif}/iucn-2025-1/meta.xml")
 iucn_vrn     <- glue("{dir_gbif}/iucn-2025-1/vernacularname.txt")
@@ -37,7 +46,8 @@ worms_vrn    <- glue("{dir_gbif}/World Register of Marine Species 2025-05-01 dat
 Sys.setenv(IUCN_REDLIST_KEY = readLines(iucn_tkn_txt))
 
 # file_delete(spp_db)
-con_spp <- dbConnect(duckdb(dbdir = spp_dd, read_only = F))
+con_spp <- dbConnect(duckdb(dbdir = spp_db, read_only = F))
+con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F))
 # dbDisconnect(con_spp, shutdown = T)
 # dbListTables(con_spp)
 ```
@@ -71,6 +81,77 @@ if (!"gbif_vernacular" %in% dbListTables(con_spp)){
   dbWriteTable(con_spp, "gbif_vernacular", d_gbif_vrn, append = T, batch_rows = 10000)
   
   dbExecute(con_spp, "CREATE INDEX gbif_vernacular_taxonID_idx on gbif (taxonID)")
+}
+
+# itis ----
+if (!"itis" %in% dbListTables(con_spp)){
+  d_itis <- read_tsv(
+    itis_tsv,
+    col_names = c(
+      "id",
+      "taxonID",
+      "parentNameUsageID",
+      "acceptedNameUsageID_chr", 
+      "scientificName", "scientificNameAuthorship",
+      "taxonRank", "taxonomicStatus", "nomenclaturalStatus", "completeness",
+      "namePublishedIn", "namePublishedInYear"),
+    col_types = "iiiccccccccD")
+  
+  # acceptedNameUsageID: get first one ----
+  # d_itis |>
+  #   filter(str_detect(acceptedNameUsageID_chr, ",")) |>
+  #   glimpse()
+  # Rows: 252
+  # Columns: 12
+  # $ id                       <int> 19398, 22148, 22152, 22503, 22520, 2579…
+  # $ taxonID                  <int> 19398, 22148, 22152, 22503, 22520, 2579…
+  # $ parentNameUsageID        <int> NA, NA, NA, NA, NA, NA, NA, NA, NA, NA,…
+  # $ acceptedNameUsageID_chr  <chr> "19279,19379", "541745,847685", "847680…
+  # $ scientificName           <chr> "Quercus prinus", "Viola purpurea ssp. …
+  # $ scientificNameAuthorship <chr> "L.", "M.S. Baker & J.C. Clausen", "M.S…
+  # $ taxonRank                <chr> "Species", "Subspecies", "Variety", "Sp…
+  # $ taxonomicStatus          <chr> "not accepted", "not accepted", "not ac…
+  # $ nomenclaturalStatus      <chr> "other, see comments", "pro parte", "da…
+  # $ completeness             <chr> NA, NA, NA, NA, NA, NA, NA, NA, NA, "un…
+  # $ namePublishedIn          <chr> NA, NA, NA, NA, NA, NA, NA, NA, NA, NA,…
+  # $ namePublishedInYear      <date> NA, NA, NA, NA, NA, NA, NA, NA, NA, NA…
+  
+  d_itis <- d_itis |> 
+    separate_wider_delim(
+      acceptedNameUsageID_chr, 
+      delim       = ",", 
+      names       = c(
+        "acceptedNameUsageID", "acceptedNameUsageID_other"),
+      cols_remove = T, 
+      too_few     = "align_start",
+      too_many    = "merge") |> 
+    mutate(
+      acceptedNameUsageID = as.integer(acceptedNameUsageID)) |> 
+    select(-id, -acceptedNameUsageID_other)
+  
+  # dbExecute(con_spp, "DROP TABLE IF EXISTS itis")
+  dbWriteTable(con_spp, "itis", d_itis, append = T, batch_rows = 10000)
+  
+  dbExecute(con_spp, "CREATE UNIQUE INDEX itis_taxonID_idx on itis (taxonID)")
+  dbExecute(con_spp, "CREATE INDEX itis_acceptedNameUsageID_idx on itis (acceptedNameUsageID)")
+  dbExecute(con_spp, "CREATE INDEX itis_scientificName_idx on itis (scientificName)")
+  dbExecute(con_spp, "CREATE INDEX itis_parentNameUsageID_idx on itis (parentNameUsageID)")
+}
+
+# itis_vernacular ----
+if (!"itis_vernacular" %in% dbListTables(con_spp)){
+  d_itis_vrn <- read_tsv(
+    itis_vrn,
+    col_names = c(
+      "taxonID",
+      "vernacularName",
+      "language"),
+    col_types = "icc")
+  
+  # dbExecute(con_spp, "DROP TABLE IF EXISTS itis_vernacular")
+  dbWriteTable(con_spp, "itis_vernacular", d_itis_vrn, append = T, batch_rows = 10000)
+  
+  dbExecute(con_spp, "CREATE INDEX itis_vernacular_taxonID_idx on itis (taxonID)")
 }
 
 # worms ----
@@ -269,7 +350,7 @@ Differentiate names (`scientific_name`, `common_name`) from:
 - `_dataset`: original dataset; versus 
 - `_accepted`: taxonomic authority (*)
 
-```{r}
+```{r alter_sdm_species_to_scientific_name_dataset_vs_accepted}
 # check if species.scientific_name has been split already
 if ("scientific_name" %in% dbListFields(con_sdm, "species")) {
 
@@ -301,9 +382,7 @@ if (F){
 }
 ```
 
-```{r}
-#| label: match_sdm_spp
-
+```{r match_sdm_spp}
 # match sdm datasets to species in spp_gbif_iucn
 librarian::shelf(
   DBI, dbplyr, dplyr, duckdb, fs, glue, here, logger, purrr, readr,
