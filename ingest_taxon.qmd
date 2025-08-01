@@ -31,6 +31,8 @@ dir_private  <- ifelse(is_server, "/share/private", "~/My Drive/private")
 iucn_tkn_txt <- glue("{dir_private}/iucnredlist.org_api_token_v4.txt")
 dir_data     <- ifelse(is_server, "/share/data"   , "~/My Drive/projects/msens/data")
 dir_gbif     <- glue("{dir_data}/raw/gbif.org")
+# dir_worms    <- glue("{dir_data}/raw/marinespecies.org/WoRMS_download_2025-07-01")
+dir_worms    <- glue("{dir_data}/raw/marinespecies.org/worms_2025-07-01_checklistbank.org")
 spp_db       <- glue("{dir_data}/derived/spp.duckdb")
 sdm_db       <- glue("{dir_data}/derived/sdm.duckdb")
 gbif_tsv     <- glue("{dir_gbif}/GBIF Backbone Taxonomy/Taxon.tsv")
@@ -40,8 +42,9 @@ itis_vrn     <- glue("{dir_gbif}/itis/vernacularname.txt")
 iucn_tsv     <- glue("{dir_gbif}/iucn-2025-1/taxon.txt")
 iucn_xml     <- glue("{dir_gbif}/iucn-2025-1/meta.xml")
 iucn_vrn     <- glue("{dir_gbif}/iucn-2025-1/vernacularname.txt")
-worms_tsv    <- glue("{dir_gbif}/World Register of Marine Species 2025-05-01 dataset-2011/taxon.txt")
-worms_vrn    <- glue("{dir_gbif}/World Register of Marine Species 2025-05-01 dataset-2011/vernacularname.txt")
+worms_tsv    <- glue("{dir_worms}/taxon.txt")
+worms_habs   <- glue("{dir_worms}/speciesprofile.txt")
+worms_vrn    <- glue("{dir_worms}/vernacularname.txt")
 
 Sys.setenv(IUCN_REDLIST_KEY = readLines(iucn_tkn_txt))
 
@@ -168,7 +171,21 @@ if (!"worms" %in% dbListTables(con_spp)){
         parentNameUsageID, 
         datasetID),
       ~ str_replace(.x, "urn:lsid:marinespecies.org:taxname:", "") |> 
-        as.integer() )) # 1,475,582 x 32
+        as.integer() )) # 1,484,358 × 32
+  
+  d_habs <- vroom(
+    worms_habs,
+    delim     = "\t",
+    col_types = "clllll",
+    progress  = F) |> 
+    mutate(across(
+      c(taxonID),
+      ~ str_replace(.x, "urn:lsid:marinespecies.org:taxname:", "") |> 
+        as.integer() )) # 1,484,358 × 6
+  d_worms <- d_worms |> 
+    left_join(
+      d_habs,
+      by = "taxonID") # 1,484,358 × 37
 
   # dbExecute(con_spp, "DROP TABLE IF EXISTS worms")
   dbWriteTable(con_spp, "worms", d_worms, append = T, batch_rows = 10000)
@@ -184,7 +201,7 @@ if (!"worms_vernacular" %in% dbListTables(con_spp)){
   d_worms_vrn <- read_tsv(worms_vrn) |> 
     mutate(
       taxonID = str_replace(taxonID, "urn:lsid:marinespecies.org:taxname:", "") |> 
-        as.integer() )  # 105,729 × 5
+        as.integer() )  # 108,634 × 5
   
   # dbExecute(con_spp, "DROP TABLE IF EXISTS worms_vernacular")
   dbWriteTable(con_spp, "worms_vernacular", d_worms_vrn, append = T, batch_rows = 10000)
@@ -405,6 +422,23 @@ spp_db <- glue("{dir_data}/derived/spp.duckdb")
 
 # file_delete(sdm_dd)
 con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F))
+
+tbl(con_sdm, "dataset") |> 
+  select(ds_key, name_short)
+#   ds_key  name_short                                                            
+# 1 am_0.05 AquaMaps suitability for all marine taxa (except birds) globally, 2019
+# 2 bl      BirdLife Birds of the World, 2024                                     
+# 3 ch_nmfs NMFS Critical Habitat for USA, 2025-05-12                             
+# 4 ch_fws  FWS Critical Habitat for USA, 2025-05-05 
+# TODO: ch_fws, rng_fws
+tbl(con_sdm, "model") |> 
+  group_by(ds_key) |> 
+  summarize(n = n())
+#   ds_key      n
+# 1 ch_nmfs    34
+# 2 am_0.05 17550
+# 3 bl        537
+
 # dbDisconnect(con_sdm, shutdown = T)
 # dbDisconnect(con_spp, shutdown = T)
 # duckdb_shutdown(duckdb())

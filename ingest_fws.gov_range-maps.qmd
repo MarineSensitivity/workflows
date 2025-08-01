@@ -1,0 +1,555 @@
+---
+title: "Ingest FWS Range Maps"
+editor_options: 
+  chunk_output_type: console
+---
+
+## Read FWS Range Maps
+
+- [ECOS: Home](https://ecos.fws.gov/ecp/)
+- [ECOS: Species Reports](https://ecos.fws.gov/ecp/species-reports)
+- [usfws_complete_species_current_range.zip](https://ecos.fws.gov/docs/species/shapefiles/usfws_complete_species_current_range.zip) (2.35 GB)
+
+```{r setup}
+librarian::shelf(
+  DBI, dplyr, DT, duckdb, fs, glue, here, knitr, janitor, leaflet, 
+  leaflet.extras2, logger, mapview, purrr, readr, readxl, sf, stringr, terra, 
+  tibble,
+  quiet = T)
+
+options(readr.show_col_types = F)
+mapviewOptions(
+  basemaps       = "Esri.OceanBasemap",
+  vector.palette = \(n) grDevices::hcl.colors(n, palette = "Spectral") )
+sf_use_s2(T)
+
+is_server    <- Sys.info()[["sysname"]] == "Linux"
+dir_private  <- ifelse(is_server, "/share/private", "~/My Drive/private")
+dir_data     <- ifelse(is_server, "/share/data"   , "~/My Drive/projects/msens/data")
+spp_db       <- glue("{dir_data}/derived/spp.duckdb")
+sdm_db       <- glue("{dir_data}/derived/sdm.duckdb")
+cell_tif     <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
+dir_fws      <- glue("{dir_data}/raw/fws.gov")
+dir_rng      <- glue("{dir_fws}/usfws_complete_species_current_range")
+rng1_shp     <- glue("{dir_rng}/usfws_complete_species_current_range_1.shp")
+rng2_shp     <- glue("{dir_rng}/usfws_complete_species_current_range_2.shp")
+dir_rast     <- glue("{dir_fws}/range_rast")
+species_csv  <- glue("{dir_fws}/species.csv")
+# rng_csv      <- glue("{dir_fws}/ranges.csv")
+rng_spp_csv  <- glue("{dir_fws}/range_spp.csv")
+ds_key       <- "rng_fws"
+
+dir.create(dir_rast, showWarnings = F)
+```
+
+## FWS Range
+
+- Storm petrel: ESA listed in Hawaii; IUCN did not account
+
+```{r setup_iterate}
+rng <- bind_rows(
+  read_sf(rng1_shp),    # 1,000
+  read_sf(rng2_shp)) |> # 1,291
+  clean_names() |>
+  st_make_valid() |> 
+  arrange(sciname) |> 
+  filter(
+    !status_abb %in% c("Extinction")) |> 
+  mutate(
+    esa_code = case_match( # er: extinction risk
+      status_abb,
+      c("Not Listed",
+        "Recovery",
+        "Resolved Taxon",
+        "Original Data in Error - New Information Discovered",
+        "Original Data in Error - Not a listable entity",
+        "Original Data in Error - Taxonomic Revision",
+        "Pre-Act Delisted Taxon",
+        "Species of Concern",
+        "Status Undefined",
+        "Under Review"
+        ) ~ "LC",    # "LC" = 0.2
+      c("Threatened",
+        "Proposed Similarity of Appearance (Threatened)",
+        "Proposed Threatened",
+        "Similarity of Appearance (Threatened)"
+        ) ~ "TN",    # "TN" = 0.6
+      c("Endangered",
+        "Experimental Population, Non-Essential",
+        "Proposed Endangered"
+        ) ~ "EN"     # "EN" = 0.8
+      ) |> 
+      factor(c("LC","TN", "EN"), ordered = T),
+    value = case_match(
+      esa_code,
+      "LC" ~ 50L,  # assign 50% presence to Least Concern, like other range maps
+      "TN" ~ 70L,  # assign 70% presence to Threatened habitat
+      "EN" ~ 90L   # assign 90% presence to Endangered habitat
+      ))
+
+d_spp <- rng |> 
+  st_drop_geometry() |> 
+  group_by(spcode, family, sciname, comname) |> 
+  summarize(
+    n_features   = n(),
+    esa_code_max = max(esa_code),  # Get max esa_code to use for species weight. Precautionary principle
+    n_esa_lc     = sum(esa_code == "LC"),
+    n_esa_tn     = sum(esa_code == "TN"),
+    n_esa_en     = sum(esa_code == "EN"),
+    .groups = "drop") |> 
+  arrange(sciname) |> 
+  rowid_to_column()
+write_csv(d_spp, rng_spp_csv)
+
+# d_spp |>
+#   filter(n_features > 1) |> View()
+# A tibble: 57 × 10
+#    rowid spcode family           sciname       comname n_features esa_code_max n_esa_tn n_esa_en n_esa_lc
+#    <int> <chr>  <chr>            <chr>         <chr>        <int> <ord>           <int>    <int>    <int>
+#  1    59 D01T   Ambystomatidae   Ambystoma ca… Califo…          3 EN                  1        2        0
+#  2    90 A009   Antilocapridae   Antilocapra … Sonora…          2 EN                  0        2        0
+#  3   176 G016   Pleuroceridae    Athearnia an… Anthon…          3 EN                  0        3        0
+#  4   280 A00D   Canidae          Canis lupus   Gray w…          4 LC                  1        2        1
+#  5   281 A00E   Canidae          Canis lupus … Mexica…          2 EN                  0        2        0
+#  6   282 A00F   Canidae          Canis rufus   Red wo…          2 EN                  0        2        0
+#  7   314 B06W   Phasianidae      Centrocercus… Greate…          2 LC                  1        0        1
+#  8   325 B079   Charadriidae     Charadrius m… Piping…          2 EN                  1        1        0
+#  9   333 C00S   Cheloniidae      Chelonia myd… Green …          4 EN                  3        1        0
+# 10   433 D043   Cryptobranchidae Cryptobranch… Easter…          2 EN                  0        2        0
+# # ℹ 47 more rows
+# rng |> st_drop_geometry() |> glimpse()
+# Rows: 2,291
+# Columns: 10
+# $ range_note <chr> "This range has been defined at a scale of finer resolu…
+# $ range_id   <dbl> 72997, 72998, 72999, 73000, 73001, 73002, 73003, 73004,…
+# $ entity_id  <dbl> 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 15, 16, 18, 20,…
+# $ spcode     <chr> "A000", "A001", "A002", "A003", "A004", "A006", "A007",…
+# $ vipcode    <chr> "V01", "V01", "V01", "V01", "V01", "V01", "V01", "V01",…
+# $ comname    <chr> "Indiana bat", "Grizzly bear", "Columbian white-tailed …
+# $ sciname    <chr> "Myotis sodalis", "Ursus arctos horribilis", "Odocoileu…
+# $ pop_abbrev <chr> "Wherever found", "U.S.A., conterminous (lower 48) Stat…
+# $ status_abb <chr> "Endangered", "Threatened", "Threatened", "Endangered",…
+# $ family     <chr> "Vespertilionidae", "Ursidae", "Cervidae", "Cervidae", …
+
+# rng$range_note[1]
+# "This range has been defined at a scale of finer resolution than \"statewide\""
+
+# table(rng$status_abb, useNA = "ifany")
+#                                          Endangered              Experimental Population, Non-Essential 
+#                                                1215                                                  56 
+#                                          Extinction                                          Not Listed 
+#                                                  12                                                  26 
+# Original Data in Error - New Information Discovered      Original Data in Error - Not a listable entity 
+#                                                   1                                                   4 
+#         Original Data in Error - Taxonomic Revision                              Pre-Act Delisted Taxon 
+#                                                   1                                                   3 
+#                                 Proposed Endangered      Proposed Similarity of Appearance (Threatened) 
+#                                                  22                                                   1 
+#                                 Proposed Threatened                                            Recovery 
+#                                                  19                                                  56 
+#                                      Resolved Taxon               Similarity of Appearance (Threatened) 
+#                                                 221                                                   6 
+#                                  Species of Concern                                    Status Undefined 
+#                                                 144                                                  46 
+#                                          Threatened                                        Under Review 
+#                                                 369                                                  89
+# sort(unique(rng$status_abb)) |> paste(collapse = '",\n"') |> cat()
+
+r_cell   <- rast(cell_tif, lyrs = "cell_id") # [   0, 360]
+r_cell_r <- rotate(r_cell)                   # [-180, 180]
+ext(r_cell_r) <- round(ext(r_cell_r), 3)
+```
+
+```{r iterate_species}
+log_txt <- glue("{dir_rast}/_log {Sys.time()}.txt")
+log_appender(appender_file(log_txt))
+
+# i = which(d_spp$sciname == "Chelonia mydas")
+for (i in d_spp$rowid){  # i = 333 # C00S _Chelonia mydas_ Green sea turtle
+  # sp = "Charadrius melodus" # Piping Plover: no intersection with er1
+  # sp = "Ursus maritimus"    # Polar Bear: 
+  
+  d_sp    <- filter(d_spp, rowid == i)
+  sp_sci  <- d_sp$sciname
+  sp_code <- d_sp$spcode
+  sp_key  <- glue("{ds_key}:{sp_code}")
+  p_sp    <- filter(rng, spcode == sp_code)
+  # mapView(p_sp, zcol = "esa_code")
+  
+  r_tif <- glue("{dir_rast}/{str_replace_all(sp_sci, ' ', '_')}.tif")
+  if (file.exists(r_tif)){
+    log_info("| SKIP | {sp_sci} | tif already exists")
+    next()
+  }
+
+  r_sp <- try(
+    rasterize(
+      p_sp,
+      r_cell_r,
+      field   = "value",
+      fun     = "max",
+      touches = T) |>
+      rotate() |> 
+      crop(r_cell) |> 
+      mask(r_cell),
+    silent = T)
+  # mapView(as.factor(trim(r_sp))) + mapView(p_sp, zcol = "esa_code")
+  if (inherits(r_sp, "try-error")){
+    log_info("| SKIP | {sp_sci} | error in rasterize(),...: {r_sp}")
+    next()
+  }
+  n_cells <- length(values(r_sp, na.rm = T))
+  if (n_cells == 0){
+    log_info("| SKIP | {sp_sci} | rast has no intersecting values")
+    next()
+  }
+  names(r_sp) <- sp_sci
+  round(ext(r_sp), 3)
+  
+  log_info("| WRITE | {sp_sci} | {format(n_cells, big.mark=',')} cells")
+  writeRaster(
+    r_sp, 
+    filename = r_tif,
+    overwrite = T)
+
+  # TODO: delete, append... ----
+}
+```
+
+```{r sp_cat}
+tbl(con_sdm, "dataset")
+tbl(con_spp, "itis")
+
+spp_db <- glue("{dir_data}/derived/spp.duckdb")
+dbExecute(con_sdm, glue("ATTACH DATABASE '{spp_db}' AS spp (READ_ONLY);"))
+
+
+tcon_sdm
+
+d_spp <- read_csv(rng_spp_csv) |> 
+  rename(sp_code = spcode)
+d_rng <- read_csv(rng_csv) |> 
+  clean_names()
+# d_spp_lst <- read_excel(spp_xlsx, skip = 1) |> 
+#   clean_names()
+d_spp_data <- read_csv(spp_data_csv) |> 
+  clean_names()
+
+d_rast <- tibble(
+  tif = dir_ls(dir_rast, glob = "*.tif")) |> 
+  mutate(
+    scientific_name = path_file(tif) |> 
+      path_ext_remove() |> 
+      str_replace_all("_", " ")) |> 
+  # left_join(
+  #   d_spp_lst,
+  #   by = "scientific_name") |>
+  # mutate(
+  #   has_sp_grp = !is.na(species_group)) |> 
+  # arrange(has_sp_grp, scientific_name) |> 
+  left_join(
+    d_spp,
+    by = c("scientific_name" = "sciname") ) |> 
+  # left_join(
+  #   d_rng,
+  #   by = "scientific_name")
+  left_join(
+    d_spp_data,
+    by = "sp_code")
+
+table(is.na(d_rast$sp_code), useNA = "ifany")
+table(is.na(d_rast$taxonomic_serial_number), useNA = "ifany")
+# FALSE  TRUE 
+#   687   164
+table(d_rast$species_group, useNA = "ifany")
+#       Amphibians           Arachnids               Birds Conifers and Cycads         Crustaceans 
+#               14                   1                  68                   3                   7 
+# Ferns and Allies              Fishes    Flowering Plants             Insects             Lichens 
+#               23                  10                 430                  38                   1 
+#          Mammals            Reptiles              Snails                <NA> 
+#               40                  42                  10                 164
+table(d_rast$taxonomic_group, useNA = "ifany")
+#       Amphibians           Arachnids               Birds Conifers and Cycads         Crustaceans 
+#               14                   1                  68                   3                   7 
+# Ferns and Allies              Fishes    Flowering Plants             Insects             Lichens 
+#               23                  10                 430                  38                   1 
+#          Mammals            Reptiles              Snails                <NA> 
+#               40                  42                  10                 164 
+table(d_rast$ecos_species_group, useNA = "ifany")
+#       Amphibians           Arachnids               Birds Conifers and Cycads         Crustaceans 
+#               14                   1                  68                   3                   7 
+# Ferns and Allies              Fishes    Flowering Plants             Insects             Lichens 
+#               23                  10                 430                  38                   1 
+#          Mammals            Reptiles              Snails                <NA> 
+#               40                  42                  10                 164 
+
+names(d_spp_data)
+d_rast |> 
+  filter(is.na(species_group)) |> 
+  View()
+
+# View(d_rast)
+
+# table(d_rast$group, useNA = "ifany")
+#  Amphibians           Arachnids               Birds Conifers and Cycads
+#          13                   1                  68                   3
+# Crustaceans    Ferns and Allies              Fishes    Flowering Plants
+#           7                  23                   7                 456
+#     Insects             Lichens             Mammals            Reptiles
+#          37                   1                  35                  27
+#      Snails                <NA>
+#          10                 129
+# Q: Do any flowering plants exist underwater?
+# A:Yes, seagrasses are flowering plants that live entirely underwater. They are the only true flowering plants that have adapted to live and reproduce in marine environments. Seagrasses have roots, stems, and leaves, and they produce flowers, fruits, and seeds. 
+# Seagrasses are true flowering plants (angiosperms) that belong to the Potamogetonaceae family. Seaweed, on the other hand, are algae and not plants. 
+
+```
+
+```{r init_dbs}
+con_spp <- dbConnect(duckdb(dbdir = spp_db, read_only = T))
+# dbListTables(con_spp)
+# [1] "gbif"             "gbif_vernacular"  "iucn_redlist"     "iucn_vernacular" 
+# [5] "worms"            "worms_vernacular"
+con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F))
+```
+
+### Add `dataset`
+
+```{r insert_dataset_row}
+row_dataset <- tibble(
+  ds_key          = !!ds_key,
+  name_short      = "FWS Critical Habitat for USA, 2025-05-05",
+  name_original   = "USFWS Threatened & Endangered Species Active Critical Habitat Report",
+  description     = "This page contains the spatial data for active proposed and final critical habitat for FWS only and Joint FWS/NMFS threatened and endangered species. ECOS is a FWS-sponsored platform for FWS data. The ECOS critical habitat on-line mapper includes (some, not all of the) proposed and final critical habitat for species listed as Threatened and Endangered by the FWS, or that are jointly managed by FWS/NMFS. The on-line mapper does not include species which are under the sole jurisdiction of NMFS.",
+  citation        = "",
+  source_broad    = "NMFS",
+  source_detail   = "https://ecos.fws.gov/ecp/",
+  regions         = "USA",
+  response_type   = "binary",
+  taxa_groups     = "all taxa",
+  year_pub        = 2025,
+  date_obs_beg    = NA,
+  date_obs_end    = NA,
+  date_env_beg    = NA,
+  date_env_end    = NA,
+  link_info       = "https://ecos.fws.gov/ecp/report/table/critical-habitat.html",
+  link_download   = "https://ecos.fws.gov/docs/crithab/crithab_all/crithab_all_layers.zip",
+  link_metadata   = "https://ecos.fws.gov/ecp/report/table/critical-habitat.html",
+  links_other     = "http://fws.maps.arcgis.com/home/webmap/viewer.html?webmap=9d8de5e265ad4fe09893cf75b8dbfb77",
+  spatial_res_deg = 0.05,
+  temporal_res    = "static")
+
+if (dbExistsTable(con_sdm, "dataset"))
+  dbExecute(con_sdm, glue("DELETE FROM dataset WHERE ds_key = '{ds_key}'"))
+
+dbWriteTable(con_sdm, "dataset", row_dataset, append = TRUE)
+# tbl(con_sdm, "dataset")
+```
+
+### Iterate rows: `species`, `model`, `model_cell`
+
+TODO: 
+
+- [ ] sort different liststatus per species, e.g. Rice's whale has both "prop." and "fin." status
+
+
+```{r}
+d_spp <- read_csv(rng_spp_csv)
+
+# get sp_cat ----
+# dbListTables(con_sdm)
+# dbListTables(con_spp)
+# dbListFields(con_spp, "worms")
+d_spp_worms <- tbl(con_spp, "worms") |> 
+  filter(scientificName %in% d_spp$sciname) |> 
+  collect() |> 
+  left_join(
+    d_spp,
+    by = c("scientificName" = "sciname"))
+# nrow(d_spp_worms) # 251
+# View(d_spp_worms)
+d_spp_not_worms <- d_spp |> 
+  filter(!(sciname %in% d_spp_worms$scientificName))
+
+View(d_spp_not_worms)
+
+d_spp_gbif <- tbl(con_spp, "gbif") |> 
+  filter(scientificName %in% d_spp$sciname) |> 
+  collect() |> 
+  left_join(
+    d_spp,
+    by = c("scientificName" = "sciname"))
+# nrow(d_spp_gbif)  # 12
+# View(d_spp_gbif)
+d_spp_iucn <- tbl(con_spp, "iucn_redlist") |> 
+  filter(taxon_scientific_name %in% d_spp$sciname) |> 
+  collect()
+# nrow(d_spp_iucn)  # 19
+
+  select(aphia_id, scientific_name_accepted, common_name_accepted) |> 
+  collect() |> 
+  clean_names()
+
+ply <- st_read(ply_geo, quiet = T) |> 
+  clean_names()
+# sum(duplicated(ply$sciename)) # 16
+
+# ply |> 
+#   st_drop_geometry() |> 
+#   glimpse()
+# Rows: 54
+# Columns: 7
+# $ taxon      <chr> "Baleen Whale", "Marine reptile", "Marine reptile", "Marine reptile", "bal…
+# $ cm_er_st   <chr> "Rice's Whale (EN) prop.", "Sea turtle, green (EN) prop.", "Sea turtle, gr…
+# $ sciename   <chr> "Balaenoptera ricei", "Chelonia mydas", "Chelonia mydas", "Chelonia mydas"…
+# $ comname    <chr> "Rice's Whale", "Sea turtle, green", "Sea turtle, green", "Sea turtle, gre…
+# $ liststatus <chr> "Endangered", "Endangered", "Threatened", "Threatened", "Endangered", "End…
+# $ habtype    <chr> "Marine, GOM waters between 100m and 400m isobaths", NA, " ", NA, "marine"…
+# $ n          <int> 1, 18, 5, 25, 2, 2, 11, 12, 510, 284, 20, 510, 22, 23, 1, 135, 9, 8, 2, 3,…
+
+# DEBUG ----
+ply_ch <- ply |> 
+  mutate(
+    taxon    = tolower(taxon),
+    esa_code = case_match( # er: extinction risk
+      liststatus,
+      "Threatened" ~ "TN",     # "TN" = 0.6
+      "Endangered" ~ "EN") |>  # "EN" = 0.8
+      factor(c("TN", "EN"), ordered = T)) |> 
+  # pull(taxon) |> table(useNA = "ifany")
+  # baleen whale           fish   invertebrate marine reptile       pinniped  toothed whale 
+  #            5             18             13              7              8              3 
+  mutate(
+    sp_cat = case_when(
+      taxon %in% c(
+        "baleen whale", "toothed whale", "pinniped") ~ "mammal",
+      str_detect(comname, "Coral")                   ~ "coral",
+      taxon == "marine reptile"                      ~ "turtle",
+      .default = taxon)) |> 
+  # pull(sp_cat) |> table(useNA = "ifany")
+  # coral         fish invertebrate       mammal       turtle 
+  #     12           18            1           16            7
+  arrange(sp_cat, sciename, comname, esa_code) |> 
+  group_by(
+    sp_cat, sciename, comname) |>
+  summarize(
+    esa_code = last(esa_code), # use precautionary principle for now; 
+    # TODO: figure out way to have different esa_code in different regions -- affect other distributions?
+    .groups = "drop")
+
+stopifnot(sum(duplicated(ply_ch$sciename)) == 0)
+
+ply_ch |> 
+  mapView(alpha.regions = 0.5, zcol = "comname")
+
+r_cell   <- rast(cell_tif, lyrs = "cell_id") # [   0, 360]
+ext(r_cell) <- round(ext(r_cell), 3)
+r_cell_r <- rotate(r_cell)                   # [-180, 180]
+ext(r_cell_r) <- round(ext(r_cell_r), 3)
+```
+
+```{r iterate_rows}
+for (i in 1:nrow(ply_ch)){  # i = 1
+  
+  p_sp   <- ply_ch |> slice(i) |> 
+    mutate(
+      value = 75L) # assign 75% to critical habitat, TODO: use extinction risk
+  d_sp   <- ply_ch |> st_drop_geometry() |> slice(i)
+  sp     <- d_sp$sciename
+  sp_key <- glue("{ds_key}:{d_sp$sciename}")
+  
+  # mapView(r_cell_r) +
+  #   mapView(r_sp) +
+  #   mapView(p_sp)
+  
+  r_sp <- rasterize(
+    p_sp,
+    r_cell_r, 
+    field = "value") |>  # trim() |> mapView()
+    rotate() |> 
+    crop(r_cell) |> 
+    mask(r_cell)
+  n_cells <- length(values(r_sp, na.rm = T))
+  if (n_cells == 0){
+    message(glue("No cells for {sp} ({i}/{nrow(ply_ch)})"))
+    # No cells for Oncorhynchus keta    (16/38)
+    # No cells for Oncorhynchus nerka   (17/38)
+    # No cells for Sebastes paucispinis (21/38)
+    # No cells for Sebastes ruberrimus  (22/38)
+    next()
+  }
+
+  # delete: existing ----
+  mdl_seqs <- tbl(con_sdm, "model") |> 
+    filter(ds_key == !!ds_key, taxa == !!sp_key) |> 
+    pull(mdl_seq)
+  if (length(mdl_seqs > 0)) {
+    dbExecute(con_sdm, glue("DELETE FROM model WHERE ds_key = '{ds_key}' AND taxa = '{sp_key}'"))
+    dbExecute(con_sdm, glue("DELETE FROM species WHERE ds_key = '{ds_key}' AND taxa = '{sp_key}'"))
+    dbExecute(con_sdm, glue("DELETE FROM model_cell WHERE mdl_seq IN ({paste(mdl_seqs, collapse = ',')})"))
+  }
+  
+  # append: model ----
+  d_model <- tibble(
+    ds_key      = ds_key,
+    taxa        = sp_key,
+    time_period = "2025",
+    region      = "Global",
+    mdl_type    = "binary",
+    description = glue(
+      "NMFS critical habitat for {sp}, interpolated to 0.05° resolution") )
+  dbWriteTable(con_sdm, "model", d_model, append = TRUE)
+  # tbl(con_sdm, "model") |> collect() |> tail()
+  
+  # get the mdl_seq that was just created
+  mdl_seq <- dbGetQuery(con_sdm, glue("
+    SELECT mdl_seq FROM model 
+    WHERE
+      ds_key = '{ds_key}' AND 
+      taxa   = '{sp_key}'
+    ORDER BY mdl_seq DESC LIMIT 1 "))$mdl_seq
+  
+  # d_sp |> glimpse()
+  # Rows: 1
+  # Columns: 4
+  # $ sp_cat   <chr> "coral"
+  # $ sciename <chr> "Acropora cervicornis"
+  # $ comname  <chr> "Coral, staghorn"
+  # $ esa_code <ord> TN
+  
+  # append: species ----
+  d_species <- tibble(
+    ds_key                   = ds_key,
+    taxa                     = sp_key,
+    sp_key                   = sp_key,
+    worms_id                 = NA_integer_,  # TODO: lookup from WoRMS
+    gbif_id                  = NA_integer_,  # TODO: lookup from GBIF
+    itis_id                  = NA_integer_,  # TODO: lookup from ITIS
+    iucn_id                  = NA_integer_,  # TODO: lookup from IUCN
+    scientific_name_dataset  = sp,
+    common_name_dataset      = d_sp$comname,
+    # TODO: do lookup from WoRMS
+    scientific_name_accepted = sp,
+    common_name_accepted     = d_sp$comname,
+    redlist_code             = d_sp$esa_code,
+    redlist_year             = NA_integer_,
+    sp_cat                   = d_sp$sp_cat)
+  stopifnot(length(setdiff(names(d_species), dbListFields(con_sdm, "species"))) == 0)
+  stopifnot(setdiff(dbListFields(con_sdm, "species"), names(d_species)) == "sp_seq")
+  dbWriteTable(con_sdm, "species", d_species, append = T)
+  # tbl(con_sdm, "species") |> collect() |> tail()
+  # tbl(con_sdm, "model")   |> collect() |> tail()
+  stopifnot(tbl(con_sdm, "species") |> filter(is.na(sp_seq)) |> collect() |> nrow() == 0)
+
+  # append: model_cell ----
+  d_mdl_cell <- as.data.frame(r_sp, cells = T, na.rm = T) |>
+    tibble() |>
+    select(cell_id = cell) |> 
+    mutate(
+      mdl_seq = mdl_seq,
+      value   = 75L) |> 
+    arrange(cell_id)
+  dbWriteTable(con_sdm, "model_cell", d_mdl_cell, append = T)
+}
+```
+

@@ -9,6 +9,10 @@ editor_options:
 
 This script ingests the Birds of the World (BOTW) dataset from BirdLife.org, which is available as a GeoPackage file. The dataset contains information about bird species, their distributions, and other relevant data.
 
+TODO:
+
+- [ ] Resolve problematic geometries (see `log_csv`) by converting to raster first and masking to study area raster, rather than intersecting with study area polygon.
+
 - Fix `terra::rotate()`: [`rotate()\` not working `[-180, 180]` to `[0, 360]`: adding only one pixel west · Issue #1876 · rspatial/terra](https://github.com/rspatial/terra/issues/1876)
 
 ```{r setup}
@@ -26,10 +30,57 @@ cell_tif  <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
 er_gpkg   <- glue("{dir_data}/derived/ply_ecoregions_2025.gpkg")
 sdm_db    <- glue("{dir_data}/derived/sdm.duckdb")
 dir_bl    <- glue("{dir_data}/raw/birdlife.org")
-dir_rast  <- glue("{dir_bl}/rast")
+# dir_rast  <- glue("{dir_bl}/rast") # OLD: vector intersection processing
+dir_rast  <- glue("{dir_bl}/botw_rast") # NEW: raster processing with only problematic species from vector intersection processing
 botw_gpkg <- glue("{dir_bl}/BOTW_GPKG_2024_2/BOTW_2024_2.gpkg")
-log_txt   <- glue("{dir_rast}/_log 2025-07-23 01:04:17.350045.txt")
+# log_txt   <- glue("{dir_rast}/_log 2025-07-23 01:04:17.350045.txt")
+log_txt   <- glue("{dir_rast}/_log 2025-07-28 13:35:16.327585.txt")
+log_csv   <- glue("{dir_rast}/_ingest_birdlife.org_status.csv")
+dir_create(dir_rast)
 ```
+
+```{r surf2poly}
+surf2poly = function(obj) {
+  # source: https://github.com/r-spatial/sf/issues/2289#issuecomment-1854502398
+  
+  # obj <- p
+  is_multi <- "MULTISURFACE" %in% st_geometry_type(st_geometry(obj))
+  
+  # browser()
+  if (!is_multi)
+    return(obj)
+  
+  out_geom_txt = obj |> 
+    sf::st_geometry() |> 
+    sf::st_as_text() |> 
+    gsub(pattern = "MULTISURFACE (", replacement = '', fixed = TRUE) |> 
+    gsub(pattern = "COMPOUNDCURVE (", replacement = '', fixed = TRUE) |> 
+    gsub(pattern = "CURVEPOLYGON (", replacement = '', fixed = TRUE) # |> 
+    # gsub(pattern = "CIRCULARSTRING", replacement = 'LINESTRING', fixed = TRUE)
+  # TODO: remove extra parenthesis at end?
+  
+  out = obj |> 
+    sf::st_set_geometry(
+      value = sf::st_as_sfc(
+        out_geom_txt, 
+        crs = sf::st_crs(obj) ))
+  
+  idx = which(sf::st_geometry_type(out) == "LINESTRING")
+  
+  out_greenlight = out[-idx, ]
+  out_redlight = out |> 
+    dplyr::slice(idx) |> 
+    sf::st_cast(to = "POLYGON") |> 
+    sf::st_cast(to = "MULTIPOLYGON")
+  
+  out = rbind(out_greenlight, out_redlight) |> 
+    sf::st_cast("MULTIPOLYGON") |> 
+    sf::st_make_valid()
+  
+  out
+}
+```
+
 
 Layers: 
 
@@ -130,11 +181,24 @@ er1 <- read_sf(er_gpkg) |> st_union()  # [-180, 180]
 # MULTIPOLYGON MULTISURFACE
 #       17,212          167
 
-r_cell   <- rast(cell_tif, lyrs = "cell_id") # [   0, 360]
-r_cell_r <- rotate(r_cell)                   # [-180, 180]
+r_cell        <- rast(cell_tif, lyrs = "cell_id") # [   0, 360]
+r_cell_r      <- rotate(r_cell)                   # [-180, 180]
+ext(r_cell)   <- round(ext(r_cell), 3)
 ext(r_cell_r) <- round(ext(r_cell_r), 3)
 
 spp <- unique(p_spp$sci_name) |> sort()
+
+sp_roseate_tern  <- "Sterna dougallii"
+roseate_tern_tif <- glue("{dir_rast}/{str_replace_all(sp_roseate_tern, ' ', '_')}.tif")
+if (file_exists(log_csv) && !file_exists(roseate_tern_tif)){
+  spp <- read_csv(log_csv) |> 
+    filter(message %in% c(
+      "no valid geometry for species",
+      "error reading geometry",
+      "rast has no values")) |> 
+    arrange(scientific_name) |> 
+    pull(scientific_name)
+}
 ```
 
 ```{r iter_spp_rast}
@@ -143,10 +207,22 @@ spp <- unique(p_spp$sci_name) |> sort()
 log_txt <- glue("{dir_rast}/_log {Sys.time()}.txt")
 log_appender(appender_file(log_txt))
 
-for (i in 1:length(spp)){ # i = 102 # Acrocephalus_familiaris
+for (i in 1:length(spp)){ # i = 2 # Acrocephalus_familiaris
+  # i = which(spp == "Sterna dougallii")
+  # i = which(spp == "Agelasticus cyanopus")
+  # i = which(spp == "Actitis hypoleucos")
   
-  sp <- spp[i] # sp <- "Acanthis flammea"
-  log_info("| INIT | {sp} | {i}/{length(spp)}")
+  sp <- spp[i]
+  rl_code <- d_spp |> 
+    filter(
+      ScientificName == sp) |>
+      pull(IUCN_RedList_Category_2024)
+  log_info("| INIT | {sp} | {i}/{length(spp)} ({rl_code})")
+  if (rl_code == "EX"){
+    # TODO: remove EX spp from previous vector intersection processing
+    log_info("| SKIP | {sp} | extinct species")
+    next()
+  }
   
   r_tif <- glue("{dir_rast}/{str_replace_all(sp, ' ', '_')}.tif")
   if (file.exists(r_tif)){
@@ -157,51 +233,71 @@ for (i in 1:length(spp)){ # i = 102 # Acrocephalus_familiaris
   p <- p_spp |> 
     filter(
       sci_name               == !!sp,
-      presence               %in% c(1,2,3), 
+      presence               %in% c(1,2,3)) |> 
       # presence -- 1: Extant, 2: Probably Extant, 3: Possibly Extant
-      st_geometry_type(geom) != "MULTISURFACE") |> 
+      # st_geometry_type(geom) != "MULTISURFACE") |> 
     mutate(
       value = 50L) # default value of 50%
   if (nrow(p) == 0){
-    log_info("| SKIP | {sp} | no valid geometry for species")
+    log_info("| SKIP | {sp} | no valid presence geometry for species")
     next()
   }
-  # mapView(p)
-  
+
   p <- try(
-    p |> 
-      st_make_valid() |> 
-      st_filter(er1, .predicate = st_intersects),
-    silent = T)
-  # mapView(p)
+    surf2poly(p),
+    silent = T) # plot(trim(r))
   if (inherits(p, "try-error")){
-    log_info("| SKIP | {sp} | error in st_make_valid(), st_filter(): {p}")
+    log_info("| SKIP | {sp} | error in surf2poly(),...: {p}")
     next()
   }
-  if (nrow(p) == 0){
-    log_info("| SKIP | {sp} | not intersecting ecoregions")
-    next()
-  }
+  # mapView(p)
   
+  # OLD: check if geometry intersects with USA ecoregions
+  # p <- try(
+  #   p |> 
+  #     st_make_valid() |> 
+  #     st_filter(er1, .predicate = st_intersects),
+  #   silent = T)
+  # # mapView(p)
+  # if (inherits(p, "try-error")){
+  #   log_info("| SKIP | {sp} | error in st_make_valid(), st_filter(): {p}")
+  #   next()
+  # }
+  # if (nrow(p) == 0){
+  #   log_info("| SKIP | {sp} | not intersecting ecoregions")
+  #   next()
+  # }
+  # 
+  # r <- try(
+  #   rasterize(
+  #     p,
+  #     r_cell_r, 
+  #     field = "value") |> 
+  #     # trim() |> 
+  #     # mapView()
+  #     rotate() |> 
+  #     crop(r_cell) |> 
+  #     mask(r_cell),
+  #   silent = T)
+  # plot(trim(r))
+  
+  # NEW: rasterize without vector intersection
   r <- try(
     rasterize(
       p,
       r_cell_r, 
-      field = "value") |> 
-      # trim() |> 
-      # mapView()
+      field = "value") |> # trim() |> mapView()
       rotate() |> 
       crop(r_cell) |> 
       mask(r_cell),
-    silent = T)
-  # plot(trim(r))
+    silent = T) # plot(trim(r))
   if (inherits(r, "try-error")){
     log_info("| SKIP | {sp} | error in rasterize(),...: {r}")
     next()
   }
   n_cells <- length(values(r, na.rm = T))
   if (n_cells == 0){
-    log_info("| SKIP | {sp} | rast has no values")
+    log_info("| SKIP | {sp} | rast has no intersecting values")
     next()
   }
   names(r) <- sp
@@ -256,6 +352,9 @@ for (i in 1:length(spp)){ # i = 102 # Acrocephalus_familiaris
 ```
 
 ```{r tbl_log}
+d_spp <- read_sf(botw_gpkg, "main_BL_HBW_Checklist_V9") |> 
+  clean_names() 
+
 d_log <- readLines(log_txt) |> 
   str_subset("^INFO") |>    # remove extra lines from error output
   paste(collapse = "\n") |> 
@@ -272,14 +371,31 @@ d_log <- readLines(log_txt) |>
     msg = str_replace(msg, "error.+", "error reading geometry")) |>
   mutate(
     tif_created = case_when(
-      msg  == "tif already exists" ~ T, #  39
-      type == "WRITE" ~ T,              # 496
+      msg  == "tif already exists" ~ T, #  39 #
+      type == "WRITE" ~ T,              # 496 #
       .default = F),                    # 535: sum
     has_problem = case_when(
       type == "SKIP" & !(msg %in% c(
-        "not intersecting ecoregions", 
+        "extinct species", 
+        "no valid presence geometry for species", 
+        "rast has no intersecting values", 
         "tif already exists")) ~ T,     # T:    443
-      .default = F))                    # F: 10,620
+      .default = F),
+    status = case_when(
+      tif_created == T ~ "extracted",
+      has_problem == T ~ "problem",
+      .default = "outside")) |> 
+  left_join(
+    d_spp |> 
+      select(sp = scientific_name, common_name, iucn_redlist = iucn_red_list_category_2024),
+    by = "sp")
+
+# only one problem: 
+# Hellmayr's Pipit _Anthus hellmayri_ -- error reading geometry
+
+d_log |> 
+  select(scientific_name = sp, common_name, iucn_redlist, status, message = msg) |> 
+  write_csv(log_csv)
 
 # DEBUG ----
 # summarize
@@ -358,6 +474,7 @@ con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F))
 
 ```{r insert_dataset}
 ds_key      <- "bl"
+
 row_dataset <- tibble(
   ds_key          = !!ds_key,
   name_short      = "BirdLife Birds of the World, 2024",

@@ -22,6 +22,7 @@ mapviewOptions(
   vector.palette = \(n) grDevices::hcl.colors(n, palette = "Spectral") )
 sf_use_s2(T)
 
+ds_key       <- "ch_nmfs"
 is_server    <- Sys.info()[["sysname"]] == "Linux"
 dir_private  <- ifelse(is_server, "/share/private", "~/My Drive/private")
 iucn_tkn_txt <- glue("{dir_private}/iucnredlist.org_api_token_v4.txt")
@@ -110,9 +111,7 @@ lns_s |>
 if (!file.exists(ply_geo)){
   sf_use_s2(F)
   
-  ply <- st_read(gdb, layer = "All_critical_habitat_poly_20230724", quiet = T) |> 
-    tibble() |> 
-    st_as_sf() |> 
+  ply <- read_sf(gdb, layer = "All_critical_habitat_poly_20230724", quiet = T) |> 
     st_make_valid()
   
   # ply$LISTSTATUS |> table()
@@ -291,7 +290,6 @@ con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F))
 ### Add `dataset`
 
 ```{r insert_dataset_row}
-ds_key      <- "ch_nmfs"
 row_dataset <- tibble(
   ds_key          = !!ds_key,
   name_short      = "NMFS Critical Habitat for USA, 2025-05-12",
@@ -329,8 +327,6 @@ TODO:
 - [ ] sort different liststatus per species, e.g. Rice's whale has both "prop." and "fin." status
 
 ```{r setup_iterate}
-ds_key      <- "ch_nmfs"
-
 ply <- read_sf(gdb, layer = "All_critical_habitat_poly_20230724", quiet = T) |> 
   clean_names() |> 
   st_make_valid() |> 
@@ -350,7 +346,11 @@ ply <- read_sf(gdb, layer = "All_critical_habitat_poly_20230724", quiet = T) |>
         "baleen whale", "toothed whale", "pinniped") ~ "mammal",
       str_detect(comname, "Coral")                   ~ "coral",
       taxon == "marine reptile"                      ~ "turtle",
-      .default = taxon))
+      .default = taxon),
+    value = case_match(
+      esa_code,
+      "TN" ~ 70L,    # assign 70% presence to Threatened habitat
+      "EN" ~ 90L ))  # assign 90% presence to Endangered habitat
 
 # ply |> pull(sp_cat) |> table(useNA = "ifany")
 # coral         fish invertebrate       mammal       turtle 
@@ -399,14 +399,7 @@ for (i in d_spp$rowid){  # i = 30 # Whale, humpback
   
   d_sp <- filter(d_spp, rowid == i)
   sp   <- d_sp$sciename
-  p_sp <- ply |> 
-    filter(
-      sciename == sp) |> 
-    mutate(
-      value = case_match(
-        esa_code,
-        "TN" ~ 70L,    # assign 70% presence to Threatened habitat
-        "EN" ~ 90L ))  # assign 90% presence to Endangered habitat
+  p_sp <- filter(ply, sciename == sp)
   # mapView(p_sp, zcol = "esa_code")
         
   sp_key <- glue("{ds_key}:{d_sp$sciename}")
@@ -414,11 +407,13 @@ for (i in d_spp$rowid){  # i = 30 # Whale, humpback
   r_sp <- rasterize(
     p_sp,
     r_cell_r, 
-    field = "value") |>  # trim() |> mapView()
+    field   = "value",
+    fun     = "max",
+    touches = T) |>  # trim() |> mapView()
     rotate() |> 
     crop(r_cell) |> 
     mask(r_cell)
-  # mapView(r_sp) + mapView(p_sp, zcol = "esa_code")
+  # mapView(as.factor(trim(r_sp)) + mapView(p_sp, zcol = "esa_code")
   
   n_cells <- length(values(r_sp, na.rm = T))
   if (n_cells == 0){
