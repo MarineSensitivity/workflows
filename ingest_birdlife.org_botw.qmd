@@ -36,6 +36,8 @@ botw_gpkg <- glue("{dir_bl}/BOTW_GPKG_2024_2/BOTW_2024_2.gpkg")
 # log_txt   <- glue("{dir_rast}/_log 2025-07-23 01:04:17.350045.txt")
 log_txt   <- glue("{dir_rast}/_log 2025-07-28 13:35:16.327585.txt")
 log_csv   <- glue("{dir_rast}/_ingest_birdlife.org_status.csv")
+ds_key    <- "bl"
+
 dir_create(dir_rast)
 ```
 
@@ -473,8 +475,6 @@ con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F))
 ### Add `dataset`
 
 ```{r insert_dataset}
-ds_key      <- "bl"
-
 row_dataset <- tibble(
   ds_key          = !!ds_key,
   name_short      = "BirdLife Birds of the World, 2024",
@@ -508,20 +508,103 @@ dbWriteTable(con_sdm, "dataset", row_dataset, append = TRUE)
 
 ### Add `species`
 
+```{r fix_sp_key}
+#| eval: false
+
+# ∆ sp_key 'bl:{spc_rec_id}' -> 'bl:{sis_rec_id}'; add 37 spp with old NAs
+
+dir_rast_0 <- glue("{dir_bl}/rast") # OLD: vector intersection processing
+d_rast <- tibble( # 573
+  tif = c(
+    dir_ls(dir_rast_0, glob = "*.tif"),
+    dir_ls(dir_rast, glob = "*.tif"))) |> 
+  mutate(
+    sp_sci = str_remove(basename(tif), "\\.tif$") |>
+      str_replace("_", " ") |>
+      str_trim()) |> 
+  left_join(
+    read_sf(botw_gpkg, "main_BL_HBW_Checklist_V9") |> 
+      clean_names(),
+  by = join_by(sp_sci == scientific_name)) |> 
+  mutate(
+    ds_key     = !!ds_key,
+    sp_key_old = glue("{ds_key}:{spc_rec_id}"),
+    sp_key_new = glue("{ds_key}:{sis_rec_id}"))
+
+sum(duplicated(d_rast$sp_key_old)) # 36
+stopifnot(sum(duplicated(d_rast$sp_key_new)) == 0)
+# is.na(d_rast$spc_rec_id) |> table()
+# FALSE  TRUE 
+#   536    37
+# is.na(d_rast$sis_rec_id) |> table()
+# FALSE 
+#   573 
+
+# find model with NA taxa (catchall for previous run using `spc_rec_id` for sp_key)
+mdl_seq_na <- tbl(con_sdm, "model") |> 
+  filter(
+    ds_key == !!ds_key, 
+    taxa  == "bl:NA") |> 
+  pull(mdl_seq) # mdl_seq_na = 18150
+# delete model_cell with mdl_seq_na
+if (length(mdl_seq_na) > 0){
+  dbExecute(con_sdm, glue("DELETE FROM model_cell WHERE mdl_seq IN ({paste(mdl_seq_na, collapse = ',')})"))
+  dbExecute(con_sdm, glue("DELETE FROM model WHERE ds_key = '{ds_key}' AND taxa = 'bl:NA'"))
+  dbExecute(con_sdm, glue("DELETE FROM species WHERE ds_key = '{ds_key}' AND taxa = 'bl:NA'"))
+}
+
+# register d_spp as temporary table for joining sis_rec_id to species
+duckdb_register(con_sdm, "tmp_spp", d_rast)
+
+# update species.taxa & .sp_key to tmp_spp.sp_key_new ----
+setdiff(
+  d_rast$sp_key_old,
+  tbl(con_sdm, "species") |> pull(taxa)) # "bl:NA"
+dbExecute(con_sdm, "
+  UPDATE species
+  SET   taxa   = tmp_spp.sp_key_new,
+        sp_key = tmp_spp.sp_key_new
+  FROM tmp_spp
+  WHERE species.ds_key = tmp_spp.ds_key AND
+        species.taxa   = tmp_spp.sp_key_old")
+setdiff(
+  d_rast$sp_key_new,
+  tbl(con_sdm, "species") |> pull(taxa)) # [37] from "bl:NA"
+
+# update model.taxa to tmp_spp.sp_key_new ----
+dbExecute(con_sdm, "
+  UPDATE model
+  SET   taxa = tmp_spp.sp_key_new
+  FROM tmp_spp
+  WHERE model.ds_key = tmp_spp.ds_key AND
+        model.taxa   = tmp_spp.sp_key_old") # 536 rows
+
+duckdb_unregister(con_sdm, "temp_spp")
+```
+
 ```{r insert_species}
-r_spp <- rast(dir_ls(dir_rast, glob = "*.tif"))
+# r_spp <- rast(dir_ls(dir_rast, glob = "*.tif"))
 
-d_spp <- read_sf(botw_gpkg, "main_BL_HBW_Checklist_V9") |> 
-  clean_names() |> 
-  filter(scientific_name %in% names(r_spp)) |> 
-  arrange(scientific_name)
-stopifnot(nrow(d_spp) == nlyr(r_spp))
+# d_spp <- read_sf(botw_gpkg, "main_BL_HBW_Checklist_V9") |> 
+#   clean_names() |> 
+#   filter(scientific_name %in% names(r_spp)) |> 
+#   arrange(scientific_name)
+# stopifnot(nrow(d_spp) == nlyr(r_spp))
 
+# DEBUG: quick fix for species with previous "bl:NA"
+d_spp <- d_rast |> 
+  rename(scientific_name = sp_sci) |> 
+  filter(
+    !sp_key_new %in% (tbl(con_sdm, "species") |> pull(taxa))) # 37 x 19
+
+r_spp <- rast(d_spp$tif) # 37 x 1
+  
 for (i in 1:nrow(d_spp)){ # i = 1
   
   sp     <- d_spp$scientific_name[i]
   d_sp   <- d_spp[i,]
-  sp_key <- glue("{ds_key}:{d_sp$spc_rec_id}")
+  # sp_key <- glue("{ds_key}:{d_sp$spc_rec_id}") # OLD: has NAs
+  sp_key <- glue("{ds_key}:{d_sp$sis_rec_id}") # NEW: has no NAs
   r_sp   <- r_spp[[sp]]
   
   # delete: existing ----
@@ -594,6 +677,7 @@ for (i in 1:nrow(d_spp)){ # i = 1
     sp_cat                   = sp_cat)
   stopifnot(length(setdiff(names(d_species), dbListFields(con_sdm, "species"))) == 0)
   stopifnot(setdiff(dbListFields(con_sdm, "species"), names(d_species)) == "sp_seq")
+  # d_species |> glimpse()
   dbWriteTable(con_sdm, "species", d_species, append = T)
   # tbl(con_sdm, "species") |> collect() |> tail()
   # tbl(con_sdm, "model") |> collect() |> tail()
