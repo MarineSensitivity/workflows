@@ -36,6 +36,7 @@ ply_shp      <- glue("{dir_fws}/crithab_all_layers/crithab_poly.shp")
 lns_shp      <- glue("{dir_fws}/crithab_all_layers/CRITHAB_LINE.shp")
 species_csv  <- glue("{dir_fws}/species.csv")
 ch_spp_csv   <- glue("{dir_fws}/crithab_spp.csv")
+ch_taxon_csv <- glue("{dir_fws}/crithab_spp_taxon.csv")
 dir_rast     <- glue("{dir_fws}/crithab_rast")
 ds_key       <- "ch_fws"
 
@@ -94,6 +95,16 @@ con_spp <- dbConnect(duckdb(dbdir = spp_db, read_only = T))
 # [1] "gbif"             "gbif_vernacular"  "itis"             "itis_vernacular" 
 # [5] "iucn_redlist"     "iucn_vernacular"  "worms"            "worms_vernacular"
 con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F))
+
+# *DEBUG* ----
+# tbl(con_sdm, "model") |>
+#   group_by(ds_key) |>
+#   summarize(n = n())
+#   ds_key      n
+#   <chr>   <dbl>
+# 1 ch_nmfs    34
+# 2 am_0.05 17550
+# 3 bl        573
 ```
 
 ### Add `dataset`
@@ -209,6 +220,10 @@ log_appender(appender_file(log_txt))
 for (i in d_spp$rowid){  # i = 69 # C00S _Chelonia mydas_ Green sea turtle
   # sp = "Charadrius melodus" # Piping Plover: no intersection with er1
   # sp = "Ursus maritimus"    # Polar Bear: 
+  
+  # rast('/Users/bbest/Library/CloudStorage/GoogleDrive-ben@ecoquants.com/My Drive/projects/msens/data/raw/fws.gov/crithab_rast/Chelonia_mydas.tif')
+  # min value   :             70 
+  # max value   :             90 
   
   d_sp    <- filter(d_spp, rowid == i)
   sp_sci  <- d_sp$sciname
@@ -480,78 +495,79 @@ d_rast_taxon <- d_rast_taxon |>
 # d_rast_taxon |>
 #   filter(common_name_dataset == "Gulf sturgeon") |>
 #   glimpse()
+
+write_csv(d_rast_taxon, ch_taxon_csv)
 ```
 
-```{r ply_ch}
-# DEBUG ----
-ply_ch <- ply |> 
+```{r iterate_rast_to_db}
+d_rast4db <- read_csv(ch_taxon_csv) # 313 × 20
+
+# table(d_rast4db$species_group, useNA = "ifany")
+#       Amphibians        Arachnids            Birds      Crustaceans 
+#                2                1               18                1 
+# Ferns and Allies           Fishes Flowering Plants          Insects 
+#               13                4              239               10 
+#          Mammals         Reptiles           Snails 
+#                9               15                1 
+
+d_birds <- d_rast4db |> 
+  filter(species_group == "Birds") |>  # 18 rows
   mutate(
-    taxon    = tolower(taxon),
-    esa_code = case_match( # er: extinction risk
-      liststatus,
-      "Threatened" ~ "TN",     # "TN" = 0.6
-      "Endangered" ~ "EN") |>  # "EN" = 0.8
-      factor(c("TN", "EN"), ordered = T)) |> 
-  # pull(taxon) |> table(useNA = "ifany")
-  # baleen whale           fish   invertebrate marine reptile       pinniped  toothed whale 
-  #            5             18             13              7              8              3 
+    sp_cat = "bird")
+d_notbirds <- d_rast4db |> 
+  filter(
+    species_group != "Birds",
+    !is.na(worms_is_marine),
+    worms_is_marine == T) |> 
   mutate(
-    sp_cat = case_when(
-      taxon %in% c(
-        "baleen whale", "toothed whale", "pinniped") ~ "mammal",
-      str_detect(comname, "Coral")                   ~ "coral",
-      taxon == "marine reptile"                      ~ "turtle",
-      .default = taxon)) |> 
-  # pull(sp_cat) |> table(useNA = "ifany")
-  # coral         fish invertebrate       mammal       turtle 
-  #     12           18            1           16            7
-  arrange(sp_cat, sciename, comname, esa_code) |> 
-  group_by(
-    sp_cat, sciename, comname) |>
-  summarize(
-    esa_code = last(esa_code), # use precautionary principle for now; 
-    # TODO: figure out way to have different esa_code in different regions -- affect other distributions?
-    .groups = "drop")
+    sp_cat = case_match(
+      species_group,
+      "Fishes"   ~ "fish",
+      "Mammals"  ~ "mammal",
+      "Reptiles" ~ "turtle"))       # 11 rows
+d_rast4db <- bind_rows(d_birds, d_notbirds) |> 
+  arrange(scientific_name_dataset)  # 313 -> 29 rows
 
-stopifnot(sum(duplicated(ply_ch$sciename)) == 0)
+# table(d_rast4db$sp_cat, useNA = "ifany")
+# bird   fish mammal turtle 
+#   18      3      3      5
 
-ply_ch |> 
-  mapView(alpha.regions = 0.5, zcol = "comname")
+# ext(r_cell) <- round(ext(r_cell), 3)
 
-r_cell   <- rast(cell_tif, lyrs = "cell_id") # [   0, 360]
-ext(r_cell) <- round(ext(r_cell), 3)
-r_cell_r <- rotate(r_cell)                   # [-180, 180]
-ext(r_cell_r) <- round(ext(r_cell_r), 3)
-```
+for (i in 1:nrow(d_rast4db)){  # i = 1
 
-```{r iterate_rows}
-for (i in 1:nrow(ply_ch)){  # i = 1
+  r_sp   <- rast(d_rast4db$tif[i])
+  ext(r_sp) <- round(ext(r_sp), 3)
   
-  p_sp   <- ply_ch |> slice(i) |> 
-    mutate(
-      value = 75L) # assign 75% to critical habitat, TODO: use extinction risk
-  d_sp   <- ply_ch |> st_drop_geometry() |> slice(i)
-  sp     <- d_sp$sciename
-  sp_key <- glue("{ds_key}:{d_sp$sciename}")
+  d_sp   <- d_rast4db |> slice(i)
+  # d_sp |> glimpse()
+  # $ tif                      <chr> "/Users/bbest/My Drive/projects/msens/data…
+  # $ sp_code                  <chr> "E04W"
+  # $ esa_code_max             <chr> "TN"
+  # $ n_esa_tn                 <dbl> 1
+  # $ n_esa_en                 <dbl> 0
+  # $ common_name_dataset      <chr> "Gulf sturgeon"
+  # $ scientific_name_dataset  <chr> "Acipenser oxyrinchus (=oxyrhynchus) desot…
+  # $ fws_url                  <chr> "https://ecos.fws.gov/ecp/species/651"
+  # $ species_group            <chr> "Fishes"
+  # $ worms_id                 <dbl> 1805509
+  # $ scientific_name_worms    <chr> "Acipenser desotoi"
+  # $ worms_is_marine          <lgl> TRUE
+  # $ worms_is_extinct         <lgl> NA
+  # $ itis_id                  <dbl> 624005
+  # $ scientific_name_itis     <chr> "Acipenser oxyrinchus desotoi"
+  # $ common_name_worms        <chr> NA
+  # $ isPreferredName          <dbl> NA
+  # $ common_name_itis         <chr> "Gulf sturgeon"
+  # $ scientific_name_accepted <chr> "Acipenser desotoi"
+  # $ common_name_accepted     <chr> "Gulf sturgeon"
+  # $ sp_cat                   <chr> "fish"
+  sp     <- d_sp$scientific_name_dataset
+  sp_key <- glue("{ds_key}:{d_sp$sp_code}")
   
-  # mapView(r_cell_r) +
-  #   mapView(r_sp) +
-  #   mapView(p_sp)
-  
-  r_sp <- rasterize(
-    p_sp,
-    r_cell_r, 
-    field = "value") |>  # trim() |> mapView()
-    rotate() |> 
-    crop(r_cell) |> 
-    mask(r_cell)
   n_cells <- length(values(r_sp, na.rm = T))
   if (n_cells == 0){
     message(glue("No cells for {sp} ({i}/{nrow(ply_ch)})"))
-    # No cells for Oncorhynchus keta    (16/38)
-    # No cells for Oncorhynchus nerka   (17/38)
-    # No cells for Sebastes paucispinis (21/38)
-    # No cells for Sebastes ruberrimus  (22/38)
     next()
   }
 
@@ -559,7 +575,7 @@ for (i in 1:nrow(ply_ch)){  # i = 1
   mdl_seqs <- tbl(con_sdm, "model") |> 
     filter(ds_key == !!ds_key, taxa == !!sp_key) |> 
     pull(mdl_seq)
-  if (length(mdl_seqs > 0)) {
+  if (length(mdl_seqs) > 0) {
     dbExecute(con_sdm, glue("DELETE FROM model WHERE ds_key = '{ds_key}' AND taxa = '{sp_key}'"))
     dbExecute(con_sdm, glue("DELETE FROM species WHERE ds_key = '{ds_key}' AND taxa = '{sp_key}'"))
     dbExecute(con_sdm, glue("DELETE FROM model_cell WHERE mdl_seq IN ({paste(mdl_seqs, collapse = ',')})"))
@@ -573,7 +589,7 @@ for (i in 1:nrow(ply_ch)){  # i = 1
     region      = "Global",
     mdl_type    = "binary",
     description = glue(
-      "NMFS critical habitat for {sp}, interpolated to 0.05° resolution") )
+      "FWS critical habitat for {sp}, interpolated to 0.05° resolution") )
   dbWriteTable(con_sdm, "model", d_model, append = TRUE)
   # tbl(con_sdm, "model") |> collect() |> tail()
   
@@ -598,18 +614,19 @@ for (i in 1:nrow(ply_ch)){  # i = 1
     ds_key                   = ds_key,
     taxa                     = sp_key,
     sp_key                   = sp_key,
-    worms_id                 = NA_integer_,  # TODO: lookup from WoRMS
+    worms_id                 = d_sp$worms_id,
     gbif_id                  = NA_integer_,  # TODO: lookup from GBIF
-    itis_id                  = NA_integer_,  # TODO: lookup from ITIS
+    itis_id                  = d_sp$itis_id,
     iucn_id                  = NA_integer_,  # TODO: lookup from IUCN
     scientific_name_dataset  = sp,
-    common_name_dataset      = d_sp$comname,
+    common_name_dataset      = d_sp$common_name_dataset,
     # TODO: do lookup from WoRMS
-    scientific_name_accepted = sp,
-    common_name_accepted     = d_sp$comname,
-    redlist_code             = d_sp$esa_code,
+    scientific_name_accepted = d_sp$scientific_name_accepted,
+    common_name_accepted     = d_sp$common_name_accepted,
+    redlist_code             = d_sp$esa_code_max,
     redlist_year             = NA_integer_,
     sp_cat                   = d_sp$sp_cat)
+  # glimpse(d_species)
   stopifnot(length(setdiff(names(d_species), dbListFields(con_sdm, "species"))) == 0)
   stopifnot(setdiff(dbListFields(con_sdm, "species"), names(d_species)) == "sp_seq")
   dbWriteTable(con_sdm, "species", d_species, append = T)
@@ -620,10 +637,9 @@ for (i in 1:nrow(ply_ch)){  # i = 1
   # append: model_cell ----
   d_mdl_cell <- as.data.frame(r_sp, cells = T, na.rm = T) |>
     tibble() |>
-    select(cell_id = cell) |> 
+    select(cell_id = cell, value = 2) |> 
     mutate(
-      mdl_seq = mdl_seq,
-      value   = 75L) |> 
+      mdl_seq = mdl_seq) |> 
     arrange(cell_id)
   dbWriteTable(con_sdm, "model_cell", d_mdl_cell, append = T)
 }
