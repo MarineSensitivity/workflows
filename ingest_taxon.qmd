@@ -45,6 +45,10 @@ iucn_vrn     <- glue("{dir_gbif}/iucn-2025-1/vernacularname.txt")
 worms_tsv    <- glue("{dir_worms}/taxon.txt")
 worms_habs   <- glue("{dir_worms}/speciesprofile.txt")
 worms_vrn    <- glue("{dir_worms}/vernacularname.txt")
+dir_bl        <- glue("{dir_data}/raw/birdlife.org")
+botw_gpkg     <- glue("{dir_bl}/BOTW_GPKG_2024_2/BOTW_2024_2.gpkg")
+botw_csv      <- glue("{dir_bl}/spp_botw.csv")
+botw_vern_csv <- glue("{dir_bl}/spp_botw_vernacular.csv")
 
 Sys.setenv(IUCN_REDLIST_KEY = readLines(iucn_tkn_txt))
 
@@ -241,6 +245,193 @@ if (!"iucn_vernacular" %in% dbListTables(con_spp)){
   dbExecute(con_spp, "CREATE INDEX iucn_vernacular_taxonID_idx on iucn_vernacular (taxonID)")
 }
 ```
+
+## Birds of the World (BOTW)
+
+```{r botw}
+
+if (any(!file_exists(c(botw_csv,botw_vern_csv)))){
+
+  # read d_botw ----
+  
+  # read in Birds of the World BOTL species data to use as taxonomic authority
+  d_botw <- read_sf(botw_gpkg, "main_BL_HBW_Checklist_V9") |>
+    clean_names()
+    
+  # names(d_botw)
+  #  [1] "seq"                         "order"                      
+  #  [3] "family_name"                 "family"                     
+  #  [5] "subfamily"                   "tribe"                      
+  #  [7] "common_name"                 "scientific_name"            
+  #  [9] "authority"                   "iucn_red_list_category_2024"
+  # [11] "synonyms"                    "alternative_common_names"   
+  # [13] "taxonomic_sources"           "sis_rec_id"                 
+  # [15] "spc_rec_id"
+  # is.na(d_botw$sis_rec_id) |> sum()      #     0
+  # is.na(d_botw$spc_rec_id) |> sum()      # 1,335
+  # duplicated(d_botw$sis_rec_id) |> sum() # 0
+  # d_botw$iucn_red_list_category_2024 |> table(useNA = "ifany")
+  #  CR  CR (PE) CR (PEW)       DD       EN       EW       EX       LC       NT       VU
+  # 204       18        1       38      395        5      164     8742      935      693
+  
+  d_botw <- d_botw |> 
+    select(
+      botw_id = sis_rec_id,
+      scientific_name, 
+      scientific_name_alternatives = synonyms,
+      common_name,
+      common_name_alternatives     = alternative_common_names, 
+      redlist_code                 = iucn_red_list_category_2024, 
+      order, 
+      family,
+      family_common_name           = family_name, 
+      subfamily, 
+      tribe,
+      taxonomic_authority = authority,
+      taxonomic_sources) |>
+    mutate(
+      kingdom = "Animalia",
+      phylum  = "Chordata",
+      class   = "Aves") |> 
+    relocate(kingdom, phylum, class, .before = order)
+  # range(d_botw$botw_id) # 22,678,073 244,681,681
+  
+  # create botw ----
+  # taxonomic table of scientific names
+  
+  # template:
+  # dbListFields(con_spp, "worms")
+    #  [1] "taxonID"                  "scientificNameID"         "acceptedNameUsageID"     
+    #  [4] "parentNameUsageID"        "namePublishedInID"        "scientificName"          
+    #  [7] "acceptedNameUsage"        "parentNameUsage"          "namePublishedIn"         
+    # [10] "namePublishedInYear"      "kingdom"                  "phylum"                  
+    # [13] "class"                    "order"                    "family"                  
+    # [16] "genus"                    "subgenus"                 "specificEpithet"         
+    # [19] "infraspecificEpithet"     "taxonRank"                "scientificNameAuthorship"
+    # [22] "nomenclaturalCode"        "taxonomicStatus"          "nomenclaturalStatus"     
+    # [25] "modified"                 "bibliographicCitation"    "references"              
+    # [28] "license"                  "rightsHolder"             "datasetName"             
+    # [31] "institutionCode"          "datasetID"                "isMarine"                
+    # [34] "isFreshwater"             "isTerrestrial"            "isExtinct"               
+    # [37] "isBrackish"  
+  
+  botw <- d_botw |>
+    rename(
+      taxonID         = botw_id,
+      scientificName  = scientific_name) |> 
+    mutate(
+      acceptedNameUsage   = scientificName,
+      acceptedNameUsageID = taxonID) |> 
+    select(
+      -scientific_name_alternatives,
+      -common_name,
+      -common_name_alternatives) # 11,195
+  
+  botw_alt <- d_botw |>
+    select(
+      -common_name,
+      -common_name_alternatives) |> 
+    filter(
+      !is.na(scientific_name_alternatives)) |>
+    rename(
+      acceptedNameUsage   = scientific_name,
+      acceptedNameUsageID = botw_id,
+      scientificName      = scientific_name_alternatives) |> 
+    mutate(
+      taxonID = NA_integer_,
+      scientificName = scientificName |> 
+        str_squish() |> 
+        str_replace_all(" ; ", "; ")) |> 
+    relocate(taxonID) |>                           # 2,539
+    separate_longer_delim(
+      scientificName, delim = "; ") |>             # 2,918
+    filter(
+      !duplicated(scientificName),                 # 2,899
+      # TODO: problematic to disregard duplicate scientificName synonyms here?
+      !(scientificName %in% botw$scientificName))  # 2,719
+    
+  stopifnot(length(setdiff(names(botw), names(botw_alt))) == 0)
+  stopifnot(length(setdiff(names(botw_alt), names(botw))) == 0)
+  botw <- bind_rows(
+    botw,
+    botw_alt)
+  stopifnot(duplicated(botw$scientificName) |> sum() == 0)
+  
+  write_csv(botw, botw_csv)
+  
+  # create botw_vernacular ----
+  # taxonomic table of common names
+  
+  # template:
+  # tbl(con_spp, "worms_vernacular")
+  # taxonID vernacularName  isPreferredName
+  
+  botw_vernacular <- d_botw |>
+    filter(!is.na(common_name)) |>
+    select(
+      taxonID        = botw_id,
+      vernacularName = common_name) |> 
+    mutate(
+      isPreferredName = T)  # 11,195
+
+  botw_vernacular_alt <- d_botw |>
+    filter(!is.na(common_name_alternatives)) |>
+    select(
+      taxonID        = botw_id,
+      vernacularName = common_name_alternatives) |> 
+    mutate(
+      isPreferredName = F,
+      vernacularName = vernacularName |> 
+        str_squish() |> 
+        str_replace_all(" , ", ", ")) |>                      # 4,770
+    separate_longer_delim(
+      vernacularName, delim = ", ") |>                        # 8,190
+    filter(
+      !duplicated(vernacularName),                            # 8,151
+      !(vernacularName %in% botw_vernacular$vernacularName))  # 7,967
+
+  stopifnot(length(setdiff(names(botw_vernacular), names(botw_vernacular_alt))) == 0)
+  stopifnot(length(setdiff(names(botw_vernacular_alt), names(botw_vernacular))) == 0)
+  
+  botw_vernacular <- bind_rows(
+    botw_vernacular,
+    botw_vernacular_alt)
+  
+  stopifnot(duplicated(botw_vernacular$vernacularName) |> sum() == 0)
+  
+  write_csv(botw_vernacular, botw_vern_csv)
+}
+
+# ingest botw  ----
+if (!"botw" %in% dbListTables(con_spp)){
+
+  botw <- read_csv(botw_csv)
+
+  # dbExecute(con_spp, "DROP TABLE IF EXISTS botw")
+  dbWriteTable(con_spp, "botw", botw, append = F, batch_rows = 10000)
+
+  # Note: taxonID not unique b/c of scientific name synonyms have taxonID = NA
+  dbExecute(con_spp, "CREATE INDEX botw_taxonID_idx on botw (taxonID)")
+  dbExecute(con_spp, "CREATE INDEX botw_acceptedNameUsageID_idx on botw (acceptedNameUsageID)")
+  dbExecute(con_spp, "CREATE INDEX botw_scientificName_idx on botw (scientificName)")
+  # Note: no parentNameUsageID since all taxonic info is simple and in other columns
+  # TODO: combine with ITIS or WoRMS to get full taxonomic hierarchy with parentNameUsageID?
+}
+
+# ingest botw_vernacular ----
+if (!"botw_vernacular" %in% dbListTables(con_spp)){
+  
+  botw_vernacular <- read_csv(botw_vern_csv)
+  
+  # dbExecute(con_spp, "DROP TABLE IF EXISTS botw_vernacular")
+  dbWriteTable(con_spp, "botw_vernacular", botw_vernacular, append = F, batch_rows = 10000)
+  
+  dbExecute(con_spp, "CREATE INDEX botw_vernacular_taxonID_idx on botw_vernacular (taxonID)")
+}
+
+  
+```
+
 
 ## Load redlist
 
