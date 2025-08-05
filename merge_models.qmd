@@ -1568,9 +1568,59 @@ dbExecute(
 duckdb_unregister(con_sdm, "d2")
 ```
 
-```{r taxon_is_marine}
-# TODO: worms_is_marine, worms_is_extinct ----
+```{r taxon_worms_id_inclbirds}
+d <- tbl(con_sdm, "taxon") |> 
+  mutate(
+    worms_id = ifelse(taxon_authority == "worms", taxon_id, NA_integer_),
+    botw_id  = ifelse(taxon_authority == "botw",  taxon_id, NA_integer_)) |> 
+  select(taxon_id, taxon_authority, worms_id, botw_id) |> 
+  collect() # 17,561 × 4
+    
+d_b <- d |> 
+  filter(
+    taxon_authority == "botw",
+    !is.na(botw_id)) |>
+  select(-worms_id) |> 
+  left_join(
+    tbl(con_sdm, "species") |> 
+      filter(
+        sp_cat == "bird",
+        !is.na(worms_id)) |> 
+      select(botw_id, worms_id) |> 
+      collect() |> 
+      group_by(botw_id) |> 
+      summarize(
+        worms_id = first(worms_id)),
+    by = join_by(botw_id)) |> 
+  filter(!is.na(worms_id)) |> 
+  select(taxon_id, worms_id)
 
+d_w <- d |> 
+  filter(
+    taxon_authority == "worms",
+    !is.na(worms_id)) |>
+  select(taxon_id, worms_id)
+
+d2 <- bind_rows(
+  d_b, 
+  d_w) |> 
+  select(taxon_id, worms_id)
+
+stopifnot(sum(duplicated(d2$taxon_id)) == 0)
+
+dbExecute(con_sdm, "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS worms_id BIGINT")
+
+duckdb_register(con_sdm, "d2", d2)
+dbExecute(
+  con_sdm, 
+    "UPDATE taxon
+    SET worms_id  = d2.worms_id
+    FROM d2
+    WHERE taxon.taxon_id = d2.taxon_id")  # 17,352
+duckdb_unregister(con_sdm, "d2")
+```
+
+```{r taxon_is_marine}
 d <- tbl(con_sdm, "taxon") |> 
   mutate(
     worms_id = ifelse(taxon_authority == "worms", taxon_id, NA_integer_),
@@ -1850,7 +1900,6 @@ for (i in 1:nrow(d_x)){  # i = 1
     common_name_dataset      = sp_cmn,
     scientific_name_accepted = sp_sci,
     common_name_accepted     = sp_cmn,
-    # DEBUG: taxon.rl_code cont: mdl_seq == 18422 ----
     redlist_code             = d_sp$redlist_code,
     redlist_year             = NA_integer_,
     sp_cat                   = sp_cat,
@@ -1880,12 +1929,125 @@ for (i in 1:nrow(d_x)){  # i = 1
 }
 ```
 
+# taxon.`is_ok`
+
+Add `is_ok`: a simple logical field for flagging valid taxa, ie (so far):
+
+- birds:
+  - [x] add worms_id (if available)
+  - `redlist_code` != "EX"
+  - has a `botw_id`
+  - if has worms_id:
+    - `worms_is_marine`  != F
+    - `worms_is_extinct` != T
+- not birds:
+  - has a `worms_id`
+  - `worms_is_marine`  != F
+  - `worms_is_extinct` != T
+  
+```{r taxon_is_ok}
+d <- tbl(con_sdm, "taxon") |> 
+  collect() # 17,561 × 16
+    
+# birds ----
+# d |>
+#   filter(
+#     taxon_authority == "botw") |>
+#   pull(redlist_code) |>
+#   table(useNA = "ifany")
+#  CR  DD  EN  LC  NT  TN  VU 
+#   3   1  58 452  45  14  41 
+# 
+# d |>
+#   filter(
+#     taxon_authority == "botw") |> 
+#   select(worms_is_marine, worms_is_extinct) |> 
+#   table(useNA = "ifany")
+#                worms_is_extinct
+# worms_is_marine <NA>
+#           FALSE  118
+#           TRUE   221
+#           <NA>   275
+
+d_b <- d |>
+  filter(
+    taxon_authority == "botw") |> 
+  mutate(
+    is_ok = case_when(
+      is.na(taxon_id) ~ F,
+      is.na(mdl_seq)  ~ F,
+      !is.na(redlist_code) & redlist_code == "EX" ~ F, # 0
+      !is.na(worms_id) & worms_is_marine  == F    ~ F, # 118
+      !is.na(worms_id) & worms_is_extinct == T    ~ F, # 0
+      .default = T))
+# d_b$is_ok |> table(useNA = "ifany")
+# FALSE  TRUE 
+#   118   496
+
+# worms ----
+
+# d |>
+#   filter(
+#     taxon_authority == "worms") |>
+#   pull(redlist_code) |>
+#   table(useNA = "ifany")
+# CR    DD    EN    EX    LC    NT    TN    VU  <NA> 
+# 47   340   235     1  5574   107    11   154 10478
+# 
+# d |>
+#   filter(
+#     taxon_authority == "worms") |>
+#   select(worms_is_marine, worms_is_extinct) |>
+#   table(useNA = "ifany")
+#                worms_is_extinct
+# worms_is_marine FALSE  TRUE  <NA>
+#           FALSE    19     0    24
+#           TRUE   4171    20 12708
+#           <NA>      0     0     5
+
+d_w <- d |>
+  filter(
+    taxon_authority == "worms") |>
+  mutate(
+    is_ok = case_when(
+      is.na(taxon_id) ~ F,
+      is.na(mdl_seq)  ~ F,
+      !is.na(redlist_code) & redlist_code == "EX" ~ F, # 1
+      !is.na(worms_id) & worms_is_marine  == F    ~ F, # 19 + 24
+      !is.na(worms_id) & worms_is_extinct == T    ~ F, # 20
+      .default = T))
+# d_w$is_ok |> table(useNA = "ifany")
+# FALSE   TRUE 
+#    64 16,883
+
+d2 <- bind_rows(
+  d_b, 
+  d_w) |> 
+  select(taxon_id, is_ok)
+
+stopifnot(sum(duplicated(d2$taxon_id)) == 0)
+
+dbExecute(
+  con_sdm, 
+  "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS is_ok BOOLEAN")
+
+duckdb_register(con_sdm, "d2", d2)
+dbExecute(
+  con_sdm, 
+    "UPDATE taxon
+    SET is_ok  = d2.is_ok
+    FROM d2
+    WHERE taxon.taxon_id = d2.taxon_id")  # 17,561
+duckdb_unregister(con_sdm, "d2")
+```
+
 ```{r taxon_summary}
 taxon_csv <- here("data/taxon.csv")
 
 # dbListFields(con_sdm, "taxon") |> paste(collapse = ", ") |> cat()
 d_taxon <- tbl(con_sdm, "taxon") |> 
   select(
+    is_ok,
     component = sp_cat, 
     common_name, scientific_name,
     redlist_code_max = redlist_code, 
@@ -1897,25 +2059,27 @@ d_taxon <- tbl(con_sdm, "taxon") |>
     taxon_authority, 
     taxon_id, 
     model_id = mdl_seq) |> 
-  arrange(component, common_name) |> 
+  arrange(desc(is_ok), component, common_name) |> 
   collect()
 
 write_csv(d_taxon, taxon_csv)
 
-# d_taxon |>
+# d_taxon |>          # 17,561
+#   filter(is_ok) |>  # 17,379
 #   select(component, redlist_code_max) |>
 #   table(useNA = "ifany")
 #               redlist_code_max
-# component        CR   DD   EN   EX   LC   NT   TN   VU <NA>
-#   bird            3    1   58    0  452   45   14   41    0
-#   coral          16   10  143    0  201   17    4   20  364
-#   fish           20  242   61    0 4920   69    2  112 1253
-#   invertebrate    7   84   18    0  381   16    0   13 7724
-#   mammal          2    4   11    1   54    5    5    6    1
-#   other           0    0    0    0    2    0    0    0 1127
-#   reptile         2    0    2    0   16    0    0    3    9
+# component        CR   DD   EN   LC   NT   TN   VU <NA>
+#   bird            3    1   53  349   41   11   38    0
+#   coral          16   10  143  201   17    4   20  364
+#   fish           20  242   61 4920   69    2  112 1252
+#   invertebrate    7   84   18  377   16    0   13 7668
+#   mammal          2    4   11   54    5    5    6    1
+#   other           0    0    0    2    0    0    0 1126
+#   reptile         2    0    2   16    0    0    3    8
 
 d_taxon_p <- d_taxon |>
+  filter(is_ok) |>
   select(
     component, 
     taxon_id, 
@@ -1941,41 +2105,42 @@ d_taxon_p <- d_taxon |>
 #     n_models  = n_distinct(mdl_seq),
 #     .groups = "drop")
 #   component    n_species n_models
-# 1 bird               614      666
+#   <chr>            <int>    <int>
+# 1 bird               496      542
 # 2 coral              775      785
-# 3 fish              6679     6694
-# 4 invertebrate      8243     8244
-# 5 mammal              89      102
-# 6 other             1129     1129
-# 7 reptile             32       48
-
+# 3 fish              6678     6693
+# 4 invertebrate      8183     8184
+# 5 mammal              88      101
+# 6 other             1128     1128
+# 7 reptile             31       47
+# 
 # d_taxon_p |>
 #   group_by(component, dataset) |>
 #   summarize(
 #     n_models  = length(unique(mdl_seq)),
-#     .groups = "drop") |> 
+#     .groups = "drop") |>
 #   print(n = Inf)
 #    component    dataset      n_models
 #    <chr>        <chr>           <int>
 #  1 bird         aquamaps            1
-#  2 bird         birdlife          571
-#  3 bird         fws_crithab        17
-#  4 bird         fws_range          77
+#  2 bird         birdlife          457
+#  3 bird         fws_crithab        16
+#  4 bird         fws_range          68
 #  5 coral        aquamaps          774
 #  6 coral        nmfs_crithab       11
-#  7 fish         aquamaps         6676
+#  7 fish         aquamaps         6675
 #  8 fish         fws_crithab         3
 #  9 fish         fws_range           9
 # 10 fish         nmfs_crithab        6
-# 11 invertebrate aquamaps         8239
+# 11 invertebrate aquamaps         8179
 # 12 invertebrate fws_range           4
 # 13 invertebrate nmfs_crithab        1
-# 14 mammal       aquamaps           84
+# 14 mammal       aquamaps           83
 # 15 mammal       fws_crithab         3
 # 16 mammal       fws_range           4
 # 17 mammal       nmfs_crithab       11
-# 18 other        aquamaps         1129
-# 19 reptile      aquamaps           32
+# 18 other        aquamaps         1128
+# 19 reptile      aquamaps           31
 # 20 reptile      fws_crithab         5
 # 21 reptile      fws_range           7
 # 22 reptile      nmfs_crithab        4
