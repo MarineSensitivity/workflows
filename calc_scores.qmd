@@ -41,17 +41,41 @@ dir_data    <- ifelse(
   is_server,
   "/share/data",
   "~/My Drive/projects/msens/data")
-pa_gpkg     <- glue("{dir_data}/derived/ply_planareas_2025.gpkg")
-er_gpkg     <- glue("{dir_data}/derived/ply_ecoregions_2025.gpkg")
-metrics_tif <- glue("{dir_data}/derived/r_metrics.tif")
-sdm_db      <- glue("{dir_data}/derived/sdm.duckdb")
-# am_db       <- glue("{dir_data}/derived/aquamaps/am.duckdb")
+pa_gpkg        <- glue("{dir_data}/derived/ply_planareas_2025.gpkg")
+er_gpkg        <- glue("{dir_data}/derived/ply_ecoregions_2025.gpkg")
+metrics_tif    <- glue("{dir_data}/derived/r_metrics.tif")
+spp_global_csv <- glue("{dir_data}/derived/spp_global_cache.csv")
+lyrs_csv       <- glue("{dir_data}/derived/layers.csv")
+sdm_db         <- glue("{dir_data}/derived/sdm.duckdb")
+cell_tif       <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
+# am_db        <- glue("{dir_data}/derived/aquamaps/am.duckdb")
+
+# helper functions ----
+get_rast <- function(m_key){
+
+  d <- dbGetQuery(con_sdm, glue("
+        SELECT
+          cm.cell_id,
+          cm.value
+        FROM cell_metric cm
+        WHERE cm.metric_seq = (
+          SELECT metric_seq
+          FROM metric
+          WHERE metric_key = '{m_key}' )" ))
+  stopifnot(sum(duplicated(d$cell_id)) == 0)
+
+  r <- init(r_cell[[1]], NA)
+  r[d$cell_id] <- d$value
+
+  r
+}
 
 # database setup
 # db_path <- glue("{dir_data}/derived/msens_sdm.duckdb") # OLD: 10 GB with indexes, unvacuumed data, etc
 
 # file_delete(sdm_dd)
 con_sdm <- dbConnect(duckdb(), dbdir = sdm_db, read_only = F) # |> 
+# con_sdm <- dbConnect(duckdb(), dbdir = sdm_db, read_only = T) # |> 
   # load_duckdb_extensions()
 # dbDisconnect(con_sdm, shutdown = T); duckdb_shutdown(duckdb()); rm(con_sdm)
 # dbListTables(con_sdm)
@@ -65,7 +89,6 @@ con_sdm <- dbConnect(duckdb(), dbdir = sdm_db, read_only = F) # |>
 
 
 # for visual checks
-cell_tif <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
 r_cell <- rast(cell_tif)
 ext(r_cell) <- round(ext(r_cell), 3)
 ```
@@ -665,36 +688,6 @@ m_seq <- dbGetQuery(con_sdm, glue("
     SELECT metric_seq FROM metric WHERE metric_key = '{m_key}'")) |> 
   pull(metric_seq)
 
-# DEBUG BEG ----
-
-# tbl(con_sdm, "cell_metric") |> 
-#   filter(
-#     metric_seq == !!m_seq) |> 
-#   pull(value) |> 
-#   summary()
-# Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
-# 1533    7708   12593   21528   30982  282413
-
-# d_metric <- tbl(con_sdm, "metric") |> collect()
-# View(d_metric)
-# 
-# d_ecoregion_minmax <- dbGetQuery(con_sdm, "
-#   SELECT 
-#     z.zone_seq,
-#     MIN(zm.value) as min_value,
-#     MAX(zm.value) as max_value
-#   FROM zone z
-#   JOIN zone_metric zm USING (zone_seq)
-#   WHERE 
-#     z.fld = 'ecoregion_key' AND 
-#     zm.metric_seq IN (
-#       SELECT metric_seq FROM metric WHERE metric_key IN (
-#         'primprod_ecoregion_min',
-#         'primprod_ecoregion_max') )
-#   GROUP BY z.zone_seq")
-  
-# DEBUG END ----
-      
 # Rescale primary productivity by ecoregion
 # dbGetQuery(con_sdm, glue("
 dbExecute(con_sdm, glue("
@@ -1405,26 +1398,206 @@ dbExecute(con, "ALTER TABLE public.ply_ecoregions_2025 ADD COLUMN  IF NOT EXISTS
 
 ## Update cached downloads: pa|er.gpkg, metrics.tif
 
+```{r re-add_con_sdm.cell}
+if (!"cell" %in% dbListTables(con_sdm)) {
+  
+  if (!exists("r_cell"))
+    r_cell <- rast(cell_tif)
+
+  d_cell <- values(r_cell, dataframe = T, na.rm = T) |>
+    tibble() |>
+    mutate(
+      cell_id = as.integer(cell_id))
+  
+  # dbRemoveTable(con_sdm, "cell")
+  dbWriteTable(con_sdm, "cell", d_cell, append = F)
+  dbExecute(con_sdm, "ALTER TABLE cell ADD PRIMARY KEY (cell_id);")
+}
+```
+
 ```{r update_cached_downloads}
 redo_dl <- T
+
+# redo_dl: delete existing files
 if (redo_dl){
-  for (f in c(pa_gpkg, er_gpkg)){
+  for (f in c(pa_gpkg, er_gpkg, lyrs_csv, metrics_tif, spp_global_csv)){
     if (file_exists(f))
       file_delete(f) } }
+
+# * pa_gpkg ----
 if (!file.exists(pa_gpkg)) {
   message("Generating Planning Areas geopackage...")
   st_read(con, "ply_planareas_2025") |>
     st_write(pa_gpkg, delete_dsn = T, quiet = T)
 }
+
+# * er_gpkg ----
 if (!file.exists(er_gpkg)) {
   message("Generating Ecoregion geopackage...")
   st_read(con, "ply_ecoregions_2025") |>
     st_write(er_gpkg, delete_dsn = T, quiet = T)
 }
-# TODO: metrics_tif
-# if (!file.exists(metrics_tif)) {
-#   # message("TODO: Generate metrics raster...")
-# }
+
+# * lyrs_csv ----
+if (!file.exists(lyrs_csv)) {
+  message("Generating layers CSV...")
+  
+  sp_cats   <- tbl(con_sdm, "taxon") |>
+    filter(is_ok) |>
+    distinct(sp_cat) |> pull(sp_cat) |> sort()
+  sp_cats_u <- sp_cats |> str_replace(" ", "_")
+  
+  d_lyrs <- bind_rows(
+    tibble(
+      order    = 1,
+      category = "Overall",
+      layer    = "score",
+      lyr      = "score_extriskspcat_primprod_ecoregionrescaled_equalweights"),
+    tibble(
+      order    = 2,
+      category = "Species, rescaled by Ecoregion",
+      layer    = glue("{sp_cats}: ext. risk, ecorgn"),
+      lyr      = glue("extrisk_{sp_cats_u}_ecoregion_rescaled")),
+    tibble(
+      order    = 3,
+      category = "Primary Productivity, rescaled by Ecoregion",
+      layer    = glue("prim prod, ecorgn"),
+      lyr      = glue("primprod_ecoregion_rescaled")),
+    tibble(
+      order    = 4,
+      category = "Species, raw Extinction Risk",
+      layer    = glue("{sp_cats}: ext. risk"),
+      lyr      = glue("extrisk_{sp_cats_u}")),
+    tibble(
+      order    = 5,
+      category = "Primary Productivity, raw Phytoplankton",
+      lyr      = "primprod",
+      layer    = "prim prod, 2014-2023 avg (mg C/m^2/day)" ) )
+
+  write_csv(d_lyrs, lyrs_csv)
+}
+
+# * metrics_tif ----
+if (!file.exists(metrics_tif)) {
+  message("Generating Metrics raster...")
+  
+  d_lyrs <- read_csv(lyrs_csv)
+  
+  # add zones
+  lst <- list()
+  for (zone_fld in c("ecoregion_key", "planarea_key")){
+    # zone_fld = "ecoregion_key"
+    # zone_fld = "planarea_key"
+
+    d <- tbl(con_sdm, "zone") |>
+      filter(fld == !!zone_fld) |>
+      left_join(
+        tbl(con_sdm, "zone_cell"),
+        by = "zone_seq") |>
+      group_by(cell_id) |>
+      window_order(pct_covered) |>
+      summarize(
+        value = last(value),
+        .groups = "drop" ) |>
+      collect() |>
+      mutate(
+        "{zone_fld}" := as.factor(value)) |>
+      select(all_of(c("cell_id", zone_fld)))
+
+    r <- init(r_cell[[1]], NA) # |> as.factor() #sort(unique(d$value)))
+    # r$chr <- NA_character_ # ensure chr type
+    r[d$cell_id] <- d[[zone_fld]]
+    varnames(r)  <- zone_fld
+    names(r)     <- zone_fld
+    levels(r)    <- tibble(
+      id            = 1:length(levels(d[[zone_fld]])),
+      "{zone_fld}" := levels(d[[zone_fld]]))
+    lst[[zone_fld]] <- r
+  }
+  r_zones <- do.call(c, lst |> unname())
+
+  # add layers
+  lst <- list()
+  for (i in 1:nrow(d_lyrs)){ # i = 2
+    lyr   <- d_lyrs$lyr[i]
+    layer <- d_lyrs$layer[i]
+
+    r <- get_rast(lyr) # plot(r)
+    names(r) <- lyr
+    varnames(r) <- layer
+    lst[[i]] <- r
+  }
+  r_metrics <- do.call(c, lst)
+
+  r_metrics <- c(r_zones, r_metrics)
+  writeRaster(r_metrics, metrics_tif, overwrite = T)
+}
+  
+# * spp_global_csv ----
+if (!file.exists(spp_global_csv)) {
+  message("Generating Global Species CSV...")
+  
+  # OLD: in apps:mapgl/app.R
+  #   sp_cat	sp_key	scientific_name_dataset	common_name_dataset	worms_id	gbif_id	redlist_code	rl_score	suitability	suit_rl	pct_total
+  # dbListFields(con_sdm, "taxon") |> paste(collapse = ", ") |> cat()
+  # taxon_id, taxon_authority, n_ds, am_0.05, ch_nmfs, ch_fws, rng_fws, sp_cat, bl, mdl_seq, scientific_name, common_name, redlist_code, worms_is_marine, worms_is_extinct, worms_id, is_ok
+  d <- tbl(con_sdm, "taxon") |>
+    filter(is_ok) |>
+    select(sp_cat, common_name, scientific_name, taxon_id, taxon_authority, redlist_code, mdl_seq) |>
+    arrange(sp_cat, common_name) |>
+    mutate(
+      rl_score = case_match(
+        redlist_code,
+        # NEW: EX (extinct): is_ok = F
+        # NEW: NE (not evaluated), DD (data deficient), <NA> (not available) -> LC
+        # https://oceanhealthindex.org/images/htmls/Supplement.html#62_Biodiversity
+        "CR" ~ 1,           #  - CR: Critically Endangered
+        "EN" ~ 0.8,         #  - EN: Endangered (+ESA)
+        "VU" ~ 0.6,         #  - VU: Vulnerable
+        "TN" ~ 0.6,         #  - TN: Threatened (ESA only)
+        "NT" ~ 0.4,         #  - NT: Near Threatened
+        "LC" ~ 0.2,         #  - LC: Least Concern
+        .default = 0.2)) |> #  - NEW: assume LC for NAs and the rest
+    collect()  # 17,379 × 8
+
+  stopifnot(sum(duplicated(d$mdl_seq)) == 0)
+
+  # model stats
+  d_m <- tbl(con_sdm, "model_cell") |>
+    filter(mdl_seq %in% d$mdl_seq) |>
+    left_join(
+      tbl(con_sdm, "cell") |> 
+        select(cell_id, area_km2),
+      by = join_by(cell_id)) |> 
+    group_by(mdl_seq) |>
+    summarize(
+      area_km2 = sum(area_km2, na.rm = T),
+      avg_suit = mean(value,   na.rm = T) / 100,
+      .groups = "drop") |>
+    collect()
+  #  summary(d_m)
+  #      mdl_seq         area_km2           avg_suit     
+  # Min.   :    1   Min.   :      19   Min.   :0.0100  
+  # 1st Qu.: 4526   1st Qu.:  155345   1st Qu.:0.2114  
+  # Median : 9096   Median :  492160   Median :0.3293  
+  # Mean   : 9073   Mean   :  868870   Mean   :0.3583  
+  # 3rd Qu.:13587   3rd Qu.:  776057   3rd Qu.:0.5000  
+  # Max.   :18512   Max.   :13706883   Max.   :0.9946  
+  #                 NA's   :10
+  # TODO: sort why NAs in area_km2?
+
+  d <- d |>
+    left_join(
+      d_m,
+      by = join_by(mdl_seq)) |>
+    mutate(
+      suit_rl      = avg_suit * rl_score,
+      suit_rl_area = avg_suit * rl_score * area_km2,
+      pct_total    = suit_rl_area / sum(suit_rl_area, na.rm = T),
+      is_pct_na    = is.na(pct_total))
+
+  write_csv(d, spp_global_csv)
+}
 ```
 
 
@@ -1518,39 +1691,51 @@ con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F)) |>
   load_duckdb_extensions()
  
 # dbListTables(con_sdm)
-dbExecute(con_sdm, "SET threads = 8;")
+dbExecute(con_sdm, "SET threads = 7;")
 dbExecute(con_sdm, "SET memory_limit = '20GB';")
 
-dir_pq <- glue("{dir_data}/derived/sdm_parquet")
+dir_pq <- glue("{dir_data}/derived/sdm_parquet") |> normalizePath()
 if (dir_exists(dir_pq))
   dir_delete(dir_pq)
 dir_create(dir_pq)
 
-dbExecute(con_sdm, glue(
-  "EXPORT DATABASE '{normalizePath(dir_pq)}' (
-    FORMAT parquet,
-    COMPRESSION zstd,
-    ROW_GROUP_SIZE 100_000, 
-    ROW_GROUPS_PER_FILE 1000,
-    OVERWRITE );")) # 3 secs
+# OLD: add primary keys, indexes
+# NEW: skip indexes, sort on export, per [performance](https://duckdb.org/docs/stable/guides/performance/indexing.html)
 
-# mdl_cell_pq <- glue("{dir_pq}/model_cell.parquet")
-# mdl_cell_pq <- glue("{dir_data}/derived/sdm_model_cell.parquet")
+tbl_keys <- list(
+  cell        = "cell_id",
+  cell_metric = c("cell_id", "metric_seq"),
+  dataset     = "ds_key",
+  metric      = "metric_seq",
+  model       = "mdl_seq",
+  model_cell  = c("cell_id", "mdl_seq"), # *big* one
+  species     = "sp_seq",
+  taxon       = "taxon_id",
+  zone        = "zone_seq",
+  zone_cell   = c("zone_seq", "cell_id"),
+  zone_metric = c("zone_seq", "metric_seq"))
+stopifnot(all(names(tbl_keys) %in% dbListTables(con_sdm)))
+stopifnot(all(dbListTables(con_sdm) %in% names(tbl_keys)))
 
-# Write sorted parquet -- note that this is not a partitioned table, not faster than native
-# dbExecute(con_sdm, glue(
-#   "COPY (
-#     SELECT cell_id, mdl_seq, value 
-#     FROM model_cell 
-#     ORDER BY cell_id, mdl_seq ) TO '{mdl_cell_pq}' 
-#   (FORMAT 'parquet', COMPRESSION 'zstd') "))
-# 
-# # Read back as external table or view
-# dbExecute(con_sdm, glue(
-#   "CREATE VIEW model_cell_view AS SELECT * FROM '{mdl_cell_pq}' " ))
-# dbExecute(con_sdm, "DROP VIEW IF EXISTS model_cell_view;")
-# TODO: use VIEWs for read-only duckdb later for chunking out files, 
-#   but doesn't seem faster than native duckdb table
+# export parquet files with sort order
+for (tbl in names(tbl_keys)){ 
+  # tbl = names(tbl_keys)[1]  # tbl = "cell_metric"
+  keys     <- tbl_keys[[tbl]]
+  keys_str <- paste(keys, collapse = ', ')
+  pq_file  <- glue("{dir_pq}/{tbl}.parquet")
+  
+  stopifnot(all(keys %in% dbListFields(con_sdm, tbl)))
+  
+  message(glue("Exporting {tbl} (ORDER BY {keys_str}) to parquet  ~  {Sys.time()}"))
+
+  dbExecute(con_sdm, glue(
+    "COPY (
+      SELECT * FROM {tbl} 
+      ORDER BY {keys_str}) 
+      TO '{pq_file}' 
+    (FORMAT parquet, PER_THREAD_OUTPUT, COMPRESSION zstd) "))
+}
+message(glue("Exporting finished  ~  {Sys.time()}")) # ~ 1 min
 ```
 
 ## Import from Parquet
@@ -1571,14 +1756,11 @@ if (file_exists(sdm_db))
 source(here("libs/sdm_functions.R"))
 con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F)) |> 
   load_duckdb_extensions()
- 
-# dbListTables(con_sdm)
+
 dbExecute(con_sdm, "SET threads = 8;")
 dbExecute(con_sdm, "SET memory_limit = '20GB';")
 
-# dbExecute(con_sdm, glue("IMPORT DATABASE '{normalizePath(dir_pq)}'"))
-# dbListTables(con_sdm)
-
+# import parquet ----
 for (pq in dir_ls(dir_pq, glob = "*.parquet")) { # pq = dir_ls(dir_pq, glob = "*.parquet")[1]
   tbl <- path_file(pq) |> str_remove("\\.parquet$")
   if (!dbExistsTable(con_sdm, tbl)) {
@@ -1587,42 +1769,39 @@ for (pq in dir_ls(dir_pq, glob = "*.parquet")) { # pq = dir_ls(dir_pq, glob = "*
   }
 }
 
-# dbExecute(con_sdm, "ALTER TABLE cell ADD PRIMARY KEY (cell_id);")
-# dbExecute(con_sdm, "ALTER TABLE dataset ALTER COLUMN date_created SET DEFAULT CURRENT_DATE;")
-# dbExecute(con_sdm, "ALTER TABLE metric ALTER COLUMN metric_seq SET DEFAULT nextval('metric_metric_seq_seq');")
-# dbExecute(con_sdm, "ALTER TABLE metric ADD PRIMARY KEY (metric_seq);")
-# dbExecute(con_sdm, "ALTER TABLE model ALTER COLUMN mdl_seq SET DEFAULT nextval('model_mdl_seq_seq');")
-# dbExecute(con_sdm, "ALTER TABLE model ADD PRIMARY KEY (mdl_seq);")
+# sequences ----
+# for auto-incrementing primary keys
+tbl_seq <- list(
+  metric  = "metric_seq",
+  model   = "mdl_seq",
+  species = "sp_seq",
+  zone    = "zone_seq")
+stopifnot(all(names(tbl_seq) %in% dbListTables(con_sdm)))
 
-## -- CREATE TABLE metric(metric_seq INTEGER DEFAULT(nextval('metric_metric_seq_seq')) PRIMARY KEY, metric_key VARCHAR NOT NULL, description VARCHAR, date_created DATE DEFAULT(CURRENT_DATE));;
-## -- CREATE TABLE model(mdl_seq INTEGER DEFAULT(nextval('model_mdl_seq_seq')) PRIMARY KEY, ds_key VARCHAR, taxa VARCHAR, time_period VARCHAR, region VARCHAR, mdl_type VARCHAR, description VARCHAR, date_created DATE DEFAULT(CURRENT_DATE), FOREIGN KEY (ds_key) REFERENCES dataset(ds_key));;
+for (tbl in names(tbl_seq)){ # tbl = "metric"
+  fld <- tbl_seq[[tbl]]
+  id  <- glue("seq_{tbl}")
 
-seqs_exist <- dbGetQuery(con_sdm, "SELECT * FROM duckdb_sequences()") |> pull(sequence_name)
+  nxt <- dbGetQuery(con_sdm, glue("SELECT MAX({fld}) FROM {tbl}")) |> 
+    pull(1) + 1
+  
+  sql <- glue("CREATE SEQUENCE {id} START {nxt}")
+  message(sql)
+  dbExecute(con_sdm, sql)
+  sql <- glue("ALTER TABLE {tbl} ALTER COLUMN {fld} SET DEFAULT nextval('{id}')")
+  message(sql)
+  dbExecute(con_sdm, sql)
+}
 
-schema_sql <- glue("{dir_pq}/schema.sql")
-for (ln in readLines(schema_sql)){ # ln = readLines(schema_sql)[1]
-  if (str_detect(ln, "CREATE TABLE")) {
-    # tbl <- str_extract(ln, "(?<=CREATE TABLE )[a-z_]+")
-    # if (!dbExistsTable(con_sdm, tbl))
-    #   dbExecute(con_sdm, ln)
-    next
-  } else if (str_detect(ln, "CREATE INDEX")) {
-    # dbExecute(con_sdm, ln)
-    next
-  } else if (str_detect(ln, "CREATE SEQUENCE")) {
-    seq <- str_extract(ln, "(?<=CREATE SEQUENCE )[a-z_]+")
-    tbl <- str_replace(seq, "([[:alnum:]]+)_.*", "\\1")
-    col <- str_replace(seq, glue("{tbl}_([[:alnum:]]+)_seq"), "\\1")
-    
-    if (!seq %in% seqs_exist){
-        # message(glue("Sequence {seq} for table.column {tbl}.{col}: \n\t{ln}"))
-        message(ln)
-        dbExecute(con_sdm, ln)
-    }
-    
-    sql <- glue("ALTER TABLE {tbl} ALTER COLUMN {col} SET DEFAULT nextval('{seq}');")
-    message(sql)
-    dbExecute(con_sdm, sql)
+# date_created ----
+# default to current_date
+for (tbl in dbListTables(con_sdm)){ # tbl = "dataset"
+  fld <- dbListFields(con_sdm, tbl) |> 
+    str_subset("date_created")
+  if (length(fld) == 1){
+    sql <- glue("ALTER TABLE {tbl} ALTER COLUMN date_created SET DEFAULT CURRENT_DATE;")
+    message(sql) 
+    a <- dbExecute(con_sdm, sql)
   }
 }
 ```

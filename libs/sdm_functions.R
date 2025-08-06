@@ -178,27 +178,29 @@ create_raster_from_points <- function(df, value_col = "value", res = 0.05,
 
 load_duckdb_extensions <- function(con, spatial=T, icu=T) {
 
-  check_spatial <- function(con) {
-    tryCatch({
-      res <- dbGetQuery(con, "SELECT ST_Point(0, 0)")
-      return(TRUE)
-    }, error = function(e) {
-      return(FALSE)
-    } ) }
+  # check_spatial <- function(con) {
+  #   tryCatch({
+  #     res <- dbGetQuery(con, "SELECT ST_Point(0, 0)")
+  #     return(TRUE)
+  #   }, error = function(e) {
+  #     return(FALSE)
+  #   } ) }
+  #
+  # check_icu <- function(con) {
+  #   tryCatch({
+  #     res <- dbGetQuery(con, "SELECT TIMESTAMPTZ '1992-09-20 11:30:00.123456789';")
+  #     return(TRUE)
+  #   }, error = function(e) {
+  #     return(FALSE)
+  #   } ) }
 
-  check_icu <- function(con) {
-    tryCatch({
-      res <- dbGetQuery(con, "SELECT TIMESTAMPTZ '1992-09-20 11:30:00.123456789';")
-      return(TRUE)
-    }, error = function(e) {
-      return(FALSE)
-    } ) }
-
-  if (spatial && !check_spatial(con))
+  # if (spatial && !check_spatial(con))
+  if (spatial)
     res <- dbExecute(con, "INSTALL spatial; LOAD spatial;")
 
-  if (icu && !check_icu(con))
-      res <- dbExecute(con, "INSTALL icu; LOAD icu;")
+  # if (icu && !check_icu(con))
+  if (icu)
+    res <- dbExecute(con, "INSTALL icu; LOAD icu;")
 
   con
 }
