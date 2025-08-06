@@ -41,13 +41,15 @@ dir_data    <- ifelse(
   is_server,
   "/share/data",
   "~/My Drive/projects/msens/data")
-pa_gpkg        <- glue("{dir_data}/derived/ply_planareas_2025.gpkg")
-er_gpkg        <- glue("{dir_data}/derived/ply_ecoregions_2025.gpkg")
-metrics_tif    <- glue("{dir_data}/derived/r_metrics.tif")
-spp_global_csv <- glue("{dir_data}/derived/spp_global_cache.csv")
-lyrs_csv       <- glue("{dir_data}/derived/layers.csv")
-sdm_db         <- glue("{dir_data}/derived/sdm.duckdb")
-cell_tif       <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
+pa_gpkg              <- glue("{dir_data}/derived/ply_planareas_2025.gpkg")
+er_gpkg              <- glue("{dir_data}/derived/ply_ecoregions_2025.gpkg")
+sr_gpkg              <- glue("{dir_data}/derived/ply_subregions_2025.gpkg")
+metrics_tif          <- glue("{dir_data}/derived/r_metrics.tif")
+zone_taxon_csv       <- glue("{dir_data}/derived/zone_taxon.csv")
+zone_taxon_akl48_csv <- glue("{dir_data}/derived/zone_taxon_akl48.csv")
+lyrs_csv             <- glue("{dir_data}/derived/layers.csv")
+sdm_db               <- glue("{dir_data}/derived/sdm.duckdb")
+cell_tif             <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
 # am_db        <- glue("{dir_data}/derived/aquamaps/am.duckdb")
 
 # helper functions ----
@@ -96,6 +98,8 @@ ext(r_cell) <- round(ext(r_cell), 3)
 ## Calculate Extinction Risk Metrics by Class
 
 ```{r delete_extrisk_metrics}
+#| eval: false
+
 # tbl(con_sdm, "metric") |>
 #   mutate(
 #     is_extrisk = str_starts(metric_key, "extrisk_")) |>
@@ -782,7 +786,7 @@ tbl(con_sdm, "metric") |>
 # 0.000   2.619   5.730  10.379  15.007 100.000
 ```
 
-## NEW: Calculate PlanArea metrics contributing to score based on cell metrics
+## Calculate PlanArea metrics contributing to score based on cell metrics
 
 ```{r cell_metrics_to_planarea_metrics}
 # get zone_seqs for planning areas
@@ -1034,9 +1038,9 @@ d_ck |>
 #  0.00   12.00   17.00   21.29   26.00   89.00
 ```
 
-## NEW: Calculate Score per PlanArea from PlanArea metrics
+## Calculate Score per PlanArea from PlanArea metrics
 
-```{r new_calc_planarea_score_from_planarea_metrics}
+```{r calc_planarea_score_from_planarea_metrics}
 # metric: calculate score per planning area
 m_key <- "score_extriskspcat_primprod_ecoregionrescaled_equalweights"
 m_seq <- tbl(con_sdm, "metric") |> 
@@ -1123,7 +1127,7 @@ d_ck |>
 
 ## Calculate Score per Ecoregion from Ecoregion metrics
 
-```{r new_calc_ecoregion_score_from_ecoregion_metrics}
+```{r calc_ecoregion_score_from_ecoregion_metrics}
 
 # metric: calculate score per planning area
 m_key <- "score_extriskspcat_primprod_ecoregionrescaled_equalweights"
@@ -1210,6 +1214,325 @@ d_ck |>
 #  Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
 # 11.70   23.81   27.01   26.27   29.60   39.54
 ```
+
+## Add SubRegions
+
+Now:
+
+- `USA`: USA mainland, Alaska, Hawaii and territories
+- `AK`: Alaska
+- `L48`: USA mainland
+- `AKL48`: USA mainland & Alaska
+
+Later:
+
+- `HI`: Hawaii
+- `L48Pac`: Pacific USA mainland
+- `L48Atl`: Atlantic USA mainland
+- `L48Goa`: Gulf of America USA mainland
+- `PAC`: Pacific USA (Hawaii, Pacific mainland and USA Territories)
+
+```{r add_subregions}
+
+# tbl(con_sdm, "zone") |>
+#   group_by(tbl) |>
+#   summarise(n_zones = n()) |>
+#   collect()
+#   tbl                 n_zones
+#   <chr>                 <dbl>
+# 1 ply_ecoregions_2025      12
+# 2 ply_planareas_2025       36
+
+zone_tbl <- tbl(con_sdm, "zone") |> 
+  distinct(tbl) |> 
+  pull(tbl)
+
+if (!"ply_subregions_2025" %in% zone_tbl){
+  
+  source(here("libs/sdm_functions.R"))
+  # - set_geom_ctr_area()
+  # - register_zones()
+  # - insert_zone_cell_data()
+ 
+  # spatial sources
+  er     <- read_sf(er_gpkg)
+  r_cell <- rast(cell_tif, lyrs = "cell_id")
+  
+  # USA: USA mainland, Alaska, Hawaii and territories
+  sr_usa <- er |> 
+    st_union() |> 
+    st_as_sf() |> 
+    mutate(
+      subregion_key  = "USA",
+      subregion_name = "USA mainland, Alaska, Hawaii and territories")
+  
+  # AK: Alaska
+  sr_ak <- er |> 
+    filter(region_key == "AK") |> 
+    st_union() |> 
+    st_as_sf() |> 
+    mutate(
+      subregion_key  = "AK",
+      subregion_name = "Alaska")
+  
+  # L48: USA mainland
+  sr_l48 <- er |>
+    filter(ecoregion_key %in% c(
+      "CAC","WAOR","SECS","WCGOA","EGOA","NECS")) |> 
+    st_union() |> 
+    st_as_sf() |> 
+    mutate(
+      subregion_key  = "L48",
+      subregion_name = "USA mainland")
+  
+  # AKL48: USA mainland & Alaska
+  sr_akl48 <- bind_rows(sr_ak, sr_l48) |>
+    st_union() |>
+    st_as_sf() |>
+    mutate(
+      subregion_key  = "AKL48",
+      subregion_name = "USA mainland & Alaska")
+  
+  # combine
+   sr <- bind_rows(
+     sr_ak,
+     sr_l48,
+     sr_akl48,
+     sr_usa) |> 
+    set_geom_ctr_area()
+   
+   # write gpkg
+   write_sf(sr, sr_gpkg)
+   
+   # shift lon [-180, 180] to [0, 360]
+   sr_sl <- st_shift_longitude(sr)
+   
+   # get percent each feature covers each cell
+   r_sr <- rasterize(
+     sr_sl, 
+     r_cell, 
+     fun     = "max", 
+     touches = T, 
+     cover   = T, 
+     by      = "subregion_key")
+
+  # convert to data frame
+  d_sr <- terra::as.data.frame(
+    r_sr, cells = T, na.rm = F, wide = F) |> 
+    filter(
+      !is.na(values)) |>  # 839,534 × 3
+    tibble()  
+  
+  # d_sr |> 
+  #   group_by(layer) |> 
+  #   summarise(n_cells  = n()) |> 
+  #   collect() |> 
+  #   arrange(desc(n_cells))
+  #
+  #   layer  n_cells
+  #   <chr>    <int>
+  # 1 USA    630,806
+  # 2 AKL48  419,767
+  # 3 AK     315,369
+  # 4 L48    104,398
+  
+  # register zones and insert zone data into con_sdm
+  register_zones(sr, "ply_subregions_2025", "subregion_key")
+  insert_zone_cell_data(d_sr, "ply_subregions_2025", "subregion_key")
+  
+  # tbl(con_sdm, "zone") |>
+  #   group_by(tbl) |>
+  #   summarise(n_zones = n()) |>
+  #   collect()
+  #
+  #   tbl                 n_zones
+  #   <chr>                 <dbl>
+  # 1 ply_ecoregions_2025      12
+  # 2 ply_planareas_2025       36
+  # 3 ply_subregions_2025       4
+  
+  # TODO: load ply_subregions_2025 into PostGIS
+}
+```
+
+## Add/update `zone_taxon`
+
+```{r zone_taxon}
+#| eval: false
+
+tbl_taxon <- tbl(con_sdm, "taxon") |>
+  filter(is_ok) |>
+  select(
+    sp_cat, sp_common = common_name, sp_scientific = scientific_name, 
+    taxon_id, taxon_authority,  # TODO: in app, sp_taxon: [{taxon_authority}:{taxon_id}](https://...)
+    rl_code = redlist_code, mdl_seq) |>
+  # arrange(sp_cat, common_name) |>
+  mutate(
+    rl_score = case_match(
+      rl_code,
+      # NEW: EX (extinct): is_ok = F
+      # NEW: NE (not evaluated), DD (data deficient), <NA> (not available) -> LC
+      # https://oceanhealthindex.org/images/htmls/Supplement.html#62_Biodiversity
+      "CR" ~ 1,           #  - CR: Critically Endangered
+      "EN" ~ 0.8,         #  - EN: Endangered (+ESA)
+      "VU" ~ 0.6,         #  - VU: Vulnerable
+      "TN" ~ 0.6,         #  - TN: Threatened (ESA only)
+      "NT" ~ 0.4,         #  - NT: Near Threatened
+      "LC" ~ 0.2,         #  - LC: Least Concern
+      .default = 0.2)) |> #  - NEW: assume LC for NAs and the rest
+  relocate(rl_score, .after = rl_code) # |> 
+# collect()  # 17,379 × 8
+
+d <- tbl(con_sdm, "zone") |> 
+  # filter(
+  #   tbl   == "ply_subregions_2025",
+  #   value == "AKL48") |>
+  select(zone_seq, zone_fld = fld, zone_value = value) |> # zone_tbl = tbl, 
+  inner_join(
+    tbl(con_sdm, "zone_cell") |>
+      select(zone_seq, cell_id),
+    by = join_by(zone_seq)) |>
+  inner_join(
+    tbl(con_sdm, "model_cell") |>
+      select(mdl_seq, cell_id, value) |> 
+      inner_join(
+        tbl_taxon,
+        by = join_by(mdl_seq)),
+    by = join_by(cell_id)) |> 
+  inner_join(
+    tbl(con_sdm, "cell") |>
+      select(cell_id, area_km2),
+    by = join_by(cell_id)) |>
+  group_by(
+    zone_fld, zone_value,  # zone_seq,
+    mdl_seq,
+    sp_cat, sp_common, sp_scientific, 
+    taxon_id, taxon_authority, 
+    rl_code, rl_score) |> 
+  summarize(
+    area_km2 = sum(area_km2, na.rm = T),
+    avg_suit = mean(value, na.rm = T) / 100,
+    .groups = "drop") |> 
+  collect()  # 220,534 × 12
+
+# taxon_usa <- d |> 
+#   filter(
+#     zone_fld   == "subregion_key",
+#     zone_value == "USA") |>
+#   pull(taxon_id)
+# 
+# tbl_taxon |> 
+#   filter(!taxon_id %in% taxon_usa) |> 
+#   select(sp_cat, sp_common, sp_scientific, taxon_id, rl_code, mdl_seq) |> 
+#   arrange(sp_cat, sp_common, sp_scientific, taxon_id, rl_code, mdl_seq) |> 
+#   collect() |> 
+#   print(n = Inf)
+#
+# A tibble: 46 × 6   
+#    sp_cat       sp_common                  sp_scientific taxon_id rl_code mdl_seq
+#    <chr>        <chr>                      <chr>            <dbl> <chr>     <int>
+#  1 bird         African Collared-dove      Streptopelia…   2.27e7 LC        18033
+#  2 bird         Aplomado Falcon            Falco femora…   2.27e7 EN        18359
+#  3 bird         Bay-breasted Warbler       Setophaga ca…   2.27e7 LC        18156
+#  4 bird         Blue-and-yellow Macaw      Ara ararauna    2.27e7 LC        17601
+#  5 bird         Brown-throated Parakeet    Eupsittula p…   2.27e7 LC        18136
+#  6 bird         Cerulean Warbler           Setophaga ce…   2.27e7 NT        17999
+#  7 bird         Common Greenshank          Tringa nebul…   2.27e7 LC        18060
+#  8 bird         Common Ringed Plover       Charadrius h…   2.27e7 LC        17677
+#  9 bird         Common Vermilion Flycatch… Pyrocephalus…   1.04e8 LC        18275
+# 10 bird         Dark-eyed Junco            Junco hyemal…   2.27e7 LC        18140
+# 11 bird         Ferruginous Pygmy-owl      Glaucidium b…   2.27e7 TN        18366
+# 12 bird         House Finch                Haemorhous m…   2.27e7 LC        17781
+# 13 bird         Island Canary              Serinus cana…   2.27e7 LC        17995
+# 14 bird         Lesser Antillean Pewee     Contopus lat…   2.27e7 LC        17700
+# 15 bird         Long-eared Owl             Asio otus       2.27e7 LC        17617
+# 16 bird         Middendorff's Grasshopper… Helopsaltes …   2.27e7 LC        18138
+# 17 bird         Nanday Parakeet            Aratinga nen…   2.27e7 LC        17602
+# 18 bird         Orange-fronted Parakeet    Eupsittula c…   2.27e7 VU        17740
+# 19 bird         Pin-tailed Whydah          Vidua macrou…   2.27e7 LC        18078
+# 20 bird         Pine Warbler               Setophaga pi…   2.27e7 LC        18157
+# 21 bird         Puerto Rican Emerald       Riccordia ma…   2.27e7 LC        17987
+# 22 bird         Purple Sandpiper           Calidris mar…   2.27e7 LC        18133
+# 23 bird         Red Siskin                 Spinus cucul…   2.27e7 EN        18021
+# 24 bird         Russet-backed Thrush       Catharus ust…   1.04e8 LC        18252
+# 25 bird         Say's Phoebe               Sayornis saya   2.27e7 LC        17992
+# 26 bird         Siberian Accentor          Prunella mon…   2.27e7 LC        17939
+# 27 bird         Spot-breasted Oriole       Icterus pect…   2.27e7 LC        17803
+# 28 bird         Spruce Grouse              Canachites c…   6.12e7 LC        17663
+# 29 bird         Swainson's Thrush          Catharus swa…   1.04e8 LC        18251
+# 30 bird         Two-barred Crossbill       Loxia leucop…   2.27e7 LC        18146
+# 31 bird         Venezuelan Troupial        Icterus icte…   2.27e7 LC        17802
+# 32 bird         Western Meadowlark         Sturnella ne…   2.27e7 LC        18161
+# 33 bird         White-tailed Sea-eagle     Haliaeetus a…   2.27e7 LC        17782
+# 34 bird         Yellow-crowned Amazon      Amazona ochr…   2.27e7 LC        17573
+# 35 bird         Yellow-headed Amazon       Amazona orat…   2.27e7 EN        17574
+# 36 bird         Yellow-throated Vireo      Vireo flavif…   2.27e7 LC        18080
+# 37 fish         Arctic telescope           Protomyctoph…   1.59e5 LC        17531
+# 38 fish         Cortez sea chub            Kyphosus ele…   2.74e5 LC        17509
+# 39 fish         Gulf grouper               Mycteroperca…   2.74e5 EN        17506
+# 40 fish         daggertooth pike conger    Muraenesox c…   1.26e5 LC        17503
+# 41 fish         prowspine cusk-eel         Lepophidium …   2.76e5 LC        17513
+# 42 fish         speckledtail flounder      Engyophrys s…   2.76e5 LC        17523
+# 43 invertebrate waved whelk                Buccinum und…   1.39e5 NA        17224
+# 44 invertebrate NA                         Paroediceros…   1.03e5 NA        17127
+# 45 invertebrate NA                         Quadrimaera …   4.22e5 NA         8245
+# 46 invertebrate NA                         Scabrotropho…   1.47e5 NA        17229
+
+d <- d |>
+  mutate(
+    suit_rl      = avg_suit * rl_score,
+    suit_rl_area = avg_suit * rl_score * area_km2) |> 
+  group_by(zone_fld, zone_value, sp_cat) |> 
+  mutate(
+    cat_suit_rl_area = sum(suit_rl_area, na.rm = T)) |> 
+  ungroup() |> 
+  mutate(
+    pct_cat = suit_rl_area / cat_suit_rl_area)
+
+d_akl48 <- d |> 
+  filter(
+    zone_fld   == "subregion_key",
+    zone_value == "AKL48")
+# nrow(d_akl48) # 10,377 species
+
+d_akl48_sum <- d_akl48 |> 
+  inner_join(
+    tbl(con_sdm, "taxon") |> 
+      filter(
+        taxon_id %in% d_akl48$taxon_id) |>
+      select(taxon_id, n_ds) |> 
+      collect(),
+    by = join_by(taxon_id)) |> 
+  group_by(sp_cat) |>
+  summarize(
+    n_species = n(),
+    n_models  = sum(n_ds))
+d_akl48_sum |> 
+  summarize(
+    total_species = sum(n_species),
+    total_models  = sum(n_models))
+#   total_species total_models
+#           <int>        <int>
+# 1         10377        10461
+# 
+#   sp_cat        n_species  n_models
+#   <chr>             <int>     <int>
+# 1 bird                247       280
+# 2 coral               342       349
+# 3 fish              3,299     3,314
+# 4 invertebrate      5,452     5,453
+# 5 mammal               72        84
+# 6 other               953       953
+# 7 reptile              12        28
+#   Total            10,377    10,461
+  
+write_csv(d_akl48, zone_taxon_akl48_csv)
+
+write_csv(d, zone_taxon_csv)
+
+dbWriteTable(con_sdm, "zone_taxon", d, overwrite = T)
+```
+
 
 ## Update Zone Tables in PostGIS with Metrics
 
@@ -1389,7 +1712,7 @@ for (i in 2:nrow(d_rm)) { # i = 1
 
 per [Feature id | pg_tileserv](https://github.com/CrunchyData/pg_tileserv?tab=readme-ov-file#feature-id)
 
-```{r}
+```{r add_index_for_vector_tiles}
 # add auto-incrementing primary key planarea_id to postgres ply_planareas_2025 table
 dbExecute(con, "ALTER TABLE public.ply_planareas_2025 ADD COLUMN IF NOT EXISTS planarea_id SERIAL PRIMARY KEY;")
 
@@ -1420,7 +1743,7 @@ redo_dl <- T
 
 # redo_dl: delete existing files
 if (redo_dl){
-  for (f in c(pa_gpkg, er_gpkg, lyrs_csv, metrics_tif, spp_global_csv)){
+  for (f in c(pa_gpkg, er_gpkg, lyrs_csv, metrics_tif)){
     if (file_exists(f))
       file_delete(f) } }
 
@@ -1532,72 +1855,6 @@ if (!file.exists(metrics_tif)) {
   r_metrics <- c(r_zones, r_metrics)
   writeRaster(r_metrics, metrics_tif, overwrite = T)
 }
-  
-# * spp_global_csv ----
-if (!file.exists(spp_global_csv)) {
-  message("Generating Global Species CSV...")
-  
-  # OLD: in apps:mapgl/app.R
-  #   sp_cat	sp_key	scientific_name_dataset	common_name_dataset	worms_id	gbif_id	redlist_code	rl_score	suitability	suit_rl	pct_total
-  # dbListFields(con_sdm, "taxon") |> paste(collapse = ", ") |> cat()
-  # taxon_id, taxon_authority, n_ds, am_0.05, ch_nmfs, ch_fws, rng_fws, sp_cat, bl, mdl_seq, scientific_name, common_name, redlist_code, worms_is_marine, worms_is_extinct, worms_id, is_ok
-  d <- tbl(con_sdm, "taxon") |>
-    filter(is_ok) |>
-    select(sp_cat, common_name, scientific_name, taxon_id, taxon_authority, redlist_code, mdl_seq) |>
-    arrange(sp_cat, common_name) |>
-    mutate(
-      rl_score = case_match(
-        redlist_code,
-        # NEW: EX (extinct): is_ok = F
-        # NEW: NE (not evaluated), DD (data deficient), <NA> (not available) -> LC
-        # https://oceanhealthindex.org/images/htmls/Supplement.html#62_Biodiversity
-        "CR" ~ 1,           #  - CR: Critically Endangered
-        "EN" ~ 0.8,         #  - EN: Endangered (+ESA)
-        "VU" ~ 0.6,         #  - VU: Vulnerable
-        "TN" ~ 0.6,         #  - TN: Threatened (ESA only)
-        "NT" ~ 0.4,         #  - NT: Near Threatened
-        "LC" ~ 0.2,         #  - LC: Least Concern
-        .default = 0.2)) |> #  - NEW: assume LC for NAs and the rest
-    collect()  # 17,379 × 8
-
-  stopifnot(sum(duplicated(d$mdl_seq)) == 0)
-
-  # model stats
-  d_m <- tbl(con_sdm, "model_cell") |>
-    filter(mdl_seq %in% d$mdl_seq) |>
-    left_join(
-      tbl(con_sdm, "cell") |> 
-        select(cell_id, area_km2),
-      by = join_by(cell_id)) |> 
-    group_by(mdl_seq) |>
-    summarize(
-      area_km2 = sum(area_km2, na.rm = T),
-      avg_suit = mean(value,   na.rm = T) / 100,
-      .groups = "drop") |>
-    collect()
-  #  summary(d_m)
-  #      mdl_seq         area_km2           avg_suit     
-  # Min.   :    1   Min.   :      19   Min.   :0.0100  
-  # 1st Qu.: 4526   1st Qu.:  155345   1st Qu.:0.2114  
-  # Median : 9096   Median :  492160   Median :0.3293  
-  # Mean   : 9073   Mean   :  868870   Mean   :0.3583  
-  # 3rd Qu.:13587   3rd Qu.:  776057   3rd Qu.:0.5000  
-  # Max.   :18512   Max.   :13706883   Max.   :0.9946  
-  #                 NA's   :10
-  # TODO: sort why NAs in area_km2?
-
-  d <- d |>
-    left_join(
-      d_m,
-      by = join_by(mdl_seq)) |>
-    mutate(
-      suit_rl      = avg_suit * rl_score,
-      suit_rl_area = avg_suit * rl_score * area_km2,
-      pct_total    = suit_rl_area / sum(suit_rl_area, na.rm = T),
-      is_pct_na    = is.na(pct_total))
-
-  write_csv(d, spp_global_csv)
-}
 ```
 
 
@@ -1702,38 +1959,58 @@ dir_create(dir_pq)
 # OLD: add primary keys, indexes
 # NEW: skip indexes, sort on export, per [performance](https://duckdb.org/docs/stable/guides/performance/indexing.html)
 
+# dbRemoveTable(con_sdm, "cell_model", force = T)
 tbl_keys <- list(
   cell        = "cell_id",
   cell_metric = c("cell_id", "metric_seq"),
+  # cell_model  = c("cell_id", "mdl_seq"),   # source: model_cell; alternative key sorting order
   dataset     = "ds_key",
   metric      = "metric_seq",
   model       = "mdl_seq",
-  model_cell  = c("cell_id", "mdl_seq"), # *big* one
+  model_cell  = c("mdl_seq", "cell_id"),   # *big* one
   species     = "sp_seq",
   taxon       = "taxon_id",
   zone        = "zone_seq",
   zone_cell   = c("zone_seq", "cell_id"),
-  zone_metric = c("zone_seq", "metric_seq"))
+  zone_metric = c("zone_seq", "metric_seq"),
+  zone_taxon  = c("zone_fld", "zone_value", "mdl_seq", "taxon_id"))
 stopifnot(all(names(tbl_keys) %in% dbListTables(con_sdm)))
 stopifnot(all(dbListTables(con_sdm) %in% names(tbl_keys)))
 
 # export parquet files with sort order
 for (tbl in names(tbl_keys)){ 
-  # tbl = names(tbl_keys)[1]  # tbl = "cell_metric"
+  # tbl = names(tbl_keys)[1]  # tbl = "cell_model"
   keys     <- tbl_keys[[tbl]]
   keys_str <- paste(keys, collapse = ', ')
   pq_file  <- glue("{dir_pq}/{tbl}.parquet")
   
-  stopifnot(all(keys %in% dbListFields(con_sdm, tbl)))
-  
   message(glue("Exporting {tbl} (ORDER BY {keys_str}) to parquet  ~  {Sys.time()}"))
-
-  dbExecute(con_sdm, glue(
-    "COPY (
-      SELECT * FROM {tbl} 
+  
+  fro_tbl <- tbl
+  if (tbl == "cell_model")
+    fro_tbl <- "model_cell"
+  stopifnot(all(keys %in% dbListFields(con_sdm, fro_tbl)))
+  
+  if (tbl %in% c("cell_model", "model_cell")){
+    flds <- dbListFields(con_sdm, fro_tbl) |>
+      setdiff(keys)
+    flds_str <- paste(flds, collapse = '\", \"')
+    sql <- glue(
+      "COPY (
+      SELECT {keys_str}, {flds_str} FROM {fro_tbl} 
       ORDER BY {keys_str}) 
       TO '{pq_file}' 
-    (FORMAT parquet, PER_THREAD_OUTPUT, COMPRESSION zstd) "))
+    (FORMAT parquet, PER_THREAD_OUTPUT, COMPRESSION zstd) ")
+  } else{
+    sql <- glue(
+      "COPY (
+      SELECT * FROM {fro_tbl} 
+      ORDER BY {keys_str}) 
+      TO '{pq_file}' 
+    (FORMAT parquet, PER_THREAD_OUTPUT, COMPRESSION zstd) ")
+  }
+  message(sql)
+  dbExecute(con_sdm, sql)
 }
 message(glue("Exporting finished  ~  {Sys.time()}")) # ~ 1 min
 ```
@@ -1757,17 +2034,33 @@ source(here("libs/sdm_functions.R"))
 con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F)) |> 
   load_duckdb_extensions()
 
-dbExecute(con_sdm, "SET threads = 8;")
-dbExecute(con_sdm, "SET memory_limit = '20GB';")
+# dbExecute(con_sdm, "SET threads = 8;")
+# dbExecute(con_sdm, "SET memory_limit = '20GB';")
 
 # import parquet ----
-for (pq in dir_ls(dir_pq, glob = "*.parquet")) { # pq = dir_ls(dir_pq, glob = "*.parquet")[1]
+for (pq in dir_ls(dir_pq, glob = "*.parquet")) { # pq = dir_ls(dir_pq, glob = "*.parquet")[2]
   tbl <- path_file(pq) |> str_remove("\\.parquet$")
   if (!dbExistsTable(con_sdm, tbl)) {
     message(glue("Importing {tbl} from {basename(pq)}/*.parquet"))
     dbExecute(con_sdm, glue("CREATE TABLE {tbl} AS SELECT * FROM '{pq}/*.parquet'"))
   }
 }
+
+# create index on 2nd column of multi-column index from parquet export
+# tbl_idx <- list(
+#   cell_metric = "metric_seq",
+#   model_cell  = "mdl_seq",
+#   zone_cell   = "cell_id",
+#   zone_metric = "metric_seq")
+# for (tbl in names(tbl_idx)){      # tbl = "model_cell"
+#   fld <- tbl_idx[[tbl]]
+#   idx <- glue("idx_{tbl}_{fld}")  # idx_model_cell_mdl_seq
+#   stopifnot(fld %in% dbListFields(con_sdm, tbl))
+#   
+#   sql <- glue("CREATE INDEX IF NOT EXISTS {idx} ON {tbl} ({fld});")
+#   message(sql)
+#   dbExecute(con_sdm, sql)
+# }
 
 # sequences ----
 # for auto-incrementing primary keys

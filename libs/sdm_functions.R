@@ -638,3 +638,63 @@ validate_sdm_data <- function(con, verbose = TRUE) {
 
   return(results)
 }
+
+
+set_geom_ctr_area <- function(x){
+
+  x |>
+    st_set_geometry("geom") |>
+    mutate(
+      ctr      = st_centroid(geom),
+      ctr_lon  = ctr |> st_coordinates() %>% .[,"X"],
+      ctr_lat  = ctr |> st_coordinates() %>% .[,"Y"],
+      area_km2 = st_area(geom) |>
+        units::set_units(km^2) |>
+        as.numeric() ) |>
+    select(-ctr)
+}
+
+drop_ctr_area <- function(x){
+  x |>
+    select(-ctr_lon, -ctr_lat, -area_km2)
+}
+
+register_zones <- function(ply, tbl, fld) {
+  # register zones in the database
+  dbExecute(con_sdm, glue("DELETE FROM zone WHERE tbl = '{tbl}' AND fld = '{fld}'"))
+
+  # check that fld is unique in tbl
+  stopifnot(sum(duplicated(ply[[fld]])) == 0)
+
+  for (i in 1:nrow(ply)) { # i = 1
+    dbExecute(con_sdm, glue("
+      INSERT INTO zone (tbl, fld, value)
+      VALUES ('{tbl}', '{fld}', '{ply[[fld]][i]}') " ) )
+  }
+}
+
+insert_zone_cell_data <- function(df, tbl, fld) {
+  # df = d_pa; tbl = "ply_planareas_2025"; fld = "planarea_key"
+  # df = d_er; tbl = "ply_ecoregions_2025"; fld = "ecoregion_key"
+
+  # get zone and metric IDs
+  d_zone <- dbGetQuery(con_sdm, glue("
+    SELECT zone_seq, value FROM zone WHERE tbl = '{tbl}' AND fld = '{fld}'" ))
+
+  d_zone_cell <- df |>
+    left_join(
+      d_zone,
+      by = c("layer" = "value")) |>
+    mutate(
+      zone_seq    = as.integer(zone_seq),
+      pct_covered = as.integer(round(values * 100)) ) |>
+    filter(pct_covered > 0) |>
+    select(
+      zone_seq,
+      cell_id = cell,
+      pct_covered)
+
+  dbExecute(con_sdm, glue("DELETE FROM zone_cell WHERE zone_seq IN ({paste(d_zone$zone_seq, collapse = ',')})"))
+  dbWriteTable(con_sdm, "zone_cell", d_zone_cell, append = T)
+}
+
