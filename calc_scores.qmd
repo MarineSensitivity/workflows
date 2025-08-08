@@ -41,16 +41,21 @@ dir_data    <- ifelse(
   is_server,
   "/share/data",
   "~/My Drive/projects/msens/data")
-pa_gpkg              <- glue("{dir_data}/derived/ply_planareas_2025.gpkg")
-er_gpkg              <- glue("{dir_data}/derived/ply_ecoregions_2025.gpkg")
-sr_gpkg              <- glue("{dir_data}/derived/ply_subregions_2025.gpkg")
-metrics_tif          <- glue("{dir_data}/derived/r_metrics.tif")
-zone_taxon_csv       <- glue("{dir_data}/derived/zone_taxon.csv")
-zone_taxon_akl48_csv <- glue("{dir_data}/derived/zone_taxon_akl48.csv")
-lyrs_csv             <- glue("{dir_data}/derived/layers.csv")
-sdm_db               <- glue("{dir_data}/derived/sdm.duckdb")
-cell_tif             <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
-# am_db        <- glue("{dir_data}/derived/aquamaps/am.duckdb")
+dir_raw              <- glue("{dir_data}/raw")
+dir_derived          <- glue("{dir_data}/derived")
+pa_gpkg              <- glue("{dir_derived}/ply_planareas_2025.gpkg")
+er_gpkg              <- glue("{dir_derived}/ply_ecoregions_2025.gpkg")
+sr_gpkg              <- glue("{dir_derived}/ply_subregions_2025.gpkg")
+sr_pa_csv            <- glue("{dir_derived}/subregion_planareas.csv") # apps: mapgl/app.R
+metrics_tif          <- glue("{dir_derived}/r_metrics.tif")
+metrics_akl48_tif    <- glue("{dir_derived}/r_metrics_akl48.tif")
+zone_taxon_csv       <- glue("{dir_derived}/zone_taxon.csv")
+zone_taxon_akl48_csv <- glue("{dir_derived}/zone_taxon_akl48.csv")
+lyrs_csv             <- glue("{dir_derived}/layers.csv")
+sdm_db               <- glue("{dir_derived}/sdm.duckdb")
+cell_tif             <- glue("{dir_derived}/r_bio-oracle_planarea.tif")
+pa_boem_geo          <- glue("{dir_raw}/boem.gov/OCS_Proposed_Planning_Area_Polygons.geojson")
+pa_metrics_geo       <- glue("{dir_derived}/OCS_Proposed_Planning_Area_Polygon_Env_Sensitivity_Metrics.geojson")
 
 # helper functions ----
 get_rast <- function(m_key){
@@ -1854,6 +1859,93 @@ if (!file.exists(metrics_tif)) {
 
   r_metrics <- c(r_zones, r_metrics)
   writeRaster(r_metrics, metrics_tif, overwrite = T)
+}
+
+# * metrics_akl48_tif ----
+if (!file.exists(metrics_akl48_tif)) {
+  message("Generating Metrics AKL48 raster...")
+  # mask to study area Alaska & Lower-48 USA mainland
+  
+  sr <- "AKL48"
+  pa_sr <- read_csv(sr_pa_csv) |> 
+    filter(subregion_key == !!sr) |> 
+    select(subregion_key, planarea_key)
+  
+  r_metrics <- rast(metrics_tif)
+  r_pa <- subset(r_metrics, "planarea_key")
+  levels(r_pa) <- levels(r_pa)[[1]] |> 
+    left_join(
+      pa_sr,
+      by = join_by(planarea_key)) |>
+    select(value, subregion_key)
+  r_pa <- simplifyLevels(r_pa)
+  r_pa[r_pa != 1] <- NA
+  # plot(r_pa)
+  r_metrics_akl48 <- r_metrics |> 
+    mask(r_pa) |> 
+    trim()
+  # plot(r_metrics_akl48[[1]])
+  # plot(r_metrics_akl48[[3]])
+  
+  writeRaster(r_metrics_akl48, metrics_akl48_tif, overwrite = T)
+}
+
+tbl(con_sdm, "cell") |> 
+  summarize(n_cells = n()) |> 
+  collect() |> 
+  print()
+
+# * pa_metrics_geo ----
+if (!file.exists(pa_metrics_geo)) {
+  
+  # pa_boem_geo          <- glue("{dir_data}/raw/boem.gov/OCS_Proposed_Planning_Area_Polygons.geojson")
+# pa_metrics_geo  <- glue("{dir_data}/derived/OCS_Proposed_Planning_Area_Polygon_Env_Sensitivity_Metrics.geojson")
+  pa_boem_geo    <- glue("{dir_data}/raw/boem.gov/OCS_Area_Polygons.geojson")
+  pa_metrics_geo <- glue("{dir_data}/derived/OCS_Area_Polygons_env_sensitivity_metrics.geojson")
+
+  pa <- read_sf(pa_gpkg)
+  
+  pa_boem <- read_sf(pa_boem_geo)
+  
+  (pa_miss <- pa_boem |>
+      st_drop_geometry() |> 
+      anti_join(
+        pa |> 
+          st_drop_geometry() |> 
+          select(planarea_key, planarea_name), 
+        by = join_by(PLANNING_AREA == planarea_key)) |> 
+      pull(PLANNING_AREA))
+  # [1] "CG" "EG" "WG"
+  
+  pa_boem |> 
+    filter(PLANNING_AREA %in% pa_miss) |> 
+    mapview::mapView(zcol = "PLANNING_AREA")
+  
+  pa |> 
+    st_drop_geometry() |> 
+    filter(
+      region_name == "Gulf of America") |> 
+    select(planarea_key, planarea_name)
+  #   planarea_key planarea_name          
+  #   <chr>        <chr>                  
+  # 1 CGA          Central Gulf of America
+  # 2 EGA          Eastern Gulf of America
+  # 3 WGA          Western Gulf of America
+  
+  pa_metrics <- pa_boem |> 
+    left_join(
+      pa |> 
+        st_drop_geometry() |> 
+        mutate(
+          PLANNING_AREA = case_match(
+            planarea_key,
+            "CGA" ~ "CG",
+            "EGA" ~ "EG",
+            "WGA" ~ "WG",
+            .default = planarea_key)),
+      by = join_by(PLANNING_AREA))
+
+  write_sf(pa_metrics, pa_metrics_geo)
 }
 ```
 
