@@ -43,6 +43,7 @@ er_pa_csv      <- glue("{dir_data}/derived/ply_ecoregion_planarea.csv")
 metrics_tif    <- glue("{dir_data}/derived/r_metrics.tif")
 # spp_global_csv <- here("../apps/mapgl/spp_global_cache.csv")
 er_pa_n_csv    <- glue("{dir_data}/derived/tbl_er_pa_scores.csv")
+pa_n_csv       <- glue("{dir_data}/derived/tbl_pa_scores.csv")
 
 Sys.setenv(MAPBOX_PUBLIC_TOKEN=readLines(mapbox_tkn_txt))
 librarian::shelf(
@@ -949,7 +950,7 @@ cellSize(r_ak, unit="km") |>
  # NA's   :539795 
 ```
 
-```{r flextable}
+```{r flextable_er_pa}
 librarian::shelf(
   flextable, ftExtra)
 
@@ -991,6 +992,60 @@ d_er_pa_n |>
     Reptile              = reptile,
     Other                = other,
     `area (1,000 km^2^)` = area_kkm2) |> 
+  flextable() |> 
+  ftExtra::colformat_md(part = "all") |> 
+  theme_vanilla() |> 
+  save_as_docx(path = tbl_docx)
+
+browseURL(tbl_docx)
+```
+
+```{r flextable_pa}
+librarian::shelf(
+  flextable, ftExtra)
+
+# flextable(mtcars) %>% 
+#   theme_vanilla() %>% 
+#   save_as_docx(path = "mytable.docx")
+
+tbl_docx <- glue("{dir_figs}/table_planarea_scores.docx")
+
+set_flextable_defaults(
+  font.family = "Arial", font.size = 10, 
+  border.color = "gray", big.mark = ",")
+
+d_pa_n <- d_er_pa_n |> 
+  filter(row_type == "planarea") |> 
+  arrange(desc(score)) |> 
+  select(
+    -row_type, 
+    -ecoregion_name, -ecoregion_key, 
+    -pct_planarea_in_ecoregion) |> 
+  mutate(
+    area_kkm2 = area_km2 / 1000) |>  # convert to 1,000 km²
+  mutate(across(where(is.numeric), round)) |>
+  mutate(
+    row_lbl = glue("{planarea_name} ({planarea_key})") ) |>
+  distinct(
+    row_lbl, score, primprod, 
+    bird, coral, fish, invertebrate, mammal, reptile, other, 
+    area_kkm2) |> 
+  select(
+    `Planning Area`      = row_lbl, # row_type,
+    Score                = score, 
+    `Primary Production` = primprod,
+    Bird                 = bird,
+    Coral                = coral,
+    Fish                 = fish,
+    Invertebrate         = invertebrate,
+    Mammal               = mammal,
+    Reptile              = reptile,
+    Other                = other,
+    `Area (1,000 km^2^)` = area_kkm2)
+# View(d_pa_n)
+write_excel_csv(d_pa_n, pa_n_csv, na = "")
+
+d_pa_n |> 
   flextable() |> 
   ftExtra::colformat_md(part = "all") |> 
   theme_vanilla() |> 
@@ -1153,7 +1208,7 @@ cols <- setNames(
 
 # one flower ----
 g <- d_fl |>
-  filter(ecoregion_key == "CAC") |> 
+  filter(ecoregion_key == "FLS") |> 
   plot_flower(
     fld_category = component,
     fld_height   = value,
@@ -1269,7 +1324,8 @@ m_input_seqs <- tbl(con_sdm, "metric") |>
   pull(metric_seq)
 
 components <- c(
-  "invertebrate", "mammal", "other", "primprod", "reptile", "bird", "coral", "fish")
+  "invertebrate", "mammal", "other", "primary production", "reptile", "bird", 
+  "coral", "fish") |> str_to_title()
 # primprod in 4th green position
 component_cols <- setNames(
   hue_pal()(length(components)),
@@ -1293,7 +1349,12 @@ d_scores <- tbl(con_sdm, "zone") |>
     by = join_by(zone_seq)) |> 
   select(planarea_key, score = value) |> 
   mutate(score = round(score)) |> 
-  collect()
+  collect() |> 
+  arrange(desc(score), planarea_key)
+
+d_scores$planarea_lbl <- factor(
+  d_scores$planarea_key,
+  levels = d_scores$planarea_key, ordered = T)
   
 # d_fl ----
 d_fl <- tbl(con_sdm, "zone") |> 
@@ -1326,7 +1387,7 @@ d_fl <- tbl(con_sdm, "zone") |>
 # TODO: try graying out since NA (vs 0)
 d_0 <- expand_grid(
   planarea_key = d_scores$planarea_key,
-  component    = components,
+  component    = sort(unique(d_fl$component)),
   value        = 0) |>  # 216 x 3
   anti_join(
     d_fl,
@@ -1338,9 +1399,21 @@ d_fl <- d_fl |>
   mutate(
     even = 1)
 
+d_fl <- d_fl |> 
+  mutate(
+    planarea_lbl = factor(
+      planarea_key,
+      levels = d_scores$planarea_key, ordered = T),
+    component    = case_match(
+      component,
+      "primprod" ~ "Primary Production",
+      .default = component),
+    component = str_to_title(component)) |> 
+  arrange(planarea_lbl, component)
+    
 # one flower ----
-pa_key <- "NOR"
-d_fl |>
+pa_key <- "FLS"
+g <- d_fl |>
   filter(planarea_key == !!pa_key) |>
   plot_flower(
     fld_category = component,
@@ -1352,7 +1425,12 @@ d_fl |>
       filter(planarea_key == !!pa_key) |> 
       pull(score),
     colors       = component_cols,
-    interactive  = T)
+    interactive  = F)
+fl_png <- glue("{dir_figs}/planarea_flower-plot_scores_{pa_key}.png")
+png(fl_png, width = 1200, height = 800, res = 150)
+print(g)
+dev.off()
+
 # g
 
 # all flowers ----
@@ -1364,8 +1442,8 @@ d_fl |>
 
 # Calculate positions
 d <- d_fl |>
-  group_by(planarea_key) |>
-  arrange(component) |>
+  arrange(planarea_lbl, component) |>
+  group_by(planarea_lbl) |>
   mutate(across(!where(is.character), as.double)) |>
   mutate(
     # Calculate angles for plotting
@@ -1386,11 +1464,14 @@ g <- d |>
     data_id = component),
     color = "white",
     alpha = 0.5) +
-  scale_fill_manual(values = component_cols) +
-  facet_wrap(~planarea_key) +
+  scale_fill_manual(
+    values = component_cols,
+    name   = "Component") +
+  facet_wrap(~planarea_lbl) +
   coord_polar(theta = "y") +
   # Create donut hole
-  xlim(c(-20, max(d_scores$score))) +
+  xlim(c(-20, max(d_scores$score, d$xmax))) + 
+  # FIXED: use max of scores and xmax to ensure all component scores fit
   # Add center score
   geom_text(
     aes(x, y, label = score),
