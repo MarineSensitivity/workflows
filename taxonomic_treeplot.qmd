@@ -1,0 +1,648 @@
+---
+title: "Interactive Hierarchical Taxonomic Tree Visualization"
+author: "Ben - EcoQuants"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-summary: "Show code"
+    theme: cosmo
+    self-contained: true
+execute:
+  warning: false
+  message: false
+  echo: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup}
+#| message: false
+#| warning: false
+
+# Load required libraries
+librarian::shelf(
+  # collapsibleTree, d3treeR/d3treeR, 
+  DT, glue, here, htmlwidgets, 
+  # networkD3, plotly,
+  yogevherz/plotme,
+  tidyverse, 
+  # treemap, 
+  worrms)
+
+# Set options
+options(stringsAsFactors = FALSE)
+```
+
+## Data Loading and Exploration
+
+```{r load-data}
+
+species_csv <- here("data/species_USA_2025-10-29.csv")
+
+# Read the species data
+df_species <- read_csv(species_csv) #|> 
+  # filter(component == "other")
+
+# Display data structure
+glimpse(df_species)
+
+# Show unique components and taxon authorities
+cat("Unique components:", paste(unique(df_species$component), collapse = ", "), "\n")
+cat("Unique taxon authorities:", paste(unique(df_species$taxon_authority), collapse = ", "), "\n")
+cat("Total records:", nrow(df_species), "\n")
+cat("WoRMS records:", sum(df_species$taxon_authority == "worms", na.rm = TRUE), "\n")
+cat("BOTW records:", sum(df_species$taxon_authority == "botw", na.rm = TRUE), "\n")
+```
+
+## Taxonomic Data Selection
+
+```{r select-taxonomy}
+
+# Choose which taxonomy to visualize - you can change this
+taxonomy_source <- "worms"  # Change to "botw" for Birds of the World
+
+# Filter data based on selected taxonomy
+if (taxonomy_source == "worms") {
+  filtered_df <- df_species %>%
+    filter(taxon_authority == "worms") %>%
+    mutate(taxon_id_num = as.numeric(taxon_id))
+  
+  cat("Selected WoRMS taxonomy with", nrow(filtered_df), "species\n")
+} else if (taxonomy_source == "botw") {
+  filtered_df <- df_species %>%
+    filter(taxon_authority == "botw")
+  
+  cat("Selected Birds of the World taxonomy with", nrow(filtered_df), "species\n")
+}
+
+# Sample data for initial display
+filtered_df %>%
+  select(component, taxon_id, scientific, common) %>%
+  head(10) %>%
+  DT::datatable(options = list(pageLength = 5))
+```
+
+## Fetch Taxonomic Hierarchy
+
+```{r fetch-hierarchy}
+# Function to get WoRMS classification with error handling
+get_worms_classification <- function(aphia_id) {
+  tryCatch({
+    classification <- wm_classification(aphia_id)
+    if (!is.null(classification) && nrow(classification) > 0) {
+      return(classification)
+    }
+    return(NULL)
+  }, error = function(e) {
+    return(NULL)
+  })
+}
+
+# Function to create simplified hierarchy for BOTW (birds)
+create_bird_hierarchy <- function(df) {
+  # For birds, we'll create a simplified hierarchy based on scientific names
+  df %>%
+    mutate(
+      # Extract genus from scientific name
+      genus = str_extract(scientific, "^[A-Z][a-z]+"),
+      # Group by first letter for higher level
+      order_group = paste0("Group_", substr(genus, 1, 1)),
+      # Use component as kingdom
+      kingdom = "Animalia",
+      phylum = "Chordata",
+      class = "Aves",
+      order = order_group,
+      family = paste0(genus, "_family"),
+      species = scientific
+    ) %>%
+    select(taxon_id, kingdom, phylum, class, order, family, genus, species, scientific, common, component)
+}
+
+# Process based on taxonomy source
+if (taxonomy_source == "worms") {
+  # For WoRMS, fetch real taxonomic classification
+  # Limit to first 50 species for demo (remove this limit for full analysis)
+  sample_ids <- filtered_df %>%
+    # slice_head(n = 50) %>%
+    pull(taxon_id_num)
+
+  # Define cache file path
+  cache_file <- here("data/worms_classifications_cache.csv")
+
+  # Load existing classifications from cache if available
+  existing_classifications <- NULL
+  processed_ids <- c()
+
+  if (file.exists(cache_file)) {
+    cat("Loading existing classifications from cache...\n")
+    existing_classifications <- read_csv(cache_file, show_col_types = FALSE)
+    processed_ids <- unique(existing_classifications$species_id)
+    cat("Found", length(processed_ids), "previously processed species\n")
+  }
+
+  # Determine which IDs still need to be fetched
+  remaining_ids <- setdiff(sample_ids, processed_ids)
+
+  # Fetch classifications
+  classifications <- list()
+
+  if (length(remaining_ids) > 0) {
+    cat("Fetching WoRMS classifications for", length(remaining_ids), "species...\n")
+    pb <- txtProgressBar(min = 0, max = length(remaining_ids), style = 3)
+
+    for (i in seq_along(remaining_ids)) {
+      aphia_id <- remaining_ids[i]
+      class_data <- get_worms_classification(aphia_id)
+
+      if (!is.null(class_data)) {
+        # Add the species info
+        species_info <- filtered_df %>%
+          filter(taxon_id_num == aphia_id) %>%
+          slice(1)
+
+        class_data$species_id <- aphia_id
+        class_data$scientific_name <- species_info$scientific
+        class_data$common_name <- species_info$common
+        class_data$component <- species_info$component
+
+        classifications[[length(classifications) + 1]] <- class_data
+
+        # Save to cache every 10 species to minimize data loss
+        if (length(classifications) %% 10 == 0) {
+          new_data <- bind_rows(classifications)
+          if (!is.null(existing_classifications)) {
+            combined_data <- bind_rows(existing_classifications, new_data)
+          } else {
+            combined_data <- new_data
+          }
+          write_csv(combined_data, cache_file)
+        }
+      }
+
+      setTxtProgressBar(pb, i)
+    }
+    close(pb)
+
+    # Final save of any remaining classifications
+    if (length(classifications) > 0) {
+      new_data <- bind_rows(classifications)
+      if (!is.null(existing_classifications)) {
+        all_classifications_cached <- bind_rows(existing_classifications, new_data)
+      } else {
+        all_classifications_cached <- new_data
+      }
+      write_csv(all_classifications_cached, cache_file)
+      cat("\nSaved", length(remaining_ids), "new classifications to cache\n")
+    }
+  } else {
+    cat("All species already processed!\n")
+  }
+  
+  # Combine all classifications (from cache and new fetches)
+  if (!is.null(existing_classifications) || length(classifications) > 0) {
+    if (length(classifications) > 0 && !is.null(existing_classifications)) {
+      # Combine existing and new
+      all_classifications <- bind_rows(existing_classifications, bind_rows(classifications))
+    } else if (length(classifications) > 0) {
+      # Only new classifications
+      all_classifications <- bind_rows(classifications)
+    } else {
+      # Only existing from cache
+      all_classifications <- existing_classifications
+    }
+
+    # Create hierarchical structure
+    hierarchy_df <- all_classifications %>%
+      select(species_id, rank, scientificname, scientific_name, common_name, component) %>%
+      pivot_wider(
+        id_cols = c(species_id, scientific_name, common_name, component),
+        names_from = rank,
+        values_from = scientificname,
+        values_fill = NA
+      )
+  } else {
+    # Fallback if no classifications fetched
+    hierarchy_df <- filtered_df %>%
+      slice_head(n = 50) %>%
+      mutate(
+        Kingdom = "Marine Life",
+        Phylum = component,
+        Class = paste0(component, "_class"),
+        Order = substr(scientific, 1, 3),
+        Family = str_extract(scientific, "^[A-Z][a-z]+"),
+        Species = scientific
+      ) %>%
+      select(taxon_id, Kingdom, Phylum, Class, Order, Family, Species, scientific, common, component)
+  }
+  
+} else {
+  # For BOTW, use simplified hierarchy
+  hierarchy_df <- create_bird_hierarchy(filtered_df %>% slice_head(n = 100))
+}
+
+# Display hierarchy structure
+cat("\nHierarchy structure:\n")
+glimpse(hierarchy_df)
+```
+
+## Interactive Collapsible Tree
+
+```{r collapsible-tree}
+#| eval: false
+
+# Prepare data for collapsible tree
+if (taxonomy_source == "worms") {
+  # Select available taxonomic levels, handling different column names
+  available_cols <- names(hierarchy_df)
+  
+  # Common taxonomic ranks to look for
+  rank_order <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species",
+                  "kingdom", "phylum", "class", "order", "family", "genus", "species")
+  
+  # Find which columns are present
+  present_ranks <- rank_order[rank_order %in% available_cols]
+  
+  if (length(present_ranks) >= 2) {
+    tree_data <- hierarchy_df %>%
+      select(any_of(c(present_ranks, "scientific_name", "common_name", "component"))) %>%
+      mutate(across(everything(), ~replace_na(., "Unknown")))
+  } else {
+    # Fallback structure
+    tree_data <- hierarchy_df %>%
+      mutate(
+        Level1 = component,
+        Level2 = substr(scientific_name, 1, 1),
+        Level3 = scientific_name
+      ) %>%
+      select(Level1, Level2, Level3, scientific_name, common_name)
+  }
+  
+} else {
+  tree_data <- hierarchy_df %>%
+    select(kingdom, phylum, class, order, family, genus, species, common) %>%
+    mutate(across(everything(), ~replace_na(., "Unknown")))
+}
+
+# Create collapsible tree
+tree_cols <- names(tree_data)[1:min(6, ncol(tree_data))]  # Use first 6 columns max
+
+collapsible_tree <- collapsibleTree(
+  tree_data,
+  hierarchy = tree_cols,
+  width = "100%",
+  height = 600,
+  zoomable = TRUE,
+  collapsed = FALSE,
+  nodeSize = "leafCount",
+  tooltipHtml = "common",
+  fill = "lightblue"
+)
+
+collapsible_tree
+```
+
+## Interactive Network Visualization
+
+```{r network-viz}
+#| eval: false
+
+# Create edge list for network visualization
+create_edge_list <- function(df, hierarchy_cols) {
+  edges <- data.frame()
+  
+  for (i in 1:(length(hierarchy_cols) - 1)) {
+    temp_edges <- df %>%
+      select(source = all_of(hierarchy_cols[i]), 
+             target = all_of(hierarchy_cols[i + 1])) %>%
+      distinct() %>%
+      filter(!is.na(source), !is.na(target))
+    
+    edges <- rbind(edges, temp_edges)
+  }
+  
+  return(edges)
+}
+
+# Get hierarchy columns
+if (exists("tree_cols")) {
+  edges <- create_edge_list(tree_data, tree_cols[1:min(4, length(tree_cols))])
+  
+  # Create nodes dataframe
+  all_nodes <- unique(c(edges$source, edges$target))
+  nodes <- data.frame(
+    name = all_nodes,
+    group = rep(1:min(5, length(all_nodes)/5), length.out = length(all_nodes)),
+    size = runif(length(all_nodes), 5, 20)
+  )
+  
+  # Convert edges to use node indices
+  edges$source_id <- match(edges$source, nodes$name) - 1
+  edges$target_id <- match(edges$target, nodes$name) - 1
+  
+  # Create force network
+  network <- forceNetwork(
+    Links = edges,
+    Nodes = nodes,
+    Source = "source_id",
+    Target = "target_id",
+    NodeID = "name",
+    Group = "group",
+    Value = "size",
+    opacity = 0.9,
+    zoom = TRUE,
+    legend = TRUE,
+    width = "100%",
+    height = 600,
+    fontSize = 12,
+    charge = -50,
+    linkDistance = 50
+  )
+  
+  network
+}
+```
+
+## Hierarchical Sunburst Chart
+
+```{r sunburst}
+#| eval: false
+
+
+# Prepare data for sunburst
+if (exists("tree_data") && ncol(tree_data) >= 3) {
+  # Create path strings for sunburst
+  sunburst_data <- tree_data %>%
+    slice_head(n = 100) %>%  # Limit for performance
+    mutate(
+      path = paste(
+        tree_cols[1],
+        if(length(tree_cols) > 1) tree_cols[2] else "",
+        if(length(tree_cols) > 2) tree_cols[3] else "",
+        sep = "-"
+      ),
+      value = 1
+    ) %>%
+    group_by(path) %>%
+    summarise(value = n(), .groups = "drop")
+  
+  # Create sunburst using plotly
+  fig <- plot_ly(
+    labels = sunburst_data$path,
+    parents = "",
+    values = sunburst_data$value,
+    type = 'sunburst',
+    branchvalues = "total",
+    hovertemplate = '<b>%{label}</b><br>Count: %{value}<extra></extra>'
+  ) %>%
+    layout(
+      title = paste("Taxonomic Hierarchy Sunburst -", 
+                   ifelse(taxonomy_source == "worms", "WoRMS", "Birds of the World")),
+      height = 600
+    )
+  
+  fig
+}
+```
+
+## Interactive Hierarchical Treemap
+
+```{r treemap-viz}
+#| eval: true
+
+# Prepare data for treemap visualization
+if (exists("hierarchy_df")) {
+  # Select hierarchical columns in order: Kingdom, Phylum, Class, Order, Family, Species
+  available_cols <- names(hierarchy_df)
+
+  # Define taxonomic ranks to include (in hierarchical order)
+  desired_ranks <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species",
+                     "kingdom", "phylum", "class", "order", "family", "genus", "species",
+                     "scientific_name")
+
+  # Find which columns are present
+  present_ranks <- desired_ranks[desired_ranks %in% available_cols]
+
+  if (length(present_ranks) >= 1) {
+    # Prepare treemap data with component first
+    treemap_data <- hierarchy_df %>%
+      select(component, any_of(present_ranks)) %>%
+      mutate(across(everything(), ~replace_na(as.character(.), "Unknown"))) %>%
+      mutate(count = 1)  # Each row represents one species
+
+    # Standardize column names for consistency
+    rank_map <- c(
+      "Kingdom" = "Kingdom", "kingdom" = "Kingdom",
+      "Phylum" = "Phylum", "phylum" = "Phylum",
+      "Class" = "Class", "class" = "Class",
+      "Order" = "Order", "order" = "Order",
+      "Family" = "Family", "family" = "Family",
+      "Genus" = "Genus", "genus" = "Genus",
+      "Species" = "Species", "species" = "Species", "scientific_name" = "Species"
+    )
+
+    # Rename columns to standard names
+    for (old_name in names(treemap_data)) {
+      if (old_name %in% names(rank_map) && old_name != "count") {
+        new_name <- rank_map[[old_name]]
+        if (!(new_name %in% names(treemap_data)) || old_name == new_name) {
+          names(treemap_data)[names(treemap_data) == old_name] <- new_name
+        }
+      }
+    }
+
+    # Identify taxonomic levels with variety (more than 1 unique value per component)
+    rank_order <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+    available_ranks <- rank_order[rank_order %in% names(treemap_data)]
+
+    # Check which ranks show variety within each component
+    ranks_with_variety <- c()
+    for (rank in available_ranks) {
+      variety_check <- treemap_data %>%
+        group_by(component) %>%
+        summarise(n_unique = n_distinct(.data[[rank]]), .groups = "drop")
+
+      # Include rank if any component has more than 1 unique value
+      if (any(variety_check$n_unique > 1)) {
+        ranks_with_variety <- c(ranks_with_variety, rank)
+      }
+    }
+
+    cat("Taxonomic ranks with variety:", paste(ranks_with_variety, collapse = ", "), "\n")
+
+    # Build hierarchy: component first, then ranks with variety
+    hierarchy_cols <- c("component", ranks_with_variety) |> 
+      setdiff(c("Genus", "Species")) |> 
+      c("scientific_name")
+
+    if (length(hierarchy_cols) >= 2) {
+      # Create the treemap
+      # tm <- treemap(
+      #   treemap_data,
+      #   index      = hierarchy_cols,
+      #   vSize      = "count",
+      #   type       = "index",
+      #   title      = paste("Hierarchical Taxonomy by Component -",
+      #                     ifelse(taxonomy_source == "worms", "WoRMS", "BOTW")),
+      #   palette    = "Set3",
+      #   fontsize.labels = c(15, 12, 10, 8, 6, 4),
+      #   fontcolor.labels = c("white", "white", "black", "black", "black", "black"),
+      #   fontface.labels = c(2, 2, 1, 1, 1, 1),
+      #   bg.labels   = c("transparent"),
+      #   align.labels = list(c("center", "center"), c("left", "top"), c("right", "bottom")),
+      #   overlap.labels = 0.5,
+      #   inflate.labels = FALSE)
+      # 
+      # Create interactive d3 treemap
+      # d3tree <- d3tree2(
+      #   tm,
+      #   rootname = "All Species")
+      # 
+      # d3tree
+      
+      treemap_data |> 
+        select(all_of(hierarchy_cols), n = count) |>
+        count_to_treemap()
+    } else {
+      cat("Not enough taxonomic variety for treemap visualization\n")
+    }
+  } else {
+    cat("No taxonomic ranks available for treemap visualization\n")
+  }
+}
+```
+
+## Component Distribution
+
+```{r component-dist}
+#| eval: false
+
+# Visualize distribution by component
+component_summary <- filtered_df %>%
+  group_by(component) %>%
+  summarise(
+    count = n(),
+    unique_species = n_distinct(scientific),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(count))
+
+# Create interactive bar chart
+fig_comp <- plot_ly(
+  data = component_summary,
+  x = ~reorder(component, count),
+  y = ~count,
+  type = 'bar',
+  text = ~paste("Component:", component, 
+                "<br>Count:", count,
+                "<br>Unique species:", unique_species),
+  hovertemplate = '%{text}<extra></extra>',
+  marker = list(color = 'rgba(50, 171, 96, 0.6)',
+                line = list(color = 'rgba(50, 171, 96, 1.0)', width = 1))
+) %>%
+  layout(
+    title = "Distribution of Species by Component",
+    xaxis = list(title = "Component"),
+    yaxis = list(title = "Number of Records"),
+    height = 400
+  )
+
+fig_comp
+```
+
+## Data Summary Table
+
+```{r summary-table}
+# Create summary statistics
+summary_stats <- filtered_df %>%
+  group_by(component) %>%
+  summarise(
+    `Total Records` = n(),
+    `Unique Species` = n_distinct(scientific),
+    `With Common Names` = sum(!is.na(common)),
+    `Avg Area (km²)` = round(mean(area_km2, na.rm = TRUE), 2),
+    `Avg Suitability` = round(mean(avg_suit, na.rm = TRUE), 3),
+    .groups = "drop"
+  )
+
+# Display as interactive table
+DT::datatable(
+  summary_stats,
+  options = list(
+    pageLength = 10,
+    scrollX = TRUE,
+    dom = 'Bfrtip',
+    buttons = c('copy', 'csv', 'excel')
+  ),
+  class = 'cell-border stripe',
+  caption = paste("Summary Statistics for", 
+                 ifelse(taxonomy_source == "worms", "WoRMS", "BOTW"), 
+                 "Taxonomy")
+)
+```
+
+## Export Options
+
+```{r export-data}
+# Save the hierarchical data for further analysis
+if (exists("hierarchy_df")) {
+  output_file <- here(glue("data/taxonomic_hierarchy_{taxonomy_source}_{Sys.Date()}.csv"))
+  
+  write_csv(hierarchy_df, output_file)
+  cat("Hierarchical data saved to:", output_file, "\n")
+}
+
+# Create a simplified tree structure for export
+if (exists("tree_data")) {
+  tree_export <- tree_data %>%
+    slice_head(n = 100)
+  
+  tree_file <- here(glue("data/taxonomic_tree_{taxonomy_source}_{Sys.Date()}.csv"))
+
+  write_csv(tree_export, tree_file)
+  cat("Tree structure saved to:", tree_file, "\n")
+}
+```
+
+## Notes and Configuration
+
+### Switching Between Taxonomies
+
+To switch between WoRMS and Birds of the World taxonomies, change the `taxonomy_source` variable in the "Taxonomic Data Selection" chunk:
+
+- `taxonomy_source <- "worms"` for marine species from WoRMS
+- `taxonomy_source <- "botw"` for birds from Birds of the World
+
+### Performance Considerations
+
+- The code currently limits WoRMS API calls to 50 species for demonstration
+- Remove the `slice_head(n = 50)` line in the hierarchy fetching section for full analysis
+- Large datasets may take time to process due to API rate limits
+
+### Cache File and Resume Capability
+
+- Classifications are automatically saved to `data/worms_classifications_cache.csv`
+- Progress is saved every 10 species to minimize data loss if processing fails
+- On restart, the script automatically loads cached data and skips already-processed species
+- To start fresh, delete the cache file before running the script
+- The cache file is specific to WoRMS taxonomy (BOTW doesn't use API calls)
+
+### Required Packages
+
+Ensure you have installed:
+```r
+install.packages(c("tidyverse", "worrms", "collapsibleTree",
+                   "networkD3", "plotly", "DT", "htmlwidgets",
+                   "treemap", "d3treeR"))
+```
+
+### Customization Options
+
+1. **Tree Visualization**: Adjust `collapsed = FALSE` to `TRUE` for initially collapsed tree
+2. **Network Force**: Modify `charge` and `linkDistance` parameters for different layouts
+3. **Sunburst Depth**: Add more hierarchy levels by extending the path construction
+4. **Treemap**: Customize color palette (e.g., "Set3", "RdYlBu", "Spectral") and font sizes in the `treemap()` function
+5. **Color Schemes**: Customize colors in plotly and network visualizations
+

@@ -1,0 +1,334 @@
+---
+title: "Interactive Taxonomic Tree - Direct Visualization"
+author: "Ben - EcoQuants"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    code-fold: true
+    theme: cosmo
+    self-contained: true
+execute:
+  warning: false
+  message: false
+---
+
+```{r setup}
+#| label: load-packages
+
+library(tidyverse)
+library(collapsibleTree)
+library(networkD3)
+library(plotly)
+library(DT)
+```
+
+## Load and Process Data
+
+```{r load-process}
+#| label: load-and-process
+
+# Read the species data
+species_df <- read_csv("/mnt/user-data/uploads/species_USA_2025-10-29.csv")
+
+# Choose taxonomy source: "worms" or "botw"
+taxonomy_source <- "worms"  # Change this to "botw" for birds
+
+# Filter data
+filtered_df <- species_df %>%
+  filter(taxon_authority == taxonomy_source)
+
+# Create hierarchical structure from scientific names
+hierarchy_df <- filtered_df %>%
+  mutate(
+    # Extract genus from scientific name
+    genus = str_extract(scientific, "^[A-Z][a-z]+"),
+    # Create family groups based on first 3 letters of genus
+    family = paste0(substr(genus, 1, 3), "_family"),
+    # Create order groups based on component and first letter
+    order = paste0(component, "_", substr(genus, 1, 1)),
+    # Higher level groupings
+    class = tools::toTitleCase(component),
+    phylum = case_when(
+      component %in% c("bird") ~ "Chordata",
+      component %in% c("coral", "invert", "sponge") ~ "Cnidaria/Porifera",
+      component %in% c("fish", "turtle", "seal", "whale") ~ "Chordata",
+      component %in% c("mangrove", "algae", "seagrass", "kelp") ~ "Plantae",
+      TRUE ~ "Other"
+    ),
+    kingdom = case_when(
+      component %in% c("mangrove", "algae", "seagrass", "kelp") ~ "Plantae",
+      TRUE ~ "Animalia"
+    )
+  ) %>%
+  select(kingdom, phylum, class, order, family, genus, species = scientific, 
+         common, component, taxon_id, area_km2, avg_suit)
+
+# Display summary
+cat("Taxonomy source:", taxonomy_source, "\n")
+cat("Total species:", nrow(hierarchy_df), "\n")
+cat("Unique genera:", n_distinct(hierarchy_df$genus), "\n")
+cat("Components:", paste(unique(hierarchy_df$component), collapse = ", "), "\n")
+```
+
+## Interactive Collapsible Tree
+
+```{r collapsible-tree}
+#| label: create-tree
+
+# Prepare tree data (limiting to top species for performance)
+tree_data <- hierarchy_df %>%
+  arrange(desc(area_km2)) %>%
+  slice_head(n = 200) %>%
+  select(kingdom, phylum, class, order, family, genus, species) %>%
+  mutate(across(everything(), ~replace_na(., "Unknown")))
+
+# Create the collapsible tree
+tree <- collapsibleTree(
+  tree_data,
+  hierarchy = c("kingdom", "phylum", "class", "order", "family", "genus", "species"),
+  width = "100%",
+  height = 700,
+  zoomable = TRUE,
+  collapsed = FALSE,
+  nodeSize = "leafCount",
+  fill = c("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", 
+           "#9467bd", "#8c564b", "#e377c2")
+)
+
+tree
+```
+
+## Network Visualization by Component
+
+```{r network-component}
+#| label: network-by-component
+
+# Create edge list for a specific component
+selected_component <- hierarchy_df %>%
+  count(component) %>%
+  slice_max(n, n = 1) %>%
+  pull(component)
+
+component_data <- hierarchy_df %>%
+  filter(component == selected_component) %>%
+  slice_head(n = 100)
+
+# Create edges
+edges <- bind_rows(
+  component_data %>% 
+    select(source = class, target = order) %>% 
+    distinct(),
+  component_data %>% 
+    select(source = order, target = family) %>% 
+    distinct(),
+  component_data %>% 
+    select(source = family, target = genus) %>% 
+    distinct()
+) %>%
+  filter(!is.na(source), !is.na(target))
+
+# Create nodes
+nodes <- data.frame(
+  name = unique(c(edges$source, edges$target)),
+  group = rep(1:5, length.out = length(unique(c(edges$source, edges$target)))),
+  size = runif(length(unique(c(edges$source, edges$target))), 10, 30)
+)
+
+# Map edges to node indices
+edges$source_id <- match(edges$source, nodes$name) - 1
+edges$target_id <- match(edges$target, nodes$name) - 1
+
+# Create force network
+forceNetwork(
+  Links = edges,
+  Nodes = nodes,
+  Source = "source_id",
+  Target = "target_id",
+  NodeID = "name",
+  Group = "group",
+  Value = "size",
+  opacity = 0.8,
+  zoom = TRUE,
+  legend = TRUE,
+  width = "100%",
+  height = 600,
+  fontSize = 14,
+  charge = -100,
+  linkDistance = 100
+)
+```
+
+## Sunburst Visualization
+
+```{r sunburst}
+#| label: create-sunburst
+
+# Prepare sunburst data
+sunburst_df <- hierarchy_df %>%
+  slice_head(n = 500) %>%
+  unite("path", kingdom, phylum, class, order, sep = "/", remove = FALSE) %>%
+  count(path, kingdom, phylum, class, order)
+
+# Split the path to create parent-child relationships
+path_parts <- str_split(sunburst_df$path, "/", simplify = TRUE)
+
+# Create labels and parents
+labels <- c()
+parents <- c()
+values <- c()
+
+# Add kingdom level
+unique_kingdoms <- unique(path_parts[,1])
+for(k in unique_kingdoms) {
+  labels <- c(labels, k)
+  parents <- c(parents, "")
+  values <- c(values, sum(sunburst_df$n[path_parts[,1] == k]))
+}
+
+# Add phylum level
+kingdom_phylum <- unique(path_parts[,1:2])
+for(i in 1:nrow(kingdom_phylum)) {
+  if(kingdom_phylum[i,2] != "") {
+    labels <- c(labels, kingdom_phylum[i,2])
+    parents <- c(parents, kingdom_phylum[i,1])
+    subset_rows <- path_parts[,1] == kingdom_phylum[i,1] & 
+                   path_parts[,2] == kingdom_phylum[i,2]
+    values <- c(values, sum(sunburst_df$n[subset_rows]))
+  }
+}
+
+# Create sunburst
+plot_ly(
+  labels = labels,
+  parents = parents,
+  values = values,
+  type = 'sunburst',
+  branchvalues = "total",
+  hovertemplate = '<b>%{label}</b><br>Count: %{value}<extra></extra>'
+) %>%
+  layout(
+    title = paste("Taxonomic Hierarchy -", taxonomy_source),
+    height = 600
+  )
+```
+
+## Treemap Visualization
+
+```{r treemap}
+#| label: create-treemap
+
+# Prepare treemap data
+treemap_df <- hierarchy_df %>%
+  count(phylum, class, component) %>%
+  arrange(desc(n))
+
+# Create treemap
+plot_ly(
+  data = treemap_df,
+  type = "treemap",
+  labels = ~paste(class, "\n(", component, ")"),
+  parents = ~phylum,
+  values = ~n,
+  textposition = "middle center",
+  hovertemplate = '<b>%{label}</b><br>Count: %{value}<br>Parent: %{parent}<extra></extra>'
+) %>%
+  layout(
+    title = "Species Distribution Treemap",
+    height = 600
+  )
+```
+
+## Component Analysis
+
+```{r component-analysis}
+#| label: analyze-components
+
+# Summary by component
+component_summary <- hierarchy_df %>%
+  group_by(component) %>%
+  summarise(
+    species_count = n(),
+    genus_count = n_distinct(genus),
+    avg_area = mean(area_km2, na.rm = TRUE),
+    avg_suitability = mean(avg_suit, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(species_count))
+
+# Interactive bar chart
+fig <- plot_ly(component_summary, 
+               x = ~reorder(component, species_count), 
+               y = ~species_count,
+               type = 'bar',
+               name = 'Species Count',
+               marker = list(color = 'rgba(50, 171, 96, 0.7)')) %>%
+  add_trace(y = ~genus_count, 
+            name = 'Genus Count',
+            marker = list(color = 'rgba(219, 64, 82, 0.7)')) %>%
+  layout(title = 'Species and Genus Counts by Component',
+         xaxis = list(title = 'Component'),
+         yaxis = list(title = 'Count'),
+         barmode = 'group',
+         height = 400)
+
+fig
+
+# Display summary table
+DT::datatable(
+  component_summary %>%
+    mutate(
+      avg_area = round(avg_area, 2),
+      avg_suitability = round(avg_suitability, 3)
+    ),
+  options = list(pageLength = 15),
+  caption = paste("Component Summary for", taxonomy_source, "taxonomy")
+)
+```
+
+## Genus Diversity
+
+```{r genus-diversity}
+#| label: genus-analysis
+
+# Top genera by species count
+top_genera <- hierarchy_df %>%
+  count(genus, component) %>%
+  arrange(desc(n)) %>%
+  slice_head(n = 20)
+
+# Horizontal bar plot
+plot_ly(
+  data = top_genera,
+  y = ~reorder(genus, n),
+  x = ~n,
+  type = 'bar',
+  orientation = 'h',
+  color = ~component,
+  text = ~paste("Component:", component),
+  hovertemplate = '<b>%{y}</b><br>Species: %{x}<br>%{text}<extra></extra>'
+) %>%
+  layout(
+    title = "Top 20 Genera by Species Count",
+    xaxis = list(title = "Number of Species"),
+    yaxis = list(title = "Genus"),
+    height = 600
+  )
+```
+
+## Export Processed Data
+
+```{r export}
+#| label: export-data
+
+# Save the hierarchical data
+write_csv(hierarchy_df, 
+          paste0("/mnt/user-data/outputs/processed_taxonomy_", 
+                taxonomy_source, "_", Sys.Date(), ".csv"))
+
+cat("✅ Processed data saved to outputs directory\n")
+cat("📊 Total species processed:", nrow(hierarchy_df), "\n")
+cat("🌿 Unique genera:", n_distinct(hierarchy_df$genus), "\n")
+cat("🔍 Components included:", paste(unique(hierarchy_df$component), collapse = ", "))
+```
+
