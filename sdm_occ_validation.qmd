@@ -1,0 +1,244 @@
+
+
+## Species of Interest
+
+Walrus, North Atlantic Right Whale, Humpback Whale, Fin Whale, Atlantic Sturgeon, Grey Seal, Atlantic Cod, Common Dolphin, Atlantic Lobster, Bowhead Whale, Black-capped Petrel. Common Tern, Calanus finmarchicus, Meganyctiphanes norvegica, Rice's Whale
+
+### Get WoRMS AphiaIDs for Species of Interest
+```{r}
+#| label: setup
+
+librarian::shelf(
+  aws.s3,
+  DBI,
+  DT,
+  dplyr,
+  duckdb,
+  glue,
+  here,
+  jsonlite,
+  mapgl,
+  mapview,
+  purrr,
+  readr,
+  rgbif,
+  sf,
+  stringr,
+  terra,
+  worrms,
+  quiet = T
+)
+
+verbose <- T
+is_server <- Sys.info()[["sysname"]] == "Linux"
+dir_private <- ifelse(
+  is_server,
+  "/share/private",
+  "~/My Drive/private"
+)
+dir_data <- ifelse(
+  is_server,
+  "/share/data",
+  "~/My Drive/projects/msens/data"
+)
+mapbox_tkn_txt <- glue("{dir_private}/mapbox_token_bdbest.txt")
+maptile_tkn_txt <- glue("{dir_private}/mapbox_token_bdbest.txt")
+cell_tif <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
+sdm_db <- glue("{dir_data}/derived/sdm.duckdb")
+spp15_csv <- here("data/sdm_occ_spp15.csv")
+
+# db ----
+con_sdm <- dbConnect(duckdb(), dbdir = sdm_db, read_only = T)
+
+# data prep ----
+r_cell <- rast(cell_tif)
+
+d_spp <- tbl(con_sdm, "taxon") |>
+  filter(is_ok) |>
+  collect()
+```
+
+```{r}
+#| label: d_spp
+
+if (!file.exists(spp15_csv)) {
+  d_spp15 <- tribble(
+    ~sp_sci                     , ~sp_cmn                      ,
+    "Odobenus rosmarus"         , "Walrus"                     ,
+    "Eubalaena glacialis"       , "North Atlantic Right Whale" ,
+    "Megaptera novaeangliae"    , "Humpback Whale"             ,
+    "Balaenoptera physalus"     , "Fin Whale"                  ,
+    "Acipenser oxyrinchus"      , "Atlantic Sturgeon"          ,
+    "Halichoerus grypus"        , "Grey Seal"                  ,
+    "Gadus morhua"              , "Atlantic Cod"               ,
+    "Delphinus delphis"         , "Common Dolphin"             ,
+    "Homarus americanus"        , "Atlantic Lobster"           ,
+    "Balaena mysticetus"        , "Bowhead Whale"              ,
+    "Pterodroma hasitata"       , "Black-capped Petrel"        ,
+    "Sterna hirundo"            , "Common Tern"                ,
+    "Calanus finmarchicus"      , "Calanus finmarchicus"       ,
+    "Meganyctiphanes norvegica" , "Meganyctiphanes norvegica"  ,
+    "Balaenoptera ricei"        , "Rice's Whale"
+  ) |>
+    relocate(sp_cmn) |>
+    arrange(sp_cmn) |>
+    mutate(
+      worms_id = map_int(sp_sci, \(x) {
+        worrms::wm_name2id(x) |>
+          as.integer()
+      }),
+      gbif_id = map_int(sp_sci, \(x) {
+        rgbif::name_backbone(x) |>
+          pull(usageKey) |>
+          as.integer()
+      })
+    )
+  write_csv(d_spp15, spp15_csv)
+} else {
+  d_spp15 <- read_csv(spp15_csv, show_col_types = F)
+}
+
+datatable(d_spp15)
+```
+
+## Map
+
+```{r}
+#| label: map
+
+maplibre(
+  style = maptiler_style("bright", variant = "dark"),
+  zoom = 3.5,
+  center = c(-106, 40.1)
+) |>
+  add_vector_source(
+    id = "er_src",
+    url = "https://api.marinesensitivity.org/tilejson?table=public.ply_ecoregions_2025"
+  ) |>
+  add_vector_source(
+    id = "pa_src",
+    url = "https://api.marinesensitivity.org/tilejson?table=public.ply_planareas_2025"
+  ) |>
+  add_line_layer(
+    id = "pa_ln",
+    source = "pa_src",
+    source_layer = "public.ply_planareas_2025",
+    line_color = "white",
+    line_opacity = 1,
+    line_width = 1
+  ) |>
+  add_line_layer(
+    id = "er_ln",
+    source = "er_src",
+    source_layer = "public.ply_ecoregions_2025",
+    line_color = "black",
+    line_opacity = 1,
+    line_width = 3,
+    before_id = "pa_ln"
+  ) |>
+  add_fullscreen_control() |>
+  add_navigation_control() |>
+  add_scale_control() |>
+  add_geocoder_control()
+```
+
+```{r}
+#| label: other
+#| eval: false
+
+# Read WKT from https://wktmap.com/?e6b28728
+wkt <- fromJSON(
+  "https://xpjpbiqaa3.execute-api.us-east-1.amazonaws.com/prod/wkt/e6b28728"
+)$wkt %>%
+  str_replace("<.*?>\\s", "")
+
+# Set up duckdb connection and extensions
+con <- dbConnect(duckdb())
+dbSendQuery(con, "install httpfs; load httpfs;")
+dbSendQuery(con, "install spatial; load spatial;")
+dbSendQuery(con, "INSTALL h3 FROM community; LOAD h3;")
+
+
+# Query
+species <- dbGetQuery(
+  con,
+  glue(
+    "
+  select kingdom, phylum, class, family, genus, species, AphiaID
+  from read_parquet('s3://obis-products/speciesgrids/h3_7/*')
+  where ST_Intersects(geometry, ST_GeomFromText('{wkt}')) 
+  group by kingdom, phylum, class, family, genus, species, AphiaID
+"
+  )
+)
+
+d_op <- get_bucket_df(
+  's3://obis-products',
+  max = Inf
+)
+
+
+d_sg <- get_bucket_df(
+  's3://obis-products',
+  prefix = 'speciesgrids/',
+  max = Inf
+)
+which(d_sg$Key == "speedy/distribution_137077.geojson")
+
+pq <- "s3://obis-products/speciesgrids/h3_7/*"
+
+column_info <- dbGetQuery(
+  con,
+  glue(
+    "DESCRIBE SELECT * FROM read_parquet('{pq}');"
+  )
+)
+print(column_info)
+
+# get all cells for species with AphiaID 156263
+aphia_id <- 137077 # _Odobenus rosmarus_ (walrus)
+# Fix the query to use h3_cell_to_boundary_wkt instead of h3_cell_to_boundary_wkb
+d_sp <- dbGetQuery(
+  con,
+  glue(
+    "select *, h3_cell_to_boundary_wkt(cell) AS geometry_wkt 
+    from read_parquet('{pq}') 
+    where AphiaID = {aphia_id}"
+  )
+)
+
+
+aws.s3::
+d_sp <- dbGetQuery(
+  con,
+  glue(
+    "select *, h3_cell_to_boundary_wkt(cell) AS geometry_wkt 
+    from read_parquet('{pq}') 
+    where AphiaID = {aphia_id}"
+  )
+)
+
+# speedy/distribution_137077.geojson
+
+# Convert WKT to sf geometry and create the map
+d_sp |>
+  filter(
+    source_obis == T,
+    !is.na(min_year)
+  ) |>
+  mutate(geometry = st_as_sfc(geometry_wkt, crs = 4326)) |>
+  st_as_sf() |>
+  mapview(zcol = "AphiaID")
+
+
+# show interactive map of wkt
+mapview(st_as_sfc(wkt, crs = 4326))
+
+dbListTables(con)
+
+```
+
+
+
+
+
