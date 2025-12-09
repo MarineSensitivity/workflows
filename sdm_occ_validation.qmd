@@ -1,3 +1,4 @@
+# SDM Validation per Ecoregion by Occurrence
 
 ## Overview
 
@@ -7,6 +8,12 @@ Process:
 
 - Get raster for species of interest from Marine Sensitivity Database
 - Get occurrence data from GBIF and WoRMS for those species
+- Compare presence of species in Ecoregions for SDM vs occurrence data using different filters
+- Determine the best filter to systematically apply that maximizes matches between SDM and occurrence data, while minimizing mismatches (additions and subtractions)
+
+TODO:
+
+- Buffer 10 km to include Rice's whale occurrences
 
 ## Species of Interest
 
@@ -152,7 +159,22 @@ if (!file.exists(spp15_csv)) {
   d_spp15 <- read_csv(spp15_csv, show_col_types = F)
 }
 
-datatable(d_spp15)
+d_spp15 |>
+  mutate(
+    worms_id = glue(
+      "<a href='https://www.marinespecies.org/aphia.php?p=taxdetails&id={worms_id}' target='_blank'>{worms_id}</a>"
+    ),
+    gbif_id = glue(
+      "<a href='https://www.gbif.org/species/{gbif_id}' target='_blank'>{gbif_id}</a>"
+    ),
+    mdl_seq = glue(
+      "<a href='https://shiny.marinesensitivity.org/mapsp/?mdl_seq={mdl_seq}' target='_blank'>{mdl_seq}</a>"
+    )
+  ) |>
+  datatable(
+    caption = "Species of interest with IDs from WoRMS (used by OBIS), GBIF and the MarineSensitivity models (`mdl_seq`)",
+    escape = F
+  )
 ```
 
 ## Get Ecoregions from Marine Sensitivity Database
@@ -283,13 +305,23 @@ if (!file.exists(h3_rds)) {
 ply_h3 <- read_rds(h3_rds)
 ```
 
-## Map of ecoregions with walrus occurrence h3 hexagons
+## Map of ecoregions with **walrus** occurrence h3 hexagons
 
 ```{r}
-#| label: map
+#| label: map_walrus
 
 ply_h3_walrus <- ply_h3 |>
-  filter(worms_id == 137077)
+  filter(worms_id == 137077) |>
+  mutate(
+    popup = glue(
+      "<strong>H3 Cell:</strong> {h3_cell}<br/>
+      <strong>Records:</strong> {records}<br/>
+      <strong>Min Year:</strong> {min_year}<br/>
+      <strong>Max Year:</strong> {max_year}<br/>
+      <strong>Source OBIS:</strong> {source_obis}<br/>
+      <strong>Source GBIF:</strong> {source_gbif}"
+    )
+  )
 
 maplibre(
   style = maptiler_style("bright", variant = "dark"),
@@ -313,25 +345,55 @@ maplibre(
     source = ply_h3_walrus,
     fill_color = "white",
     fill_opacity = 0.5,
-    popup = paste0(
-      "<strong>H3 Cell:</strong> ",
-      ply_h3_walrus$h3_cell,
-      "<br/>",
-      "<strong>Records:</strong> ",
-      ply_h3_walrus$records,
-      "<br/>",
-      "<strong>Min Year:</strong> ",
-      ply_h3_walrus$min_year,
-      "<br/>",
-      "<strong>Max Year:</strong> ",
-      ply_h3_walrus$max_year,
-      "<br/>",
-      "<strong>Source OBIS:</strong> ",
-      ply_h3_walrus$source_obis,
-      "<br/>",
-      "<strong>Source GBIF:</strong> ",
-      ply_h3_walrus$source_gbif
+    popup = "popup"
+  ) |>
+  add_fullscreen_control() |>
+  add_navigation_control() |>
+  add_scale_control() |>
+  add_geocoder_control()
+```
+
+## Map of ecoregions with **Rice's whale** occurrence h3 hexagons
+
+```{r}
+#| label: map_ricei
+
+ply_h3_ricei <- ply_h3 |>
+  filter(worms_id == 1576133) |>
+  mutate(
+    popup = glue(
+      "<strong>H3 Cell:</strong> {h3_cell}<br/>
+      <strong>Records:</strong> {records}<br/>
+      <strong>Min Year:</strong> {min_year}<br/>
+      <strong>Max Year:</strong> {max_year}<br/>
+      <strong>Source OBIS:</strong> {source_obis}<br/>
+      <strong>Source GBIF:</strong> {source_gbif}"
     )
+  )
+
+maplibre(
+  style = maptiler_style("bright", variant = "dark"),
+  zoom = 3.5,
+  center = c(-106, 40.1)
+) |>
+  add_vector_source(
+    id = "er_src",
+    url = "https://api.marinesensitivity.org/tilejson?table=public.ply_ecoregions_2025"
+  ) |>
+  add_line_layer(
+    id = "er_ln",
+    source = "er_src",
+    source_layer = "public.ply_ecoregions_2025",
+    line_color = "gray",
+    line_opacity = 1,
+    line_width = 3
+  ) |>
+  add_fill_layer(
+    id = "ricei_h3",
+    source = ply_h3_ricei,
+    fill_color = "white",
+    fill_opacity = 0.5,
+    popup = "popup"
   ) |>
   add_fullscreen_control() |>
   add_navigation_control() |>
@@ -477,7 +539,10 @@ d_spp_er_occ <- d_spp_er |>
   relocate(sp_cmn, worms_id, er_key) |>
   arrange(sp_cmn, er_key)
 
-datatable(d_spp_er_occ)
+datatable(
+  d_spp_er_occ,
+  caption = "Species counts in Ecoregions for SDM vs occurrenced data"
+)
 ```
 
 ## Compare Ecoregions from SDM vs Occurrence Data
@@ -504,7 +569,9 @@ d_spp_er_occ_lgl |>
   # relocate(sp_cmn_id) |>
   # select(-sp_cmn, -worms_id) |>
   select(-worms_id) |>
-  datatable() |>
+  datatable(
+    caption = "Species counts in Ecoregions from SDM vs Occurrence data as logical values",
+  ) |>
   formatStyle(
     columns = c(
       "has_sdm",
@@ -557,30 +624,33 @@ d_spp_er_smry <- d_spp_er_occ_lgl |>
   relocate(n_er_equal, n_er_miss, n_er_add, .after = filter) |>
   arrange(sp_cmn, filter)
 
-datatable(d_spp_er_smry)
+datatable(
+  d_spp_er_smry,
+  caption = "Summary of Ecoregion matches between SDM and Occurrence data per species and filter"
+)
 
 # determine which filter maximizes n_er_equal while minimizing n_er_miss and n_er_add
 d_spp_er_best <- d_spp_er_smry |>
   group_by(sp_cmn) |>
   slice_max(
     order_by = n_er_equal,
-    # n = 1,
     with_ties = T
   ) |>
   slice_min(
     order_by = n_er_miss,
-    # n = 1,
     with_ties = T
   ) |>
   slice_min(
     order_by = n_er_add,
-    # n = 1,
-    with_ties = F
+    with_ties = T
   ) |>
   ungroup() |>
   arrange(sp_cmn)
 
-datatable(d_spp_er_best)
+datatable(
+  d_spp_er_best,
+  caption = "Summary of Best Ecoregion matches between SDM and Occurrence data per species"
+)
 ```
 
 
