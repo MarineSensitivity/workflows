@@ -1,0 +1,233 @@
+---
+title: "SDM validation by expert range"
+execute:
+  message: false
+editor_options: 
+  chunk_output_type: console
+---
+
+## Overview
+
+Validate (and mask) species distribution model (SDM) outputs in the Marine 
+Sensitivity Toolkit (MST) against expert range maps 
+where available, e.g. [Spatial Data Download | IUCN Red List of Threatened Species](https://www.iucnredlist.org/resources/spatial-data-download).
+.
+
+We start with:
+
+- walrus (_Odobenus rosmarus_; MST `mdl_seq`: [790](https://shiny.marinesensitivity.org/mapsp/?mdl_seq=790))
+
+```{r}
+#| label: setup
+
+# packages ----
+librarian::shelf(
+  dplyr,
+  duckdb,
+  glue,
+  mapgl,
+  mapview,
+  sf,
+  terra,
+  tibble,
+  quiet = T)
+
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  message   = FALSE,
+  warning   = FALSE)
+terraOptions(progress = 0)
+
+# variables ----
+
+dir_iucn           <- "~/My Drive/projects/msens/data/raw/iucnredlist.org"
+marmam_sea_shp     <- glue("{dir_iucn}/MAMMALS_MARINE_ONLY/MAMMALS_MARINE_ONLY.shp")
+marmam_sealand_shp <- glue("{dir_iucn}/MAMMALS_MARINE_AND_TERRESTRIAL/MAMMALS_MARINE_AND_TERRESTRIAL.shp")
+
+is_server <- Sys.info()[["sysname"]] == "Linux"
+dir_data <- ifelse(
+  is_server,
+  "/share/data",
+  "~/My Drive/projects/msens/data")
+cell_tif <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
+sdm_db <- glue("{dir_data}/derived/sdm.duckdb")
+
+# helper functions ----
+get_rast <- function(mdl_seq){
+
+    d <- tbl(con_sdm, "model_cell") |>
+      filter(mdl_seq == !!mdl_seq) |>
+      select(cell_id, value) |>
+      collect()
+
+    r <- init(r_cell[[1]], NA)
+    r[d$cell_id] <- d$value
+    names(r) <- "value"
+
+    r
+  }
+
+# initialize ----
+r_cell <- rast(cell_tif)
+
+con_sdm <- dbConnect(duckdb(), dbdir = sdm_db, read_only = T)
+```
+
+## Map of walrus SDM suitability (AquaMaps)
+
+Data source: [Odobenus rosmarus | AquaMaps.org](https://www.sealifebase.ca/summary/Odobenus-rosmarus.html)
+
+```{r}
+#| label: map_sdm_walrus
+
+sdm_mdl <- 790
+sdm_title <- "Walrus SDM Suitability"
+
+r <- get_rast(sdm_mdl) |> 
+  rotate()
+
+bbox <- st_bbox(r) |> as.numeric()
+n_cols <- 11
+cols_r <- rev(RColorBrewer::brewer.pal(n_cols, "Spectral"))
+rng_r <- minmax(r) |> as.numeric() |> signif(digits = 3)
+
+map_r <- maplibre(
+  style = maptiler_style("bright", variant = "dark")) |>
+  fit_bounds(bbox) |>
+  add_image_source(
+    id     = "r_src",
+    data   = r,
+    colors = cols_r) |>
+  add_raster_layer(
+    id                = "r_lyr",
+    source            = "r_src",
+    raster_opacity    = 0.6,
+    raster_resampling = "nearest",
+    before_id         = "er_ln") |>
+  mapgl::add_legend(
+    legend_title = sdm_title,
+    values       = rng_r,
+    colors       = cols_r,
+    position     = "bottom-right") |>
+  add_vector_source(
+    id  = "er_src",
+    url = "https://api.marinesensitivity.org/tilejson?table=public.ply_ecoregions_2025") |>
+  add_line_layer(
+    id           = "er_ln",
+    source       = "er_src",
+    source_layer = "public.ply_ecoregions_2025",
+    line_color   = "gray",
+    line_opacity = 1,
+    line_width   = 3) |>
+  # add_fill_layer(
+  #   id = "walrus_h3",
+  #   source = ply_h3_walrus,
+  #   fill_color = "white",
+  #   fill_opacity = 0.5,
+  #   popup = "popup") |>
+  add_fullscreen_control() |>
+  add_navigation_control() |>
+  add_scale_control() |>
+  add_geocoder_control()
+map_r
+```
+
+## Map of walrus expert range (IUCN)
+
+Data source: [Odobenus rosmarus (Walrus) | IUCNRedList.org](https://www.iucnredlist.org/species/15106/272356023)
+
+```{r}
+#| label: map_range_walrus
+
+sp_sci <- "Odobenus rosmarus"
+
+# sf_ranges <- read_sf(marmam_sea_shp)
+sf_ranges <- read_sf(marmam_sealand_shp)
+# df_ranges <- st_drop_geometry(sf_ranges) 
+
+sf_sp <- sf_ranges |> 
+  filter(sci_name == sp_sci)
+bbox <- st_bbox(sf_sp) |> as.numeric()
+
+# mapView(zcol = "subspecies")
+
+maplibre(
+  style = maptiler_style("bright", variant = "dark")) |>
+  fit_bounds(bbox) |>
+  add_fill_layer(
+    id           = "range_lyr",
+    source       = sf_sp,
+    fill_color   = "red",
+    fill_opacity = 0.5,
+    popup        = "subspecies") |>
+  add_vector_source(
+    id  = "er_src",
+    url = "https://api.marinesensitivity.org/tilejson?table=public.ply_ecoregions_2025") |>
+  add_line_layer(
+    id           = "er_ln",
+    source       = "er_src",
+    source_layer = "public.ply_ecoregions_2025",
+    line_color   = "gray",
+    line_opacity = 1,
+    line_width   = 3) |>
+  add_fullscreen_control() |>
+  add_navigation_control() |>
+  add_scale_control() |>
+  add_geocoder_control()
+```
+
+## Map of SDM masked by expert range 
+
+```{r}
+# mask SDM by expert range
+r_m <- mask(r, vect(st_union(sf_sp)))
+# r_m; plot(r_m)
+sp_m_title <- "Walrus SDM suitability<br>masked by expert range"
+
+map_r_m <- maplibre(
+  style = maptiler_style("bright", variant = "dark")) |>
+  fit_bounds(bbox) |>
+  add_image_source(
+    id     = "r_src",
+    data   = r_m,
+    colors = cols_r) |>
+  add_raster_layer(
+    id                = "r_lyr",
+    source            = "r_src",
+    raster_opacity    = 0.6,
+    raster_resampling = "nearest",
+    before_id         = "er_ln") |>
+  mapgl::add_legend(
+    legend_title = sp_m_title,
+    values       = rng_r,
+    colors       = cols_r,
+    position     = "bottom-right") |>
+  add_vector_source(
+    id  = "er_src",
+    url = "https://api.marinesensitivity.org/tilejson?table=public.ply_ecoregions_2025") |>
+  add_line_layer(
+    id           = "er_ln",
+    source       = "er_src",
+    source_layer = "public.ply_ecoregions_2025",
+    line_color   = "gray",
+    line_opacity = 1,
+    line_width   = 3) |>
+  # add_fill_layer(
+  #   id = "walrus_h3",
+  #   source = ply_h3_walrus,
+  #   fill_color = "white",
+  #   fill_opacity = 0.5,
+  #   popup = "popup") |>
+  add_fullscreen_control() |>
+  add_navigation_control() |>
+  add_scale_control() |>
+  add_geocoder_control()
+map_r_m
+```
+
+## Compare Before vs After Masking
+
+```{r}
+mapgl::compare(map_r, map_r_m)
+```
+
