@@ -46,7 +46,10 @@ dir_derived          <- glue("{dir_data}/derived")
 pa_gpkg              <- glue("{dir_derived}/ply_planareas_2025.gpkg")
 er_gpkg              <- glue("{dir_derived}/ply_ecoregions_2025.gpkg")
 sr_gpkg              <- glue("{dir_derived}/ply_subregions_2025.gpkg")
+pra_gpkg_raw         <- glue("{dir_raw}/boem.gov/boem_program_areas_2025-11.gpkg")
+pra_gpkg             <- glue("{dir_derived}/ply_programareas_2026.gpkg")
 sr_pa_csv            <- glue("{dir_derived}/subregion_planareas.csv") # apps: mapgl/app.R
+sr_pra_csv           <- glue("{dir_derived}/subregion_programareas.csv") # apps: mapgl/app.R
 metrics_tif          <- glue("{dir_derived}/r_metrics.tif")
 metrics_akl48_tif    <- glue("{dir_derived}/r_metrics_akl48.tif")
 zone_taxon_csv       <- glue("{dir_derived}/zone_taxon.csv")
@@ -100,6 +103,331 @@ r_cell <- rast(cell_tif)
 ext(r_cell) <- round(ext(r_cell), 3)
 ```
 
+## Add Program Areas to SDM zones
+
+Add BOEM Program Areas (11th National Draft Proposed Program, 2025-11) as a new zone type.
+Program Areas are derived from Planning Areas with additional GOA subdivisions.
+
+```{r add_programareas}
+#| eval: false
+
+zone_tbl <- tbl(con_sdm, "zone") |>
+  distinct(tbl) |>
+  pull(tbl)
+
+if (!"ply_programareas_2026" %in% zone_tbl){
+
+  source(here("libs/sdm_functions.R"))
+  # - set_geom_ctr_area()
+  # - register_zones()
+  # - insert_zone_cell_data()
+
+  # load planning areas for field join
+  pa <- read_sf(pa_gpkg) |>
+    st_drop_geometry() |>
+    select(planarea_name, region_key, planarea_key)
+
+  # load and process program areas with field renaming
+  pra <- read_sf(pra_gpkg_raw) |>
+    rename(
+      region_name      = BOEM_OCS_REGION,
+      planarea_name    = PLANNING_AREA,
+      programarea_name = Label,
+      programarea_id   = OBJECTID) |>
+    # left join to get region_key and planarea_key from planning areas
+    left_join(pa, by = "planarea_name") |>
+    # programarea_key defaults to planarea_key
+    mutate(
+      programarea_key = planarea_key) |>
+    # handle NA values for GOA Program Areas (not in planning areas)
+    mutate(
+      programarea_key = case_when(
+        programarea_name == "GOA Program Area A" ~ "GAA",
+        programarea_name == "GOA Program Area B" ~ "GAB",
+        TRUE ~ programarea_key),
+      planarea_key = case_when(
+        programarea_name == "GOA Program Area A" ~ "WGA,CGA,EGA",
+        programarea_name == "GOA Program Area B" ~ "CGA,EGA",
+        TRUE ~ planarea_key),
+      region_key = case_when(
+        str_detect(programarea_name, "GOA") ~ "GA",
+        TRUE ~ region_key)) |> 
+    select(programarea_id, region_key, region_name, planarea_key, planarea_name, programarea_key, programarea_name) |> 
+    st_transform(st_crs(4326))
+  # pra |>
+  #   st_drop_geometry()
+  #      programarea_id region_key region_name     planarea_key planarea_name                                   programarea_key programarea_name
+  #  *          <dbl> <chr>      <chr>           <chr>        <chr>                                           <chr>           <chr>
+  #  1              1 AK         Alaska          ALA          Aleutian Arc                                    ALA             Aleutian Arc
+  #  2              2 AK         Alaska          ALB          Aleutian Basin                                  ALB             Aleutian Basin
+  #  3              3 AK         Alaska          HAR          High Arctic                                     HAR             High Arctic
+  #  4              4 AK         Alaska          BOW          Bowers Basin                                    BOW             Bowers Basin
+  #  5              5 AK         Alaska          COK          Cook Inlet                                      COK             Cook Inlet
+  #  6              6 AK         Alaska          GEO          St. George Basin                                GEO             St. George Basin
+  #  7              7 AK         Alaska          GOA          Gulf of Alaska                                  GOA             Gulf of Alaska
+  #  8              8 AK         Alaska          HOP          Hope Basin                                      HOP             Hope Basin
+  #  9              9 AK         Alaska          KOD          Kodiak                                          KOD             Kodiak
+  # 10             10 AK         Alaska          MAT          St. Matthew-Hall                                MAT             St. Matthew-Hall
+  # 11             11 AK         Alaska          NAV          Navarin Basin                                   NAV             Navarin Basin
+  # 12             12 AK         Alaska          NOR          Norton Basin                                    NOR             Norton Basin
+  # 13             13 AK         Alaska          SHU          Shumagin                                        SHU             Shumagin
+  # 14             14 AK         Alaska          BFT          Beaufort Sea                                    BFT             Beaufort Sea
+  # 15             15 AK         Alaska          CHU          Chukchi Sea                                     CHU             Chukchi Sea
+  # 16             16 PA         Pacific         CEC          Central California                              CEC             Central California
+  # 17             17 PA         Pacific         NOC          Northern California                             NOC             Northern California
+  # 18             18 PA         Pacific         SOC          Southern California                             SOC             Southern California
+  # 19             20 GA         Gulf of America WGA,CGA,EGA  Western and Central and Eastern Gulf of America GAA             GOA Program Area A
+  # 20             21 GA         Gulf of America CGA,EGA      Central and Eastern Gulf of America             GAB             GOA Program Area B
+  
+  # add centroid and area
+  pra <- pra |> set_geom_ctr_area()
+
+  # write derived gpkg
+  write_sf(pra, pra_gpkg)
+  message(glue("Wrote {nrow(pra)} program areas to {pra_gpkg}"))
+  # Wrote 20 program areas to ~/My Drive/projects/msens/data/derived/ply_programareas_2026.gpkg
+
+  # shift lon [-180, 180] to [0, 360]
+  pra_sl <- st_shift_longitude(pra)
+
+  # load cell raster template
+  r_cell <- rast(cell_tif, lyrs = "cell_id")
+
+  # get percent each feature covers each cell
+  r_pra <- rasterize(
+    pra_sl,
+    r_cell,
+    fun     = "max",
+    touches = T,
+    cover   = T,
+    by      = "programarea_key")
+
+  # convert to data frame
+  d_pra <- terra::as.data.frame(
+    r_pra, cells = T, na.rm = F, wide = F) |>
+    filter(!is.na(values)) |>
+    tibble()
+
+  message(glue("Program areas cover {length(unique(d_pra$cell))} cells"))
+
+  # register zones and insert zone data into con_sdm
+  register_zones(pra, "ply_programareas_2026", "programarea_key")
+  insert_zone_cell_data(d_pra, "ply_programareas_2026", "programarea_key")
+
+  # verify registration
+  tbl(con_sdm, "zone") |>
+    group_by(tbl) |>
+    summarise(n_zones = n()) |>
+    collect() |>
+    print()
+}
+```
+
+## Create Subregion-ProgramArea Lookup
+
+Create lookup table for which program areas belong to which subregions.
+
+```{r sr_pra_lookup}
+#| eval: false
+
+# calculate intersections between subregions and program areas using zone_cell
+d_sr_pra <- tbl(con_sdm, "zone_cell") |>
+  inner_join(
+    tbl(con_sdm, "zone") |> filter(tbl == "ply_subregions_2025"),
+    by = "zone_seq") |>
+  rename(subregion_key = value) |>
+  select(cell_id, subregion_key) |>
+  inner_join(
+    tbl(con_sdm, "zone_cell") |>
+      inner_join(
+        tbl(con_sdm, "zone") |> filter(tbl == "ply_programareas_2026"),
+        by = "zone_seq") |>
+      select(cell_id, programarea_key = value),
+    by = "cell_id") |>
+  distinct(subregion_key, programarea_key) |>
+  collect()
+
+write_csv(d_sr_pra, sr_pra_csv)
+message(glue("Wrote {nrow(d_sr_pra)} subregion-programarea mappings to {sr_pra_csv}"))
+```
+
+## Load into PostGIS database
+
+For viewing in mapgl and mapsp apps.
+
+```{r}
+#| label: load_db
+
+# devtools::install_local("../msens")
+librarian::shelf(
+  here, leaflet, leaflet.extras, # mapview, 
+  marinesensitivity/msens, 
+  sf, tibble,
+  quiet = T)
+
+source(here("libs/db.R")) # define: con
+
+tbls_old <- c(
+  "ply_shlfs", "ply_shlfs_s05", 
+  "ply_rgns" , "ply_rgns_s05")
+
+tbls <- c(
+  "ply_boemrgns" , "ply_boemrgns_s05",
+  "ply_ecorgns"  , "ply_ecorgns_s05",
+  "ply_planareas", "ply_planareas_s05",
+  "ply_ecoareas" , "ply_ecoareas_s05")
+  
+redo <- F
+
+# if (any(tbls_old %in% dbListTables(con))){
+#   for (tbl in tbls_old){  # tbl = tbls_old[1]
+#     dbExecute(con, glue("DROP TABLE IF EXISTS {tbl} CASCADE"))
+#   }
+# }
+
+if (!all(tbls %in% dbListTables(con))){
+  for (tbl in tbls){  # tbl = tbls[2]
+    
+    o <- get(tbl) |>
+      st_wrap_dateline()  # shift from 0:360 to -180:180
+
+    st_write(
+      o,
+      dsn           = con,
+      layer         = tbl,
+      driver        = "PostgreSQL",
+      layer_options = "OVERWRITE=true")
+
+    # enforce SRID so shows up in tile.marinesensivity.org
+    dbExecute(con, glue(
+      "SELECT UpdateGeometrySRID('{tbl}','geom',4326);"))
+    
+    # fix any invalid geometries
+    dbExecute(con, glue("UPDATE {tbl} SET geom = ST_MakeValid(geom) WHERE NOT ST_IsValid(geom)"))
+    
+    # add spatial index for faster queries
+    dbExecute(con, glue(
+      "CREATE INDEX IF NOT EXISTS {tbl}_geom_idx ON {tbl} USING gist(geom);"))
+  }
+}
+```
+
+
+## Reclassify Reptiles (Turtles vs Sea Snakes)
+
+Reclassify `sp_cat` for reptiles:
+- Turtles (common name contains "turtle") → `sp_cat = "turtle"`
+- Non-turtles (sea snakes) → `sp_cat = NULL`, `is_ok = FALSE` (excluded from calculations)
+
+```{r reclassify_reptiles}
+#| eval: false
+
+# check current reptile records
+d_reptiles <- tbl(con_sdm, "taxon") |>
+  filter(sp_cat == "reptile") |>
+  select(taxon_id, common_name, scientific_name, is_ok) |>
+  collect()
+
+message(glue("Found {nrow(d_reptiles)} reptile records"))
+# Found 32 reptile records
+
+# identify turtles by common name
+d_turtles <- d_reptiles |>
+  filter(str_detect(str_to_lower(common_name), "turtle"))
+message(glue("  - Turtles: {nrow(d_turtles)}"))
+#  - Turtles: 5
+d_non_turtles <- d_reptiles |>
+  filter(!str_detect(str_to_lower(common_name), "turtle"))
+message(glue("  - Non-turtles (sea snakes): {nrow(d_non_turtles)}"))
+#  - Non-turtles (sea snakes): 26
+
+# update: turtles -> sp_cat = "turtle"
+if (nrow(d_turtles) > 0) {
+  turtle_ids <- paste(d_turtles$taxon_id, collapse = ", ")
+  dbExecute(con_sdm, glue("
+    UPDATE taxon SET sp_cat = 'turtle'
+    WHERE taxon_id IN ({turtle_ids})"))
+  message(glue("Updated {nrow(d_turtles)} turtles to sp_cat = 'turtle'"))
+  # Updated 5 turtles to sp_cat = 'turtle'
+}
+
+# update: non-turtles (sea snakes) -> is_ok = FALSE, sp_cat = NULL
+if (nrow(d_non_turtles) > 0) {
+  non_turtle_ids <- paste(d_non_turtles$taxon_id, collapse = ", ")
+  # non_turtle_ids <- 1389961 # Boa constrictor manually excluded
+  dbExecute(con_sdm, glue("
+    UPDATE taxon SET sp_cat = NULL, is_ok = FALSE
+    WHERE taxon_id IN ({non_turtle_ids})"))
+  message(glue("Excluded {nrow(d_non_turtles)} sea snakes (is_ok = FALSE)"))
+  # Excluded 26 sea snakes (is_ok = FALSE)
+}
+
+# verify changes
+tbl(con_sdm, "taxon") |>
+  filter(sp_cat == "turtle" | taxon_id %in% d_reptiles$taxon_id) |>
+  select(taxon_id, common_name, sp_cat, is_ok) |>
+  collect() |>
+  print()
+```
+
+## Mask Walrus SDM by IUCN Range
+
+Mask walrus (mdl_seq = 790) species distribution model by the IUCN expert range
+to remove cells outside the known range.
+
+```{r mask_walrus_sdm}
+#| eval: false
+
+walrus_mdl_seq <- 790
+sp_sci <- "Odobenus rosmarus"
+
+# load IUCN marine mammal ranges
+dir_iucn <- "~/My Drive/projects/msens/data/raw/iucnredlist.org"
+marmam_sealand_shp <- glue("{dir_iucn}/MAMMALS_MARINE_AND_TERRESTRIAL/MAMMALS_MARINE_AND_TERRESTRIAL.shp")
+
+sf_ranges <- read_sf(marmam_sealand_shp)
+sf_walrus <- sf_ranges |> filter(sci_name == sp_sci)
+
+message(glue("IUCN walrus range: {nrow(sf_walrus)} polygon(s)"))
+
+# get current walrus SDM values
+d_walrus_before <- tbl(con_sdm, "model_cell") |>
+  filter(mdl_seq == walrus_mdl_seq) |>
+  collect()
+n_before <- nrow(d_walrus_before)
+message(glue("Walrus SDM cells before masking: {n_before}"))
+# Walrus SDM cells before masking: 139,076
+
+# create raster and mask by IUCN range
+r <- init(r_cell[[1]], NA)
+r[d_walrus_before$cell_id] <- d_walrus_before$value
+names(r) <- "value"
+# sum(!is.na(values(r)))
+
+# mask by IUCN range (need to rotate to 0-360 longitude for consistency)
+r_masked <- mask(rotate(r), vect(st_union(sf_walrus)))
+
+# extract masked cell values
+d_masked <- terra::as.data.frame(r_masked, cells = T, na.rm = T, xy = F) |>
+  tibble() |>
+  rename(cell_id = cell)
+
+n_after <- nrow(d_masked)
+message(glue("Walrus SDM cells after masking: {n_after} ({round((1 - n_after/n_before) * 100, 1)}% removed)"))
+# Walrus SDM cells after masking: 84451 (39.3% removed)
+
+# update database: delete and re-insert masked values
+dbExecute(con_sdm, glue("DELETE FROM model_cell WHERE mdl_seq = {walrus_mdl_seq}"))
+
+d_insert <- d_masked |>
+  mutate(mdl_seq = walrus_mdl_seq) |>
+  select(mdl_seq, cell_id, value)
+dbWriteTable(con_sdm, "model_cell", d_insert, append = TRUE)
+
+message(glue("Updated model_cell table for walrus (mdl_seq = {walrus_mdl_seq})"))
+# Updated model_cell table for walrus (mdl_seq = 790)
+```
+
 ## Calculate Extinction Risk Metrics by Class
 
 ```{r delete_extrisk_metrics}
@@ -124,17 +452,21 @@ if (length(existing_seqs) > 0) {
 } 
 ```
 
-```{r calc_metrics_redlist}
+```{r calc_cell_metric_redlist}
 #| eval: false
 
 d_taxon_ok <- tbl(con_sdm, "taxon") |>
   filter(is_ok) |> 
   collect()
 # table(d_taxon_ok$sp_cat, useNA = "ifany")
+# OLD: 
 #    bird        coral          fish  invertebrate       mammal         other 
 #     496          775         6,678         8,183           88         1,128 
 # reptile 
 #      31
+# NEW:
+#  bird  coral   fish  invertebrate  mammal  other  turtle 
+#   496    775  6,678         8,183      88  1,128       5
  
 sp_cats <- c(
   "all",
@@ -238,6 +570,16 @@ tbl(con_sdm, "metric") |>
   select(-date_created) |> 
   collect() |> 
   print(n = Inf)
+#   metric_seq metric_key           description                     
+#        <int> <chr>                <chr>                           
+# 1        295 extrisk_all          Extinction risk for all         
+# 2        296 extrisk_other        Extinction risk for other       
+# 3        297 extrisk_coral        Extinction risk for coral       
+# 4        298 extrisk_fish         Extinction risk for fish        
+# 5        299 extrisk_invertebrate Extinction risk for invertebrate
+# 6        300 extrisk_mammal       Extinction risk for mammal      
+# 7        301 extrisk_turtle       Extinction risk for turtle      
+# 8        302 extrisk_bird         Extinction risk for bird 
 ```
 
 ## Calculate ExtinctionRisk min/max per SpeciesCategory and Ecoregion
@@ -309,6 +651,16 @@ tbl(con_sdm, "metric") |>
   select(-date_created) |> 
   collect() |> 
   print(n = Inf)
+  metric_seq metric_key                         description                                     
+#        <int> <chr>                              <chr>                                           
+# 1        303 extrisk_all_ecoregion_min          Extinction risk for all Ecoregional min         
+# 2        305 extrisk_other_ecoregion_min        Extinction risk for other Ecoregional min       
+# 3        307 extrisk_coral_ecoregion_min        Extinction risk for coral Ecoregional min       
+# 4        309 extrisk_fish_ecoregion_min         Extinction risk for fish Ecoregional min        
+# 5        311 extrisk_invertebrate_ecoregion_min Extinction risk for invertebrate Ecoregional min
+# 6        313 extrisk_mammal_ecoregion_min       Extinction risk for mammal Ecoregional min      
+# 7        315 extrisk_turtle_ecoregion_min       Extinction risk for turtle Ecoregional min      
+# 8        317 extrisk_bird_ecoregion_min         Extinction risk for bird Ecoregional min 
 ```
 
 ## Calculate rescaled ExtinctionRisk per cell based on EcoregionMinMax per SpeciesCategory
@@ -416,6 +768,18 @@ tbl(con_sdm, "metric") |>
   select(-date_created) |> 
   collect() |> 
   print(n = Inf)
+
+#   metric_seq metric_key                              description                                          
+#        <int> <chr>                                   <chr>                                                
+# 1        319 extrisk_all_ecoregion_rescaled          Extinction risk for all, rescaled to [0,100] based o…
+# 2        320 extrisk_other_ecoregion_rescaled        Extinction risk for other, rescaled to [0,100] based…
+# 3        321 extrisk_coral_ecoregion_rescaled        Extinction risk for coral, rescaled to [0,100] based…
+# 4        322 extrisk_fish_ecoregion_rescaled         Extinction risk for fish, rescaled to [0,100] based …
+# 5        323 extrisk_invertebrate_ecoregion_rescaled Extinction risk for invertebrate, rescaled to [0,100…
+# 6        324 extrisk_mammal_ecoregion_rescaled       Extinction risk for mammal, rescaled to [0,100] base…
+# 7        325 extrisk_turtle_ecoregion_rescaled       Extinction risk for turtle, rescaled to [0,100] base…
+# 8        326 extrisk_bird_ecoregion_rescaled         Extinction risk for bird, rescaled to [0,100] based …
+
 ```
 
 
@@ -502,7 +866,6 @@ tbl(con_sdm, "metric") |>
 # r[d$cell_id] <- d$value
 # r_r <- rotate(r)
 # plet(r_r)
-
 ```
 
 
@@ -879,8 +1242,99 @@ d_ck |>
 #  Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
 # 0.035   6.745  19.124  25.349  38.889  90.960
 # NEW:
-#   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#   Min. 1st Qu.  Median    Mean 3rd Qu.    Max.
 # 0.7705  7.7090 20.1478 24.9488 38.0759 91.7481
+# NEWEST:
+#   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+# 0.7705  8.9566 20.8480 26.1353 39.8928 91.2885 
+```
+
+## Calculate ProgramArea metrics contributing to score based on cell metrics
+
+```{r cell_metrics_to_programarea_metrics}
+#| eval: false
+
+# get zone_seqs for program areas
+z_seqs <- tbl(con_sdm, "zone") |>
+  filter(tbl == "ply_programareas_2026") |>
+  pull(zone_seq)
+
+message(glue("Calculating metrics for {length(z_seqs)} program areas..."))
+
+# use same metrics as planning areas (with turtle instead of reptile)
+sp_cats_u <- c("all", "bird", "coral", "fish", "invertebrate", "mammal", "other", "turtle")
+metrics <- c(
+  glue("extrisk_{sp_cats_u}"),
+  glue("extrisk_{sp_cats_u}_ecoregion_rescaled"),
+  "primprod",
+  "primprod_ecoregion_rescaled")
+
+for (m_key in metrics){ # m_key = metrics[1]
+
+  # get existing metric_seq
+  m_seq <- tbl(con_sdm, "metric") |>
+    filter(metric_key == !!m_key) |>
+    pull(metric_seq)
+
+  if (length(m_seq) != 1) {
+    message(glue("  Skipping {m_key} - metric not found"))
+    next
+  }
+
+  # delete existing zone_metric values for this metric and program areas
+  dbExecute(con_sdm, glue(
+    "DELETE FROM zone_metric
+    WHERE metric_seq = {m_seq}
+      AND zone_seq IN ({paste(z_seqs, collapse = ',')})"))
+
+  # stop if no cell_metric found
+  n_cm <- tbl(con_sdm, "cell_metric") |>
+    filter(metric_seq == !!m_seq) |>
+    tally() |>
+    pull(n)
+
+  if (n_cm == 0) {
+    message(glue("  Skipping {m_key} - no cell_metric values"))
+    next
+  }
+
+  # calculate average score per program area weighted by cell coverage
+  dbExecute(con_sdm, glue("
+    INSERT INTO zone_metric (zone_seq, metric_seq, value)
+    SELECT
+      zc.zone_seq,
+      {m_seq} as metric_seq,
+      SUM(cm.value * zc.pct_covered) / SUM(zc.pct_covered) as value
+    FROM zone_cell zc
+    JOIN cell_metric cm ON zc.cell_id = cm.cell_id
+    WHERE
+      cm.metric_seq = {m_seq}
+      AND zc.zone_seq IN ({paste(z_seqs, collapse = ',')})
+      AND cm.value IS NOT NULL
+    GROUP BY zc.zone_seq"))
+
+  message(glue("  Calculated {m_key}"))
+}
+
+# verify
+d_ck <- tbl(con_sdm, "metric") |>
+  select(metric_seq, metric_key) |>
+  filter(metric_key %in% metrics) |>
+  left_join(
+    tbl(con_sdm, "zone_metric"),
+    by = "metric_seq") |>
+  left_join(
+    tbl(con_sdm, "zone") |>
+      filter(tbl == "ply_programareas_2026") |>
+      select(zone_seq, pra_key = value),
+    by = "zone_seq") |>
+  filter(!is.na(pra_key)) |>
+  collect()
+
+d_ck |>
+  filter(str_detect(metric_key, "_ecoregion_rescaled")) |>
+  pull(value) |>
+  summary()
 ```
 
 ## Calculate Ecoregion metrics contributing to score based on cell metrics
@@ -1653,6 +2107,49 @@ update_table_with_clear <- function(con, df, tbl, key_col = "planarea_key") {
 # For complete refresh (clears existing values first)
 update_table_with_clear(con, d_pa_metrics, "ply_planareas_2025" , "planarea_key")
 update_table_with_clear(con, d_er_metrics, "ply_ecoregions_2025", "ecoregion_key")
+```
+
+## Load Program Areas to PostGIS
+
+```{r pg_load_programareas}
+#| eval: false
+
+source(here("libs/db.R")) # con
+
+# check if table exists in PostGIS
+if (!dbExistsTable(con, "ply_programareas_2026")) {
+  # load from GeoPackage and write to PostGIS
+  pra <- read_sf(pra_gpkg)
+  st_write(pra, con, "ply_programareas_2026", delete_layer = TRUE)
+  message("Created ply_programareas_2026 in PostGIS")
+}
+
+# get program area metrics from DuckDB
+d_pra_metrics <- tbl(con_sdm, "zone") |>
+  filter(tbl == "ply_programareas_2026") |>
+  select(programarea_key = value, zone_seq) |>
+  left_join(
+    tbl(con_sdm, "zone_metric") |>
+      mutate(value = round(value, 1)),
+    by = "zone_seq") |>
+  left_join(
+    tbl(con_sdm, "metric") |>
+      select(metric_seq, metric_key),
+    by = "metric_seq") |>
+  select(programarea_key, metric_key, value) |>
+  filter(
+    !is.na(programarea_key),
+    !is.na(metric_key),
+    !is.na(value)) |>
+  pivot_wider(
+    names_from  = metric_key,
+    values_from = value) |>
+  collect()
+
+message(glue("Loaded {nrow(d_pra_metrics)} program area metrics"))
+
+# update PostGIS table with metrics
+update_table_with_clear(con, d_pra_metrics, "ply_programareas_2026", "programarea_key")
 ```
 
 ```{r pg_rm_old_metrics}
