@@ -26,7 +26,7 @@ is_server     <- Sys.info()[["sysname"]] == "Linux"
 dir_private   <- ifelse(is_server, "/share/private", "~/My Drive/private")
 dir_data      <- ifelse(is_server, "/share/data"   , "~/My Drive/projects/msens/data")
 spp_db        <- glue("{dir_data}/derived/spp.duckdb")
-sdm_db        <- glue("{dir_data}/derived/sdm.duckdb")
+sdm_db        <- glue("{dir_data}/derived/sdm_2026.duckdb")
 cell_tif      <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
 dir_bl        <- glue("{dir_data}/raw/birdlife.org")
 botw_gpkg     <- glue("{dir_bl}/BOTW_GPKG_2024_2/BOTW_2024_2.gpkg")
@@ -38,6 +38,7 @@ con_spp <- dbConnect(duckdb(dbdir = spp_db, read_only = T))
 # [1] "gbif"             "gbif_vernacular"  "itis"             "itis_vernacular" 
 # [5] "iucn_redlist"     "iucn_vernacular"  "worms"            "worms_vernacular"
 con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F))
+# dbDisconnect(con_sdm, shutdown = T); duckdb_shutdown(duckdb()); rm(con_sdm)
 # dbListTables(con_sdm)
 # [1] "cell_metric" "dataset"     "metric"      "model"       "model_cell" 
 # [6] "species"     "zone"        "zone_cell"   "zone_metric"
@@ -1711,13 +1712,350 @@ dbExecute(
 duckdb_unregister(con_sdm, "d2")
 ```
 
-```{r insert_dataset_row}
+## Add IUCN Range Maps dataset (`ds_key`: "rng_iucn")
+
+
+```{r insert_rng_iucn_dataset_row}
+ds_key <- "rng_iucn"
+row_dataset <- tibble(
+  ds_key          = !!ds_key,
+  name_short      = "IUCN Red List Range Maps, 2025-2",
+  name_original   = "Digital Distribution Maps on The IUCN Red List of Threatened Species",
+  description     = "This dataset contains distribution information on species assessed for The IUCN Red List of Threatened Species™. The maps are developed as part of a comprehensive assessment of global biodiversity in order to highlight taxa threatened with extinction, and thereby promote their conservation.",
+  citation        = "IUCN Red List of Threatened Species. Version 2025-2. <www.iucnredlist.org>. Downloaded on 21 January 2026.",
+  source_broad    = "IUCN",
+  source_detail   = "https://www.iucnredlist.org/resources/spatial-data-download",
+  regions         = "Global",
+  response_type   = "binary",
+  taxa_groups     = "all taxa (except birds)",
+  year_pub        = 2025,
+  date_obs_beg    = NA,
+  date_obs_end    = NA,
+  date_env_beg    = NA,
+  date_env_end    = NA,
+  link_info       = "https://www.iucnredlist.org/resources/spatial-data-download",
+  link_download   = NA,
+  link_metadata   = NA,
+  links_other     = NA,
+  spatial_res_deg = 0.05,
+  temporal_res    = "static")
+
+if (dbExistsTable(con_sdm, "dataset"))
+  dbExecute(con_sdm, glue("DELETE FROM dataset WHERE ds_key = '{ds_key}'"))
+
+dbWriteTable(con_sdm, "dataset", row_dataset, append = TRUE)
+tbl(con_sdm, "dataset") |> 
+  select(ds_key, name_short)
+#   ds_key   name_short                                                            
+#   <chr>    <chr>                                                                 
+# 1 am_0.05  AquaMaps suitability for all marine taxa (except birds) globally, 2019
+# 2 bl       BirdLife Birds of the World, 2024                                     
+# 3 ch_fws   FWS Critical Habitat for USA, 2025-05-05                              
+# 4 ch_nmfs  NMFS Critical Habitat for USA, 2025-05-12                             
+# 5 rng_fws  FWS Current Range Maps, 2025-07-23                                    
+# 6 ms_merge Marine Sensitivity Merged Model                                       
+# 7 rng_iucn IUCN Red List Range Maps, 2025-2 
+```
+
+
+```{r setup_rng_iucn}
+# TODO: add all IUCN range maps to spatial db table model_cell, not just matching; but then have to link taxon_id to IUCN id 
+
+ds_key <- "rng_iucn"
+
+dir_iucn_raw       <- glue("{dir_data}/raw/iucnredlist.org")
+dir_iucn_derived   <- glue("{dir_data}/derived/iucnredlist.org")
+rng_shps           <- list.files(dir_iucn_raw, pattern = "\\.shp$", recursive = T, full.names = T)
+flds_req           <- c("sci_name", "marine", "yrcompiled", "category")
+default_cell_value <- 50L # TODO: redo based on IUCN categories? For now, only using as mask
+sf_use_s2(F) # prevent invalid geometries, eg MAMMALS_MARINE_ONLY | Skipping invalid geometries with sci_name: Balaena mysticetus, Balaenoptera musculus, Balaenoptera physalus, Eschrichtius robustus, Monodon monoceros, Phocoena phocoena, Delphinus delphis
+
+d_taxon       <- tbl(con_sdm, "taxon") |> collect()
+
+r_cell        <- rast(cell_tif, lyrs = "cell_id") # [   0, 360]
+r_cell_r      <- rotate(r_cell)                   # [-180, 180]
+ext(r_cell)   <- round(ext(r_cell), 3)
+ext(r_cell_r) <- round(ext(r_cell_r), 3)
+```
+
+```{r extract_rng_iucn_models}
+#| eval: false
+
+log_txt <- glue("{dir_iucn_derived}/_log {Sys.time()}.txt")
+log_appender(appender_file(log_txt))
+
+# this R loop took 6.2 hrs (with MARINEFISH duplicates): 2026-01-23 00:41 - 2026-01-22 18:30
+for (i in 1:length(rng_shps)){ # i = 4 # EELS.shp # i = 9 # MAMMALS_MARINE_ONLY.shp
+  rng_shp  <- rng_shps[i]  
+  grp      <- basename(rng_shp) |> str_replace_all("\\.shp$", "")
+  grp_gpkg <- glue("{dir_iucn_derived}/{grp}.gpkg")
+  grp_tif  <- glue("{dir_iucn_derived}/{grp}.tif")
+  
+  log_info("| INIT | {grp} | {i}/{length(rng_shps)}")
+  
+  if (file.exists(grp_tif)){
+    log_info("| SKIP | {grp} | tif already exists")
+    next
+  }
+  
+  if (file.exists(grp_gpkg)){
+    log_info("| INFO | {grp} | gpkg already exists")
+    x <- read_sf(grp_gpkg)
+  } else {
+    a <- read_sf(rng_shp)  # st_drop_geometry(a) |> View()
+    flds_notreq <- setdiff(flds_req, names(a))
+    
+    # a |> st_drop_geometry() |> names()
+    # a |> st_drop_geometry() |> View()
+    
+    if (length(flds_notreq) > 0)
+      log_error("| ERROR | {grp} | missing required fields: {paste(flds_notreq, collapse = ', ')}")
+    
+    # DEBUG ----
+    # a <- a |> 
+    #   filter(sci_name %in% c(
+    #     "Balaena mysticetus", "Balaenoptera musculus", "Balaenoptera physalus", 
+    #     "Eschrichtius robustus", "Monodon monoceros", "Phocoena phocoena", "Delphinus delphis"))
+    # 18 × 29
+
+    if (any(!st_is_valid(a))){
+      log_warn("| WARN | {grp} | repairing invalid geometries before summarizing")
+      a <- st_make_valid(a)
+    }
+    if (any(!st_is_valid(a))){
+      # filter out invalid geometries and report on which sci_name
+      invalid_sci <- a %>% 
+        filter(!st_is_valid(.)) |> 
+        pull(sci_name) |> 
+        unique()
+      log_warn("| SKIP | {grp} | Skipping invalid geometries with sci_name: {paste(invalid_sci, collapse = ', ')}")
+      a <- a %>% 
+        filter(st_is_valid(.))
+    }
+    
+    x <- a |> 
+      rename(iucn_id = id_no) |> 
+      filter(
+        str_to_lower(marine) %in% c("true", "t")) |> 
+      inner_join(
+        d_taxon |> 
+          select(taxon_id, scientific_name),
+        by = c("sci_name" = "scientific_name")) |> 
+      # group_by(taxon_id, category) |> 
+      group_by(iucn_id, taxon_id, sci_name, category) |> 
+      summarize(
+        yrcompiled = max(yrcompiled, na.rm = T),
+        n_shp_rows = n(),
+        .groups = "drop")
+    # st_drop_geometry(x) |> View()
+    # st_is_valid(x, reason = T)
+    
+    log_info("| INFO | {grp} | found {nrow(x)} matching taxa")
+    if (nrow(x) == 0){
+      log_info("| SKIP | {grp} | no intersecting marine taxa found")
+      next
+    }
+    
+    sci_dupes <- x |> 
+      filter(sci_name %in% duplicated(x$sci_name)) |>
+      pull(sci_name)
+    if (length(sci_dupes) > 0)
+      log_error("| ERROR | {grp} | duplicate `sci_name` in: {paste(sci_dupes, collapse = ', ')}")
+    
+    if (any(!st_is_valid(x))){
+      log_warn("| WARN | {grp} | repairing invalid geometries after summarizing")
+      x <- st_make_valid(x)
+    }
+    stopifnot(all(st_is_valid(x)))
+    
+    # save a copy of the filtered intersected shapefile as a geopackage
+    log_info("| WRITE | {grp} | gpkg")
+    st_write(x, grp_gpkg, delete_dsn = T, quiet = T)
+  }
+  
+  # iterate by individual species, otherwise R can crash (eg EELS with 352 species)
+  for (j in 1:nrow(x)){ # j = 1
+    sp_tif <- glue("{dir_iucn_derived}/{grp}/{x$sci_name[j]}.tif")
+    dir.create(dirname(sp_tif), recursive = T, showWarnings = F)
+    
+    log_info("| INFO | {grp} | rasterizing {j}/{nrow(x)}: {x$sci_name[j]}")
+    r <- try(rasterize(
+      x |> 
+        slice(j),
+      r_cell_r, 
+      field   = default_cell_value,
+      touches = T,
+      by      = "sci_name") |> 
+      rotate() |> 
+      crop(r_cell) |> 
+      mask(r_cell),
+    silent = T)
+    # plot(trim(r))
+    if (inherits(r, "try-error")){
+      log_warn("| SKIP | {grp} | error in rasterize() of {j}/{nrow(x)} ({x$sci_name[j]}): {r}")
+      next()
+    }
+    # r_t <- trim(r[[1]]); plot(r_t); mapView(r_t)
+    
+    n_notna <- global(r, "notNA") |> as.integer()
+    if (n_notna == 0){
+      log_info("| SKIP | {grp} | No layers in rast have notNA after cropping and masking to US EEZ")
+      next()
+    }
+    
+    log_info("| WRITE | {grp} | Writing tif {j}/{nrow(x)}: {x$sci_name[j]}")
+    writeRaster(
+      r, 
+      filename = sp_tif,
+      overwrite = T)
+  }
+  
+}
+```
+
+
+```{r insert-models_iucn_rng}
+# TODO: see rng_fws ingest for dataset, model, model_cell  ----
+# dbListFields(con_sdm, "model_cell") |> paste(collapse = ", ")
+# mdl_seq cell_id value
+# dbListFields(con_sdm, "model") |> paste(collapse = ", ")
+# mdl_seq, ds_key, taxa, time_period, region, mdl_type, description, date_created
+# tbl(con_sdm, "model") |> 
+# tbl(con_sdm, "model") |> 
+#   filter()
+
+# gpkg has extra columns of data, but also extra rows of species outside US EEZ filtered out from *.tif
+d_gpkg <- tibble( # 573
+  gpkg = dir_ls(dir_iucn_derived, glob = "*.gpkg")) |> 
+  mutate(
+    grp  = str_remove(basename(gpkg), "\\.gpkg$"),
+    data = map(gpkg, \(x) read_sf(x) |> st_drop_geometry())) |> 
+  unnest(data) |>  # 
+  left_join(
+    d_taxon |> 
+      select(scientific_name, sp_cat, mdl_seq),
+  by = join_by(sci_name == scientific_name))
+# names(d_gpkg) |> paste(collapse = ", ")
+# gpkg, grp, iucn_id, taxon_id, sci_name, category, yrcompiled, n_shp_rows, sp_cat, mdl_seq
+# Note: taxon_id == worms_id (no birds); MARINEFISH* is duplicated from other groups
+stopifnot(sum(duplicated(d_gpkg$sci_name)) == 0)
+
+d_tif <- tibble( # 573
+  tif = dir_ls(dir_iucn_derived, glob = "*.tif", recurse = T)) |> 
+  mutate(
+    data = map(tif, \(x) tibble(sci_name = names(rast(x))) ) ) |> 
+  unnest(data)
+
+d_spp <- d_gpkg |> 
+  inner_join(
+    d_tif,
+    by = join_by(sci_name)) |> 
+  arrange(grp, sci_name)
+
+for (i in 2:nrow(d_spp)){ # i = 1
+  
+  sp       <- d_spp$sci_name[i]
+  d_sp     <- d_spp[i,]
+  sp_key   <- glue("{ds_key}:{sp}")
+  sp_tif   <- d_sp$tif
+  r_sp     <- rast(sp_tif, lyrs = sp)
+  
+  # delete: existing ----
+  mdl_seqs <- tbl(con_sdm, "model") |> 
+    filter(ds_key == !!ds_key, taxa == !!sp_key) |> 
+    pull(mdl_seq)
+  if (length(mdl_seqs > 0)) {
+    dbExecute(con_sdm, glue("DELETE FROM model WHERE ds_key = '{ds_key}' AND taxa = '{sp_key}'"))
+    dbExecute(con_sdm, glue("DELETE FROM species WHERE ds_key = '{ds_key}' AND taxa = '{sp_key}'"))
+    dbExecute(con_sdm, glue("DELETE FROM model_cell WHERE mdl_seq IN ({paste(mdl_seqs, collapse = ',')})"))
+  }
+  
+  # append: model ----
+  d_model <- tibble(
+    ds_key      = ds_key,
+    taxa        = sp_key,
+    time_period = "2025",
+    region      = "Global",
+    mdl_type    = "binary",
+    description = glue(
+      "IUCN Red List (2025-2) range map for {sp}, interpolated to 0.05° resolution") )
+  dbWriteTable(con_sdm, "model", d_model, append = TRUE)
+  
+  # get the mdl_seq that was just created
+  mdl_seq <- dbGetQuery(con_sdm, glue("
+    SELECT mdl_seq FROM model 
+    WHERE
+      ds_key = '{ds_key}' AND 
+      taxa   = '{sp_key}'
+    ORDER BY mdl_seq DESC LIMIT 1 "))$mdl_seq
+  
+  # d_sp |> glimpse()
+  # Rows: 1
+  # Columns: 11
+  # $ tif        <fs::path> "/Users/bbest/My Drive/projects/msens/data/derived/iucnredlist.org/ABALONES.tif"
+  # $ grp        <chr> "ABALONES"
+  # $ gpkg       <glue> "~/My Drive/projects/msens/data/derived/iucnredlist.org/ABALONES.gpkg"
+  # $ sci_name   <chr> "Haliotis asinina"
+  # $ category   <chr> "LC"
+  # $ yrcompiled <int> 2020
+  # $ n_shp_rows <int> 1
+  # $ taxon_id   <dbl> 147456
+  # $ worms_id   <dbl> 147456
+  # $ sp_cat     <chr> "invertebrate"
+  # $ mdl_seq    <int> 15595
+  
+  # append: species ----
+  d_species <- tibble(
+    ds_key                   = ds_key,
+    taxa                     = sp_key,
+    sp_key                   = sp_key,
+    worms_id                 = d_sp$taxon_id,
+    gbif_id                  = NA_integer_,   # TODO: lookup from GBIF
+    itis_id                  = NA_integer_,   # TODO: lookup from ITIS
+    scientific_name_dataset  = sp,
+    common_name_dataset      = NA_character_, # TODO: do lookup from WoRMS
+    scientific_name_accepted = sp,
+    common_name_accepted     = NA_character_, # TODO: do lookup from WoRMS
+    iucn_id                  = d_sp$iucn_id,
+    botw_id                  = NA_integer_,
+    worms_is_marine          = NA,  # d_sp$"worms_is_marine"
+    worms_is_extinct         = NA,  # d_sp$"worms_is_extinct"
+    redlist_code             = d_sp$category, # TODO: lookup lastest from ITIS
+    redlist_year             = d_sp$yrcompiled,
+    sp_cat                   = d_sp$sp_cat)
+  stopifnot(length(setdiff(names(d_species), dbListFields(con_sdm, "species"))) == 0)
+  stopifnot(setdiff(dbListFields(con_sdm, "species"), names(d_species)) == "sp_seq")
+  # d_species |> glimpse()
+  dbWriteTable(con_sdm, "species", d_species, append = T)
+  # tbl(con_sdm, "species") |> collect() |> tail()
+  # tbl(con_sdm, "model") |> collect() |> tail()
+  
+  # append: model_cell ----
+  d_mdl_cell <- as.data.frame(r_sp, cells = T, na.rm = T) |>
+    tibble() |>
+    select(cell_id = cell) |> 
+    mutate(
+      mdl_seq = mdl_seq,
+      value   = default_cell_value) |> 
+    arrange(cell_id)
+  dbWriteTable(con_sdm, "model_cell", d_mdl_cell, append = T)
+}
+# Haliotis cracherodii
+# 18513
+# mapView(r_sp, maxpixels = Inf)
+
+# TODO: add taxon.`rng_iucn` column; update `n_ds`+1 and new `mdl_seq`
+```
+
+## Add Merged Marine Sensitivity Dataset (`ds_key`: "ms_merge")
+
+```{r insert_dataset_merged}
 ds_key <- "ms_merge"
 row_dataset <- tibble(
   ds_key          = !!ds_key,
-  name_short      = "Marine Sensitivity Merged Model",
+  name_short      = glue("Marine Sensitivity Merged Model, {Sys.Date()}"),
   name_original   = "Marine Sensitivity merged model from multiple inputs",
-  description     = "This dataset is derived from others. When a given taxon has multiple distributions, the maximum value is taken.",
+  description     = "This dataset is derived from others. When a given taxon has multiple distributions, the maximum value is taken. If an IUCN range exists, then that and any critical habitat (NOAA or FWS) are used to mask the other inputs so that only areas within the IUCN range are considered.",
   citation        = "",
   source_broad    = "BOEM",
   source_detail   = "https://marinesensitivity.org/docs",

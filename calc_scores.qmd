@@ -23,6 +23,32 @@ Process:
 #| message: false
 #| warning: false
 
+# TODO ----
+# TODO: 
+# - model
+#   - unique by: ds_key, taxa_id, time_period
+#   - pkey: mdl_seq
+#   - [ ] ∆ taxa -> taxa_id (unique worms_id, botw_id)
+#   - [ ] ∆ time_period -> time_type == `2019` (AquaMaps) -> "climatic annual"; need "climatic monthly" for GoMMAPS, plus annualized version
+#   - [ ] ∆ time_period == "month:January"? ISO?
+#   - [ ] + year_published: `2019` (AquaMaps)
+#   - [ ] ∆ ds_key -> ds_seq; eg "am_0.05" -> 1; allows for later changing name, year version, etc
+# - [ ] species -> dataset_taxon
+# - [ ] taxon: all unique taxa cross-listed with identifiers
+#
+# d_species <- tbl(con_sdm, "species") |> collect()
+# table(d_species$ds_key)
+# am_0.05       bl   ch_fws  ch_nmfs ms_merge  rng_fws 
+#   17550      573       29       34       91      106
+# d_taxon   <- tbl(con_sdm, "taxon") |> collect()
+# stopifnot(all(!duplicated(d_taxon$taxon_id)))
+# table(d_taxon$n_ds)
+#        1     2     3     4 
+#   17,470    72    14     5
+# table(d_taxon$taxon_authority)
+#   botw  worms 
+#    614 16,947
+
 librarian::shelf(
   DBI, dbplyr, dplyr, duckdb, fs, glue, here, leaflet, logger, purrr, readr,
   sf, stringr, terra, tibble, tidyr, quiet = T )
@@ -46,7 +72,7 @@ dir_derived          <- glue("{dir_data}/derived")
 pa_gpkg              <- glue("{dir_derived}/ply_planareas_2025.gpkg")
 er_gpkg              <- glue("{dir_derived}/ply_ecoregions_2025.gpkg")
 sr_gpkg              <- glue("{dir_derived}/ply_subregions_2025.gpkg")
-pra_gpkg_raw         <- glue("{dir_raw}/boem.gov/boem_program_areas_2025-11.gpkg")
+pra_raw_gpkg         <- glue("{dir_raw}/boem.gov/boem_program_areas_2025-11.gpkg")
 pra_gpkg             <- glue("{dir_derived}/ply_programareas_2026.gpkg")
 sr_pa_csv            <- glue("{dir_derived}/subregion_planareas.csv") # apps: mapgl/app.R
 sr_pra_csv           <- glue("{dir_derived}/subregion_programareas.csv") # apps: mapgl/app.R
@@ -131,7 +157,7 @@ if (!"ply_programareas_2026" %in% zone_tbl){
     select(planarea_name, region_key, planarea_key)
 
   # load and process program areas with field renaming
-  pra <- read_sf(pra_gpkg_raw) |>
+  pra <- read_sf(pra_raw_gpkg) |>
     rename(
       region_name      = BOEM_OCS_REGION,
       planarea_name    = PLANNING_AREA,
@@ -373,12 +399,14 @@ tbl(con_sdm, "taxon") |>
   print()
 ```
 
-## Mask Walrus SDM by IUCN Range
+## Mask SDM by IUCN Range (eg, for walrus)
+
+### Return original walrus values
 
 Mask walrus (mdl_seq = 790) species distribution model by the IUCN expert range
 to remove cells outside the known range.
 
-```{r mask_walrus_sdm}
+```{r readd_orig_walrus_sdm_pre_iucn-mask}
 #| eval: false
 
 # helper functions ----
@@ -396,7 +424,6 @@ get_rast_con <- function(mdl_seq, con){
   r
 }
 
-# initialize ----
 con_sdm <- dbConnect(duckdb(), dbdir = sdm_db, read_only = F)
 sdm_db_2025 <- glue("{dir_derived}/sdm_2025-08-06.duckdb")
 con_sdm_2025 <- dbConnect(duckdb(), dbdir = sdm_db_2025, read_only = T)
@@ -405,49 +432,40 @@ con_sdm_2025 <- dbConnect(duckdb(), dbdir = sdm_db_2025, read_only = T)
 walrus_mdl_seq <- 790
 sp_sci <- "Odobenus rosmarus"
 
-r_w <- get_rast_con(walrus_mdl_seq, con_sdm_2025) |> 
-  rotate()
-n_before <- global(r_w, 'notNA')
-message(glue("Walrus SDM cells before masking: {n_before}")) # 139,076
-
-# load IUCN marine mammal ranges
-dir_iucn <- "~/My Drive/projects/msens/data/raw/iucnredlist.org"
-marmam_sealand_shp <- glue("{dir_iucn}/MAMMALS_MARINE_AND_TERRESTRIAL/MAMMALS_MARINE_AND_TERRESTRIAL.shp")
-
-sf_walrus <- read_sf(marmam_sealand_shp) |>
-  filter(sci_name == sp_sci) |> 
-  # st_shift_longitude() |>  # shift lon [-180, 180] to [0, 360] to match raster
-  st_union() # 2 polygons
-
-# mask by IUCN range
-r_w_m <- mask(r_w, vect(sf_walrus))
-
-n_after <- global(r_w_m, 'notNA')
-message(glue("Walrus SDM cells after masking: {n_after}")) # 84,451
-
-# get cell_id
-r_c <- r_cell[["cell_id"]] |> 
-  rotate()
-r_w_mc <- c(r_c, r_w_m)
+r_w <- get_rast_con(walrus_mdl_seq, con_sdm_2025)
+r_c <- r_cell[["cell_id"]]
+r_wc <- c(r_c, r_w)
 
 # get tibble
-d_w_mc <- terra::as.data.frame(r_w_mc, cells = F, na.rm = T, xy = F) |>
+d_wc <- terra::as.data.frame(r_wc, cells = F, na.rm = T, xy = F) |>
   tibble()
 
-message(glue("Walrus SDM cells after masking: {n_after} ({round((1 - n_after/n_before) * 100, 1)}% removed)"))
-# Walrus SDM cells after masking: 84,451 (39.3% removed)
-
-# update database: delete and re-insert masked values
+# update database: delete and re-insert original walrus SDM values
 dbExecute(con_sdm, glue("DELETE FROM model_cell WHERE mdl_seq = {walrus_mdl_seq}"))
 
-d_model_cell_w <- d_w_mc |>
+d_model_cell_w <- d_wc |>
   mutate(mdl_seq = walrus_mdl_seq) |>
   select(mdl_seq, cell_id, value)
 dbWriteTable(con_sdm, "model_cell", d_model_cell_w, append = TRUE)
 
-message(glue("Updated model_cell table for walrus (mdl_seq = {walrus_mdl_seq})"))
-# Updated model_cell table for walrus (mdl_seq = 790)
+tbl(con_sdm, "model_cell") |> 
+  filter(mdl_seq == walrus_mdl_seq) |>
+  summarise(
+    n_cells = n(),
+    value_min = min(value, na.rm = T),
+    value_max = max(value, na.rm = T),
+    value_mean = mean(value, na.rm = T)) |>
+  collect() |>
+  print()
+#   n_cells value_min value_max value_mean
+#     <dbl>     <int>     <int>      <dbl>
+# 1  139076         1       100       66.4
 ```
+
+
+### Mask SDMs by IUCN range
+
+Run `merge_models.qmd` to ingest IUCN range maps and mask SDMs.
 
 ## Calculate Extinction Risk Metrics by Class
 
