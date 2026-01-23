@@ -37,7 +37,8 @@ con_spp <- dbConnect(duckdb(dbdir = spp_db, read_only = T))
 # dbListTables(con_spp)
 # [1] "gbif"             "gbif_vernacular"  "itis"             "itis_vernacular" 
 # [5] "iucn_redlist"     "iucn_vernacular"  "worms"            "worms_vernacular"
-con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F))
+# con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = T))
+con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = T))
 # dbDisconnect(con_sdm, shutdown = T); duckdb_shutdown(duckdb()); rm(con_sdm)
 # dbListTables(con_sdm)
 # [1] "cell_metric" "dataset"     "metric"      "model"       "model_cell" 
@@ -1915,14 +1916,10 @@ for (i in 1:length(rng_shps)){ # i = 4 # EELS.shp # i = 9 # MAMMALS_MARINE_ONLY.
 
 
 ```{r insert-models_iucn_rng}
-# TODO: see rng_fws ingest for dataset, model, model_cell  ----
 # dbListFields(con_sdm, "model_cell") |> paste(collapse = ", ")
 # mdl_seq cell_id value
 # dbListFields(con_sdm, "model") |> paste(collapse = ", ")
 # mdl_seq, ds_key, taxa, time_period, region, mdl_type, description, date_created
-# tbl(con_sdm, "model") |> 
-# tbl(con_sdm, "model") |> 
-#   filter()
 
 # gpkg has extra columns of data, but also extra rows of species outside US EEZ filtered out from *.tif
 d_gpkg <- tibble( # 573
@@ -2044,7 +2041,46 @@ for (i in 2:nrow(d_spp)){ # i = 1
 # 18513
 # mapView(r_sp, maxpixels = Inf)
 
-# TODO: add taxon.`rng_iucn` column; update `n_ds`+1 and new `mdl_seq`
+```
+
+```{r add_rng_iucn_to_taxon}
+# get IUCN range model mdl_seq values by scientific_name
+d_iucn <- tbl(con_sdm, "model") |>
+  filter(ds_key == "rng_iucn") |>
+  select(mdl_seq, taxa) |>
+  collect() |>
+  mutate(
+    scientific_name = str_remove(taxa, "^rng_iucn:"))
+
+# add rng_iucn column to taxon table
+dbExecute(con_sdm, "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS rng_iucn INTEGER")
+
+# update taxon.rng_iucn with mdl_seq values
+duckdb_register(con_sdm, "d_iucn", d_iucn)
+dbExecute(con_sdm,
+  "UPDATE taxon
+   SET rng_iucn = d_iucn.mdl_seq
+   FROM d_iucn
+   WHERE taxon.scientific_name = d_iucn.scientific_name")
+duckdb_unregister(con_sdm, "d_iucn")
+
+# update n_ds to count rng_iucn
+dbExecute(con_sdm,
+  'UPDATE taxon
+   SET n_ds = (
+     CASE WHEN "am_0.05"  IS NOT NULL THEN 1 ELSE 0 END +
+     CASE WHEN ch_nmfs    IS NOT NULL THEN 1 ELSE 0 END +
+     CASE WHEN ch_fws     IS NOT NULL THEN 1 ELSE 0 END +
+     CASE WHEN rng_fws    IS NOT NULL THEN 1 ELSE 0 END +
+     CASE WHEN bl         IS NOT NULL THEN 1 ELSE 0 END +
+     CASE WHEN rng_iucn   IS NOT NULL THEN 1 ELSE 0 END
+   )')
+
+# reset mdl_seq for taxa that now need re-merging with IUCN
+dbExecute(con_sdm,
+  "UPDATE taxon
+   SET mdl_seq = NULL
+   WHERE rng_iucn IS NOT NULL AND n_ds > 1")
 ```
 
 ## Add Merged Marine Sensitivity Dataset (`ds_key`: "ms_merge")
@@ -2092,24 +2128,41 @@ d_x <- tbl(con_sdm, "taxon") |>
   filter(is.na(mdl_seq)) |>
   arrange(desc(n_ds), taxon_id) |> 
   collect()  # 91
+# BUT is this only done then for IUCN when adding models later?
+
+# quick fix: update taxon.sp_cat = "turtle" where scientific_name matches: Caretta caretta, Lepidochelys olivacea
+# TODO: move this code to appropriate place where defining sp_cat earlier
+dbExecute(con_sdm,
+  "UPDATE taxon
+   SET sp_cat = 'turtle'
+   WHERE scientific_name IN ('Caretta caretta', 'Lepidochelys olivacea')") # loggerhead, olive ridley
 
 # table(d_x$sp_cat, useNA = "ifany")
+# OLD:
 # bird        coral         fish invertebrate       mammal      reptile 
 #   49           10           12            1           12            7 
+# NEW (rng_iucn):
+# coral         fish invertebrate       mammal        other       turtle 
+#   375          927          148           58            2            6
 
-ds_keys <- tbl(con_sdm, "dataset") |> 
-  pull(ds_key) |> 
+ds_keys <- tbl(con_sdm, "dataset") |>
+  pull(ds_key) |>
   setdiff("ms_merge")
+
+# datasets for extracting max value SDM
+ds_keys_sdm  <- setdiff(ds_keys, "rng_iucn")
+# datasets that form the combined mask (IUCN range + critical habitats + national range), only when rng_iucn exists for species
+ds_keys_mask <- c("rng_iucn", "ch_fws", "ch_nmfs", "rng_fws", "bl")
 
 for (i in 1:nrow(d_x)){  # i = 1
   
   d_sp <- d_x |> slice(i)
   # d_sp |> glimpse()
   # Rows: 1
-  # Columns: 15
+  # Columns: 18
   # $ taxon_id         <dbl> 127186
   # $ taxon_authority  <chr> "worms"
-  # $ n_ds             <int> 4
+  # $ n_ds             <int> 5
   # $ am_0.05          <int> 7466
   # $ ch_nmfs          <int> 18230
   # $ ch_fws           <int> 18309
@@ -2122,55 +2175,117 @@ for (i in 1:nrow(d_x)){  # i = 1
   # $ redlist_code     <chr> "EN"
   # $ worms_is_marine  <lgl> TRUE
   # $ worms_is_extinct <lgl> NA
+  # $ worms_id         <dbl> 127186
+  # $ is_ok            <lgl> TRUE
+  # $ rng_iucn         <int> 19445
   
+  # list species models by dataset with mdl_seq
   cols_l <- c("taxon_id", "taxon_authority", ds_keys)
-  d_sp_l <- d_sp |> 
-    select(all_of(cols_l)) |> 
+  d_sp_l <- d_sp |>
+    select(all_of(cols_l)) |>
     pivot_longer(
-      cols      = all_of(ds_keys), 
-      names_to  = "ds_key", 
+      cols      = all_of(ds_keys),
+      names_to  = "ds_key",
       values_to = "mdl_seq") |>
     filter(!is.na(mdl_seq))
+  #   taxon_id taxon_authority ds_key   mdl_seq
+  #      <dbl> <chr>           <chr>      <int>
+  # 1   127186 worms           am_0.05     7466
+  # 2   127186 worms           ch_fws     18309
+  # 3   127186 worms           ch_nmfs    18230
+  # 4   127186 worms           rng_fws    18401
+  # 5   127186 worms           rng_iucn   19445
+  # NEW ds_key: "ms_merge"; mdl_seq: 20030
   
-  d_r_ds <- tbl(con_sdm, "model_cell") |> 
+  d_r_ds <- tbl(con_sdm, "model_cell") |>
     filter(
-      mdl_seq %in% d_sp_l$mdl_seq) |> 
+      mdl_seq %in% d_sp_l$mdl_seq) |>
     left_join(
-      tbl(con_sdm, "model") |> 
-        select(mdl_seq, ds_key) |> 
+      tbl(con_sdm, "model") |>
+        select(mdl_seq, ds_key) |>
         filter(mdl_seq %in% d_sp_l$mdl_seq),
-      by = "mdl_seq") |> 
-    group_by(ds_key) |> 
+      by = "mdl_seq") |>
+    group_by(ds_key) |>
     summarize(
       n_cell = n(),
-      v_min = min(value, na.rm = T),
-      v_max = max(value, na.rm = T),
-      .groups = "drop") |> 
-    collect() |> 
+      v_min  = min(value, na.rm = T),
+      v_max  = max(value, na.rm = T),
+      .groups = "drop") |>
+    collect() |>
     mutate(
       ds_str = glue("{ds_key} ({n_cell} cells, {v_min} - {v_max})"))
-  #   ds_key  n_cell v_min v_max ds_str                        
-  #   <chr>    <dbl> <int> <int> <glue>                        
-  # 1 ch_nmfs      3    90    90 ch_nmfs (3 cells, 90 - 90)    
-  # 2 am_0.05  11739     1   100 am_0.05 (11739 cells, 1 - 100)
-  # 3 ch_fws      29    90    90 ch_fws (29 cells, 90 - 90)    
-  # 4 rng_fws    264    50    90 rng_fws (264 cells, 50 - 90) 
+  #   ds_key   n_cell v_min v_max ds_str                        
+  #   <chr>     <dbl> <int> <int> <glue>                        
+  # 1 rng_iucn   6245    50    50 rng_iucn (6245 cells, 50 - 50)
+  # 2 ch_fws       29    90    90 ch_fws (29 cells, 90 - 90)    
+  # 3 am_0.05   11739     1   100 am_0.05 (11739 cells, 1 - 100)
+  # 4 ch_nmfs       3    90    90 ch_nmfs (3 cells, 90 - 90)    
+  # 5 rng_fws     264    50    90 rng_fws (264 cells, 50 - 90) 
   
-  d_r_sp <- tbl(con_sdm, "model_cell") |> 
-    filter(
-      mdl_seq %in% d_sp_l$mdl_seq) |> 
-    group_by(cell_id) |> 
-    summarize(
-      value = max(value, na.rm = T),
-      .groups = "drop") |> 
-    collect()
-  # TODO: get new mdl_seq
+  # datasets used for SDM
+  ds_sdm_sp <- intersect(d_sp_l$ds_key, ds_keys_sdm)
   
-  # visual check
-  # r <- init(r_cell[[1]], NA)
-  # r[d_r_sp$cell_id] <- d_r_sp$value
-  # r_r <- rotate(r)
-  # plet(r_r)
+  sdm_mdl_seqs <- d_sp_l |> 
+    filter(ds_key %in% ds_sdm_sp) |>
+    pull(mdl_seq)
+  
+  # query of SDM with max value across all datasets
+  q_sdm <- tbl(con_sdm, "model_cell") |>
+      filter(
+        mdl_seq %in% sdm_mdl_seqs) |>
+      group_by(cell_id) |>
+      summarize(value = max(value, na.rm = T), .groups = "drop")
+
+    # check if IUCN range exists for this taxon
+  has_iucn <- !is.na(d_sp$rng_iucn)
+  if (has_iucn) {
+    # get datasets used for mask
+    ds_mask_sp <- intersect(d_sp_l$ds_key, ds_keys_mask)
+    
+    # get mdl_seqs for masking datasets
+    mask_mdl_seqs <- d_sp_l |>
+      filter(ds_key %in% ds_mask_sp) |>
+      pull(mdl_seq)
+    
+    q_mask <- tbl(con_sdm, "model_cell") |>
+      filter(mdl_seq %in% mask_mdl_seqs) |> 
+      distinct(cell_id) |> 
+      mutate(value = 1)
+    
+    # get SDM cells with mask applied
+    d_r_sp <- q_sdm |> 
+      semi_join(
+        q_mask, 
+        by = join_by(cell_id)) |> 
+      collect()
+    
+    # visual checks ----
+    # # r_sdm_mask
+    # r <- init(r_cell[[1]], NA)
+    # r[d_r_sp$cell_id] <- d_r_sp$value
+    # r <- trim(r) |> rotate()
+    # plet(r)
+    # 
+    # # r_mask
+    # d_mask <- q_mask |> collect()
+    # r <- init(r_cell[[1]], NA)
+    # r[d_mask$cell_id] <- d_mask$value
+    # names(r) <- "mask"
+    # r_mask <- trim(r) |> rotate()
+    # plet(r_mask)
+    # 
+    # # r_sdm
+    # d_sdm <- q_sdm |> collect()
+    # r <- init(r_cell[[1]], NA)
+    # r[d_sdm$cell_id] <- d_sdm$value
+    # names(r) <- "sdm"
+    # r_sdm <- trim(r) |> rotate()
+    # plet(r_sdm)
+
+  } else {
+    # no IUCN range - use original logic (no masking), just max value of all SDMs
+    d_r_sp <- collect(q_sdm)
+  }
   
   sp_sci  <- d_sp$scientific_name
   sp_cmn  <- d_sp$common_name
@@ -2196,6 +2311,8 @@ for (i in 1:nrow(d_x)){  # i = 1
   }
   
   # append: model ----
+  has_iucn_str <- if (has_iucn)
+    glue("; Mask applied (because IUCN range map present) from combining datasets: {paste(ds_mask_sp, collapse = ', ')}") else ""
   d_model <- tibble(
     ds_key      = ds_key,
     taxa        = sp_key,
@@ -2203,7 +2320,7 @@ for (i in 1:nrow(d_x)){  # i = 1
     region      = "USA",
     mdl_type    = "mixed",
     description = glue(
-      "Marine Sensitivity merged model from datasets: {paste(d_r_ds$ds_str, collapse = '; ')}") )
+      "Marine Sensitivity merged model with max values from datasets: {paste(ds_sdm_sp, collapse = ', ')}{has_iucn_str}") )
   dbWriteTable(con_sdm, "model", d_model, append = TRUE)
   # tbl(con_sdm, "model") |> collect() |> tail()
   
@@ -2275,6 +2392,7 @@ for (i in 1:nrow(d_x)){  # i = 1
     SET   mdl_seq  = {mdl_seq} 
     WHERE taxon_id = {d_sp$taxon_id}"))
 }
+# Salmo salar            silver salmon
 ```
 
 # taxon.`is_ok`
