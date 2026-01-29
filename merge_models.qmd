@@ -37,8 +37,8 @@ con_spp <- dbConnect(duckdb(dbdir = spp_db, read_only = T))
 # dbListTables(con_spp)
 # [1] "gbif"             "gbif_vernacular"  "itis"             "itis_vernacular" 
 # [5] "iucn_redlist"     "iucn_vernacular"  "worms"            "worms_vernacular"
+con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F))
 # con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = T))
-con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = T))
 # dbDisconnect(con_sdm, shutdown = T); duckdb_shutdown(duckdb()); rm(con_sdm)
 # dbListTables(con_sdm)
 # [1] "cell_metric" "dataset"     "metric"      "model"       "model_cell" 
@@ -2043,6 +2043,168 @@ for (i in 2:nrow(d_spp)){ # i = 1
 
 ```
 
+```{r update_rng_iucn_to_redlist-value}
+
+q_spp <- tbl(con_sdm, "species") |> 
+  filter(ds_key == "rng_iucn")
+
+# q_spp |> 
+#   pull(redlist_code) |> 
+#   table()
+# CR  DD   EN     LC  NT  VU 
+# 38  46  157  1,143  45  87 
+# Note: keeping DD for masking and assigning LC score
+
+taxa <- q_spp |> pull(taxa) |> sort()
+
+d_smry <- tbl(con_sdm, "model") |>
+  filter(ds_key == "rng_iucn") |>
+  left_join(
+    tbl(con_sdm, "model_cell"),
+    by = join_by(mdl_seq)) |>
+  group_by(taxa) |>
+  summarize(
+    value = mean(value, na.rm = T)) |>
+  collect()
+table(d_smry$value)
+# BEFORE:
+#      50 
+#   1,516
+# AFTER:
+#    20  40  60   80  100 
+# 1,189  45  87  157   38
+
+for (i in 1:length(taxa)){ # 
+  taxon = taxa[i]  # taxon = "rng_iucn:Balaenoptera ricei"
+  
+  mdl_seq <- tbl(con_sdm, "model") |> 
+    filter(
+      ds_key == "rng_iucn",
+      taxa   == !!taxon) |> 
+    pull(mdl_seq)
+  
+  rl_val <- q_spp |> 
+    filter(
+      taxa == !!taxon) |> 
+    mutate(
+      rl_score = case_match(
+        redlist_code,
+        # skipped: EX (extinct), NE (not evaluated), DD (data deficient), <NA> (not available)
+        # https://oceanhealthindex.org/images/htmls/Supplement.html#62_Biodiversity
+        "CR" ~ 1,       #  - CR: Critically Endangered	
+        "EN" ~ 0.8,     #  - EN: Endangered (+ESA)
+        "VU" ~ 0.6,     #  - VU: Vulnerable
+        "TN" ~ 0.6,     #  - TN: Threatened (ESA only)
+        "NT" ~ 0.4,     #  - NT: Near Threatened
+        "LC" ~ 0.2,     #  - LC: Least Concern
+        "DD" ~ 0.2      #  - DD: Data Deficient, so at least use distributional info and apply minimal rank
+        )) |>
+    pull(rl_score) * 100
+  
+  message(glue("Updating taxa:'{taxon}' (mdl_seq:{mdl_seq}; {i}/{length(taxa)}) model_cells to value: {rl_val} ~ {Sys.time()}"))
+  
+  dbExecute(con_sdm, glue(
+    "UPDATE model_cell SET value = {rl_val} WHERE mdl_seq = {mdl_seq}") )
+}
+```
+
+```{r update_rng-iucn-redlist-code_in_taxon}
+
+d_iucn_chg <- tbl(con_sdm, "taxon") |> 
+  select(worms_id, scientific_name, common_name, redlist_code_taxon = redlist_code) |> 
+  inner_join(
+    tbl(con_sdm, "species") |> 
+      filter(ds_key == "rng_iucn") |> # collect() # 1,516 x 18
+      select(worms_id, redlist_code_rng = redlist_code),
+    by = join_by(worms_id)) |> 
+  filter(redlist_code_rng != redlist_code_taxon) |> 
+  arrange(redlist_code_rng, scientific_name) |> 
+  collect()
+# print(d_iucn_chg, n=Inf)
+# # A tibble: 33 × 5
+#    worms_id scientific_name           common_name                  redlist_code_taxon redlist_code_rng
+#       <dbl> <chr>                     <chr>                        <chr>              <chr>           
+#  1  1576133 Balaenoptera ricei        Rice's Whale                 EN                 CR              
+#  2   105858 Mobula mobular            devil ray                    EN                 CR              
+#  3   105859 Mobula tarapacana         sicklefin devil ray          EN                 CR              
+#  4   217430 Mobula thurstoni          smoothtail mobula            EN                 CR              
+#  5   137102 Orcinus orca              killer whale                 EN                 DD              
+#  6   137078 Cystophora cristata       hooded seal                  VU                 EN              
+#  7   758260 Orbicella annularis       Coral, lobed star            TN                 EN              
+#  8   758261 Orbicella faveolata       Coral, mountainous star      TN                 EN              
+#  9   158512 Apristurus brunneus       brown cat shark              DD                 LC              
+# 10   271342 Apristurus kampae         Longnose catshark            DD                 LC              
+# 11   137206 Chelonia mydas            green turtle                 EN                 LC              
+# 12   137115 Delphinapterus leucas     buluga                       EN                 LC              
+# 13  1048080 Fimbriaphyllia paradivisa Coral (Euphyllia paradivisa) TN                 LC              
+# 14   759975 Goniopora pedunculata     NA                           NT                 LC              
+# 15   276694 Heterodontus francisci    horn shark                   DD                 LC              
+# 16   886931 Homophyllia bowerbanki    NA                           NT                 LC              
+# 17   137092 Megaptera novaeangliae    hump                         EN                 LC              
+# 18   158075 Oncorhynchus tshawytscha  Chinook salmon               EN                 LC              
+# 19   207267 Psammocora contigua       branched sandpaper coral     NT                 LC              
+# 20   254570 Salvelinus malma          dolly varden                 TN                 LC              
+# 21   137079 Erignathus barbatus       bearded seal                 TN                 NT              
+# 22   254999 Eumetopias jubatus        Steller sea lion             EN                 NT              
+# 23   271389 Mustelus lunulatus        sicklefin smoothhound        LC                 NT              
+# 24   758262 Orbicella franksi         Coral, boulder star          TN                 NT              
+# 25   159019 Pagophilus groenlandicus  harp seal                    LC                 NT              
+# 26   137104 Pseudorca crassidens      false killer whale           EN                 NT              
+# 27   127186 Salmo salar               silver salmon                EN                 NT              
+# 28   137209 Dermochelys coriacea      leatherback turtle           EN                 VU              
+# 29   289807 Dichocoenia stokesii      pineapple coral              DD                 VU              
+# 30  1663107 Neomonachus schauinslandi Seal, Hawaiian monk          EN                 VU              
+# 31   271667 Squatina californica      Pacific angel shark          NT                 VU              
+# 32   137085 Ursus maritimus           polar bear                   TN                 VU              
+# 33   283213 Zapteryx exasperata       banded guitarfish            DD                 VU  
+
+# SQL UPDATE using DuckDB's UPDATE ... FROM syntax
+dbExecute(con_sdm, "
+  UPDATE taxon
+  SET redlist_code = s.redlist_code
+  FROM species s
+  WHERE taxon.worms_id = s.worms_id
+    AND s.ds_key = 'rng_iucn'
+    AND taxon.redlist_code != s.redlist_code
+") # 33 rows affected.
+```
+
+```{r add_esa-code_in_taxon}
+
+# tbl(con_sdm, "taxon")
+
+# pull esa codes from species where ds_key = 'ch_nmfs' or 'ch_fws'
+d_esa <- tbl(con_sdm, "species") |>
+  filter(ds_key %in% c("ch_nmfs", "ch_fws")) |> 
+  select(
+    ds_key, 
+    worms_id, scientific_name_dataset, common_name_dataset,
+    redlist_code, redlist_year) |>
+  # prefer NMFS over FWS if both exist
+  arrange(worms_id, desc(ds_key)) |>
+  group_by(worms_id) |>
+  summarize(
+    ds_key        = first(ds_key),
+    redlist_code  = first(redlist_code),
+    # redlist_year  = last(redlist_year), # TODO: extract year and prefer based on year before agency (NMFS, FWS)
+    # TODO: Charadrius nivosus nivosus (Western Snowy Plover) has no worms_id
+    .groups = "drop") |>
+  collect()
+# View(d_esa)
+
+# update taxon table
+dbExecute(con_sdm, "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS esa_code TEXT")
+
+duckdb_register(con_sdm, "d_esa", d_esa)
+dbExecute(
+  con_sdm,
+  "UPDATE taxon
+    SET esa_code = d_esa.ds_key
+    FROM d_esa
+    WHERE taxon.worms_id = d_esa.worms_id")
+```
+
+
 ```{r add_rng_iucn_to_taxon}
 # get IUCN range model mdl_seq values by scientific_name
 d_iucn <- tbl(con_sdm, "model") |>
@@ -2125,7 +2287,8 @@ ds_key   <- "ms_merge"
 # ext(r_cell) <- round(ext(r_cell), 3)
 
 d_x <- tbl(con_sdm, "taxon") |> 
-  filter(is.na(mdl_seq)) |>
+  filter(
+    is.na(mdl_seq)) |>  # consider running: reset mdl_seq for taxa that now need re-merging with IUCN
   arrange(desc(n_ds), taxon_id) |> 
   collect()  # 91
 # BUT is this only done then for IUCN when adding models later?
@@ -2150,11 +2313,12 @@ ds_keys <- tbl(con_sdm, "dataset") |>
   setdiff("ms_merge")
 
 # datasets for extracting max value SDM
-ds_keys_sdm  <- setdiff(ds_keys, "rng_iucn")
+# ds_keys_sdm  <- setdiff(ds_keys, "rng_iucn")   # OLD: excluding IUCN range map except for masking
+ds_keys_sdm <- ds_keys                          # NEW: include IUCN range map for max value SDM
 # datasets that form the combined mask (IUCN range + critical habitats + national range), only when rng_iucn exists for species
 ds_keys_mask <- c("rng_iucn", "ch_fws", "ch_nmfs", "rng_fws", "bl")
 
-for (i in 1:nrow(d_x)){  # i = 1
+for (i in 1:nrow(d_x)){  # i = 1  # which(str_detect(d_x$scientific_name, ".*ricei")) # i = 1512
   
   d_sp <- d_x |> slice(i)
   # d_sp |> glimpse()
