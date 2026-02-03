@@ -508,12 +508,221 @@ tbl(con_sdm, "model") |>
   filter(ds_key %in% c("ch_nmfs"))
 ```
 
+## Species Directory - All Species
+
+- [Species Directory | NOAA Fisheries](https://www.fisheries.noaa.gov/species-directory)
+- [Glossary: Classifications for Protected Species | NOAA Fisheries](https://www.fisheries.noaa.gov/national/glossary-classifications-protected-species)
+
+```{r}
+#| label: scrape_species-directory_all
+
+librarian::shelf(
+  dplyr, here, purrr, rvest, stringr, tibble,
+  quiet = T)
+
+# output csv
+spp_csv <- here("data/noaa_species_directory.csv")
+
+# configuration ----
+BASE_URL      <- "https://www.fisheries.noaa.gov"
+DIRECTORY_URL <- "https://www.fisheries.noaa.gov/species-directory"
+REQUEST_DELAY <- 1.5  # seconds between requests
+
+# helper: parse species data from a table row ----
+parse_species_row <- function(row) {
+
+  # column 2: species name, scientific name, and aliases
+  name_element <- row |> html_element("td:nth-child(2) a")
+  common_name  <- name_element |> html_text(trim = TRUE)
+  species_url  <- name_element |> html_attr("href")
+
+  # parse the full name cell text
+  name_cell_text <- row |>
+    html_element("td:nth-child(2)") |>
+    html_text(trim = TRUE)
+
+  lines <- str_split(name_cell_text, "\n")[[1]] |>
+    str_trim() |>
+    (\(x) x[x != ""])()
+
+  # scientific name (usually second line, in Genus species format)
+  scientific_name <- NA_character_
+  if (length(lines) >= 2) {
+    candidate <- lines[2]
+    if (str_detect(candidate, "^[A-Z][a-z]+ [a-z]+"))
+      scientific_name <- candidate
+  }
+
+  # also known as (alternative names)
+  aka_idx       <- which(str_detect(lines, "Also Known As"))
+  also_known_as <- if (length(aka_idx) > 0 && aka_idx < length(lines)) {
+    paste(lines[(aka_idx + 1):length(lines)], collapse = ", ")
+  } else {
+    NA_character_
+  }
+
+  # column 3: species category
+  category_text  <- row |>
+    html_element("td:nth-child(3)") |>
+    html_text(trim = TRUE)
+  category_lines <- str_split(category_text, "\n")[[1]] |>
+    str_trim() |>
+    (\(x) x[x != "" & x != "Species Category"])()
+  category       <- paste(category_lines, collapse = "; ")
+
+  # column 4: protected status (ESA, CITES, etc.)
+  status_text     <- row |>
+    html_element("td:nth-child(4)") |>
+    html_text(trim = TRUE)
+  status_lines    <- str_split(status_text, "\n")[[1]] |>
+    str_trim() |>
+    (\(x) x[x != "" & x != "---"])()
+  protected_status <- if (length(status_lines) > 0) {
+    paste(status_lines, collapse = "; ")
+  } else {
+    NA_character_
+  }
+
+  # column 5: region
+  region_text  <- row |>
+    html_element("td:nth-child(5)") |>
+    html_text(trim = TRUE)
+  region_lines <- str_split(region_text, "\n")[[1]] |>
+    str_trim() |>
+    (\(x) x[x != ""])() |>
+    str_replace("^Region\\s*", "")
+  region       <- paste(region_lines, collapse = "; ")
+
+  tibble(
+    common_name      = common_name,
+    scientific_name  = scientific_name,
+    also_known_as    = also_known_as,
+    category         = category,
+    protected_status = protected_status,
+    region           = region,
+    species_url      = if (!is.na(species_url)) paste0(BASE_URL, species_url) else NA_character_)
+}
+
+# helper: extract all species from HTML document ----
+extract_species <- function(html) {
+  rows <- html |> html_elements("table tbody tr")
+
+  if (length(rows) == 0) {
+    message("  No species rows found")
+    return(tibble())
+  }
+
+  message(sprintf("  Found %d species", length(rows)))
+  map_dfr(rows, parse_species_row)
+}
+
+# helper: get total pages from pagination ----
+get_total_pages <- function(html) {
+  # try to find "Last" link
+  last_link <- html |>
+    html_element(".pager__item--last a") |>
+    html_attr("href")
+
+  if (!is.na(last_link)) {
+    page_num <- str_extract(last_link, "page=\\d+") |>
+      str_extract("\\d+") |>
+      as.numeric()
+    return(page_num + 1)  # 0-indexed
+  }
+
+  # fallback: find max page number
+  page_numbers <- html |>
+    html_elements(".pager__item a") |>
+    html_attr("href") |>
+    str_extract("page=\\d+") |>
+    str_extract("\\d+") |>
+    as.numeric() |>
+    na.omit()
+
+  if (length(page_numbers) == 0) return(1)
+  max(page_numbers) + 1
+}
+
+# helper: safe HTTP request with retry ----
+safe_read_html <- function(url, retries = 3) {
+  for (i in 1:retries) {
+    result <- tryCatch(
+      read_html(url),
+      error = function(e) {
+        if (i < retries) {
+          message(sprintf("  Retry %d/%d after error: %s", i, retries, e$message))
+          Sys.sleep(REQUEST_DELAY * 2)
+        }
+        NULL
+      })
+    if (!is.null(result)) return(result)
+  }
+  stop(sprintf("Failed to fetch %s after %d attempts", url, retries))
+}
+
+# crawl with pagination (standard HTTP, no chromote) ----
+crawl_noaa_species <- function(verbose = TRUE) {
+
+  if (verbose) {
+    message("NOAA Fisheries Species Directory Crawler")
+    message("Method: Standard HTTP (read_html) with pagination")
+  }
+
+  # get first page and determine total pages
+  if (verbose) message("\nFetching page 1...")
+  html        <- safe_read_html(DIRECTORY_URL)
+  total_pages <- get_total_pages(html)
+
+  if (verbose) message(sprintf("Total pages: %d\n", total_pages))
+
+  # extract from first page
+  all_species <- extract_species(html)
+  if (verbose) message(sprintf("  Cumulative: %d species\n", nrow(all_species)))
+
+  # process remaining pages
+  if (total_pages > 1) {
+    for (page in 2:total_pages) {
+      Sys.sleep(REQUEST_DELAY)
+
+      page_url <- sprintf("%s?page=%d", DIRECTORY_URL, page - 1)
+      if (verbose) message(sprintf("Fetching page %d...", page))
+
+      html         <- safe_read_html(page_url)
+      page_species <- extract_species(html)
+      all_species  <- bind_rows(all_species, page_species)
+
+      if (verbose) message(sprintf("  Cumulative: %d species\n", nrow(all_species)))
+    }
+  }
+
+  # clean and deduplicate
+  all_species <- all_species |>
+    distinct() |>
+    arrange(common_name)
+
+  if (verbose)
+    message(sprintf("Complete! Total unique species: %d", nrow(all_species)))
+
+  all_species
+}
+
+# run crawler and save ----
+d_spp <- crawl_noaa_species(verbose = TRUE)
+write.csv(d_spp, spp_csv, row.names = FALSE)
+message(sprintf("Saved to: %s", spp_csv))
+
+d_spp
+```
+
+
 
 ## Species Directory - ESA Threatened & Endangered | NOAA Fisheries
 
 - [Species Directory - ESA Threatened & Endangered | NOAA Fisheries](https://www.fisheries.noaa.gov/species-directory/threatened-endangered?oq=&field_species_categories_vocab=All&field_region_vocab=All&items_per_page=350)
 
 ```{r}
+#| label: scrape_species-directory_esa-threatened-endangered
+
 librarian::shelf(
   chromote, rvest, tidyr)
 
