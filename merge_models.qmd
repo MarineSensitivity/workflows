@@ -61,7 +61,7 @@ con_spp <- dbConnect(duckdb(dbdir = spp_db, read_only = T))
 con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F))
 # con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = T))
 # dbDisconnect(con_sdm, shutdown = T); duckdb_shutdown(duckdb()); rm(con_sdm)
-# dbListTables(con_sdm)
+# dbListTables(con_sdm) |> paste(collapse = ", ")
 # [1] "cell_metric" "dataset"     "metric"      "model"       "model_cell"
 # [6] "species"     "zone"        "zone_cell"   "zone_metric"
 ```
@@ -1750,17 +1750,36 @@ d_taxon <- bind_rows(
 # 7  17860   18014.     18284 ▇▇▇▆▃
 # 8   9114.  13616.     18419 ▇▇▇▇▇
 
+# create taxon_model junction table ----
+ds_cols <- c("am_0.05", "ch_nmfs", "ch_fws", "rng_fws", "bl")
+d_taxon_model <- d_taxon |>
+  select(taxon_id, any_of(ds_cols)) |>
+  pivot_longer(
+    -taxon_id,
+    names_to  = "ds_key",
+    values_to = "mdl_seq") |>
+  filter(!is.na(mdl_seq))
+
+if (dbExistsTable(con_sdm, "taxon_model")) {
+  dbExecute(con_sdm, "DROP TABLE taxon_model")
+}
+dbWriteTable(con_sdm, "taxon_model", d_taxon_model, overwrite = TRUE)
+message(glue("taxon_model: {nrow(d_taxon_model)} rows"))
+
+# write taxon table without per-dataset columns ----
+d_taxon_clean <- d_taxon |>
+  select(-any_of(ds_cols))
+
 if (dbExistsTable(con_sdm, "taxon")) {
   dbExecute(con_sdm, "DELETE FROM taxon")
 }
 
-dbWriteTable(con_sdm, "taxon", d_taxon, append = F)
+dbWriteTable(con_sdm, "taxon", d_taxon_clean, append = F)
 
 tmp_taxon_csv <- here("data/tmp_taxon.csv")
 if (!file_exists(tmp_taxon_csv)) {
   write_csv(d_taxon, tmp_taxon_csv)
 }
-# TODO: update mdl_seq in taxon table
 ```
 
 ```{r}
@@ -1864,6 +1883,76 @@ dbExecute(
     WHERE taxon.taxon_id = d2.taxon_id"
 ) # 7,083
 duckdb_unregister(con_sdm, "d2")
+```
+
+### Join listing data (extrisk_code, er_score)
+
+LEFT JOIN the `listing` staging table (from `ingest_nmfs-fws-mmpa-mbta-listings.qmd`)
+onto `taxon`. For unmatched taxa, fall back to IUCN `redlist_code`.
+
+```{r}
+#| label: taxon_listing_join
+
+# add new columns for extrisk_code, er_score, is_mmpa, is_mbta, is_bcc
+for (col_sql in c(
+  "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS extrisk_code VARCHAR",
+  "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS er_score DOUBLE",
+  "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS is_mmpa BOOLEAN DEFAULT FALSE",
+  "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS is_mbta BOOLEAN DEFAULT FALSE",
+  "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS is_bcc BOOLEAN DEFAULT FALSE")) {
+  dbExecute(con_sdm, col_sql)
+}
+
+# join listing by worms_id (covers both worms and botw taxa via worms_id)
+if (dbExistsTable(con_sdm, "listing")) {
+  dbExecute(
+    con_sdm,
+    "UPDATE taxon SET
+      extrisk_code = l.extrisk_code,
+      er_score     = l.er_score,
+      is_mmpa      = l.is_mmpa,
+      is_mbta      = l.is_mbta,
+      is_bcc       = l.is_bcc
+    FROM listing l
+    WHERE taxon.worms_id = l.worms_id")
+
+  n_us <- dbGetQuery(con_sdm,
+    "SELECT count(*) AS n FROM taxon WHERE extrisk_code IS NOT NULL")$n
+  message(glue("Listing joined: {n_us} taxa with US extrisk_code"))
+} else {
+  message("No listing table found; skipping listing join")
+}
+
+# IUCN fallback for unmatched taxa
+dbExecute(
+  con_sdm,
+  "UPDATE taxon SET
+    extrisk_code = 'IUCN:' || redlist_code,
+    er_score     = CASE redlist_code
+      WHEN 'CR' THEN 0.50
+      WHEN 'EN' THEN 0.25
+      WHEN 'VU' THEN 0.05
+      WHEN 'NT' THEN 0.02
+      ELSE 0.01 END
+  WHERE extrisk_code IS NULL AND redlist_code IS NOT NULL")
+
+# default for taxa with no listing and no redlist_code
+dbExecute(
+  con_sdm,
+  "UPDATE taxon SET
+    er_score = 0.01
+  WHERE er_score IS NULL")
+
+# summary
+tbl(con_sdm, "taxon") |>
+  mutate(
+    authority = CASE_WHEN(
+      str_starts(extrisk_code, "NMFS") ~ "NMFS",
+      str_starts(extrisk_code, "FWS")  ~ "FWS",
+      str_starts(extrisk_code, "IUCN") ~ "IUCN",
+      TRUE                             ~ "none")) |>
+  count(authority) |>
+  collect()
 ```
 
 ```{r}
@@ -2863,43 +2952,42 @@ d_iucn <- tbl(con_sdm, "model") |>
     scientific_name = str_remove(taxa, "^rng_iucn:")
   )
 
-# add rng_iucn column to taxon table
-dbExecute(
-  con_sdm,
-  "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS rng_iucn INTEGER"
-)
+# join taxon_id to IUCN models via scientific_name
+d_iucn_tm <- d_iucn |>
+  inner_join(
+    tbl(con_sdm, "taxon") |>
+      select(taxon_id, scientific_name) |>
+      collect(),
+    by = "scientific_name"
+  ) |>
+  transmute(
+    taxon_id = taxon_id,
+    ds_key   = "rng_iucn",
+    mdl_seq  = mdl_seq)
 
-# update taxon.rng_iucn with mdl_seq values
-duckdb_register(con_sdm, "d_iucn", d_iucn)
+# append rng_iucn rows to taxon_model junction table
+dbWriteTable(con_sdm, "taxon_model", d_iucn_tm, append = TRUE)
+message(glue("Added {nrow(d_iucn_tm)} rng_iucn rows to taxon_model"))
+
+# update n_ds from taxon_model
 dbExecute(
   con_sdm,
   "UPDATE taxon
-   SET rng_iucn = d_iucn.mdl_seq
-   FROM d_iucn
-   WHERE taxon.scientific_name = d_iucn.scientific_name"
-)
-duckdb_unregister(con_sdm, "d_iucn")
-
-# update n_ds to count rng_iucn
-dbExecute(
-  con_sdm,
-  'UPDATE taxon
-   SET n_ds = (
-     CASE WHEN "am_0.05"  IS NOT NULL THEN 1 ELSE 0 END +
-     CASE WHEN ch_nmfs    IS NOT NULL THEN 1 ELSE 0 END +
-     CASE WHEN ch_fws     IS NOT NULL THEN 1 ELSE 0 END +
-     CASE WHEN rng_fws    IS NOT NULL THEN 1 ELSE 0 END +
-     CASE WHEN bl         IS NOT NULL THEN 1 ELSE 0 END +
-     CASE WHEN rng_iucn   IS NOT NULL THEN 1 ELSE 0 END
-   )'
+   SET n_ds = tm.n_ds
+   FROM (
+     SELECT taxon_id, COUNT(*) AS n_ds
+     FROM taxon_model
+     GROUP BY taxon_id
+   ) tm
+   WHERE taxon.taxon_id = tm.taxon_id"
 )
 
-# reset mdl_seq for taxa that now need re-merging with IUCN
+# reset mdl_seq for taxa that now need re-merging (n_ds > 1)
 dbExecute(
   con_sdm,
   "UPDATE taxon
    SET mdl_seq = NULL
-   WHERE rng_iucn IS NOT NULL AND n_ds > 1"
+   WHERE n_ds > 1 AND mdl_seq IS NOT NULL"
 )
 ```
 
@@ -3009,16 +3097,12 @@ for (i in 1:nrow(d_x)) {
   # $ is_ok            <lgl> TRUE
   # $ rng_iucn         <int> 19445
 
-  # list species models by dataset with mdl_seq
-  cols_l <- c("taxon_id", "taxon_authority", ds_keys)
-  d_sp_l <- d_sp |>
-    select(all_of(cols_l)) |>
-    pivot_longer(
-      cols = all_of(ds_keys),
-      names_to = "ds_key",
-      values_to = "mdl_seq"
-    ) |>
-    filter(!is.na(mdl_seq))
+  # list species models by dataset from taxon_model junction table
+  d_sp_l <- tbl(con_sdm, "taxon_model") |>
+    filter(taxon_id == !!d_sp$taxon_id) |>
+    collect() |>
+    mutate(
+      taxon_authority = d_sp$taxon_authority)
   #   taxon_id taxon_authority ds_key   mdl_seq
   #      <dbl> <chr>           <chr>      <int>
   # 1   127186 worms           am_0.05     7466
@@ -3072,8 +3156,8 @@ for (i in 1:nrow(d_x)) {
     group_by(cell_id) |>
     summarize(value = max(value, na.rm = T), .groups = "drop")
 
-  # check if IUCN range exists for this taxon
-  has_iucn <- !is.na(d_sp$rng_iucn)
+  # check if IUCN range exists for this taxon (via taxon_model)
+  has_iucn <- "rng_iucn" %in% d_sp_l$ds_key
   if (has_iucn) {
     # get datasets used for mask
     ds_mask_sp <- intersect(d_sp_l$ds_key, ds_keys_mask)
@@ -3270,16 +3354,23 @@ for (i in 1:nrow(d_x)) {
     arrange(cell_id)
   dbWriteTable(con_sdm, "model_cell", d_mdl_cell, append = T)
 
-  # TODO: update taxon with mdl_seq
+  # update taxon with mdl_seq
   dbExecute(
     con_sdm,
     glue(
       "
-    UPDATE taxon 
-    SET   mdl_seq  = {mdl_seq} 
-    WHERE taxon_id = {d_sp$taxon_id}"
-    )
-  )
+    UPDATE taxon
+    SET   mdl_seq  = {mdl_seq}
+    WHERE taxon_id = {d_sp$taxon_id}"))
+
+  # append ms_merge row to taxon_model junction table
+  dbWriteTable(
+    con_sdm, "taxon_model",
+    tibble(
+      taxon_id = d_sp$taxon_id,
+      ds_key   = "ms_merge",
+      mdl_seq  = as.integer(mdl_seq)),
+    append = TRUE)
 }
 # Salmo salar            silver salmon
 ```
@@ -3418,14 +3509,14 @@ d_taxon <- tbl(con_sdm, "taxon") |>
     common_name,
     scientific_name,
     redlist_code_max = redlist_code,
+    extrisk_code,
+    er_score,
+    is_mmpa,
+    is_mbta,
+    is_bcc,
     worms_is_marine,
     worms_is_extinct,
     n_datasets = n_ds,
-    ds_aquamaps_mdl_id = am_0.05,
-    ds_birdlife_mdl_id = bl,
-    ds_nmfs_crithab_mdl_id = ch_nmfs,
-    ds_fws_crithab_mdl_id = ch_fws,
-    ds_fws_range_mdl_id = rng_fws,
     taxon_authority,
     taxon_id,
     model_id = mdl_seq
@@ -3453,28 +3544,14 @@ d_taxon <- read_csv(taxon_csv)
 
 d_taxon_p <- d_taxon |>
   filter(is_ok) |>
-  select(
-    component,
-    taxon_id,
-    ds_aquamaps_mdl_id,
-    ds_birdlife_mdl_id,
-    ds_nmfs_crithab_mdl_id,
-    ds_fws_crithab_mdl_id,
-    ds_fws_range_mdl_id
-  ) |>
-  pivot_longer(
-    cols = starts_with("ds_"),
-    names_to = "dataset",
-    values_to = "mdl_seq"
-  ) |>
-  mutate(
-    dataset = str_remove(dataset, "^ds_") |>
-      str_replace_all("_mdl_id", "")
-  ) |>
+  select(component, taxon_id) |>
+  inner_join(
+    tbl(con_sdm, "taxon_model") |> collect(),
+    by = "taxon_id") |>
+  rename(dataset = ds_key) |>
   filter(
     !is.na(taxon_id),
-    !is.na(mdl_seq)
-  ) |>
+    !is.na(mdl_seq)) |>
   arrange(component, taxon_id)
 
 # d_taxon_p |>

@@ -538,59 +538,29 @@ for (sp_cat in sp_cats){ # sp_cat = sp_cats[1]
     "SELECT max(metric_seq) AS metric_seq FROM metric WHERE metric_key = '{metric_key}'")) |> 
     pull(metric_seq)
   
-  d_rl <- tbl(con_sdm, "taxon") |> # 17,550
+  # use er_score from taxon (pre-computed in ingest_nmfs-fws-mmpa-mbta-listings.qmd
+  # and merged in merge_models.qmd)
+  d_er <- tbl(con_sdm, "taxon") |>
     filter(
       is_ok,
-      if (!!sp_cat == "all") T else sp_cat == !!sp_cat) |> 
-    select(mdl_seq, redlist_code) |> 
-    # OLD: filter out DD, EX, NE, NA
-    # filter(
-    #   !is.na(redlist_code),
-    #   !redlist_code %in% c("DD","EX")) |> 
-    # NEW: handle EX with is_ok; the rest assume LC
-    collect() |> 
-    mutate(
-      rl_score = case_match(
-        redlist_code,
-        # EX (extinct): is_ok = F
-        # NE (not evaluated), DD (data deficient), <NA> (not available) -> LC
-        # https://oceanhealthindex.org/images/htmls/Supplement.html#62_Biodiversity
-        "CR" ~ 1,        #  - CR: Critically Endangered	
-        "EN" ~ 0.8,      #  - EN: Endangered (+ESA)
-        "VU" ~ 0.6,      #  - VU: Vulnerable
-        "TN" ~ 0.6,      #  - TN: Threatened (ESA only)
-        "NT" ~ 0.4,      #  - NT: Near Threatened
-        "LC" ~ 0.2,      #  - LC: Least Concern
-        .default = 0.2)) #  - NEW: assume LC for NAs and the rest
-  
-  # sp_cat == "all"
-  # d_rl |> select(redlist_code, rl_score) |> table(useNA = "ifany")
-  #               rl_score
-  # redlist_code   0.2   0.4   0.6   0.8     1
-  #         CR       0     0     0     0    50
-  #         DD     341     0     0     0     0
-  #         EN       0     0     0   288     0
-  #         LC    5919     0     0     0     0
-  #         NT       0   148     0     0     0
-  #         TN       0     0    22     0     0
-  #         VU       0     0   192     0     0
-  #         <NA> 10419     0     0     0     0
-  
+      if (!!sp_cat == "all") T else sp_cat == !!sp_cat) |>
+    select(mdl_seq, er_score) |>
+    collect()
+
   # tbl(con_sdm, "model_cell")  # value <int>:  [   0,100]
   # tbl(con_sdm, "cell_metric") # value <dbl>: ~(-Inf,Inf)
-  
-  duckdb_register(con_sdm, "tmp_rl", d_rl |> select(mdl_seq, rl_score))
+
+  duckdb_register(con_sdm, "tmp_er", d_er |> select(mdl_seq, er_score))
   dbExecute(con_sdm, glue("
     INSERT INTO cell_metric (cell_id, metric_seq, value)
-    SELECT 
+    SELECT
       mc.cell_id,
       {metric_seq} AS metric_seq,
-      -- NEW: mc.value/100; ROUND(,2)
-      ROUND(SUM(rl.rl_score * (mc.value/100)) * 100, 2) AS value 
+      ROUND(SUM(er.er_score * (mc.value/100)) * 100, 2) AS value
     FROM model_cell mc
-    JOIN tmp_rl rl ON mc.mdl_seq = rl.mdl_seq
+    JOIN tmp_er er ON mc.mdl_seq = er.mdl_seq
     GROUP BY mc.cell_id"))  # 6,662,075
-  duckdb_unregister(con_sdm, "tmp_rl")
+  duckdb_unregister(con_sdm, "tmp_er")
   
   # visual check ----
   # d <- tbl(con_sdm, "cell_metric") |>
@@ -2000,25 +1970,9 @@ For showing species composition per zone (e.g. subregion, planning area, program
 tbl_taxon <- tbl(con_sdm, "taxon") |>
   filter(is_ok) |>
   select(
-    sp_cat, sp_common = common_name, sp_scientific = scientific_name, 
-    taxon_id, taxon_authority,  # TODO: in app, sp_taxon: [{taxon_authority}:{taxon_id}](https://...)
-    rl_code = redlist_code, mdl_seq) |>
-  # arrange(sp_cat, common_name) |>
-  mutate(
-    rl_score = case_match(
-      rl_code,
-      # NEW: EX (extinct): is_ok = F
-      # NEW: NE (not evaluated), DD (data deficient), <NA> (not available) -> LC
-      # https://oceanhealthindex.org/images/htmls/Supplement.html#62_Biodiversity
-      "CR" ~ 1,           #  - CR: Critically Endangered
-      "EN" ~ 0.8,         #  - EN: Endangered (+ESA)
-      "VU" ~ 0.6,         #  - VU: Vulnerable
-      "TN" ~ 0.6,         #  - TN: Threatened (ESA only)
-      "NT" ~ 0.4,         #  - NT: Near Threatened
-      "LC" ~ 0.2,         #  - LC: Least Concern
-      .default = 0.2)) |> #  - NEW: assume LC for NAs and the rest
-  relocate(rl_score, .after = rl_code) # |> 
-  # collect()  # OLD PlanAreas_2025: 17,379 × 8; NEW ProgramAreas_2026: 17,353 × 8
+    sp_cat, sp_common = common_name, sp_scientific = scientific_name,
+    taxon_id, taxon_authority,
+    rl_code = extrisk_code, er_score, mdl_seq)
 
 d <- tbl(con_sdm, "zone") |> 
   # filter(
@@ -2045,7 +1999,7 @@ d <- tbl(con_sdm, "zone") |>
     mdl_seq,
     sp_cat, sp_common, sp_scientific, 
     taxon_id, taxon_authority, 
-    rl_code, rl_score) |> 
+    rl_code, er_score) |>
   summarize(
     area_km2 = sum(area_km2, na.rm = T),
     avg_suit = mean(value, na.rm = T) / 100,
@@ -2117,8 +2071,8 @@ d <- tbl(con_sdm, "zone") |>
 
 d <- d |>
   mutate(
-    suit_rl      = avg_suit * rl_score,
-    suit_rl_area = avg_suit * rl_score * area_km2) |> 
+    suit_rl      = avg_suit * er_score,
+    suit_rl_area = avg_suit * er_score * area_km2) |> 
   group_by(zone_fld, zone_value, sp_cat) |> 
   mutate(
     cat_suit_rl_area = sum(suit_rl_area, na.rm = T)) |> 

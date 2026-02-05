@@ -1,3 +1,710 @@
+## 2026-02-05 run big update
+
+⏺ Here's the run order:                                                                                                   
+                                                                                                                                                                                                                
+  Step-by-step execution                                                                                                                                                                                        
+                                                                                                                                                                                                                
+  1.  msens package        (already installed ✅)                                                                                                                                                               
+  2.  ingest listings      workflows/ingest_nmfs-fws-mmpa-mbta-listings.qmd                                                                                                                                     
+  3.  merge models         workflows/merge_models.qmd                                                                                                                                                           
+  4.  calc scores          workflows/calc_scores.qmd                                                                                                                                                            
+  5.  update apps          apps_2026/mapgl/app.R, apps_2026/mapsp/app.R                                                                                                                                         
+                                                                                                                                                                                                                
+  Run each notebook interactively in RStudio (chunk-by-chunk), since they have eval: false on expensive chunks.
+
+  What each step does
+
+  1. ingest listings — reads NOAA/FWS/MBTA sources, computes extrisk_code + er_score, writes listing staging table to sdm_2026.duckdb
+  2. merge models — creates taxon_model junction table, writes slimmed taxon (no dataset columns), LEFT JOINs listing onto taxon, IUCN fallback for unmatched, ingests IUCN range maps, runs merge loop
+  3. calc scores — uses er_score directly from taxon (no more case_match on redlist_code), recalculates cell_metric and zone_metric
+
+  Apps that need updating
+
+  Both mapgl apps have the old case_match scoring baked in:
+  ┌───────────────────────┬────────────┬────────────────────────────────────────────────────────────────────┐
+  │         File          │   Lines    │                           What to change                           │
+  ├───────────────────────┼────────────┼────────────────────────────────────────────────────────────────────┤
+  │ apps_2026/mapgl/app.R │ ~1274-1293 │ Replace rl_code/rl_score case_match with er_score from taxon table │
+  ├───────────────────────┼────────────┼────────────────────────────────────────────────────────────────────┤
+  │ apps_2026/mapsp/app.R │ ~111, 414  │ Update redlist_code display to extrisk_code                        │
+  ├───────────────────────┼────────────┼────────────────────────────────────────────────────────────────────┤
+  │ apps/mapgl/app.R      │ ~832-847   │ Same as above (older version)                                      │
+  ├───────────────────────┼────────────┼────────────────────────────────────────────────────────────────────┤
+  │ apps/mapsp/app.R      │ ~194       │ Display-only redlist_code reference                                │
+  └───────────────────────┴────────────┴────────────────────────────────────────────────────────────────────┘
+  The key change in the mapgl apps is replacing the ~15 lines of case_match scoring with a single er_score column read from the database. The zone_taxon table (written by calc_scores.qmd) will also have
+  er_score instead of rl_score, so apps reading that CSV/table get the new scores automatically.
+
+  Or use targets
+
+  Alternatively, from workflows/:
+  targets::tar_make()
+  Though for a first run I'd recommend going chunk-by-chunk to verify each step.
+
+## 2026-02-05 big update
+
+I have a fairly massive overhaul to do as version 3 of this project. The main goals are:
+
+- Flag species addressed by US federal sources (NOAA and FWS) for applying Threatened/Endangered/LeastConcern status, and not allowing international IUCN scores override these:
+
+  * **NOAA**  
+    [noaa\_species\_directory.csv](https://github.com/MarineSensitivity/workflows/blob/f2a6a0c6287afcd57ecbd483d77595f65b0d8414/data/noaa_species_directory.csv)  
+    @workflows/data/noaa_species_directory.csv
+    * See [**Glossary-classifications**](https://www.fisheries.noaa.gov/national/glossary-classifications-protected-species) with definitions  
+      eg: ESA Endangered; **MMPA** Protected; MMPA Depleted; CITES Appendix II; SPAW Annex II, …
+  
+  * **FWS**  
+    [FWS\_Species\_Data\_Explorer.csv](https://drive.google.com/open?id=1GNqaCgFleSq-leRsJp7-iq-SxL5YcsH6&usp=drive_fs)
+    @'~/My Drive/projects/msens/data/raw/fws.gov/species/FWS_Species_Data_Explorer.csv'
+    * Includes BCC: Birds of Conservation Concern list
+    
+    * **MTBA** (birds)  
+      [CFR50-Part10.13-2023.xlsx](https://docs.google.com/spreadsheets/d/1paoAZw_UdGZ1KAgDycv0AiULzeL-I6Jo?rtpof=true&usp=drive_fs)
+      @'~/My Drive/projects/msens/data/raw/fws.gov/birds_mbta/CFR50-Part10.13-2023.xlsx'
+
+- Apply a new non-linear scoring system for species also flagged above as part of MMPA, MBTA and BCC (not sure how to weight that one yet) on extinction risk categories from US (favored) and International sources:
+
+  [MST scoring](https://docs.google.com/spreadsheets/u/0/d/1GbSwo83lKptV0BghKwtRV5P-SyilmNn2w37uFpJY2AM/edit)
+  
+  | US |  |  |  |  |
+  | ----- | ----- | :---- | :---- | :---- |
+  | **score** | **score, original** | **US code** | **description** | **notes** |
+  | 100 | 90 | EN | Endangered |  |
+  | 50 | 70 | TN | Threatened |  |
+  | 20 |  | MMPA | marine mammal | more legal issues with mammals than birds; incidental take retained |
+  | 10 |  | MBTA | seabird | incidental take removed |
+  | 1 |  | LC | if listed, but not classifed as EN or TN |  |
+  
+  | International |  |  |  |  |
+  | ----- | :---- | ----: | ----: | ----: |
+  | **IUCN code** | **description** | **score, original** | **score, old** | **score** |
+  | CR | Critically Endangered | 100 | 100 | 50 |
+  | EN | Endangered | 80 | 50 | 25 |
+  | VU | Vulnerable | 60 | 10 | 5 |
+  | NT | Near Threatened | 40 | 5 | 2 |
+  | LC | Least Concern | 20 | 1 | 1 |
+  | DD | Data Deficient | 20 | 1 | 1 |
+
+- Address individual species concerns in @dev/2026-02-05_v3_species-concerns.md.
+
+- Answer questions along the way like:
+
+  * What IUCN CR/EN species are not covered by NMFS/FWS listings?
+
+- Update model cells and zone metrics accordingly
+
+The problem is that this framework is a bit messy. I've lately been copying a 
+backup copy of the database at @~/My Drive/projects/msens/data/derived/sdm_2026.duckdb, 
+jamming data into @workflows/merge_models.qmd, then re-running @workflows/calc_scores.qmd,
+and forking another new set of apps in @apps_2026/mapgl and @apps_2026/mapsp. I 
+was previously ingesting per dataset like @workflows/ingest_fisheries.noaa.gov_critical-habitat.qmd,
+ingest_aquamaps_to_sdm_duckdb.qmd, etc., but I've lost track of the necessary 
+sequence and need something like the targets R pacakge to keep track of 
+dependencies and sequence. Other fixes probably involve:
+
+- Of the tables in the database (cell, cell_metric, dataset, metric, model, 
+  model_cell, species, taxon, zone, zone_cell, zone_metric, zone_taxon), 
+  the taxon table has column identifiers for datasets matching that taxon and
+  value of the mdl_seq. That should be pivoted longer into taxon_model (or taxon_dataset?), 
+  so that new datasets getting added can be inserted without DDL on taxon table.
+
+
+Use targets, not simple numbered scripts. 
+Handle the taxon_model restructuring now.
+
+
+Love the modifiable format of @workflows/data/species_overrides_v3.csv.
+
+Let's rename v3_ingest_listings.qmd to ingest_nmfs-fws-mmpa-mtba-listings.qmd 
+to be more explicit about the content.
+
+In Part D: Modify calc_scores.qmd, instead of replacing old `redlist_code` with 
+`score_v3`, let's use `extrisk_code` and preface with authority in values, so
+"NMFS:EN", "FWS:TN", "IUCN:CR", "IUCN:LC", etc., Then downstream let's call this
+`er_score` instead of `rl_score`.
+
+I like the comparison table of Score Scale Impact. Be sure to include that in the notebook.
+
+Be sure to run @workflows/v3_ingest_listings.qmd before @workflows/merge_models.qmd 
+to ensure the new scoring system is applied.
+
+When parsing these new species lists, apply "LC" (vs leaving blank as <NA>) if 
+in NOAA or FWS species directory but not "EN/TN". This ensures the US classification
+gets applied and not overwritten by IUCN where no US listing exists.
+
+Can you please think deeply about how these notebooks could be better organized and possibly
+broken into smaller parts and use reusable functions in the @msens R library.
+
+Be sure to retain verification steps at the end of each modified/created notebook. 
+You can use @'~/My Drive/projects/msens/data/derived/sdm_2026-01-29.duckdb' as
+the reference database for the prior version to compare against.
+
+⏺ The plan has been updated with all your feedback:
+
+  - Renamed to ingest_nmfs-fws-mmpa-mbta-listings.qmd
+  - extrisk_code with authority-prefixed values ("NMFS:EN", "FWS:TN", "IUCN:CR", etc.)
+  - er_score replaces rl_score downstream
+  - LC for listed-but-not-EN/TN species — US classification always applied
+  - Run order: listings runs BEFORE merge_models (writes staging listing table, which merge_models LEFT JOINs)
+  - msens R package: new R/db.R, R/listings.R, R/taxa.R with reusable functions
+  - Score Scale Impact table included in notebook output
+  - Verification against sdm_2026-01-29.duckdb reference at end of each notebook
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Ready to code?
+                                                                                                                                                                                                              
+ Here is Claude's plan:
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ MarineSensitivity v3 Implementation Plan               
+
+ Overview
+
+ Overhaul species scoring to prioritize US federal listings (ESA, MMPA, MBTA) over IUCN, restructure taxon table by extracting dataset columns into a taxon_model junction table, adopt targets for pipeline
+ management, extract reusable functions into the msens R package, and address 13 specific species concerns.
+
+ Key Decisions
+
+ - US score always wins when a US listing exists (Rule A)
+ - MMPA/MBTA additive with ESA scores, capped at 100
+ - targets R package for pipeline dependency management
+ - Restructure now: create taxon_model junction table, remove dataset columns from taxon
+ - extrisk_code replaces redlist_code with authority-prefixed values: "NMFS:EN", "FWS:TN", "IUCN:CR", etc.
+ - er_score replaces rl_score downstream (numeric 0-1)
+ - LC for listed species: any species in NOAA or FWS directory but not EN/TN gets "LC" (not NA)
+ - Run order: ingest_nmfs-fws-mmpa-mbta-listings.qmd runs BEFORE merge_models.qmd
+ - Reusable functions: extract scoring/listing logic into msens R package
+
+ ---
+ Part A: Schema Restructuring — taxon_model Junction Table
+
+ Current State
+
+ The taxon table has 6 dataset-specific columns storing mdl_seq values:
+ ┌──────────┬──────────┬───────────────────────────────┐
+ │  Column  │ Coverage │          Description          │
+ ├──────────┼──────────┼───────────────────────────────┤
+ │ am_0.05  │ 96.4%    │ AquaMaps mdl_seq              │
+ ├──────────┼──────────┼───────────────────────────────┤
+ │ ch_nmfs  │ 0.19%    │ NMFS Critical Habitat mdl_seq │
+ ├──────────┼──────────┼───────────────────────────────┤
+ │ ch_fws   │ 0.16%    │ FWS Critical Habitat mdl_seq  │
+ ├──────────┼──────────┼───────────────────────────────┤
+ │ rng_fws  │ 0.58%    │ FWS Range mdl_seq             │
+ ├──────────┼──────────┼───────────────────────────────┤
+ │ bl       │ 3.25%    │ BirdLife mdl_seq              │
+ ├──────────┼──────────┼───────────────────────────────┤
+ │ rng_iucn │ ~3%      │ IUCN Range mdl_seq            │
+ └──────────┴──────────┴───────────────────────────────┘
+ Key insight: These dataset columns are ONLY used during merge_models.qmd creation. All downstream code uses only mdl_seq.
+
+ New table: taxon_model
+
+ CREATE TABLE taxon_model (
+   taxon_id  BIGINT  NOT NULL,
+   ds_key    VARCHAR NOT NULL,
+   mdl_seq   INTEGER NOT NULL,
+   PRIMARY KEY (taxon_id, ds_key)
+ );
+
+ Updated taxon columns (post-restructuring)
+
+ taxon_id, taxon_authority, sp_cat, scientific_name, common_name,
+ worms_id, redlist_code,
+ extrisk_code, er_score, is_mmpa, is_mbta, is_bcc,
+ n_ds, mdl_seq, is_ok
+
+ Dataset columns (am_0.05, ch_nmfs, etc.) removed — live in taxon_model now.
+
+ ---
+ Part B: msens R Package Enhancements
+
+ B1: msens/R/db.R — database connection helpers
+
+ #' Path to SDM DuckDB
+ #' @param version version date suffix (default: "2026")
+ #' @return character path
+ #' @export
+ #' @concept db
+ sdm_db_path <- function(version = "2026") {
+   dir_data <- switch(Sys.info()[["sysname"]],
+     "Darwin" = "~/My Drive/projects/msens/data",
+     "Linux"  = "/share/data")
+   glue::glue("{dir_data}/derived/sdm_{version}.duckdb")
+ }
+
+ #' Connect to SDM DuckDB
+ #' @param version version date suffix
+ #' @param read_only logical
+ #' @return DBI connection
+ #' @export
+ #' @concept db
+ sdm_db_con <- function(version = "2026", read_only = FALSE) {
+   DBI::dbConnect(duckdb::duckdb(
+     dbdir = sdm_db_path(version), read_only = read_only))
+ }
+
+ #' Connect to species taxonomy DuckDB
+ #' @param read_only logical
+ #' @return DBI connection
+ #' @export
+ #' @concept db
+ spp_db_con <- function(read_only = TRUE) {
+   dir_data <- switch(Sys.info()[["sysname"]],
+     "Darwin" = "~/My Drive/projects/msens/data",
+     "Linux"  = "/share/data")
+   DBI::dbConnect(duckdb::duckdb(
+     dbdir     = glue::glue("{dir_data}/derived/spp.duckdb"),
+     read_only = read_only))
+ }
+
+ Add DBI, dplyr, duckdb, stringr to DESCRIPTION Imports.
+
+ B2: msens/R/listings.R — listing parsers and score computation
+
+ #' Parse NOAA protected_status field
+ #' @param status_str character vector of semicolon-delimited statuses
+ #' @return tibble with columns: esa_status, is_mmpa
+ #' @export
+ #' @concept listings
+ parse_noaa_status <- function(status_str) {
+   tibble::tibble(
+     esa_status = dplyr::case_when(
+       stringr::str_detect(status_str, "ESA Endangered(?! - Foreign)") ~ "EN",
+       stringr::str_detect(status_str, "ESA Threatened(?! - Foreign)")  ~ "TN",
+       TRUE ~ "LC"),
+     is_mmpa = stringr::str_detect(status_str, "MMPA") |>
+       tidyr::replace_na(FALSE))
+ }
+
+ #' Compute extinction risk score from extrisk_code and flags
+ #'
+ #' US-listed: base from ESA + additive MMPA(20)/MBTA(10), cap at 100.
+ #' Non-US: IUCN fallback scale (CR=50, EN=25, VU=5, NT=2, other=1).
+ #'
+ #' @param extrisk_code character, e.g. "NMFS:EN", "FWS:TN", "IUCN:CR"
+ #' @param is_mmpa logical
+ #' @param is_mbta logical
+ #' @return integer score 0-100
+ #' @export
+ #' @concept listings
+ compute_er_score <- function(extrisk_code, is_mmpa = FALSE, is_mbta = FALSE) {
+   authority <- stringr::str_split_i(extrisk_code, ":", 1)
+   code      <- stringr::str_split_i(extrisk_code, ":", 2)
+   is_us     <- authority %in% c("NMFS", "FWS")
+
+   base_us <- dplyr::case_match(code,
+     "EN" ~ 100L, "TN" ~ 50L, "LC" ~ 1L, .default = 0L)
+   bonus   <- ifelse(is_mmpa, 20L, 0L) + ifelse(is_mbta, 10L, 0L)
+
+   score_iucn <- dplyr::case_match(code,
+     "CR" ~ 50L, "EN" ~ 25L, "VU" ~ 5L, "NT" ~ 2L, .default = 1L)
+
+   dplyr::case_when(
+     is.na(extrisk_code) ~ 1L,
+     is_us               ~ pmin(base_us + bonus, 100L),
+     TRUE                ~ score_iucn)
+ }
+
+ B3: msens/R/taxa.R — taxonomy matching cascade
+
+ #' Match taxa to spp.duckdb via cascade
+ #'
+ #' 1. ITIS TSN crosswalk -> worms_id
+ #' 2. Exact scientific_name match in worms table
+ #' 3. WoRMS REST API for unmatched (via msens::wm_rest())
+ #'
+ #' @param d data.frame with scientific_name and optionally itis_id
+ #' @param con_spp DBI connection to spp.duckdb
+ #' @return d with added worms_id, botw_id columns
+ #' @export
+ #' @concept taxa
+ match_taxa <- function(d, con_spp) {
+   # implementation follows patterns in merge_models.qmd
+ }
+
+ ---
+ Part C: ingest_nmfs-fws-mmpa-mbta-listings.qmd
+
+ Purpose
+
+ Ingest US federal species listings, compute extrisk_code and er_score, write staging listing table to sdm_2026.duckdb. Runs BEFORE merge_models.qmd.
+
+ Key: Matches to spp.duckdb taxonomy (not the sdm taxon table, which doesn't exist yet).
+
+ Section 1: Setup
+
+ librarian::shelf(
+   DBI, dplyr, duckdb, glue, here, janitor,
+   msens, readr, readxl, stringr, tibble, tidyr, quiet = T)
+
+ dir_data  <- msens::sdm_db_path() |> dirname() |> dirname()
+ con_spp   <- msens::spp_db_con()
+ con_sdm   <- msens::sdm_db_con(read_only = FALSE)
+
+ Section 2: Ingest NOAA Species Directory (309 spp)
+
+ Source: workflows/data/noaa_species_directory.csv
+
+ Parse protected_status using msens::parse_noaa_status(). Key rule: any species in NOAA directory gets at minimum "LC" (not NA). Match to spp.duckdb via scientific_name → WoRMS synonym lookup → manual
+ overrides.
+
+ Section 3: Ingest FWS Species Data Explorer (~4,470 marine spp)
+
+ Source: ~/My Drive/projects/msens/data/raw/fws.gov/species/FWS_Species_Data_Explorer.csv
+
+ Filter to marine taxonomic groups. ESA status: "Endangered" → "EN", "Threatened" → "TN", otherwise → "LC". Match via ITIS TSN crosswalk → scientific name → WoRMS synonym. Subspecies handling (Rule C):
+ strip subspecific epithets, take max ESA status.
+
+ Section 4: Ingest MBTA Bird List
+
+ Source: ~/My Drive/projects/msens/data/raw/fws.gov/birds_mbta/CFR50-Part10.13-2023.xlsx
+
+ Match to BirdLife (botw) by scientific name. Set is_mbta = TRUE.
+
+ Section 5: Combine and compute extrisk_code
+
+ # priority: NMFS EN > FWS EN > NMFS TN > FWS TN > NMFS LC > FWS LC > IUCN
+ d_listing <- d_noaa |>
+   full_join(d_fws, by = "worms_id") |>
+   mutate(
+     extrisk_code = case_when(
+       nmfs_esa == "EN" ~ "NMFS:EN",
+       fws_esa  == "EN" ~ "FWS:EN",
+       nmfs_esa == "TN" ~ "NMFS:TN",
+       fws_esa  == "TN" ~ "FWS:TN",
+       nmfs_esa == "LC" ~ "NMFS:LC",
+       fws_esa  == "LC" ~ "FWS:LC",
+       TRUE             ~ NA_character_),
+     er_score = msens::compute_er_score(extrisk_code, is_mmpa, is_mbta) / 100)
+
+ Section 6: Apply Species Overrides
+
+ File: workflows/data/species_overrides_v3.csv
+ ┌────────────────────────────┬──────────┬──────────────┬───────────────────────────┬───────────────────────────────┐
+ │      scientific_name       │ worms_id │   override   │           value           │             notes             │
+ ├────────────────────────────┼──────────┼──────────────┼───────────────────────────┼───────────────────────────────┤
+ │ Sotalia guianensis         │ 344009   │ is_ok        │ FALSE                     │ outside US EEZ                │
+ ├────────────────────────────┼──────────┼──────────────┼───────────────────────────┼───────────────────────────────┤
+ │ Globicephala melas         │ 137205   │ common_name  │ Long-finned Pilot Whale   │ fix name                      │
+ ├────────────────────────────┼──────────┼──────────────┼───────────────────────────┼───────────────────────────────┤
+ │ Hyperoodon ampullatus      │ 137098   │ common_name  │ Northern Bottlenose Whale │ fix name                      │
+ ├────────────────────────────┼──────────┼──────────────┼───────────────────────────┼───────────────────────────────┤
+ │ Lagenorhynchus albirostris │ 137107   │ common_name  │ White-beaked Dolphin      │ fix name                      │
+ ├────────────────────────────┼──────────┼──────────────┼───────────────────────────┼───────────────────────────────┤
+ │ Odobenus rosmarus          │ 137084   │ er_score     │ 0.01                      │ FWS "not listed"              │
+ ├────────────────────────────┼──────────┼──────────────┼───────────────────────────┼───────────────────────────────┤
+ │ Balaenoptera ricei         │ 1576133  │ extrisk_code │ NMFS:EN                   │ ESA EN + MMPA                 │
+ ├────────────────────────────┼──────────┼──────────────┼───────────────────────────┼───────────────────────────────┤
+ │ Cystophora cristata        │ 137078   │ extrisk_code │ NMFS:LC                   │ MMPA only, not ESA            │
+ ├────────────────────────────┼──────────┼──────────────┼───────────────────────────┼───────────────────────────────┤
+ │ Pagophilus groenlandicus   │ 159019   │ extrisk_code │ NMFS:LC                   │ MMPA only; clip to IUCN range │
+ ├────────────────────────────┼──────────┼──────────────┼───────────────────────────┼───────────────────────────────┤
+ │ Phoca vitulina             │ 137084   │ extrisk_code │ NMFS:LC                   │ MMPA only                     │
+ ├────────────────────────────┼──────────┼──────────────┼───────────────────────────┼───────────────────────────────┤
+ │ Phocoena phocoena          │ 137117   │ extrisk_code │ NMFS:LC                   │ MMPA only                     │
+ └────────────────────────────┴──────────┴──────────────┴───────────────────────────┴───────────────────────────────┘
+ Section 7: Write staging listing table
+
+ d_listing_out <- d_listing |>
+   select(worms_id, botw_id, extrisk_code, er_score, is_mmpa, is_mbta, is_bcc)
+ dbWriteTable(con_sdm, "listing", d_listing_out, overwrite = TRUE)
+
+ Section 8: Score Scale Impact (rendered in notebook)
+ ┌─────────────────────────┬──────────────────┬──────────────────┬────────┐
+ │      Species type       │   Old rl_score   │   New er_score   │ Change │
+ ├─────────────────────────┼──────────────────┼──────────────────┼────────┤
+ │ ESA Endangered mammal   │ 0.8              │ 1.0 (100 capped) │ +25%   │
+ ├─────────────────────────┼──────────────────┼──────────────────┼────────┤
+ │ ESA Threatened          │ 0.6              │ 0.5              │ -17%   │
+ ├─────────────────────────┼──────────────────┼──────────────────┼────────┤
+ │ MMPA-only mammal        │ 0.2 (LC default) │ 0.21 (1+20)/100  │ +5%    │
+ ├─────────────────────────┼──────────────────┼──────────────────┼────────┤
+ │ MBTA-only bird          │ 0.2 (LC default) │ 0.11 (1+10)/100  │ -45%   │
+ ├─────────────────────────┼──────────────────┼──────────────────┼────────┤
+ │ IUCN CR (no US listing) │ 1.0              │ 0.5              │ -50%   │
+ ├─────────────────────────┼──────────────────┼──────────────────┼────────┤
+ │ IUCN EN (no US listing) │ 0.8              │ 0.25             │ -69%   │
+ ├─────────────────────────┼──────────────────┼──────────────────┼────────┤
+ │ No listing at all       │ 0.2              │ 0.01             │ -95%   │
+ └─────────────────────────┴──────────────────┴──────────────────┴────────┘
+ Section 9: Audit Outputs
+
+ - CSV: IUCN CR/EN species NOT covered by NMFS/FWS listings
+ - CSV: all species where US listing overrides IUCN, with rationale
+ - Summary table: er_score distribution by sp_cat
+
+ Section 10: Verification vs reference
+
+ con_ref <- DBI::dbConnect(duckdb::duckdb(
+   dbdir = msens::sdm_db_path("2026-01-29"), read_only = TRUE))
+ # compare old redlist_code distribution vs new extrisk_code
+ # spot-check specific species
+
+ ---
+ Part D: Modify merge_models.qmd
+
+ D1: Create taxon_model junction table
+
+ After building d_taxon with pivot-wider dataset columns (~line 1414), extract into taxon_model:
+
+ d_taxon_model <- d_taxon |>
+   select(taxon_id, any_of(c("am_0.05", "ch_nmfs", "ch_fws", "rng_fws", "bl"))) |>
+   pivot_longer(-taxon_id, names_to = "ds_key", values_to = "mdl_seq") |>
+   filter(!is.na(mdl_seq))
+ dbWriteTable(con_sdm, "taxon_model", d_taxon_model, overwrite = TRUE)
+
+ Later append rng_iucn and ms_merge rows as those models are created.
+
+ D2: LEFT JOIN listing data onto taxon
+
+ After writing initial taxon table (~line 1753), join listing staging table:
+
+ UPDATE taxon SET
+   extrisk_code = l.extrisk_code,
+   er_score     = l.er_score,
+   is_mmpa      = l.is_mmpa,
+   is_mbta      = l.is_mbta,
+   is_bcc       = l.is_bcc
+ FROM listing l
+ WHERE taxon.worms_id = l.worms_id OR taxon.taxon_id = l.botw_id
+
+ For taxa NOT matched, apply IUCN fallback:
+
+ UPDATE taxon SET
+   extrisk_code = 'IUCN:' || redlist_code,
+   er_score     = CASE redlist_code
+     WHEN 'CR' THEN 0.50  WHEN 'EN' THEN 0.25
+     WHEN 'VU' THEN 0.05  WHEN 'NT' THEN 0.02
+     ELSE 0.01 END
+ WHERE extrisk_code IS NULL AND redlist_code IS NOT NULL
+
+ D3: Remove per-dataset columns from taxon write
+
+ d_taxon_clean <- d_taxon |>
+   select(-am_0.05, -ch_nmfs, -ch_fws, -rng_fws, -bl, -rng_iucn)
+
+ Keep mdl_seq and n_ds for backward compatibility.
+
+ D4: Verification at end of notebook
+
+ Compare taxon row count, taxon_model row count, and extrisk_code distribution against reference sdm_2026-01-29.duckdb.
+
+ ---
+ Part E: Modify calc_scores.qmd
+
+ E1: Replace scoring lookup (lines 541-564)
+
+ Before:
+ d_rl <- tbl(con_sdm, "taxon") |>
+   filter(is_ok, ...) |>
+   select(mdl_seq, redlist_code) |>
+   collect() |>
+   mutate(rl_score = case_match(redlist_code,
+     "CR" ~ 1, "EN" ~ 0.8, "VU" ~ 0.6, "TN" ~ 0.6,
+     "NT" ~ 0.4, "LC" ~ 0.2, .default = 0.2))
+
+ After:
+ d_er <- tbl(con_sdm, "taxon") |>
+   filter(is_ok,
+     if (!!sp_cat == "all") TRUE else sp_cat == !!sp_cat) |>
+   select(mdl_seq, er_score) |>
+   collect()
+
+ Rename rl_score → er_score in downstream SQL temp table. The insertion SQL formula stays the same:
+ ROUND(SUM(er.er_score * (mc.value/100)) * 100, 2) AS value
+
+ E2: Update zone_taxon section (~line 2005)
+
+ Replace case_match on redlist_code with direct er_score column.
+
+ E3: Verification at end of notebook
+
+ Compare cell_metric and zone_metric distributions against reference database.
+
+ ---
+ Part F: targets Pipeline
+
+ workflows/_targets.R
+
+ library(targets)
+ tar_option_set(packages = c("DBI", "dplyr", "duckdb", "glue", "here", "msens"))
+ tar_source("R/")
+
+ list(
+   tar_target(spp_db,      run_ingest_taxon(),    format = "file"),
+   tar_target(listing_db,  run_ingest_listings(spp_db), format = "file"),
+   tar_target(sdm_aquamaps, run_ingest_aquamaps(), format = "file"),
+   tar_target(sdm_birdlife, run_ingest_birdlife(), format = "file"),
+   tar_target(sdm_ch_nmfs,  run_ingest_ch_nmfs(),  format = "file"),
+   tar_target(sdm_ch_fws,   run_ingest_ch_fws(),   format = "file"),
+   tar_target(sdm_rng_fws,  run_ingest_rng_fws(),  format = "file"),
+   tar_target(sdm_rng_iucn, run_ingest_rng_iucn(), format = "file"),
+   tar_target(rast_prod,    run_ingest_productivity(), format = "file"),
+   tar_target(taxon_db, run_merge_models(
+     spp_db, listing_db,
+     sdm_aquamaps, sdm_birdlife,
+     sdm_ch_nmfs, sdm_ch_fws, sdm_rng_fws, sdm_rng_iucn),
+     format = "file"),
+   tar_target(scores, run_calc_scores(taxon_db, rast_prod), format = "file")
+ )
+
+ DAG
+
+ ingest_taxon ─────────────────────────┐
+       │                               │
+ ingest_listings ──────────────────────┤
+                                       │
+ ingest_aquamaps ──┐                   │
+ ingest_birdlife ──┤                   │
+ ingest_ch_nmfs  ──┤                   │
+ ingest_ch_fws   ──┼── merge_models ── calc_scores
+ ingest_rng_fws  ──┤         │              │
+ ingest_rng_iucn ──┘         │              │
+                             │       ingest_productivity
+                      ingest_taxon +
+                      ingest_listings
+
+ workflows/R/run_*.R wrapper functions
+
+ Each wraps quarto::quarto_render() on the corresponding .qmd, returns the db file path for format = "file" tracking.
+
+ ---
+ Implementation Sequence
+
+ Phase 1: msens R package (Part B)
+
+ 1. Create msens/R/db.R, msens/R/listings.R, msens/R/taxa.R
+ 2. Update msens/DESCRIPTION (add DBI, dplyr, duckdb, stringr)
+ 3. devtools::document() and devtools::install()
+
+ Phase 2: Listings notebook (Part C)
+
+ 1. Create workflows/data/species_overrides_v3.csv
+ 2. Create workflows/ingest_nmfs-fws-mmpa-mbta-listings.qmd
+ 3. Run interactively; verify listing table in sdm_2026.duckdb
+
+ Phase 3: Schema + merge_models (Parts A + D)
+
+ 1. Modify workflows/merge_models.qmd:
+   - Create taxon_model junction table
+   - LEFT JOIN listing staging table onto taxon
+   - IUCN fallback for unmatched taxa
+   - Remove per-dataset columns from taxon write
+ 2. Run interactively; verify taxon has extrisk_code, er_score
+
+ Phase 4: calc_scores (Part E)
+
+ 1. Modify workflows/calc_scores.qmd:
+   - Replace rl_score computation with er_score
+   - Update zone_taxon section
+ 2. Run interactively; verify cell_metric values
+
+ Phase 5: targets pipeline (Part F)
+
+ 1. Create workflows/_targets.R
+ 2. Create workflows/R/run_*.R wrappers
+ 3. tar_make() end-to-end
+
+ ---
+ Critical Files
+ ┌──────────────────────────────────────────────────┬─────────────────────────────────────────────────────────┐
+ │                       File                       │                         Action                          │
+ ├──────────────────────────────────────────────────┼─────────────────────────────────────────────────────────┤
+ │ msens/R/db.R                                     │ CREATE — sdm_db_path(), sdm_db_con(), spp_db_con()      │
+ ├──────────────────────────────────────────────────┼─────────────────────────────────────────────────────────┤
+ │ msens/R/listings.R                               │ CREATE — parse_noaa_status(), compute_er_score()        │
+ ├──────────────────────────────────────────────────┼─────────────────────────────────────────────────────────┤
+ │ msens/R/taxa.R                                   │ CREATE — match_taxa() cascade                           │
+ ├──────────────────────────────────────────────────┼─────────────────────────────────────────────────────────┤
+ │ msens/DESCRIPTION                                │ MODIFY — add DBI, dplyr, duckdb, stringr                │
+ ├──────────────────────────────────────────────────┼─────────────────────────────────────────────────────────┤
+ │ workflows/ingest_nmfs-fws-mmpa-mbta-listings.qmd │ CREATE — ingest listings, compute extrisk_code/er_score │
+ ├──────────────────────────────────────────────────┼─────────────────────────────────────────────────────────┤
+ │ workflows/data/species_overrides_v3.csv          │ CREATE — manual overrides                               │
+ ├──────────────────────────────────────────────────┼─────────────────────────────────────────────────────────┤
+ │ workflows/merge_models.qmd                       │ MODIFY — taxon_model, LEFT JOIN listing, slim taxon     │
+ ├──────────────────────────────────────────────────┼─────────────────────────────────────────────────────────┤
+ │ workflows/calc_scores.qmd                        │ MODIFY — use er_score instead of redlist_code           │
+ ├──────────────────────────────────────────────────┼─────────────────────────────────────────────────────────┤
+ │ workflows/_targets.R                             │ CREATE — pipeline definition                            │
+ ├──────────────────────────────────────────────────┼─────────────────────────────────────────────────────────┤
+ │ workflows/R/run_*.R                              │ CREATE — target wrappers                                │
+ └──────────────────────────────────────────────────┴─────────────────────────────────────────────────────────┘
+ Verification
+
+ Reference database
+
+ Use sdm_2026-01-29.duckdb as baseline:
+ - Path: ~/My Drive/projects/msens/data/derived/sdm_2026-01-29.duckdb
+
+ Spot checks
+ ┌─────────────────────────────────────┬───────────────────────┬───────────────────┐
+ │               Species               │ Expected extrisk_code │ Expected er_score │
+ ├─────────────────────────────────────┼───────────────────────┼───────────────────┤
+ │ Balaenoptera ricei (Rice's whale)   │ NMFS:EN               │ 1.00              │
+ ├─────────────────────────────────────┼───────────────────────┼───────────────────┤
+ │ Phocoena phocoena (harbor porpoise) │ NMFS:LC               │ 0.21              │
+ ├─────────────────────────────────────┼───────────────────────┼───────────────────┤
+ │ Cystophora cristata (hooded seal)   │ NMFS:LC               │ 0.21              │
+ ├─────────────────────────────────────┼───────────────────────┼───────────────────┤
+ │ Odobenus rosmarus (walrus)          │ FWS:LC                │ 0.01 (override)   │
+ ├─────────────────────────────────────┼───────────────────────┼───────────────────┤
+ │ Chelonia mydas (green turtle)       │ NMFS:EN               │ 1.00              │
+ ├─────────────────────────────────────┼───────────────────────┼───────────────────┤
+ │ Unlisted IUCN CR species            │ IUCN:CR               │ 0.50              │
+ ├─────────────────────────────────────┼───────────────────────┼───────────────────┤
+ │ Unlisted IUCN LC species            │ IUCN:LC               │ 0.01              │
+ ├─────────────────────────────────────┼───────────────────────┼───────────────────┤
+ │ MBTA-only bird (no ESA)             │ FWS:LC                │ 0.11              │
+ └─────────────────────────────────────┴───────────────────────┴───────────────────┘
+ Automated checks
+
+ 1. taxon_model row count = sum of non-NA dataset columns in old taxon
+ 2. All downstream apps work with taxon.mdl_seq
+ 3. Ecoregion-rescaled cell_metric values span [0,100]
+ 4. IUCN CR/EN gap analysis: which internationally threatened species lack US coverage
+ 5. tar_visnetwork() shows correct DAG; tar_make() runs end-to-end
+ 6. Score Scale Impact table rendered in listings notebook
+
+⏺ Summary of All Changes
+
+  Here's what was implemented across all 5 phases:
+
+  Phase 1: msens R Package (msens/)
+
+  - Created msens/R/db.R — sdm_db_path(), sdm_db_con(), spp_db_con()
+  - Created msens/R/listings.R — parse_noaa_status(), compute_er_score()
+  - Created msens/R/taxa.R — match_taxa() cascade (ITIS → WoRMS name → WoRMS API)
+  - Modified msens/DESCRIPTION — added DBI, dplyr, duckdb, stats, stringr to Imports
+  - Package documented and installed; all spot checks pass (e.g., compute_er_score("NMFS:EN", is_mmpa=TRUE) → 100)
+
+  Phase 2: Listings Notebook (workflows/)
+
+  - Created workflows/data/species_overrides_v3.csv — 15 override rows for 10 species
+  - Created workflows/ingest_nmfs-fws-mmpa-mbta-listings.qmd — ingests NOAA (309 spp), FWS (~4,470 marine), MBTA bird list; computes extrisk_code/er_score; applies overrides; writes listing staging table;
+  includes audit outputs and score impact table
+
+  Phase 3: merge_models.qmd Modifications
+
+  - Added taxon_model junction table creation (pivots dataset columns into rows)
+  - Removed per-dataset columns (am_0.05, ch_nmfs, ch_fws, rng_fws, bl) from taxon table write
+  - Added listing JOIN chunk: LEFT JOINs listing staging table onto taxon by worms_id, with IUCN fallback for unmatched taxa
+  - Updated IUCN range section to write to taxon_model instead of taxon column
+  - Updated merge loop to read from taxon_model and append ms_merge rows
+  - Updated summary section to use taxon_model instead of removed columns
+
+  Phase 4: calc_scores.qmd Modifications
+
+  - Replaced rl_score computation (case_match on redlist_code) with direct er_score from taxon table
+  - Updated SQL: tmp_rl → tmp_er, rl.rl_score → er.er_score
+  - Updated zone_taxon section: uses er_score instead of case_match on rl_code
+
+  Phase 5: targets Pipeline
+
+  - Created workflows/_targets.R — 11 targets with correct DAG dependencies
+  - Created workflows/R/run_*.R — 8 wrapper functions for each pipeline step
+  - Verified: tar_manifest() lists all 11 targets, tar_network() shows 22 correct edges
+
 ## 2025-07-13 migrate to msens fxns
 
 Update the @README.md file with a new plan for 
