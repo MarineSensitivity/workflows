@@ -74,6 +74,10 @@ options(readr.show_col_types = F)
 stopifnot(packageVersion("terra") >= "1.8.60")
 # [rotate() issue](https://github.com/rspatial/terra/issues/1876)
 
+# version ----
+v_int <- 3
+v_sfx <- paste0("_v", v_int)
+
 # source(here("libs/db.R"))
 # source(here("libs/am_functions.R"))
 # source(here("libs/sdm_functions.R"))
@@ -87,21 +91,21 @@ dir_data <- ifelse(
 )
 dir_raw <- glue("{dir_data}/raw")
 dir_derived <- glue("{dir_data}/derived")
-pa_gpkg <- glue("{dir_derived}/ply_planareas_2025.gpkg")
-er_gpkg <- glue("{dir_derived}/ply_ecoregions_2025.gpkg")
-sr_gpkg <- glue("{dir_derived}/ply_subregions_2025.gpkg")
+pa_gpkg <- glue("{dir_derived}/ply_planareas_2025{v_sfx}.gpkg")
+er_gpkg <- glue("{dir_derived}/ply_ecoregions_2025{v_sfx}.gpkg")
+sr_gpkg <- glue("{dir_derived}/ply_subregions_2025{v_sfx}.gpkg")
 pra_raw_gpkg <- glue("{dir_raw}/boem.gov/boem_program_areas_2025-11.gpkg")
-pra_gpkg <- glue("{dir_derived}/ply_programareas_2026.gpkg")
+pra_gpkg <- glue("{dir_derived}/ply_programareas_2026{v_sfx}.gpkg")
 sr_pa_csv <- glue("{dir_derived}/subregion_planareas.csv") # apps: mapgl/app.R
 sr_pra_csv <- glue("{dir_derived}/subregion_programareas.csv") # apps: mapgl/app.R
 metrics_tif <- glue("{dir_derived}/r_metrics.tif")
-metrics_2026_tif <- glue("{dir_derived}/r_metrics_2026.tif")
-metrics_akl48_tif <- glue("{dir_derived}/r_metrics_akl48.tif")
+metrics_2026_tif <- glue("{dir_derived}/r_metrics_2026{v_sfx}.tif")
+metrics_akl48_tif <- glue("{dir_derived}/r_metrics_akl48{v_sfx}.tif")
 # zone_taxon_csv       <- glue("{dir_derived}/zone_taxon.csv")
-zone_taxon_csv <- glue("{dir_derived}/zone_taxon_2026.csv")
+zone_taxon_csv <- glue("{dir_derived}/zone_taxon_2026{v_sfx}.csv")
 # zone_taxon_akl48_csv <- glue("{dir_derived}/zone_taxon_akl48.csv")
 lyrs_csv <- glue("{dir_derived}/layers.csv")
-lyrs_2026_csv <- glue("{dir_derived}/layers_2026.csv")
+lyrs_2026_csv <- glue("{dir_derived}/layers_2026{v_sfx}.csv")
 # sdm_db               <- glue("{dir_derived}/sdm.duckdb")
 sdm_db <- glue("{dir_derived}/sdm_2026.duckdb") # TODO: version duckdb or datalake?
 cell_tif <- glue("{dir_derived}/r_bio-oracle_planarea.tif")
@@ -2660,7 +2664,7 @@ d <- d |>
 write_csv(d, zone_taxon_csv)
 # d <- read_csv(zone_taxon_csv)
 # tbl(con_sdm, "zone_taxon")
-dbWriteTable(con_sdm, "zone_taxon", d, overwrite = T)
+dbWriteTable(con_sdm, glue("zone_taxon{v_sfx}"), d, overwrite = T)
 ```
 
 
@@ -2731,6 +2735,41 @@ update_table_with_clear <- function(con, df, tbl, key_col = "planarea_key") {
 
 source(here("libs/db.R")) # con
 # dbListTables(con)
+
+# update zone.tbl to include version suffix ----
+zone_tbls <- tbl(con_sdm, "zone") |> distinct(tbl) |> pull(tbl)
+for (zt in zone_tbls) {
+  zt_v <- if (!grepl("_v\\d+$", zt)) paste0(zt, v_sfx) else zt
+  if (zt != zt_v) {
+    dbExecute(
+      con_sdm,
+      glue(
+        "UPDATE zone SET tbl = '{zt_v}' WHERE tbl = '{zt}'"
+      )
+    )
+    message(glue("zone.tbl: {zt} -> {zt_v}"))
+  }
+}
+```
+
+```{r}
+#| label: create_pg_v3_tables
+
+# create versioned PostGIS tables from existing tables ----
+pg_zone_tbls <- c(
+  "ply_planareas_2025",
+  "ply_ecoregions_2025",
+  "ply_programareas_2026"
+)
+for (pg_tbl in pg_zone_tbls) {
+  pg_tbl_v <- glue("{pg_tbl}{v_sfx}")
+  if (!dbExistsTable(con, pg_tbl_v)) {
+    dbExecute(con, glue("CREATE TABLE {pg_tbl_v} AS SELECT * FROM {pg_tbl}"))
+    message(glue("Created {pg_tbl_v} from {pg_tbl}"))
+  } else {
+    message(glue("{pg_tbl_v} already exists"))
+  }
+}
 ```
 
 ```{r}
@@ -2747,7 +2786,7 @@ dbExecute(
 ) # 0
 
 d_pa_metrics <- tbl(con_sdm, "zone") |>
-  filter(tbl == "ply_planareas_2025") |>
+  filter(tbl == glue("ply_planareas_2025{v_sfx}")) |>
   select(planarea_key = value, zone_seq) |>
   left_join(
     tbl(con_sdm, "zone_metric") |>
@@ -2784,7 +2823,7 @@ d_pa_metrics <- tbl(con_sdm, "zone") |>
 #   range() # |> signif(digits = 3)
 
 d_er_metrics <- tbl(con_sdm, "zone") |>
-  filter(tbl == "ply_ecoregions_2025") |>
+  filter(tbl == glue("ply_ecoregions_2025{v_sfx}")) |>
   select(ecoregion_key = value, zone_seq) |>
   left_join(
     tbl(con_sdm, "zone_metric") |>
@@ -2811,11 +2850,16 @@ d_er_metrics <- tbl(con_sdm, "zone") |>
   collect()
 
 # For complete refresh (clears existing values first)
-update_table_with_clear(con, d_pa_metrics, "ply_planareas_2025", "planarea_key")
+update_table_with_clear(
+  con,
+  d_pa_metrics,
+  glue("ply_planareas_2025{v_sfx}"),
+  "planarea_key"
+)
 update_table_with_clear(
   con,
   d_er_metrics,
-  "ply_ecoregions_2025",
+  glue("ply_ecoregions_2025{v_sfx}"),
   "ecoregion_key"
 )
 ```
@@ -2827,13 +2871,13 @@ update_table_with_clear(
 #| eval: false
 
 # check if table exists in PostGIS
-if (!dbExistsTable(con, "ply_programareas_2026")) {
-  stop("Run create_pg_ply_programareas_2026 R chunk above")
+if (!dbExistsTable(con, glue("ply_programareas_2026{v_sfx}"))) {
+  stop("Run create_pg_v3_tables R chunk above")
 }
 
 # get program area metrics from DuckDB
 d_pra_metrics <- tbl(con_sdm, "zone") |>
-  filter(tbl == "ply_programareas_2026") |>
+  filter(tbl == glue("ply_programareas_2026{v_sfx}")) |>
   select(programarea_key = value, zone_seq) |>
   left_join(
     tbl(con_sdm, "zone_metric") |>
@@ -2863,7 +2907,7 @@ message(glue("Loaded {nrow(d_pra_metrics)} program area metrics"))
 update_table_with_clear(
   con,
   d_pra_metrics,
-  "ply_programareas_2026",
+  glue("ply_programareas_2026{v_sfx}"),
   "programarea_key"
 )
 ```
@@ -2871,22 +2915,22 @@ update_table_with_clear(
 ```{r}
 #| label: pg_rm_old_metrics
 flds_pa_df <- names(d_pa_metrics)
-flds_pa_db <- dbListFields(con, "ply_planareas_2025")
+flds_pa_db <- dbListFields(con, glue("ply_planareas_2025{v_sfx}"))
 fdls_pa_rm <- setdiff(flds_pa_db, flds_pa_df) |>
   str_subset("(extrisk_)|(^na$)")
 
 flds_er_df <- names(d_er_metrics)
-flds_er_db <- dbListFields(con, "ply_ecoregions_2025")
+flds_er_db <- dbListFields(con, glue("ply_ecoregions_2025{v_sfx}"))
 fdls_er_rm <- setdiff(flds_er_db, flds_er_df) |>
   str_subset("(extrisk_)|(^na$)")
 
 d_rm <- bind_rows(
   tibble(
-    tbl = "ply_planareas_2025",
+    tbl = glue("ply_planareas_2025{v_sfx}"),
     fld = fdls_pa_rm
   ),
   tibble(
-    tbl = "ply_ecoregions_2025",
+    tbl = glue("ply_ecoregions_2025{v_sfx}"),
     fld = fdls_er_rm
   )
 )
@@ -2940,17 +2984,23 @@ per [Feature id | pg_tileserv](https://github.com/CrunchyData/pg_tileserv?tab=re
 # add auto-incrementing primary key planarea_id to postgres ply_planareas_2025 table
 dbExecute(
   con,
-  "ALTER TABLE public.ply_planareas_2025 ADD COLUMN IF NOT EXISTS planarea_id SERIAL PRIMARY KEY;"
+  glue(
+    "ALTER TABLE public.ply_planareas_2025{v_sfx} ADD COLUMN IF NOT EXISTS planarea_id SERIAL PRIMARY KEY;"
+  )
 )
 
 dbExecute(
   con,
-  "ALTER TABLE public.ply_programareas_2026 ALTER COLUMN programarea_id TYPE INTEGER;"
+  glue(
+    "ALTER TABLE public.ply_programareas_2026{v_sfx} ALTER COLUMN programarea_id TYPE INTEGER;"
+  )
 )
 
 dbExecute(
   con,
-  "ALTER TABLE public.ply_ecoregions_2025 ADD COLUMN  IF NOT EXISTS ecoregion_id SERIAL PRIMARY KEY;"
+  glue(
+    "ALTER TABLE public.ply_ecoregions_2025{v_sfx} ADD COLUMN IF NOT EXISTS ecoregion_id SERIAL PRIMARY KEY;"
+  )
 )
 ```
 
@@ -2992,21 +3042,21 @@ if (redo_dl) {
 # * pa_gpkg ----
 if (!file.exists(pa_gpkg)) {
   message("Generating Planning Areas geopackage...")
-  st_read(con, "ply_planareas_2025") |>
+  st_read(con, glue("ply_planareas_2025{v_sfx}")) |>
     st_write(pa_gpkg, delete_dsn = T, quiet = T)
 }
 
 # * pra_gpkg ----
 if (!file.exists(pra_gpkg)) {
   message("Generating Program Areas geopackage...")
-  st_read(con, "ply_programareas_2026") |>
+  st_read(con, glue("ply_programareas_2026{v_sfx}")) |>
     st_write(pra_gpkg, delete_dsn = T, quiet = T)
 }
 
 # * er_gpkg ----
 if (!file.exists(er_gpkg)) {
   message("Generating Ecoregion geopackage...")
-  st_read(con, "ply_ecoregions_2025") |>
+  st_read(con, glue("ply_ecoregions_2025{v_sfx}")) |>
     st_write(er_gpkg, delete_dsn = T, quiet = T)
 }
 
