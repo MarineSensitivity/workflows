@@ -1,0 +1,271 @@
+---
+title: "Update Scores"
+subtitle: "Remap model_cell values, listing join, re-export taxon CSV"
+format:
+  html:
+    code-fold: true
+    code-tools: true
+editor_options:
+  chunk_output_type: console
+---
+
+## Overview
+
+Focused update notebook to:
+
+1. Remap old model_cell values (70/90 for ch, 50/70/90 for rng) to the new `er_score` scale
+2. Recompute merged model cells for affected taxa
+3. Run the listing join to populate `extrisk_code`/`er_score` on the `taxon` table
+4. Re-export `data/taxon.csv`
+
+After running this notebook, re-run `calc_scores.qmd` interactively starting from
+chunk `delete_extrisk_metrics` (line 472) to recalculate downstream scoring metrics.
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+
+librarian::shelf(
+  DBI, dplyr, duckdb, glue, here, readr, stringr, tibble, quiet = T)
+options(readr.show_col_types = F)
+
+# set up paths
+is_server <- Sys.info()[["sysname"]] == "Linux"
+dir_data  <- ifelse(
+  is_server,
+  "/share/data",
+  "~/My Drive/projects/msens/data")
+sdm_db <- glue("{dir_data}/derived/sdm_2026.duckdb")
+
+con_sdm <- dbConnect(duckdb(), sdm_db)
+```
+
+## Step 1: Remap ch/rng model_cell values to er_score scale
+
+Remap old ad-hoc values to match the `compute_er_score()` scale: EN=100, TN=50, LC=1.
+
+```{r}
+#| label: remap_model_cell_values
+
+# check current values before remapping
+d_before <- dbGetQuery(con_sdm, "
+  SELECT m.ds_key, mc.value, count(*) AS n
+  FROM model_cell mc
+  JOIN model m ON mc.mdl_seq = m.mdl_seq
+  WHERE m.ds_key IN ('ch_nmfs', 'ch_fws', 'rng_fws')
+  GROUP BY m.ds_key, mc.value
+  ORDER BY m.ds_key, mc.value")
+message("before remapping:")
+print(d_before)
+
+# remap: 90->100 (EN), 70->50 (TN), 50->1 (LC, rng_fws only)
+n_updated <- dbExecute(con_sdm, "
+  UPDATE model_cell SET value = CASE value
+    WHEN 90 THEN 100
+    WHEN 70 THEN 50
+    WHEN 50 THEN 1
+  END
+  WHERE mdl_seq IN (
+    SELECT mdl_seq FROM model
+    WHERE ds_key IN ('ch_nmfs', 'ch_fws', 'rng_fws')
+  )")
+message(glue("remapped {n_updated} model_cell rows"))
+
+# verify
+d_after <- dbGetQuery(con_sdm, "
+  SELECT m.ds_key, mc.value, count(*) AS n
+  FROM model_cell mc
+  JOIN model m ON mc.mdl_seq = m.mdl_seq
+  WHERE m.ds_key IN ('ch_nmfs', 'ch_fws', 'rng_fws')
+  GROUP BY m.ds_key, mc.value
+  ORDER BY m.ds_key, mc.value")
+message("after remapping:")
+print(d_after)
+stopifnot(all(d_after$value %in% c(1, 50, 100)))
+```
+
+## Step 2: Recompute merged model cells for affected taxa
+
+For taxa with merged models (n_ds > 1) that include ch/rng data, recompute cell
+values as `max(all source values)` since the source ch/rng values changed.
+
+```{r}
+#| label: recompute_merged_models
+
+# count affected taxa
+d_affected <- dbGetQuery(con_sdm, "
+  SELECT count(DISTINCT t.taxon_id) AS n_taxa
+  FROM taxon t
+  WHERE t.mdl_seq IS NOT NULL
+    AND t.n_ds > 1
+    AND t.taxon_id IN (
+      SELECT DISTINCT taxon_id FROM taxon_model
+      WHERE ds_key IN ('ch_nmfs', 'ch_fws', 'rng_fws')
+    )")
+message(glue("recomputing merged models for {d_affected$n_taxa} taxa"))
+
+n_updated <- dbExecute(con_sdm, "
+  UPDATE model_cell mc SET value = src.max_val
+  FROM (
+    SELECT t.mdl_seq AS merged_seq, all_src.cell_id,
+           MAX(all_src.value) AS max_val
+    FROM taxon t
+    JOIN taxon_model tm ON t.taxon_id = tm.taxon_id
+    JOIN model_cell all_src ON tm.mdl_seq = all_src.mdl_seq
+    WHERE t.mdl_seq IS NOT NULL
+      AND t.n_ds > 1
+      AND t.taxon_id IN (
+        SELECT DISTINCT taxon_id FROM taxon_model
+        WHERE ds_key IN ('ch_nmfs', 'ch_fws', 'rng_fws')
+      )
+    GROUP BY t.mdl_seq, all_src.cell_id
+  ) AS src
+  WHERE mc.mdl_seq = src.merged_seq
+    AND mc.cell_id = src.cell_id")
+message(glue("updated {n_updated} merged model_cell rows"))
+```
+
+## Step 3: Listing join
+
+Populate `extrisk_code`, `er_score`, `is_mmpa`, `is_mbta`, `is_bcc` on the `taxon` table
+from the `listing` table. Includes a secondary join by `botw_id` for BOTW-only birds.
+
+```{r}
+#| label: listing_join
+
+# add columns if not exist
+for (col_sql in c(
+  "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS extrisk_code VARCHAR",
+  "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS er_score INTEGER",
+  "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS is_mmpa BOOLEAN DEFAULT FALSE",
+  "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS is_mbta BOOLEAN DEFAULT FALSE",
+  "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS is_bcc  BOOLEAN DEFAULT FALSE")) {
+  dbExecute(con_sdm, col_sql)
+}
+
+# clear any existing values so we start fresh
+dbExecute(con_sdm, "
+  UPDATE taxon SET
+    extrisk_code = NULL, er_score = NULL,
+    is_mmpa = FALSE, is_mbta = FALSE, is_bcc = FALSE")
+
+# primary: join by worms_id (covers non-birds + birds with worms mapping)
+n_worms <- dbExecute(con_sdm, "
+  UPDATE taxon SET
+    extrisk_code = l.extrisk_code,
+    er_score     = l.er_score,
+    is_mmpa      = l.is_mmpa,
+    is_mbta      = l.is_mbta,
+    is_bcc       = l.is_bcc
+  FROM listing l
+  WHERE taxon.worms_id = l.worms_id")
+message(glue("listing join by worms_id: {n_worms} taxa matched"))
+
+# secondary: join by botw_id for BOTW-only birds not matched above
+n_botw <- dbExecute(con_sdm, "
+  UPDATE taxon SET
+    extrisk_code = l.extrisk_code,
+    er_score     = l.er_score,
+    is_mmpa      = l.is_mmpa,
+    is_mbta      = l.is_mbta,
+    is_bcc       = l.is_bcc
+  FROM listing l
+  WHERE taxon.taxon_authority = 'botw'
+    AND taxon.taxon_id = l.botw_id
+    AND taxon.extrisk_code IS NULL")
+message(glue("listing join by botw_id: {n_botw} taxa matched"))
+
+# IUCN fallback for unmatched taxa
+n_iucn <- dbExecute(con_sdm, "
+  UPDATE taxon SET
+    extrisk_code = 'IUCN:' || redlist_code,
+    er_score     = CASE redlist_code
+      WHEN 'CR' THEN 50
+      WHEN 'EN' THEN 25
+      WHEN 'VU' THEN 5
+      WHEN 'NT' THEN 2
+      ELSE 1 END
+  WHERE extrisk_code IS NULL AND redlist_code IS NOT NULL")
+message(glue("IUCN fallback: {n_iucn} taxa"))
+
+# default for taxa with no listing and no redlist_code
+n_default <- dbExecute(con_sdm, "
+  UPDATE taxon SET er_score = 1
+  WHERE er_score IS NULL")
+message(glue("default er_score=1: {n_default} taxa"))
+
+# verify no nulls remain
+n_null <- dbGetQuery(con_sdm,
+  "SELECT count(*) AS n FROM taxon WHERE er_score IS NULL")$n
+stopifnot(n_null == 0)
+
+# summary by authority
+tbl(con_sdm, "taxon") |>
+  mutate(
+    authority = CASE_WHEN(
+      str_starts(extrisk_code, "NMFS") ~ "NMFS",
+      str_starts(extrisk_code, "FWS")  ~ "FWS",
+      str_starts(extrisk_code, "IUCN") ~ "IUCN",
+      TRUE                             ~ "none")) |>
+  count(authority) |>
+  collect() |>
+  print()
+
+# summary by taxon_authority
+tbl(con_sdm, "taxon") |>
+  filter(!is.na(extrisk_code)) |>
+  count(taxon_authority) |>
+  collect() |>
+  print()
+```
+
+## Step 4: Re-export taxon summary CSV
+
+```{r}
+#| label: taxon_summary
+
+taxon_csv <- here("data/taxon.csv")
+
+d_taxon <- tbl(con_sdm, "taxon") |>
+  select(
+    is_ok,
+    component     = sp_cat,
+    common_name,
+    scientific_name,
+    redlist_code_max = redlist_code,
+    extrisk_code,
+    er_score,
+    is_mmpa,
+    is_mbta,
+    is_bcc,
+    worms_is_marine,
+    worms_is_extinct,
+    n_datasets    = n_ds,
+    taxon_authority,
+    taxon_id,
+    model_id      = mdl_seq) |>
+  arrange(desc(is_ok), component, common_name) |>
+  collect()
+
+write_csv(d_taxon, taxon_csv)
+message(glue("wrote {nrow(d_taxon)} rows to {taxon_csv}"))
+```
+
+## Cleanup
+
+```{r}
+#| label: cleanup
+
+dbDisconnect(con_sdm, shutdown = TRUE)
+```
+
+## Next steps
+
+Re-run `calc_scores.qmd` interactively in Positron starting from chunk
+`delete_extrisk_metrics` (line 472):
+
+1. `delete_extrisk_metrics` -- clear old metrics
+2. `calc_cell_metric_redlist` -- recompute cell-level extinction risk
+3. `calc_ecoregion_minmax` through `cell_metric_score` -- rescale and aggregate
+4. `zone_taxon` -- per-zone species sensitivity with updated er_score

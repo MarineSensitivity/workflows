@@ -1,3 +1,331 @@
+## 2026-02-10.b + 
+
+Create a new notebook ingest_nmfs_core-areas.qmd to add a dataset “NMFS Core Areas” (ca_nmfs) in sdm_2026.duckdb. Burn in a new model and model_cell values for Rice’s whale (_Balaenoptera ricei; worms_id:1576133) into the database. Apply the highest weighting of “NMFS:EN” (100). The spatial footprint is found here:
+
+'/Users/bbest/Library/CloudStorage/GoogleDrive-ben@ecoquants.com/My Drive/projects/msens/data/raw/fisheries.noaa.gov/core-areas/shapefile_Rices_whale_core_distribution_area_Jun19_SERO/shapefile_Rices_whale_core_distribution_area_Jun19_SERO.shp'
+
+But this is also the same shape as the IUCN range map (mdl_seq:19014), so you can more easily copy those rows and apply the 100 value.This new dataset needs to be added to the model_merge and calculate scores listing.
+
+⏺ Updated plan                                                                                                     
+  ⎿  /plan to preview
+                                                                                                                   
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Ready to code?                                                                                                    
+                                                                                                                   
+ Here is Claude's plan:                                                                                            
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Plan: Ingest NMFS Core Areas (ca_nmfs) for Rice's Whale                  
+
+ Context
+
+ Rice's whale (Balaenoptera ricei; worms_id: 1576133) has a designated NMFS Core Distribution Area that matches
+ its IUCN range map footprint. This core area needs to be ingested as a new dataset (ca_nmfs) in sdm_2026.duckdb
+ with maximum weighting (value=100), and integrated into the model merge and scoring pipeline so it contributes to
+  sensitivity calculations.
+
+ The IUCN range map already exists at mdl_seq:19014, so we can copy those cell_ids rather than rasterizing the
+ shapefile from scratch.
+
+ ---
+ Files to Create
+
+ 1. ingest_nmfs_core-areas.qmd (new)
+
+ Follow the pattern from ingest_fisheries.noaa.gov_critical-habitat.qmd. Sections:
+
+ Setup chunk:
+ librarian::shelf(
+   DBI, dplyr, duckdb, glue, here, sf, terra,
+   quiet = T)
+
+ ds_key   <- "ca_nmfs"
+ is_server <- Sys.info()[["sysname"]] == "Linux"
+ dir_data  <- ifelse(is_server, "/share/data", "~/My Drive/projects/msens/data")
+ sdm_db    <- glue("{dir_data}/derived/sdm_2026.duckdb")
+ cell_tif  <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
+
+ con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F))
+
+ Insert dataset row (ds_key = "ca_nmfs"):
+ - name_short: "NMFS Core Areas, 2019"
+ - source_broad: "NMFS"
+ - source_detail: "https://www.fisheries.noaa.gov"
+ - response_type: "binary"
+ - taxa_groups: "cetaceans"
+ - spatial_res_deg: 0.05
+ - temporal_res: "static"
+ - Reference the shapefile source in link_download
+
+ Delete existing ca_nmfs data (idempotent re-runs):
+ - Delete from model_cell, model, species WHERE ds_key = 'ca_nmfs'
+
+ Copy model_cell from IUCN range map (mdl_seq: 19014):
+ - Query: SELECT cell_id FROM model_cell WHERE mdl_seq = 19014
+ - Insert model row for Rice's whale: taxa = "ca_nmfs:Balaenoptera ricei", mdl_type = "binary"
+ - Insert species row: worms_id = 1576133, redlist_code = "EN", sp_cat = "mammal"
+ - Insert model_cell rows: same cell_ids, value = 100 (highest weighting)
+
+ Optional visualization: Show the core area on a leaflet map (read the shapefile for visual confirmation, but use
+ the IUCN cells for the data).
+
+ ---
+ Files to Modify
+
+ 2. merge_models.qmd
+
+ Two changes needed:
+
+ Line 1754 — Add "ca_nmfs" to ds_cols so it's included in the taxon_model junction table:
+ # before:
+ ds_cols <- c("am_0.05", "ch_nmfs", "ch_fws", "rng_fws", "bl")
+ # after:
+ ds_cols <- c("am_0.05", "ca_nmfs", "ch_nmfs", "ch_fws", "rng_fws", "bl")
+
+ Line 3072 — Add "ca_nmfs" to ds_keys_mask so core areas contribute to the IUCN range mask:
+ # before:
+ ds_keys_mask <- c("rng_iucn", "ch_fws", "ch_nmfs", "rng_fws", "bl")
+ # after:
+ ds_keys_mask <- c("rng_iucn", "ca_nmfs", "ch_fws", "ch_nmfs", "rng_fws", "bl")
+
+ No changes to calc_scores.qmd are needed — it already uses er_score from the taxon table (which is 100 for
+ NMFS:EN via ingest_nmfs-fws-listings.qmd) multiplied by the merged model_cell.value. Adding ca_nmfs to the merge
+ ensures it flows through to scoring automatically.
+
+ ---
+ How It Flows Through the Pipeline
+
+ 1. ingest_nmfs_core-areas.qmd → writes dataset, model, species, model_cell rows for ca_nmfs with value=100
+ 2. merge_models.qmd → picks up ca_nmfs in pivot_wider (creates ca_nmfs column in taxon), adds to taxon_model
+ junction, includes in ds_keys_mask for range masking, and takes MAX value (100) when merging with other models
+ for Rice's whale
+ 3. calc_scores.qmd → uses merged model value (boosted by 100 from core area) × er_score (100 for NMFS:EN) =
+ maximum sensitivity contribution
+
+ ---
+ Verification
+
+ After running the notebook:
+ # verify dataset row
+ tbl(con_sdm, "dataset") |> filter(ds_key == "ca_nmfs") |> collect()
+
+ # verify model row
+ tbl(con_sdm, "model") |> filter(ds_key == "ca_nmfs") |> collect()
+
+ # verify species row
+ tbl(con_sdm, "species") |> filter(ds_key == "ca_nmfs") |> collect()
+
+ # verify model_cell count matches IUCN range
+ n_ca   <- tbl(con_sdm, "model_cell") |> filter(mdl_seq == NEW_MDL_SEQ) |> count() |> pull(n)
+ n_iucn <- tbl(con_sdm, "model_cell") |> filter(mdl_seq == 19014)       |> count() |> pull(n)
+ stopifnot(n_ca == n_iucn)
+
+ # verify all values are 100
+ tbl(con_sdm, "model_cell") |> filter(mdl_seq == NEW_MDL_SEQ) |>
+   summarize(v_min = min(value), v_max = max(value)) |> collect()
+ # should show v_min = 100, v_max = 100
+
+Use:
+
+- source_detail = "https://www.fisheries.noaa.gov/resource/map/rices-whale-core-distribution-area-map-gis-data",
+- link_download = "https://www.fisheries.noaa.gov/s3/2021-09/shapefile_Rices_whale_core_distribution_area_Jun19_SERO.zip" 
+
+
+## 2026-02-10 merge_models, calc_scores deep think
+
+Think deeply in evaluating next steps to update species with merge_models.qmd and calc_scores.qmd. Do I want 
+   to run all chunks in these files or should we split these out a bit to better organize updating steps. We   
+  also want to update scores for distributions ingested for NMFS (ie fisheries.noaa.gov) and FWS.gov           
+  critical-habitat and range-maps. We applied an old scoring to those distributions of 70L and "TN" ~ 70L,     
+  "EN" ~ 90L. Rather than re-running these workflows, it would be better to have a quick fix converting old to 
+   new with a query updating the model_cell values in the sdm_2026.duckdb. For now we're conflating extinction 
+   risk with distribution cell values in addition to an overall species weight. In future hopefully we'll      
+  disentangle suitability..                                                            
+
+⏺ Updated plan
+  ⎿  /plan to preview
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Ready to code?
+
+ Here is Claude's plan:
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Update scores: model_cell values, listing join, recalculate metrics
+
+ Context
+
+ After fixing botw_id propagation and converting er_score to integer [0,100], we need to:
+ 1. Remap old model_cell values (70/90 for ch, 50/70/90 for rng) to the new er_score scale
+ 2. Run the listing join to populate extrisk_code/er_score on the taxon table (not yet run)
+ 3. Recalculate downstream scoring metrics
+
+ Rather than re-running merge_models.qmd (49 chunks, 3620 lines) or calc_scores.qmd end-to-end, create a focused
+ update_scores.qmd for the SQL updates + targeted recalculation.
+
+ Note: For now, extinction risk stays conflated in both model_cell values AND the per-species er_score weight — a
+ deliberate choice to disentangle suitability from risk in a future iteration.
+
+ ---
+ Current state (sdm_2026.duckdb)
+
+ - taxon: 17,561 rows (16,947 worms + 614 botw). Has worms_id column. Does NOT yet have extrisk_code or er_score.
+ - listing: 718 rows with spp_id, worms_id, botw_id, extrisk_code, er_score (integer [0,100])
+ - model_cell values (old → new mapping):
+   - ch_nmfs: 70→50 (TN), 90→100 (EN)
+   - ch_fws: 70→50 (TN), 90→100 (EN)
+   - rng_fws: 50→1 (LC), 70→50 (TN), 90→100 (EN)
+ - Merged models (ms_merge): max(value) across datasets per cell — must be recomputed for affected taxa
+
+ ---
+ Step 1: Remap ch/rng model_cell values to er_score scale
+
+ Remap old ad-hoc values to match the compute_er_score() scale: EN=100, TN=50, LC=1.
+
+ UPDATE model_cell SET value = CASE value
+   WHEN 90 THEN 100   -- EN
+   WHEN 70 THEN 50    -- TN
+   WHEN 50 THEN 1     -- LC (rng_fws only)
+ END
+ WHERE mdl_seq IN (
+   SELECT mdl_seq FROM model
+   WHERE ds_key IN ('ch_nmfs', 'ch_fws', 'rng_fws')
+ )
+
+ Step 2: Recompute merged model cells for affected taxa
+
+ For taxa with merged models (n_ds > 1) that include ch/rng data, recompute cell values as max(all source values)
+ since the source ch/rng values changed. This avoids re-running the expensive raster merge loop (~169 affected
+ species).
+
+ UPDATE model_cell mc SET value = src.max_val
+ FROM (
+   SELECT t.mdl_seq AS merged_seq, all_src.cell_id,
+          MAX(all_src.value) AS max_val
+   FROM taxon t
+   JOIN taxon_model tm ON t.taxon_id = tm.taxon_id
+   JOIN model_cell all_src ON tm.mdl_seq = all_src.mdl_seq
+   WHERE t.mdl_seq IS NOT NULL
+   AND t.n_ds > 1
+   AND t.taxon_id IN (
+     SELECT DISTINCT taxon_id FROM taxon_model
+     WHERE ds_key IN ('ch_nmfs', 'ch_fws', 'rng_fws')
+   )
+   GROUP BY t.mdl_seq, all_src.cell_id
+ ) AS src
+ WHERE mc.mdl_seq = src.merged_seq
+ AND mc.cell_id = src.cell_id
+
+ Step 3: Listing join (with botw_id support)
+
+ Adapted from merge_models.qmd chunk taxon_listing_join (line 1894). Key addition: a second UPDATE for BOTW-only
+ birds (209 birds in taxon have no worms_id, only botw_id via taxon_id).
+
+ -- add columns if not exist
+ ALTER TABLE taxon ADD COLUMN IF NOT EXISTS extrisk_code VARCHAR;
+ ALTER TABLE taxon ADD COLUMN IF NOT EXISTS er_score INTEGER;
+ ALTER TABLE taxon ADD COLUMN IF NOT EXISTS is_mmpa BOOLEAN DEFAULT FALSE;
+ ALTER TABLE taxon ADD COLUMN IF NOT EXISTS is_mbta BOOLEAN DEFAULT FALSE;
+ ALTER TABLE taxon ADD COLUMN IF NOT EXISTS is_bcc  BOOLEAN DEFAULT FALSE;
+
+ -- primary: join by worms_id (covers non-birds + birds with worms mapping)
+ UPDATE taxon SET
+   extrisk_code = l.extrisk_code, er_score = l.er_score,
+   is_mmpa = l.is_mmpa, is_mbta = l.is_mbta, is_bcc = l.is_bcc
+ FROM listing l
+ WHERE taxon.worms_id = l.worms_id;
+
+ -- secondary: join by botw_id for BOTW-only birds not matched above
+ UPDATE taxon SET
+   extrisk_code = l.extrisk_code, er_score = l.er_score,
+   is_mmpa = l.is_mmpa, is_mbta = l.is_mbta, is_bcc = l.is_bcc
+ FROM listing l
+ WHERE taxon.taxon_authority = 'botw'
+   AND taxon.taxon_id = l.botw_id
+   AND taxon.extrisk_code IS NULL;
+
+ -- IUCN fallback for unmatched taxa
+ UPDATE taxon SET
+   extrisk_code = 'IUCN:' || redlist_code,
+   er_score     = CASE redlist_code
+     WHEN 'CR' THEN 50  WHEN 'EN' THEN 25
+     WHEN 'VU' THEN 5   WHEN 'NT' THEN 2  ELSE 1 END
+ WHERE extrisk_code IS NULL AND redlist_code IS NOT NULL;
+
+ -- default for taxa with no listing and no redlist_code
+ UPDATE taxon SET er_score = 1 WHERE er_score IS NULL;
+
+ Step 4: Re-export taxon summary CSV
+
+ Reproduce merge_models.qmd chunk taxon_summary (line 3501) to write updated data/taxon.csv with new extrisk_code,
+  er_score, is_mmpa, is_mbta, is_bcc columns.
+
+ Step 5: Recalculate scoring metrics
+
+ Re-run calc_scores.qmd interactively in Positron starting from chunk delete_extrisk_metrics (line 472). This
+ avoids duplicating complex scoring logic (ecoregion normalization, rescaling, zone aggregation). The key chunks
+ to run sequentially:
+
+ 1. delete_extrisk_metrics — clear old metrics
+ 2. calc_cell_metric_redlist — recompute cell-level extinction risk
+ 3. calc_ecoregion_minmax through cell_metric_score — rescale and aggregate
+ 4. zone_taxon — per-zone species sensitivity with updated er_score
+
+ Also update: merge_models.qmd listing join
+
+ Edit chunk taxon_listing_join (~line 1907) to add the botw_id secondary join, so future full re-runs also handle
+ BOTW-only birds correctly.
+
+ ---
+ Files to create/modify
+ ┌───────────────────┬─────────────────────────────────────────────────────────────────────────────────────┐
+ │       File        │                                       Action                                        │
+ ├───────────────────┼─────────────────────────────────────────────────────────────────────────────────────┤
+ │ update_scores.qmd │ CREATE — focused update notebook (Steps 1-4)                                        │
+ ├───────────────────┼─────────────────────────────────────────────────────────────────────────────────────┤
+ │ merge_models.qmd  │ EDIT chunk taxon_listing_join (~line 1907) — add botw_id secondary join             │
+ ├───────────────────┼─────────────────────────────────────────────────────────────────────────────────────┤
+ │ calc_scores.qmd   │ No code changes needed (already updated for integer er_score); re-run interactively │
+ └───────────────────┴─────────────────────────────────────────────────────────────────────────────────────┘
+ Verification
+
+ 1. After Step 1: SELECT ds_key, value, count(*) FROM model_cell mc JOIN model m ON mc.mdl_seq = m.mdl_seq WHERE
+ m.ds_key IN ('ch_nmfs','ch_fws','rng_fws') GROUP BY ds_key, value → values are 1, 50, or 100
+ 2. After Step 3: SELECT taxon_authority, count(*) FROM taxon WHERE extrisk_code IS NOT NULL GROUP BY
+ taxon_authority → both worms and botw represented
+ 3. After Step 3: SELECT count(*) FROM taxon WHERE er_score IS NULL → 0
+ 4. After Step 5: scoring metrics reflect new values, no errors in calc_scores render
+
+⏺ Everything looks good. Here's a summary of what was done:                                                        
+                                                                                                                   
+  Changes made                                                                                                     
+                                                                                                                   
+  1. Created update_scores.qmd (new file)                                                            
+                                                                                                                   
+  Focused update notebook with 4 steps:                                                                            
+  - Step 1 (remap_model_cell_values): Remaps ch/rng model_cell values from old scale (50/70/90) to er_score scale
+  (1/50/100), with before/after verification
+  - Step 2 (recompute_merged_models): Recomputes merged model cells for ~169 affected taxa with n_ds > 1 that
+  include ch/rng data
+  - Step 3 (listing_join): Populates extrisk_code/er_score/is_mmpa/is_mbta/is_bcc on the taxon table via:
+    - Primary join by worms_id
+    - Secondary join by botw_id for BOTW-only birds
+    - IUCN fallback for unmatched taxa
+    - Default er_score=1 for remaining
+  - Step 4 (taxon_summary): Re-exports data/taxon.csv with updated columns
+
+  2. Edited merge_models.qmd (lines ~1919-1940)
+
+  Added the botw_id secondary join to the taxon_listing_join chunk so future full re-runs also handle BOTW-only
+  birds correctly. The new code:
+  - Joins by botw_id for taxa where taxon_authority = 'botw' and extrisk_code IS NULL
+  - Reports counts for both worms_id and botw_id matches
+
+  Next steps
+
+  After running update_scores.qmd, re-run calc_scores.qmd interactively from chunk delete_extrisk_metrics (line
+  472) through zone_taxon to recalculate downstream scoring metrics.
+
+
+
 ## 2026-02-05 run big update
 
 
