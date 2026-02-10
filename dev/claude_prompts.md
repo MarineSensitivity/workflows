@@ -150,6 +150,185 @@ And a @workflows/render_derived_products.qmd with detailed instructions.
 
 We also need planarea_flower-plot_scores.png|pdf, table_planarea_scores.docx|xlsx, subregion_planareas.csv, table_ecoregion_planarea_scores.docx, table_planarea_scores.xlsx, tbl_er_pa_scores.csv, map_cell_score_l48.png, map_cell_score_ak.png, map_cell_npp_l48.png, map_cell_npp_ak.png, map_pa_l48.png, map_pa_ak.png -- but for Program Areas, not Planning Areas. Also try matching up products in the subfolder @'~/My Drive/projects/msens/data/derived/downloads/figures' -- we definitely need the latest greatest flower plots for Program Areas.
 
+⏺ Updated plan                                          
+  ⎿  /plan to preview                                   
+                                    
+ Here is Claude's 
+ 
+ Plan: Regenerate Derived Products for Program Areas
+                                                        
+ Context
+
+ After ingesting updated NMFS/FWS listings and the Rice's whale "ca_nmfs" model, merge_models.qmd and calc_scores.qmd have been run —
+  sdm_2026.duckdb now has updated scores. The derived export files and summary products need regeneration, focused on Program Areas
+ (not Planning Areas). We also need to archive existing products and create documentation for the regeneration pipeline.
+
+ Deliverables
+
+ 1. workflows/data/derived_products.csv — lookup table
+
+ CSV with columns: output_file, output_dir, source_qmd, source_chunk, chunk_line, dependencies, description
+
+ Maps every derived file to its generating workflow/chunk, including:
+ - All calc_scores.qmd exports (gpkg, csv, tif, geojson, parquet)
+ - All msens-summary_programareas.qmd outputs (maps, flower plots, tables)
+ - Products copied to downloads/
+
+ 2. workflows/render_derived_products.qmd — regeneration guide
+
+ A Quarto notebook with:
+ - Step-by-step instructions for regenerating all derived products
+ - Ordered chunk execution list for calc_scores.qmd
+ - Archiving old files before overwriting
+ - Copying files to downloads/
+ - Reference to derived_products.csv for the full inventory
+
+ 3. Bug fixes in workflows/calc_scores.qmd (3 edits)
+
+ Fix 1 (line 2386): redo_dl deletion loop is incomplete — add pra_gpkg, lyrs_2026_csv, metrics_2026_tif, metrics_akl48_tif
+
+ `# before:
+ for (f in c(pa_gpkg, er_gpkg, lyrs_csv, metrics_tif)){
+ `# after:
+ for (f in c(pa_gpkg, pra_gpkg, er_gpkg, lyrs_csv, lyrs_2026_csv,
+             metrics_tif, metrics_2026_tif, metrics_akl48_tif)){
+
+ Fix 2 (lines 2517-2527): metrics_akl48_tif reads old raster and uses planarea_key — switch to metrics_2026_tif and programarea_key
+
+ `# before:
+   pa_sr <- read_csv(sr_pa_csv) |>
+     filter(subregion_key == !!sr) |>
+     select(subregion_key, planarea_key)
+   r_metrics <- rast(metrics_tif)
+   r_pa <- subset(r_metrics, "planarea_key")
+   levels(r_pa) <- levels(r_pa)[[1]] |>
+     left_join(pa_sr, by = join_by(planarea_key)) |>
+     select(value, subregion_key)
+ `# after:
+   pra_sr <- read_csv(sr_pra_csv) |>
+     filter(subregion_key == !!sr) |>
+     select(subregion_key, programarea_key)
+   r_metrics <- rast(metrics_2026_tif)
+   r_pa <- subset(r_metrics, "programarea_key")
+   levels(r_pa) <- levels(r_pa)[[1]] |>
+     left_join(pra_sr, by = join_by(programarea_key)) |>
+     select(value, subregion_key)
+
+ Fix 3 (line 2695): export_parquet hard-codes old DB
+
+ `# before:
+ sdm_db <- glue("{dir_data}/derived/sdm.duckdb")
+ `# after:
+ sdm_db <- glue("{dir_data}/derived/sdm_2026.duckdb")
+
+ 4. New workflows/msens-summary_programareas.qmd — Program Area summaries
+
+ A new Quarto notebook adapted from msens-summary_env-national-ocs.qmd, producing Program Area versions of all summary products:
+
+ Setup changes (vs original):
+ - sdm_dd → sdm_2026.duckdb
+ - metrics_tif → r_metrics_2026.tif
+ - pra_gpkg → ply_programareas_2026.gpkg
+ - dir_figs → figs/msens-summary_programareas
+ - Zone table: ply_programareas_2026 instead of ply_planareas_2025
+ - Zone field: programarea_key instead of planarea_key
+
+ Outputs (all using programarea naming):
+ ┌─────────────────────────────────────────┬──────────┬──────────────────────────┬───────────────────────────────────────────────┐
+ │               Output File               │   Dir    │       Source Chunk       │                     Notes                     │
+ ├─────────────────────────────────────────┼──────────┼──────────────────────────┼───────────────────────────────────────────────┤
+ │ map_pra_l48.png                         │ figs/    │ map_imgs_pra_ply_l48_ak  │ mapgl vector tiles from ply_programareas_2026 │
+ ├─────────────────────────────────────────┼──────────┼──────────────────────────┼───────────────────────────────────────────────┤
+ │ map_pra_ak.png                          │ figs/    │ map_imgs_pra_ply_l48_ak  │ mapgl vector tiles from ply_programareas_2026 │
+ ├─────────────────────────────────────────┼──────────┼──────────────────────────┼───────────────────────────────────────────────┤
+ │ map_cell_score_l48.png                  │ figs/    │ map_imgs_cell_l48_ak     │ cell-level from r_metrics_2026.tif            │
+ ├─────────────────────────────────────────┼──────────┼──────────────────────────┼───────────────────────────────────────────────┤
+ │ map_cell_score_ak.png                   │ figs/    │ map_imgs_cell_l48_ak     │ cell-level from r_metrics_2026.tif            │
+ ├─────────────────────────────────────────┼──────────┼──────────────────────────┼───────────────────────────────────────────────┤
+ │ map_cell_npp_l48.png                    │ figs/    │ map_imgs_cell_l48_ak     │ cell-level NPP                                │
+ ├─────────────────────────────────────────┼──────────┼──────────────────────────┼───────────────────────────────────────────────┤
+ │ map_cell_npp_ak.png                     │ figs/    │ map_imgs_cell_l48_ak     │ cell-level NPP                                │
+ ├─────────────────────────────────────────┼──────────┼──────────────────────────┼───────────────────────────────────────────────┤
+ │ programarea_flower-plot_scores.png|pdf  │ figs/    │ plot_programarea_flowers │ all 20 PRAs, 5 themes                         │
+ ├─────────────────────────────────────────┼──────────┼──────────────────────────┼───────────────────────────────────────────────┤
+ │ ecoregion_flower-plot_scores.png|pdf    │ figs/    │ plot_ecoregion_flowers   │ ecoregion flowers (updated data)              │
+ ├─────────────────────────────────────────┼──────────┼──────────────────────────┼───────────────────────────────────────────────┤
+ │ programarea_primprod.png|pdf            │ figs/    │ plot_primprod            │ NPP bar chart for PRAs                        │
+ ├─────────────────────────────────────────┼──────────┼──────────────────────────┼───────────────────────────────────────────────┤
+ │ table_ecoregion_programarea_scores.docx │ figs/    │ flextable_er_pra         │ hierarchical table                            │
+ ├─────────────────────────────────────────┼──────────┼──────────────────────────┼───────────────────────────────────────────────┤
+ │ table_programarea_scores.docx|xlsx      │ figs/    │ flextable_pra            │ PRA-only table                                │
+ ├─────────────────────────────────────────┼──────────┼──────────────────────────┼───────────────────────────────────────────────┤
+ │ tbl_er_pra_scores.csv                   │ derived/ │ pra_score_table          │ ecoregion + PRA scores                        │
+ ├─────────────────────────────────────────┼──────────┼──────────────────────────┼───────────────────────────────────────────────┤
+ │ tbl_pra_scores.csv                      │ derived/ │ flextable_pra            │ PRA scores                                    │
+ ├─────────────────────────────────────────┼──────────┼──────────────────────────┼───────────────────────────────────────────────┤
+ │ subregion_programareas.csv              │ derived/ │ already exists           │ from calc_scores.qmd                          │
+ └─────────────────────────────────────────┴──────────┴──────────────────────────┴───────────────────────────────────────────────┘
+ Key code adaptations from the PA version:
+
+ - pa_score_table → pra_score_table: Query zone table where tbl == "ply_programareas_2026" and fld == "programarea_key". Join with
+ ply_programareas_2026 PostGIS table for names/regions. Create ecoregion-programarea intersection (ply_ecoregion_programarea.gpkg)
+ using st_intersection().
+ - plot_programarea_flowers: Query zone_metric for programarea_key values (20 PRAs). Use same plot_flower() function, same
+ components, same color palette. Facet by programarea_lbl (20 facets vs 27).
+ - map_imgs_pra_ply_l48_ak: Use public.ply_programareas_2026 as vector tile source. Filter and color by
+ score_extriskspcat_primprod_ecoregionrescaled_equalweights column.
+ - flextable_er_pra / flextable_pra: Same flextable structure with programarea_key/programarea_name columns instead of
+ planarea_key/planarea_name.
+
+ Reusable code from original (copy these functions/patterns):
+ - plot_flower() function (lines 57-151) — import via source()
+ - update_table_with_clear() from libs/db.R
+ - Component color palette generation
+ - mapgl + webshot rendering pattern
+ - flextable styling
+
+ Files to archive before regeneration
+
+ Move existing files from derived/downloads/ to derived/downloads/archive_2026-02-10/:
+ - All .png, .pdf map and flower plot files
+ - planarea_flower-plot_scores.*
+ - table_planarea_scores.docx, table_planarea_scores.xlsx
+ - table_ecoregion_planarea_scores.docx
+ - tbl_er_pa_scores.csv, planarea_primprod.csv
+ - map_pa_l48.png, map_pa_ak.png
+ - map_cell_score_*.png, map_cell_npp_*.png
+ - ply_planareas_2025.gpkg, ply_ecoregions_2025.gpkg
+ - figures/ subdirectory files (flower plot themes, etc.)
+
+ Execution order
+
+ 1. Archive existing downloads files → archive_2026-02-10/
+ 2. Apply 3 bug fixes to calc_scores.qmd
+ 3. Run calc_scores.qmd chunks interactively (in order):
+   - setup (line 22)
+   - zone_taxon (line 1967) — rebuilds zone_taxon_2026.csv
+   - setup_update_pgtable_with_clear (line 2131)
+   - pg_update_planarea_ecoregion_metrics_2025 (line 2184)
+   - pg_update_programareas_metrics_2026 (line 2256)
+   - pg_rm_old_metrics (line 2291)
+   - add_index_for_vector_tiles (line 2353)
+   - re-add_con_sdm.cell (line 2364)
+   - update_cached_downloads (line 2381)
+   - r_metrics_akl48_primprod_log (line 2541)
+   - pa_metrics_geo (line 2555)
+   - export_parquet (line 2691)
+ 4. Copy gpkg files to downloads/
+ 5. Render msens-summary_programareas.qmd to generate all PRA products
+ 6. Copy relevant outputs to downloads/ and downloads/figures/
+ 7. Create workflows/data/derived_products.csv
+ 8. Create workflows/render_derived_products.qmd
+
+ Verification
+
+ - Check all derived/ files have today's date: ls -lt ~/My\ Drive/projects/msens/data/derived/
+ - Verify Rice's whale in zone_taxon_2026.csv: grep -i "rice" zone_taxon_2026.csv
+ - Verify r_metrics_2026.tif layer names include programarea_key
+ - Verify flower plots show 20 Program Areas (not 27 Planning Areas)
+ - Verify PRA maps render correctly for both AK and L48 regions
+ - Compare score values in PRA tables against DuckDB zone_metric table
+
 ## 2026-02-10.c run sequence after ran ingest_nmfs_core-areas.qmd, update_scores.qmd
 
 Now that I've added the NMFS Core Areas dataset for Rice's whale @workflows/ingest_nmfs_core-areas.qmd. I ran @workflows/update_scores.qmd, including the new pivoting of `taxon` to `taxon` and `taxon_model`, and it says for Next steps:
@@ -549,6 +728,112 @@ Likewise could the dataset table be updated with a column or columns if not yet 
   3. Server: Removed hardcoded layer_names (now top-level); removed hardcoded mdl_names, mdl_info, ds_keys_values, ds_keys_mask from species_info; builds available layers dynamically in
   observeEvent(input$sel_sp)
 
+I am manually executing R chunks from chunk `notbirds_wormsid_ds_duplicates` (line 795) in @workflows/merge_models.qmd, and having trouble with R chunk "taxon_listing_join" presumably with lines 1981 - 1992. Not having `worms_id` column in table `taxon` is deeply concerning -- is this now defined differently and what are the consequences for the rest of the code, per Next Steps in @workfolows/update_scores.qmd?
+
+⏺ Here's the explanation:             
+
+  Why worms_id is missing: The d_taxon data frame (and thus d_taxon_clean) never had a worms_id column — it uses taxon_id as the      
+  primary key, where taxon_id = worms_id for non-birds and taxon_id = botw_id for birds. Previously, DELETE FROM taxon preserved the
+  table schema (including worms_id from prior ALTER TABLE calls), and data went into the existing columns. With overwrite = T, the    
+  table is recreated fresh with only d_taxon_clean columns. 
+
+  The fix I just applied (in taxon_to_db chunk, right after dbWriteTable):
+  dbExecute(con_sdm, "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS worms_id INTEGER")
+  dbExecute(con_sdm, "UPDATE taxon SET worms_id = taxon_id WHERE taxon_authority = 'worms'")
+
+  Downstream impact — 3 SQL statements reference taxon.worms_id:
+  1. Line ~1991 (taxon_listing_join): WHERE taxon.worms_id = l.worms_id — now works
+  2. Line ~2994: WHERE taxon.worms_id = s.worms_id for rng_iucn redlist update — now works
+  3. Line ~3043 (add_esa-code_in_taxon): WHERE taxon.worms_id = d_esa.worms_id — now works
+
+  No impact on the rest of the pipeline:
+  - worms_is_marine / worms_is_extinct are already added via ALTER TABLE at line ~2207
+  - calc_scores.qmd doesn't use worms_id (it works with taxon_id, er_score, etc.)
+  - The app's d_spp query selects worms_id — now it will be there
+  - The is_ok computation (line ~3601) uses worms_id — now works
+
+  You can re-run the taxon_to_db chunk and continue from taxon_listing_join.
+
+
+Re-ran the taxon_to_db chunk and continued from taxon_listing_join and got error...
+
+
+⏺ The good news: all the UPDATE statements succeeded (listing join: 349 + 137 taxa, IUCN fallback: 6701, default er_score: 10374). The
+   error is only in the diagnostic summary at the end.
+                                                                                                                                      
+  The issue is CASE_WHEN — that's not a valid R/dplyr function. It should be case_when (lowercase). Let me fix it.
+                                                                                                                                      
+⏺ Searched for 1 pattern, read 1 file (ctrl+o to expand)     
+
+⏺ Update(workflows/merge_models.qmd)
+  ⎿  Added 1 line, removed 1 line
+      2059  # summary                                                                                                                 
+      2060  tbl(con_sdm, "taxon") |>
+      2061    mutate(                                                                                                                 
+      2062 -    authority = CASE_WHEN(                                                                                         
+      2062 +    authority = case_when(
+      2063        str_starts(extrisk_code, "NMFS") ~ "NMFS",
+      2064        str_starts(extrisk_code, "FWS") ~ "FWS",
+      2065        str_starts(extrisk_code, "IUCN") ~ "IUCN",
+
+⏺ Fixed. CASE_WHEN is SQL syntax, not an R function — dplyr uses case_when (lowercase).                                               
+  
+  Your data is fine though — all the UPDATEs completed before the summary errored. You can re-run just the summary part, or simply    
+  continue to the next chunk. 
+
+
+The chunk "update_rng_iucn_to_redlist" seems to be applying the old scoring system, not the new one:
+
+```r
+rl_score =                
+  case_match(              
+    redlist_code,                                                                           # skipped: EX (extinct), NE (not evaluated), DD (data deficient), <NA> (not available)
+    # https://oceanhealthindex.org/images/htmls/Supplement.html#62_Biodiversity
+    "CR" ~ 1, #  - CR: Critically Endangered
+    "EN" ~ 0.8, #  - EN: Endangered (+ESA)
+    "VU" ~ 0.6, #  - VU: Vulnerable               
+    "TN" ~ 0.6, #  - TN: Threatened (ESA only)
+    "NT" ~ 0.4, #  - NT: Near Threatened    
+    "LC" ~ 0.2, #  - LC: Least Concern   
+    "DD" ~ 0.2 #  - DD: Data Deficient, so at least use distributional info and apply minimal rank
+  )  
+```
+
+⏺ This chunk is actually correct for what it does, despite the confusing variable name. Let me explain the distinction:               
+                                    
+  Two different scoring systems, two different purposes:
+  ┌─────────┬───────────────────────────────────────────┬─────────────────────────────────────┐
+  │         │       model_cell.value (this chunk)       │ taxon.er_score (taxon_listing_join) │                                      
+  ├─────────┼───────────────────────────────────────────┼─────────────────────────────────────┤
+  │ Purpose │ Cell values in rng_iucn spatial raster    │ Per-taxon extinction risk weight    │
+  ├─────────┼───────────────────────────────────────────┼─────────────────────────────────────┤
+  │ Used by │ Merge loop (ms_merge)                     │ calc_scores.qmd sensitivity calc    │
+  ├─────────┼───────────────────────────────────────────┼─────────────────────────────────────┤
+  │ Values  │ CR:100, EN:80, VU:60, NT:40, LC:20, DD:20 │ CR:50, EN:25, VU:5, NT:2, else:1    │
+  └─────────┴───────────────────────────────────────────┴─────────────────────────────────────┘
+  The rl_score * 100 math produces the correct cell values:
+  - CR: 1.0 × 100 = 100, EN: 0.8 × 100 = 80, VU: 0.6 × 100 = 60, NT: 0.4 × 100 = 40, LC: 0.2 × 100 = 20, DD: 0.2 × 100 = 20
+
+  These match exactly what the value_info metadata says for rng_iucn: "CR:100, EN:80, VU:60, NT:40, LC:20, DD:20".
+
+  The variable name rl_score is legacy naming but the output values are correct. The TN:60 case is a no-op since TN is ESA-only and
+  never appears in IUCN data.
+
+  This chunk is safe to run as-is. Do you want me to rename the variable from rl_score to something clearer (like cell_value), or is it fine to leave and move on?
+
+Actually we want to apply the same new IUCN scoring (CR:50, EN:25, VU:5, NT:2, else:1) for both cell values and per-taxon weight. What else do we need to change and re-run to accomplish this? I know it's redundant, and something to flag for fixing later, but the way we need to proceed for now. It will only exagerate the non-linear nature of the scores, but that's OK.
+
+⏺ Also update in apps_2026/mapsp/app.R — the app reads value_info from the DB, so it will pick up the new values automatically after re-running dataset_metadata. No app code changes needed.
+                                                                            
+  Summary of changes:
+
+  1. update_rng_iucn_to_redlist-value: scoring changed from CR:100/EN:80/VU:60/NT:40/LC:20/DD:20  to CR:50/EN:25/VU:5/NT:2/LC:1/DD:1 (aligned with er_score)
+  2. dataset_metadata: rng_iucn value_info updated to match
+
+  What to re-run:
+  - From update_rng_iucn_to_redlist-value through end of merge_models.qmd (this updates rng_iucn cell values, then the merge loop will
+   incorporate the new values into ms_merge models, then dataset_metadata populates the DB)
+  - Then calc_scores.qmd from delete_extrisk_metrics as before
 
 ## 2026-02-10.b + ingest_nmfs_core-areas.qmd for ricei
 
