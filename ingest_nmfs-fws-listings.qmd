@@ -1,0 +1,1186 @@
+---
+title: "Ingest NMFS/FWS/MMPA/MBTA Listings"
+subtitle: "Compute extrisk_code and er_score from US federal species listings"
+format:
+  html:
+    code-fold: true
+    code-tools: true
+editor_options:
+  chunk_output_type: console
+---
+
+## Overview
+
+Ingest US federal species listings (ESA from NMFS/FWS, MMPA from NMFS, MBTA from FWS), compute
+`extrisk_code` and `er_score`, and write a staging `listing` table to
+`sdm_2026.duckdb`. This notebook runs **BEFORE** `merge_models.qmd`.
+
+**Scoring rules:**
+
+- US-listed species get max of ESA score, MMPA (20), MBTA (10)
+- Any species in NMFS or FWS directory but not EN/TN gets "LC" (not NA)
+- Non-US species fall back to IUCN scale in `merge_models.qmd`
+
+```{r}
+#| label: setup
+
+devtools::load_all("../msens")
+librarian::shelf(
+  DBI,
+  dplyr,
+  DT,
+  duckdb,
+  glue,
+  here,
+  htmltools,
+  janitor,
+  litedown,
+  MarineSensitivity / msens,
+  readr,
+  readxl,
+  stringr,
+  tibble,
+  tidyr,
+  quiet = T
+)
+
+options(readr.show_col_types = F)
+
+# helper functions ----
+
+# helper: convert *_url columns to HTML links in datatable
+datatable_with_links <- function(data, url_rx = "_url$", ...) {
+  # find all *_url columns
+  url_cols <- names(data)[str_detect(names(data), url_rx)]
+
+  if (length(url_cols) > 0) {
+    # get corresponding display columns (remove _url suffix)
+    display_cols <- str_remove(url_cols, url_rx)
+
+    # check that display columns exist in data
+    display_cols <- display_cols[display_cols %in% names(data)]
+    stopifnot(length(display_cols) == length(url_cols))
+
+    # create links for each pair
+    for (i in seq_along(url_cols)) {
+      url_col <- url_cols[i]
+      display_col <- display_cols[i]
+
+      data <- data |>
+        mutate(
+          !!display_col := ifelse(
+            !is.na(.data[[url_col]]) & .data[[url_col]] != "",
+            glue(
+              '<a href="{.data[[url_col]]}" target="_blank">{.data[[display_col]]}</a>'
+            ),
+            as.character(.data[[display_col]])
+          )
+        ) |>
+        select(-all_of(url_col))
+    }
+  }
+
+  # determine which columns have HTML links
+  has_links <- any(str_detect(names(data), "_url$")) || length(url_cols) > 0
+
+  datatable(data, escape = !has_links, ...)
+}
+
+common_words <- function(names) {
+  # find longest common subsequence of words across common names
+
+  words_list <- str_split(names, "\\s+")
+  common <- Reduce(intersect, words_list)
+  if (length(common) == 0) {
+    return(paste(names, collapse = " / "))
+  }
+  paste(common, collapse = " ")
+}
+
+# paths ----
+
+dir_data <- msens::sdm_db_path() |> dirname() |> dirname()
+
+con_spp <- msens::spp_db_con()
+con_sdm <- msens::sdm_db_con(read_only = FALSE)
+
+nmfs_src_csv <- here("data/nmfs_species-directory.csv")
+nmfs_worms_csv <- here("data/nmfs_species-directory_worms-matched.csv")
+
+fws_spp_csv <- glue(
+  "{dir_data}/raw/fws.gov/species/FWS_Species_Data_Explorer.csv"
+)
+f_bw_csv <- here("data/fws_species_worms-botw.csv")
+
+mbta_xlsx <- glue(
+  "{dir_data}/raw/fws.gov/birds_mbta/CFR50-Part10.13-2023.xlsx"
+)
+mbta_botw_worms_csv <- here("data/mbta_botw_worms.csv")
+
+overrides_csv <- here("data/species_overrides_v3.csv")
+overrides_audit_csv <- here("data/species_overrides_v3_.csv")
+
+# values ----
+
+# esa severity ranking for taking the max
+esa_levels <- c("LC", "TN", "EN")
+
+# lookup tables for corrections ----
+rx_todrop <- ",| and |Multiple species"
+
+spp_sci_to_cmn <- tribble(
+  ~scientific_name_dataset , ~common_name ,
+  "Coryphaena hippurus"    , "Mahi Mahi"  ,
+)
+
+spp_sci_renames <- tribble(
+  ~scientific_name_dataset             , ~scientific_name_corrected  ,
+  "Sardinops sagax caerulea"           , "Sardinops sagax caeruleus" ,
+  "Lampris guttatus, Lampris spp."     , "Lampris"                   ,
+  "Crassostrea gigas; Magallana gigas" , "Magallana gigas"           ,
+  "Mercluccius productus"              , "Merluccius productus"      ,
+  "Delphinus capensis"                 , "Delphinus delphis"         ,
+  "Acanthocybium solanderi"            , "Acanthocybium solandri"
+)
+# "Delphinus capensis" has 2 accepted WoRMS matches: _Delphinus delphis_ and _Cephalorhynchus heavisidii_
+
+d_worms_missing <- tribble(
+  ~sci_ds                , ~scientific_name_accepted , ~worms_id , ~taxon_rank , ~is_marine ,
+  "Saccharina latissima" , "Saccharina latissima"    ,    234483 , "Species"   , TRUE
+) # Wierdly, algaes (from AlgaeBase) are searchable on WoRMS but not downloadable
+```
+
+## Ingest NMFS Species Directory
+
+Source: `r nmfs_src_csv` (309 species)
+
+Parse `protected_status` using `msens::parse_noaa_status()`. Any species in
+the NMFS directory gets at minimum `"LC"` (not NA).
+
+- Chum Salmon	_Oncorhynchus keta_: LC, TN
+- Coho Salmon _Oncorhynchus kisutch_: LC, EN
+
+```{r}
+#| label: ingest_nmfs
+
+d_nmfs_raw <- read_csv(nmfs_src_csv)
+
+# parse protected status into esa_status and is_mmpa
+d_nmfs_parsed <- msens::parse_noaa_status(d_nmfs_raw$protected_status)
+
+d_nmfs <- d_nmfs_raw |>
+  bind_cols(d_nmfs_parsed) |>
+  rename(
+    scientific_name_dataset = scientific_name,
+    scientific_name_dataset_url = species_url
+  ) |>
+  mutate(
+    scientific_name_corrected = recode_values(
+      scientific_name_dataset,
+      from = spp_sci_renames$scientific_name_dataset,
+      to = spp_sci_renames$scientific_name_corrected
+    ),
+    common_name = recode_values(
+      scientific_name_dataset,
+      from = spp_sci_to_cmn$scientific_name_dataset,
+      to = spp_sci_to_cmn$common_name
+    ),
+    # sci_ds: scientific_name_dataset (corrected)
+    sci_ds = ifelse(
+      !is.na(scientific_name_corrected),
+      scientific_name_corrected,
+      scientific_name_dataset
+    ),
+  ) |>
+  relocate(sci_ds)
+
+d_nmfs |>
+  filter(!is.na(scientific_name_corrected)) |>
+  select(
+    scientific_name_dataset,
+    scientific_name_dataset_url,
+    scientific_name_corrected,
+    common_name
+  ) |>
+  arrange(scientific_name_dataset) |>
+  datatable_with_links(caption = "NMFS species with corrected scientific names")
+
+d_nmfs |>
+  filter(duplicated(sci_ds) | duplicated(sci_ds, fromLast = TRUE)) |>
+  arrange(esa_status, sci_ds) |>
+  select(-scientific_name_corrected) |>
+  datatable_with_links(
+    caption = HTML(mark(
+      "NMFS duplicated scientific names (dataset corrected) `sci_ds`"
+    ))
+  )
+
+
+# handle duplicates by taking max ESA status
+d_nmfs <- d_nmfs |>
+  mutate(
+    nmfs_esa = factor(esa_status, levels = esa_levels, ordered = TRUE)
+  ) |>
+  summarize(
+    scientific_name_dataset = first(scientific_name_dataset),
+    scientific_name_dataset_url = first(scientific_name_dataset_url),
+    category = first(category),
+    region = paste(unique(region), collapse = "; "),
+    common_name = common_words(common_name),
+    nmfs_esa = max(nmfs_esa),
+    nmfs_esa_all = paste(unique(nmfs_esa), collapse = "; "),
+    is_mmpa = any(is_mmpa),
+    .by = sci_ds
+  )
+
+d_nmfs_todrop <- d_nmfs |>
+  filter(
+    is.na(scientific_name_dataset) | str_detect(sci_ds, rx_todrop)
+  )
+
+d_nmfs_todrop |>
+  select(scientific_name_dataset, common_name, nmfs_esa) |>
+  datatable_with_links(
+    caption = HTML(mark(glue(
+      "NMFS species dropped due to missing or multi-species scientific names (regex: `{rx_todrop}`)."
+    )))
+  )
+
+d_nmfs <- d_nmfs |> filter(!sci_ds %in% d_nmfs_todrop$sci_ds)
+
+# d_wn_direct: worms to nmfs direct matches to WoRMS via scientific name (Rule A)
+d_wn_direct <- tbl(con_spp, "worms") |>
+  filter(
+    scientificName %in% !!unique(d_nmfs$sci_ds),
+    taxonomicStatus == "accepted"
+  ) |>
+  select(
+    sci_ds = scientificName,
+    scientific_name_accepted = acceptedNameUsage,
+    worms_id = taxonID,
+    taxon_rank = taxonRank,
+    is_marine = isMarine
+  ) |>
+  collect()
+
+sci_indirect = setdiff(d_nmfs$sci_ds, d_wn_direct$sci_ds) |>
+  unique()
+
+# for indirect, get acceptedNameUsageID  (Rule B)
+d_wn_indirect <- tbl(con_spp, "worms") |>
+  filter(
+    scientificName %in% !!sci_indirect,
+  ) |>
+  select(
+    sci_ds = scientificName,
+    scientific_name_accepted = acceptedNameUsage,
+    worms_id = acceptedNameUsageID,
+  ) |>
+  left_join(
+    tbl(con_spp, "worms") |>
+      select(
+        worms_id = taxonID,
+        taxon_rank = taxonRank,
+        is_marine = isMarine
+      ),
+    by = join_by(worms_id)
+  ) |>
+  collect()
+
+d_wn <- bind_rows(d_wn_direct, d_wn_indirect, d_worms_missing) |>
+  mutate(
+    worms_id_url = glue(
+      "https://www.marinespecies.org/aphia.php?p=taxdetails&id={worms_id}"
+    )
+  )
+
+stopifnot(length(setdiff(d_nmfs$sci_ds, d_wn$sci_ds)) == 0)
+
+d_wn |>
+  datatable_with_links(
+    caption = HTML(mark(
+      "WoRMS matches to NMFS species directory via scientific name (`sci_ds`), including indirect matches via acceptedNameUsage."
+    ))
+  )
+
+d_wn |>
+  filter(sci_ds != scientific_name_accepted) |>
+  datatable_with_links(
+    caption = HTML(mark(
+      "NMFS scientific names not matching WoRMS accepted name. These may be synonyms that can still be matched via `worms_acc`."
+    ))
+  )
+
+stopifnot(sum(duplicated(d_wn$sci_ds)) == 0)
+stopifnot(sum(duplicated(d_wn$worms_id)) == 0)
+
+d_wn |>
+  filter(taxon_rank != "Species") |>
+  datatable_with_links(
+    caption = "WoRMS matches that are not a taxonomic rank of Species"
+  )
+
+# d_nw: nmfs joined to worms
+d_nw <- d_nmfs |>
+  left_join(d_wn, by = join_by(sci_ds))
+
+# write to csv
+d_nw |>
+  write_csv(nmfs_worms_csv)
+
+d_nw |>
+  datatable_with_links(
+    caption = "NMFS species directory filtered and matched to WoRMS."
+  )
+
+# summary
+d_nw |>
+  count(nmfs_esa, is_mmpa, name = "n_species") |>
+  arrange(desc(n_species)) |>
+  datatable(
+    caption = HTML(mark(
+      "Summary of NMFS species directory by ESA status and MMPA listing"
+    ))
+  )
+```
+
+## Ingest FWS Species Data Explorer
+
+Source: [FWS Species Data Explorer](https://ecos.fws.gov/ecp/report/adhoc-creator?catalogId=species&reportId=species&columns=%2Fspecies@cn,sn,gn;%2Fspecies%2Ftaxonomy@tsn,spcode&sort=%2Fspecies@cn%20asc;%2Fspecies@sn%20asc&distinct=true)
+
+Exclude taxonomic groups that do not contain marine species:
+```{r}
+#| label: fws_taxonomic_exclusions
+#| echo: false
+#| results: asis
+
+# filter to marine-relevant taxonomic groups
+fws_taxonomic_groups_exclude <- c(
+  "Amphibians",
+  "Arachnids",
+  "Conifers and Cycads",
+  "Ferns and Allies",
+  "Flowering Plants",
+  "Insects",
+  "Lichens",
+  "Millipedes"
+)
+
+cat(paste0("- ", fws_taxonomic_groups_exclude, collapse = "\n"))
+```
+
+
+ESA status:
+
+- "Endangered" -> "EN",
+- "Threatened" -> "TN", 
+- otherwise -> "LC". 
+
+Match via ITIS TSN crosswalk.
+
+```{r}
+#| label: ingest_fws
+
+d_fws_raw <- read_csv(fws_spp_csv) |>
+  clean_names() |>
+  mutate(
+    taxonomic_group_excluded = taxonomic_group %in% fws_taxonomic_groups_exclude
+  )
+
+d_fws_raw |>
+  filter(is_bcc) |>
+  datatable(
+    caption = "Number of FWS species that are Birds of Conservation Concern (BCC)"
+  )
+
+d_fws_raw |>
+  filter(taxonomic_group_excluded) |>
+  group_by(taxonomic_group) |>
+  summarize(n = n()) %>%
+  bind_rows(
+    summarize(., taxonomic_group = "TOTAL", n = sum(n))
+  ) |>
+  datatable(
+    caption = "Number of FWS species in excluded non-marine taxonomic groups"
+  ) |>
+  formatCurrency("n", digits = 0, currency = "")
+
+d_fws <- d_fws_raw |>
+  filter(!taxonomic_group_excluded)
+
+d_fws |>
+  group_by(taxonomic_group) |>
+  summarize(n = n()) %>%
+  bind_rows(
+    summarize(., taxonomic_group = "TOTAL", n = sum(n))
+  ) |>
+  datatable(
+    caption = "Number of FWS species by taxonomic group after excluding non-marine groups"
+  ) |>
+  formatCurrency("n", digits = 0, currency = "")
+
+
+d_fws |>
+  datatable_with_links(
+    caption = "FWS species after non-marine taxonomic group exclusion"
+  )
+
+d_fws |>
+  count(status_category) |>
+  arrange(desc(n)) |>
+  datatable(
+    caption = HTML(mark("FWS `status_category` distribution in raw data"))
+  ) |>
+  formatCurrency("n", digits = 0, currency = "")
+
+d_fws |>
+  count(esa_listing_status) |>
+  arrange(desc(n)) |>
+  datatable(
+    caption = HTML(mark("FWS `esa_listing_status` distribution in raw data"))
+  ) |>
+  formatCurrency("n", digits = 0, currency = "")
+
+d_fws <- d_fws |>
+  rename(
+    scientific_name_dataset = scientific_name,
+    scientific_name_dataset_url = scientific_name_url
+  ) |>
+  mutate(
+    # clean scientific name: strip subspecific qualifiers
+    sci_ds = scientific_name_dataset |>
+      str_remove_all("\\(=[^)]+\\)") |>
+      str_remove_all("\\s+ssp\\.$") |>
+      str_remove_all("\\s+sp\\.$") |>
+      str_remove_all("\\s+sp\\.\\s+#?\\d+") |>
+      str_remove_all("\\s+species$") |>
+      str_squish(),
+    itis_id = ifelse(
+      taxonomic_serial_number < 0,
+      NA,
+      taxonomic_serial_number
+    ) |>
+      as.integer(),
+    # map ESA status
+    fws_esa = case_when(
+      str_detect(esa_listing_status, "Endangered") ~ "EN",
+      str_detect(esa_listing_status, "Threatened") ~ "TN",
+      TRUE ~ "LC"
+    ),
+    is_bcc = is_bcc %in% c(TRUE, "TRUE")
+  ) |>
+  relocate(sci_ds)
+
+d_fws |>
+  filter(scientific_name_dataset == "Acipenser oxyrinchus oxyrinchus") |>
+  datatable_with_links(
+    caption = "Example of FWS species with multiple distinct population segments (DPS)"
+  )
+
+d_fws |>
+  filter(sci_ds != scientific_name_dataset) |>
+  select(
+    sci_ds,
+    scientific_name_dataset,
+    scientific_name_dataset_url,
+    status_category,
+    esa_listing_status
+  ) |>
+  arrange(scientific_name_dataset, sci_ds) |>
+  datatable_with_links(
+    caption = "FWS species where scientific name has been cleaned."
+  )
+
+d_fws |>
+  datatable_with_links(
+    caption = "FWS species with cleaned scientific names (`sci_ds`) that differ from original `scientific_name_dataset`."
+  )
+
+# ensure no NA sci_ds
+stopifnot(!any(is.na(d_fws$sci_ds)))
+
+# handle birds ----
+spp_fws_birds <- d_fws |>
+  filter(
+    taxonomic_group == "Birds"
+  ) |>
+  pull(sci_ds)
+
+# TODO: add spp.botw.taxonRank
+# TODO: add spp.botw.profile_code to spp.botw eg _Rhea pennata_; botw_id: 22678081; commonName: Lesser Rhea; https://birdsoftheworld.org/bow/species/lesrhe2/cur/introduction; so profile_code: lesrhe2
+
+# d_bf: birds of the world & fws matches
+d_bf <- tbl(con_spp, "botw") |>
+  filter(
+    scientificName %in% !!unique(spp_fws_birds)
+  ) |>
+  select(
+    sci_ds = scientificName,
+    scientific_name_accepted = acceptedNameUsage,
+    botw_id = acceptedNameUsageID,
+    redlist_code
+  ) |>
+  collect()
+
+d_bwf |>
+  select(-worms_id, -worms_id_url, -taxon_rank, -is_marine) |>
+  filter(
+    !is.na(botw_id)
+  ) |>
+  arrange(sci_ds, scientific_name_accepted, botw_id) |>
+  datatable_with_links(
+    caption = HTML(mark(
+      "BOTW matches to FWS species with duplicated BOTW IDs to be collapsed with rest of FWS species data."
+    ))
+  )
+
+
+# d_wf: worms_fws ---
+d_wf_direct <- tbl(con_spp, "worms") |>
+  filter(
+    scientificName %in% !!unique(d_fws$sci_ds),
+    taxonomicStatus == "accepted"
+  ) |>
+  select(
+    worms_id = taxonID,
+    sci_ds = scientificName,
+    scientific_name_accepted = acceptedNameUsage,
+    is_marine = isMarine,
+    taxon_rank = taxonRank
+  ) |>
+  collect()
+
+sci_indirect = setdiff(d_fws$sci_ds, d_wf_direct$sci_ds) |>
+  unique()
+# Lontra longicaudis (incl. platensis)
+
+d_wf_indirect <- tbl(con_spp, "worms") |>
+  filter(
+    scientificName %in% !!sci_indirect
+  ) |>
+  select(
+    sci_ds = scientificName,
+    scientific_name_accepted = acceptedNameUsage,
+    worms_id = acceptedNameUsageID,
+  ) |>
+  left_join(
+    tbl(con_spp, "worms") |>
+      select(
+        worms_id = taxonID,
+        taxon_rank = taxonRank,
+        is_marine = isMarine
+      ),
+    by = join_by(worms_id)
+  ) |>
+  collect()
+
+# nrow(d_wf_direct) # nrow: 2,070
+# nrow(d_wf_indirect) # nrow:   276
+
+d_wf <- bind_rows(d_wf_direct, d_wf_indirect) |>
+  mutate(
+    worms_id_url = glue(
+      "https://www.marinespecies.org/aphia.php?p=taxdetails&id={worms_id}"
+    )
+  ) |>
+  filter(!is.na(worms_id))
+
+# intersect(names(d_bf), names(d_wf)) # "sci_ds"    "scientific_name_accepted"
+# setdiff(names(d_bf), names(d_wf))   # "botw_id"   "redlist_code"
+# setdiff(names(d_wf), names(d_bf))   # "worms_id"  "is_marine"    "taxon_rank"   "worms_id_url"
+
+d_b_wf <- d_bf |>
+  inner_join(
+    d_wf |>
+      select(
+        sci_ds,
+        worms_id,
+        worms_id_url,
+        taxon_rank,
+        is_marine
+      ),
+    by = join_by(sci_ds)
+  ) |>
+  filter(!is.na(worms_id) & !is.na(botw_id))
+
+d_b_notwf <- d_bf |>
+  anti_join(
+    d_b_wf,
+    by = join_by(sci_ds)
+  ) |>
+  filter(!is.na(botw_id))
+
+d_wf_notb <- d_wf |>
+  anti_join(
+    d_b_wf,
+    by = join_by(sci_ds)
+  ) |>
+  filter(!is.na(worms_id))
+
+d_bwf <- bind_rows(
+  d_b_wf,
+  d_b_notwf,
+  d_wf_notb
+) |>
+  arrange(sci_ds, scientific_name_accepted, botw_id, worms_id)
+
+d_bwf |>
+  filter(!is.na(worms_id)) |>
+  count(is_marine) |>
+  datatable(
+    caption = HTML(mark(
+      "Summary of WoRMS matches to FWS species by whether occurs in the marine environment (`is_marine`). Those explicitly not (ie 'false') get excluded."
+    ))
+  )
+
+sci_w_notmarine <- d_bwf |>
+  filter(is_marine == FALSE) |>
+  pull(sci_ds)
+d_bwf <- d_bwf |> filter(!sci_ds %in% sci_w_notmarine)
+
+d_bwf |>
+  filter(!is.na(worms_id)) |>
+  select(-botw_id, -redlist_code) |>
+  datatable_with_links(
+    caption = HTML(mark(
+      "WoRMS matches to FWS species via cleaned dataset scientific name (`sci_ds`) and `is_marine == TRUE` filter."
+    ))
+  )
+
+stopifnot(sum(duplicated(d_bwf$sci_ds)) == 0)
+# sum(duplicated(d_bwf$worms_id)) # 5
+
+d_bwf |>
+  select(-botw_id, -redlist_code) |>
+  filter(
+    !is.na(worms_id),
+    duplicated(worms_id) |
+      duplicated(worms_id, fromLast = TRUE)
+  ) |>
+  arrange(worms_id, sci_ds, scientific_name_accepted) |>
+  datatable_with_links(
+    caption = HTML(mark(
+      "WoRMS matches to FWS species with duplicated WoRMS IDs to be collapsed with rest of FWS species data."
+    ))
+  )
+
+d_fbw <- d_fws |>
+  left_join(
+    d_bwf,
+    by = join_by(sci_ds)
+  ) |>
+  filter(
+    !is.na(worms_id) | !is.na(botw_id),
+  )
+
+# nrow(d_fws_raw) # 10,998
+# nrow(d_fws)     #  4,470
+# nrow(d_bwf)      #   984
+# nrow(d_fbw)      # 1,114
+
+d_fbw |>
+  filter(
+    duplicated(worms_id) | duplicated(worms_id, fromLast = TRUE)
+  ) |>
+  relocate(worms_id, sci_ds, scientific_name_dataset) |>
+  arrange(worms_id, sci_ds, scientific_name_dataset) |>
+  datatable_with_links(
+    caption = HTML(mark(
+      "FWS species with duplicated WoRMS IDs after join (`d_fbw`) to be collapsed by taking max ESA status."
+    ))
+  )
+
+d_fbw |>
+  filter(
+    duplicated(botw_id) | duplicated(botw_id, fromLast = TRUE)
+  ) |>
+  relocate(botw_id, sci_ds, scientific_name_dataset) |>
+  arrange(botw_id, sci_ds, scientific_name_dataset) |>
+  datatable_with_links(
+    caption = HTML(mark(
+      "FWS species with duplicated BOTW IDs after join (`d_fbw`) to be collapsed by taking max ESA status."
+    ))
+  )
+
+# d_fw$esa_listing_status |> table(useNA = "ifany")
+# d_fw$fws_esa |> table(useNA = "ifany")
+
+d_f_w <- d_fbw |>
+  mutate(
+    fws_esa = factor(fws_esa, levels = esa_levels, ordered = TRUE)
+  ) |>
+  summarize(
+    botw_id = first(botw_id),
+    redlist_code = first(redlist_code),
+    worms_id_url = first(worms_id),
+    scientific_names_dataset = paste(
+      unique(scientific_name_dataset),
+      collapse = "; "
+    ),
+    scientific_names_dataset_url = first(scientific_name_dataset_url),
+    scientific_name_accepted = first(scientific_name_accepted),
+    taxon_rank = first(taxon_rank),
+    common_name = common_words(common_name),
+    taxonomic_group = first(taxonomic_group),
+    entity_descriptions = paste(unique(entity_description), collapse = "; "),
+    lead_agency = paste(unique(lead_agency), collapse = "; "),
+    fws_esa = max(fws_esa),
+    fws_esa_all = paste(unique(fws_esa), collapse = "; "),
+    is_bcc = any(is_bcc),
+    .by = worms_id
+  )
+
+spp_w_b <- d_f_w |>
+  filter(!is.na(botw_id)) |>
+  pull(worms_id)
+
+d_f_b <- d_fbw |>
+  filter(
+    !worms_id %in% spp_w_b
+  ) |>
+  mutate(
+    fws_esa = factor(fws_esa, levels = esa_levels, ordered = TRUE)
+  ) |>
+  summarize(
+    redlist_code = first(redlist_code),
+    worms_id = first(botw_id),
+    worms_id_url = first(worms_id),
+    scientific_names_dataset = paste(
+      unique(scientific_name_dataset),
+      collapse = "; "
+    ),
+    scientific_names_dataset_url = first(scientific_name_dataset_url),
+    scientific_name_accepted = first(scientific_name_accepted),
+    taxon_rank = first(taxon_rank),
+    common_name = common_words(common_name),
+    taxonomic_group = first(taxonomic_group),
+    entity_descriptions = paste(unique(entity_description), collapse = "; "),
+    lead_agency = paste(unique(lead_agency), collapse = "; "),
+    fws_esa = max(fws_esa),
+    fws_esa_all = paste(unique(fws_esa), collapse = "; "),
+    is_bcc = any(is_bcc),
+    .by = botw_id
+  )
+
+d_f_bw <- d_f_w |>
+  bind_rows(
+    d_f_b
+  ) |>
+  arrange(scientific_name_accepted)
+
+write_csv(d_f_bw, f_bw_csv)
+
+d_f_bw |>
+  datatable_with_links(
+    caption = HTML(mark(
+      "FWS species after collapsing duplicates by WoRMS ID (`worms_id`) and Birds of the World ID (`botw_id`) and taking max ESA status."
+    ))
+  )
+
+d_f_bw |>
+  count(fws_esa, taxonomic_group, name = "n_species") |>
+  arrange(desc(n_species)) |>
+  datatable(
+    caption = HTML(mark(
+      "Summary of FWS species by ESA status and taxonomic group sorted by `n_species` after collapsing duplicates by WoRMS ID (`worms_id`) and Birds of the World ID (`botw_id`)."
+    ))
+  )
+
+d_f_bw |> 
+  filter(taxonomic_group == "Birds") |> 
+  count(!is.na(botw_id), !is.na(worms_id)) |> 
+  datatable(
+    caption = HTML(mark(
+      "Summary of FWS bird species by presence of WoRMS ID (`worms_id`) and Birds of the World ID (`botw_id`)."
+    ))
+  )
+```
+  
+## Ingest MBTA Bird List
+  
+Source: CFR 50 Part 10.13 Excel file listing MBTA-protected birds.
+  
+```{r}
+#| label: ingest_mbta
+
+d_mbta_raw <- read_excel(mbta_xlsx, sheet = 2) |>
+  clean_names()
+
+d_mbta <- d_mbta_raw |>
+  rename(
+    common_name = english_name,
+  ) |> 
+  mutate(
+    scientific_name = str_squish(scientific_name),
+    is_mbta = TRUE
+  )
+
+d_wm_direct <- tbl(con_spp, "worms") |>
+  filter(
+    scientificName %in% !!unique(d_mbta$scientific_name),
+    taxonomicStatus == "accepted"
+  ) |>
+  select(
+    scientific_name = scientificName,
+    scientific_name_accepted = acceptedNameUsage,
+    worms_id = taxonID,
+    taxon_rank = taxonRank,
+    is_marine = isMarine
+  ) |>
+  collect()
+
+sci_indirect <- setdiff(d_mbta$scientific_name, d_wm_direct$scientific_name) |>
+  unique()
+
+d_wm_indirect <- tbl(con_spp, "worms") |>
+  filter(
+    scientificName %in% !!sci_indirect
+  ) |>
+  select(
+    scientific_name = scientificName,
+    scientific_name_accepted = acceptedNameUsage,
+    worms_id = acceptedNameUsageID,
+  ) |>
+  left_join(
+    tbl(con_spp, "worms") |>
+      select(
+        worms_id = taxonID,
+        taxon_rank = taxonRank,
+        is_marine = isMarine
+      ),
+    by = join_by(worms_id)
+  ) |>
+  collect()
+
+d_wm <- bind_rows(d_wm_direct, d_wm_indirect) |>
+  mutate(
+    worms_id_url = glue(
+      "https://www.marinespecies.org/aphia.php?p=taxdetails&id={worms_id}"
+    )
+  ) |>
+  filter(!is.na(worms_id))
+
+d_bm <- tbl(con_spp, "botw") |>
+  filter(
+    scientificName %in% !!unique(d_mbta$scientific_name)
+  ) |>
+  select(
+    scientific_name = scientificName,
+    scientific_name_accepted = acceptedNameUsage,
+    botw_id = taxonID,
+    redlist_code
+  ) |>
+  collect()
+
+d_b_wm <- d_bm |>
+  inner_join(
+    d_wm |>
+      select(
+        scientific_name,
+        worms_id,
+        worms_id_url,
+        taxon_rank,
+        is_marine
+      ),
+    by = join_by(scientific_name)
+  ) |>
+  filter(!is.na(worms_id) & !is.na(botw_id))
+
+d_b_wm |> 
+  filter(scientific_name %in% !!unique(d_m_bw_dupes$scientific_name))
+
+d_b_notwm <- d_bm |>
+  anti_join(
+    d_b_wm,
+    by = join_by(scientific_name)
+  ) |>
+  filter(!is.na(botw_id))
+
+d_wm_notb <- d_wm |>
+  anti_join(
+    d_b_wm,
+    by = join_by(scientific_name)
+  ) |>
+  filter(!is.na(worms_id))
+
+d_bwm <- bind_rows(
+  d_b_wm,
+  d_b_notwm,
+  d_wm_notb
+) |>
+  arrange(scientific_name, scientific_name_accepted, botw_id, worms_id) |>
+  filter(is.na(is_marine) | is_marine == TRUE)
+
+d_m_bw <- d_mbta |>
+  left_join(d_bwm, by = "scientific_name") |>
+  filter(!is.na(worms_id) | !is.na(botw_id))
+
+
+# check duplicated
+stopifnot(sum(duplicated(na.omit(d_m_bw$worms_id))) == 0)
+stopifnot(sum(duplicated(na.omit(d_m_bw$botw_id))) == 0)
+
+write_csv(d_m_bw, mbta_botw_worms_csv)
+
+d_m_bw |>
+  datatable_with_links(
+    caption = HTML(mark(
+      "MBTA-protected birds matched to WoRMS and Birds of the World."
+    ))
+  )
+```
+
+## Combine and compute `extrisk_code`
+
+Priority: NMFS EN > FWS EN > NMFS TN > FWS TN > NMFS LC > FWS LC
+
+```{r}
+#| label: combine_listings
+
+# combine NMFS and FWS listings
+d_listing <- d_nw |>
+  select(worms_id, nmfs_esa, is_mmpa) |>
+  full_join(
+    d_f_bw |>
+      select(worms_id, fws_esa, is_bcc),
+    by = "worms_id"
+  ) |>
+  left_join(
+    d_m_bw,
+    by = "worms_id"
+  ) |>
+  mutate(
+    is_mmpa = replace_na(is_mmpa, FALSE),
+    is_mbta = replace_na(is_mbta, FALSE),
+    is_bcc = replace_na(is_bcc, FALSE)
+  )
+
+# assign extrisk_code with priority ordering
+d_listing <- d_listing |>
+  mutate(
+    extrisk_code = case_when(
+      nmfs_esa == "EN" ~ "NMFS:EN",
+      nmfs_esa == "TN" ~ "NMFS:TN",
+      nmfs_esa == "LC" ~ "NMFS:LC",
+      fws_esa == "EN" ~ "FWS:EN",
+      fws_esa == "TN" ~ "FWS:TN",
+      fws_esa == "LC" ~ "FWS:LC",
+      TRUE ~ NA_character_
+    ),
+    er_score = msens::compute_er_score(extrisk_code, is_mmpa, is_mbta) / 100
+  )
+
+d_listing |>
+  count(extrisk_code, name = "n_species") |>
+  arrange(desc(n_species))
+```
+
+## Apply Species Overrides
+
+Manual overrides from `species_overrides_v3.csv`.
+
+```{r}
+#| label: apply_overrides
+
+d_overrides <- read_csv(overrides_csv)
+
+# apply extrisk_code overrides
+ovr_extrisk <- d_overrides |>
+  filter(override == "extrisk_code") |>
+  select(worms_id, extrisk_code_ovr = value)
+
+ovr_is_mmpa <- d_overrides |>
+  filter(override == "is_mmpa") |>
+  mutate(value = as.logical(value)) |>
+  select(worms_id, is_mmpa_ovr = value)
+
+ovr_er_score <- d_overrides |>
+  filter(override == "er_score") |>
+  mutate(value = as.numeric(value)) |>
+  select(worms_id, er_score_ovr = value)
+
+# merge overrides
+d_listing <- d_listing |>
+  left_join(ovr_extrisk, by = "worms_id") |>
+  left_join(ovr_is_mmpa, by = "worms_id") |>
+  left_join(ovr_er_score, by = "worms_id") |>
+  mutate(
+    extrisk_code = coalesce(extrisk_code_ovr, extrisk_code),
+    is_mmpa = coalesce(is_mmpa_ovr, is_mmpa),
+    # recompute er_score with updated extrisk_code and is_mmpa
+    er_score = coalesce(
+      er_score_ovr,
+      msens::compute_er_score(extrisk_code, is_mmpa, is_mbta) / 100
+    )
+  ) |>
+  select(-ends_with("_ovr"))
+
+# ensure species with overrides but not already in listing are added
+ovr_missing <- d_overrides |>
+  filter(!worms_id %in% d_listing$worms_id) |>
+  distinct(worms_id)
+
+if (nrow(ovr_missing) > 0) {
+  message(glue(
+    "Adding {nrow(ovr_missing)} override-only species to listing"
+  ))
+  d_ovr_add <- ovr_missing |>
+    left_join(ovr_extrisk, by = "worms_id") |>
+    left_join(ovr_is_mmpa, by = "worms_id") |>
+    left_join(ovr_er_score, by = "worms_id") |>
+    mutate(
+      extrisk_code = extrisk_code_ovr,
+      is_mmpa = replace_na(is_mmpa_ovr, FALSE),
+      is_mbta = FALSE,
+      is_bcc = FALSE,
+      er_score = coalesce(
+        er_score_ovr,
+        msens::compute_er_score(extrisk_code, is_mmpa, is_mbta) / 100
+      )
+    ) |>
+    select(-ends_with("_ovr"))
+  d_listing <- bind_rows(d_listing, d_ovr_add)
+}
+
+# spot-check overrides
+d_listing |>
+  filter(worms_id %in% d_overrides$worms_id) |>
+  select(worms_id, extrisk_code, er_score, is_mmpa, is_mbta) |>
+  arrange(worms_id)
+```
+
+## Write staging `listing` table
+
+```{r}
+#| label: write_listing
+
+# also get botw_id for birds from spp.duckdb
+d_botw <- tbl(con_spp, "worms") |>
+  filter(taxonID %in% !!d_listing$worms_id) |>
+  select(worms_id = taxonID) |>
+  collect()
+
+d_listing_out <- d_listing |>
+  select(
+    worms_id,
+    extrisk_code,
+    er_score,
+    is_mmpa,
+    is_mbta,
+    is_bcc
+  ) |>
+  distinct(worms_id, .keep_all = TRUE)
+
+if (dbExistsTable(con_sdm, "listing")) {
+  dbExecute(con_sdm, "DROP TABLE listing")
+}
+dbWriteTable(con_sdm, "listing", d_listing_out, overwrite = TRUE)
+
+message(glue(
+  "Wrote {nrow(d_listing_out)} rows to listing table in sdm_2026.duckdb"
+))
+
+tbl(con_sdm, "listing") |>
+  count(extrisk_code, name = "n") |>
+  arrange(desc(n))
+```
+
+## Score Scale Impact
+
+Comparison of old `rl_score` vs new `er_score` scoring:
+
+| Species type | Old rl_score | New er_score | Change |
+|---|---|---|---|
+| ESA Endangered mammal | 0.8 | 1.0 (100 capped) | +25% |
+| ESA Threatened | 0.6 | 0.5 | -17% |
+| MMPA-only mammal | 0.2 (LC default) | 0.21 (1+20)/100 | +5% |
+| MBTA-only bird | 0.2 (LC default) | 0.11 (1+10)/100 | -45% |
+| IUCN CR (no US listing) | 1.0 | 0.5 | -50% |
+| IUCN EN (no US listing) | 0.8 | 0.25 | -69% |
+| No listing at all | 0.2 | 0.01 | -95% |
+
+## Audit Outputs
+
+```{r}
+#| label: audit
+
+# IUCN CR/EN species NOT covered by NMFS/FWS listings
+d_iucn_rl <- tbl(con_spp, "iucn_redlist") |>
+  filter(category %in% c("CR", "EN")) |>
+  select(worms_id = taxonID, iucn_code = category) |>
+  collect()
+
+d_iucn_gap <- d_iucn_rl |>
+  anti_join(
+    d_listing_out |> filter(!is.na(extrisk_code)),
+    by = "worms_id"
+  )
+
+if (nrow(d_iucn_gap) > 0) {
+  message(glue(
+    "Gap analysis: {nrow(d_iucn_gap)} IUCN CR/EN species without US listing"
+  ))
+  write_csv(
+    d_iucn_gap,
+    overrides_audit_csv
+  )
+}
+
+# all species where US listing overrides IUCN
+d_us_override <- d_listing_out |>
+  filter(str_detect(extrisk_code, "^(NMFS|FWS):")) |>
+  inner_join(d_iucn_rl, by = "worms_id")
+
+if (nrow(d_us_override) > 0) {
+  write_csv(
+    d_us_override,
+    here("data/audit_us_overrides_iucn_v3.csv")
+  )
+}
+
+# summary of er_score distribution
+d_listing_out |>
+  mutate(
+    er_bucket = cut(
+      er_score,
+      breaks = c(0, 0.01, 0.05, 0.25, 0.50, 1.0),
+      include.lowest = TRUE
+    )
+  ) |>
+  count(er_bucket, name = "n_species")
+```
+
+## Verification vs Reference
+
+```{r}
+#| label: verify_reference
+#| eval: false
+
+con_ref <- DBI::dbConnect(duckdb::duckdb(
+  dbdir = msens::sdm_db_path("2026-01-29"),
+  read_only = TRUE
+))
+
+# compare old redlist_code distribution
+d_old <- tbl(con_ref, "taxon") |>
+  count(redlist_code, name = "n_old") |>
+  collect()
+
+d_new <- tbl(con_sdm, "listing") |>
+  count(extrisk_code, name = "n_new") |>
+  collect()
+
+message("Old redlist_code distribution:")
+print(d_old)
+message("\nNew extrisk_code distribution:")
+print(d_new)
+
+DBI::dbDisconnect(con_ref, shutdown = TRUE)
+```
+
+```{r}
+#| label: cleanup
+
+DBI::dbDisconnect(con_spp, shutdown = TRUE)
+DBI::dbDisconnect(con_sdm, shutdown = TRUE)
+```
