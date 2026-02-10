@@ -1,5 +1,19 @@
 ## 2026-02-05 run big update
 
+
+Rename @workflows/ingest_nmfs-fws-mmpa-mbta-listings.qmd to 
+@workflows/ingest_nmfs-fws-listings.qmd since they both include MMPA and MBTA 
+listings. Update any other dependencies, like the targets.
+
+Let's make US-listed species er_score based on max (not additive) score from ESA, MMPA (20), MBTA (10)
+
+Let's use NMFS vs NOAA since NMFS is more specific.
+
+∆ wording:
+
+Species not listed explicitly by NMFS or FWS fall back to IUCN scale in `merge_models.qmd`
+
+
 ⏺ Here's the run order:                                                                                                   
                                                                                                                                                                                                                 
   Step-by-step execution                                                                                                                                                                                        

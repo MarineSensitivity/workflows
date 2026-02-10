@@ -517,23 +517,10 @@ d_bf <- tbl(con_spp, "botw") |>
   select(
     sci_ds = scientificName,
     scientific_name_accepted = acceptedNameUsage,
-    botw_id = acceptedNameUsageID,
+    botw_id = taxonID,
     redlist_code
   ) |>
   collect()
-
-d_bwf |>
-  select(-worms_id, -worms_id_url, -taxon_rank, -is_marine) |>
-  filter(
-    !is.na(botw_id)
-  ) |>
-  arrange(sci_ds, scientific_name_accepted, botw_id) |>
-  datatable_with_links(
-    caption = HTML(mark(
-      "BOTW matches to FWS species with duplicated BOTW IDs to be collapsed with rest of FWS species data."
-    ))
-  )
-
 
 # d_wf: worms_fws ---
 d_wf_direct <- tbl(con_spp, "worms") |>
@@ -625,6 +612,18 @@ d_bwf <- bind_rows(
   arrange(sci_ds, scientific_name_accepted, botw_id, worms_id)
 
 d_bwf |>
+  select(-worms_id, -worms_id_url, -taxon_rank, -is_marine) |>
+  filter(
+    !is.na(botw_id)
+  ) |>
+  arrange(sci_ds, scientific_name_accepted, botw_id) |>
+  datatable_with_links(
+    caption = HTML(mark(
+      "BOTW matches to FWS species with duplicated BOTW IDs to be collapsed with rest of FWS species data."
+    ))
+  )
+
+d_bwf |>
   filter(!is.na(worms_id)) |>
   count(is_marine) |>
   datatable(
@@ -712,7 +711,7 @@ d_f_w <- d_fbw |>
   summarize(
     botw_id = first(botw_id),
     redlist_code = first(redlist_code),
-    worms_id_url = first(worms_id),
+    worms_id_url = first(worms_id_url),
     scientific_names_dataset = paste(
       unique(scientific_name_dataset),
       collapse = "; "
@@ -743,8 +742,8 @@ d_f_b <- d_fbw |>
   ) |>
   summarize(
     redlist_code = first(redlist_code),
-    worms_id = first(botw_id),
-    worms_id_url = first(worms_id),
+    worms_id     = first(worms_id),
+    worms_id_url = first(worms_id_url),
     scientific_names_dataset = paste(
       unique(scientific_name_dataset),
       collapse = "; "
@@ -886,9 +885,6 @@ d_b_wm <- d_bm |>
   ) |>
   filter(!is.na(worms_id) & !is.na(botw_id))
 
-d_b_wm |> 
-  filter(scientific_name %in% !!unique(d_m_bw_dupes$scientific_name))
-
 d_b_notwm <- d_bm |>
   anti_join(
     d_b_wm,
@@ -913,7 +909,11 @@ d_bwm <- bind_rows(
 
 d_m_bw <- d_mbta |>
   left_join(d_bwm, by = "scientific_name") |>
-  filter(!is.na(worms_id) | !is.na(botw_id))
+  filter(!is.na(worms_id) | !is.na(botw_id)) |>
+  # collapse synonyms: when multiple MBTA names resolve to same worms_id,
+  # keep the row with botw_id (accepted species in BOTW)
+  arrange(is.na(botw_id)) |>
+  filter(is.na(worms_id) | !duplicated(worms_id))
 
 
 # check duplicated
@@ -942,17 +942,20 @@ d_listing <- d_nw |>
   select(worms_id, nmfs_esa, is_mmpa) |>
   full_join(
     d_f_bw |>
-      select(worms_id, fws_esa, is_bcc),
-    by = "worms_id"
+      select(worms_id, botw_id, fws_esa, is_bcc),
+    by = "worms_id",
+    na_matches = "never"
   ) |>
   left_join(
-    d_m_bw,
-    by = "worms_id"
+    d_m_bw |>
+      select(botw_id, is_mbta, redlist_code),
+    by = "botw_id",
+    na_matches = "never"
   ) |>
   mutate(
     is_mmpa = replace_na(is_mmpa, FALSE),
     is_mbta = replace_na(is_mbta, FALSE),
-    is_bcc = replace_na(is_bcc, FALSE)
+    is_bcc  = replace_na(is_bcc, FALSE)
   )
 
 # assign extrisk_code with priority ordering
@@ -967,7 +970,7 @@ d_listing <- d_listing |>
       fws_esa == "LC" ~ "FWS:LC",
       TRUE ~ NA_character_
     ),
-    er_score = msens::compute_er_score(extrisk_code, is_mmpa, is_mbta) / 100
+    er_score = msens::compute_er_score(extrisk_code, is_mmpa, is_mbta)
   )
 
 d_listing |>
@@ -996,7 +999,7 @@ ovr_is_mmpa <- d_overrides |>
 
 ovr_er_score <- d_overrides |>
   filter(override == "er_score") |>
-  mutate(value = as.numeric(value)) |>
+  mutate(value = as.integer(value)) |>
   select(worms_id, er_score_ovr = value)
 
 # merge overrides
@@ -1010,7 +1013,7 @@ d_listing <- d_listing |>
     # recompute er_score with updated extrisk_code and is_mmpa
     er_score = coalesce(
       er_score_ovr,
-      msens::compute_er_score(extrisk_code, is_mmpa, is_mbta) / 100
+      msens::compute_er_score(extrisk_code, is_mmpa, is_mbta)
     )
   ) |>
   select(-ends_with("_ovr"))
@@ -1035,7 +1038,7 @@ if (nrow(ovr_missing) > 0) {
       is_bcc = FALSE,
       er_score = coalesce(
         er_score_ovr,
-        msens::compute_er_score(extrisk_code, is_mmpa, is_mbta) / 100
+        msens::compute_er_score(extrisk_code, is_mmpa, is_mbta)
       )
     ) |>
     select(-ends_with("_ovr"))
@@ -1054,22 +1057,20 @@ d_listing |>
 ```{r}
 #| label: write_listing
 
-# also get botw_id for birds from spp.duckdb
-d_botw <- tbl(con_spp, "worms") |>
-  filter(taxonID %in% !!d_listing$worms_id) |>
-  select(worms_id = taxonID) |>
-  collect()
-
 d_listing_out <- d_listing |>
+  filter(!is.na(extrisk_code)) |>
+  mutate(spp_id = coalesce(worms_id, botw_id)) |>
   select(
+    spp_id,
     worms_id,
+    botw_id,
     extrisk_code,
     er_score,
     is_mmpa,
     is_mbta,
     is_bcc
   ) |>
-  distinct(worms_id, .keep_all = TRUE)
+  distinct(spp_id, .keep_all = TRUE)
 
 if (dbExistsTable(con_sdm, "listing")) {
   dbExecute(con_sdm, "DROP TABLE listing")
@@ -1091,13 +1092,13 @@ Comparison of old `rl_score` vs new `er_score` scoring:
 
 | Species type | Old rl_score | New er_score | Change |
 |---|---|---|---|
-| ESA Endangered mammal | 0.8 | 1.0 (100 capped) | +25% |
-| ESA Threatened | 0.6 | 0.5 | -17% |
-| MMPA-only mammal | 0.2 (LC default) | 0.21 (1+20)/100 | +5% |
-| MBTA-only bird | 0.2 (LC default) | 0.11 (1+10)/100 | -45% |
-| IUCN CR (no US listing) | 1.0 | 0.5 | -50% |
-| IUCN EN (no US listing) | 0.8 | 0.25 | -69% |
-| No listing at all | 0.2 | 0.01 | -95% |
+| ESA Endangered mammal | 0.8 | 100 | +25% |
+| ESA Threatened | 0.6 | 50 | -17% |
+| MMPA-only mammal | 0.2 (LC default) | 20 (max of 1, 20) | +5% |
+| MBTA-only bird | 0.2 (LC default) | 10 (max of 1, 10) | -45% |
+| IUCN CR (no US listing) | 1.0 | 50 | -50% |
+| IUCN EN (no US listing) | 0.8 | 25 | -69% |
+| No listing at all | 0.2 | 1 | -95% |
 
 ## Audit Outputs
 
@@ -1106,8 +1107,21 @@ Comparison of old `rl_score` vs new `er_score` scoring:
 
 # IUCN CR/EN species NOT covered by NMFS/FWS listings
 d_iucn_rl <- tbl(con_spp, "iucn_redlist") |>
-  filter(category %in% c("CR", "EN")) |>
-  select(worms_id = taxonID, iucn_code = category) |>
+  filter(red_list_category_code %in% c("CR", "EN")) |>
+  select(
+    taxon_scientific_name,
+    iucn_code = red_list_category_code
+  ) |>
+  left_join(
+    tbl(con_spp, "worms") |>
+      filter(taxonomicStatus == "accepted") |>
+      select(
+        taxon_scientific_name = scientificName,
+        worms_id = taxonID
+      ),
+    by = "taxon_scientific_name"
+  ) |>
+  filter(!is.na(worms_id)) |>
   collect()
 
 d_iucn_gap <- d_iucn_rl |>
@@ -1143,7 +1157,7 @@ d_listing_out |>
   mutate(
     er_bucket = cut(
       er_score,
-      breaks = c(0, 0.01, 0.05, 0.25, 0.50, 1.0),
+      breaks = c(0, 1, 5, 25, 50, 100),
       include.lowest = TRUE
     )
   ) |>
