@@ -1,0 +1,178 @@
+---
+title: "Ingest NMFS Core Distribution Areas"
+editor_options:
+  chunk_output_type: console
+---
+
+## Ingest NMFS Core Distribution Areas
+
+Rice's whale (*Balaenoptera ricei*) has a designated NMFS Core Distribution Area
+that matches its IUCN range map footprint. Rather than rasterizing the shapefile
+from scratch, we copy cell_ids from the existing IUCN range map (mdl_seq: 19014)
+and assign maximum weighting (value = 100).
+
+- [Rice's Whale | NOAA Fisheries](https://www.fisheries.noaa.gov/species/rices-whale)
+
+```{r setup}
+librarian::shelf(
+  DBI, dplyr, duckdb, glue, here, sf, terra,
+  quiet = T)
+
+ds_key    <- "ca_nmfs"
+is_server <- Sys.info()[["sysname"]] == "Linux"
+dir_data  <- ifelse(is_server, "/share/data", "~/My Drive/projects/msens/data")
+sdm_db    <- glue("{dir_data}/derived/sdm_2026.duckdb")
+cell_tif  <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
+
+con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F))
+```
+
+### Add `dataset`
+
+```{r insert_dataset_row}
+row_dataset <- tibble(
+  ds_key          = !!ds_key,
+  name_short      = "NMFS Core Areas, 2019",
+  name_original   = "NMFS Core Distribution Areas",
+  description     = "Core distribution areas designated by NOAA Fisheries for species with restricted ranges, used as high-confidence habitat indicators.",
+  citation        = "",
+  source_broad    = "NMFS",
+  source_detail   = "https://www.fisheries.noaa.gov/resource/map/rices-whale-core-distribution-area-map-gis-data",
+  regions         = "USA",
+  response_type   = "binary",
+  taxa_groups     = "cetaceans",
+  year_pub        = 2019,
+  date_obs_beg    = NA,
+  date_obs_end    = NA,
+  date_env_beg    = NA,
+  date_env_end    = NA,
+  link_info       = "https://www.fisheries.noaa.gov/species/rices-whale",
+  link_download   = "https://www.fisheries.noaa.gov/s3/2021-09/shapefile_Rices_whale_core_distribution_area_Jun19_SERO.zip",
+  link_metadata   = NA_character_,
+  links_other     = NA_character_,
+  spatial_res_deg = 0.05,
+  temporal_res    = "static")
+
+if (dbExistsTable(con_sdm, "dataset"))
+  dbExecute(con_sdm, glue("DELETE FROM dataset WHERE ds_key = '{ds_key}'"))
+
+dbWriteTable(con_sdm, "dataset", row_dataset, append = TRUE)
+tbl(con_sdm, "dataset") |> filter(ds_key == !!ds_key) |> collect()
+```
+
+### Delete existing ca_nmfs data (idempotent re-runs)
+
+```{r delete_existing}
+mdl_seqs <- tbl(con_sdm, "model") |>
+  filter(ds_key == !!ds_key) |>
+  pull(mdl_seq)
+
+if (length(mdl_seqs) > 0) {
+  dbExecute(con_sdm, glue(
+    "DELETE FROM model_cell WHERE mdl_seq IN ({paste(mdl_seqs, collapse = ',')})"))
+  dbExecute(con_sdm, glue("DELETE FROM model   WHERE ds_key = '{ds_key}'"))
+  dbExecute(con_sdm, glue("DELETE FROM species WHERE ds_key = '{ds_key}'"))
+}
+```
+
+### Add Rice's whale: `model`, `species`, `model_cell`
+
+Copy cell_ids from the existing IUCN range map (mdl_seq: 19014) for Rice's whale.
+
+```{r add_rices_whale}
+# rice's whale parameters
+sp_sci       <- "Balaenoptera ricei"
+sp_cmn       <- "Rice's whale"
+worms_id     <- 1576133L
+iucn_mdl_seq <- 19014L
+sp_key       <- glue("{ds_key}:{sp_sci}")
+
+# append: model ----
+d_model <- tibble(
+  ds_key      = ds_key,
+  taxa        = sp_key,
+  time_period = "2019",
+  region      = "Gulf of Mexico",
+  mdl_type    = "binary",
+  description = glue(
+    "NMFS core distribution area for {sp_sci}, copied from IUCN range map cells"))
+dbWriteTable(con_sdm, "model", d_model, append = TRUE)
+
+# get the mdl_seq that was just created
+mdl_seq <- dbGetQuery(con_sdm, glue("
+  SELECT mdl_seq FROM model
+  WHERE
+    ds_key = '{ds_key}' AND
+    taxa   = '{sp_key}'
+  ORDER BY mdl_seq DESC LIMIT 1 "))$mdl_seq
+message(glue("New mdl_seq for {sp_sci}: {mdl_seq}"))
+
+# append: species ----
+d_species <- tibble(
+  ds_key                  = ds_key,
+  taxa                    = sp_key,
+  sp_key                  = sp_key,
+  worms_id                = worms_id,
+  botw_id                 = NA_integer_,
+  gbif_id                 = NA_integer_,
+  itis_id                 = NA_integer_,
+  iucn_id                 = NA_integer_,
+  scientific_name_dataset  = sp_sci,
+  common_name_dataset      = sp_cmn,
+  scientific_name_accepted = sp_sci,
+  common_name_accepted     = sp_cmn,
+  redlist_code             = "EN",
+  redlist_year             = NA_integer_,
+  sp_cat                   = "mammal",
+  worms_is_marine          = TRUE,
+  worms_is_extinct         = FALSE)
+
+stopifnot(length(setdiff(names(d_species), dbListFields(con_sdm, "species"))) == 0)
+stopifnot(setdiff(dbListFields(con_sdm, "species"), names(d_species)) == "sp_seq")
+dbWriteTable(con_sdm, "species", d_species, append = T)
+
+# append: model_cell (copy from IUCN range map with value = 100) ----
+d_iucn_cells <- tbl(con_sdm, "model_cell") |>
+  filter(mdl_seq == !!iucn_mdl_seq) |>
+  select(cell_id) |>
+  collect()
+message(glue("Copying {nrow(d_iucn_cells)} cells from IUCN mdl_seq {iucn_mdl_seq}"))
+
+d_mdl_cell <- d_iucn_cells |>
+  mutate(
+    mdl_seq = mdl_seq,
+    value   = 100L) |>
+  arrange(cell_id)
+dbWriteTable(con_sdm, "model_cell", d_mdl_cell, append = T)
+```
+
+### Verify
+
+```{r verify}
+# verify dataset row
+tbl(con_sdm, "dataset") |> filter(ds_key == !!ds_key) |> collect()
+
+# verify model row
+tbl(con_sdm, "model") |> filter(ds_key == !!ds_key) |> collect()
+
+# verify species row
+tbl(con_sdm, "species") |> filter(ds_key == !!ds_key) |> collect()
+
+# verify model_cell count matches IUCN range
+n_ca   <- tbl(con_sdm, "model_cell") |> filter(mdl_seq == !!mdl_seq) |> count() |> pull(n)
+n_iucn <- tbl(con_sdm, "model_cell") |> filter(mdl_seq == !!iucn_mdl_seq) |> count() |> pull(n)
+message(glue("ca_nmfs cells: {n_ca}, IUCN cells: {n_iucn}"))
+stopifnot(n_ca == n_iucn)
+
+# verify all values are 100
+d_vals <- tbl(con_sdm, "model_cell") |>
+  filter(mdl_seq == !!mdl_seq) |>
+  summarize(v_min = min(value), v_max = max(value)) |>
+  collect()
+message(glue("value range: {d_vals$v_min} - {d_vals$v_max}"))
+stopifnot(d_vals$v_min == 100, d_vals$v_max == 100)
+```
+
+```{r disconnect}
+dbDisconnect(con_sdm, shutdown = TRUE)
+```

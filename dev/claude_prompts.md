@@ -124,11 +124,32 @@ But this is also the same shape as the IUCN range map (mdl_seq:19014), so you ca
    summarize(v_min = min(value), v_max = max(value)) |> collect()
  # should show v_min = 100, v_max = 100
 
-Use:
+⏺ All changes are implemented and verified. Here's a summary:                                                      
+                                                                           
+  Created                                                                                                          
+                                                                           
+  - ingest_nmfs_core-areas.qmd — New Quarto notebook that:                                                         
+    - Inserts a dataset row for ca_nmfs (NMFS Core Areas, 2019)            
+    - Deletes any existing ca_nmfs data for idempotent re-runs
+    - Copies cell_ids from IUCN range map mdl_seq = 19014 (Rice's whale) with value = 100
+    - Inserts model (binary, Gulf of Mexico), species (worms_id 1576133, EN, mammal), and model_cell rows
+    - Includes verification checks: cell count match, all values = 100
 
+  Modified
+
+  - merge_models.qmd line 1754 — Added "ca_nmfs" to ds_cols so it's included in the taxon_model junction table
+  - merge_models.qmd line 3091 — Added "ca_nmfs" to ds_keys_mask so core areas contribute to the IUCN range mask
+
+  Both edits place "ca_nmfs" right after "am_0.05" / "rng_iucn" respectively, keeping it grouped with the other
+  NMFS datasets.
+
+Use:
 - source_detail = "https://www.fisheries.noaa.gov/resource/map/rices-whale-core-distribution-area-map-gis-data",
 - link_download = "https://www.fisheries.noaa.gov/s3/2021-09/shapefile_Rices_whale_core_distribution_area_Jun19_SERO.zip" 
 
+⏺ Updated both URLs in ingest_nmfs_core-areas.qmd:                                                                 
+  - source_detail now points to the GIS data map page
+  - link_download now points to the actual shapefile zip  
 
 ## 2026-02-10 merge_models, calc_scores deep think
 
