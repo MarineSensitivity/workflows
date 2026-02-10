@@ -329,9 +329,250 @@ We also need planarea_flower-plot_scores.png|pdf, table_planarea_scores.docx|xls
  - Verify PRA maps render correctly for both AK and L48 regions
  - Compare score values in PRA tables against DuckDB zone_metric table
 
-Update plan capturing changes to `@workflows/calc_scores.qmd` that incorporate version of tables and file outputs. Apply this approach to the new `@workflows/msens-summary_programareas.qmd`, adding version specific suffixes (eg `_v3`) to output files and an easily updated variable at the top of the notebook (ie in `setup` chunk) to iterate in future.
+Update plan to capture changes to `@workflows/calc_scores.qmd` that incorporate version of tables and file outputs. Apply this approach to the new `@workflows/msens-summary_programareas.qmd`, adding version specific suffixes (eg `_v3`) to output files and an easily updated variable at the top of the notebook (ie in `setup` chunk) to iterate in future.
 
 Also track down where `metrics_tif` gets defined and ensure that gets updated (with version).
+
+
+Update plan to capture changes to `@workflows/calc_scores.qmd` that incorporate version of tables and file outputs. Apply this approach to the new `@workflows/msens-summary_programareas.qmd`, adding version specific suffixes (eg `_v3`) to output files and an easily updated variable at the top of the notebook (ie in `setup` chunk) to iterate in future.Also track down where `metrics_tif` gets defined and ensure that gets updated (with version).
+
+⏺ Updated plan                                          
+                                           
+ Here is Claude's Plan: Regenerate Versioned Derived Products for Program Areas                      
+                                                        
+ Context
+
+ After ingesting updated NMFS/FWS listings and the Rice's whale "ca_nmfs" model, merge_models.qmd and calc_scores.qmd have been run — sdm_2026.duckdb
+ now has updated scores. The file already uses a version variable (v_int <- 3, v_sfx <- "_v3") for most output paths. However, several paths and code
+ blocks still reference old unversioned files. We need to:
+
+ 1. Fix remaining unversioned references in calc_scores.qmd
+ 2. Create a new msens-summary_programareas.qmd with the same versioning approach for Program Area products
+ 3. Document everything in a lookup CSV and a rendering guide QMD
+
+ Deliverables
+
+ A. Fix calc_scores.qmd versioning gaps (4 code changes)
+
+ File: workflows/calc_scores.qmd
+
+ Current versioning (already working): v_int <- 3; v_sfx <- "_v3" at line 78-79. Applied to:
+ - pa_gpkg → ply_planareas_2025_v3.gpkg (line 94)
+ - er_gpkg → ply_ecoregions_2025_v3.gpkg (line 95)
+ - pra_gpkg → ply_programareas_2026_v3.gpkg (line 98)
+ - metrics_2026_tif → r_metrics_2026_v3.tif (line 102)
+ - metrics_akl48_tif → r_metrics_akl48_v3.tif (line 103)
+ - zone_taxon_csv → zone_taxon_2026_v3.csv (line 105)
+ - lyrs_2026_csv → layers_2026_v3.csv (line 108)
+ - PostGIS tables: ply_planareas_2025_v3, ply_programareas_2026_v3, etc.
+
+ Fix 1 — metrics_tif still unversioned (line 101)
+
+ metrics_tif is defined as r_metrics.tif (no version). It's referenced in:
+ - redo_dl loop (line 3035) — deletes old files
+ - metrics_akl48_tif generation (line 3187) — reads as source raster
+
+ Change: Either remove metrics_tif or leave it as the legacy reference. The key fix is in the code that USES it (Fixes 2 & 3 below).
+
+ Fix 2 — redo_dl deletion loop incomplete (line 3035)
+
+ The loop only deletes OLD unversioned files. It doesn't delete the versioned _v3 files, so they won't regenerate.
+
+ `# line 3035, before:
+   for (f in c(pa_gpkg, er_gpkg, lyrs_csv, metrics_tif)) {
+
+ `# after:
+   for (f in c(pa_gpkg, pra_gpkg, er_gpkg,
+               lyrs_csv, lyrs_2026_csv,
+               metrics_tif, metrics_2026_tif, metrics_akl48_tif)) {
+
+ Fix 3 — metrics_akl48_tif uses old raster and planarea_key (lines 3183-3194)
+
+ The 2026 raster has programarea_key (not planarea_key), and the code reads metrics_tif (old unversioned) instead of metrics_2026_tif.
+
+ `# lines 3183-3194, before:
+   pa_sr <- read_csv(sr_pa_csv) |>
+     filter(subregion_key == !!sr) |>
+     select(subregion_key, planarea_key)
+
+   r_metrics <- rast(metrics_tif)
+   r_pa <- subset(r_metrics, "planarea_key")
+   levels(r_pa) <- levels(r_pa)[[1]] |>
+     left_join(
+       pa_sr,
+       by = join_by(planarea_key)
+     ) |>
+     select(value, subregion_key)
+
+ `# after:
+   pra_sr <- read_csv(sr_pra_csv) |>
+     filter(subregion_key == !!sr) |>
+     select(subregion_key, programarea_key)
+
+   r_metrics <- rast(metrics_2026_tif)
+   r_pa <- subset(r_metrics, "programarea_key")
+   levels(r_pa) <- levels(r_pa)[[1]] |>
+     left_join(
+       pra_sr,
+       by = join_by(programarea_key)
+     ) |>
+     select(value, subregion_key)
+
+ Fix 4 — export_parquet hard-codes old DB (line 3382)
+
+ `# line 3382, before:
+ sdm_db <- glue("{dir_data}/derived/sdm.duckdb")
+
+ `# after:
+ `# sdm_db already defined in setup as sdm_2026.duckdb; just remove this override
+ `# or change to:
+ sdm_db <- glue("{dir_data}/derived/sdm_2026.duckdb")
+
+ B. New workflows/msens-summary_programareas.qmd
+
+ A new Quarto notebook adapted from msens-summary_env-national-ocs.qmd, producing Program Area versions of all summary products.
+
+ Setup chunk — key changes from original:
+
+ `# version variable (same as calc_scores.qmd)
+ v_int <- 3
+ v_sfx <- paste0("_v", v_int)
+
+ `# paths with version suffix
+ sdm_dd         <- glue("{dir_data}/derived/sdm_2026.duckdb")
+ pra_gpkg       <- glue("{dir_data}/derived/ply_programareas_2026{v_sfx}.gpkg")
+ er_gpkg        <- glue("{dir_data}/derived/ply_ecoregions_2025{v_sfx}.gpkg")
+ metrics_tif    <- glue("{dir_data}/derived/r_metrics_2026{v_sfx}.tif")
+ sr_pra_csv     <- glue("{dir_data}/derived/subregion_programareas.csv")
+ dir_figs       <- here("figs/msens-summary_programareas")
+ dir_dl         <- glue("{dir_data}/derived/downloads")
+
+ `# output files with version suffix
+ er_pra_gpkg    <- glue("{dir_data}/derived/ply_ecoregion_programarea{v_sfx}.gpkg")
+ er_pra_csv     <- glue("{dir_data}/derived/ply_ecoregion_programarea{v_sfx}.csv")
+ er_pra_n_csv   <- glue("{dir_data}/derived/tbl_er_pra_scores{v_sfx}.csv")
+ pra_n_csv      <- glue("{dir_data}/derived/tbl_pra_scores{v_sfx}.csv")
+
+ Chunks to create (adapted from PA version):
+ Chunk: setup
+ Output Files: —
+ Adaptation from PA version: Version vars, PRA paths, DuckDB+PostGIS connections, plot_flower() function (source from shared lib)
+ ────────────────────────────────────────
+ Chunk: read_plys
+ Output Files: ply_ecoregion_programarea{v_sfx}.gpkg, .csv
+ Adaptation from PA version: Intersect ecoregions × program areas (instead of planning areas)
+ ────────────────────────────────────────
+ Chunk: ply_lbl_pts
+ Output Files: label placement data
+ Adaptation from PA version: PRA centroids for map labels
+ ────────────────────────────────────────
+ Chunk: map_imgs_pra_ply_l48_ak
+ Output Files: map_pra_l48.png, map_pra_ak.png
+ Adaptation from PA version: Use ply_programareas_2026{v_sfx} PostGIS layer, programarea_key
+ ────────────────────────────────────────
+ Chunk: map_imgs_cell_l48_ak
+ Output Files: map_cell_score_l48.png, map_cell_score_ak.png, map_cell_npp_l48.png, map_cell_npp_ak.png
+ Adaptation from PA version: Use r_metrics_2026{v_sfx}.tif, mask by PRA ecoregions
+ ────────────────────────────────────────
+ Chunk: pra_score_table
+ Output Files: tbl_er_pra_scores{v_sfx}.csv
+ Adaptation from PA version: Query zone where tbl == "ply_programareas_2026{v_sfx}" and fld == "programarea_key"
+ ────────────────────────────────────────
+ Chunk: flextable_er_pra
+ Output Files: table_ecoregion_programarea_scores{v_sfx}.docx
+ Adaptation from PA version: Hierarchical ecoregion → program area table
+ ────────────────────────────────────────
+ Chunk: flextable_pra
+ Output Files: table_programarea_scores{v_sfx}.docx, tbl_pra_scores{v_sfx}.csv, table_programarea_scores{v_sfx}.xlsx
+ Adaptation from PA version: PRA-only table
+ ────────────────────────────────────────
+ Chunk: plot_ecoregion_flowers
+ Output Files: ecoregion_flower-plot_scores{v_sfx}.png|pdf
+ Adaptation from PA version: Same data source (ecoregion metrics), updated version suffix
+ ────────────────────────────────────────
+ Chunk: plot_programarea_flowers
+ Output Files: programarea_flower-plot_scores{v_sfx}.png|pdf (5 themes × 2 formats)
+ Adaptation from PA version: Query zone_metric for programarea_key (20 PRAs), facet by programarea_lbl
+ ────────────────────────────────────────
+ Chunk: plot_primprod
+ Output Files: programarea_primprod{v_sfx}.png|pdf, programarea_primprod{v_sfx}.csv
+ Adaptation from PA version: Query primprod_avg/stddev for PRA zones
+ ────────────────────────────────────────
+ Chunk: copy_to_downloads
+ Output Files: —
+ Adaptation from PA version: Copy versioned outputs to derived/downloads/ and downloads/figures/
+ Key code patterns (from original, adapted for PRA):
+
+ 1. Zone queries use tbl == "ply_programareas_2026{v_sfx}" and fld == "programarea_key"
+ 2. PostGIS table: ply_programareas_2026{v_sfx} (already has metric columns from calc_scores)
+ 3. 20 Program Areas instead of 27 Planning Areas (includes GAA, GAB for GOA)
+ 4. PRA list: from tbl(con, "ply_programareas_2026{v_sfx}") filtering region_key == "AK" or specific L48 keys
+ 5. plot_flower() function sourced from msens-summary_env-national-ocs.qmd or extracted to a shared lib file
+
+ C. workflows/data/derived_products.csv
+
+ Columns: output_file, output_dir, source_qmd, source_chunk, chunk_line, dependencies, description
+
+ Will catalog every derived product from both calc_scores.qmd and msens-summary_programareas.qmd, including:
+ - All versioned file outputs (_v3 suffix)
+ - DuckDB table writes (e.g., zone_taxon_v3)
+ - PostGIS table updates
+ - Files copied to downloads/
+
+ D. workflows/render_derived_products.qmd
+
+ Step-by-step regeneration guide:
+
+ 1. Archive — Move existing downloads/ files to archive_2026-02-10/
+ 2. calc_scores.qmd execution order (interactive chunks):
+   - setup (line 53)
+   - zone_taxon (line ~2600)
+   - setup_update_pgtable_with_clear (line ~2730)
+   - pg_update_planarea_ecoregion_metrics_2025 (line ~2785)
+   - pg_update_programareas_metrics_2026 (line ~2870)
+   - pg_rm_old_metrics (line ~2918)
+   - add_index_for_vector_tiles (line ~2985)
+   - re-add_con_sdm.cell (line ~3010)
+   - update_cached_downloads (line 3029)
+   - r_metrics_akl48_primprod_log (line 3208)
+   - pa_metrics_geo (line 3223)
+   - export_parquet (line 3377)
+ 3. Copy to downloads/ — gpkg files
+ 4. Render msens-summary_programareas.qmd — generates all PRA products
+ 5. Copy PRA products to downloads/ and downloads/figures/
+ 6. Verify — check dates, spot-check values
+
+ Files to archive
+
+ Move from derived/downloads/ to derived/downloads/archive_2026-02-10/:
+ - ply_planareas_2025.gpkg, ply_ecoregions_2025.gpkg
+ - planarea_flower-plot_scores.* (all variants)
+ - table_planarea_scores.docx, table_planarea_scores.xlsx
+ - table_ecoregion_planarea_scores.docx
+ - tbl_er_pa_scores.csv, planarea_primprod.*
+ - map_pa_l48.png, map_pa_ak.png
+ - map_cell_score_*.png, map_cell_npp_*.png
+ - r_metrics_akl48.tif
+ - zone_taxon.csv, zone_taxon_akl48.csv
+ - subregion_planareas.csv
+ - figures/* (all existing flower plot files)
+
+ Files modified
+
+ - workflows/calc_scores.qmd — 4 targeted edits (lines 3035, 3183-3194, 3382)
+ - workflows/msens-summary_programareas.qmd — new file
+ - workflows/data/derived_products.csv — new file
+ - workflows/render_derived_products.qmd — new file
+
+ Verification
+
+ - All _v3 files in derived/ should have today's date
+ - zone_taxon_2026_v3.csv: grep for Rice's whale
+ - r_metrics_2026_v3.tif: terra::rast() → layers include programarea_key
+ - PRA flower plots: 20 facets (not 27)
+ - PRA maps: show program area boundaries with correct score coloring
+ - Compare table scores against zone_metric in DuckDB
+
 
 
 ## 2026-02-10.c run sequence after ran ingest_nmfs_core-areas.qmd, update_scores.qmd
@@ -1317,6 +1558,7 @@ In @apps_2026/mapgl/app.R and @apps_2026/mapsp/app.R, similarly use v_int and v_
 
  ---
  Leave untouched
+ 
  ┌─────────────────────────────────────────┬───────────────────────────────────────────────────────────────────┐
  │                  Item                   │                              Reason                               │
  ├─────────────────────────────────────────┼───────────────────────────────────────────────────────────────────┤
@@ -1390,7 +1632,47 @@ In @apps_2026/mapgl/app.R and @apps_2026/mapsp/app.R, similarly use v_int and v_
   - Added v_int/v_sfx variables
   - Versioned tilejson URLs and all source_layer references (er, pra, including add_er_fill_layer helper)
 
+What do I need to run next to update all outputs to the latest versions? 
 
+⏺ Based on the changes, here's the run sequence:
+
+  1. calc_scores.qmd — run these chunks in order
+
+  From RStudio or Quarto, run the following labeled chunks sequentially:
+
+  1. setup — loads packages, sets v_int=3/v_sfx="_v3", connects to DuckDB
+  2. setup_update_pgtable_with_clear — defines update_table_with_clear() helper, sources libs/db.R (connects to PostGIS), and runs the version_zone_tbl
+  loop to rename DuckDB zone.tbl values
+  3. create_pg_v3_tables — creates ply_planareas_2025_v3, ply_ecoregions_2025_v3, ply_programareas_2026_v3 in PostGIS as copies of v2
+  4. pg_update_planarea_ecoregion_metrics_2025 — writes pa/er metrics to _v3 PostGIS tables
+  5. pg_update_programareas_metrics_2026 — writes pra metrics to _v3 PostGIS table
+  6. pg_rm_old_metrics — drops stale metric columns from _v3 tables
+  7. add_index_for_vector_tiles — adds primary key indexes for pg_tileserv on _v3 tables
+  8. update_cached_downloads — exports _v3 PostGIS tables to versioned gpkg/csv/tif files
+
+  2. Verify
+
+  `# PostGIS: v3 tables exist and have data
+  dbGetQuery(con, "SELECT count(*) FROM ply_programareas_2026_v3 WHERE score_extriskspcat_primprod_ecoregionrescaled_equalweights IS NOT NULL")
+
+  `# v2 untouched
+  dbGetQuery(con, "SELECT count(*) FROM ply_programareas_2026 WHERE score_extriskspcat_primprod_ecoregionrescaled_equalweights IS NOT NULL")
+
+  `# DuckDB: zone.tbl renamed
+  tbl(con_sdm, "zone") |> distinct(tbl) |> collect()
+
+  `# DuckDB: zone_taxon_v3 exists
+  tbl(con_sdm, "zone_taxon_v3")
+
+  3. Test apps locally
+
+  `# mapgl
+  shiny::runApp(here::here("apps_2026/mapgl"))
+
+  `# mapsp
+  shiny::runApp(here::here("apps_2026/mapsp"))
+
+  Confirm program area fills and ecoregion outlines render. The storymap app should still work with v2 tables (untouched).
 
 ## 2026-02-10.b + ingest_nmfs_core-areas.qmd for ricei
 
@@ -1470,15 +1752,15 @@ But this is also the same shape as the IUCN range map (mdl_seq:19014), so you ca
  Two changes needed:
 
  Line 1754 — Add "ca_nmfs" to ds_cols so it's included in the taxon_model junction table:
- # before:
+ `# before:
  ds_cols <- c("am_0.05", "ch_nmfs", "ch_fws", "rng_fws", "bl")
- # after:
+ `# after:
  ds_cols <- c("am_0.05", "ca_nmfs", "ch_nmfs", "ch_fws", "rng_fws", "bl")
 
  Line 3072 — Add "ca_nmfs" to ds_keys_mask so core areas contribute to the IUCN range mask:
- # before:
+ `# before:
  ds_keys_mask <- c("rng_iucn", "ch_fws", "ch_nmfs", "rng_fws", "bl")
- # after:
+ `# after:
  ds_keys_mask <- c("rng_iucn", "ca_nmfs", "ch_fws", "ch_nmfs", "rng_fws", "bl")
 
  No changes to calc_scores.qmd are needed — it already uses er_score from the taxon table (which is 100 for
@@ -1499,24 +1781,24 @@ But this is also the same shape as the IUCN range map (mdl_seq:19014), so you ca
  Verification
 
  After running the notebook:
- # verify dataset row
+ `# verify dataset row
  tbl(con_sdm, "dataset") |> filter(ds_key == "ca_nmfs") |> collect()
 
- # verify model row
+ `# verify model row
  tbl(con_sdm, "model") |> filter(ds_key == "ca_nmfs") |> collect()
 
- # verify species row
+ `# verify species row
  tbl(con_sdm, "species") |> filter(ds_key == "ca_nmfs") |> collect()
 
- # verify model_cell count matches IUCN range
+ `# verify model_cell count matches IUCN range
  n_ca   <- tbl(con_sdm, "model_cell") |> filter(mdl_seq == NEW_MDL_SEQ) |> count() |> pull(n)
  n_iucn <- tbl(con_sdm, "model_cell") |> filter(mdl_seq == 19014)       |> count() |> pull(n)
  stopifnot(n_ca == n_iucn)
 
- # verify all values are 100
+ `# verify all values are 100
  tbl(con_sdm, "model_cell") |> filter(mdl_seq == NEW_MDL_SEQ) |>
    summarize(v_min = min(value), v_max = max(value)) |> collect()
- # should show v_min = 100, v_max = 100
+ `# should show v_min = 100, v_max = 100
 
 ⏺ All changes are implemented and verified. Here's a summary:                                                      
                                                                            
