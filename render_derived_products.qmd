@@ -1,0 +1,226 @@
+---
+title: "Rendering Guide: Derived Products v3"
+subtitle: "Step-by-step instructions for regenerating all versioned outputs"
+author: "Marine Sensitivity Toolkit Team"
+date: "2026-02-10"
+editor_options:
+  chunk_output_type: console
+---
+
+## Overview
+
+This guide documents how to regenerate all versioned derived products (`_v3` suffix) from
+`calc_scores.qmd` and `msens-summary_programareas.qmd`. All output files are cataloged in
+`workflows/data/derived_products.csv`.
+
+**Prerequisites:**
+
+- Updated `sdm_2026.duckdb` (with Rice's whale ca_nmfs model and NMFS/FWS listings)
+- PostGIS database accessible via `libs/db.R`
+- Mapbox token configured in private directory
+
+## Step 1: Archive Old Downloads
+
+Move existing unversioned files from `derived/downloads/` to an archive directory
+so they are preserved but won't conflict with new versioned outputs.
+
+```{r}
+#| label: archive_old
+#| eval: false
+librarian::shelf(fs, glue, quiet = T)
+
+is_server <- Sys.info()[["sysname"]] == "Linux"
+dir_data <- ifelse(
+  is_server,
+  "/share/data",
+  "~/My Drive/projects/msens/data"
+)
+dir_dl <- glue("{dir_data}/derived/downloads")
+dir_archive <- glue("{dir_dl}/archive_2026-02-10")
+dir_create(dir_archive)
+
+# files to archive (old unversioned products)
+old_files <- c(
+  "ply_planareas_2025.gpkg",
+  "ply_ecoregions_2025.gpkg",
+  "table_planarea_scores.docx",
+  "table_planarea_scores.xlsx",
+  "table_ecoregion_planarea_scores.docx",
+  "tbl_er_pa_scores.csv",
+  "map_pa_l48.png",
+  "map_pa_ak.png",
+  "map_cell_score_l48.png",
+  "map_cell_score_ak.png",
+  "map_cell_npp_l48.png",
+  "map_cell_npp_ak.png",
+  "r_metrics_akl48.tif",
+  "zone_taxon.csv",
+  "zone_taxon_akl48.csv",
+  "subregion_planareas.csv"
+)
+
+for (f in old_files) {
+  src <- glue("{dir_dl}/{f}")
+  if (file_exists(src)) {
+    file_move(src, glue("{dir_archive}/{f}"))
+  }
+}
+
+# archive old figures
+dir_dl_figs <- glue("{dir_dl}/figures")
+dir_archive_figs <- glue("{dir_archive}/figures")
+if (dir_exists(dir_dl_figs)) {
+  dir_create(dir_archive_figs)
+  old_figs <- dir_ls(dir_dl_figs, regexp = "planarea|primprod|flower")
+  for (f in old_figs) {
+    file_move(f, glue("{dir_archive_figs}/{path_file(f)}"))
+  }
+}
+
+message(glue("Archived old files to {dir_archive}"))
+```
+
+## Step 2: Run `calc_scores.qmd` Chunks
+
+Run these chunks **interactively** in order (do not render the full document):
+
+| Order | Chunk Label | Purpose |
+|-------|-------------|---------|
+| 1 | `setup` (line ~53) | load packages, set version vars, db connections |
+| 2 | `zone_taxon` (line ~2600) | rebuild zone × taxon matrix |
+| 3 | `setup_update_pgtable_with_clear` (line ~2730) | define PostGIS update helper |
+| 4 | `pg_update_planarea_ecoregion_metrics_2025` (line ~2785) | update PA & ER PostGIS tables |
+| 5 | `pg_update_programareas_metrics_2026` (line ~2870) | update PRA PostGIS table |
+| 6 | `pg_rm_old_metrics` (line ~2918) | remove obsolete metric columns |
+| 7 | `add_index_for_vector_tiles` (line ~2985) | add spatial indexes |
+| 8 | `re-add_con_sdm.cell` (line ~3010) | refresh DuckDB cell table |
+| 9 | `update_cached_downloads` (line ~3029) | generate gpkg, csv, tif files |
+| 10 | `r_metrics_akl48_primprod_log` (line ~3208) | add primprod_log layer to AKL48 raster |
+| 11 | `pa_metrics_geo` (line ~3223) | generate GeoJSON for planning areas |
+| 12 | `export_parquet` (line ~3377) | export DuckDB to parquet (optional) |
+
+**Key outputs from this step:**
+
+- `ply_planareas_2025_v3.gpkg`
+- `ply_programareas_2026_v3.gpkg`
+- `ply_ecoregions_2025_v3.gpkg`
+- `layers_2026_v3.csv`
+- `r_metrics_2026_v3.tif`
+- `r_metrics_akl48_v3.tif`
+- `zone_taxon_2026_v3.csv`
+
+## Step 3: Copy calc_scores Outputs to Downloads
+
+```{r}
+#| label: copy_calc_scores
+#| eval: false
+librarian::shelf(fs, glue, quiet = T)
+
+is_server <- Sys.info()[["sysname"]] == "Linux"
+dir_data <- ifelse(
+  is_server,
+  "/share/data",
+  "~/My Drive/projects/msens/data"
+)
+dir_derived <- glue("{dir_data}/derived")
+dir_dl <- glue("{dir_derived}/downloads")
+dir_create(dir_dl)
+
+v_sfx <- "_v3"
+
+# copy versioned gpkg files
+gpkg_files <- c(
+  glue("ply_planareas_2025{v_sfx}.gpkg"),
+  glue("ply_programareas_2026{v_sfx}.gpkg"),
+  glue("ply_ecoregions_2025{v_sfx}.gpkg")
+)
+
+for (f in gpkg_files) {
+  src <- glue("{dir_derived}/{f}")
+  if (file_exists(src)) {
+    file_copy(src, glue("{dir_dl}/{f}"), overwrite = T)
+  }
+}
+
+# copy other versioned files
+other_files <- c(
+  glue("zone_taxon_2026{v_sfx}.csv"),
+  glue("layers_2026{v_sfx}.csv"),
+  glue("r_metrics_akl48{v_sfx}.tif"),
+  "subregion_programareas.csv"
+)
+
+for (f in other_files) {
+  src <- glue("{dir_derived}/{f}")
+  if (file_exists(src)) {
+    file_copy(src, glue("{dir_dl}/{f}"), overwrite = T)
+  }
+}
+
+message("Copied calc_scores outputs to downloads/")
+```
+
+## Step 4: Render `msens-summary_programareas.qmd`
+
+Run all chunks interactively (or render the full document):
+
+```{r}
+#| label: render_pra_summary
+#| eval: false
+quarto::quarto_render(here::here("workflows/msens-summary_programareas.qmd"))
+```
+
+This generates all Program Area products:
+
+- Ecoregion × Program Area intersection polygons (`.gpkg`, `.csv`)
+- Score tables (`.csv`, `.docx`, `.xlsx`)
+- Maps (`.png`): PRA boundaries, cell scores, cell NPP
+- Flower plots: ecoregion and program area (5 themes × 2 formats)
+- Primary productivity bar chart (`.png`, `.pdf`, `.csv`)
+- Copies everything to `downloads/` and `downloads/figures/`
+
+## Step 5: Verify Outputs
+
+```{r}
+#| label: verify
+#| eval: false
+librarian::shelf(fs, glue, readr, terra, quiet = T)
+
+is_server <- Sys.info()[["sysname"]] == "Linux"
+dir_data <- ifelse(
+  is_server,
+  "/share/data",
+  "~/My Drive/projects/msens/data"
+)
+dir_derived <- glue("{dir_data}/derived")
+v_sfx <- "_v3"
+
+# check dates — all v3 files should have today's date
+v3_files <- dir_ls(dir_derived, regexp = "_v3\\.", recurse = F)
+message(glue("Found {length(v3_files)} versioned files in derived/"))
+for (f in v3_files) {
+  mod <- file_info(f)$modification_time
+  message(glue("  {path_file(f)}: {mod}"))
+}
+
+# check Rice's whale in zone_taxon
+zt <- read_csv(
+  glue("{dir_derived}/zone_taxon_2026{v_sfx}.csv"),
+  show_col_types = F
+)
+rice <- zt |> dplyr::filter(grepl("Rice", sp_scientific, ignore.case = T))
+message(glue("Rice's whale rows in zone_taxon: {nrow(rice)}"))
+
+# check raster layers include programarea_key
+r <- rast(glue("{dir_derived}/r_metrics_2026{v_sfx}.tif"))
+message(glue("Raster layers: {paste(names(r), collapse = ', ')}"))
+stopifnot("programarea_key" %in% names(r))
+
+# check PRA flower plot has correct facets
+message("Verify PRA flower plots manually — should show ~20 facets (not 27)")
+```
+
+## Appendix: Full Product Catalog
+
+See `workflows/data/derived_products.csv` for a complete listing of every output file,
+its source QMD, chunk label, and dependencies.
