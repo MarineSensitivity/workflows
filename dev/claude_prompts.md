@@ -329,6 +329,222 @@ We also need planarea_flower-plot_scores.png|pdf, table_planarea_scores.docx|xls
  - Verify PRA maps render correctly for both AK and L48 regions
  - Compare score values in PRA tables against DuckDB zone_metric table
 
+Update plan capturing changes to `@workflows/calc_scores.qmd` that incorporate version of tables and file outputs. Apply this approach to the new `@workflows/msens-summary_programareas.qmd`, adding version specific suffixes (eg `_v3`) to output files and an easily updated variable at the top of the notebook (ie in `setup` chunk) to iterate in future.
+
+⏺ I was about to submit the versioning plan for your approval. Let me do that now.
+
+ Here is Claude's plan:
+ Plan: Version PostGIS tables and outputs for v3 scoring
+
+ Context
+
+ We're at setup_update_pgtable_with_clear in calc_scores.qmd, about to write v3 metric scores to PostGIS. The existing PostGIS tables
+  contain v2 metrics used by live apps. Writing v3 directly would overwrite v2 data. We need versioned output tables, files, and
+ DuckDB references so v2 and v3 coexist.
+
+ The approach: add v_int = 3 to the setup chunk and derive a _v3 suffix used for all output table names (PostGIS + DuckDB) and output
+  file names.
+
+ ---
+ Part 1: calc_scores.qmd — setup chunk changes
+
+ File: workflows/calc_scores.qmd, lines 78-107 (setup chunk)
+
+ 1a. Add version variable after line 81 (librarian::shelf(...))
+
+ `# version ----
+ v_int <- 3
+ v_sfx <- paste0("_v", v_int)
+
+ 1b. Version the output file paths (lines 90-107)
+
+ Replace hardcoded file paths with versioned ones. Keep the base (unversioned) paths as comments for reference:
+
+ pa_gpkg          <- glue("{dir_derived}/ply_planareas_2025{v_sfx}.gpkg")
+ er_gpkg          <- glue("{dir_derived}/ply_ecoregions_2025{v_sfx}.gpkg")
+ sr_gpkg          <- glue("{dir_derived}/ply_subregions_2025{v_sfx}.gpkg")
+ pra_gpkg         <- glue("{dir_derived}/ply_programareas_2026{v_sfx}.gpkg")
+ zone_taxon_csv   <- glue("{dir_derived}/zone_taxon_2026{v_sfx}.csv")
+ lyrs_2026_csv    <- glue("{dir_derived}/layers_2026{v_sfx}.csv")
+ metrics_2026_tif <- glue("{dir_derived}/r_metrics_2026{v_sfx}.tif")
+ metrics_akl48_tif <- glue("{dir_derived}/r_metrics_akl48{v_sfx}.tif")
+
+ Keep existing unversioned paths (e.g., pra_raw_gpkg, sr_pa_csv, sr_pra_csv, sdm_db, cell_tif, pa_boem_geo) unchanged — these are
+ inputs, not outputs.
+
+ ---
+ Part 2: calc_scores.qmd — DuckDB zone.tbl versioning
+
+ The DuckDB zone table stores tbl values like "ply_programareas_2026". The mapgl app filters by these values. To version DuckDB
+ consistently, update zone.tbl values to include v_sfx.
+
+ 2a. Add a chunk after source(here("libs/db.R")) (line 2732), before PostGIS writes
+
+ New chunk version_zone_tbl:
+
+ `# update zone.tbl to include version suffix ----
+ zone_tbls <- tbl(con_sdm, "zone") |> distinct(tbl) |> pull(tbl)
+ for (zt in zone_tbls) {
+   zt_v <- if (!grepl("_v\\d+$", zt)) paste0(zt, v_sfx) else zt
+   if (zt != zt_v) {
+     dbExecute(con_sdm, glue(
+       "UPDATE zone SET tbl = '{zt_v}' WHERE tbl = '{zt}'"))
+     message(glue("zone.tbl: {zt} -> {zt_v}"))
+   }
+ }
+
+ This is idempotent: if already versioned, no-op.
+
+ 2b. Version zone_taxon DuckDB table (line 2663)
+
+ `# before:
+ dbWriteTable(con_sdm, "zone_taxon", d, overwrite = T)
+
+ `# after:
+ dbWriteTable(con_sdm, glue("zone_taxon{v_sfx}"), d, overwrite = T)
+
+ Also version the CSV export (line 2660) — already handled by 1b since zone_taxon_csv is versioned.
+
+ ---
+ Part 3: calc_scores.qmd — PostGIS table versioning
+
+ 3a. New chunk create_pg_v3_tables (after setup_update_pgtable_with_clear)
+
+ Create versioned PostGIS tables as full copies of existing tables (geometry + existing columns), then clear metric data:
+
+ pg_zone_tbls <- c("ply_planareas_2025", "ply_ecoregions_2025", "ply_programareas_2026")
+ for (pg_tbl in pg_zone_tbls) {
+   pg_tbl_v <- glue("{pg_tbl}{v_sfx}")
+   if (!dbExistsTable(con, pg_tbl_v)) {
+     dbExecute(con, glue("CREATE TABLE {pg_tbl_v} AS SELECT * FROM {pg_tbl}"))
+     message(glue("Created {pg_tbl_v} from {pg_tbl}"))
+   } else {
+     message(glue("{pg_tbl_v} already exists"))
+   }
+ }
+
+ 3b. Update pg_update_planarea_ecoregion_metrics_2025 chunk (lines 2814-2820)
+
+ update_table_with_clear(con, d_pa_metrics, glue("ply_planareas_2025{v_sfx}"),    "planarea_key")
+ update_table_with_clear(con, d_er_metrics, glue("ply_ecoregions_2025{v_sfx}"),   "ecoregion_key")
+
+ 3c. Update pg_update_programareas_metrics_2026 chunk (line 2866)
+
+ update_table_with_clear(con, d_pra_metrics, glue("ply_programareas_2026{v_sfx}"), "programarea_key")
+
+ 3d. Update pg_rm_old_metrics chunk (lines 2873-2930)
+
+ Reference versioned tables:
+
+ flds_pa_db <- dbListFields(con, glue("ply_planareas_2025{v_sfx}"))
+ flds_er_db <- dbListFields(con, glue("ply_ecoregions_2025{v_sfx}"))
+ `# ... and in the ALTER TABLE DROP loop:
+ tbl <- d_rm$tbl[i]  # these values already include v_sfx if d_rm is built from the versioned table names
+
+ 3e. Update add_index_for_vector_tiles chunk (lines 2941-2954)
+
+ dbExecute(con, glue(
+   "ALTER TABLE public.ply_planareas_2025{v_sfx} ADD COLUMN IF NOT EXISTS planarea_id SERIAL PRIMARY KEY;"))
+ dbExecute(con, glue(
+   "ALTER TABLE public.ply_programareas_2026{v_sfx} ALTER COLUMN programarea_id TYPE INTEGER;"))
+ dbExecute(con, glue(
+   "ALTER TABLE public.ply_ecoregions_2025{v_sfx} ADD COLUMN IF NOT EXISTS ecoregion_id SERIAL PRIMARY KEY;"))
+
+ 3f. Update update_cached_downloads chunk (lines 2992-3010)
+
+ The gpkg paths are already versioned from Part 1b. Update the st_read calls:
+
+ st_read(con, glue("ply_planareas_2025{v_sfx}")) |> st_write(pa_gpkg, ...)
+ st_read(con, glue("ply_programareas_2026{v_sfx}")) |> st_write(pra_gpkg, ...)
+ st_read(con, glue("ply_ecoregions_2025{v_sfx}")) |> st_write(er_gpkg, ...)
+
+ ---
+ Part 4: apps_2026/mapgl/app.R
+
+ 4a. Tilejson URLs (lines 696, 704)
+
+ url = "https://api.marinesensitivity.org/tilejson?table=public.ply_ecoregions_2025_v3"
+ url = "https://api.marinesensitivity.org/tilejson?table=public.ply_programareas_2026_v3"
+
+ 4b. Source layer references (lines 722, 730, 974)
+
+ All source_layer = "public.ply_programareas_2026" → "public.ply_programareas_2026_v3"
+ All source_layer = "public.ply_ecoregions_2025" → "public.ply_ecoregions_2025_v3"
+
+ 4c. gpkg paths (lines 62, 67)
+
+ er_gpkg  <- glue("{dir_data}/derived/ply_ecoregions_2025_v3.gpkg")
+ pra_gpkg <- glue("{dir_data}/derived/ply_programareas_2026_v3.gpkg")
+
+ 4d. dbListFields (line 332)
+
+ lyrs_pra <- dbListFields(con, "ply_programareas_2026_v3")
+
+ 4e. DuckDB zone.tbl filter (line 416)
+
+ tbl == "ply_subregions_2026_v3"
+
+ 4f. DuckDB zone_taxon reference (lines 1244, 1375)
+
+ tbl(con_sdm, "zone_taxon_v3")
+
+ ---
+ Part 5: apps_2026/mapsp/app.R
+
+ 5a. Tilejson URLs and source_layer references
+
+ - Line 466: ply_ecoregions_2025 → ply_ecoregions_2025_v3 (tilejson URL)
+ - Line 474: ply_programareas_2026 → ply_programareas_2026_v3 (tilejson URL)
+ - Line 487: ply_programareas_2026 → ply_programareas_2026_v3 (source_layer)
+ - Line 495: ply_ecoregions_2025 → ply_ecoregions_2025_v3 (source_layer)
+ - Line 563: ply_ecoregions_2025 → ply_ecoregions_2025_v3 (source_layer)
+
+ ---
+
+ Leave untouched
+ 
+ ┌─────────────────────────────────────────┬───────────────────────────────────────────────────────────────────┐
+ │                  Item                   │                              Reason                               │
+ ├─────────────────────────────────────────┼───────────────────────────────────────────────────────────────────┤
+ │ apps_2026/storymap/                     │ Uses v2 planareas/ecoregions — keep as-is                         │
+ ├─────────────────────────────────────────┼───────────────────────────────────────────────────────────────────┤
+ │ api/plumber.R                           │ Generic tilejson — table name comes from query param              │
+ ├─────────────────────────────────────────┼───────────────────────────────────────────────────────────────────┤
+ │ server/docker-compose.yml               │ pg_tileserv auto-discovers all tables                             │
+ ├─────────────────────────────────────────┼───────────────────────────────────────────────────────────────────┤
+ │ DuckDB cell_metric, zone_metric, metric │ Internal computation tables, overwritten each run — not versioned │
+ └─────────────────────────────────────────┴───────────────────────────────────────────────────────────────────┘
+ ---
+ Files Modified
+ File: workflows/calc_scores.qmd
+ Changes: Add v_int/v_sfx in setup; version output file paths; add version_zone_tbl chunk; add create_pg_v3_tables chunk; update all
+   PostGIS write calls, index calls, gpkg exports, and zone_taxon DuckDB write to use v_sfx
+ ────────────────────────────────────────
+ File: apps_2026/mapgl/app.R
+ Changes: Update tilejson URLs, source_layer refs, gpkg paths, DuckDB zone.tbl filter, zone_taxon table name — all to _v3
+ ────────────────────────────────────────
+ File: apps_2026/mapsp/app.R
+ Changes: Update tilejson URLs and source_layer refs to _v3
+ Run Sequence
+
+ 1. Edit calc_scores.qmd as described
+ 2. Re-run from setup_update_pgtable_with_clear through update_cached_downloads
+ 3. Edit + test mapgl and mapsp apps locally
+
+ Verification
+
+ 1. PostGIS: \dt public.ply_* shows both v2 (unversioned) and v3 tables side by side
+ 2. v2 tables unchanged: SELECT count(*) FROM ply_programareas_2026 WHERE score_extriskspcat_primprod_ecoregionrescaled_equalweights
+ IS NOT NULL → same as before
+ 3. v3 tables populated: same query on ply_programareas_2026_v3 → returns 20
+ 4. pg_tileserv auto-discovers v3: https://tile.marinesensitivity.org/public.ply_programareas_2026_v3.json returns valid TileJSON
+ 5. DuckDB: tbl(con_sdm, "zone") |> distinct(tbl) |> collect() shows _v3 suffixed names
+ 6. DuckDB: tbl(con_sdm, "zone_taxon_v3") returns data
+ 7. mapgl app: run locally, confirm program area fills render with v3 metrics
+ 8. mapsp app: ecoregion and program area outlines render
+ 9. storymap: still works with v2 tables (untouched)
+
+
 ## 2026-02-10.c run sequence after ran ingest_nmfs_core-areas.qmd, update_scores.qmd
 
 Now that I've added the NMFS Core Areas dataset for Rice's whale @workflows/ingest_nmfs_core-areas.qmd. I ran @workflows/update_scores.qmd, including the new pivoting of `taxon` to `taxon` and `taxon_model`, and it says for Next steps:
@@ -834,6 +1050,41 @@ Actually we want to apply the same new IUCN scoring (CR:50, EN:25, VU:5, NT:2, e
   - From update_rng_iucn_to_redlist-value through end of merge_models.qmd (this updates rng_iucn cell values, then the merge loop will
    incorporate the new values into ms_merge models, then dataset_metadata populates the DB)
   - Then calc_scores.qmd from delete_extrisk_metrics as before
+
+I'm running chunk `zone_taxon` and noticing use of old redlist score. Does this chunk look in keeping with the latest extinction risk scoring?
+
+```r
+      suit_rl = avg_suit * er_score / 100,
+      suit_rl_area = avg_suit * er_score / 100 * area_km2
+```                                                                                               
+
+⏺ The math is actually correct for the v3 system. Here's why:                                                                         
+                              
+  - avg_suit = mean(value) / 100 — model cell values (1-100) normalized to 0-1                                                        
+  - er_score — integer 1-100 from taxon table (v3 system: CR:50, EN:25, VU:5, NT:2, default:1)
+  - er_score / 100 — converts to 0-1 multiplier                                                                                       
+  - suit_rl = avg_suit * er_score / 100 — suitability weighted by extinction risk (0-1 × 0-1)
+
+  The formula correctly uses er_score (not the old rl_score), and the /100 normalizes the integer er_score to a 0-1 weight. The column
+   names suit_rl are legacy naming but the computation is v3-correct.
+
+  The only cosmetic issue is the column names still say rl (redlist). If you want to rename for clarity:
+
+  - suit_rl → suit_er
+  - suit_rl_area → suit_er_area
+  - cat_suit_rl_area → cat_suit_er_area
+
+  But that would cascade into downstream code (mapgl app, PostGIS updates, etc.) that references these column names. I'd recommend
+  leaving the names as-is for now and flagging for a future cleanup pass. The math is sound — proceed with running the chunk.
+
+I'm at the R chunk `setup_update_pgtable_with_clear` and realizing that we want to keep the PostGIS tables from earlier versions for the mapping apps `@apps_2026/mapgl/` and `@apps_2026/mapsp/`. Plus we want Program Areas for v3 Planning Areas.  Can you think about implications of appending versions to tables (eg `ply_programareas_2026_v3`) and come up with plan for execution?
+
+⏺ For v3, should the DuckDB zone table references also be versioned? Currently zone.tbl stores 'ply_programareas_2026' — the calc_scores
+ queries filter by this string. If we version the PostGIS names but not the DuckDB zone.tbl values, the DuckDB side stays clean but   
+the names diverge. Or should zone.tbl also become 'ply_programareas_2026_v3'? 
+
+Apply to both PostGIS + DuckDB. Update plan with changes to `@workflows/calc_scores.qmd` to include version specific suffixes (eg `_v3`) to output tables in databases as well as all output files. Use an easily updated variable, (eg `v_int = 3`) at the top of the notebook (ie in `setup` chunk) to easily iterate in future.
+
 
 ## 2026-02-10.b + ingest_nmfs_core-areas.qmd for ricei
 
