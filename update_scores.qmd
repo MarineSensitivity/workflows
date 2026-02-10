@@ -27,18 +27,74 @@ chunk `delete_extrisk_metrics` (line 472) to recalculate downstream scoring metr
 #| warning: false
 
 librarian::shelf(
-  DBI, dplyr, duckdb, glue, here, readr, stringr, tibble, quiet = T)
+  DBI,
+  dplyr,
+  duckdb,
+  glue,
+  here,
+  readr,
+  stringr,
+  tibble,
+  tidyr,
+  quiet = T
+)
 options(readr.show_col_types = F)
 
 # set up paths
 is_server <- Sys.info()[["sysname"]] == "Linux"
-dir_data  <- ifelse(
+dir_data <- ifelse(
   is_server,
   "/share/data",
-  "~/My Drive/projects/msens/data")
+  "~/My Drive/projects/msens/data"
+)
 sdm_db <- glue("{dir_data}/derived/sdm_2026.duckdb")
 
 con_sdm <- dbConnect(duckdb(), sdm_db)
+```
+
+## Step 0: Create taxon_model from tmp_taxon.csv
+
+The `taxon_model` junction table (taxon_id, ds_key, mdl_seq) was defined in
+`merge_models.qmd` but never written to DB. Reconstruct it from `data/tmp_taxon.csv`
+which has per-dataset `mdl_seq` columns.
+
+```{r}
+#| label: create_taxon_model
+
+# read tmp_taxon.csv (has per-dataset mdl_seq columns)
+d_taxon_full <- read_csv(here("data/tmp_taxon.csv"))
+
+# pivot to junction table: (taxon_id, ds_key, mdl_seq)
+ds_cols <- c("am_0.05", "ch_nmfs", "ch_fws", "rng_fws", "bl")
+d_taxon_model <- d_taxon_full |>
+  select(taxon_id, any_of(ds_cols)) |>
+  pivot_longer(
+    -taxon_id,
+    names_to = "ds_key",
+    values_to = "mdl_seq"
+  ) |>
+  filter(!is.na(mdl_seq))
+
+# write to DB
+if (dbExistsTable(con_sdm, "taxon_model")) {
+  dbExecute(con_sdm, "DROP TABLE taxon_model")
+}
+dbWriteTable(con_sdm, "taxon_model", d_taxon_model, overwrite = TRUE)
+message(glue("wrote {nrow(d_taxon_model)} rows to taxon_model"))
+# wrote 17668 rows to taxon_model
+
+# verify
+dbGetQuery(
+  con_sdm,
+  "SELECT ds_key, count(*) AS n FROM taxon_model GROUP BY ds_key ORDER BY ds_key"
+) |>
+  print()
+#    ds_key     n
+# 1 am_0.05 16935
+# 2      bl   571
+# 3  ch_fws    28
+# 4 ch_nmfs    33
+# 5 rng_fws   101
 ```
 
 ## Step 1: Remap ch/rng model_cell values to er_score scale
@@ -49,18 +105,36 @@ Remap old ad-hoc values to match the `compute_er_score()` scale: EN=100, TN=50, 
 #| label: remap_model_cell_values
 
 # check current values before remapping
-d_before <- dbGetQuery(con_sdm, "
+d_before <- dbGetQuery(
+  con_sdm,
+  "
   SELECT m.ds_key, mc.value, count(*) AS n
   FROM model_cell mc
   JOIN model m ON mc.mdl_seq = m.mdl_seq
   WHERE m.ds_key IN ('ch_nmfs', 'ch_fws', 'rng_fws')
   GROUP BY m.ds_key, mc.value
-  ORDER BY m.ds_key, mc.value")
+  ORDER BY m.ds_key, mc.value"
+)
 message("before remapping:")
 print(d_before)
+# before remapping:
+#    ds_key value      n
+# 1  ch_fws    70  51655
+# 2  ch_fws    90    150
+# 3 ch_nmfs    70 188503
+# 4 ch_nmfs    90  56886
+# 5 rng_fws    50   9459
+# 6 rng_fws    70 377995
+# 7 rng_fws    90 888062
 
-# remap: 90->100 (EN), 70->50 (TN), 50->1 (LC, rng_fws only)
-n_updated <- dbExecute(con_sdm, "
+# only run if values are as expected
+if (all(d_before$value %in% c(50, 70, 90))) {
+  message("model_cell values are OLD — proceeding with remapping")
+
+  # remap: 90->100 (EN), 70->50 (TN), 50->1 (LC, rng_fws only)
+  n_updated <- dbExecute(
+    con_sdm,
+    "
   UPDATE model_cell SET value = CASE value
     WHEN 90 THEN 100
     WHEN 70 THEN 50
@@ -69,19 +143,38 @@ n_updated <- dbExecute(con_sdm, "
   WHERE mdl_seq IN (
     SELECT mdl_seq FROM model
     WHERE ds_key IN ('ch_nmfs', 'ch_fws', 'rng_fws')
-  )")
-message(glue("remapped {n_updated} model_cell rows"))
+  )"
+  )
+  message(glue("remapped {n_updated} model_cell rows"))
 
-# verify
-d_after <- dbGetQuery(con_sdm, "
+  # verify
+  d_after <- dbGetQuery(
+    con_sdm,
+    "
   SELECT m.ds_key, mc.value, count(*) AS n
   FROM model_cell mc
   JOIN model m ON mc.mdl_seq = m.mdl_seq
   WHERE m.ds_key IN ('ch_nmfs', 'ch_fws', 'rng_fws')
   GROUP BY m.ds_key, mc.value
-  ORDER BY m.ds_key, mc.value")
-message("after remapping:")
-print(d_after)
+  ORDER BY m.ds_key, mc.value"
+  )
+  message("after remapping:")
+  print(d_after)
+  # after remapping:
+  #    ds_key value      n
+  # 1  ch_fws    50  51655
+  # 2  ch_fws   100    150
+  # 3 ch_nmfs    50 188503
+  # 4 ch_nmfs   100  56886
+  # 5 rng_fws     1   9459
+  # 6 rng_fws    50 377995
+  # 7 rng_fws   100 888062
+} else if (all(d_before$value %in% c(1, 50, 100))) {
+  stop("model_cell values are NEW — aborting remapping")
+} else {
+  stop("unexpected model_cell values — aborting")
+}
+
 stopifnot(all(d_after$value %in% c(1, 50, 100)))
 ```
 
@@ -93,37 +186,55 @@ values as `max(all source values)` since the source ch/rng values changed.
 ```{r}
 #| label: recompute_merged_models
 
-# count affected taxa
-d_affected <- dbGetQuery(con_sdm, "
-  SELECT count(DISTINCT t.taxon_id) AS n_taxa
-  FROM taxon t
-  WHERE t.mdl_seq IS NOT NULL
-    AND t.n_ds > 1
-    AND t.taxon_id IN (
-      SELECT DISTINCT taxon_id FROM taxon_model
-      WHERE ds_key IN ('ch_nmfs', 'ch_fws', 'rng_fws')
-    )")
-message(glue("recomputing merged models for {d_affected$n_taxa} taxa"))
+# check if ms_merge models exist (they are created by merge_models.qmd merge loop)
+n_merge <- dbGetQuery(
+  con_sdm,
+  "SELECT count(*) AS n FROM model WHERE ds_key = 'ms_merge'"
+)$n
 
-n_updated <- dbExecute(con_sdm, "
-  UPDATE model_cell mc SET value = src.max_val
-  FROM (
-    SELECT t.mdl_seq AS merged_seq, all_src.cell_id,
-           MAX(all_src.value) AS max_val
+if (n_merge == 0) {
+  message("no ms_merge models found in model table — skipping recompute")
+} else {
+  # count affected taxa
+  d_affected <- dbGetQuery(
+    con_sdm,
+    "
+    SELECT count(DISTINCT t.taxon_id) AS n_taxa
     FROM taxon t
-    JOIN taxon_model tm ON t.taxon_id = tm.taxon_id
-    JOIN model_cell all_src ON tm.mdl_seq = all_src.mdl_seq
     WHERE t.mdl_seq IS NOT NULL
       AND t.n_ds > 1
       AND t.taxon_id IN (
         SELECT DISTINCT taxon_id FROM taxon_model
         WHERE ds_key IN ('ch_nmfs', 'ch_fws', 'rng_fws')
-      )
-    GROUP BY t.mdl_seq, all_src.cell_id
-  ) AS src
-  WHERE mc.mdl_seq = src.merged_seq
-    AND mc.cell_id = src.cell_id")
-message(glue("updated {n_updated} merged model_cell rows"))
+      )"
+  )
+  message(glue("recomputing merged models for {d_affected$n_taxa} taxa"))
+  # recomputing merged models for 87 taxa
+
+  n_updated <- dbExecute(
+    con_sdm,
+    "
+    UPDATE model_cell mc SET value = src.max_val
+    FROM (
+      SELECT t.mdl_seq AS merged_seq, all_src.cell_id,
+             MAX(all_src.value) AS max_val
+      FROM taxon t
+      JOIN taxon_model tm ON t.taxon_id = tm.taxon_id
+      JOIN model_cell all_src ON tm.mdl_seq = all_src.mdl_seq
+      WHERE t.mdl_seq IS NOT NULL
+        AND t.n_ds > 1
+        AND t.taxon_id IN (
+          SELECT DISTINCT taxon_id FROM taxon_model
+          WHERE ds_key IN ('ch_nmfs', 'ch_fws', 'rng_fws')
+        )
+      GROUP BY t.mdl_seq, all_src.cell_id
+    ) AS src
+    WHERE mc.mdl_seq = src.merged_seq
+      AND mc.cell_id = src.cell_id"
+  )
+  message(glue("updated {n_updated} merged model_cell rows"))
+  # updated 5548640 merged model_cell rows
+}
 ```
 
 ## Step 3: Listing join
@@ -140,18 +251,24 @@ for (col_sql in c(
   "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS er_score INTEGER",
   "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS is_mmpa BOOLEAN DEFAULT FALSE",
   "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS is_mbta BOOLEAN DEFAULT FALSE",
-  "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS is_bcc  BOOLEAN DEFAULT FALSE")) {
+  "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS is_bcc  BOOLEAN DEFAULT FALSE"
+)) {
   dbExecute(con_sdm, col_sql)
 }
 
 # clear any existing values so we start fresh
-dbExecute(con_sdm, "
+dbExecute(
+  con_sdm,
+  "
   UPDATE taxon SET
     extrisk_code = NULL, er_score = NULL,
-    is_mmpa = FALSE, is_mbta = FALSE, is_bcc = FALSE")
+    is_mmpa = FALSE, is_mbta = FALSE, is_bcc = FALSE"
+) # 17561
 
 # primary: join by worms_id (covers non-birds + birds with worms mapping)
-n_worms <- dbExecute(con_sdm, "
+n_worms <- dbExecute(
+  con_sdm,
+  "
   UPDATE taxon SET
     extrisk_code = l.extrisk_code,
     er_score     = l.er_score,
@@ -159,11 +276,15 @@ n_worms <- dbExecute(con_sdm, "
     is_mbta      = l.is_mbta,
     is_bcc       = l.is_bcc
   FROM listing l
-  WHERE taxon.worms_id = l.worms_id")
+  WHERE taxon.worms_id = l.worms_id"
+)
 message(glue("listing join by worms_id: {n_worms} taxa matched"))
+# listing join by worms_id: 491 taxa matched
 
 # secondary: join by botw_id for BOTW-only birds not matched above
-n_botw <- dbExecute(con_sdm, "
+n_botw <- dbExecute(
+  con_sdm,
+  "
   UPDATE taxon SET
     extrisk_code = l.extrisk_code,
     er_score     = l.er_score,
@@ -173,11 +294,15 @@ n_botw <- dbExecute(con_sdm, "
   FROM listing l
   WHERE taxon.taxon_authority = 'botw'
     AND taxon.taxon_id = l.botw_id
-    AND taxon.extrisk_code IS NULL")
+    AND taxon.extrisk_code IS NULL"
+)
 message(glue("listing join by botw_id: {n_botw} taxa matched"))
+# listing join by botw_id: 2 taxa matched
 
 # IUCN fallback for unmatched taxa
-n_iucn <- dbExecute(con_sdm, "
+n_iucn <- dbExecute(
+  con_sdm,
+  "
   UPDATE taxon SET
     extrisk_code = 'IUCN:' || redlist_code,
     er_score     = CASE redlist_code
@@ -186,31 +311,48 @@ n_iucn <- dbExecute(con_sdm, "
       WHEN 'VU' THEN 5
       WHEN 'NT' THEN 2
       ELSE 1 END
-  WHERE extrisk_code IS NULL AND redlist_code IS NOT NULL")
+  WHERE extrisk_code IS NULL AND redlist_code IS NOT NULL"
+)
 message(glue("IUCN fallback: {n_iucn} taxa"))
+# IUCN fallback: 6640 taxa
 
 # default for taxa with no listing and no redlist_code
-n_default <- dbExecute(con_sdm, "
+n_default <- dbExecute(
+  con_sdm,
+  "
   UPDATE taxon SET er_score = 1
-  WHERE er_score IS NULL")
+  WHERE er_score IS NULL"
+)
 message(glue("default er_score=1: {n_default} taxa"))
+# default er_score=1: 10428 taxa
 
 # verify no nulls remain
-n_null <- dbGetQuery(con_sdm,
-  "SELECT count(*) AS n FROM taxon WHERE er_score IS NULL")$n
+n_null <- dbGetQuery(
+  con_sdm,
+  "SELECT count(*) AS n FROM taxon WHERE er_score IS NULL"
+)$n
 stopifnot(n_null == 0)
 
 # summary by authority
 tbl(con_sdm, "taxon") |>
   mutate(
-    authority = CASE_WHEN(
+    authority = case_when(
       str_starts(extrisk_code, "NMFS") ~ "NMFS",
-      str_starts(extrisk_code, "FWS")  ~ "FWS",
+      str_starts(extrisk_code, "FWS") ~ "FWS",
       str_starts(extrisk_code, "IUCN") ~ "IUCN",
-      TRUE                             ~ "none")) |>
+      TRUE ~ "none"
+    )
+  ) |>
   count(authority) |>
   collect() |>
+  arrange(desc(n)) |>
   print()
+#   authority      n
+#   <chr>      <dbl>
+# 1 none      10,428
+# 2 IUCN       6,640
+# 3 FWS          259
+# 4 NMFS         234
 
 # summary by taxon_authority
 tbl(con_sdm, "taxon") |>
@@ -218,6 +360,10 @@ tbl(con_sdm, "taxon") |>
   count(taxon_authority) |>
   collect() |>
   print()
+#   taxon_authority     n
+#   <chr>           <dbl>
+# 1 botw              614
+# 2 worms            6519
 ```
 
 ## Step 4: Re-export taxon summary CSV
@@ -230,7 +376,7 @@ taxon_csv <- here("data/taxon.csv")
 d_taxon <- tbl(con_sdm, "taxon") |>
   select(
     is_ok,
-    component     = sp_cat,
+    component = sp_cat,
     common_name,
     scientific_name,
     redlist_code_max = redlist_code,
@@ -241,15 +387,17 @@ d_taxon <- tbl(con_sdm, "taxon") |>
     is_bcc,
     worms_is_marine,
     worms_is_extinct,
-    n_datasets    = n_ds,
+    n_datasets = n_ds,
     taxon_authority,
     taxon_id,
-    model_id      = mdl_seq) |>
+    model_id = mdl_seq
+  ) |>
   arrange(desc(is_ok), component, common_name) |>
   collect()
 
 write_csv(d_taxon, taxon_csv)
 message(glue("wrote {nrow(d_taxon)} rows to {taxon_csv}"))
+# wrote 17561 rows to /Users/bbest/Github/MarineSensitivity/workflows/data/taxon.csv
 ```
 
 ## Cleanup
@@ -262,8 +410,15 @@ dbDisconnect(con_sdm, shutdown = TRUE)
 
 ## Next steps
 
-Re-run `calc_scores.qmd` interactively in Positron starting from chunk
-`delete_extrisk_metrics` (line 472):
+Re-run `merge_models.qmd` interactively in Positron starting from chunk
+`notbirds_wormsid_ds_duplicates` (line 795). This rebuilds `taxon` (without
+per-dataset columns) and `taxon_model` (junction table with all dataset
+mdl_seq values including `ca_nmfs` and `rng_iucn`), re-runs the merge loop
+to create `ms_merge` models, populates listing/ESA/is_ok fields, and exports
+`data/taxon.csv`.
+
+Then re-run `calc_scores.qmd` starting from chunk `delete_extrisk_metrics`
+(line 472):
 
 1. `delete_extrisk_metrics` -- clear old metrics
 2. `calc_cell_metric_redlist` -- recompute cell-level extinction risk

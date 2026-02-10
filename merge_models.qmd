@@ -1751,9 +1751,11 @@ d_taxon <- bind_rows(
 # 8   9114.  13616.     18419 ▇▇▇▇▇
 
 # create taxon_model junction table ----
-ds_cols <- c("am_0.05", "ca_nmfs", "ch_nmfs", "ch_fws", "rng_fws", "bl")
+ds_keys <- tbl(con_sdm, "dataset") |>
+  filter(!ds_key %in% c("ms_merge")) |>
+  pull(ds_key)
 d_taxon_model <- d_taxon |>
-  select(taxon_id, any_of(ds_cols)) |>
+  select(taxon_id, any_of(ds_keys)) |>
   pivot_longer(
     -taxon_id,
     names_to  = "ds_key",
@@ -1768,7 +1770,7 @@ message(glue("taxon_model: {nrow(d_taxon_model)} rows"))
 
 # write taxon table without per-dataset columns ----
 d_taxon_clean <- d_taxon |>
-  select(-any_of(ds_cols))
+  select(-any_of(ds_keys))
 
 if (dbExistsTable(con_sdm, "taxon")) {
   dbExecute(con_sdm, "DELETE FROM taxon")
@@ -3048,6 +3050,53 @@ dbWriteTable(con_sdm, "dataset", row_dataset, append = TRUE)
 ```
 
 ```{r}
+#| label: dataset_metadata
+
+# add metadata columns to dataset table ----
+for (col_def in list(
+  c("name_display", "VARCHAR"),
+  c("value_info",   "VARCHAR"),
+  c("is_mask",      "BOOLEAN"),
+  c("sort_order",   "INTEGER"))) {
+  tryCatch(
+    dbExecute(con_sdm, glue(
+      "ALTER TABLE dataset ADD COLUMN {col_def[1]} {col_def[2]}")),
+    error = function(e) {
+      if (!grepl("already exists", e$message, ignore.case = TRUE))
+        stop(e)
+    })
+}
+
+# populate metadata for each dataset
+metadata <- tribble(
+  ~ds_key,    ~name_display,             ~value_info,                                  ~is_mask, ~sort_order,
+  "am_0.05",  "AquaMaps SDM",            NA,                                           FALSE,    1L,
+  "ca_nmfs",  "NMFS Core Area",          "Core: 100",                                  TRUE,     2L,
+  "ch_nmfs",  "NMFS Critical Habitat",   "EN:100, TN:50",                              TRUE,     3L,
+  "ch_fws",   "FWS Critical Habitat",    "EN:100, TN:50",                              TRUE,     4L,
+  "rng_fws",  "FWS Range",               "EN:100, TN:50, LC:1",                        TRUE,     5L,
+  "bl",       "BirdLife Range",           NA,                                           TRUE,     6L,
+  "rng_iucn", "IUCN Range",              "CR:100, EN:80, VU:60, NT:40, LC:20, DD:20",  TRUE,     7L,
+  "ms_merge", "Merged Model",            NA,                                           FALSE,    0L)
+
+for (i in 1:nrow(metadata)) {
+  m  <- metadata[i, ]
+  vi <- ifelse(is.na(m$value_info), "NULL", glue("'{m$value_info}'"))
+  dbExecute(con_sdm, glue(
+    "UPDATE dataset
+     SET name_display = '{m$name_display}',
+         value_info   = {vi},
+         is_mask      = {tolower(m$is_mask)},
+         sort_order   = {m$sort_order}
+     WHERE ds_key = '{m$ds_key}'"))
+}
+
+tbl(con_sdm, "dataset") |>
+  select(ds_key, name_display, is_mask, sort_order) |>
+  collect()
+```
+
+```{r}
 #| label: iterate_merge_ds_mdl
 ds_key <- "ms_merge"
 
@@ -3088,7 +3137,9 @@ ds_keys <- tbl(con_sdm, "dataset") |>
 # ds_keys_sdm  <- setdiff(ds_keys, "rng_iucn")   # OLD: excluding IUCN range map except for masking
 ds_keys_sdm <- ds_keys # NEW: include IUCN range map for max value SDM
 # datasets that form the combined mask (IUCN range + critical habitats + national range), only when rng_iucn exists for species
-ds_keys_mask <- c("rng_iucn", "ca_nmfs", "ch_fws", "ch_nmfs", "rng_fws", "bl")
+ds_keys_mask <- tbl(con_sdm, "dataset") |>
+  filter(is_mask) |>
+  pull(ds_key)
 
 for (i in 1:nrow(d_x)) {
   # i = 1  # which(str_detect(d_x$scientific_name, ".*ricei")) # i = 1512

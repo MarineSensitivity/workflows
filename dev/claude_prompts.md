@@ -1,4 +1,556 @@
-## 2026-02-10.b + 
+## 2026-02-10.d update derived products
+
+The database has been updated with the NMFS/FWS full species listing (@workflows/ingest_nmfs-fws-listings.qmd), and new "ca_nmfs" model for Rice's whale (@workflows/ingest_nmfs_core-areas.qmd). Assume that the merging of models (@workflows/merge_models.qmd) and calculation of scores (@workflows/calc_scores.qmd) have also been run. I need to quickly render derived products which are located @'~/My Drive/projects/msens/data/derived' and subdirectory @'~/My Drive/projects/msens/data/derived/downloads' (which may include copies from derived parent). Sort these by most recently updated to find matching code in one of the @workflows/*.qmd that generated it. Evaluate the R chunk and its dependents to come up with a plan for regenerating these from the latest model outputs.
+
+⏺ Updated plan
+  ⎿  /plan to preview
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Ready to code?
+
+ Here is Claude's plan:
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Plan: Regenerate Derived Products from Latest Model Outputs
+
+ Context
+
+ After ingesting updated NMFS/FWS full species listings and the new Rice's whale "ca_nmfs" model, merge_models.qmd and calc_scores.qmd have
+ been run — so sdm_2026.duckdb has updated cell_metric, zone_metric, and taxon tables. Now the derived export files need to be regenerated.
+
+ Files to regenerate
+ ┌───────────────────────────────────────────────────┬────────────────────┬────────────────────────────────────────────────────────────┐
+ │                       File                        │      Location      │                           Source                           │
+ ├───────────────────────────────────────────────────┼────────────────────┼────────────────────────────────────────────────────────────┤
+ │ zone_taxon_2026.csv                               │ derived/           │ calc_scores.qmd zone_taxon chunk (line 1967)               │
+ ├───────────────────────────────────────────────────┼────────────────────┼────────────────────────────────────────────────────────────┤
+ │ ply_planareas_2025.gpkg                           │ derived/           │ calc_scores.qmd update_cached_downloads (line 2381)        │
+ ├───────────────────────────────────────────────────┼────────────────────┼────────────────────────────────────────────────────────────┤
+ │ ply_programareas_2026.gpkg                        │ derived/           │ calc_scores.qmd update_cached_downloads (line 2381)        │
+ ├───────────────────────────────────────────────────┼────────────────────┼────────────────────────────────────────────────────────────┤
+ │ ply_ecoregions_2025.gpkg                          │ derived/           │ calc_scores.qmd update_cached_downloads (line 2381)        │
+ ├───────────────────────────────────────────────────┼────────────────────┼────────────────────────────────────────────────────────────┤
+ │ layers_2026.csv                                   │ derived/           │ calc_scores.qmd update_cached_downloads (line 2381)        │
+ ├───────────────────────────────────────────────────┼────────────────────┼────────────────────────────────────────────────────────────┤
+ │ r_metrics_2026.tif                                │ derived/           │ calc_scores.qmd update_cached_downloads (line 2381)        │
+ ├───────────────────────────────────────────────────┼────────────────────┼────────────────────────────────────────────────────────────┤
+ │ r_metrics_akl48.tif                               │ derived/           │ calc_scores.qmd within update_cached_downloads (line 2511) │
+ ├───────────────────────────────────────────────────┼────────────────────┼────────────────────────────────────────────────────────────┤
+ │ OCS_Area_Polygons_env_sensitivity_metrics.geojson │ derived/           │ calc_scores.qmd pa_metrics_geo (line 2555)                 │
+ ├───────────────────────────────────────────────────┼────────────────────┼────────────────────────────────────────────────────────────┤
+ │ sdm_parquet/                                      │ derived/           │ calc_scores.qmd export_parquet (line 2691)                 │
+ ├───────────────────────────────────────────────────┼────────────────────┼────────────────────────────────────────────────────────────┤
+ │ ply_planareas_2025.gpkg                           │ derived/downloads/ │ manual copy from derived/                                  │
+ ├───────────────────────────────────────────────────┼────────────────────┼────────────────────────────────────────────────────────────┤
+ │ ply_ecoregions_2025.gpkg                          │ derived/downloads/ │ manual copy from derived/                                  │
+ └───────────────────────────────────────────────────┴────────────────────┴────────────────────────────────────────────────────────────┘
+ Bug fixes needed before running (3 code changes in calc_scores.qmd)
+
+ Fix 1: redo_dl deletion loop is incomplete (line 2386)
+
+ Currently only deletes old-version files (lyrs_csv, metrics_tif), not the 2026 versions. The 2026 files won't regenerate if they already
+ exist.
+
+ File: workflows/calc_scores.qmd line 2386
+ Change:
+ `# before:
+ for (f in c(pa_gpkg, er_gpkg, lyrs_csv, metrics_tif)){
+
+ `# after:
+ for (f in c(pa_gpkg, pra_gpkg, er_gpkg, lyrs_csv, lyrs_2026_csv,
+             metrics_tif, metrics_2026_tif, metrics_akl48_tif)){
+
+ Fix 2: metrics_akl48_tif uses old raster and planarea_key (lines 2521-2527)
+
+ The 2026 raster has programarea_key (not planarea_key), and the code reads the old metrics_tif instead of metrics_2026_tif.
+
+ File: workflows/calc_scores.qmd lines 2517-2527
+ Change:
+ `# before:
+   pa_sr <- read_csv(sr_pa_csv) |>
+     filter(subregion_key == !!sr) |>
+     select(subregion_key, planarea_key)
+
+   r_metrics <- rast(metrics_tif)
+   r_pa <- subset(r_metrics, "planarea_key")
+   levels(r_pa) <- levels(r_pa)[[1]] |>
+     left_join(
+       pa_sr,
+       by = join_by(planarea_key)) |>
+     select(value, subregion_key)
+
+ `# after:
+   pra_sr <- read_csv(sr_pra_csv) |>
+     filter(subregion_key == !!sr) |>
+     select(subregion_key, programarea_key)
+
+   r_metrics <- rast(metrics_2026_tif)
+   r_pa <- subset(r_metrics, "programarea_key")
+   levels(r_pa) <- levels(r_pa)[[1]] |>
+     left_join(
+       pra_sr,
+       by = join_by(programarea_key)) |>
+     select(value, subregion_key)
+
+ Fix 3: export_parquet hard-codes old DB path (line 2695)
+
+ File: workflows/calc_scores.qmd line 2695
+ Change:
+ `# before:
+ sdm_db <- glue("{dir_data}/derived/sdm.duckdb")
+
+ `# after:
+ sdm_db <- glue("{dir_data}/derived/sdm_2026.duckdb")
+
+ Execution order in calc_scores.qmd (interactive RStudio)
+
+ Most chunks have eval: false — run them sequentially in RStudio:
+
+ 1. setup (line 22) — establishes con_sdm, paths, r_cell, get_rast()
+ 2. zone_taxon (line 1967) — rebuilds species-per-zone from updated data; writes zone_taxon_2026.csv and DuckDB zone_taxon table
+ 3. setup_update_pgtable_with_clear (line 2131) — defines update_table_with_clear(), opens PostGIS con
+ 4. pg_update_planarea_ecoregion_metrics_2025 (line 2184) — updates PostGIS planareas + ecoregions with latest metrics. NOTE: comment says
+ "DO NOT run to keep mapgl unchanged" — run it now since we want updated scores
+ 5. pg_update_programareas_metrics_2026 (line 2256) — updates PostGIS programareas with latest metrics
+ 6. pg_rm_old_metrics (line 2291) — removes obsolete metric columns
+ 7. add_index_for_vector_tiles (line 2353) — ensures primary keys for pg_tileserv
+ 8. re-add_con_sdm.cell (line 2364) — ensures cell table in DuckDB (no-op if exists)
+ 9. Apply Fix 1, Fix 2 above before running the next chunk
+ 10. update_cached_downloads (line 2381) — regenerates all gpkg, csv, tif files
+ 11. r_metrics_akl48_primprod_log (line 2541) — adds log-primprod layer to akl48 raster
+ 12. pa_metrics_geo (line 2555) — regenerates GeoJSON
+ 13. Apply Fix 3 above, then run export_parquet (line 2691) — exports to sdm_parquet/
+
+ Post-export: copy to downloads/
+
+ dir_dl <- glue("{dir_derived}/downloads")
+ file.copy(pa_gpkg,  glue("{dir_dl}/ply_planareas_2025.gpkg"),  overwrite = TRUE)
+ file.copy(er_gpkg,  glue("{dir_dl}/ply_ecoregions_2025.gpkg"), overwrite = TRUE)
+
+ Optional: update msens-summary_env-national-ocs.qmd
+
+ This workflow still references old paths (sdm.duckdb, r_metrics.tif). If you want to regenerate the summary maps, flower plots, and tables:
+
+ File: workflows/msens-summary_env-national-ocs.qmd
+ - Line 38: sdm.duckdb → sdm_2026.duckdb
+ - Line 43: r_metrics.tif → r_metrics_2026.tif
+ - Verify raster layer names (the 2026 raster uses programarea_key not planarea_key)
+
+ Then render to regenerate all figures, tables, and CSVs in figs/msens-summary_env-national-ocs/ and derived/.
+
+ Verification
+
+ After running all steps:
+ - Check file dates: ls -lt ~/My\ Drive/projects/msens/data/derived/ — all key files should show today's date
+ - Spot-check zone_taxon_2026.csv for Rice's whale entries
+ - Verify r_metrics_2026.tif has correct layers: terra::rast(metrics_2026_tif) |> names()
+ - Compare gpkg metric values for a known planning area against the DuckDB zone_metric table
+
+Consider writing a lookup table in @workflows/data/derived_products.csv with workflows qmd filename and R chunk responsible for writing to the output and perhaps a list of qmd.chunk dependencies.
+And a @workflows/render_derived_products.qmd with detailed instructions.
+
+We also need planarea_flower-plot_scores.png|pdf, table_planarea_scores.docx|xlsx, subregion_planareas.csv, table_ecoregion_planarea_scores.docx, table_planarea_scores.xlsx, tbl_er_pa_scores.csv, map_cell_score_l48.png, map_cell_score_ak.png, map_cell_npp_l48.png, map_cell_npp_ak.png, map_pa_l48.png, map_pa_ak.png -- but for Program Areas, not Planning Areas. Also try matching up products in the subfolder @'~/My Drive/projects/msens/data/derived/downloads/figures' -- we definitely need the latest greatest flower plots for Program Areas.
+
+## 2026-02-10.c run sequence after ran ingest_nmfs_core-areas.qmd, update_scores.qmd
+
+Now that I've added the NMFS Core Areas dataset for Rice's whale @workflows/ingest_nmfs_core-areas.qmd. I ran @workflows/update_scores.qmd, including the new pivoting of `taxon` to `taxon` and `taxon_model`, and it says for Next steps:
+
+```
+Re-run `calc_scores.qmd` interactively in Positron starting from chunk
+`delete_extrisk_metrics` (line 472):
+
+1. `delete_extrisk_metrics` -- clear old metrics
+2. `calc_cell_metric_redlist` -- recompute cell-level extinction risk
+3. `calc_ecoregion_minmax` through `cell_metric_score` -- rescale and aggregate
+4. `zone_taxon` -- per-zone species sensitivity with updated er_score
+```
+
+But I am pretty sure I need to run some or all of @workflows/merge_models.qmd next before @workflows/calc_scores.qmd.
+
+I need to also fix at least the Shiny app @apps_2026/mapsp/app.R and probably @apps_2026/mapgl/app.R to account for the new pivoted `taxon` to `taxon` and `taxon_model` structure. The model for rice's whale seems to have incorporated the ca_nmfs dataset correctly (since the core area has a score of 100 for NMFS:EN and not 50 for IUCN:CR), but the sidebar does not show the "ca_nmfs" model (mdl_seq = 23004; see screenshot attached). 
+
+I see the following new fields in table `taxon`: esa_code <chr>, esa_source <chr>, extrisk_code <chr>, er_score <int>, is_mmpa <lgl>, is_mbta <lgl>, is_bcc <lgl>. But I do not see `ca_nmfs` in the `taxon` table, which could partially explain why the app doesn't show that model.
+
+What needs fixing and what is the run sequence to get everything updated and working?
+
+Plan: Integrate ca_nmfs into pipeline and fix apps for taxon/taxon_model schema
+
+ Context
+
+ After running ingest_nmfs_core-areas.qmd (adds Rice's whale core distribution area as ca_nmfs dataset) and update_scores.qmd (pivoted per-dataset columns out of taxon into taxon_model junction table), there
+  are three problems:
+
+ 1. ca_nmfs is not in taxon_model — update_scores.qmd created taxon_model from tmp_taxon.csv which predates the ca_nmfs ingest. It also lacks rng_iucn rows.
+ 2. Merged models need re-running — The ms_merge models (which take max across datasets, masked by IUCN range) were not re-created to include ca_nmfs.
+ 3. Apps reference per-dataset columns in taxon — The mapsp app (apps_2026/mapsp/app.R line 110) selects am_0.05, ch_nmfs, ch_fws, rng_fws, bl, rng_iucn directly from the taxon table. After the schema
+ normalization, these need to come from taxon_model via a pivot join. Also ca_nmfs is missing from the app UI entirely.
+
+ Run Sequence
+
+ Step 1: Re-run merge_models.qmd (from chunk notbirds_wormsid_ds_duplicates, line 795)
+
+ The taxonomy resolution chunks (worms/itis/gbif ID updates, marine/extinct flags) are already done and stable. Re-run starting from the pivot step, which will:
+
+ - Pick up ca_nmfs from the species table (the ingest already added it)
+ - Build d_nb_ds / d_b_ds wide tables including ca_nmfs column
+ - Write taxon table (core columns only, per-dataset columns removed per line 1770)
+ - Write taxon_model junction table (with am_0.05, ca_nmfs, ch_nmfs, ch_fws, rng_fws, bl)
+ - Add redlist_code, extrisk_code, er_score, is_mmpa, is_mbta, is_bcc (listing join)
+ - Add worms_id, worms_is_marine, worms_is_extinct
+ - Add rng_iucn rows to taxon_model + update n_ds
+ - Add esa_code, esa_source
+ - Run merge loop (ms_merge models) — ca_nmfs is already in ds_keys_mask at line 3091
+ - Set is_ok flags
+ - Export data/taxon.csv
+
+ Chunks to run (in order):
+ notbirds_wormsid_ds_duplicates → notbirds_wormsid_ds_pivoted → update_turtle_to_reptile → bird_bl_to_botwid → birds_notbl_to_botwid → birds_notbl_to_botwid_common_ds → birds_notbl_to_botwid_common_acc →
+ birds_notbl_to_botwid_rmsubsp → birds_botwid_ds_duplicates → birds_botwid_ds_pivoted → bind_birds_notbirds_ds → notbirds_worms_sci → birds_botw_sci → birds_cmn → notbirds_cmn → taxon_to_db →
+ taxon_redlist_code → taxon_listing_join → taxon_worms_id_inclbirds → (worms_is_marine/extinct) → (ESA codes) → add_rng_iucn_to_taxon → insert_dataset_merged → iterate_merge_ds_mdl → taxon_is_ok →
+ taxon_summary
+
+ Step 2: Skip update_scores.qmd
+
+ Its functions are fully covered by merge_models.qmd:
+ - taxon_model creation ✓ (merge_models taxon_to_db chunk)
+ - model_cell value remapping ✓ (already done, values are now 1/50/100)
+ - listing join ✓ (merge_models taxon_listing_join chunk)
+ - taxon CSV export ✓ (merge_models taxon_summary chunk)
+
+ Step 3: Run calc_scores.qmd from chunk delete_extrisk_metrics (line 472)
+
+ As already noted in the update_scores.qmd next steps:
+ 1. delete_extrisk_metrics — clear old metrics
+ 2. calc_cell_metric_redlist — recompute cell-level extinction risk
+ 3. calc_ecoregion_minmax through cell_metric_score — rescale and aggregate
+ 4. zone_taxon — per-zone species sensitivity with updated er_score
+
+ Step 4: Fix apps_2026/mapsp/app.R
+
+ Update the app to use the normalized taxon + taxon_model structure and add ca_nmfs support.
+
+ 4a. Data prep: join taxon_model to reconstruct per-dataset columns
+
+ File: apps_2026/mapsp/app.R, lines 106-136
+
+ Replace direct select of per-dataset columns from taxon with a pivot-join from taxon_model:
+
+ '# query taxon base data (no per-dataset columns)
+ d_spp <- tbl(con_sdm, "taxon") |>
+   filter(is_ok, !is.na(mdl_seq)) |>
+   select(
+     taxon_id, scientific_name, common_name, sp_cat, n_ds, mdl_seq,
+     worms_id, redlist_code, esa_code, esa_source) |>
+   collect()
+
+ '# pivot taxon_model to get per-dataset mdl_seq columns
+ d_tm <- tbl(con_sdm, "taxon_model") |>
+   filter(taxon_id %in% !!d_spp$taxon_id) |>
+   collect() |>
+   pivot_wider(names_from = ds_key, values_from = mdl_seq)
+
+ '# join
+ d_spp <- d_spp |>
+   left_join(d_tm, by = "taxon_id") |>
+   mutate(...)  # existing label/URL mutations
+
+ 4b. Add ca_nmfs to ds_cols and UI definitions
+
+ Line 155: Add ca_nmfs to ds_cols:
+ ds_cols <- c("am_0.05", "ca_nmfs", "ch_nmfs", "ch_fws", "rng_fws", "bl", "rng_iucn")
+
+ Line 211-219: Add ca_nmfs to radioButtons choices:
+ "NMFS Core Area"  = "ca_nmfs",
+
+ Line 240-247: Add to layer_names:
+ "ca_nmfs"  = "NMFS Core Distribution Area",
+
+ Lines 329-340: Add to mdl_names and mdl_info:
+ '# in mdl_names:
+ "ca_nmfs"  = "NMFS Core Area",
+
+ '# in mdl_info:
+ "ca_nmfs"  = "Core: 100",
+
+ '# update ch_nmfs values (were remapped by update_scores.qmd):
+ "ch_nmfs"  = "EN:100, TN:50",   # was "EN:90, TN:70"
+
+ Lines 367, 371: Add ca_nmfs to ds_keys_values and ds_keys_mask:
+ ds_keys_values <- c("am_0.05", "ca_nmfs", "ch_nmfs", "ch_fws", "rng_fws", "bl", "rng_iucn")
+ ds_keys_mask <- c("rng_iucn", "ca_nmfs", "ch_nmfs", "ch_fws", "rng_fws")
+
+ Lines 592-599: Add ca_nmfs to available layers check:
+ if (!is.na(sp_row$ca_nmfs))    available <- c(available, "NMFS Core Area"  = "ca_nmfs")
+
+ Step 5: Check apps_2026/mapgl/app.R
+
+ The mapgl app does NOT query per-dataset columns from taxon — it uses zone_taxon for species tables and metric/cell_metric for raster layers. No changes needed unless the zone_taxon table columns changed
+ (they shouldn't have).
+
+ Files Modified
+ ┌───────────────────────┬──────────────────────────────────────────────────────────┐
+ │         File          │                          Change                          │
+ ├───────────────────────┼──────────────────────────────────────────────────────────┤
+ │ apps_2026/mapsp/app.R │ Join taxon_model for per-dataset cols; add ca_nmfs to UI │
+ └───────────────────────┴──────────────────────────────────────────────────────────┘
+ Files Run (not modified, executed interactively in Positron)
+ ┌────────────────────────────┬──────────────────────────────────────────────────────────────────┐
+ │            File            │                              Scope                               │
+ ├────────────────────────────┼──────────────────────────────────────────────────────────────────┤
+ │ workflows/merge_models.qmd │ From chunk notbirds_wormsid_ds_duplicates (line 795) through end │
+ ├────────────────────────────┼──────────────────────────────────────────────────────────────────┤
+ │ workflows/calc_scores.qmd  │ From chunk delete_extrisk_metrics (line 472) through end         │
+ └────────────────────────────┴──────────────────────────────────────────────────────────────────┘
+ Verification
+
+ 1. After merge_models.qmd: check taxon_model has ca_nmfs rows for Rice's whale (worms_id: 1576133)
+ 2. After merge_models.qmd: check taxon.mdl_seq for Rice's whale is a merged model incorporating ca_nmfs
+ 3. After calc_scores.qmd: verify zone_taxon and cell_metric tables are updated
+ 4. After app fix: run mapsp app locally, select Rice's whale, verify sidebar shows "NMFS Core Area" link and ca_nmfs model is selectable
+
+Please fix Next Steps in @update_scores.qmd, which is what I ran last, with these precise next steps and rationale from the plan.
+When should dataset columns in taxon be removed from the table, so we're only pulling from taxon_model for this info?
+Could `ds_cols` be updated via query of taxon_model for all datasets and renamed to something more sensible that doesn't referencing columns (`_cols`)?
+Likewise could the dataset table be updated with a column or columns if not yet there that gets used for radioButton choices, layer_names, mdl_names, mdl_info, ds_keys_values, ds_keys_mask via query?
+
+⏺ Updated plan                                          
+  ⎿  /plan to preview
+                                                                                                                                                                                                                
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Ready to code?                                                                                                                                                                                                 
+                                                                                                                                                                                                                
+ Here is Claude's plan:
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Plan: Integrate ca_nmfs, normalize taxon/taxon_model, data-driven app metadata
+
+ Context
+
+ After running ingest_nmfs_core-areas.qmd and update_scores.qmd, three problems exist:
+
+ 1. taxon_model is incomplete — Missing ca_nmfs and rng_iucn rows (created from old tmp_taxon.csv)
+ 2. Merged models stale — ms_merge models don't incorporate ca_nmfs
+ 3. Apps hardcode dataset metadata — Per-dataset columns queried from taxon (should use taxon_model), and all display names/info/mask flags are hardcoded in mapsp/app.R
+
+ The fix normalizes the schema fully and makes app metadata data-driven from the dataset table.
+
+ ---
+ Part A: Schema & Pipeline Changes
+
+ A1. Add metadata columns to dataset table
+
+ Add these columns to the dataset table (via ALTER TABLE in merge_models.qmd, before the merge loop):
+ ┌──────────────┬─────────┬──────────────────────────────────────────┬────────────────────────────────────────────────┐
+ │    Column    │  Type   │                 Purpose                  │                 Example values                 │
+ ├──────────────┼─────────┼──────────────────────────────────────────┼────────────────────────────────────────────────┤
+ │ name_display │ VARCHAR │ Short UI label for radioButtons/legends  │ "AquaMaps SDM", "NMFS Core Area", "IUCN Range" │
+ ├──────────────┼─────────┼──────────────────────────────────────────┼────────────────────────────────────────────────┤
+ │ value_info   │ VARCHAR │ Value explanation tooltip (NULL if none) │ "EN:100, TN:50", "Core: 100", NULL             │
+ ├──────────────┼─────────┼──────────────────────────────────────────┼────────────────────────────────────────────────┤
+ │ is_mask      │ BOOLEAN │ Participates in IUCN range masking       │ TRUE for all except am_0.05 and ms_merge       │
+ ├──────────────┼─────────┼──────────────────────────────────────────┼────────────────────────────────────────────────┤
+ │ sort_order   │ INTEGER │ Display ordering in UI                   │ 1=AquaMaps, 2=NMFS Core, 3=NMFS CH, ...        │
+ └──────────────┴─────────┴──────────────────────────────────────────┴────────────────────────────────────────────────┘
+ Values to populate:
+ ┌──────────┬───────────────────────┬─────────────────────────────────────────────┬─────────┬────────────┐
+ │  ds_key  │     name_display      │                 value_info                  │ is_mask │ sort_order │
+ ├──────────┼───────────────────────┼─────────────────────────────────────────────┼─────────┼────────────┤
+ │ am_0.05  │ AquaMaps SDM          │ NULL                                        │ FALSE   │ 1          │
+ ├──────────┼───────────────────────┼─────────────────────────────────────────────┼─────────┼────────────┤
+ │ ca_nmfs  │ NMFS Core Area        │ "Core: 100"                                 │ TRUE    │ 2          │
+ ├──────────┼───────────────────────┼─────────────────────────────────────────────┼─────────┼────────────┤
+ │ ch_nmfs  │ NMFS Critical Habitat │ "EN:100, TN:50"                             │ TRUE    │ 3          │
+ ├──────────┼───────────────────────┼─────────────────────────────────────────────┼─────────┼────────────┤
+ │ ch_fws   │ FWS Critical Habitat  │ "EN:100, TN:50"                             │ TRUE    │ 4          │
+ ├──────────┼───────────────────────┼─────────────────────────────────────────────┼─────────┼────────────┤
+ │ rng_fws  │ FWS Range             │ "EN:100, TN:50, LC:1"                       │ TRUE    │ 5          │
+ ├──────────┼───────────────────────┼─────────────────────────────────────────────┼─────────┼────────────┤
+ │ bl       │ BirdLife Range        │ NULL                                        │ TRUE    │ 6          │
+ ├──────────┼───────────────────────┼─────────────────────────────────────────────┼─────────┼────────────┤
+ │ rng_iucn │ IUCN Range            │ "CR:100, EN:80, VU:60, NT:40, LC:20, DD:20" │ TRUE    │ 7          │
+ ├──────────┼───────────────────────┼─────────────────────────────────────────────┼─────────┼────────────┤
+ │ ms_merge │ Merged Model          │ NULL                                        │ FALSE   │ 0          │
+ └──────────┴───────────────────────┴─────────────────────────────────────────────┴─────────┴────────────┘
+ File: workflows/merge_models.qmd — add a new chunk after insert_dataset_merged (line 3048) that runs ALTER TABLE + UPDATE statements.
+
+ A2. Derive ds_keys dynamically (replaces hardcoded ds_cols)
+
+ In merge_models.qmd, replace:
+ ds_cols <- c("am_0.05", "ca_nmfs", "ch_nmfs", "ch_fws", "rng_fws", "bl")
+ With:
+ ds_keys <- tbl(con_sdm, "dataset") |>
+   filter(!ds_key %in% c("ms_merge")) |>
+   pull(ds_key)
+
+ This automatically picks up any new datasets. Used for:
+ - Pivoting taxon_model from wide format (merge_models.qmd:1754)
+ - Removing per-dataset columns from taxon (merge_models.qmd:1770)
+ - Building ds_keys_mask: tbl(con_sdm, "dataset") |> filter(is_mask) |> pull(ds_key)
+
+ A3. Per-dataset columns removed from taxon table
+
+ When: In merge_models.qmd, chunk taxon_to_db (line 1770) — this already does select(-any_of(ds_cols)). After re-running merge_models.qmd, the taxon table will have only core columns. The per-dataset mdl_seq
+  values live exclusively in taxon_model.
+
+ taxon table final columns:
+ taxon_id, taxon_authority, sp_cat, scientific_name, common_name, n_ds, mdl_seq, redlist_code, extrisk_code, er_score, is_mmpa, is_mbta, is_bcc, worms_id, worms_is_marine, worms_is_extinct, esa_code,
+ esa_source, is_ok
+
+ taxon_model junction table columns:
+ taxon_id, ds_key, mdl_seq
+
+ ---
+ Part B: Run Sequence
+
+ B1. Re-run merge_models.qmd from chunk notbirds_wormsid_ds_duplicates (line 795) through end
+
+ This rebuilds everything:
+ - taxon + taxon_model (with ca_nmfs, later rng_iucn + ms_merge rows appended)
+ - Merge loop (ca_nmfs already in ds_keys_mask at line 3091)
+ - Listing join, ESA codes, is_ok flags, taxon CSV export
+
+ B2. Skip update_scores.qmd
+
+ All its steps are covered by merge_models.qmd. Only edit it to update the Next Steps section (see Part D).
+
+ B3. Run calc_scores.qmd from chunk delete_extrisk_metrics (line 472)
+
+ 1. delete_extrisk_metrics → 2. calc_cell_metric_redlist → 3. calc_ecoregion_minmax through cell_metric_score → 4. zone_taxon
+
+ ---
+ Part C: Fix apps_2026/mapsp/app.R
+
+ C1. Data prep: pivot taxon_model for per-dataset columns (lines 106-136)
+
+ Replace hardcoded select of per-dataset columns from taxon:
+
+ '# query taxon base data (no per-dataset columns)
+ d_spp <- tbl(con_sdm, "taxon") |>
+   filter(is_ok, !is.na(mdl_seq)) |>
+   select(
+     taxon_id, scientific_name, common_name, sp_cat, n_ds, mdl_seq,
+     worms_id, redlist_code, esa_code, esa_source) |>
+   collect()
+
+ '# pivot taxon_model to wide format, join to taxon
+ d_tm <- tbl(con_sdm, "taxon_model") |>
+   filter(taxon_id %in% !!d_spp$taxon_id) |>
+   collect() |>
+   pivot_wider(names_from = ds_key, values_from = mdl_seq)
+
+ d_spp <- d_spp |>
+   left_join(d_tm, by = "taxon_id") |>
+   mutate(...)  # existing label/URL mutations
+
+ C2. Query dataset table for all metadata (replaces hardcoded maps)
+
+ Replace all hardcoded named vectors with queries from dataset:
+
+ '# query dataset metadata once at startup
+ d_datasets <- tbl(con_sdm, "dataset") |>
+   select(ds_key, name_display, value_info, is_mask, sort_order) |>
+   collect() |>
+   arrange(sort_order)
+
+ '# derive what was previously hardcoded
+ ds_keys     <- d_datasets |> filter(!ds_key %in% c("ms_merge")) |> pull(ds_key)
+ layer_names <- c("mdl_seq" = "Merged Model", deframe(d_datasets |> filter(ds_key != "ms_merge") |> select(ds_key, name_display)))
+ mdl_names   <- deframe(d_datasets |> filter(ds_key != "ms_merge") |> select(ds_key, name_display))
+ mdl_info    <- deframe(d_datasets |> filter(!is.na(value_info)) |> select(ds_key, value_info))
+ ds_keys_mask <- d_datasets |> filter(is_mask) |> pull(ds_key)
+
+ C3. Update radioButtons and available layers (lines 211-219, 592-599)
+
+ Build radioButtons choices dynamically from d_datasets:
+ radio_choices <- c("Merged Model" = "mdl_seq")
+ for (i in seq_len(nrow(d_datasets))) {
+   dk <- d_datasets$ds_key[i]
+   if (dk != "ms_merge") radio_choices[d_datasets$name_display[i]] <- dk
+ }
+
+ Build available layers dynamically:
+ available <- c()
+ if (!is.na(sp_row$mdl_seq)) available <- c(available, "Merged Model" = "mdl_seq")
+ for (dk in ds_keys) {
+   if (dk %in% names(sp_row) && !is.na(sp_row[[dk]])) {
+     available <- c(available, setNames(dk, d_datasets$name_display[d_datasets$ds_key == dk]))
+   }
+ }
+
+ C4. No changes needed for apps_2026/mapgl/app.R
+
+ Uses zone_taxon and metric/cell_metric, not per-dataset taxon columns.
+
+ ---
+ Part D: Update update_scores.qmd Next Steps section
+
+ File: workflows/update_scores.qmd, lines 411-419
+
+ Replace with:
+
+ '## Next steps
+
+ Re-run `merge_models.qmd` interactively in Positron starting from chunk
+ `notbirds_wormsid_ds_duplicates` (line 795). This rebuilds `taxon` (without
+ per-dataset columns) and `taxon_model` (junction table with all dataset
+ mdl_seq values including `ca_nmfs` and `rng_iucn`), re-runs the merge loop
+ to create `ms_merge` models, populates listing/ESA/is_ok fields, and exports
+ `data/taxon.csv`.
+
+ Then re-run `calc_scores.qmd` starting from chunk `delete_extrisk_metrics`
+ (line 472):
+
+ 1. `delete_extrisk_metrics` -- clear old metrics
+ 2. `calc_cell_metric_redlist` -- recompute cell-level extinction risk
+ 3. `calc_ecoregion_minmax` through `cell_metric_score` -- rescale and aggregate
+ 4. `zone_taxon` -- per-zone species sensitivity with updated er_score
+
+ ---
+ Files Modified
+ ┌─────────────────────────────┬────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │            File             │                                                                          Changes                                                                           │
+ ├─────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ workflows/update_scores.qmd │ Update Next Steps section (lines 411-419)                                                                                                                  │
+ ├─────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ workflows/merge_models.qmd  │ Add dataset metadata columns chunk; replace hardcoded ds_cols with dynamic ds_keys query (line 1754); derive ds_keys_mask from dataset.is_mask (line 3091) │
+ ├─────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ apps_2026/mapsp/app.R       │ Pivot-join from taxon_model; query dataset table for all metadata; remove all hardcoded ds_key lists                                                       │
+ └─────────────────────────────┴────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ Files Run Interactively (not modified by Claude)
+ ┌────────────────────────────┬────────────────────────────────────────────────────────────┐
+ │            File            │                           Scope                            │
+ ├────────────────────────────┼────────────────────────────────────────────────────────────┤
+ │ workflows/merge_models.qmd │ From notbirds_wormsid_ds_duplicates (line 795) through end │
+ ├────────────────────────────┼────────────────────────────────────────────────────────────┤
+ │ workflows/calc_scores.qmd  │ From delete_extrisk_metrics (line 472) through end         │
+ └────────────────────────────┴────────────────────────────────────────────────────────────┘
+ Verification
+
+ 1. After merge_models: SELECT ds_key, name_display, is_mask FROM dataset shows all 8 datasets with metadata
+ 2. After merge_models: SELECT * FROM taxon_model WHERE taxon_id = 1576133 shows ca_nmfs row for Rice's whale
+ 3. After merge_models: taxon table has NO per-dataset columns (only core + metadata columns)
+ 4. After calc_scores: zone_taxon and cell_metric tables updated
+ 5. After app fix: run mapsp locally, select Rice's whale → sidebar shows "NMFS Core Area" link, all layer switches work
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+
+⏺ All changes are implemented. Here's a summary of what was done:                                                                                                                                               
+                                                                                   
+  Files Modified
+
+  workflows/update_scores.qmd — Updated Next Steps section to reference the full pipeline: re-run merge_models.qmd from notbirds_wormsid_ds_duplicates first, then calc_scores.qmd.                             
+    
+  workflows/merge_models.qmd — Three changes:                                                                                                                                                                   
+  1. Line 1754: Replaced hardcoded ds_cols vector with dynamic ds_keys query from dataset table (also updated references at lines 1758, 1773)                                                                   
+  2. After line 3048: Added new dataset_metadata chunk that ALTERs the dataset table to add name_display, value_info, is_mask, sort_order columns and populates them for all 8 datasets                         
+  3. Line 3091: Replaced hardcoded ds_keys_mask with dynamic query: tbl(con_sdm, "dataset") |> filter(is_mask) |> pull(ds_key)                                                                                  
+
+  apps_2026/mapsp/app.R — Made fully data-driven:
+  1. Data prep (lines 102-185): Queries d_datasets from the dataset table at startup; derives ds_keys, layer_names, mdl_names, mdl_info, ds_keys_mask from it; queries taxon without per-dataset columns; pivots
+   taxon_model to wide format and joins
+  2. RadioButtons (line 228): Built dynamically from d_datasets
+  3. Server: Removed hardcoded layer_names (now top-level); removed hardcoded mdl_names, mdl_info, ds_keys_values, ds_keys_mask from species_info; builds available layers dynamically in
+  observeEvent(input$sel_sp)
+
+
+## 2026-02-10.b + ingest_nmfs_core-areas.qmd for ricei
 
 Create a new notebook ingest_nmfs_core-areas.qmd to add a dataset “NMFS Core Areas” (ca_nmfs) in sdm_2026.duckdb. Burn in a new model and model_cell values for Rice’s whale (_Balaenoptera ricei; worms_id:1576133) into the database. Apply the highest weighting of “NMFS:EN” (100). The spatial footprint is found here:
 
