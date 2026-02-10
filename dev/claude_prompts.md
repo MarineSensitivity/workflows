@@ -573,6 +573,78 @@ Update plan to capture changes to `@workflows/calc_scores.qmd` that incorporate 
  - PRA maps: show program area boundaries with correct score coloring
  - Compare table scores against zone_metric in DuckDB
 
+⏺ All 4 deliverables are complete. Here's a summary of what was done:          
+                                          
+  A. Fixed calc_scores.qmd — 4 targeted edits                                                                                                           
+                                          
+  1. Fix 2 (line 3038): Expanded redo_dl deletion loop to include all versioned files: pra_gpkg, lyrs_2026_csv, metrics_tif, metrics_akl48_tif          
+  2. Fix 3 (lines 3186-3199): Changed metrics_akl48_tif generation to use sr_pra_csv/programarea_key instead of sr_pa_csv/planarea_key, and reads
+  metrics_2026_tif (already correct)                                                                                                                    
+  3. Fix 4 (line 3385): Changed export_parquet DB path from sdm.duckdb to sdm_2026.duckdb                                                               
+                                                                                                                                                        
+  B. Created workflows/msens-summary_programareas.qmd                                                                                                   
+
+  New ~700-line Quarto notebook adapted from the PA version with:
+  - Versioned paths (v_int <- 3, v_sfx <- "_v3")
+  - All chunks adapted: read_plys (ecoregion × program area intersection), ply_lbl_pts, map_imgs_pra_ply_l48_ak, map_imgs_cell_l48_ak, pra_score_table,
+  flextable_er_pra, flextable_pra (docx + xlsx), plot_ecoregion_flowers, plot_programarea_flowers (5 themes), plot_primprod, copy_to_downloads
+  - Queries use tbl == "ply_programareas_2026_v3" and fld == "programarea_key"
+  - PostGIS tile URLs use versioned table names
+
+  C. Created workflows/data/derived_products.csv
+
+  Catalogs 35 output files with columns: output_file, output_dir, source_qmd, source_chunk, dependencies, description
+
+  D. Created workflows/render_derived_products.qmd
+
+  Step-by-step guide with: archive old files, calc_scores.qmd chunk execution order (12 steps), copy to downloads, render PRA summary, and verification
+  checks (file dates, Rice's whale, raster layers, facet count).
+
+
+What is the sequence I should run? I think I already ran everything updated in @workflows/calc_scores.qmd (but you could easily inspect filesystem to confirm)
+
+⏺ Here's what I see from the filesystem:                                                                                                                
+                                                                                                                                                        
+  Already completed today (Feb 10)                                                                                                                      
+  ┌───────────────────────────────┬───────────┬─────────────────────────┐                                                                               
+  │             File              │ Timestamp │      Source chunk       │                                                                               
+  ├───────────────────────────────┼───────────┼─────────────────────────┤                                                                               
+  │ zone_taxon_2026_v3.csv        │ 12:46     │ zone_taxon              │                                                                               
+  ├───────────────────────────────┼───────────┼─────────────────────────┤                                                                               
+  │ ply_programareas_2026_v3.gpkg │ 14:43     │ update_cached_downloads │                                                                               
+  ├───────────────────────────────┼───────────┼─────────────────────────┤                                                                               
+  │ layers_2026_v3.csv            │ 14:43     │ update_cached_downloads │                                                                               
+  ├───────────────────────────────┼───────────┼─────────────────────────┤                                                                               
+  │ ply_planareas_2025_v3.gpkg    │ 14:45     │ update_cached_downloads │
+  ├───────────────────────────────┼───────────┼─────────────────────────┤
+  │ ply_ecoregions_2025_v3.gpkg   │ 14:45     │ update_cached_downloads │
+  ├───────────────────────────────┼───────────┼─────────────────────────┤
+  │ r_metrics_2026_v3.tif         │ 14:45     │ update_cached_downloads │
+  ├───────────────────────────────┼───────────┼─────────────────────────┤
+  │ sdm_parquet/                  │ 15:08     │ export_parquet          │
+  └───────────────────────────────┴───────────┴─────────────────────────┘
+  Still missing (not yet regenerated with v3)
+  ┌────────────────────────┬────────────────────────────────────────────────────────┬─────────────────────────────────────────────────────┐
+  │          File          │                         Status                         │                    Source chunk                     │
+  ├────────────────────────┼────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ r_metrics_akl48_v3.tif │ missing — only old r_metrics_akl48.tif (Aug 18) exists │ update_cached_downloads → metrics_akl48_tif section │
+  ├────────────────────────┼────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ OCS_...Metrics.geojson │ stale (Aug 7)                                          │ pa_metrics_geo                                      │
+  └────────────────────────┴────────────────────────────────────────────────────────┴─────────────────────────────────────────────────────┘
+  Remaining sequence to run
+
+  1. update_cached_downloads (line 3032) — re-run just the metrics_akl48_tif section (line 3180). This will now use the fixed code (programarea_key +
+  sr_pra_csv + metrics_2026_tif).
+  2. r_metrics_akl48_primprod_log (line 3211) — adds primprod_log layer to the new AKL48 raster
+  3. pa_metrics_geo (line 3226) — regenerate the GeoJSON (optional, planning areas only)
+  4. Archive old downloads — run the archive chunk in render_derived_products.qmd
+  5. Copy calc_scores outputs to downloads — run the copy chunk in render_derived_products.qmd
+  6. Run msens-summary_programareas.qmd — all chunks, generates PRA maps/tables/flowers/primprod
+  7. Verify — spot-check Rice's whale, raster layers, facet count
+
+  The critical next step is #1 — generating r_metrics_akl48_v3.tif — since that's the only v3 derived file missing from calc_scores.qmd. Everything else
+   from that notebook is done.
+
 
 
 ## 2026-02-10.c run sequence after ran ingest_nmfs_core-areas.qmd, update_scores.qmd
@@ -1673,6 +1745,52 @@ What do I need to run next to update all outputs to the latest versions?
   shiny::runApp(here::here("apps_2026/mapsp"))
 
   Confirm program area fills and ecoregion outlines render. The storymap app should still work with v2 tables (untouched).
+
+What is the sequence I should run? I think I already ran everything updated in @workflows/calc_scores.qmd (but you could easily inspect filesystem to confirm) 
+
+⏺ Here's what I see from the filesystem:                                                                                                                
+                                                                                                                                                        
+  Already completed today (Feb 10)                                                                                                                      
+  ┌───────────────────────────────┬───────────┬─────────────────────────┐                                                                               
+  │             File              │ Timestamp │      Source chunk       │                                                                               
+  ├───────────────────────────────┼───────────┼─────────────────────────┤                                                                               
+  │ zone_taxon_2026_v3.csv        │ 12:46     │ zone_taxon              │                                                                               
+  ├───────────────────────────────┼───────────┼─────────────────────────┤                                                                               
+  │ ply_programareas_2026_v3.gpkg │ 14:43     │ update_cached_downloads │                                                                               
+  ├───────────────────────────────┼───────────┼─────────────────────────┤                                                                               
+  │ layers_2026_v3.csv            │ 14:43     │ update_cached_downloads │                                                                               
+  ├───────────────────────────────┼───────────┼─────────────────────────┤                                                                               
+  │ ply_planareas_2025_v3.gpkg    │ 14:45     │ update_cached_downloads │
+  ├───────────────────────────────┼───────────┼─────────────────────────┤
+  │ ply_ecoregions_2025_v3.gpkg   │ 14:45     │ update_cached_downloads │
+  ├───────────────────────────────┼───────────┼─────────────────────────┤
+  │ r_metrics_2026_v3.tif         │ 14:45     │ update_cached_downloads │
+  ├───────────────────────────────┼───────────┼─────────────────────────┤
+  │ sdm_parquet/                  │ 15:08     │ export_parquet          │
+  └───────────────────────────────┴───────────┴─────────────────────────┘
+  Still missing (not yet regenerated with v3)
+  ┌────────────────────────┬────────────────────────────────────────────────────────┬─────────────────────────────────────────────────────┐
+  │          File          │                         Status                         │                    Source chunk                     │
+  ├────────────────────────┼────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ r_metrics_akl48_v3.tif │ missing — only old r_metrics_akl48.tif (Aug 18) exists │ update_cached_downloads → metrics_akl48_tif section │
+  ├────────────────────────┼────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ OCS_...Metrics.geojson │ stale (Aug 7)                                          │ pa_metrics_geo                                      │
+  └────────────────────────┴────────────────────────────────────────────────────────┴─────────────────────────────────────────────────────┘
+  Remaining sequence to run
+
+  1. update_cached_downloads (line 3032) — re-run just the metrics_akl48_tif section (line 3180). This will now use the fixed code (programarea_key +
+  sr_pra_csv + metrics_2026_tif).
+  2. r_metrics_akl48_primprod_log (line 3211) — adds primprod_log layer to the new AKL48 raster
+  3. pa_metrics_geo (line 3226) — regenerate the GeoJSON (optional, planning areas only)
+  4. Archive old downloads — run the archive chunk in render_derived_products.qmd
+  5. Copy calc_scores outputs to downloads — run the copy chunk in render_derived_products.qmd
+  6. Run msens-summary_programareas.qmd — all chunks, generates PRA maps/tables/flowers/primprod
+  7. Verify — spot-check Rice's whale, raster layers, facet count
+
+  The critical next step is #1 — generating r_metrics_akl48_v3.tif — since that's the only v3 derived file missing from calc_scores.qmd. Everything else
+   from that notebook is done.
+
+
 
 ## 2026-02-10.b + ingest_nmfs_core-areas.qmd for ricei
 

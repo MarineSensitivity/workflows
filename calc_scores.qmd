@@ -3035,7 +3035,16 @@ redo_dl <- T
 
 # redo_dl: delete existing files
 if (redo_dl) {
-  for (f in c(pa_gpkg, er_gpkg, lyrs_csv, metrics_2026_tif)) {
+  for (f in c(
+    pa_gpkg,
+    pra_gpkg,
+    er_gpkg,
+    lyrs_csv,
+    lyrs_2026_csv,
+    metrics_tif,
+    metrics_2026_tif,
+    metrics_akl48_tif
+  )) {
     if (file_exists(f)) {
       file_delete(f)
     }
@@ -3182,24 +3191,28 @@ if (!file.exists(metrics_akl48_tif)) {
   message("Generating Metrics AKL48 raster...")
   # mask to study area Alaska & Lower-48 USA mainland
 
-  sr <- "AKL48"
-  pa_sr <- read_csv(sr_pa_csv) |>
+  # subregion_keys in sr_pra_csv: USA (all 20), AK (15), PA (3), GA (2)
+  # AK + L48 = USA (all program areas)
+  sr <- "USA"
+  pra_sr <- read_csv(sr_pra_csv) |>
     filter(subregion_key == !!sr) |>
-    select(subregion_key, planarea_key)
-
+    pull(programarea_key)
+   
   r_metrics <- rast(metrics_2026_tif)
-  r_pa <- subset(r_metrics, "planarea_key")
-  levels(r_pa) <- levels(r_pa)[[1]] |>
-    left_join(
-      pa_sr,
-      by = join_by(planarea_key)
-    ) |>
-    select(value, subregion_key)
-  r_pa <- simplifyLevels(r_pa)
-  r_pa[r_pa != 1] <- NA
-  # plot(r_pa)
+  r_pa <- subset(r_metrics, "programarea_key")
+
+  # get integer codes for AKL48 program areas from the category table
+  ct <- cats(r_pa)[[1]]
+  # first column is the integer code (may be named 'id' or 'value')
+  akl48_ids <- ct[[1]][ct$programarea_key %in% pra_sr]
+
+  # strip categories to get raw integer raster, then mask
+  r_pa_int <- r_pa
+  levels(r_pa_int) <- NULL
+  r_mask <- ifel(r_pa_int %in% akl48_ids, 1, NA)
+  # plot(r_mask)
   r_metrics_akl48 <- r_metrics |>
-    mask(r_pa) |>
+    mask(r_mask) |>
     trim()
   # plot(r_metrics_akl48[[1]])
   # plot(r_metrics_akl48[[3]])
@@ -3382,7 +3395,7 @@ mapgl_rast(r_m, layer_name = m_key)
 #| eval: false
 # TODO: model_cell: PARTITION BY (mdl_seq);") # https://duckdb.org/docs/stable/data/parquet/overview
 
-sdm_db <- glue("{dir_data}/derived/sdm.duckdb")
+sdm_db <- glue("{dir_data}/derived/sdm_2026.duckdb")
 
 source(here("libs/sdm_functions.R"))
 con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F)) |>
@@ -3407,18 +3420,20 @@ tbl_keys <- list(
   cell_metric = c("cell_id", "metric_seq"),
   # cell_model  = c("cell_id", "mdl_seq"),   # source: model_cell; alternative key sorting order
   dataset = "ds_key",
+  listing = "spp_id",
   metric = "metric_seq",
   model = "mdl_seq",
   model_cell = c("mdl_seq", "cell_id"), # *big* one
   species = "sp_seq",
   taxon = "taxon_id",
+  taxon_model = c("taxon_id", "ds_key"),
   zone = "zone_seq",
   zone_cell = c("zone_seq", "cell_id"),
   zone_metric = c("zone_seq", "metric_seq"),
   zone_taxon = c("zone_fld", "zone_value", "mdl_seq", "taxon_id")
 )
-stopifnot(all(names(tbl_keys) %in% dbListTables(con_sdm)))
-stopifnot(all(dbListTables(con_sdm) %in% names(tbl_keys)))
+stopifnot(length(setdiff(names(tbl_keys), dbListTables(con_sdm))) == 0)
+stopifnot(length(setdiff(dbListTables(con_sdm), names(tbl_keys))) == 0)
 
 # export parquet files with sort order
 for (tbl in names(tbl_keys)) {
