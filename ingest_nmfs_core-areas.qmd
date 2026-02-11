@@ -20,9 +20,11 @@ librarian::shelf(
   quiet = T)
 
 ds_key    <- "ca_nmfs"
+v_int     <- 3
+v_sfx     <- paste0("_v", v_int)
 is_server <- Sys.info()[["sysname"]] == "Linux"
 dir_data  <- ifelse(is_server, "/share/data", "~/My Drive/projects/msens/data")
-sdm_db    <- glue("{dir_data}/derived/sdm_2026.duckdb")
+sdm_db    <- glue("{dir_data}/derived/sdm{v_sfx}.duckdb")
 cell_tif  <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
 
 con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F))
@@ -151,6 +153,26 @@ d_mdl_cell <- d_iucn_cells |>
 dbWriteTable(con_sdm, "model_cell", d_mdl_cell, append = T)
 ```
 
+### Add `taxon_model` entry
+
+```{r}
+#| label: add_taxon_model
+# look up taxon_id for rice's whale
+tid <- tbl(con_sdm, "taxon") |>
+  filter(worms_id == !!worms_id) |>
+  pull(taxon_id)
+stopifnot(length(tid) == 1)
+
+# delete existing ca_nmfs entries for this taxon (idempotent re-runs)
+dbExecute(con_sdm, glue(
+  "DELETE FROM taxon_model WHERE ds_key = '{ds_key}' AND taxon_id = {tid}"))
+
+# insert new mapping
+d_tm <- tibble(taxon_id = tid, ds_key = ds_key, mdl_seq = mdl_seq)
+dbWriteTable(con_sdm, "taxon_model", d_tm, append = TRUE)
+message(glue("Added taxon_model: taxon_id={tid}, ds_key={ds_key}, mdl_seq={mdl_seq}"))
+```
+
 ### Verify
 
 ```{r}
@@ -177,6 +199,13 @@ d_vals <- tbl(con_sdm, "model_cell") |>
   collect()
 message(glue("value range: {d_vals$v_min} - {d_vals$v_max}"))
 stopifnot(d_vals$v_min == 100, d_vals$v_max == 100)
+
+# verify taxon_model entry
+d_tm_check <- tbl(con_sdm, "taxon_model") |>
+  filter(ds_key == !!ds_key) |>
+  collect()
+message(glue("taxon_model ca_nmfs rows: {nrow(d_tm_check)}"))
+stopifnot(nrow(d_tm_check) == 1)
 ```
 
 ```{r}

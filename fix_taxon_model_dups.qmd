@@ -1,0 +1,137 @@
+---
+title: "Fix taxon_model Duplicates"
+editor_options:
+  chunk_output_type: console
+---
+
+## Problem
+
+The `taxon_model` table has duplicate `(taxon_id, ds_key)` groups:
+
+- **rng_iucn**: exact duplicates (same mdl_seq repeated 3x per group)
+- **ms_merge**: distinct duplicates (different mdl_seq values; older ones are orphans not in `model` table)
+
+## Setup
+
+```{r}
+#| label: setup
+librarian::shelf(
+  DBI,
+  dplyr,
+  duckdb,
+  glue,
+  quiet = T
+)
+
+is_server <- Sys.info()[["sysname"]] == "Linux"
+dir_data <- ifelse(is_server, "/share/data", "~/My Drive/projects/msens/data")
+
+# version
+v_int <- 3
+v_sfx <- paste0("_v", v_int)
+sdm_db <- glue("{dir_data}/derived/sdm{v_sfx}.duckdb")
+
+con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F))
+```
+
+## Before: report duplicates
+
+```{r}
+#| label: before_report
+d_dups_before <- dbGetQuery(
+  con_sdm,
+  "
+  SELECT ds_key, taxon_id, COUNT(*) AS n
+  FROM taxon_model
+  GROUP BY ds_key, taxon_id
+  HAVING COUNT(*) > 1
+  ORDER BY ds_key, taxon_id"
+)
+
+message(glue("Duplicate (taxon_id, ds_key) groups: {nrow(d_dups_before)}"))
+message(glue("Breakdown by ds_key:"))
+d_dups_before |>
+  count(ds_key, name = "n_dup_groups") |>
+  print()
+
+n_total_before <- dbGetQuery(con_sdm, "SELECT COUNT(*) AS n FROM taxon_model")$n
+message(glue("Total rows before cleanup: {n_total_before}"))
+```
+
+## Clean: remove duplicates and orphaned mdl_seq
+
+Recreate `taxon_model` keeping only DISTINCT rows whose `mdl_seq` exists in `model`.
+
+```{r}
+#| label: clean_duplicates
+# recreate without duplicates and without orphaned mdl_seq
+dbExecute(
+  con_sdm,
+  "
+  CREATE TABLE taxon_model_clean AS
+  SELECT DISTINCT taxon_id, ds_key, mdl_seq
+  FROM taxon_model
+  WHERE mdl_seq IN (SELECT mdl_seq FROM model)"
+)
+
+dbExecute(con_sdm, "DROP TABLE taxon_model")
+dbExecute(con_sdm, "ALTER TABLE taxon_model_clean RENAME TO taxon_model")
+
+# add unique constraint to prevent future duplicates
+dbExecute(
+  con_sdm,
+  "CREATE UNIQUE INDEX idx_taxon_model_tid_dskey ON taxon_model(taxon_id, ds_key)"
+)
+message("Cleaned taxon_model and added UNIQUE index on (taxon_id, ds_key)")
+```
+
+## After: verify no duplicates remain
+
+```{r}
+#| label: after_report
+d_dups_after <- dbGetQuery(
+  con_sdm,
+  "
+  SELECT ds_key, taxon_id, COUNT(*) AS n
+  FROM taxon_model
+  GROUP BY ds_key, taxon_id
+  HAVING COUNT(*) > 1"
+)
+
+n_total_after <- dbGetQuery(con_sdm, "SELECT COUNT(*) AS n FROM taxon_model")$n
+message(glue("Total rows after cleanup: {n_total_after}"))
+message(glue("Rows removed: {n_total_before - n_total_after}"))
+message(glue("Remaining duplicate groups: {nrow(d_dups_after)}"))
+stopifnot(nrow(d_dups_after) == 0)
+
+# verify unique index prevents re-insertion
+tryCatch(
+  {
+    d_test <- dbGetQuery(
+      con_sdm,
+      "SELECT taxon_id, ds_key, mdl_seq FROM taxon_model LIMIT 1"
+    )
+    dbExecute(
+      con_sdm,
+      glue(
+        "INSERT INTO taxon_model VALUES ({d_test$taxon_id}, '{d_test$ds_key}', {d_test$mdl_seq})"
+      )
+    )
+    stop("UNIQUE constraint did NOT prevent duplicate insertion!")
+  },
+  error = function(e) {
+    if (grepl("Duplicate key|UNIQUE|unique", e$message)) {
+      message("UNIQUE index verified: duplicate INSERT correctly rejected")
+    } else {
+      stop(e)
+    }
+  }
+)
+```
+
+## Disconnect
+
+```{r}
+#| label: disconnect
+dbDisconnect(con_sdm, shutdown = TRUE)
+```

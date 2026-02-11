@@ -46,8 +46,11 @@ options(readr.show_col_types = F)
 is_server <- Sys.info()[["sysname"]] == "Linux"
 dir_private <- ifelse(is_server, "/share/private", "~/My Drive/private")
 dir_data <- ifelse(is_server, "/share/data", "~/My Drive/projects/msens/data")
+v_int <- 3
+v_sfx <- paste0("_v", v_int)
+
 spp_db <- glue("{dir_data}/derived/spp.duckdb")
-sdm_db <- glue("{dir_data}/derived/sdm_2026.duckdb")
+sdm_db <- glue("{dir_data}/derived/sdm{v_sfx}.duckdb")
 cell_tif <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
 dir_bl <- glue("{dir_data}/raw/birdlife.org")
 botw_gpkg <- glue("{dir_bl}/BOTW_GPKG_2024_2/BOTW_2024_2.gpkg")
@@ -1836,6 +1839,8 @@ if (dbExistsTable(con_sdm, "taxon_model")) {
   dbExecute(con_sdm, "DROP TABLE taxon_model")
 }
 dbWriteTable(con_sdm, "taxon_model", d_taxon_model, overwrite = TRUE)
+dbExecute(con_sdm,
+  "CREATE UNIQUE INDEX idx_taxon_model_tid_dskey ON taxon_model(taxon_id, ds_key)")
 message(glue("taxon_model: {nrow(d_taxon_model)} rows"))
 # taxon_model: 19157 rows
 
@@ -2744,7 +2749,7 @@ for (i in 2:nrow(d_spp)) {
   mdl_seqs <- tbl(con_sdm, "model") |>
     filter(ds_key == !!ds_key, taxa == !!sp_key) |>
     pull(mdl_seq)
-  if (length(mdl_seqs > 0)) {
+  if (length(mdl_seqs) > 0) {
     dbExecute(
       con_sdm,
       glue("DELETE FROM model WHERE ds_key = '{ds_key}' AND taxa = '{sp_key}'")
@@ -3085,6 +3090,9 @@ d_iucn_tm <- d_iucn |>
     mdl_seq = mdl_seq
   )
 
+# delete existing rng_iucn rows before re-inserting (idempotent re-runs)
+dbExecute(con_sdm, "DELETE FROM taxon_model WHERE ds_key = 'rng_iucn'")
+
 # append rng_iucn rows to taxon_model junction table
 dbWriteTable(con_sdm, "taxon_model", d_iucn_tm, append = TRUE)
 message(glue("Added {nrow(d_iucn_tm)} rng_iucn rows to taxon_model"))
@@ -3421,6 +3429,10 @@ for (i in 1:nrow(d_x)) {
     filter(ds_key == !!ds_key, taxa == !!sp_key) |>
     pull(mdl_seq)
   if (length(mdl_seqs) > 0) {
+    dbExecute(
+      con_sdm,
+      glue("DELETE FROM taxon_model WHERE ds_key = '{ds_key}' AND taxon_id = {d_sp$taxon_id}")
+    )
     dbExecute(
       con_sdm,
       glue("DELETE FROM model WHERE ds_key = '{ds_key}' AND taxa = '{sp_key}'")

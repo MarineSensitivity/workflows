@@ -1,3 +1,305 @@
+## 2026-02-11 duplicates in taxon_model
+
+When running @apps_2026/mapsp/app.R I discovered that there are duplicates in the taxon_model table of the SDM db. There should be only one single model (`mdl_seq`) per `taxon_id` and `ds_key`.
+
+```r
+# duplicates
+d_tm_dups <- tbl(con_sdm, "taxon_model") |>
+  group_by(taxon_id, ds_key) |>
+  summarize(
+    n = n(),
+    mdl_seqs = stringr::str_flatten(mdl_seq, collapse = ","),
+    .groups = "drop"
+  ) |>
+  filter(n > 1) |>
+  arrange(desc(n), taxon_id, ds_key)
+d_tm_dups
+```
+```
+# A tibble: 3,089 × 4
+   taxon_id ds_key       n mdl_seqs         
+      <dbl> <chr>    <dbl> <chr>            
+ 1   105787 rng_iucn     3 19605,19605,19605
+ 2   105788 rng_iucn     3 19608,19608,19608
+ 3   105789 rng_iucn     3 19609,19609,19609
+ 4   105790 rng_iucn     3 19610,19610,19610
+ 5   105791 rng_iucn     3 19611,19611,19611
+ 6   105792 rng_iucn     3 19612,19612,19612
+ 7   105793 rng_iucn     3 19613,19613,19613
+ 8   105794 rng_iucn     3 19614,19614,19614
+ 9   105795 rng_iucn     3 19615,19615,19615
+10   105796 rng_iucn     3 19616,19616,19616
+```
+
+```r
+# duplicates with distinct rows
+d_tm_dups <- tbl(con_sdm, "taxon_model") |>
+  distinct() |>
+  group_by(taxon_id, ds_key) |>
+  summarize(
+    n = n(),
+    mdl_seqs = stringr::str_flatten(mdl_seq, collapse = ","),
+    .groups = "drop"
+  ) |>
+  filter(n > 1) |>
+  arrange(desc(n), taxon_id, ds_key)
+d_tm_dups
+```
+```
+# A tibble: 2,361 × 4
+   taxon_id ds_key       n mdl_seqs   
+      <dbl> <chr>    <dbl> <chr>      
+ 1   105787 ms_merge     2 25418,23845
+ 2   105788 ms_merge     2 23846,25419
+ 3   105789 ms_merge     2 25420,23847
+ 4   105790 ms_merge     2 25421,23848
+ 5   105791 ms_merge     2 23849,25422
+ 6   105792 ms_merge     2 23850,25423
+ 7   105793 ms_merge     2 25424,23851
+ 8   105794 ms_merge     2 25425,23852
+ 9   105795 ms_merge     2 23853,25426
+10   105796 ms_merge     2 23854,25427
+```
+
+I am hoping you can fix this in the database and ensure it doesn't happen again. Originally when I injected models into the database, I would search for the related `mdl_seq` and then delete in all related tables before inserting the new model (with an auto-incremented `mdl_seq`). But the `taxon_model` table only got subsequently created (from pivoting longer on the `taxon` table) and so not removed there.
+
+I would guess that the smaller number (ie older) `mdl_seq` values are orphans, ie do not exist in the `model` or `model_cell` tables. But this should be confirmed.
+
+I am concerned that these extra rows may have affected:
+
+- Calculation of scores:
+  - @workflows/update_scores.qmd
+  - @workflows/merge_models.qmd
+  - @workflows/calc_scores.qmd
+
+- Creation of derived products:
+  - @workflows/render_derived_products.qmd
+  - @workflows/msens-summary_programareas.qmd
+
+Note: In the apps (@apps_2026/mapsp/app.R; @apps_2026/mapgl/app.R) I changed the name of the SDM database from `sdm_2026.duckdb` to `sdm{v_sfx}` (where `v_int <- 3; v_sfx <- paste0("_v", v_int)`) and want this to be used throughout the recently used and relevant workflow scripts.
+
+Please fix @workflows/ingest_nmfs_core-areas.qmd so "ca_nmfs" models do get added to the `taxon_model` table (and pre-existing `mdl_seq` for same ds_key and taxa would get deleted). Evaluate how this might effect downstream score calculation, especially for Rice's whale.
+
+Since the @workflows/fix_taxon_model_dups.qmd will be a quick fix, that's fine to include "4. Adds a UNIQUE index on (taxon_id, ds_key) to prevent future duplicates" to get the database patched for now, but also add it to a sensible core workflow, after taxon_model creation and before model injection, for reproducibility into future (eg if we rebuild the whole database, which will happen later when reconstructing for global context).
+
+⏺ Updated plan                             
+  ⎿  /plan to preview
+ Here is Claude's plan:                                           
+ Fix taxon_model Duplicates & Update DB References                     
+                                                            
+ Problem Summary                                        
+
+ The taxon_model table in sdm_v3.duckdb has 3,089 duplicate (taxon_id, ds_key) groups:
+ - rng_iucn: Exact duplicates (same mdl_seq repeated 3x per group)
+ - ms_merge: Distinct duplicates (different mdl_seq values — older ones are orphans not in model table)
+
+ Root causes:
+ 1. ms_merge delete block (merge_models.qmd ~line 3419-3446) deletes from model, species, model_cell but NOT taxon_model
+ 2. rng_iucn append (merge_models.qmd ~line 3088) has no prior DELETE, so re-runs accumulate rows
+
+ Impact Assessment
+
+ Scores are NOT affected. All score calculations (calc_scores.qmd) join through taxon.mdl_seq directly, not through taxon_model. The recompute_merged_models in update_scores.qmd does join through taxon_model
+  but only filters for ch_nmfs/ch_fws/rng_fws which have zero duplicates. No score recalculation needed.
+
+ Fix 1: One-time database cleanup (workflows/fix_taxon_model_dups.qmd)
+
+ Create a Quarto notebook that:
+ 1. Reports current duplicate counts (before state)
+ 2. Removes exact duplicates (rng_iucn) using DISTINCT
+ 3. Removes orphaned mdl_seq entries (ms_merge old rows not in model table)
+ 4. Adds a UNIQUE index on (taxon_id, ds_key) to prevent future duplicates
+ 5. Reports final state (after counts)
+
+ -- step 1: recreate taxon_model without duplicates
+ CREATE TABLE taxon_model_clean AS
+ SELECT DISTINCT taxon_id, ds_key, mdl_seq
+ FROM taxon_model
+ WHERE mdl_seq IN (SELECT mdl_seq FROM model);
+
+ DROP TABLE taxon_model;
+ ALTER TABLE taxon_model_clean RENAME TO taxon_model;
+
+ -- step 2: add unique constraint
+ CREATE UNIQUE INDEX idx_taxon_model_tid_dskey ON taxon_model(taxon_id, ds_key);
+
+ Fix 2: Add UNIQUE index on taxon_model after creation (merge_models.qmd)
+
+ After dbWriteTable(con_sdm, "taxon_model", ...) at line 1838, add the UNIQUE index for reproducibility in future full rebuilds:
+
+ dbWriteTable(con_sdm, "taxon_model", d_taxon_model, overwrite = TRUE)
+ dbExecute(con_sdm,
+   "CREATE UNIQUE INDEX idx_taxon_model_tid_dskey ON taxon_model(taxon_id, ds_key)")
+ message(glue("taxon_model: {nrow(d_taxon_model)} rows"))
+
+ This ensures that even on a full database rebuild, the constraint is in place before any rng_iucn/ms_merge/ca_nmfs injection steps run.
+
+ Fix 3: Add DELETE from taxon_model in ms_merge loop (merge_models.qmd)
+
+ In the ms_merge deletion block (~lines 3419-3446), add a DELETE from taxon_model alongside the existing deletes from model, species, model_cell:
+
+ ```r
+ # add before existing deletes in the ms_merge cleanup block
+ dbExecute(con_sdm, glue(
+   "DELETE FROM taxon_model
+    WHERE ds_key = 'ms_merge' AND taxon_id = {tid}"))
+ ```
+
+ Fix 4: Add DELETE before rng_iucn append + fix latent bug (merge_models.qmd)
+
+ Before the dbWriteTable(con_sdm, "taxon_model", d_iucn_tm, append = TRUE) call (~line 3088), add:
+
+ ```r
+ # delete existing rng_iucn rows before re-inserting
+ dbExecute(con_sdm, "DELETE FROM taxon_model WHERE ds_key = 'rng_iucn'")
+ ```
+
+ Also fix the operator precedence bug at line 2747:
+ - Before: if (length(mdl_seqs > 0))
+ - After: if (length(mdl_seqs) > 0)
+
+ Fix 5: Update sdm_2026.duckdb references to versioned pattern
+
+ Add v_int <- 3; v_sfx <- paste0("_v", v_int) and change sdm_2026.duckdb to sdm{v_sfx}.duckdb in:
+ ┌──────────────────────────────────────────┬────────────────────────┬───────────────────────────┬─────────────────────────────────────────────┐
+ │                   File                   │        Line(s)         │          Current          │                     New                     │
+ ├──────────────────────────────────────────┼────────────────────────┼───────────────────────────┼─────────────────────────────────────────────┤
+ │ workflows/merge_models.qmd               │ ~50                    │ sdm_2026.duckdb           │ sdm{v_sfx}.duckdb (add v_int/v_sfx vars)    │
+ ├──────────────────────────────────────────┼────────────────────────┼───────────────────────────┼─────────────────────────────────────────────┤
+ │ workflows/update_scores.qmd              │ ~50                    │ sdm_2026.duckdb           │ sdm{v_sfx}.duckdb (add v_int/v_sfx vars)    │
+ ├──────────────────────────────────────────┼────────────────────────┼───────────────────────────┼─────────────────────────────────────────────┤
+ │ workflows/calc_scores.qmd                │ ~110, ~3397            │ sdm_2026.duckdb           │ sdm{v_sfx}.duckdb (already has v_int/v_sfx) │
+ ├──────────────────────────────────────────┼────────────────────────┼───────────────────────────┼─────────────────────────────────────────────┤
+ │ workflows/msens-summary_programareas.qmd │ ~76                    │ sdm_2026.duckdb           │ sdm{v_sfx}.duckdb (already has v_int/v_sfx) │
+ ├──────────────────────────────────────────┼────────────────────────┼───────────────────────────┼─────────────────────────────────────────────┤
+ │ workflows/ingest_nmfs_core-areas.qmd     │ ~25                    │ sdm_2026.duckdb           │ sdm{v_sfx}.duckdb (add v_int/v_sfx vars)    │
+ ├──────────────────────────────────────────┼────────────────────────┼───────────────────────────┼─────────────────────────────────────────────┤
+ │ workflows/render_derived_products.qmd    │ ~18                    │ sdm_2026.duckdb (in docs) │ sdm{v_sfx}.duckdb                           │
+ ├──────────────────────────────────────────┼────────────────────────┼───────────────────────────┼─────────────────────────────────────────────┤
+ │ msens/R/db.R                             │ sdm_db_path/sdm_db_con │ default "2026"            │ default "v3"                                │
+ └──────────────────────────────────────────┴────────────────────────┴───────────────────────────┴─────────────────────────────────────────────┘
+ Fix 6: Add ca_nmfs entries to taxon_model (ingest_nmfs_core-areas.qmd)
+
+ Problem: ingest_nmfs_core-areas.qmd creates model, species, and model_cell rows for ca_nmfs but never writes to taxon_model. This means the junction table is missing the (taxon_id, ds_key='ca_nmfs',
+ mdl_seq) mapping.
+
+ Fix: Add a new code chunk after the model_cell insertion that:
+ 1. Looks up taxon_id for Rice's whale from the taxon table (by worms_id = 1576133)
+ 2. Deletes any existing ca_nmfs rows from taxon_model for that taxon (idempotent re-runs)
+ 3. Inserts a new (taxon_id, ds_key='ca_nmfs', mdl_seq) row
+
+ ### Add `taxon_model` entry
+
+ ```r
+ # look up taxon_id for rice's whale
+ tid <- tbl(con_sdm, "taxon") |>
+   filter(worms_id == !!worms_id) |>
+   pull(taxon_id)
+ stopifnot(length(tid) == 1)
+
+ # delete existing ca_nmfs entries for this taxon (idempotent)
+ dbExecute(con_sdm, glue(
+   "DELETE FROM taxon_model WHERE ds_key = '{ds_key}' AND taxon_id = {tid}"))
+
+ # insert new mapping
+ d_tm <- tibble(taxon_id = tid, ds_key = ds_key, mdl_seq = mdl_seq)
+ dbWriteTable(con_sdm, "taxon_model", d_tm, append = TRUE)
+ message(glue("Added taxon_model: taxon_id={tid}, ds_key={ds_key}, mdl_seq={mdl_seq}"))
+ ```
+
+ Downstream impact assessment for Rice's whale
+
+ Rice's whale (Balaenoptera ricei, worms_id 1576133):
+ - extrisk_code: NMFS:EN → er_score: 100 (maximum)
+ - Datasets: ca_nmfs (core area, value=100), rng_iucn, ms_merge
+
+ Scores are NOT affected by adding ca_nmfs to taxon_model:
+ - calc_scores.qmd computes cell_metric and zone_metric using taxon.mdl_seq (the ms_merge model) and taxon.er_score — neither comes from taxon_model
+ - The ms_merge model for Rice's whale already incorporates ca_nmfs as a mask constituent during the merge loop in merge_models.qmd (ca_nmfs has is_mask = TRUE)
+ - update_scores.qmd recompute_merged_models only touches ch_nmfs/ch_fws/rng_fws — ca_nmfs is static (always 100) so correctly excluded from recomputation
+ - zone_taxon scores also use taxon.mdl_seq directly
+
+ What DOES change: The mapsp app (apps_2026/mapsp/app.R) queries taxon_model to build dataset columns (lines 155-172). After this fix, Rice's whale will correctly show a ca_nmfs column with the associated
+ mdl_seq, allowing users to view the core area layer separately.
+
+ Execution Sequence
+
+ 1. Fix 1 — Create & run cleanup notebook workflows/fix_taxon_model_dups.qmd (one-time, adds UNIQUE index)
+ 2. Fix 2 — Edit merge_models.qmd: add UNIQUE index after taxon_model creation (line ~1838) for future rebuilds
+ 3. Fix 3 — Edit merge_models.qmd: add DELETE from taxon_model in ms_merge delete block
+ 4. Fix 4 — Edit merge_models.qmd: add DELETE before rng_iucn append + fix operator precedence bug
+ 5. Fix 5 — Update sdm_2026.duckdb references to versioned pattern across all files
+ 6. Fix 6 — Edit ingest_nmfs_core-areas.qmd to add taxon_model entry after model creation
+ 7. No score recalculation needed — all scores use taxon.mdl_seq (ms_merge) directly
+
+ Verification
+
+ After all fixes:
+ - Run fix_taxon_model_dups.qmd to clean up existing duplicates and add UNIQUE index
+ - Verify no duplicates remain: SELECT taxon_id, ds_key, COUNT(*) FROM taxon_model GROUP BY 1,2 HAVING COUNT(*) > 1
+ - Verify ca_nmfs entry exists: SELECT * FROM taxon_model WHERE ds_key = 'ca_nmfs'
+ - Verify UNIQUE index prevents re-insertion: attempting a duplicate INSERT should error
+ - Spot-check Rice's whale in mapsp app to confirm ca_nmfs column appears
+
+⏺ All edits verified. Let me also make sure there are no remaining sdm_2026 references in the source QMD files (excluding _output/ HTML, dev prompts, and data CSVs).                                           
+                                                                      
+⏺ Searched for 1 pattern (ctrl+o to expand)    
+
+⏺ Those are just prose/message strings in ingest_nmfs-fws-listings.qmd, not code that constructs the path. That file uses msens::sdm_db_con() (which now defaults to "v3"). The references are cosmetic — let me check if the plan mentioned this file.                 
+  The plan didn't include ingest_nmfs-fws-listings.qmd in the update list, so these prose references are expected to remain as-is.                                                                              
+
+  Here's a summary of all changes made:                                                                                                                                                                                                         
+  Changes Summary
+
+  Fix 1: New file workflows/fix_taxon_model_dups.qmd
+
+  - One-time cleanup notebook that reports duplicates, removes them via DISTINCT + orphan filtering, adds UNIQUE INDEX, and verifies
+
+  Fix 2: workflows/merge_models.qmd ~line 1842
+
+  - Added CREATE UNIQUE INDEX idx_taxon_model_tid_dskey ON taxon_model(taxon_id, ds_key) after initial dbWriteTable for future full rebuilds
+
+  Fix 3: workflows/merge_models.qmd ~line 3434
+
+  - Added DELETE FROM taxon_model WHERE ds_key = '{ds_key}' AND taxon_id = {d_sp$taxon_id} in the ms_merge delete block, before the existing model/species/model_cell deletes
+
+  Fix 4: workflows/merge_models.qmd ~line 3094 + line 2752
+
+  - Added DELETE FROM taxon_model WHERE ds_key = 'rng_iucn' before the rng_iucn append
+  - Fixed operator precedence bug: length(mdl_seqs > 0) → length(mdl_seqs) > 0
+
+  Fix 5: Versioned DB references across 7 files
+  ┌──────────────────────────────────────────┬───────────────────────────────────────────────────────────────┐
+  │                   File                   │                            Change                             │
+  ├──────────────────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ workflows/merge_models.qmd               │ Added v_int/v_sfx, changed to sdm{v_sfx}.duckdb               │
+  ├──────────────────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ workflows/update_scores.qmd              │ Added v_int/v_sfx, changed to sdm{v_sfx}.duckdb               │
+  ├──────────────────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ workflows/calc_scores.qmd                │ Changed 2 refs to sdm{v_sfx}.duckdb (already had v_int/v_sfx) │
+  ├──────────────────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ workflows/msens-summary_programareas.qmd │ Changed to sdm{v_sfx}.duckdb (already had v_int/v_sfx)        │
+  ├──────────────────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ workflows/ingest_nmfs_core-areas.qmd     │ Added v_int/v_sfx, changed to sdm{v_sfx}.duckdb               │
+  ├──────────────────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ workflows/render_derived_products.qmd    │ Changed prose reference to sdm_v3.duckdb                      │
+  ├──────────────────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ msens/R/db.R                             │ Default parameter changed from "2026" to "v3"                 │
+  └──────────────────────────────────────────┴───────────────────────────────────────────────────────────────┘
+  Fix 6: workflows/ingest_nmfs_core-areas.qmd
+
+  - Added new "Add taxon_model entry" section that looks up Rice's whale taxon_id, deletes existing ca_nmfs rows (idempotent), and inserts new (taxon_id, ds_key, mdl_seq) mapping
+  - Added taxon_model verification to the existing Verify block
+
+  Next steps
+
+  1. Rename the actual DB file: mv sdm_2026.duckdb sdm_v3.duckdb (or copy)
+  2. Run fix_taxon_model_dups.qmd to clean existing duplicates and add the UNIQUE index
+  3. Run devtools::document() in msens/ to regenerate .Rd man pages with the new defaults
+  4. Re-run ingest_nmfs_core-areas.qmd to add the ca_nmfs taxon_model entry
+
+Go ahead and update @workflows/ingest_nmfs-fws-listings.qmd with any necessary changes, ie to SDM duckdb and mdl_seq bookkeeping, especially with new taxon_model table.
+
 ## 2026-02-10.d update derived products
 
 The database has been updated with the NMFS/FWS full species listing (@workflows/ingest_nmfs-fws-listings.qmd), and new "ca_nmfs" model for Rice's whale (@workflows/ingest_nmfs_core-areas.qmd). Assume that the merging of models (@workflows/merge_models.qmd) and calculation of scores (@workflows/calc_scores.qmd) have also been run. I need to quickly render derived products which are located @'~/My Drive/projects/msens/data/derived' and subdirectory @'~/My Drive/projects/msens/data/derived/downloads' (which may include copies from derived parent). Sort these by most recently updated to find matching code in one of the @workflows/*.qmd that generated it. Evaluate the R chunk and its dependents to come up with a plan for regenerating these from the latest model outputs.
