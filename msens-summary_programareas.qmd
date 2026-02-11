@@ -68,7 +68,7 @@ dir_data <- ifelse(
   "~/My Drive/projects/msens/data"
 )
 dir_derived <- glue("{dir_data}/derived")
-dir_figs <- here(glue("figs/msens-summary_programareas_{v_sfx}"))
+dir_figs <- here(glue("figs/msens-summary_programareas{v_sfx}"))
 dir_dl <- glue("{dir_derived}/downloads")
 mapbox_tkn_txt <- glue("{dir_private}/mapbox_token_bdbest.txt")
 
@@ -503,23 +503,10 @@ d_lbls <- read_csv(lbls_csv)
 lyr_score <- "score_extriskspcat_primprod_ecoregionrescaled_equalweights"
 lyr_npp <- "npp_avg"
 
-er_ak <- er |>
-  filter(region_key == "AK") |>
-  pull(ecoregion_key)
-pra_l48 <- pra |>
-  filter(region_key != "AK") |>
-  pull(programarea_key)
-
-# mask to program areas (l48) + ecoregions (ak) to exclude Atlantic coast
-r_mask <- (r_metrics$programarea_key %in% pra_l48) |
-  (r_metrics$ecoregion_key %in% er_ak)
-
-r_score <- r_metrics[[lyr_score]] |>
-  mask(r_mask, maskvalues = F)
-
-r_npp <- r_vgpm |>
-  log() |>
-  mask(r_mask, maskvalues = F)
+# mask to program areas to exclude Atlantic coast
+ply_mask <- vect(pra |> st_shift_longitude())
+r_score <- r_metrics[[lyr_score]] |> mask(ply_mask)
+r_npp <- r_vgpm |> log() |> mask(ply_mask)
 
 n_cols <- 11
 rng_r_score <- range(values(r_score, na.rm = T))
@@ -531,6 +518,7 @@ cols_r_npp <- pal_viridis()(n_cols)
 brks_r_npp <- seq(rng_r_npp[1], rng_r_npp[2], length.out = n_cols)
 
 for (is_vgpm in c(T, F)) {
+  # npp: is_vgpm = T # score: is_vgpm = F
   if (is_vgpm) {
     r <- r_npp
     rng_r <- round(rng_r_npp, 2)
@@ -548,14 +536,22 @@ for (is_vgpm in c(T, F)) {
   }
 
   for (is_ak in c(T, F)) {
+    # is_ak = T
     if (is_ak) {
+      rgn_mask <- pra |>
+        filter(region_key == "AK") |>
+        # st_union() |>
+        st_shift_longitude() |>
+        vect()
+
       r_area <- r |>
-        mask(r_metrics$ecoregion_key %in% er_ak, maskvalues = F) |>
+        mask(rgn_mask) |>
         trim()
 
       er_area <- er |>
         filter(region_key == "AK") |>
         st_shift_longitude()
+
       pra_area <- pra |>
         filter(region_key == "AK") |>
         st_shift_longitude()
@@ -577,8 +573,13 @@ for (is_vgpm in c(T, F)) {
 
       lgnd_pos <- "top-left"
     } else {
+      rgn_mask <- pra |>
+        filter(region_key != "AK") |>
+        st_shift_longitude() |>
+        vect()
+
       r_area <- r |>
-        mask(r_metrics$programarea_key %in% pra_l48, maskvalues = F) |>
+        mask(rgn_mask) |>
         trim()
 
       box_lower48 <- pra |>

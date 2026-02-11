@@ -1,3 +1,18 @@
+## 2026-02-11.? TODO: versioning strategy
+
+app deps:
+- data/derived/*_v3.*, including sdm_v3.duckdb
+
+app forks, releases or ...?
+
+## 2026-02-11.b why not properly masked Alaska?
+
+Why are the map_cell_[score|npp]_ak_v3.png outputs generatedy by @workflows/msens-summary_programareas.qmd not properly masked to the Alaska study area (whereas it is properly masked in the app @apps_2026/mapsp/app.R - area to be masked circled in pink)? Can this be easily fixed? Would the excess cell values have affected the scores (@workflows/calc_scores.qmd)?
+
+~/Downloads/mapgl_alaska.png
+~/My Drive/projects/msens/data/derived/downloads/figures/map_cell_score_ak_v3.png
+~/My Drive/projects/msens/data/derived/downloads/figures/map_cell_npp_ak_v3.png
+
 ## 2026-02-11 duplicates in taxon_model
 
 When running @apps_2026/mapsp/app.R I discovered that there are duplicates in the taxon_model table of the SDM db. There should be only one single model (`mdl_seq`) per `taxon_id` and `ds_key`.
