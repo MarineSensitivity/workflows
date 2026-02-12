@@ -16,20 +16,24 @@ This notebook calculates scores from models loaded into sdm db and taxon table, 
 - Extinction risk metrics by class (eg `extrisk_bird`, `extrisk_fish`, etc)
 - Other metrics TBD
 
-This should be run after `merge_models.qmd`.
-
-Process:
-
-- Added `con_spp.botw` (Birds of the World) as another taxonomic authority with [ingest_taxon.qmd](https://github.com/MarineSensitivity/workflows/blob/3880f9edf3a204d8ec9768e7be1a1aa51f70d9f0/ingest_taxon.qmd)
-
-- Built `con_sdm.taxon` table as authoritative unique taxa reference from multiple entries in `species` with [merge_models.qmd](https://github.com/MarineSensitivity/workflows/blob/3880f9edf3a204d8ec9768e7be1a1aa51f70d9f0/merge_models.qmd)
+**Source**:
 
 - Copied this notebook from  [ingest_aquamaps_to_sdm_duckdb.qmd](https://github.com/MarineSensitivity/workflows/blob/3880f9edf3a204d8ec9768e7be1a1aa51f70d9f0/ingest_aquamaps_to_sdm_duckdb.qmd) to work up only calculation component from models already loaded
 
+**Process**:
+
+- Before:
+  1. `ingest_taxon.qmd`
+    - Added `con_spp.botw` (Birds of the World) as another taxonomic authority with [ingest_taxon.qmd](https://github.com/MarineSensitivity/workflows/blob/3880f9edf3a204d8ec9768e7be1a1aa51f70d9f0/ingest_taxon.qmd)
+  1.`merge_models.qmd`
+    - Built `con_sdm.taxon` table as authoritative unique taxa reference from multiple entries in `species` with [merge_models.qmd](https://github.com/MarineSensitivity/workflows/blob/3880f9edf3a204d8ec9768e7be1a1aa51f70d9f0/merge_models.qmd)
+- After:
+  1. `render_derived_products.qmd`
+  1. `msens_summary_programareas.qmd`
+
 ## TODO
 
-- [ ] fix "reptile" in flower plots 
-
+- [x] fix "reptile" in flower plots (addressed by merge_models.qmd reclassification)
 - [ ] Add functions here and in `libs/sdm_functions.R` to `msens` R package
 - [ ] All R chunks under `## Add Zones` should be re-evaluated with to check existence and creation with the version suffix (`{v_sfx} = "_v3"`), eg `ply_programareas_2026_v3`, `ply_subregions_2026_v3`, etc. For now evaluation is turned off (`eval = F`). - [ ] Delete orphans, like zone_cell without zone, zone_metric without zone & metric,... Reference [DuckDB Raster Data Metric Sequence Insertion - Claude](https://claude.ai/chat/748f00aa-d2f6-46a5-91d9-fb56b27e3ebe)
 - [ ] Add relationships and primary keys to sdm db tables (eg taxon_id in taxon, ds_seq in species, etc) for data integrity, and schema viz (ERD) for query understanding
@@ -144,13 +148,10 @@ get_rast <- function(m_key) {
   r
 }
 
-# file_delete(sdm_dd)
 con_sdm <- dbConnect(duckdb(), dbdir = sdm_db, read_only = F)
 # dbDisconnect(con_sdm, shutdown = T); duckdb_shutdown(duckdb()); rm(con_sdm)
 source(here("libs/db.R")) # generates Postgres database connection `con`; fails if ssh-msens not connected
 # dbListTables(con_sdm) # dbListTables(con)
-
-# note: Postgres db `con` set by `source(here("libs/db.R"))` below
 
 sp_cats <- tbl(con_sdm, "taxon") |>
   filter(is_ok) |>
@@ -179,7 +180,7 @@ Flags for evaluating R chunks:
 
 ```{r}
 #| label: re-add_con_sdm
-#| eval: !expr do_metrics
+#| eval: !expr do_zones
 
 if (!"cell" %in% dbListTables(con_sdm)) {
   if (!exists("r_cell")) {
@@ -206,7 +207,7 @@ Program Areas are derived from Planning Areas with additional GOA subdivisions.
 
 ```{r}
 #| label: add_programareas
-#| eval: !expr do_metrics
+#| eval: !expr do_zones
 
 zone_tbls <- tbl(con_sdm, "zone") |>
   distinct(tbl) |>
@@ -265,7 +266,7 @@ if (tbl_pra %in% zone_tbls) {
       programarea_name
     ) |>
     st_transform(st_crs(4326))
-  
+
   # add centroid and area
   pra <- pra |> set_geom_ctr_area()
 
@@ -321,7 +322,7 @@ For viewing in mapgl and mapsp apps.
 
 ```{r}
 #| label: create_pg_ply_programareas_2026
-#| eval: !expr do_metrics
+#| eval: !expr do_zones
 
 # devtools::install_local("../msens")
 librarian::shelf(
@@ -344,30 +345,29 @@ pra |>
     layer_options = "OVERWRITE=true"
   )
 
-# change name of table from ply_progareas_2026 to ply_programareas_2026
-# dbExecute(con, glue("ALTER TABLE ply_progareas_2026 RENAME TO {tbl};"))
-
 # TODO: need to convert to 1st column to integer for mapgl viewing?
 
-# enforce SRID so shows up in tile.marinesensivity.org
+# enforce SRID so shows up in tile.marinesensitivity.org
 dbExecute(
   con,
   glue(
-    "SELECT UpdateGeometrySRID('{tbl}','geom',4326);"
+    "SELECT UpdateGeometrySRID('{tbl_pra}','geom',4326);"
   )
 )
 
 # fix any invalid geometries
 dbExecute(
   con,
-  glue("UPDATE {tbl} SET geom = ST_MakeValid(geom) WHERE NOT ST_IsValid(geom)")
+  glue(
+    "UPDATE {tbl_pra} SET geom = ST_MakeValid(geom) WHERE NOT ST_IsValid(geom)"
+  )
 ) # 6 rows fixed
 
 # add spatial index for faster queries
 dbExecute(
   con,
   glue(
-    "CREATE INDEX IF NOT EXISTS {tbl}_geom_idx ON {tbl} USING gist(geom);"
+    "CREATE INDEX IF NOT EXISTS {tbl_pra}_geom_idx ON {tbl_pra} USING gist(geom);"
   )
 )
 ```
@@ -380,7 +380,7 @@ Used in dropdown of mapgl app.
 
 ```{r}
 #| label: subregion_programareas_lookup
-#| eval: !expr do_metrics
+#| eval: !expr do_zones
 
 # calculate intersections between subregions and program areas using zone_cell
 d_sr_pra <- tbl(con_sdm, "zone_cell") |>
@@ -394,7 +394,7 @@ d_sr_pra <- tbl(con_sdm, "zone_cell") |>
   inner_join(
     tbl(con_sdm, "zone_cell") |>
       inner_join(
-        tbl(con_sdm, "zone") |> 
+        tbl(con_sdm, "zone") |>
           filter(tbl == !!tbl_pra),
         by = "zone_seq"
       ) |>
@@ -405,8 +405,10 @@ d_sr_pra <- tbl(con_sdm, "zone_cell") |>
   collect()
 
 
-get_sr_bbox() <- function(sr_key) {
-  pra_sr <- sr |> filter(subregion_key == !!sr_key) |> pull(programarea_key)
+get_sr_bbox <- function(sr_key) {
+  pra_sr <- d_sr_pra |>
+    filter(subregion_key == !!sr_key) |>
+    pull(programarea_key)
   r <- init(r_cell[[1]], NA)
   r_sr <- r_metrics[["programarea_key"]] %in% pra_sr
   trim(r_sr) |> st_bbox() |> as.numeric()
@@ -454,7 +456,7 @@ v3:
 
 ```{r}
 #| label: add_subregions_2026
-#| eval: !expr do_metrics
+#| eval: !expr do_zones
 
 zones <- tbl(con_sdm, "zone") |>
   distinct(tbl) |>
@@ -462,7 +464,7 @@ zones <- tbl(con_sdm, "zone") |>
 
 # delete existing tbl_sr
 if (tbl_sr %in% zones) {
-  dbExecute(con_sdm, "DELETE FROM zone WHERE tbl = 'ply_subregions_2026'")
+  dbExecute(con_sdm, glue("DELETE FROM zone WHERE tbl = '{tbl_sr}'"))
   # dbExecute(con_sdm, "DELETE FROM zone_cell WHERE zone_seq NOT IN (SELECT zone_seq FROM zone)")
 }
 
@@ -729,8 +731,8 @@ if (!"ply_subregions_2025" %in% zone_tbls) {
 
 # Start fresh with all extrisk_* metrics
 existing_seqs <- tbl(con_sdm, "metric") |>
-  mutate(
-    is_extrisk = str_starts(metric_key, "extrisk_")
+  filter(
+    str_starts(metric_key, "extrisk_")
   ) |>
   pull(metric_seq)
 if (length(existing_seqs) > 0) {
@@ -880,15 +882,15 @@ for (sp_cat in sp_cats) {
     if (length(existing_seq) > 0) {
       dbExecute(
         con_sdm,
-        glue("DELETE FROM metric      WHERE metric_seq = {m_seq}")
+        glue("DELETE FROM metric      WHERE metric_seq = {existing_seq}")
       )
       dbExecute(
         con_sdm,
-        glue("DELETE FROM cell_metric WHERE metric_seq = {m_seq}")
+        glue("DELETE FROM cell_metric WHERE metric_seq = {existing_seq}")
       )
       dbExecute(
         con_sdm,
-        glue("DELETE FROM zone_metric WHERE metric_seq = {m_seq}")
+        glue("DELETE FROM zone_metric WHERE metric_seq = {existing_seq}")
       )
     }
 
@@ -934,7 +936,7 @@ for (sp_cat in sp_cats) {
 }
 
 tbl(con_sdm, "metric") |>
-  filter(str_detect(metric_key, "^extrisk_.*_ecoregion_(min|max])$")) |>
+  filter(str_detect(metric_key, "^extrisk_.*_ecoregion_(min|max)$")) |>
   arrange(metric_seq) |>
   select(-date_created) |>
   collect() |>
@@ -1094,7 +1096,6 @@ m_description <- "Primary productivity: Oregon State Vertically Generalized Prod
 # TODO: consider log rescaling PrimaryProductivity
 
 # workflow: ingest_productivity.qmd
-yr <- 2023 # vgpm-viirs most recent complete year
 dir_vgpm <- glue("{dir_data}/raw/oregonstate.edu")
 vgpm_tif <- glue(
   "{dir_vgpm}/vgpm.r2022.v.chl.v.sst.2160x4320_2014-2023.avg.sd.tif"
@@ -1205,7 +1206,7 @@ pp_seq <- dbGetQuery(
 for (fxn in c("min", "max")) {
   # fxn = "min"
 
-  # Get existing primprod_ecoregion_rescaled metric_seq
+  # get existing primprod ecoregion min/max metric_seq
   m_key <- glue("primprod_ecoregion_{fxn}")
   m_description <- glue("Primary productivity Ecoregional {fxn}")
 
@@ -1315,7 +1316,7 @@ pp_seq <- dbGetQuery(
 for (fxn in c("avg", "stddev")) {
   # fxn = "avg"
 
-  # Get existing primprod_ecoregion_rescaled metric_seq
+  # get existing primprod avg/stddev metric_seq
   m_key <- glue("primprod_{fxn}")
   m_description <- glue("Primary productivity {fxn}")
 
@@ -1331,19 +1332,19 @@ for (fxn in c("avg", "stddev")) {
     dbExecute(
       con_sdm,
       glue(
-        "DELETE FROM metric      WHERE metric_seq IN ({paste(m_seq, collapse = ',')})"
+        "DELETE FROM metric      WHERE metric_seq IN ({paste(existing_seq, collapse = ',')})"
       )
     )
     dbExecute(
       con_sdm,
       glue(
-        "DELETE FROM cell_metric WHERE metric_seq IN ({paste(m_seq, collapse = ',')})"
+        "DELETE FROM cell_metric WHERE metric_seq IN ({paste(existing_seq, collapse = ',')})"
       )
     )
     dbExecute(
       con_sdm,
       glue(
-        "DELETE FROM zone_metric WHERE metric_seq IN ({paste(m_seq, collapse = ',')})"
+        "DELETE FROM zone_metric WHERE metric_seq IN ({paste(existing_seq, collapse = ',')})"
       )
     )
   }
@@ -1367,7 +1368,7 @@ for (fxn in c("avg", "stddev")) {
 
   stopifnot(length(m_seq) == 1)
 
-  # Calculate min/max primary productivity per ecoregion
+  # calculate avg/stddev primary productivity per planning area
   # dbGetQuery(con_sdm, glue(
   #   "SELECT
   dbExecute(
@@ -1672,7 +1673,7 @@ d_ck |>
 #| label: cell_metrics_to_ecoregion_metrics
 #| eval: !expr do_metrics
 
-# get zone_seqs for planning areas
+# get zone_seqs for ecoregions
 z_seqs <- tbl(con_sdm, "zone") |>
   filter(
     tbl == !!tbl_er
@@ -1697,12 +1698,12 @@ for (m_key in metrics) {
     pull(metric_seq)
   stopifnot(length(m_seq) == 1)
 
-  # delete existing zone_metric values for this metric and planning areas
+  # delete existing zone_metric values for this metric and ecoregions
   dbExecute(
     con_sdm,
     glue(
-      "DELETE FROM zone_metric 
-    WHERE metric_seq = {m_seq} 
+      "DELETE FROM zone_metric
+    WHERE metric_seq = {m_seq}
       AND zone_seq IN ({paste(z_seqs, collapse = ',')})"
     )
   )
@@ -1716,7 +1717,7 @@ for (m_key in metrics) {
     pull(n)
   stopifnot(n_cm > 0)
 
-  # calculate average score per planning area weighted by cell coverage
+  # calculate average score per ecoregion weighted by cell coverage
   dbExecute(
     con_sdm,
     glue(
@@ -1879,7 +1880,7 @@ d_ck |>
 #| label: calc_programarea_score_from_programarea_metrics
 #| eval: !expr do_metrics
 
-# metric: calculate score per planning area
+# metric: calculate score per program area
 m_key <- "score_extriskspcat_primprod_ecoregionrescaled_equalweights"
 m_seq <- tbl(con_sdm, "metric") |>
   filter(metric_key == !!m_key) |>
@@ -1894,7 +1895,7 @@ m_input_seqs <- tbl(con_sdm, "metric") |>
   pull(metric_seq)
 stopifnot(length(metric_input_keys) == length(m_input_seqs))
 
-# get zone_seqs for planning areas
+# get zone_seqs for program areas
 z_seqs <- tbl(con_sdm, "zone") |>
   filter(
     tbl == !!tbl_pra
@@ -1924,7 +1925,7 @@ dbExecute(
   )
 )
 
-# calculate average score per planning area weighted by cell coverage
+# calculate average score per program area
 dbExecute(
   con_sdm,
   glue(
@@ -1956,7 +1957,7 @@ d_ck <- tbl(con_sdm, "metric") |>
   left_join(
     tbl(con_sdm, "zone") |>
       filter(
-        tbl == "ply_planareas_2025"
+        tbl == !!tbl_pra
       ) |>
       select(zone_seq, pa_key = value),
     by = "zone_seq"
@@ -2005,8 +2006,9 @@ tbl_taxon <- tbl(con_sdm, "taxon") |>
 
 d <- tbl(con_sdm, "zone") |>
   filter(
-    tbl   == "ply_subregions_2025",
-    value == "AKL48") |>
+    tbl == !!tbl_sr,
+    value == "USA"
+  ) |>
   select(zone_seq, zone_tbl = tbl, zone_fld = fld, zone_value = value) |> # zone_tbl = tbl,
   inner_join(
     tbl(con_sdm, "zone_cell") |>
@@ -2043,7 +2045,8 @@ d <- tbl(con_sdm, "zone") |>
     is_mbta,
     is_bcc,
     esa_code,
-    esa_source) |>
+    esa_source
+  ) |>
   summarize(
     area_km2 = sum(area_km2, na.rm = T),
     avg_suit = mean(value, na.rm = T) / 100,
@@ -2267,12 +2270,13 @@ pg_zone_tbls <- c(
   tbl_pra
 )
 for (pg_tbl in pg_zone_tbls) {
-  pg_tbl_v <- glue("{pg_tbl}{v_sfx}")
-  if (!dbExistsTable(con, pg_tbl_v)) {
-    dbExecute(con, glue("CREATE TABLE {pg_tbl_v} AS SELECT * FROM {pg_tbl}"))
-    message(glue("Created {pg_tbl_v} from {pg_tbl}"))
+  # pg_tbl already includes v_sfx (e.g. _v3) from tbl_er, tbl_pra
+  pg_tbl_base <- str_remove(pg_tbl, v_sfx)
+  if (!dbExistsTable(con, pg_tbl)) {
+    dbExecute(con, glue("CREATE TABLE {pg_tbl} AS SELECT * FROM {pg_tbl_base}"))
+    message(glue("Created {pg_tbl} from {pg_tbl_base}"))
   } else {
-    message(glue("{pg_tbl_v} already exists"))
+    message(glue("{pg_tbl} already exists"))
   }
 }
 ```
@@ -2341,10 +2345,11 @@ flds_pra_db <- dbListFields(con, tbl_pra)
 fdls_pra_rm <- setdiff(flds_pra_db, flds_pra_df) |>
   str_subset("(extrisk_)|(^na$)")
 
-d_rm <- 
+d_rm <-
   tibble(
     tbl = tbl_pra,
-    fld = fdls_pra_rm)
+    fld = fdls_pra_rm
+  )
 
 for (i in seq_len(nrow(d_rm))) {
   # i = 1
@@ -2365,7 +2370,7 @@ per [Feature id | pg_tileserv](https://github.com/CrunchyData/pg_tileserv?tab=re
 #| label: add_index_for_vector_tiles
 #| eval: !expr do_postgis
 
-# add auto-incrementing primary key planarea_id to postgres ply_planareas_2025 table
+# add integer primary key to postgres programareas table
 dbExecute(
   con,
   glue(
@@ -2510,7 +2515,7 @@ if (!file.exists(metrics_tif)) {
   r_metrics <- do.call(c, lst)
 
   # add log of primprod
-  r[["primprod_log"]] <- log(r[["primprod"]])
+  r_metrics[["primprod_log"]] <- log(r_metrics[["primprod"]])
 
   # show layer names
   names(r_metrics) |> sort() |> print()
@@ -2530,12 +2535,12 @@ if (!file.exists(metrics_pra_tif)) {
   pra_sr <- read_csv(sr_pra_csv) |>
     filter(subregion_key == !!sr) |>
     pull(programarea_key)
-   
+
   r_metrics <- rast(metrics_tif)
   r_mask <- subset(r_metrics, "programarea_key")
 
-  r_metrics_pra <- r_metrics |> 
-    mask(r_mask) |> 
+  r_metrics_pra <- r_metrics |>
+    mask(r_mask) |>
     trim()
 
   writeRaster(r_metrics_pra, metrics_pra_tif, overwrite = T)

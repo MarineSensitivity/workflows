@@ -94,6 +94,13 @@ dir_create(dir_figs)
 source(here("libs/db.R")) # con (PostGIS)
 con_sdm <- dbConnect(duckdb(), dbdir = sdm_dd, read_only = T)
 
+# species categories, ie components ----
+sp_cats <- tbl(con_sdm, "taxon") |>
+  filter(is_ok) |>
+  distinct(sp_cat) |>
+  pull(sp_cat) |>
+  sort()
+
 # flower plot function ----
 plot_flower <- function(
   data,
@@ -801,16 +808,6 @@ d_er_pra_n <- bind_rows(
   ) |>
   relocate(row_lbl)
 
-sp_cols <- c(
-  "bird",
-  "coral",
-  "fish",
-  "invertebrate",
-  "mammal",
-  "reptile",
-  "other"
-)
-
 d_er_pra_n |>
   select(
     row_type,
@@ -823,7 +820,7 @@ d_er_pra_n |>
     row_lbl,
     score,
     primprod,
-    any_of(sp_cols),
+    any_of(sp_cats),
     area_km2
   ) |>
   write_excel_csv(er_pra_n_csv)
@@ -864,7 +861,7 @@ d_er_pra_n |>
       Fish = "fish",
       Invertebrate = "invertebrate",
       Mammal = "mammal",
-      Reptile = "reptile",
+      Turtle = "turtle",
       Other = "other"
     )),
     `area (1,000 km^2^)` = area_kkm2
@@ -911,7 +908,7 @@ d_pra_only <- d_er_pra_n |>
     row_lbl,
     score,
     primprod,
-    any_of(sp_cols),
+    any_of(sp_cats),
     area_kkm2
   ) |>
   distinct() |>
@@ -925,7 +922,7 @@ d_pra_only <- d_er_pra_n |>
       Fish = "fish",
       Invertebrate = "invertebrate",
       Mammal = "mammal",
-      Reptile = "reptile",
+      Turtle = "Turtle",
       Other = "other"
     )),
     `Area (1,000 km^2^)` = area_kkm2
@@ -947,147 +944,6 @@ d_pra_only |>
 browseURL(tbl_docx)
 ```
 
-## Ecoregion Flower Plots
-
-```{r}
-#| label: plot_ecoregion_flowers
-source(here("libs/db.R")) # con
-
-# contributing metrics (same as PA version — ecoregion-level)
-sp_cats_u <- tbl(con_sdm, "species") |>
-  distinct(sp_cat) |>
-  pull(sp_cat) |>
-  str_replace(" ", "_")
-metric_input_keys <- c(
-  glue("extrisk_{sp_cats_u}_ecoregion_rescaled"),
-  "primprod_ecoregion_rescaled"
-)
-m_input_seqs <- tbl(con_sdm, "metric") |>
-  filter(metric_key %in% metric_input_keys) |>
-  pull(metric_seq)
-
-er_tbl <- glue("ply_ecoregions_2025{v_sfx}")
-d_fl <- tbl(con_sdm, "zone") |>
-  filter(tbl == !!er_tbl) |>
-  select(ecoregion_key = value, zone_seq) |>
-  left_join(
-    tbl(con_sdm, "zone_metric"),
-    by = "zone_seq"
-  ) |>
-  left_join(
-    tbl(con_sdm, "metric") |>
-      filter(metric_seq %in% m_input_seqs) |>
-      select(metric_seq, metric_key),
-    by = "metric_seq"
-  ) |>
-  filter(!is.na(metric_key)) |>
-  select(ecoregion_key, metric_key, value) |>
-  arrange(ecoregion_key, metric_key) |>
-  collect() |>
-  left_join(
-    tbl(con, glue("ply_ecoregions_2025{v_sfx}")) |>
-      filter(
-        region_key == "AK" |
-          ecoregion_key %in% c("CAC", "WAOR", "SECS", "WCGOA", "EGOA", "NECS")
-      ) |>
-      select(ecoregion_key, ecoregion_name) |>
-      collect(),
-    by = "ecoregion_key"
-  ) |>
-  mutate(
-    component = metric_key |>
-      str_replace("extrisk_", "") |>
-      str_replace("_ecoregion_rescaled", "") |>
-      str_replace("_", " "),
-    even = 1
-  ) |>
-  filter(component != "all") |>
-  filter(
-    !is.na(ecoregion_name),
-    !is.na(metric_key),
-    !is.na(value)
-  )
-
-components <- c(
-  "invertebrate",
-  "mammal",
-  "other",
-  "primprod",
-  "reptile",
-  "bird",
-  "coral",
-  "fish"
-)
-cols <- setNames(hue_pal()(length(components)), components)
-
-# all flowers ----
-d <- d_fl |>
-  group_by(ecoregion_name) |>
-  arrange(component) |>
-  mutate(across(!where(is.character), as.double)) |>
-  mutate(
-    ymax = cumsum(even),
-    ymin = lag(ymax, default = 0),
-    xmax = value,
-    xmin = 0
-  )
-
-d_scores <- d_fl |>
-  group_by(ecoregion_key, ecoregion_name) |>
-  summarize(
-    score = weighted.mean(value, even, na.rm = T) |> round(),
-    .groups = "drop"
-  )
-
-g <- d |>
-  ggplot() +
-  geom_rect_interactive(
-    aes(
-      xmin = xmin,
-      xmax = xmax,
-      ymin = ymin,
-      ymax = ymax,
-      fill = component,
-      color = "white",
-      data_id = component
-    ),
-    color = "white",
-    alpha = 0.5
-  ) +
-  scale_fill_manual(values = cols) +
-  facet_wrap(~ecoregion_key) +
-  coord_polar(theta = "y") +
-  xlim(c(-20, max(d_scores$score))) +
-  geom_text(
-    aes(x, y, label = score),
-    data = d_scores |>
-      mutate(x = -20, y = 0),
-    size = 4,
-    fontface = "bold"
-  ) +
-  theme_minimal() +
-  theme(
-    legend.position = "bottom",
-    plot.margin = unit(c(20, 20, 20, 20), "pt"),
-    strip.text.x = element_text(size = 8),
-    axis.title.x = element_blank(),
-    axis.text.x = element_blank(),
-    axis.ticks.x = element_blank(),
-    axis.title.y = element_blank(),
-    axis.text.y = element_blank(),
-    axis.ticks.y = element_blank()
-  )
-
-er_fl_png <- glue("{dir_figs}/ecoregion_flower-plot_scores{v_sfx}.png")
-er_fl_pdf <- glue("{dir_figs}/ecoregion_flower-plot_scores{v_sfx}.pdf")
-png(er_fl_png, width = 1200, height = 800, res = 150)
-print(g)
-dev.off()
-pdf(er_fl_pdf, width = 7, height = 5)
-print(g)
-dev.off()
-```
-
 ## Program Area Flower Plots
 
 ```{r}
@@ -1100,10 +956,6 @@ pra_all <- tbl(con, glue("ply_programareas_2026{v_sfx}")) |>
   collect()
 
 # components ----
-sp_cats <- tbl(con_sdm, "taxon") |>
-  filter(is_ok) |>
-  distinct(sp_cat) |>
-  pull(sp_cat)
 metric_input_keys <- c(
   glue("extrisk_{sp_cats}_ecoregion_rescaled"),
   "primprod_ecoregion_rescaled"
@@ -1112,17 +964,7 @@ m_input_seqs <- tbl(con_sdm, "metric") |>
   filter(metric_key %in% metric_input_keys) |>
   pull(metric_seq)
 
-components <- c(
-  "invertebrate",
-  "mammal",
-  "other",
-  "primary production",
-  "reptile",
-  "bird",
-  "coral",
-  "fish"
-) |>
-  str_to_title()
+components <- c(str_to_title(sp_cats), "Primary Production")
 component_cols <- setNames(
   hue_pal()(length(components)),
   components
