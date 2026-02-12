@@ -93,12 +93,28 @@ dir_raw <- glue("{dir_data}/raw")
 # version ----
 v_int <- 3
 v_sfx <- paste0("_v", v_int)
+v_dir <- paste0("v", v_int)
 
-# inputs
+# versioned output directories
+dir_v <- glue("{dir_derived}/{v_dir}")
+dir_big <- ifelse(
+  is_server,
+  dir_v, # server: all together
+  glue("~/_big/msens/derived/{v_dir}")
+) # local: big files outside GDrive
+dir_create(dir_v)
+dir_create(dir_big)
+
+# inputs (shared, unversioned)
 pra_raw_gpkg <- glue("{dir_raw}/boem.gov/boem_program_areas_2025-11.gpkg")
 cell_tif <- glue("{dir_derived}/r_bio-oracle_planarea.tif")
-sdm_db <- glue("{dir_derived}/sdm{v_sfx}.duckdb")
-pa_gpkg <- glue("{dir_derived}/ply_planareas{v_sfx}.gpkg") # for generating program areas
+stopifnot(all(file_exists(c(cell_tif, pra_raw_gpkg)))
+
+# big files (duckdb — no version suffix in folder)
+sdm_db <- glue("{dir_big}/sdm.duckdb")
+
+# input polygon (from prior step)
+pa_gpkg <- glue("{dir_v}/ply_planareas_2025{v_sfx}.gpkg")
 
 # flags
 do_zones <- F # no, except if new spatial
@@ -107,22 +123,28 @@ do_zone_taxon <- F # no, b/c slow and ancillary for mapgl
 do_postgis <- T # YES
 do_downloads <- T # YES
 do_map <- F # no, but useful for visual checks during development
-do_parquet <- F #  no, but produces smaller faster duckdb
+do_parquet <- F # no, but produces smaller faster duckdb
 
 # variables
 tbl_er <- glue("ply_ecoregions_2025{v_sfx}")
 tbl_pra <- glue("ply_programareas_2026{v_sfx}")
 tbl_sr <- glue("ply_subregions_2026{v_sfx}")
 
-# outputs
-sr_pra_csv <- glue("{dir_derived}/subregion_programareas.csv")
-pra_gpkg <- glue("{dir_derived}/ply_programareas{v_sfx}.gpkg")
-er_gpkg <- glue("{dir_derived}/ply_ecoregions{v_sfx}.gpkg")
-sr_gpkg <- glue("{dir_derived}/ply_subregions{v_sfx}.gpkg")
-metrics_tif <- glue("{dir_derived}/rast_metrics{v_sfx}.tif")
-metrics_pra_tif <- glue("{dir_derived}/rast_metrics_programareas{v_sfx}.tif")
-zone_taxon_csv <- glue("{dir_derived}/zone_taxon{v_sfx}.csv")
-lyrs_csv <- glue("{dir_derived}/layers{v_sfx}.csv")
+# spatial outputs (year + version suffix — reflects input data vintage)
+pra_gpkg <- glue("{dir_v}/ply_programareas_2026{v_sfx}.gpkg")
+er_gpkg <- glue("{dir_v}/ply_ecoregions_2025{v_sfx}.gpkg")
+sr_gpkg <- glue("{dir_v}/ply_subregions_2026{v_sfx}.gpkg")
+
+# computed outputs (version suffix only — no obvious input year)
+sr_pra_csv <- glue("{dir_v}/subregion_programareas.csv")
+metrics_tif <- glue("{dir_v}/r_metrics{v_sfx}.tif")
+metrics_pra_tif <- glue("{dir_v}/r_metrics_programareas{v_sfx}.tif")
+zone_taxon_csv <- glue("{dir_v}/zone_taxon{v_sfx}.csv")
+lyrs_csv <- glue("{dir_v}/layers{v_sfx}.csv")
+# file_exists(c(sr_pra_csv, metrics_tif, metrics_pra_tif, zone_taxon_csv, lyrs_csv))
+
+# parquet (big files)
+dir_pq <- glue("{dir_big}/sdm_parquet")
 
 # helper functions ----
 get_rast <- function(m_key) {
@@ -2710,8 +2732,6 @@ This cleans up the DuckDB database by exporting tables to Parquet files (with so
 
 # TODO: model_cell: PARTITION BY (mdl_seq);") # https://duckdb.org/docs/stable/data/parquet/overview
 
-sdm_db <- glue("{dir_data}/derived/sdm{v_sfx}.duckdb")
-
 source(here("libs/sdm_functions.R"))
 con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F)) |>
   load_duckdb_extensions()
@@ -2720,7 +2740,7 @@ con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F)) |>
 dbExecute(con_sdm, "SET threads = 7;")
 dbExecute(con_sdm, "SET memory_limit = '20GB';")
 
-dir_pq <- glue("{dir_data}/derived/sdm_parquet") |> normalizePath()
+dir_pq <- normalizePath(dir_pq)
 if (dir_exists(dir_pq)) {
   dir_delete(dir_pq)
 }
@@ -2799,8 +2819,7 @@ message(glue("Exporting finished  ~  {Sys.time()}")) # ~ 1 min
 #| label: import_parquet
 #| eval: !expr do_parquet
 
-dir_pq <- glue("{dir_data}/derived/sdm_parquet")
-sdm_db <- glue("{dir_data}/derived/sdm.duckdb")
+# dir_pq and sdm_db defined in setup chunk
 
 if (exists("con_sdm")) {
   dbDisconnect(con_sdm, shutdown = T)

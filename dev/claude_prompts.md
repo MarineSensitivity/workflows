@@ -1,6 +1,18 @@
+## 2026-02-? TODO:
+
+- Migrate from pg_tileserv to PMTiles, see:
+  - [Creating PMTiles | Protomaps Docs](https://docs.protomaps.com/pmtiles/create)
+  - [CalCOFI README_PLAN](https://calcofi.io/workflows/README_PLAN.html)
+- Automate server updates:
+  - Upload sdm.duckdb to v3/ on server (scp or rsync)
+  - Update any Shiny Server config if app paths changed
+
+
 ## 2026-02-12.b TODO: git version apps for running older versions on server
 
 Described in follow up plan of "sensibly restructure..." below.
+
+
 
 
 ## 2026-02-12 sensibly restructure output files in derived/, big files outside Google Drive and versions within
@@ -59,11 +71,6 @@ Do you agree this is a good?
   The mapsp v3 app's mask_tif currently has r_metrics{v_sfx}.tif → r_metrics_v3.tif. In the plan this becomes {dir_v}/r_metrics{v_sfx}.tif → v3/r_metrics_v3.tif. 
   The migration renames r_metrics_2026_v3.tif → v3/r_metrics_v3.tif. Consistent.
 
-──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
- Ready to code?
-                                                                                                                                                                  
- Here is Claude's plan:
-╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
  Plan: Restructure derived data into version subfolders                        
 
  Context
@@ -180,38 +187,38 @@ Do you agree this is a good?
 
  Add v_dir and dir_big to the setup chunk. Change all output paths to use dir_v with standardized names.
 
- # version ----
+ `# version ----
  v_int <- 3
  v_sfx <- paste0("_v", v_int)
  v_dir <- paste0("v", v_int)
 
- # versioned output directories
+ `# versioned output directories
  dir_v   <- glue("{dir_derived}/{v_dir}")
  dir_big <- ifelse(
    is_server,
    dir_v,                                                       # server: all together
    glue("~/big-files_gdrive-notsync/msens/derived/{v_dir}"))    # local: big files outside GDrive
 
- # inputs (shared, unversioned)
+ `# inputs (shared, unversioned)
  cell_tif     <- glue("{dir_derived}/r_bio-oracle_planarea.tif")
  pra_raw_gpkg <- glue("{dir_raw}/boem.gov/boem_program_areas_2025-11.gpkg")
 
- # big files (duckdb — no version suffix in folder)
+ `# big files (duckdb — no version suffix in folder)
  sdm_db <- glue("{dir_big}/sdm.duckdb")
 
- # spatial outputs (year + version suffix — reflects input data vintage)
+ `# spatial outputs (year + version suffix — reflects input data vintage)
  pra_gpkg        <- glue("{dir_v}/ply_programareas_2026{v_sfx}.gpkg")
  er_gpkg         <- glue("{dir_v}/ply_ecoregions_2025{v_sfx}.gpkg")
  sr_gpkg         <- glue("{dir_v}/ply_subregions_2026{v_sfx}.gpkg")
 
- # computed outputs (version suffix only — no obvious input year)
+ `# computed outputs (version suffix only — no obvious input year)
  sr_pra_csv      <- glue("{dir_v}/subregion_programareas.csv")
  metrics_tif     <- glue("{dir_v}/r_metrics{v_sfx}.tif")
  metrics_pra_tif <- glue("{dir_v}/r_metrics_programareas{v_sfx}.tif")
  zone_taxon_csv  <- glue("{dir_v}/zone_taxon{v_sfx}.csv")
  lyrs_csv        <- glue("{dir_v}/layers{v_sfx}.csv")
 
- # parquet (big files)
+ `# parquet (big files)
  dir_pq <- glue("{dir_big}/sdm_parquet")
 
  Also add dir_create(dir_v) and dir_create(dir_big) near the top so directories exist.
@@ -402,6 +409,84 @@ Do you agree this is a good?
  6. Run apps_2026/mapgl/app.R locally — confirm app starts and loads data
  7. Run apps_2026/mapsp/app.R locally — confirm app starts
  8. Confirm sdm_v3.duckdb no longer in Google Drive sync path (check ~/My Drive/projects/msens/data/derived/ for absence of large duckdb files)
+
+⏺ Everything looks consistent. Let me provide a summary of all changes made.                                                                                      
+                                                                                                                                                                  
+  Summary of all changes                                                                                                                                          
+                                                                                                                                                                  
+  Phase 1: workflows/calc_scores.qmd                                                                                                                              
+                                                                                                                                                                  
+  - Added v_dir, dir_v, dir_big, dir_pq variables in setup chunk
+  - Added dir_create(dir_v) and dir_create(dir_big) to ensure directories exist
+  - sdm_db now points to {dir_big}/sdm.duckdb (no version suffix)
+  - pa_gpkg now under dir_v
+  - All spatial outputs (pra_gpkg, er_gpkg, sr_gpkg) use {dir_v}/...2026{v_sfx}.gpkg naming
+  - Computed outputs (metrics_tif, lyrs_csv, etc.) use {dir_v}/...{v_sfx}.* (no year)
+  - rast_metrics renamed to r_metrics
+  - Parquet export/import chunks now reference dir_pq from setup instead of redefining
+
+  Phase 2: workflows/msens-summary_programareas.qmd
+
+  - Added v_dir, dir_v, dir_big, dir_dl_figs in setup
+  - dir_dl now under dir_v ({dir_v}/downloads)
+  - sdm_dd → {dir_big}/sdm.duckdb
+  - metrics_tif → {dir_v}/r_metrics{v_sfx}.tif (dropped _2026)
+  - All outputs under dir_v
+  - lbls_csv updated to use dir_v
+  - Removed duplicate dir_dl_figs definition from copy_to_downloads chunk
+
+  Phase 3: workflows/render_derived_products.qmd
+
+  - All chunks now use dir_v = derived/v3 as base
+  - Copy sources reference dir_v not dir_derived
+  - File names updated: zone_taxon_v3.csv, layers_v3.csv, r_metrics_programareas_v3.tif
+  - Verify chunk checks dir_v instead of flat dir_derived
+  - Key outputs list updated to show v3/ prefix
+
+  Phase 4: apps_2026/mapgl/app.R and apps_2026/mapsp/app.R
+
+  - Added v_dir, dir_v, dir_big
+  - sdm_db → {dir_big}/sdm.duckdb
+  - All data files now read from dir_v with standardized names
+  - lyrs_csv dropped _2026, metrics_tif dropped _2026
+
+  Phase 5: apps/mapgl/app.R and apps/mapsp/app.R (v1)
+
+  - Added v_dir = "v1", dir_v, dir_big
+  - sdm_db → {dir_big}/sdm.duckdb
+  - All data files now read from derived/v1/ with unversioned names
+
+  Phase 6: workflows/migrate_derived_to_versions.R (new)
+
+  - Creates v1/, v3/ directories in both derived/ and big-files/
+  - Moves v1 files (gpkg, csv, tif) to derived/v1/
+  - Moves v3 files to derived/v3/ with renames (drop _2026, rast_ → r_, akl48 → programareas)
+  - Moves sdm.duckdb → big-files/v1/, sdm_v3.duckdb → big-files/v3/sdm.duckdb
+  - Moves sdm_parquet/ to big-files/v3/
+  - Replaces macOS alias with Unix symlink
+  - Lists stale/intermediate files for manual cleanup
+
+In @render_derived_products.qmd, use version variables like in @calc_scores.qmd:
+```r
+v_int <- 3
+v_sfx <- paste0("_v", v_int)
+v_dir <- paste0("v", v_int)
+```
+With @msens-summary_programareas.qmd and other *.qmd and @migrate_derived_to_versions.R, let's not populate seperate `downloads` (`dir_dl`) and `figures` (`dir_figs`) subfolders. Let's simply dump all output files into `dir_v`.
+Change symlink from `_derived_big_files` to simply `_big`.
+
+⏺ All three changes done. Here's a summary:                                                                                                                       
+                                                                                
+  Changes made                                                                                                                                                    
+                                                                                
+  1. render_derived_products.qmd — Rewrote to use version variables (v_int, v_sfx, v_dir) instead of hardcoded "v3"/"_v3". Removed Step 1 (archive old downloads) 
+  and Step 3 (copy to downloads) since all outputs now go directly into dir_v. Simplified from 5 steps to 3.
+  2. msens-summary_programareas.qmd — Removed dir_dl, dir_dl_figs from setup. Replaced the "Copy to Downloads" section with "Copy figures to dir_v" — data files
+  are already written to dir_v directly, so only figures (generated in the local figs/ repo dir) need copying.
+  3. migrate_derived_to_versions.R — Removed downloads and downloads/figures from directory creation. Changed symlink from _derived_big_files to _big. Removed
+  unused safe_copy helper.
+
+
 
 ## 2026-02-12 inspect after `calc_scores.qmd` cleanup
 
