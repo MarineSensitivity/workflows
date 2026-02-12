@@ -7,7 +7,7 @@ app forks, releases or ...?
 
 ## 2026-02-11.f _v3 for outputs, not inputs
 
-I edited  @workflows/calc_scores.qmd so essential chunks should evaluate (default `eval: true`). But before running I realize that the version suffix (`{v_sfx} = "_v3"`) shouldn't have been applied to inputs like `zone.tbl` values:
+I edited  @workflows/calc_scores.qmd so essential chunks should evaluate (default `eval: true`). But before running I realize that the version suffix (`{v_sfx} = "_v3"`) shouldn't have been applied to inputs, like `zone.tbl` values:
 
 ```r
 tbl(con_sdm, "zone") |>
@@ -17,6 +17,7 @@ tbl(con_sdm, "zone") |>
 #                     12                       36                       20                        4                        4 
 ```
 
+The version suffix should however continue to be applied to the outputs, like the 
 
 
 
