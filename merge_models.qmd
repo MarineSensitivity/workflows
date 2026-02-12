@@ -56,6 +56,16 @@ dir_bl <- glue("{dir_data}/raw/birdlife.org")
 botw_gpkg <- glue("{dir_bl}/BOTW_GPKG_2024_2/BOTW_2024_2.gpkg")
 botw_csv <- glue("{dir_bl}/spp_botw.csv")
 botw_vern_csv <- glue("{dir_bl}/spp_botw_vernacular.csv")
+sci_turtles <- c(
+  "Chelonia mydas", # green
+  "Caretta caretta", # loggerhead
+  "Eretmochelys imbricata", # hawksbill
+  "Lepidochelys kempii", # Kemp's ridley
+  "Lepidochelys olivacea", # olive ridley
+  "Natator depressus", # flatback
+  "Dermochelys coriacea" # leatherback
+)
+
 
 con_spp <- dbConnect(duckdb(dbdir = spp_db, read_only = T))
 # dbListTables(con_spp)
@@ -1055,12 +1065,31 @@ d_nb_ds |>
 # ℹ Use `print(n = ...)` to see more rows
 ```
 
+## update species.sp_cat = 'turtle' by scientific name
+
 ```{r}
 #| label: update_turtle_to_reptile
+
+# tbl(con_sdm, "species") |>
+#   filter(scientific_name_accepted %in% sci_turtles) |>
+#   count(scientific_name_accepted)
+#
+#   scientific_name_accepted     n
+#   <chr>                    <dbl>
+# 1 Chelonia mydas               5
+# 2 Lepidochelys kempii          3
+# 3 Dermochelys coriacea         5
+# 4 Eretmochelys imbricata       5
+# 5 Caretta caretta              5
+# 6 Lepidochelys olivacea        3
+
 # convert all "turtle" sp_cat to "reptile", b/c some sea snakes
+sci_turtles_str <- paste(sci_turtles, collapse = "','")
 dbExecute(
   con_sdm,
-  "UPDATE species SET sp_cat = 'reptile' WHERE sp_cat = 'turtle'"
+  glue(
+    "UPDATE species SET sp_cat = 'turtle' WHERE scientific_name_accepted IN ('{sci_turtles_str}')"
+  )
 ) # 49
 ```
 
@@ -1839,8 +1868,10 @@ if (dbExistsTable(con_sdm, "taxon_model")) {
   dbExecute(con_sdm, "DROP TABLE taxon_model")
 }
 dbWriteTable(con_sdm, "taxon_model", d_taxon_model, overwrite = TRUE)
-dbExecute(con_sdm,
-  "CREATE UNIQUE INDEX idx_taxon_model_tid_dskey ON taxon_model(taxon_id, ds_key)")
+dbExecute(
+  con_sdm,
+  "CREATE UNIQUE INDEX idx_taxon_model_tid_dskey ON taxon_model(taxon_id, ds_key)"
+)
 message(glue("taxon_model: {nrow(d_taxon_model)} rows"))
 # taxon_model: 19157 rows
 
@@ -1863,11 +1894,76 @@ dbExecute(
   con_sdm,
   "UPDATE taxon SET worms_id = taxon_id WHERE taxon_authority = 'worms'"
 )
+```
+
+
+## update taxon.sp_cat = 'turtle' by scientific name, reptile is_ok = F
+
+```{r}
+#| label: reclassify_turtles_reptiles
+
+# reclassify reptiles: turtles → sp_cat = "turtle"; sea snakes → excluded
+d_turtles_0 <- tbl(con_sdm, "taxon") |>
+  filter(sp_cat == "turtle") |>
+  select(taxon_id, common_name, scientific_name, is_ok) |>
+  collect()
+message(glue(
+  "Found {nrow(d_turtles_0)} turtle records in taxon (initially; sp_cat = 'turtle')"
+))
+
+d_reptiles <- tbl(con_sdm, "taxon") |>
+  filter(is_ok, sp_cat == "reptile") |>
+  select(taxon_id, common_name, scientific_name, is_ok) |>
+  collect()
+message(glue(
+  "Found {nrow(d_reptiles)} reptile records in accepted taxon (sp_cat = 'reptile', is_ok = TRUE)"
+))
+
+d_turtles <- d_reptiles |>
+  filter(scientific_name %in% sci_turtles)
+message(glue("  - Turtles (to convert from reptile): {nrow(d_turtles)}"))
+
+d_non_turtles <- d_reptiles |>
+  filter(!scientific_name %in% d_turtles$scientific_name)
+message(glue("  - Non-turtles (sea snakes, alligator): {nrow(d_non_turtles)}"))
+
+# turtles -> sp_cat = "turtle"
+if (nrow(d_turtles) > 0) {
+  turtle_ids <- paste(d_turtles$taxon_id, collapse = ", ")
+  dbExecute(
+    con_sdm,
+    glue("UPDATE taxon SET sp_cat = 'turtle' WHERE taxon_id IN ({turtle_ids})")
+  )
+  message(glue("Updated {nrow(d_turtles)} turtles to sp_cat = 'turtle'"))
+}
+
+# sea snakes -> is_ok = FALSE, sp_cat = NULL
+if (nrow(d_non_turtles) > 0) {
+  non_turtle_ids <- paste(d_non_turtles$taxon_id, collapse = ", ")
+  dbExecute(
+    con_sdm,
+    glue(
+      "UPDATE taxon SET is_ok = FALSE WHERE taxon_id IN ({non_turtle_ids})"
+    )
+  )
+  message(glue(
+    "Excluded {nrow(d_non_turtles)} sea snakes/alligator (is_ok = FALSE)"
+  ))
+}
+
+# verify: no "reptile" sp_cat should remain in taxon
+stopifnot(
+  tbl(con_sdm, "taxon") |>
+    filter(is_ok, sp_cat == "reptile") |>
+    count() |>
+    pull(n) ==
+    0
+)
 
 tmp_taxon_csv <- here("data/tmp_taxon.csv")
-if (!file_exists(tmp_taxon_csv)) {
-  write_csv(d_taxon, tmp_taxon_csv)
-}
+tbl(con_sdm, "taxon") |>
+  collect() |>
+  write_csv(tmp_taxon_csv)
 ```
 
 ```{r}
@@ -3244,14 +3340,8 @@ d_x <- tbl(con_sdm, "taxon") |>
   collect() # 91
 # BUT is this only done then for IUCN when adding models later?
 
-# quick fix: update taxon.sp_cat = "turtle" where scientific_name matches: Caretta caretta, Lepidochelys olivacea
-# TODO: move this code to appropriate place where defining sp_cat earlier
-dbExecute(
-  con_sdm,
-  "UPDATE taxon
-   SET sp_cat = 'turtle'
-   WHERE scientific_name IN ('Caretta caretta', 'Lepidochelys olivacea')"
-) # loggerhead, olive ridley
+# removed: quick fix for turtle sp_cat — now handled by reclassify_reptiles
+# chunk after taxon table creation (bind_birds_notbirds_ds)
 
 # table(d_x$sp_cat, useNA = "ifany")
 # OLD:
@@ -3431,7 +3521,9 @@ for (i in 1:nrow(d_x)) {
   if (length(mdl_seqs) > 0) {
     dbExecute(
       con_sdm,
-      glue("DELETE FROM taxon_model WHERE ds_key = '{ds_key}' AND taxon_id = {d_sp$taxon_id}")
+      glue(
+        "DELETE FROM taxon_model WHERE ds_key = '{ds_key}' AND taxon_id = {d_sp$taxon_id}"
+      )
     )
     dbExecute(
       con_sdm,
@@ -3598,6 +3690,8 @@ Add `is_ok`: a simple logical field for flagging valid taxa, ie (so far):
   - if has worms_id:
     - `worms_is_marine`  != F
     - `worms_is_extinct` != T
+- no model cells overlap with Program Areas
+- category is "reptile" but not "turtle" (handled by reclassify_reptiles)
 - not birds:
   - has a `worms_id`
   - `worms_is_marine`  != F
@@ -3605,6 +3699,7 @@ Add `is_ok`: a simple logical field for flagging valid taxa, ie (so far):
   
 ```{r}
 #| label: taxon_is_ok
+
 d <- tbl(con_sdm, "taxon") |>
   collect() # 17,561 × 16
 
@@ -3678,6 +3773,8 @@ d_w <- d |>
       !is.na(redlist_code) & redlist_code == "EX" ~ F, # 1
       !is.na(worms_id) & worms_is_marine == F ~ F, # 19 + 24
       !is.na(worms_id) & worms_is_extinct == T ~ F, # 20
+      sp_cat == "reptile" ~ F,
+      sp_cat == "turtle" ~ T,
       .default = T
     )
   )
@@ -3690,6 +3787,39 @@ d2 <- bind_rows(
   d_w
 ) |>
   select(taxon_id, is_ok)
+
+# flag taxa with no distribution inside program areas ----
+# (mirrors r_mask approach in apps_2026/mapsp/app.R but with DB queries)
+taxa_in_pra <- tbl(con_sdm, "taxon_model") |>
+  inner_join(
+    tbl(con_sdm, "model_cell") |> select(mdl_seq, cell_id),
+    by = "mdl_seq"
+  ) |>
+  inner_join(
+    tbl(con_sdm, "zone_cell") |> select(zone_seq, cell_id),
+    by = "cell_id"
+  ) |>
+  inner_join(
+    tbl(con_sdm, "zone") |>
+      filter(
+        tbl == !!glue("ply_programareas_2026{v_sfx}"),
+        fld == "programarea_key"
+      ) |>
+      select(zone_seq),
+    by = "zone_seq"
+  ) |>
+  distinct(taxon_id) |>
+  pull(taxon_id)
+
+n_outside <- sum(d2$is_ok & !(d2$taxon_id %in% taxa_in_pra))
+message(glue(
+  "{n_outside} taxa flagged is_ok=F (no distribution in program areas)"
+))
+
+d2 <- d2 |>
+  mutate(
+    is_ok = is_ok & taxon_id %in% taxa_in_pra
+  )
 
 stopifnot(sum(duplicated(d2$taxon_id)) == 0)
 

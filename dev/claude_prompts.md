@@ -5,6 +5,70 @@ app deps:
 
 app forks, releases or ...?
 
+## 2026-02-11.f _v3 for outputs, not inputs
+
+I edited  @workflows/calc_scores.qmd so essential chunks should evaluate (default `eval: true`). But before running I realize that the version suffix (`{v_sfx} = "_v3"`) shouldn't have been applied to inputs like `zone.tbl` values:
+
+```r
+tbl(con_sdm, "zone") |>
+  pull(tbl) |> 
+  table()
+# ply_ecoregions_2025_v3    ply_planareas_2025_v3 ply_programareas_2026_v3   ply_subregions_2025_v3   ply_subregions_2026_v3 
+#                     12                       36                       20                        4                        4 
+```
+
+
+
+
+
+The zones: zone.tbl = ply_programareas_2026_v3 -> ply_programareas_2026; 
+
+## 2026-02-11.e reptiles -> turtles
+
+I am confused why there are still reptiles in the database? I thought I fixed this with the `update_turtle_to_reptile` R chunk in @workflows/merge_models.qmd.
+
+```r
+tbl(con_sdm, "species") |>
+  filter(sp_cat %in% c("reptile", "turtle")) |>
+  count(sp_cat)
+#   sp_cat      n
+#   <chr>   <dbl>
+# 1 turtle      2
+# 2 reptile    58
+
+tbl(con_sdm, "taxon") |>
+  filter(sp_cat %in% c("reptile", "turtle")) |>
+  count(sp_cat)
+#   sp_cat      n
+#   <chr>   <dbl>
+# 1 reptile    30
+# 2 turtle      2
+
+tbl(con_sdm, "taxon") |>
+  filter(
+    is_ok,
+    sp_cat %in% c("reptile", "turtle")
+  ) |>
+  count(sp_cat)
+#   sp_cat      n
+#   <chr>   <dbl>
+# 1 turtle      2
+# 2 reptile     9
+```
+
+I need to fix this now and forever (so where in reproducible workflow should this appear?), plus determine if I need to re-run @workflows/calc_scores.qmd (assume yes).
+
+
+## 2026-02-11.d mapsp: mask to program areas
+
+## 2026-02-11.c mapgl,mapsp: rl_code|score -> er_code|score, + is_mmpa, is_mbta
+
+Since we've now explicitly transitioned to a more generalized extinction risk code and score (`er_code`, `er_score`) that includes and favors US national ESA listings from NMFS and FWS over the international IUCN RedList code and score (`rl_code`, `rl_score`), update the @apps_2026/mapgl/app.R accordingly. Rename the table outputs and update the "Species table information".
+
+Looks good, except the er_score is not additive. I reworded er_score to align with msens::compute_er_score() from @msens/ `er_score` extinction risk score (1-100%): derived from the max of extinction risk      
+  codes (`NMFS|FWS:EN=100`, `NMFS|FWS:TN=50`, `IUCN:CR=50`, `IUCN:EN=25`, `IUCN:VU=5`, ``IUCN:NT=2`, `IUCN:LC|DD=1`) and if protected under MMPA (20) or MBTA (10). Now add `is_mmpa` and `is_mbta` to the      
+  table
+
 ## 2026-02-11.b why not properly masked Alaska?
 
 Why are the map_cell_[score|npp]_ak_v3.png outputs generatedy by @workflows/msens-summary_programareas.qmd not properly masked to the Alaska study area (whereas it is properly masked in the app @apps_2026/mapsp/app.R - area to be masked circled in pink)? Can this be easily fixed? Would the excess cell values have affected the scores (@workflows/calc_scores.qmd)?
@@ -12,6 +76,99 @@ Why are the map_cell_[score|npp]_ak_v3.png outputs generatedy by @workflows/msen
 ~/Downloads/mapgl_alaska.png
 ~/My Drive/projects/msens/data/derived/downloads/figures/map_cell_score_ak_v3.png
 ~/My Drive/projects/msens/data/derived/downloads/figures/map_cell_npp_ak_v3.png
+
+Ok, the fix for msens-summary_programareas.qmd makes good sense. I don't quite understand if calc_scores.qmd has the same issue -- if so, it should be fixed.
+  If it's just about the slight bleeding of touching cells, then no worries.   
+
+Doesn't this line to continue the problem: `mask(vect(er |> filter(region_key == "AK")))`? The Ecoregions (`er`) are much bigger and more inclusive than the
+  Program Areas (pra) which have the proper areas masked, which is why this second masking in the file is correct: `mask(vect(pra |> filter(region_key !=         
+  "AK")))`
+
+╭─────────────────────────────────────────────────────────────────────────────╮
+│ Plan to implement                                                           │
+│                                                                             │
+│ Fix raster masking in msens-summary_programareas.qmd                        │
+│                                                                             │
+│ Context                                                                     │
+│                                                                             │
+│ The map_imgs_cell_l48_ak chunk produces 4 cell-level map PNGs where raster  │
+│ data visibly bleeds beyond polygon outlines. The mask uses rasterized zone  │
+│ layers from r_metrics (created with rasterize(..., touches = T)), which     │
+│ include cells that merely touch polygon edges. The scoring pipeline         │
+│ (calc_scores.qmd) is unaffected because zonal stats are weighted by         │
+│ pct_covered.                                                                │
+│                                                                             │
+│ File to modify                                                              │
+│                                                                             │
+│ workflows/msens-summary_programareas.qmd — map_imgs_cell_l48_ak chunk only  │
+│ (lines 493–723)                                                             │
+│                                                                             │
+│ Changes                                                                     │
+│                                                                             │
+│ 1. Global mask (lines 513–522)                                              │
+│                                                                             │
+│ Replace raster-based mask with polygon-based mask:                          │
+│                                                                             │
+│ # before                                                                    │
+│ r_mask <- (r_metrics$programarea_key %in% pra_l48) |                        │
+│   (r_metrics$ecoregion_key %in% er_ak)                                      │
+│ r_score <- r_metrics[[lyr_score]] |>                                        │
+│   mask(r_mask, maskvalues = F)                                              │
+│ r_npp <- r_vgpm |>                                                          │
+│   log() |>                                                                  │
+│   mask(r_mask, maskvalues = F)                                              │
+│                                                                             │
+│ # after                                                                     │
+│ ply_mask <- vect(bind_rows(                                                 │
+│   pra |> filter(region_key != "AK"),                                        │
+│   er  |> filter(region_key == "AK")                                         │
+│ ))                                                                          │
+│ r_score <- r_metrics[[lyr_score]] |> mask(ply_mask)                         │
+│ r_npp   <- r_vgpm |> log() |> mask(ply_mask)                                │
+│                                                                             │
+│ 2. Alaska branch (lines 552–554)                                            │
+│                                                                             │
+│ # before                                                                    │
+│ r_area <- r |>                                                              │
+│   mask(r_metrics$ecoregion_key %in% er_ak, maskvalues = F) |>               │
+│   trim()                                                                    │
+│                                                                             │
+│ # after                                                                     │
+│ r_area <- r |>                                                              │
+│   mask(vect(er |> filter(region_key == "AK"))) |>                           │
+│   trim()                                                                    │
+│                                                                             │
+│ 3. Lower-48 branch (lines 580–582)                                          │
+│                                                                             │
+│ # before                                                                    │
+│ r_area <- r |>                                                              │
+│   mask(r_metrics$programarea_key %in% pra_l48, maskvalues = F) |>           │
+│   trim()                                                                    │
+│                                                                             │
+│ # after                                                                     │
+│ r_area <- r |>                                                              │
+│   mask(vect(pra |> filter(region_key != "AK"))) |>                          │
+│   trim()                                                                    │
+│                                                                             │
+│ Affected outputs (all 4 cell-level maps)                                    │
+│                                                                             │
+│ - map_cell_score_ak_v3.png                                                  │
+│ - map_cell_npp_ak_v3.png                                                    │
+│ - map_cell_score_l48_v3.png                                                 │
+│ - map_cell_npp_l48_v3.png                                                   │
+│                                                                             │
+│ Not affected                                                                │
+│                                                                             │
+│ - Polygon-based maps (map_pra_ak_v3.png, map_pra_l48_v3.png) — use vector   │
+│ tiles                                                                       │
+│ - Scores in calc_scores.qmd — weighted by pct_covered, boundary cells       │
+│ contribute proportionally                                                   │
+│                                                                             │
+│ Verification                                                                │
+│                                                                             │
+│ Re-render the map_imgs_cell_l48_ak chunk and confirm raster data is clipped │
+│  to polygon boundaries in all 4 PNGs.                                       │
+╰─────────────────────────────────────────────────────────────────────────────
 
 ## 2026-02-11 duplicates in taxon_model
 
