@@ -8,14 +8,383 @@
   - Update any Shiny Server config if app paths changed
 
 
-## 2026-02-12.b TODO: git version apps for running older versions on server
+## 2026-02-12.b apps versioning with git branches, deploy latest v3 to server
 
-Described in follow up plan of "sensibly restructure..." below.
+Now that I've confirmed all file restructuring help me with apps versioning with branches, releases or other idea?
+
+    I would also like to maintain backword compatibility with `v1` (sdm.duckdb), `v2` (sdm_2026.duckdb) and `v3` (sdm_v3.duckdb) of the @../apps/{mapgl|mapsp} (now on main branch for v1 on laptop and server). What advice do you have on maintaining backwards compatability with the apps at different iterations? Seems like I should:
+
+    - `v1`: rename @../apps to @../apps_v1 with a fork from "main" to branch "v1", 
+    - `v2`: copy @../apps_2026 to @../apps_v2 and rollback to commits predating "v3" and fork to branch "v2"
+    - `v3`: rename @../apps_2026 to @../apps and merge current branch "programareas_2026" to branch "main"
+
+Here also is the current state of the Shiny app git repositories with branch, commit and date stamp:
+
+```bash
+# cd to symlinks of Shiny server folders
+cd /srv/shiny-server
+for d in *; do if [[ -L "$d" ]] && [[ "$d" == *mapgl* || "$d" == *mapsp* ]]; then (cd "$d" && printf "%-30s %-20s %s %s\n" "$d" "$(git branch --show-current 2>/dev/null)" "$(git log -1 --format='%h %ci' 2>/dev/null)"); fi; done
+```
+```
+mapgl                          programareas_2026    76afd58 2026-02-11 13:56:00 -0600 
+mapgl_2025                     main                 6cb5ae0 2026-01-13 13:12:14 -0800 
+mapgl_v2                       programareas_2026    86448d1 2026-01-30 09:07:52 -0600 
+mapsp                          programareas_2026    76afd58 2026-02-11 13:56:00 -0600 
+mapsp_2025                     main                 6cb5ae0 2026-01-13 13:12:14 -0800 
+mapsp_v2                       programareas_2026    86448d1 2026-01-30 09:07:52 -0600 
+```
+
+And here's the state of the data/derived folder on the server which needs to get cleaned up:
+
+```bash
+cd /share/data/derived
+ls -latr
+```
+```
+total 13349712
+drwxr-xr-x  2 admin admin         44 May 22  2025 aquamaps
+-rw-r--r--  1 admin admin   31672006 May 22  2025 pa_oa_2025.geojson
+-rw-r--r--  1 admin admin      34753 May 26  2025 pa-2025_am-cid.tif
+drwxr-xr-x  3 admin admin         66 May 26  2025 aquamaps.org
+-rw-r--r--  1 admin admin   42102914 May 30  2025 r_bio-oracle_planarea.tif
+drwxrwxr-x 12 admin admin       4096 Jun 18  2025 sdm_parquet_2025-06-18
+-rw-r--r--  1 admin admin   14913536 Jun 18  2025 ply_planareas_2025.gpkg
+-rw-r--r--  1 admin admin   18165760 Jun 18  2025 ply_ecoregions_2025.gpkg
+drwxrwxr-x 14 admin admin       4096 Aug  6  2025 sdm_parquet
+-rw-r--r--  1 admin admin 2005938176 Aug  6  2025 sdm.duckdb
+-rw-r--r--  1 admin admin       1436 Aug  6  2025 layers.csv
+-rw-rw-r--  1 admin admin   14905344 Aug  6  2025 ply_planareas_2025-06-18.gpkg
+-rw-rw-r--  1 admin admin   18169856 Aug  6  2025 ply_ecoregions_2025-06-18.gpkg
+-rw-r--r--  1 admin admin   39829222 Aug  6  2025 r_metrics.tif
+-rw-rw-r--  1 admin admin        785 Aug  7  2025 subregion_planareas.csv
+-rw-rw-r--  1 admin admin   52740096 Aug  7  2025 ply_subregions_2025.gpkg
+drwxr-xr-x  7 admin admin         87 Sep 29 20:08 ..
+-rw-rw-r--  1 admin admin        330 Jan 13 14:02 subregion_programareas.csv
+-rw-rw-r--  1 admin admin       1432 Jan 13 14:02 layers_2026.csv
+-rw-rw-r--  1 admin admin    7368704 Jan 13 14:02 ply_programareas_2026.gpkg
+-rw-rw-r--  1 admin admin   39625975 Jan 13 14:02 r_metrics_2026.tif
+-rw-rw-r--  1 admin admin   62022622 Jan 13 14:02 zone_taxon_2026.csv
+-rw-r--r--  1 admin admin 2067804160 Jan 23 19:44 sdm_2026-01-13.duckdb
+drwxrwxr-x  2 admin admin          6 Jan 23 19:48 new
+-rw-rw-r--  1 admin admin 2205954048 Jan 29 15:37 sdm_2026-01-23.duckdb
+-rw-rw-r--  1 admin admin 2240819200 Jan 29 16:05 sdm_2026.duckdb
+-rw-rw-r--  1 admin admin        796 Feb 11 13:31 ply_label_placement_pra.csv
+-rw-rw-r--  1 admin admin       1863 Feb 11 13:31 ply_ecoregion_programarea_v3.csv
+-rw-rw-r--  1 admin admin      16696 Feb 11 13:31 r_metrics_2026_v3.tif.aux.xml
+-rw-rw-r--  1 admin admin      16696 Feb 11 13:31 r_metrics_akl48_v3.tif.aux.xml
+-rw-rw-r--  1 admin admin    7806976 Feb 11 13:32 ply_ecoregion_programarea_v3.gpkg
+-rw-rw-r--  1 admin admin       1599 Feb 11 13:32 layers_2026_v3.csv
+-rw-rw-r--  1 admin admin   14909440 Feb 11 13:32 ply_planareas_2025_v3.gpkg
+-rw-rw-r--  1 admin admin    7360512 Feb 11 13:32 ply_programareas_2026_v3.gpkg
+-rw-rw-r--  1 admin admin   18165760 Feb 11 13:32 ply_ecoregions_2025_v3.gpkg
+-rw-rw-r--  1 admin admin   22390205 Feb 11 13:32 r_metrics_akl48_v3.tif
+-rw-rw-r--  1 admin admin   41939639 Feb 11 13:32 r_metrics_2026_v3.tif
+-rw-rw-r--  1 admin admin   60834144 Feb 11 13:32 zone_taxon_2026_v3.csv
+-rw-rw-r--  1 admin admin 2281189376 Feb 11 17:30 sdm_v3.duckdb
+-rw-rw-r--  1 admin admin 2280665088 Feb 12 11:08 sdm_v3_2026-02-12.duckdb
+-rw-rw-r--  1 admin admin      16580 Feb 12 14:49 rast_metrics_programareas_v3.tif.aux.xml
+-rw-rw-r--  1 admin admin       1091 Feb 12 14:49 tbl_pra_scores_v3.csv
+-rw-rw-r--  1 admin admin       4700 Feb 12 14:49 tbl_er_pra_scores_v3.csv
+drwxr-xr-x  7 admin admin       4096 Feb 12 14:49 .
+-rw-rw-r--  1 admin admin      16580 Feb 12 14:49 rast_metrics_v3.tif.aux.xml
+-rw-rw-r--  1 admin admin       1432 Feb 12 14:49 layers_v3.csv
+-rw-rw-r--  1 admin admin    7368704 Feb 12 14:49 ply_programareas_v3.gpkg
+-rw-rw-r--  1 admin admin   21846330 Feb 12 14:50 rast_metrics_programareas_v3.tif
+-rw-rw-r--  1 admin admin   43395433 Feb 12 14:51 rast_metrics_v3.tif
+```
+
+Can you also advise on how best to automate the server updates, like with rclone, ssh commands or similar, for pushing files from laptop to server and pulling Github commits. We only need to do this for the latest version app (now v3).
+
+⏺ Updated plan                                                                                                                                                    
+  ⎿  /plan to preview                                                                                                                                                                  
+ Here is Claude's plan:
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Plan: Apps versioning with git branches                                                                                                                        
+
+ Context
+
+ The MarineSensitivity/apps repo serves three simultaneous app versions on the
+ Shiny server. Currently main has v1 code and programareas_2026 has v2→v3
+ code. Two local clones exist: apps/ (on main, uncommitted v1 path changes)
+ and apps_2026/ (on programareas_2026, committed v3 path changes). The server
+ has six symlinks pointing to clones at various commits. Goal: formalize with
+ proper v1, v2 branches, merge v3 into main, restructure server data into
+ v1/, v2/, v3/ subdirectories.
+
+ Phase 1: Create v1 branch (in apps/ clone)
+
+ cd ~/Github/MarineSensitivity/apps  # on main, with uncommitted v1 path changes
+
+ git add mapgl/app.R mapsp/app.R
+ git commit -m "update paths to derived/v1/ for versioned directory structure"
+ git branch v1           # freeze v1 at this commit
+ git push origin v1
+
+ Phase 2: Create v2 branch (in apps_2026/ clone)
+
+ cd ~/Github/MarineSensitivity/apps_2026
+
+ git branch v2 86448d1   # v2 cutoff commit (Jan 30)
+ git checkout v2
+
+ Update mapgl/app.R paths (~line 48-72) to use derived/v2/:
+
+ v_dir <- "v2"
+ dir_v   <- glue("{dir_data}/derived/{v_dir}")
+ dir_big <- ifelse(is_server, dir_v,
+   glue("~/_big/msens/derived/{v_dir}"))
+
+ sdm_db      <- glue("{dir_big}/sdm.duckdb")
+ cell_tif    <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
+ er_gpkg     <- glue("{dir_v}/ply_ecoregions_2025.gpkg")
+ lyrs_csv    <- glue("{dir_v}/layers.csv")
+ metrics_tif <- glue("{dir_v}/r_metrics.tif")
+ pra_gpkg    <- glue("{dir_v}/ply_programareas_2026.gpkg")
+ sr_pra_csv  <- glue("{dir_v}/subregion_programareas.csv")
+
+ Update mapsp/app.R paths (~line 30-45):
+
+ v_dir <- "v2"
+ dir_v   <- glue("{dir_data}/derived/{v_dir}")
+ dir_big <- ifelse(is_server, dir_v,
+   glue("~/_big/msens/derived/{v_dir}"))
+
+ sdm_db   <- glue("{dir_big}/sdm.duckdb")
+ cell_tif <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
+
+ git add mapgl/app.R mapsp/app.R
+ git commit -m "update paths to derived/v2/ for versioned directory structure"
+ git push origin v2
+
+ Phase 3: Merge programareas_2026 into main
+
+ ```bash
+ cd ~/Github/MarineSensitivity/apps_2026
+
+ git checkout main
+ git pull origin main           # get the v1 commit from Phase 1
+ git merge programareas_2026 -m "merge programareas_2026 (v3) into main"
+ # resolve any conflicts (mapgl/app.R, mapsp/app.R — keep programareas_2026 version)
+ git push origin main
+ ```
+
+ Phase 4: Rename local clones
+ 
+ ```bash
+ cd ~/Github/MarineSensitivity
+
+ mv apps apps_v1                     # frozen v1 clone
+ cd apps_v1 && git checkout v1 && cd ..
+
+ mv apps_2026 apps                   # active v3 clone, now on main
+ cd apps && git checkout main && git pull && cd ..
+
+ # v2 worktree (lightweight, no separate clone)
+ git -C apps worktree add ../apps_v2 v2
+
+ Result:
+ apps/     → main   (v3, active development)
+ apps_v1/  → v1     (frozen)
+ apps_v2/  → v2     (frozen)
+ ```
+
+ Phase 5: Server data — create v1/, v2/, v3/
+
+ ```bash
+ ssh msens
+ cd /share/data/derived
+ mkdir -p v1 v2 v3
+
+ # --- v1 files ---
+ mv ply_planareas_2025.gpkg      v1/
+ mv ply_ecoregions_2025.gpkg     v1/
+ mv ply_subregions_2025.gpkg     v1/
+ mv layers.csv                   v1/
+ mv r_metrics.tif                v1/
+ mv subregion_planareas.csv      v1/
+ mv sdm.duckdb                   v1/
+
+ # --- v2 files (drop _2026 suffix where it's a computed output) ---
+ mv sdm_2026.duckdb              v2/sdm.duckdb
+ mv layers_2026.csv              v2/layers.csv
+ mv ply_programareas_2026.gpkg   v2/
+ mv r_metrics_2026.tif           v2/r_metrics.tif
+ mv zone_taxon_2026.csv          v2/zone_taxon.csv
+ cp subregion_programareas.csv   v2/
+ cp v1/ply_ecoregions_2025.gpkg  v2/   # v2 also uses this
+
+ # --- v3 files (standardized names) ---
+ mv sdm_v3.duckdb                    v3/sdm.duckdb
+ mv layers_2026_v3.csv               v3/layers_v3.csv
+ mv layers_v3.csv                    v3/   # dup from calc_scores — overwrite OK
+ mv ply_programareas_2026_v3.gpkg    v3/
+ mv ply_ecoregions_2025_v3.gpkg      v3/
+ mv ply_planareas_2025_v3.gpkg       v3/
+ mv r_metrics_2026_v3.tif            v3/r_metrics_v3.tif
+ mv r_metrics_2026_v3.tif.aux.xml    v3/r_metrics_v3.tif.aux.xml
+ mv r_metrics_akl48_v3.tif           v3/r_metrics_programareas_v3.tif
+ mv r_metrics_akl48_v3.tif.aux.xml   v3/r_metrics_programareas_v3.tif.aux.xml
+ mv zone_taxon_2026_v3.csv           v3/zone_taxon_v3.csv
+ mv subregion_programareas.csv       v3/
+ mv ply_ecoregion_programarea_v3.gpkg v3/
+ mv ply_ecoregion_programarea_v3.csv  v3/
+ mv ply_label_placement_pra.csv       v3/
+ mv tbl_er_pra_scores_v3.csv          v3/
+ mv tbl_pra_scores_v3.csv             v3/
+ mv rast_metrics_v3.tif               v3/   # stale dup — delete after confirming
+ mv rast_metrics_programareas_v3.tif  v3/   # stale dup — delete after confirming
+ mv ply_programareas_v3.gpkg          v3/   # stale dup — delete after confirming
+
+ Stale files to archive/delete after apps confirmed working:
+ sdm_2026-01-13.duckdb, sdm_2026-01-23.duckdb   (dated backups)
+ sdm_v3_2026-02-12.duckdb                       (dated backup)
+ sdm_parquet/, sdm_parquet_2025-06-18/           (old parquet exports)
+ ply_planareas_2025-06-18.gpkg                   (dated)
+ ply_ecoregions_2025-06-18.gpkg                  (dated)
+ pa_oa_2025.geojson, pa-2025_am-cid.tif         (intermediate)
+ rast_metrics_*.tif.aux.xml                      (wrong prefix, aux only)
+ new/                                            (empty?)
+ aquamaps/, aquamaps.org/                        (source data, not derived)
+ ```
+
+ Phase 6: Update server app clones + symlinks
+
+ ```bash
+ ssh msens
+ cd /srv/shiny-server
+
+ # v3: switch from programareas_2026 to main
+ for d in mapgl mapsp; do
+   cd $d && git fetch origin && git checkout main && git pull && cd ..
+ done
+
+ # v1: switch from main to v1 branch
+ for d in mapgl_2025 mapsp_2025; do
+   cd $d && git fetch origin && git checkout v1 && git pull origin v1 && cd ..
+ done
+
+ # v2: switch to v2 branch
+ for d in mapgl_v2 mapsp_v2; do
+   cd $d && git fetch origin && git checkout v2 && git pull origin v2 && cd ..
+ done
+
+ Optional: rename _2025 symlinks to _v1 for consistency:
+ cd /srv/shiny-server
+ ln -sfn $(readlink mapgl_2025) mapgl_v1 && rm mapgl_2025
+ ln -sfn $(readlink mapsp_2025) mapsp_v1 && rm mapsp_2025
+ ```
+
+ Phase 7: Server data READMEs
+
+ Copy README.md files to server v1/, v2/, v3/ directories
+ (create v2 README matching the pattern of the v1/v3 READMEs already written
+ to Google Drive).
+
+ Files to modify
+ ┌──────────────┬────────┬─────────────────────────────────────────────────┐
+ │     File     │ Branch │                     Changes                     │
+ ├──────────────┼────────┼─────────────────────────────────────────────────┤
+ │ mapgl/app.R  │ v1     │ commit existing uncommitted derived/v1/ paths   │
+ ├──────────────┼────────┼─────────────────────────────────────────────────┤
+ │ mapsp/app.R  │ v1     │ commit existing uncommitted derived/v1/ paths   │
+ ├──────────────┼────────┼─────────────────────────────────────────────────┤
+ │ mapgl/app.R  │ v2     │ update flat derived/ paths → derived/v2/        │
+ ├──────────────┼────────┼─────────────────────────────────────────────────┤
+ │ mapsp/app.R  │ v2     │ update flat derived/ paths → derived/v2/        │
+ ├──────────────┼────────┼─────────────────────────────────────────────────┤
+ │ (no changes) │ main   │ v3 paths already committed on programareas_2026 │
+ └──────────────┴────────┴─────────────────────────────────────────────────┘
+ Phase 8: Deployment script — deploy_v3.sh
+
+ Create workflows/deploy_v3.sh to automate syncing v3 data and pulling app
+ code on the server. Uses rsync over SSH with the existing key.
+
+ ```bash
+ #!/usr/bin/env bash
+ # deploy_v3.sh — sync v3 derived data + app code to msens server
+ #
+ # usage:
+ #   ./deploy_v3.sh            # sync data + pull apps
+ #   ./deploy_v3.sh data       # sync data only
+ #   ./deploy_v3.sh apps       # pull apps only
+ set -euo pipefail
+
+ # ssh config ----
+ SSH_KEY="$HOME/My Drive/private/msens_key_pair.pem"
+ SSH_HOST="ubuntu@msens1.marinesensitivity.org"
+ SSH_CMD="ssh -i \"$SSH_KEY\""
+
+ # local paths ----
+ DIR_V3="$HOME/My Drive/projects/msens/data/derived/v3/"
+ DIR_BIG="$HOME/_big/msens/derived/v3/"
+ DIR_SHARED="$HOME/My Drive/projects/msens/data/derived/r_bio-oracle_planarea.tif"
+
+ # remote paths ----
+ REMOTE_DERIVED="/share/data/derived"
+
+ MODE="${1:-all}"
+
+ # sync data ----
+ if [[ "$MODE" == "all" || "$MODE" == "data" ]]; then
+   echo "=== syncing derived/v3/ (small files) ==="
+   rsync -avz --progress \
+     -e "ssh -i \"$SSH_KEY\"" \
+     --exclude='*.aux.xml' \
+     "$DIR_V3" \
+     "$SSH_HOST:$REMOTE_DERIVED/v3/"
+
+   echo "=== syncing _big/v3/ (sdm.duckdb, parquet) ==="
+   rsync -avz --progress \
+     -e "ssh -i \"$SSH_KEY\"" \
+     "$DIR_BIG" \
+     "$SSH_HOST:$REMOTE_DERIVED/v3/"
+
+   echo "=== syncing shared input raster ==="
+   rsync -avz --progress \
+     -e "ssh -i \"$SSH_KEY\"" \
+     "$DIR_SHARED" \
+     "$SSH_HOST:$REMOTE_DERIVED/"
+ fi
+
+ # pull app code ----
+ if [[ "$MODE" == "all" || "$MODE" == "apps" ]]; then
+   echo "=== pulling v3 apps on server ==="
+   ssh -i "$SSH_KEY" "$SSH_HOST" bash -s <<'REMOTE'
+     cd /srv/shiny-server
+     for d in mapgl mapsp; do
+       echo "--- $d ---"
+       cd "$d"
+       git fetch origin
+       git checkout main
+       git pull origin main
+       cd ..
+     done
+     echo "=== done ==="
+ REMOTE
+ fi
+ ```
+
+ Notes:
+ - rsync -avz = archive mode, verbose, compressed transfer
+ - --progress shows per-file transfer progress (useful for big sdm.duckdb)
+ - On the server, both small and big files land in /share/data/derived/v3/
+ (no separate _big directory since server has everything colocated)
+ - First run will transfer ~2.5GB (sdm.duckdb); subsequent runs only transfer
+ changed files (rsync is incremental)
+ - Add --dry-run flag to preview what would transfer without doing it
+ - The script only deploys v3 (active version); v1/v2 are frozen
+
+ Verification
+
+ 1. Locally: git checkout v1 in apps_v1/ — confirm file.exists() checks pass
+ 2. Locally: git checkout v2 in apps_v2/ — confirm paths resolve
+ 3. Locally: apps/ on main — confirm v3 app starts
+ 4. Server: restart each app pair, confirm correct v{N}/ data loads
+ 5. URLs: shiny.marinesensitivity.org/mapgl/ (v3), /mapgl_v1/ or /mapgl_2025/, /mapgl_v2/
+ 6. No app reads from flat derived/ except r_bio-oracle_planarea.tif
 
 
-
-
-## 2026-02-12 sensibly restructure output files in derived/, big files outside Google Drive and versions within
+## 2026-02-12 sensibly restructure output files in derived/, _big files outside Google Drive and v1/ v3/ versions within
 
 In the process of trying to make files distinguishable from past versions and creating extra copies in subdirectories, I have confused myself as to which files to use. For example, here are some of the seeming same files for ply_programareas_*.gpkg:
 
@@ -486,6 +855,36 @@ Change symlink from `_derived_big_files` to simply `_big`.
   3. migrate_derived_to_versions.R — Removed downloads and downloads/figures from directory creation. Changed symlink from _derived_big_files to _big. Removed
   unused safe_copy helper.
 
+⏺ All phases complete. Here's a summary of what was done:
+                                                        
+  Summary                                                                                                                                                         
+                                                       
+  Phase 1 — v1 branch: Committed uncommitted v1 path changes in apps/, created v1 branch, pushed to origin.                                                       
+                                                                                                                                                                  
+  Phase 2 — v2 branch: Created v2 branch from commit 86448d1, updated mapgl/app.R and mapsp/app.R paths to use derived/v2/ with dir_v/dir_big pattern, committed  
+  and pushed.                                                                                                                                                     
+                                                                                                                                                                  
+  Phase 3 — Merge: Merged programareas_2026 into main in apps_2026/, resolved conflicts keeping the programareas_2026 (v3) version, pushed.                       
+                                                                                                                                                                  
+  Phase 4 — Local clones:                                                                                                                                         
+  apps/     → main   (v3, active development)
+  apps_v1/  → v1     (frozen)                                                                                                                                     
+  apps_v2/  → v2     (worktree, frozen)                                                                                                                           
+                                                                                                                                                                  
+  Phase 5 — Server data: Created v1/, v2/, v3/ subdirectories under /share/data/derived/ and moved all files into their versioned directories. Stale/dated files  
+  remain in the root for later cleanup.                                                                                                                           
+                                                                                                                                                                  
+  Phase 6 — Server apps + symlinks:                                                                                                                               
+  - apps_v3 → main (was programareas_2026)
+  - apps → v1 (was main)
+  - apps_2026 → v2 (was programareas_2026)
+  - Renamed mapgl_2025/mapsp_2025 symlinks to mapgl_v1/mapsp_v1
+
+  Phase 8 — Deploy script: Created workflows/deploy_v3.sh with rsync for data + git pull for apps, adapted to actual server paths
+  (/share/github/MarineSensitivity/apps_v3/).
+
+  Note: Phase 7 (server data READMEs) was not explicitly executed — you may want to scp those from Google Drive separately. Also, you'll want to verify the apps
+  are working at their URLs before cleaning up the stale files.
 
 
 ## 2026-02-12 inspect after `calc_scores.qmd` cleanup
@@ -873,7 +1272,7 @@ Since the @workflows/fix_taxon_model_dups.qmd will be a quick fix, that's fine t
  2. Deletes any existing ca_nmfs rows from taxon_model for that taxon (idempotent re-runs)
  3. Inserts a new (taxon_id, ds_key='ca_nmfs', mdl_seq) row
 
- ### Add `taxon_model` entry
+ `### Add `taxon_model` entry
 
  ```r
  # look up taxon_id for rice's whale
@@ -3405,6 +3804,7 @@ the reference database for the prior version to compare against.
 
  B2: msens/R/listings.R — listing parsers and score computation
 
+ ```r
  #' Parse NOAA protected_status field
  #' @param status_str character vector of semicolon-delimited statuses
  #' @return tibble with columns: esa_status, is_mmpa
@@ -3448,9 +3848,11 @@ the reference database for the prior version to compare against.
      is_us               ~ pmin(base_us + bonus, 100L),
      TRUE                ~ score_iucn)
  }
+ ```
 
  B3: msens/R/taxa.R — taxonomy matching cascade
 
+ ```r
  #' Match taxa to spp.duckdb via cascade
  #'
  #' 1. ITIS TSN crosswalk -> worms_id
@@ -3465,6 +3867,7 @@ the reference database for the prior version to compare against.
  match_taxa <- function(d, con_spp) {
    # implementation follows patterns in merge_models.qmd
  }
+ ```
 
  ---
  Part C: ingest_nmfs-fws-mmpa-mbta-listings.qmd
