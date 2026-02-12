@@ -18,6 +18,7 @@ DIR_SHARED="$HOME/My Drive/projects/msens/data/derived/r_bio-oracle_planarea.tif
 
 # remote paths ----
 REMOTE_DERIVED="/share/data/derived"
+REMOTE_BIG="/share/data/big"
 
 MODE="${1:-all}"
 
@@ -30,11 +31,11 @@ if [[ "$MODE" == "all" || "$MODE" == "data" ]]; then
     "$DIR_V3" \
     "$SSH_HOST:$REMOTE_DERIVED/v3/"
 
-  echo "=== syncing _big/v3/ (sdm.duckdb, parquet) ==="
+  echo "=== syncing _big/v3/ (sdm.duckdb) to /share/data/big/v3/ ==="
   rsync -avz --progress \
     -e "ssh -i \"$SSH_KEY\"" \
     "$DIR_BIG" \
-    "$SSH_HOST:$REMOTE_DERIVED/v3/"
+    "$SSH_HOST:$REMOTE_BIG/v3/"
 
   echo "=== syncing shared input raster ==="
   rsync -avz --progress \
@@ -47,7 +48,7 @@ fi
 if [[ "$MODE" == "all" || "$MODE" == "apps" ]]; then
   echo "=== pulling v3 apps on server ==="
   ssh -i "$SSH_KEY" "$SSH_HOST" bash -s <<'REMOTE'
-    cd /share/github/MarineSensitivity/apps_v3
+    cd /share/github/MarineSensitivity/apps
     echo "--- $(pwd) ---"
     git fetch origin
     git checkout main

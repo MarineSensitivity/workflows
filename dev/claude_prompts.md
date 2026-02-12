@@ -20,6 +20,8 @@ Now that I've confirmed all file restructuring help me with apps versioning with
 
 Here also is the current state of the Shiny app git repositories with branch, commit and date stamp:
 
+
+
 ```bash
 # cd to symlinks of Shiny server folders
 cd /srv/shiny-server
@@ -383,6 +385,21 @@ Can you also advise on how best to automate the server updates, like with rclone
  5. URLs: shiny.marinesensitivity.org/mapgl/ (v3), /mapgl_v1/ or /mapgl_2025/, /mapgl_v2/
  6. No app reads from flat derived/ except r_bio-oracle_planarea.tif
 
+I was expecting to see just 3 apps repo clones on both server (first image) and laptop (2nd image): apps (main branch for v3 or latest working version),
+  apps_v1, apps_v2. But that's not quite what I am seeing. Do I need to manually clean up or am I missing something?    
+
+⏺ Clean on both sides now:        
+  ┌───────────┬───────────────┬───────────────┬────────────────────┐
+  │ Directory │ Laptop branch │ Server branch │      Symlinks      │                                                                                              
+  ├───────────┼───────────────┼───────────────┼────────────────────┤
+  │ apps/     │ main (v3)     │ main (v3)     │ mapgl, mapsp       │                                                                                              
+  ├───────────┼───────────────┼───────────────┼────────────────────┤       
+  │ apps_v1/  │ v1            │ v1            │ mapgl_v1, mapsp_v1 │
+  ├───────────┼───────────────┼───────────────┼────────────────────┤
+  │ apps_v2/  │ v2 (worktree) │ v2            │ mapgl_v2, mapsp_v2 │
+  └───────────┴───────────────┴───────────────┴────────────────────┘
+
+Since I want to have the main files on Google Drive for comparison, I copied the server's /share/data/derived/v2/ to 
 
 ## 2026-02-12 sensibly restructure output files in derived/, _big files outside Google Drive and v1/ v3/ versions within
 
