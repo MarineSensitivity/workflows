@@ -40,6 +40,17 @@ This notebook calculates scores from models loaded into sdm db and taxon table, 
 - [ ] Show tabular results of R chunks before / after execution with `DT::datatable()`
 - [ ] Migrate from PostGIS & pg_tileserv to [creating PMTiles](https://docs.protomaps.com/pmtiles/create) and map with `mapgl::add_pmtiles_source()`
 - [ ] Redo parquet export into dir outside Google Drive (sync issues)
+
+### Future Considerations
+
+- **Cell-level endemism / species richness**: Currently species richness is
+  implicitly captured by summing species layers per taxonomic group. A future
+  enhancement could compute explicit richness or cell-level endemism metrics.
+- **Endemism vs richness distinction**: "Endemism" (range restriction) is a
+  species-level property; "species richness" (how many species share a cell)
+  is a cell-level property. The former is computed in `ms_endemism` per species;
+  the latter emerges naturally from summing `ms_merge` layers across species.
+
 - include more complex models:
   - unique by: ds_key, taxa_id, time_period
   - pkey: mdl_seq
@@ -832,17 +843,18 @@ for (sp_cat in sp_cats) {
   ) |>
     pull(metric_seq)
 
-  # use er_score from taxon (pre-computed in ingest_nmfs-fws-mmpa-mbta-listings.qmd
-  # and merged in merge_models.qmd)
-  d_er <- tbl(con_sdm, "taxon") |>
+  # ms_merge values already incorporate extinction risk per cell
+  # (ms_merge = max(1, round(ms_suit * ms_er / 100))), so we simply
+  # sum ms_merge values across species — no scalar er_score multiplication
+  d_mdl <- tbl(con_sdm, "taxon") |>
     filter(
       is_ok,
       if (!!sp_cat == "all") T else sp_cat == !!sp_cat
     ) |>
-    select(mdl_seq, er_score) |>
+    select(mdl_seq) |>
     collect()
 
-  duckdb_register(con_sdm, "tmp_er", d_er |> select(mdl_seq, er_score))
+  duckdb_register(con_sdm, "tmp_mdl", d_mdl)
   dbExecute(
     con_sdm,
     glue(
@@ -851,13 +863,13 @@ for (sp_cat in sp_cats) {
     SELECT
       mc.cell_id,
       {metric_seq} AS metric_seq,
-      ROUND(SUM(er.er_score * mc.value) / 100.0, 2) AS value
+      ROUND(SUM(mc.value), 2) AS value
     FROM model_cell mc
-    JOIN tmp_er er ON mc.mdl_seq = er.mdl_seq
+    JOIN tmp_mdl tm ON mc.mdl_seq = tm.mdl_seq
     GROUP BY mc.cell_id"
     )
-  ) # 6,662,075
-  duckdb_unregister(con_sdm, "tmp_er")
+  )
+  duckdb_unregister(con_sdm, "tmp_mdl")
 
   # visual check ----
   # d <- tbl(con_sdm, "cell_metric") |>
@@ -2139,10 +2151,13 @@ d <- tbl(con_sdm, "zone") |>
 # 45 invertebrate NA                         Quadrimaera …   4.22e5 NA         8245
 # 46 invertebrate NA                         Scabrotropho…   1.47e5 NA        17229
 
+# ms_merge values already incorporate ER per cell, so avg_suit from
+# ms_merge is the combined suitability x extinction risk score.
+# suit_rl is simply the avg ms_merge value scaled to 0-1.
 d <- d |>
   mutate(
-    suit_rl = avg_suit * er_score / 100,
-    suit_rl_area = avg_suit * er_score / 100 * area_km2
+    suit_rl = avg_suit,
+    suit_rl_area = avg_suit * area_km2
   ) |>
   group_by(zone_fld, zone_value, sp_cat) |>
   mutate(

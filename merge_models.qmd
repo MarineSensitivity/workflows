@@ -17,6 +17,7 @@ Merge species distribution models from multiple datasets, flag valid taxa
 Data preparation steps (taxonomic ID resolution, ad-hoc species fixes,
 dataset ingestion) are in `merge_models_prep.qmd`.
 
+
 ```{r}
 #| label: setup
 librarian::shelf(
@@ -59,48 +60,97 @@ sdm_db <- glue("{dir_big_v}/sdm.duckdb")
 # database connections
 con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F))
 
+tbl(con_sdm, "taxon") |>
+  filter(scientific_name == "Balaenoptera ricei") |>
+  select(worms_id = taxon_id) |>
+  left_join(
+    tbl(con_sdm, "species"),
+    by = join_by(worms_id)
+  ) |>
+  select(worms_id, ds_key, taxa, scientific_name_accepted) |>
+  collect()
+
+
+tbl(con_sdm, "model") |> collect() |> head()
+
 # section eval flags (set to TRUE to re-run) ----
-do_merge <- F  # create ms_merge merged models
-do_is_ok <- F  # flag valid taxa
+do_merge <- T # create ms_merge merged models
+do_is_ok <- F # flag valid taxa
+
+# TODO: move to merge_models_prep.qmd after merged models created.
 ```
 
-## Add Merged Dataset (`ms_merge`)
+## Add Derived Datasets
 
-### Insert ms_merge dataset row
+### Separating Suitability and Extinction Risk
+
+The model pipeline separates two concepts that were previously conflated in
+`model_cell.value`:
+
+- **Suitability** (`is_suit`): likelihood of species presence (0-100).
+  AquaMaps SDM provides continuous suitability; endemism (`ms_endemism`)
+  converts binary range maps to a suitability proxy via log-scaled range
+  restriction (10=widespread, 90=endemic).
+  
+- **Extinction Risk** (`is_er`): conservation status encoded as cell values
+  (e.g., EN:100, TN:50, LC:1). Applies to range/CH/CA maps where values
+  represent ESA/IUCN listing status.
+
+The final merged model is the product:
+`ms_merge = max(1, round(ms_suit * ms_er / 100))`
+
+This ensures species never "disappear" (floor of 1) and that suitability
+and extinction risk are independently interpretable layers.
+
+### Insert derived dataset rows
 
 ```{r}
-#| label: insert_dataset_merged
+#| label: insert_dataset_derived
 #| eval: !expr do_merge
-ds_key <- "ms_merge"
-row_dataset <- tibble(
-  ds_key = !!ds_key,
-  name_short = glue("Marine Sensitivity Merged Model, {Sys.Date()}"),
-  name_original = "Marine Sensitivity merged model from multiple inputs",
-  description = "This dataset is derived from others. When a given taxon has multiple distributions, the maximum value is taken. If an IUCN range exists, then that and any critical habitat (NOAA or FWS) are used to mask the other inputs so that only areas within the IUCN range are considered.",
-  citation = "",
-  source_broad = "BOEM",
-  source_detail = "https://marinesensitivity.org/docs",
-  regions = "USA",
-  response_type = "mixed",
-  taxa_groups = "all taxa",
-  year_pub = 2025,
-  date_obs_beg = NA,
-  date_obs_end = NA,
-  date_env_beg = NA,
-  date_env_end = NA,
-  link_info = "https://github.com/MarineSensitivity",
-  link_download = NA,
-  link_metadata = NA,
-  links_other = NA,
-  spatial_res_deg = 0.05,
-  temporal_res = "static"
+
+# dataset templates for all derived layers
+derived_datasets <- tribble(
+  ~ds_key       , ~name_short                                        , ~description                                                                                                                                                                                                                           ,
+  "ms_endemism" , glue("Endemism (suitability proxy), {Sys.Date()}") , "Log-scaled endemism score (10-90) derived from species range size relative to total Program Area cells. Small ranges score high (endemic), large ranges score low (dispersed). Used as a suitability proxy for species lacking SDMs." ,
+  "ms_suit"     , glue("Merged Suitability, {Sys.Date()}")           , "Per-cell maximum of all suitability layers (AquaMaps SDM and endemism). Masked to IUCN range when available. Values 1-100 representing likelihood of species presence."                                                               ,
+  "ms_er"       , glue("Merged Extinction Risk, {Sys.Date()}")       , "Per-cell extinction risk from the highest-priority ER layer (US > Intl, NMFS > FWS > IUCN). Cells in species range but without ER layer coverage receive the species-level max ER value. Values 1-100."                               ,
+  "ms_merge"    , glue("Final Merged Model, {Sys.Date()}")           , "Product of suitability and extinction risk: max(1, round(ms_suit * ms_er / 100)). This is the final per-species model layer used for scoring."
 )
 
-if (dbExistsTable(con_sdm, "dataset")) {
-  dbExecute(con_sdm, glue("DELETE FROM dataset WHERE ds_key = '{ds_key}'"))
+for (i in 1:nrow(derived_datasets)) {
+  dd <- derived_datasets[i, ]
+
+  row_dataset <- tibble(
+    ds_key = dd$ds_key,
+    name_short = dd$name_short,
+    name_original = dd$name_short,
+    description = dd$description,
+    citation = "",
+    source_broad = "BOEM",
+    source_detail = "https://marinesensitivity.org/docs",
+    regions = "USA",
+    response_type = "mixed",
+    taxa_groups = "all taxa",
+    year_pub = 2025,
+    date_obs_beg = NA,
+    date_obs_end = NA,
+    date_env_beg = NA,
+    date_env_end = NA,
+    link_info = "https://github.com/MarineSensitivity",
+    link_download = NA,
+    link_metadata = NA,
+    links_other = NA,
+    spatial_res_deg = 0.05,
+    temporal_res = "static"
+  )
+
+  if (dbExistsTable(con_sdm, "dataset")) {
+    dbExecute(con_sdm, glue("DELETE FROM dataset WHERE ds_key = '{dd$ds_key}'"))
+  }
+
+  dbWriteTable(con_sdm, "dataset", row_dataset, append = TRUE)
 }
 
-dbWriteTable(con_sdm, "dataset", row_dataset, append = TRUE)
 # tbl(con_sdm, "dataset")
 ```
 
@@ -115,6 +165,8 @@ for (col_def in list(
   c("name_display", "VARCHAR"),
   c("value_info", "VARCHAR"),
   c("is_mask", "BOOLEAN"),
+  c("is_suit", "BOOLEAN"),
+  c("is_er", "BOOLEAN"),
   c("sort_order", "INTEGER")
 )) {
   tryCatch(
@@ -133,16 +185,21 @@ for (col_def in list(
 }
 
 # populate metadata for each dataset
+# is_suit: dataset contributes to suitability (likelihood of presence)
+# is_er:   dataset contributes to extinction risk (conservation status)
 metadata <- tribble(
-  ~ds_key    , ~name_display           , ~value_info                            , ~is_mask , ~sort_order ,
-  "am_0.05"  , "AquaMaps SDM"          , NA                                     , FALSE    , 1L          ,
-  "ca_nmfs"  , "NMFS Core Area"        , "Core: 100"                            , TRUE     , 2L          ,
-  "ch_nmfs"  , "NMFS Critical Habitat" , "EN:100, TN:50"                        , TRUE     , 3L          ,
-  "ch_fws"   , "FWS Critical Habitat"  , "EN:100, TN:50"                        , TRUE     , 4L          ,
-  "rng_fws"  , "FWS Range"             , "EN:100, TN:50, LC:1"                  , TRUE     , 5L          ,
-  "bl"       , "BirdLife Range"        , NA                                     , TRUE     , 6L          ,
-  "rng_iucn" , "IUCN Range"            , "CR:50, EN:25, VU:5, NT:2, LC:1, DD:1" , TRUE     , 7L          ,
-  "ms_merge" , "Merged Model"          , NA                                     , FALSE    , 0L
+  ~ds_key       , ~name_display            , ~value_info                            , ~is_mask , ~is_suit , ~is_er , ~sort_order ,
+  "am_0.05"     , "AquaMaps SDM"           , NA                                     , FALSE    , TRUE     , FALSE  ,  1L         ,
+  "ca_nmfs"     , "NMFS Core Area"         , "Core: 100"                            , TRUE     , FALSE    , TRUE   ,  2L         ,
+  "ch_nmfs"     , "NMFS Critical Habitat"  , "EN:100, TN:50"                        , TRUE     , FALSE    , TRUE   ,  3L         ,
+  "ch_fws"      , "FWS Critical Habitat"   , "EN:100, TN:50"                        , TRUE     , FALSE    , TRUE   ,  4L         ,
+  "rng_fws"     , "FWS Range"              , "EN:100, TN:50, LC:1"                  , TRUE     , FALSE    , TRUE   ,  5L         ,
+  "bl"          , "BirdLife Range"         , "CR:50, EN:25, VU:5, NT:2, LC:1, DD:1" , TRUE     , FALSE    , TRUE   ,  6L         ,
+  "rng_iucn"    , "IUCN Range"             , "CR:50, EN:25, VU:5, NT:2, LC:1, DD:1" , TRUE     , FALSE    , TRUE   ,  7L         ,
+  "ms_endemism" , "Endemism (suitability)" , "10=dispersed, 90=endemic"             , FALSE    , TRUE     , FALSE  , 10L         ,
+  "ms_suit"     , "Merged Suitability"     , NA                                     , FALSE    , FALSE    , FALSE  , 11L         ,
+  "ms_er"       , "Merged Extinction Risk" , NA                                     , FALSE    , FALSE    , FALSE  , 12L         ,
+  "ms_merge"    , "Final Merged Model"     , NA                                     , FALSE    , FALSE    , FALSE  ,  0L
 )
 
 for (i in 1:nrow(metadata)) {
@@ -155,6 +212,8 @@ for (i in 1:nrow(metadata)) {
      SET name_display = '{m$name_display}',
          value_info   = {vi},
          is_mask      = {tolower(m$is_mask)},
+         is_suit      = {tolower(m$is_suit)},
+         is_er        = {tolower(m$is_er)},
          sort_order   = {m$sort_order}
      WHERE ds_key = '{m$ds_key}'"
     )
@@ -162,294 +221,727 @@ for (i in 1:nrow(metadata)) {
 }
 
 tbl(con_sdm, "dataset") |>
-  select(ds_key, name_display, is_mask, sort_order) |>
+  select(ds_key, name_display, is_mask, is_suit, is_er, sort_order) |>
   collect()
 ```
 
-### Iterate merge across taxa
+### Fix BirdLife range map values
+
+BirdLife models currently have a flat `model_cell.value = 50` regardless of
+the species' IUCN Red List status. This should match the `rng_iucn` encoding
+scheme so that the ER layer values correctly reflect conservation status:
+CR=50, EN=25, VU=5, NT=2, LC=1, DD=1.
 
 ```{r}
-#| label: iterate_merge_ds_mdl
+#| label: fix_birdlife_values
 #| eval: !expr do_merge
-ds_key <- "ms_merge"
 
-# cell_tif <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
-# r_cell <- rast(cell_tif)
-# ext(r_cell) <- round(ext(r_cell), 3)
+bl_value_map <- c(CR = 50L, EN = 25L, VU = 5L, NT = 2L, LC = 1L, DD = 1L)
 
-d_x <- tbl(con_sdm, "taxon") |>
+# get BirdLife models with species redlist codes
+d_bl <- tbl(con_sdm, "taxon_model") |>
+  filter(ds_key == "bl") |>
+  inner_join(
+    tbl(con_sdm, "taxon") |>
+      select(taxon_id, redlist_code),
+    by = "taxon_id"
+  ) |>
+  collect()
+
+# map redlist codes to new values
+d_bl <- d_bl |>
+  mutate(
+    new_value = as.integer(bl_value_map[redlist_code])
+  ) |>
+  # species without a recognized redlist code get DD default
+  mutate(
+    new_value = ifelse(is.na(new_value), 1L, new_value)
+  )
+
+# batch update model_cell values per mdl_seq
+n_updated <- 0L
+for (i in seq_len(nrow(d_bl))) {
+  ms <- d_bl$mdl_seq[i]
+  nv <- d_bl$new_value[i]
+
+  n <- dbExecute(
+    con_sdm,
+    glue("UPDATE model_cell SET value = {nv} WHERE mdl_seq = {ms}")
+  )
+  n_updated <- n_updated + n
+}
+
+message(glue(
+  "Updated {n_updated} BirdLife cells across {nrow(d_bl)} species"
+))
+
+# verify: show species counts by redlist code and new value
+d_bl |>
+  count(redlist_code, new_value) |>
+  print()
+```
+
+### Create Endemism Layer (`ms_endemism`)
+
+Endemism is a species-level suitability proxy derived from range restriction.
+Species with smaller ranges (fewer cells in Program Areas) get higher scores,
+reflecting that being within a restricted range is stronger evidence of
+suitability. The log scaling provides better differentiation among endemic
+species compared to linear scaling.
+
+**Range**: 10 (most widespread) to 90 (most endemic)
+
+- **Floor of 10**: Even the most widespread species have meaningful
+  suitability — being in a known range is stronger evidence than absence
+- **Ceiling of 90**: Highly endemic species likely have high suitability
+  where found, but range maps carry more spatial uncertainty than SDMs
+  (which can reach 100%)
+- **Log scaling**: Approximate values: 1 cell → 90, 1K cells → ~60,
+  10K → ~43, 50% of area → ~22, all cells → 10
+
+```{r}
+#| label: create_ms_endemism
+#| eval: !expr do_merge
+
+# get total program area cells as a lazy query (for efficient semi_joins)
+q_pra_cells <- tbl(con_sdm, "zone") |>
   filter(
-    is.na(mdl_seq)
-  ) |> # consider running: reset mdl_seq for taxa that now need re-merging with IUCN
-  arrange(desc(n_ds), taxon_id) |>
-  collect() # 91
-# BUT is this only done then for IUCN when adding models later?
+    tbl == !!glue("ply_programareas_2026{v_sfx}"),
+    fld == "programarea_key"
+  ) |>
+  inner_join(
+    tbl(con_sdm, "zone_cell") |> select(zone_seq, cell_id),
+    by = "zone_seq"
+  ) |>
+  distinct(cell_id)
+n_total_cells <- q_pra_cells |> collect() |> nrow()
+message(glue("Total Program Area cells: {n_total_cells}"))
 
-# removed: quick fix for turtle sp_cat — now handled by reclassify_reptiles
-# chunk after taxon table creation (bind_birds_notbirds_ds)
-
-# table(d_x$sp_cat, useNA = "ifany")
-# OLD:
-# bird        coral         fish invertebrate       mammal      reptile
-#   49           10           12            1           12            7
-# NEW (rng_iucn):
-# coral         fish invertebrate       mammal        other       turtle
-#   375          927          148           58            2            6
-
-ds_keys <- tbl(con_sdm, "dataset") |>
-  pull(ds_key) |>
-  setdiff("ms_merge")
-
-# datasets for extracting max value SDM
-# ds_keys_sdm  <- setdiff(ds_keys, "rng_iucn")   # OLD: excluding IUCN range map except for masking
-ds_keys_sdm <- ds_keys # NEW: include IUCN range map for max value SDM
-# datasets that form the combined mask (IUCN range + critical habitats + national range), only when rng_iucn exists for species
+# dataset key definitions
 ds_keys_mask <- tbl(con_sdm, "dataset") |>
   filter(is_mask) |>
   pull(ds_key)
 
-for (i in 1:nrow(d_x)) {
-  # i = 1  # which(str_detect(d_x$scientific_name, ".*ricei")) # i = 1512
+ds_keys_input <- tbl(con_sdm, "dataset") |>
+  filter(!ds_key %in% c("ms_endemism", "ms_suit", "ms_er", "ms_merge")) |>
+  pull(ds_key)
 
-  d_sp <- d_x |> slice(i)
-  # d_sp |> glimpse()
-  # Rows: 1
-  # Columns: 18
-  # $ taxon_id         <dbl> 127186
-  # $ taxon_authority  <chr> "worms"
-  # $ n_ds             <int> 5
-  # $ am_0.05          <int> 7466
-  # $ ch_nmfs          <int> 18230
-  # $ ch_fws           <int> 18309
-  # $ rng_fws          <int> 18401
-  # $ sp_cat           <chr> "fish"
-  # $ bl               <int> NA
-  # $ mdl_seq          <int> NA
-  # $ scientific_name  <chr> "Salmo salar"
-  # $ common_name      <chr> "silver salmon"
-  # $ redlist_code     <chr> "EN"
-  # $ worms_is_marine  <lgl> TRUE
-  # $ worms_is_extinct <lgl> NA
-  # $ worms_id         <dbl> 127186
-  # $ is_ok            <lgl> TRUE
-  # $ rng_iucn         <int> 19445
+# get all valid taxa
+d_taxa <- tbl(con_sdm, "taxon") |>
+  filter(is_ok) |>
+  collect()
 
-  # list species models by dataset from taxon_model junction table
+# clean up existing ms_endemism models
+existing_ms <- tbl(con_sdm, "model") |>
+  filter(ds_key == "ms_endemism") |>
+  pull(mdl_seq)
+if (length(existing_ms) > 0) {
+  ms_str <- paste(existing_ms, collapse = ",")
+  dbExecute(
+    con_sdm,
+    glue("DELETE FROM model_cell  WHERE mdl_seq IN ({ms_str})")
+  )
+  dbExecute(
+    con_sdm,
+    glue("DELETE FROM taxon_model WHERE ds_key = 'ms_endemism'")
+  )
+  dbExecute(
+    con_sdm,
+    glue("DELETE FROM model       WHERE ds_key = 'ms_endemism'")
+  )
+  dbExecute(
+    con_sdm,
+    glue("DELETE FROM species     WHERE ds_key = 'ms_endemism'")
+  )
+}
+
+for (i in seq_len(nrow(d_taxa))) {
+  # i = 1
+  d_sp <- d_taxa[i, ]
+
+  # get this species' input models (excluding derived layers)
   d_sp_l <- tbl(con_sdm, "taxon_model") |>
-    filter(taxon_id == !!d_sp$taxon_id) |>
-    collect() |>
-    mutate(
-      taxon_authority = d_sp$taxon_authority
-    )
-  #   taxon_id taxon_authority ds_key   mdl_seq
-  #      <dbl> <chr>           <chr>      <int>
-  # 1   127186 worms           am_0.05     7466
-  # 2   127186 worms           ch_fws     18309
-  # 3   127186 worms           ch_nmfs    18230
-  # 4   127186 worms           rng_fws    18401
-  # 5   127186 worms           rng_iucn   19445
-  # NEW ds_key: "ms_merge"; mdl_seq: 20030
-
-  d_r_ds <- tbl(con_sdm, "model_cell") |>
     filter(
-      mdl_seq %in% d_sp_l$mdl_seq
+      taxon_id == !!d_sp$taxon_id,
+      ds_key %in% ds_keys_input
     ) |>
-    left_join(
-      tbl(con_sdm, "model") |>
-        select(mdl_seq, ds_key) |>
-        filter(mdl_seq %in% d_sp_l$mdl_seq),
-      by = "mdl_seq"
-    ) |>
-    group_by(ds_key) |>
-    summarize(
-      n_cell = n(),
-      v_min = min(value, na.rm = T),
-      v_max = max(value, na.rm = T),
-      .groups = "drop"
-    ) |>
-    collect() |>
-    mutate(
-      ds_str = glue("{ds_key} ({n_cell} cells, {v_min} - {v_max})")
-    )
-  #   ds_key   n_cell v_min v_max ds_str
-  #   <chr>     <dbl> <int> <int> <glue>
-  # 1 rng_iucn   6245    50    50 rng_iucn (6245 cells, 50 - 50)
-  # 2 ch_fws       29    90    90 ch_fws (29 cells, 90 - 90)
-  # 3 am_0.05   11739     1   100 am_0.05 (11739 cells, 1 - 100)
-  # 4 ch_nmfs       3    90    90 ch_nmfs (3 cells, 90 - 90)
-  # 5 rng_fws     264    50    90 rng_fws (264 cells, 50 - 90)
+    collect()
 
-  # datasets used for SDM
-  ds_sdm_sp <- intersect(d_sp_l$ds_key, ds_keys_sdm)
+  if (nrow(d_sp_l) == 0) {
+    next
+  }
 
-  sdm_mdl_seqs <- d_sp_l |>
-    filter(ds_key %in% ds_sdm_sp) |>
-    pull(mdl_seq)
-
-  # query of SDM with max value across all datasets
-  q_sdm <- tbl(con_sdm, "model_cell") |>
-    filter(
-      mdl_seq %in% sdm_mdl_seqs
-    ) |>
-    group_by(cell_id) |>
-    summarize(value = max(value, na.rm = T), .groups = "drop")
-
-  # check if IUCN range exists for this taxon (via taxon_model)
+  # determine the mask: if has rng_iucn, use union of is_mask layers;
+  # otherwise use union of ALL distributions
   has_iucn <- "rng_iucn" %in% d_sp_l$ds_key
   if (has_iucn) {
-    # get datasets used for mask
-    ds_mask_sp <- intersect(d_sp_l$ds_key, ds_keys_mask)
-
-    # get mdl_seqs for masking datasets
     mask_mdl_seqs <- d_sp_l |>
-      filter(ds_key %in% ds_mask_sp) |>
+      filter(ds_key %in% ds_keys_mask) |>
       pull(mdl_seq)
-
-    q_mask <- tbl(con_sdm, "model_cell") |>
-      filter(mdl_seq %in% mask_mdl_seqs) |>
-      distinct(cell_id) |>
-      mutate(value = 1)
-
-    # get SDM cells with mask applied
-    d_r_sp <- q_sdm |>
-      semi_join(
-        q_mask,
-        by = join_by(cell_id)
-      ) |>
-      collect()
-
-    # visual checks ----
-    # # r_sdm_mask
-    # r <- init(r_cell[[1]], NA)
-    # r[d_r_sp$cell_id] <- d_r_sp$value
-    # r <- trim(r) |> rotate()
-    # plet(r)
-    #
-    # # r_mask
-    # d_mask <- q_mask |> collect()
-    # r <- init(r_cell[[1]], NA)
-    # r[d_mask$cell_id] <- d_mask$value
-    # names(r) <- "mask"
-    # r_mask <- trim(r) |> rotate()
-    # plet(r_mask)
-    #
-    # # r_sdm
-    # d_sdm <- q_sdm |> collect()
-    # r <- init(r_cell[[1]], NA)
-    # r[d_sdm$cell_id] <- d_sdm$value
-    # names(r) <- "sdm"
-    # r_sdm <- trim(r) |> rotate()
-    # plet(r_sdm)
   } else {
-    # no IUCN range - use original logic (no masking), just max value of all SDMs
-    d_r_sp <- collect(q_sdm)
+    mask_mdl_seqs <- d_sp_l$mdl_seq
   }
 
-  sp_sci <- d_sp$scientific_name
-  sp_cmn <- d_sp$common_name
-  sp_cat <- d_sp$sp_cat
-  sp_key <- glue("{ds_key}:{d_sp$taxon_id}")
-  message(glue(
-    "Processing {i}/{nrow(d_x)} [{sp_key}] ({sp_cat}): {sp_cmn} (_{sp_sci}_)"
+  # count cells in program areas
+  q_sp_pra <- tbl(con_sdm, "model_cell") |>
+    filter(mdl_seq %in% mask_mdl_seqs) |>
+    distinct(cell_id) |>
+    semi_join(q_pra_cells, by = "cell_id")
+
+  n_sp_cells <- q_sp_pra |> collect() |> nrow()
+
+  if (n_sp_cells == 0) {
+    next
+  }
+
+  # log-scaled endemism: 10 (widespread) to 90 (endemic)
+  endemism <- round(pmax(
+    10,
+    pmin(90, 10 + 80 * log(n_total_cells / n_sp_cells) / log(n_total_cells))
   ))
 
-  n_cells <- nrow(d_r_sp)
-  if (n_cells == 0) {
-    message(glue("No cells for {sp_sci} ({i}/{nrow(d_x)})"))
-    next()
+  # get all cells in the species mask (within program areas)
+  mask_cell_ids <- q_sp_pra |> pull(cell_id)
+
+  sp_key <- glue("ms_endemism:{d_sp$taxon_id}")
+
+  if (i %% 100 == 0 || i == 1) {
+    message(glue(
+      "ms_endemism {i}/{nrow(d_taxa)}: {d_sp$scientific_name} ",
+      "({n_sp_cells} cells, endemism={endemism})"
+    ))
   }
 
-  # delete: existing ----
-  mdl_seqs <- tbl(con_sdm, "model") |>
-    filter(ds_key == !!ds_key, taxa == !!sp_key) |>
-    pull(mdl_seq)
-  if (length(mdl_seqs) > 0) {
-    dbExecute(
-      con_sdm,
-      glue(
-        "DELETE FROM taxon_model WHERE ds_key = '{ds_key}' AND taxon_id = {d_sp$taxon_id}"
+  # insert model row
+  dbWriteTable(
+    con_sdm,
+    "model",
+    tibble(
+      ds_key = "ms_endemism",
+      taxa = sp_key,
+      time_period = "2025",
+      region = "USA",
+      mdl_type = "derived",
+      description = glue(
+        "Endemism score {endemism} for {d_sp$scientific_name} ",
+        "({n_sp_cells}/{n_total_cells} PA cells)"
       )
-    )
-    dbExecute(
-      con_sdm,
-      glue("DELETE FROM model WHERE ds_key = '{ds_key}' AND taxa = '{sp_key}'")
-    )
-    dbExecute(
-      con_sdm,
-      glue(
-        "DELETE FROM species WHERE ds_key = '{ds_key}' AND taxa = '{sp_key}'"
-      )
-    )
-    dbExecute(
-      con_sdm,
-      glue(
-        "DELETE FROM model_cell WHERE mdl_seq IN ({paste(mdl_seqs, collapse = ',')})"
-      )
-    )
-    dbExecute(
-      con_sdm,
-      glue(
-        "UPDATE taxon SET mdl_seq = NULL WHERE mdl_seq IN ({paste(mdl_seqs, collapse = ',')})"
-      )
-    )
-  }
-
-  # append: model ----
-  has_iucn_str <- if (has_iucn) {
-    glue(
-      "; Mask applied (because IUCN range map present) from combining datasets: {paste(ds_mask_sp, collapse = ', ')}"
-    )
-  } else {
-    ""
-  }
-  d_model <- tibble(
-    ds_key = ds_key,
-    taxa = sp_key,
-    time_period = "2025",
-    region = "USA",
-    mdl_type = "mixed",
-    description = glue(
-      "Marine Sensitivity merged model with max values from datasets: {paste(ds_sdm_sp, collapse = ', ')}{has_iucn_str}"
-    )
+    ),
+    append = TRUE
   )
-  dbWriteTable(con_sdm, "model", d_model, append = TRUE)
-  # tbl(con_sdm, "model") |> collect() |> tail()
 
-  # get the mdl_seq that was just created
   mdl_seq <- dbGetQuery(
     con_sdm,
     glue(
-      "
-    SELECT mdl_seq FROM model
-    WHERE
-      ds_key = '{ds_key}' AND
-      taxa   = '{sp_key}'
-    ORDER BY mdl_seq DESC LIMIT 1 "
+      "SELECT mdl_seq FROM model
+       WHERE ds_key = 'ms_endemism' AND taxa = '{sp_key}'
+       ORDER BY mdl_seq DESC LIMIT 1"
     )
   )$mdl_seq
 
-  # d_sp |> glimpse()
-  # Rows: 1
-  # Columns: 15
-  # $ taxon_id         <dbl> 127186
-  # $ taxon_authority  <chr> "worms"
-  # $ n_ds             <int> 4
-  # $ am_0.05          <int> 7466
-  # $ ch_nmfs          <int> 18230
-  # $ ch_fws           <int> 18309
-  # $ rng_fws          <int> 18401
-  # $ sp_cat           <chr> "fish"
-  # $ bl               <int> NA
-  # $ mdl_seq          <int> NA
-  # $ scientific_name  <chr> "Salmo salar"
-  # $ common_name      <chr> "silver salmon"
-  # $ redlist_code     <chr> "EN"
-  # $ worms_is_marine  <lgl> TRUE
-  # $ worms_is_extinct <lgl> NA
+  # insert model_cell rows (all mask cells get same endemism value)
+  dbWriteTable(
+    con_sdm,
+    "model_cell",
+    tibble(
+      mdl_seq = as.integer(mdl_seq),
+      cell_id = as.integer(mask_cell_ids),
+      value = as.integer(endemism)
+    ),
+    append = TRUE
+  )
 
-  # append: species ----
+  # insert taxon_model junction
+  dbWriteTable(
+    con_sdm,
+    "taxon_model",
+    tibble(
+      taxon_id = d_sp$taxon_id,
+      ds_key = "ms_endemism",
+      mdl_seq = as.integer(mdl_seq)
+    ),
+    append = TRUE
+  )
+}
+
+message("ms_endemism complete")
+```
+
+### Create Merged Suitability (`ms_suit`)
+
+Per species, per cell: `ms_suit = max(all is_suit layers for that cell)`.
+Species with AquaMaps + ms_endemism get `max(AquaMaps, endemism)` per cell.
+Species with only ms_endemism get their endemism score.
+Masked to IUCN range when available.
+
+```{r}
+#| label: create_ms_suit
+#| eval: !expr do_merge
+
+ds_keys_suit <- tbl(con_sdm, "dataset") |>
+  filter(is_suit) |>
+  pull(ds_key)
+# c("am_0.05", "ms_endemism")
+
+# clean up existing
+existing_ms <- tbl(con_sdm, "model") |>
+  filter(ds_key == "ms_suit") |>
+  pull(mdl_seq)
+if (length(existing_ms) > 0) {
+  ms_str <- paste(existing_ms, collapse = ",")
+  dbExecute(
+    con_sdm,
+    glue("DELETE FROM model_cell  WHERE mdl_seq IN ({ms_str})")
+  )
+  dbExecute(con_sdm, glue("DELETE FROM taxon_model WHERE ds_key = 'ms_suit'"))
+  dbExecute(con_sdm, glue("DELETE FROM model       WHERE ds_key = 'ms_suit'"))
+  dbExecute(con_sdm, glue("DELETE FROM species     WHERE ds_key = 'ms_suit'"))
+}
+
+for (i in seq_len(nrow(d_taxa))) {
+  d_sp <- d_taxa[i, ]
+
+  # get suitability layers for this species
+  d_sp_suit <- tbl(con_sdm, "taxon_model") |>
+    filter(
+      taxon_id == !!d_sp$taxon_id,
+      ds_key %in% ds_keys_suit
+    ) |>
+    collect()
+
+  if (nrow(d_sp_suit) == 0) {
+    next
+  }
+
+  suit_mdl_seqs <- d_sp_suit$mdl_seq
+
+  # per-cell max across suitability layers
+  q_suit <- tbl(con_sdm, "model_cell") |>
+    filter(mdl_seq %in% suit_mdl_seqs) |>
+    group_by(cell_id) |>
+    summarize(value = max(value, na.rm = TRUE), .groups = "drop")
+
+  # apply IUCN mask if available
+  d_sp_all <- tbl(con_sdm, "taxon_model") |>
+    filter(
+      taxon_id == !!d_sp$taxon_id,
+      ds_key %in% ds_keys_input
+    ) |>
+    collect()
+
+  has_iucn <- "rng_iucn" %in% d_sp_all$ds_key
+  if (has_iucn) {
+    mask_mdl_seqs <- d_sp_all |>
+      filter(ds_key %in% ds_keys_mask) |>
+      pull(mdl_seq)
+    q_mask <- tbl(con_sdm, "model_cell") |>
+      filter(mdl_seq %in% mask_mdl_seqs) |>
+      distinct(cell_id)
+    d_r_sp <- q_suit |>
+      semi_join(q_mask, by = "cell_id") |>
+      collect()
+  } else {
+    d_r_sp <- q_suit |> collect()
+  }
+
+  if (nrow(d_r_sp) == 0) {
+    next
+  }
+
+  # clamp to 1-100
+  d_r_sp <- d_r_sp |>
+    mutate(value = pmax(1L, pmin(100L, as.integer(value))))
+
+  sp_key <- glue("ms_suit:{d_sp$taxon_id}")
+
+  if (i %% 100 == 0 || i == 1) {
+    message(glue(
+      "ms_suit {i}/{nrow(d_taxa)}: {d_sp$scientific_name} ",
+      "({nrow(d_r_sp)} cells)"
+    ))
+  }
+
+  suit_ds_str <- paste(d_sp_suit$ds_key, collapse = ", ")
+  mask_str <- if (has_iucn) "; IUCN masked" else ""
+
+  dbWriteTable(
+    con_sdm,
+    "model",
+    tibble(
+      ds_key = "ms_suit",
+      taxa = sp_key,
+      time_period = "2025",
+      region = "USA",
+      mdl_type = "derived",
+      description = glue(
+        "Merged suitability (max of: {suit_ds_str}{mask_str})"
+      )
+    ),
+    append = TRUE
+  )
+
+  mdl_seq <- dbGetQuery(
+    con_sdm,
+    glue(
+      "SELECT mdl_seq FROM model
+       WHERE ds_key = 'ms_suit' AND taxa = '{sp_key}'
+       ORDER BY mdl_seq DESC LIMIT 1"
+    )
+  )$mdl_seq
+
+  dbWriteTable(
+    con_sdm,
+    "model_cell",
+    tibble(
+      mdl_seq = as.integer(mdl_seq),
+      cell_id = as.integer(d_r_sp$cell_id),
+      value = as.integer(d_r_sp$value)
+    ),
+    append = TRUE
+  )
+
+  dbWriteTable(
+    con_sdm,
+    "taxon_model",
+    tibble(
+      taxon_id = d_sp$taxon_id,
+      ds_key = "ms_suit",
+      mdl_seq = as.integer(mdl_seq)
+    ),
+    append = TRUE
+  )
+}
+
+message("ms_suit complete")
+```
+
+### Create Merged Extinction Risk (`ms_er`)
+
+Per species, per cell: take value from highest-priority (lowest `sort_order`)
+ER layer. Cells in distribution but without ER layer coverage get the
+species-level max ER value across all its ER layers (or the scalar
+`er_score` from `taxon` if no ER layers exist).
+
+Priority ordering (US > International, NMFS > FWS > IUCN):
+ca_nmfs (2) > ch_nmfs (3) > ch_fws (4) > rng_fws (5) > bl (6) > rng_iucn (7)
+
+```{r}
+#| label: create_ms_er
+#| eval: !expr do_merge
+
+ds_er_priority <- tbl(con_sdm, "dataset") |>
+  filter(is_er) |>
+  arrange(sort_order) |>
+  collect()
+# ca_nmfs, ch_nmfs, ch_fws, rng_fws, bl, rng_iucn
+
+# clean up existing
+existing_ms <- tbl(con_sdm, "model") |>
+  filter(ds_key == "ms_er") |>
+  pull(mdl_seq)
+if (length(existing_ms) > 0) {
+  ms_str <- paste(existing_ms, collapse = ",")
+  dbExecute(
+    con_sdm,
+    glue("DELETE FROM model_cell  WHERE mdl_seq IN ({ms_str})")
+  )
+  dbExecute(con_sdm, glue("DELETE FROM taxon_model WHERE ds_key = 'ms_er'"))
+  dbExecute(con_sdm, glue("DELETE FROM model       WHERE ds_key = 'ms_er'"))
+  dbExecute(con_sdm, glue("DELETE FROM species     WHERE ds_key = 'ms_er'"))
+}
+
+for (i in seq_len(nrow(d_taxa))) {
+  d_sp <- d_taxa[i, ]
+
+  # get ER layers for this species, ordered by priority
+  d_sp_er <- tbl(con_sdm, "taxon_model") |>
+    filter(
+      taxon_id == !!d_sp$taxon_id,
+      ds_key %in% !!ds_er_priority$ds_key
+    ) |>
+    collect() |>
+    left_join(
+      ds_er_priority |> select(ds_key, sort_order),
+      by = "ds_key"
+    ) |>
+    arrange(sort_order)
+
+  # get all input models for mask determination
+  d_sp_all <- tbl(con_sdm, "taxon_model") |>
+    filter(
+      taxon_id == !!d_sp$taxon_id,
+      ds_key %in% ds_keys_input
+    ) |>
+    collect()
+
+  has_iucn <- "rng_iucn" %in% d_sp_all$ds_key
+
+  # determine the species distribution mask
+  if (has_iucn) {
+    mask_mdl_seqs <- d_sp_all |>
+      filter(ds_key %in% ds_keys_mask) |>
+      pull(mdl_seq)
+  } else {
+    mask_mdl_seqs <- d_sp_all$mdl_seq
+  }
+
+  mask_cells <- tbl(con_sdm, "model_cell") |>
+    filter(mdl_seq %in% mask_mdl_seqs) |>
+    distinct(cell_id) |>
+    pull(cell_id)
+
+  if (length(mask_cells) == 0) {
+    next
+  }
+
+  if (nrow(d_sp_er) > 0) {
+    # build per-cell ER values using priority ordering:
+    # for each cell, take value from highest-priority ER layer present
+    d_er_cells <- NULL
+    for (j in seq_len(nrow(d_sp_er))) {
+      d_layer <- tbl(con_sdm, "model_cell") |>
+        filter(mdl_seq == !!d_sp_er$mdl_seq[j]) |>
+        select(cell_id, value) |>
+        collect()
+
+      if (is.null(d_er_cells)) {
+        d_er_cells <- d_layer
+      } else {
+        # only add cells not already covered by higher-priority layer
+        new_cells <- d_layer |>
+          filter(!cell_id %in% d_er_cells$cell_id)
+        d_er_cells <- bind_rows(d_er_cells, new_cells)
+      }
+    }
+
+    # restrict to mask
+    d_er_cells <- d_er_cells |>
+      filter(cell_id %in% mask_cells)
+
+    # cells in mask but not covered by any ER layer:
+    # assign max ER value across all ER layers for this species
+    uncovered_cells <- setdiff(mask_cells, d_er_cells$cell_id)
+    if (length(uncovered_cells) > 0) {
+      max_er_value <- max(d_er_cells$value, na.rm = TRUE)
+      d_er_cells <- bind_rows(
+        d_er_cells,
+        tibble(
+          cell_id = as.integer(uncovered_cells),
+          value = as.integer(max_er_value)
+        )
+      )
+    }
+  } else {
+    # no ER layers at all: use scalar er_score from taxon table
+    fallback_er <- ifelse(
+      is.na(d_sp$er_score),
+      1L,
+      as.integer(d_sp$er_score)
+    )
+    d_er_cells <- tibble(
+      cell_id = as.integer(mask_cells),
+      value = fallback_er
+    )
+  }
+
+  # clamp to 1-100
+  d_er_cells <- d_er_cells |>
+    mutate(value = pmax(1L, pmin(100L, as.integer(value))))
+
+  sp_key <- glue("ms_er:{d_sp$taxon_id}")
+
+  if (i %% 100 == 0 || i == 1) {
+    message(glue(
+      "ms_er {i}/{nrow(d_taxa)}: {d_sp$scientific_name} ",
+      "({nrow(d_er_cells)} cells)"
+    ))
+  }
+
+  er_ds_str <- paste(d_sp_er$ds_key, collapse = ", ")
+  if (nrow(d_sp_er) == 0) {
+    er_ds_str <- glue("scalar er_score={d_sp$er_score}")
+  }
+
+  dbWriteTable(
+    con_sdm,
+    "model",
+    tibble(
+      ds_key = "ms_er",
+      taxa = sp_key,
+      time_period = "2025",
+      region = "USA",
+      mdl_type = "derived",
+      description = glue(
+        "Merged extinction risk (priority: {er_ds_str})"
+      )
+    ),
+    append = TRUE
+  )
+
+  mdl_seq <- dbGetQuery(
+    con_sdm,
+    glue(
+      "SELECT mdl_seq FROM model
+       WHERE ds_key = 'ms_er' AND taxa = '{sp_key}'
+       ORDER BY mdl_seq DESC LIMIT 1"
+    )
+  )$mdl_seq
+
+  dbWriteTable(
+    con_sdm,
+    "model_cell",
+    tibble(
+      mdl_seq = as.integer(mdl_seq),
+      cell_id = as.integer(d_er_cells$cell_id),
+      value = as.integer(d_er_cells$value)
+    ),
+    append = TRUE
+  )
+
+  dbWriteTable(
+    con_sdm,
+    "taxon_model",
+    tibble(
+      taxon_id = d_sp$taxon_id,
+      ds_key = "ms_er",
+      mdl_seq = as.integer(mdl_seq)
+    ),
+    append = TRUE
+  )
+}
+
+message("ms_er complete")
+```
+
+### Create Final Merged Model (`ms_merge`)
+
+The final merged model combines suitability and extinction risk:
+`ms_merge = max(1, round(ms_suit * ms_er / 100))`
+
+The floor of 1 ensures species with low suitability x low ER (e.g.,
+1% x 1% = 0.01%) still appear on the map rather than rounding to 0
+and disappearing. Since ms_merge already incorporates ER per cell,
+the downstream scoring in `calc_scores.qmd` no longer needs to
+multiply by a scalar `er_score`.
+
+```{r}
+#| label: create_ms_merge
+#| eval: !expr do_merge
+
+# clean up existing ms_merge models
+existing_ms <- tbl(con_sdm, "model") |>
+  filter(ds_key == "ms_merge") |>
+  pull(mdl_seq)
+if (length(existing_ms) > 0) {
+  ms_str <- paste(existing_ms, collapse = ",")
+  dbExecute(
+    con_sdm,
+    glue("DELETE FROM model_cell  WHERE mdl_seq IN ({ms_str})")
+  )
+  dbExecute(con_sdm, glue("DELETE FROM taxon_model WHERE ds_key = 'ms_merge'"))
+  dbExecute(con_sdm, glue("DELETE FROM model       WHERE ds_key = 'ms_merge'"))
+  dbExecute(con_sdm, glue("DELETE FROM species     WHERE ds_key = 'ms_merge'"))
+  dbExecute(
+    con_sdm,
+    glue(
+      "UPDATE taxon SET mdl_seq = NULL WHERE mdl_seq IN ({ms_str})"
+    )
+  )
+}
+
+for (i in seq_len(nrow(d_taxa))) {
+  d_sp <- d_taxa[i, ]
+
+  # get ms_suit and ms_er models for this species
+  d_sp_derived <- tbl(con_sdm, "taxon_model") |>
+    filter(
+      taxon_id == !!d_sp$taxon_id,
+      ds_key %in% c("ms_suit", "ms_er")
+    ) |>
+    collect()
+
+  suit_mdl <- d_sp_derived |> filter(ds_key == "ms_suit")
+  er_mdl <- d_sp_derived |> filter(ds_key == "ms_er")
+
+  if (nrow(suit_mdl) == 0 || nrow(er_mdl) == 0) {
+    next
+  }
+
+  # get per-cell values from both layers
+  d_suit <- tbl(con_sdm, "model_cell") |>
+    filter(mdl_seq == !!suit_mdl$mdl_seq) |>
+    select(cell_id, suit = value) |>
+    collect()
+
+  d_er <- tbl(con_sdm, "model_cell") |>
+    filter(mdl_seq == !!er_mdl$mdl_seq) |>
+    select(cell_id, er = value) |>
+    collect()
+
+  # join and compute product
+  d_merge <- d_suit |>
+    inner_join(d_er, by = "cell_id") |>
+    mutate(
+      value = pmax(1L, pmin(100L, as.integer(round(suit * er / 100))))
+    ) |>
+    select(cell_id, value)
+
+  if (nrow(d_merge) == 0) {
+    next
+  }
+
+  sp_key <- glue("ms_merge:{d_sp$taxon_id}")
+
+  if (i %% 100 == 0 || i == 1) {
+    message(glue(
+      "ms_merge {i}/{nrow(d_taxa)}: {d_sp$scientific_name} ",
+      "({nrow(d_merge)} cells)"
+    ))
+  }
+
+  # insert model
+  dbWriteTable(
+    con_sdm,
+    "model",
+    tibble(
+      ds_key = "ms_merge",
+      taxa = sp_key,
+      time_period = "2025",
+      region = "USA",
+      mdl_type = "derived",
+      description = glue(
+        "Final merged model: max(1, round(ms_suit * ms_er / 100))"
+      )
+    ),
+    append = TRUE
+  )
+
+  mdl_seq <- dbGetQuery(
+    con_sdm,
+    glue(
+      "SELECT mdl_seq FROM model
+       WHERE ds_key = 'ms_merge' AND taxa = '{sp_key}'
+       ORDER BY mdl_seq DESC LIMIT 1"
+    )
+  )$mdl_seq
+
+  # insert model_cell
+  dbWriteTable(
+    con_sdm,
+    "model_cell",
+    tibble(
+      mdl_seq = as.integer(mdl_seq),
+      cell_id = as.integer(d_merge$cell_id),
+      value = as.integer(d_merge$value)
+    ),
+    append = TRUE
+  )
+
+  # insert species row
+  sp_sci <- d_sp$scientific_name
+  sp_cmn <- d_sp$common_name
   d_species <- tibble(
-    ds_key = ds_key,
+    ds_key = "ms_merge",
     taxa = sp_key,
     sp_key = sp_key,
     worms_id = ifelse(
@@ -471,45 +963,22 @@ for (i in 1:nrow(d_x)) {
     common_name_accepted = sp_cmn,
     redlist_code = d_sp$redlist_code,
     redlist_year = NA_integer_,
-    sp_cat = sp_cat,
+    sp_cat = d_sp$sp_cat,
     worms_is_marine = d_sp$worms_is_marine,
     worms_is_extinct = d_sp$worms_is_extinct
   )
-  # d_species |> glimpse()
-
-  stopifnot(
-    length(setdiff(names(d_species), dbListFields(con_sdm, "species"))) == 0
-  )
-  stopifnot(
-    setdiff(dbListFields(con_sdm, "species"), names(d_species)) == "sp_seq"
-  )
-  dbWriteTable(con_sdm, "species", d_species, append = T)
-  # tbl(con_sdm, "species") |> collect() |> tail()
-  # tbl(con_sdm, "model")   |> collect() |> tail()
-  stopifnot(
-    tbl(con_sdm, "species") |> filter(is.na(sp_seq)) |> collect() |> nrow() == 0
-  )
-
-  # append: model_cell ----
-  d_mdl_cell <- d_r_sp |>
-    mutate(
-      mdl_seq = mdl_seq
-    ) |>
-    arrange(cell_id)
-  dbWriteTable(con_sdm, "model_cell", d_mdl_cell, append = T)
+  dbWriteTable(con_sdm, "species", d_species, append = TRUE)
 
   # update taxon with mdl_seq
   dbExecute(
     con_sdm,
     glue(
-      "
-    UPDATE taxon
-    SET   mdl_seq  = {mdl_seq}
-    WHERE taxon_id = {d_sp$taxon_id}"
+      "UPDATE taxon SET mdl_seq = {mdl_seq}
+       WHERE taxon_id = {d_sp$taxon_id}"
     )
   )
 
-  # append ms_merge row to taxon_model junction table
+  # insert taxon_model junction
   dbWriteTable(
     con_sdm,
     "taxon_model",
@@ -521,7 +990,8 @@ for (i in 1:nrow(d_x)) {
     append = TRUE
   )
 }
-# Salmo salar            silver salmon
+
+message("ms_merge complete")
 ```
 
 ## Set taxon.is_ok
@@ -763,10 +1233,10 @@ tbl(con_sdm, "species") |>
 tbl(con_sdm, "species") |>
   group_by(sp_cat, ds_key) |>
   summarize(
-    n       = n(),
+    n = n(),
     n_worms = sum(!is.na(worms_id), na.rm = T),
-    n_itis  = sum(!is.na(itis_id), na.rm = T),
-    n_gbif  = sum(!is.na(gbif_id), na.rm = T),
+    n_itis = sum(!is.na(itis_id), na.rm = T),
+    n_gbif = sum(!is.na(gbif_id), na.rm = T),
     n_allna = sum(
       is.na(worms_id) & is.na(itis_id) & is.na(gbif_id),
       na.rm = T
@@ -775,8 +1245,8 @@ tbl(con_sdm, "species") |>
   ) |>
   mutate(
     pct_worms = round(n_worms / n * 100, 1),
-    pct_itis  = round(n_itis / n * 100, 1),
-    pct_gbif  = round(n_gbif / n * 100, 1),
+    pct_itis = round(n_itis / n * 100, 1),
+    pct_gbif = round(n_gbif / n * 100, 1),
     pct_allna = round(n_allna / n * 100, 1)
   ) |>
   arrange(sp_cat, ds_key) |>
@@ -791,12 +1261,12 @@ tbl(con_sdm, "species") |>
 tbl(con_sdm, "species") |>
   group_by(sp_cat) |>
   summarize(
-    n               = n(),
-    n_worms_marine  = sum(worms_is_marine, na.rm = T),
+    n = n(),
+    n_worms_marine = sum(worms_is_marine, na.rm = T),
     n_worms_extinct = sum(worms_is_extinct, na.rm = T)
   ) |>
   mutate(
-    pct_worms_marine  = round(n_worms_marine / n * 100, 1),
+    pct_worms_marine = round(n_worms_marine / n * 100, 1),
     pct_worms_extinct = round(n_worms_extinct / n * 100, 1)
   ) |>
   collect() |>
@@ -814,7 +1284,7 @@ tbl(con_sdm, "taxon") |>
   summarize(n = n(), .groups = "drop") |>
   collect() |>
   pivot_wider(
-    names_from  = is_ok,
+    names_from = is_ok,
     values_from = n,
     names_prefix = "is_ok_"
   ) |>
@@ -831,7 +1301,7 @@ tbl(con_sdm, "taxon") |>
   summarize(n = n(), .groups = "drop") |>
   collect() |>
   pivot_wider(
-    names_from  = redlist_code,
+    names_from = redlist_code,
     values_from = n,
     values_fill = 0
   ) |>
@@ -847,7 +1317,7 @@ tbl(con_sdm, "taxon") |>
   mutate(
     authority = case_when(
       str_starts(extrisk_code, "NMFS") ~ "NMFS",
-      str_starts(extrisk_code, "FWS")  ~ "FWS",
+      str_starts(extrisk_code, "FWS") ~ "FWS",
       str_starts(extrisk_code, "IUCN") ~ "IUCN",
       TRUE ~ "none"
     )
@@ -883,7 +1353,7 @@ tbl(con_sdm, "taxon_model") |>
   summarize(n = n(), .groups = "drop") |>
   collect() |>
   pivot_wider(
-    names_from  = ds_key,
+    names_from = ds_key,
     values_from = n,
     values_fill = 0
   ) |>
@@ -897,14 +1367,20 @@ tbl(con_sdm, "taxon_model") |>
 tbl(con_sdm, "taxon") |>
   filter(is_ok) |>
   select(
-    sp_cat, scientific_name, common_name,
-    redlist_code, extrisk_code, er_score,
-    n_ds, taxon_id, taxon_authority
+    sp_cat,
+    scientific_name,
+    common_name,
+    redlist_code,
+    extrisk_code,
+    er_score,
+    n_ds,
+    taxon_id,
+    taxon_authority
   ) |>
   arrange(sp_cat, scientific_name) |>
   collect() |>
   DT::datatable(
-    filter  = "top",
+    filter = "top",
     options = list(pageLength = 25)
   )
 ```
