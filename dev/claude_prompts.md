@@ -3,10 +3,179 @@
 - Migrate from pg_tileserv to PMTiles, see:
   - [Creating PMTiles | Protomaps Docs](https://docs.protomaps.com/pmtiles/create)
   - [CalCOFI README_PLAN](https://calcofi.io/workflows/README_PLAN.html)
+
 - Automate server updates:
   - Upload sdm.duckdb to v3/ on server (scp or rsync)
   - Update any Shiny Server config if app paths changed
 
+- Generate GD:data/derived/v3/`README.md` from NEW generate_outputs.qmd
+  - merges output generation from @`calc_scores.qmd` and @`msens-summary_programareas.qmd`
+  - to be run after calc_scores.qmd
+  - Differentitate in `README.md`:
+    - Spatial data (, *.tif, *.gpkg)
+    - Tables (*.csv, *.xlsx, *.docx)
+    - Figures (*.png, *.pdf)
+    - Big files (): too big for Google Drive, internally used
+
+- Migrate to hexagons
+
+## 2026-02-13 apply er_score spatially
+
+Originally species distributions were brought in with cell values representing suitable habitat, starting with AquaMaps (`dataset.ds_key`: 'am_0.05'. Then range maps from BirdLife International (`dataset.ds_key`: 'bl') were ingested (since AquaMaps generally lacks seabirds) with cell values of 50% (halfway between 100% present and 0% absent). Then an extinction risk from IUCN RedList (`rl_score` 0 to 100%) for the species was multipled by the suitability to create the "vulnerability" of a species cell. (This species cell was then summed to taxonomic groups and rescaled by ecoregion max before component weighting to acheive a score.) Here's the relevant excerpt from @workflows/final-report_2025:
+
+> For spatial implementation, the vulnerability of a cell ($v_c$) is calculated as the sum across all species in the given taxonomic group ($S_g$) of the products for the species presence in the cell ($p_{sc}$) and a species weight ($w_s$), which is the risk of that species going extinct:
+> 
+> $$
+> v_c=∑_1^{S_g} p_{sc} * w_s
+> $$
+> 
+> In other words, for each cell in the ocean, we add up the sensitivity of all the species found there.
+> 
+> -   $v_c$ is the vulnerability of a cell.
+> 
+> -   $p_{sc}$ is how likely species $s$ is to be present in that cell (from 0 to 1).
+> 
+> -   $w_s$ is how at-risk that species is of going extinct (also from 0 to 1; ranging from Least Concern 0.2 to Critically Endangered as 1).
+> 
+> -   $S_g$ is the total number of species in that taxonomic group.
+> 
+> If a cell has many species that are both likely to be present and at high risk of extinction, it gets a higher sensitivity score. This helps us find > places where rare or threatened species are concentrated. Ecoregional rescaling makes it easy to compare areas within the same region and planning area aggregation gives us an overall sensitivity score for each planning area, taking into account both the sensitivity of each part and how big each part is.
+
+Then we ingested critical habitat and range maps from NMFS and FWS (`dataset.ds_key`: 'ca_nmfs', 'ch_fws', 'ch_nmfs', 'rng_fws') which got cell values assigned according to the US national ESA listing status Endangered (100%), Threatened (50%), or Least Concern (1%) of the given spatial footprint (aligned with a Distinct Population Segment, if applicable, so not necessarily the same value for the entire species distribution). This then muddied the definition of a cell value -- does it represent suitability and therefore a likelihood of presence, or is it a measure of extinction risk?
+
+Could we have both? So, instead of multiplying a single scalar value of the maximum extinction risk available (ie from NMFS, FWS or IUCN) to the whole distribution raster, we can multiply the suitability raster by a raster representing extinction risk. In cases where we don't have any extinction-risk-specific species distribution models (ie  `dataset.ds_key`: 'rng_iucn', 'ca_nmfs', 'ch_fws', 'ch_nmfs', 'rng_fws'), we would assign the maximum (`max(er_score)`) (or 1 for assumed LC) to the whole distribution. In cases where more than one er_score layer is available for the same cell, the dataset.`sort_order` should determine the preferred value (ie prefer: US > International; NMFS > FWS > IUCN | BirdLife):
+
+```r
+d_datasets <- tbl(con_sdm, "dataset") |> collect()
+d_datasets |>
+  arrange(sort_order) |>
+  select(sort_order, ds_key, name_display, value_info, is_mask, sort_order)
+```
+```
+  sort_order ds_key   name_display          value_info                           is_mask
+       <int> <chr>    <chr>                 <chr>                                <lgl>
+1          0 ms_merge Merged Model          NA                                   FALSE
+2          1 am_0.05  AquaMaps SDM          NA                                   FALSE
+3          2 ca_nmfs  NMFS Core Area        Core: 100                            TRUE
+4          3 ch_nmfs  NMFS Critical Habitat EN:100, TN:50                        TRUE
+5          4 ch_fws   FWS Critical Habitat  EN:100, TN:50                        TRUE
+6          5 rng_fws  FWS Range             EN:100, TN:50, LC:1                  TRUE
+7          6 bl       BirdLife Range        NA                                   TRUE
+8          7 rng_iucn IUCN Range            CR:50, EN:25, VU:5, NT:2, LC:1, DD:1 TRUE
+```
+
+Modifications will be needed to apply this new scheme:
+
+- Add a new column `has_er` to `dataset` table, which for now has the same values as `is_mask`.
+- I believe BirdLife  
+
+
+What else should be considered or modified?
+
+
+
+
+We still want to apply a mask to species with an IUCN range map (`ds_key`: 'rng_iucn') to the results.
+
+```r
+d_datasets <- tbl(con_sdm, "dataset") |> collect()
+View(d_datasets)
+d_datasets |>
+  arrange(sort_order) |>
+  select(sort_order, ds_key, name_display, value_info, is_mask, sort_order)
+```
+```
+  sort_order ds_key   name_display          value_info                           is_mask
+       <int> <chr>    <chr>                 <chr>                                <lgl>
+1          0 ms_merge Merged Model          NA                                   FALSE
+2          1 am_0.05  AquaMaps SDM          NA                                   FALSE
+3          2 ca_nmfs  NMFS Core Area        Core: 100                            TRUE
+4          3 ch_nmfs  NMFS Critical Habitat EN:100, TN:50                        TRUE
+5          4 ch_fws   FWS Critical Habitat  EN:100, TN:50                        TRUE
+6          5 rng_fws  FWS Range             EN:100, TN:50, LC:1                  TRUE
+7          6 bl       BirdLife Range        NA                                   TRUE
+8          7 rng_iucn IUCN Range            CR:50, EN:25, VU:5, NT:2, LC:1, DD:1 TRUE
+```
+
+ (which could be the same value for the entire distribution, so effectively the same as before)
+
+Code the datasets table to account for which layers `has_er_info`.
+
+ms_merge, 
+
+- For all bird models (dataset.ds_key = "bl")
+
+datasets: am_0.05, bl, ca_nmfs, ch_fws, ch_nmfs, ms_merge, rng_fws, rng_iucn
+
+`msens::compute_er_score()`
+
+## 2026-02-13.b + schema.qmd
+
+Generate a workflow `schema.qmd` that shows me the schema and table info for the following two databases:
+
+- **SDM** 
+  _Species Distribution Model_
+  path: `/Users/bbest/_big/msens/derived/v3/sdm.duckdb`
+
+- **SPP**
+  _species_: taxonomic authority tables
+  path: `/Users/bbest/_big/msens/derived/spp.duckdb`
+
+For each database (under its own level 2 headers), generate:
+
+- **Schema**: an ERD mermaid diagram with inferred primary and foreign keys
+
+- **Tables**: tabsets of each table with columns for:
+
+  - `column`: column name
+  - `type`: storage type
+  - `description`: infer description
+  - `range`: range of values (as '[min, max]') if numeric or date
+  - `samples`: show some sample values with most frequent listed first
+
+
+Generate a workflow `schema.qmd` that shows me the schema and table info for the following two databases:
+
+- **SDM** 
+  _Species Distribution Model_
+  path: `/Users/bbest/_big/msens/derived/v3/sdm.duckdb`
+
+- **SPP**
+  _species_: taxonomic authority tables
+  path: `/Users/bbest/_big/msens/derived/spp.duckdb`
+
+For each database (under its own level 2 headers), generate:
+
+- **Schema**: an ERD mermaid diagram with inferred primary and foreign keys
+
+- **Tables**: tabsets of each table with columns for:
+
+  - `column`: column name
+  - `type`: storage type
+  - `description`: infer description
+  - `range`: range of values (as '[min, max]') if numeric or date
+  - `samples`: show some sample values with most frequent listed first
+
+* `schema.qmd` has been created and renders successfully to `_output/schema.html` (189K).
+
+The file includes:
+- **Setup**: read-only connections to both DuckDB databases (`sdm.duckdb` v3, `spp.duckdb`) with `is_server` path switching
+- **Schema change detection**: compares actual `information_schema.columns` against expected lists; emits a `{.callout-warning}` if tables/columns are added or removed
+- **SDM section** (14 tables): mermaid ERD showing all relationships (`dataset`, `model`, `species`, `cell`, `model_cell`, `cell_metric`, `metric`, `zone`, `zone_cell`, `zone_metric`, `taxon`, `taxon_model`, `zone_taxon`, `listing`) + tabset with interactive DT tables per table
+- **SPP section** (10 tables): mermaid ERD with 5 authority/vernacular pairs (`worms`, `gbif`, `itis`, `botw`, `iucn_redlist`) + tabset with DT tables
+- **`tbl_info()` helper**: for each table shows column name, type, inferred description, `[min, max]` range for numeric/date columns, and top 5 most frequent values (with sampling for tables >5M rows)
+
+
+The ERD diagram has tiny text and is hard to read. Is there an option to zoom or expand it to full screen and move it around, like Github has for mermaid diagrams? If handling the SVG like this is not easily acheived, perhaps it could be conveted to a figure and        
+  the lightbox Quarto extension applied?         
+
+## 2026-02-13 add motherduck MCP to claude (but for calcofi for now)
+
+```bash
+claude mcp add duckdb --transport stdio -- uvx mcp-server-motherduck --db-path /Users/bbest/_big/msens/derived/v3/sdm.duckdb
+
+'/Users/bbest/Library/CloudStorage/GoogleDrive-ben@ecoquants.com/My Drive/private/2026-02-13_motherduck.com_access-token_ben-read-write-01.txt'
+```
 
 ## 2026-02-12.b apps versioning with git branches, deploy latest v3 to server
 
@@ -399,7 +568,28 @@ I was expecting to see just 3 apps repo clones on both server (first image) and 
   │ apps_v2/  │ v2 (worktree) │ v2            │ mapgl_v2, mapsp_v2 │
   └───────────┴───────────────┴───────────────┴────────────────────┘
 
-Since I want to have the main files on Google Drive for comparison, I copied the server's /share/data/derived/v2/ to 
+Since I want to have the main files on Google Drive for comparison, I copied the server's /share/data/derived/v2 to '~/My Drive/projects/msens/data/derived/v2'. I noticed that the sdm.duckdb is located in each of the /share/data/derived/v{#} folders, but not in the comprable '~/My Drive/projects/msens/data/derived/v{#}'. Will that persist with versions? And perhaps to prevent accidental copying for quick manual fixes later, we should create a seperate folder on the server /share/data/big to mimic laptop ~/_big/msens/data?
+
+⏺ Done. Here's the final layout:     
+ 
+  Server data:                       
+  ┌───────────────────────────────────────────────┬───────────────────────────────────────────────────────────────┐
+  │                     Path                      │                           Contents                            │
+  ├───────────────────────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ /share/data/derived/v{1,2,3}/                 │ small files (gpkg, csv, tif) — safe to mirror on Google Drive │
+  ├───────────────────────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ /share/data/big/v{1,2,3}/                     │ large files (sdm.duckdb ~2GB each) — mirrors laptop ~/_big/   │
+  ├───────────────────────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ /share/data/derived/r_bio-oracle_planarea.tif │ shared input raster (all versions)                            │
+  └───────────────────────────────────────────────┴───────────────────────────────────────────────────────────────┘
+  App code (dir_big on all 3 branches):
+  dir_big <- ifelse(
+    is_server,
+    glue("/share/data/big/{v_dir}"),
+    glue("~/_big/msens/derived/{v_dir}"))
+
+  This way if you copy /share/data/derived/v2/ to Google Drive, you won't accidentally grab the 2GB duckdb — it lives separately in /share/data/big/v2/.
+
 
 ## 2026-02-12 sensibly restructure output files in derived/, _big files outside Google Drive and v1/ v3/ versions within
 
