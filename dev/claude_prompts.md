@@ -21,7 +21,7 @@
 
 ## 2026-02-13 apply er_score spatially
 
-Originally species distributions were brought in with cell values representing suitable habitat, starting with AquaMaps (`dataset.ds_key`: 'am_0.05'. Then range maps from BirdLife International (`dataset.ds_key`: 'bl') were ingested (since AquaMaps generally lacks seabirds) with cell values of 50% (halfway between 100% present and 0% absent). Then an extinction risk from IUCN RedList (`rl_score` 0 to 100%) for the species was multipled by the suitability to create the "vulnerability" of a species cell. (This species cell was then summed to taxonomic groups and rescaled by ecoregion max before component weighting to acheive a score.) Here's the relevant excerpt from @workflows/final-report_2025:
+Originally species distributions were brought in with cell values representing suitable habitat, starting with AquaMaps (`dataset.ds_key`: 'am_0.05'. Then range maps from BirdLife International (`dataset.ds_key`: 'bl') were ingested (since AquaMaps generally lacks seabirds) with cell values of 50% (halfway between 100% present and 0% absent). Then an extinction risk from IUCN RedList category was transformed to a single scalar value of `rl_score` (1 to 100%) for multiplying by the suitability raster to create the "vulnerability" of a species cell. (This species cell was then summed to taxonomic groups and rescaled by ecoregion max before component weighting to acheive a score.) Here's the relevant excerpt from @workflows/final-report_2025:
 
 > For spatial implementation, the vulnerability of a cell ($v_c$) is calculated as the sum across all species in the given taxonomic group ($S_g$) of the products for the species presence in the cell ($p_{sc}$) and a species weight ($w_s$), which is the risk of that species going extinct:
 > 
@@ -41,73 +41,131 @@ Originally species distributions were brought in with cell values representing s
 > 
 > If a cell has many species that are both likely to be present and at high risk of extinction, it gets a higher sensitivity score. This helps us find > places where rare or threatened species are concentrated. Ecoregional rescaling makes it easy to compare areas within the same region and planning area aggregation gives us an overall sensitivity score for each planning area, taking into account both the sensitivity of each part and how big each part is.
 
-Then we ingested critical habitat and range maps from NMFS and FWS (`dataset.ds_key`: 'ca_nmfs', 'ch_fws', 'ch_nmfs', 'rng_fws') which got cell values assigned according to the US national ESA listing status Endangered (100%), Threatened (50%), or Least Concern (1%) of the given spatial footprint (aligned with a Distinct Population Segment, if applicable, so not necessarily the same value for the entire species distribution). This then muddied the definition of a cell value -- does it represent suitability and therefore a likelihood of presence, or is it a measure of extinction risk?
+Since that original formulation, we ingested critical habitat and range maps from NMFS and FWS (`dataset.ds_key`: 'ca_nmfs', 'ch_fws', 'ch_nmfs', 'rng_fws') which got cell values assigned according to the US national ESA listing status Endangered (100%), Threatened (50%), or Least Concern (1%) of the given spatial footprint (aligned with a Distinct Population Segment, if applicable, so not necessarily the same value for the entire species distribution). This then muddied the definition of a cell value -- does it represent suitability and therefore a likelihood of presence, or is it a measuring the extinction risk of a species or even a subpopulation?
 
-Could we have both? So, instead of multiplying a single scalar value of the maximum extinction risk available (ie from NMFS, FWS or IUCN) to the whole distribution raster, we can multiply the suitability raster by a raster representing extinction risk. In cases where we don't have any extinction-risk-specific species distribution models (ie  `dataset.ds_key`: 'rng_iucn', 'ca_nmfs', 'ch_fws', 'ch_nmfs', 'rng_fws'), we would assign the maximum (`max(er_score)`) (or 1 for assumed LC) to the whole distribution. In cases where more than one er_score layer is available for the same cell, the dataset.`sort_order` should determine the preferred value (ie prefer: US > International; NMFS > FWS > IUCN | BirdLife):
+Could we have both? So, instead of multiplying a single scalar value of the maximum extinction risk available (ie from NMFS, FWS or IUCN) to the whole distribution raster, we can multiply the suitability raster by a raster representing extinction risk. In cases where we don't have any extinction-risk-specific species distribution models (ie  `dataset.ds_key`: 'rng_iucn', 'ca_nmfs', 'ch_fws', 'ch_nmfs', 'rng_fws'), we would assign the maximum (`max(er_score)`) (or 1 for assumed LC) to the whole known distribution (ie the mask, unless rng_iucn missing, then all distributions). In cases where more than one er_score layer is available for the same cell, the dataset.`sort_order` should determine the preferred value (ie prefer: US > International; NMFS > FWS > IUCN | BirdLife):
 
 ```r
-d_datasets <- tbl(con_sdm, "dataset") |> collect()
-d_datasets |>
+d_dataset <- tbl(con_sdm, "dataset") |> collect()
+d_dataset |>
   arrange(sort_order) |>
-  select(sort_order, ds_key, name_display, value_info, is_mask, sort_order)
+  select(sort_order, ds_key, name_display, response_type, taxa_groups, value_info, is_mask, sort_order)
 ```
 ```
-  sort_order ds_key   name_display          value_info                           is_mask
-       <int> <chr>    <chr>                 <chr>                                <lgl>
-1          0 ms_merge Merged Model          NA                                   FALSE
-2          1 am_0.05  AquaMaps SDM          NA                                   FALSE
-3          2 ca_nmfs  NMFS Core Area        Core: 100                            TRUE
-4          3 ch_nmfs  NMFS Critical Habitat EN:100, TN:50                        TRUE
-5          4 ch_fws   FWS Critical Habitat  EN:100, TN:50                        TRUE
-6          5 rng_fws  FWS Range             EN:100, TN:50, LC:1                  TRUE
-7          6 bl       BirdLife Range        NA                                   TRUE
-8          7 rng_iucn IUCN Range            CR:50, EN:25, VU:5, NT:2, LC:1, DD:1 TRUE
+  sort_order ds_key   name_display          response_type taxa_groups             value_info                           is_mask
+       <int> <chr>    <chr>                 <chr>         <chr>                   <chr>                                <lgl>  
+1          0 ms_merge Merged Model          mixed         all taxa                NA                                   FALSE  
+2          1 am_0.05  AquaMaps SDM          suitability   all taxa, except birds  NA                                   FALSE  
+3          2 ca_nmfs  NMFS Core Area        binary        cetaceans               Core: 100                            TRUE   
+4          3 ch_nmfs  NMFS Critical Habitat binary        all taxa                EN:100, TN:50                        TRUE   
+5          4 ch_fws   FWS Critical Habitat  binary        all taxa                EN:100, TN:50                        TRUE   
+6          5 rng_fws  FWS Range             binary        all taxa                EN:100, TN:50, LC:1                  TRUE   
+7          6 bl       BirdLife Range        binary        birds                   NA                                   TRUE   
+8          7 rng_iucn IUCN Range            binary        all taxa (except birds) CR:50, EN:25, VU:5, NT:2, LC:1, DD:1 TRUE   
 ```
 
 Modifications will be needed to apply this new scheme:
 
-- Add a new column `has_er` to `dataset` table, which for now has the same values as `is_mask`.
-- I believe BirdLife  
+- Add a new column `is_er` to `dataset` table indicating the dataset contains input models (not internal ms_* model) describing distribution of extinction risk (and not suitability). For now this should be populated with the same values as `is_mask`.
+- Add a new column `is_suit` to `dataset` table indicating the dataset contains input models describing distribution of suitability. For now, only am_0.05 is T.
+- So we want to generate two more prior models in the `dataset` table that get multplied to become the "Final Merged Model" (`dataset.ds_key='ms_merge'`) in `@merge_models.qmd`:
+  1. "Merged Suitability Model" (`dataset.ds_key='ms_suit'`)
+  2. "Merged Extinction Risk Model" (`dataset.ds_key='ms_er'`)
+    - Can we use the same `msens::compute_er_score()` function from @../msens to apply to the raster?
+- These models should also be included in the `taxon` table. The `mdl_seq` can remain as the 
+- Fix BirdLife range maps to have extinction risk applied to model cells:
+  - Add `dataset.value_info` value to row `ds_key='bl'` same as row for `ds_key='rng_iucn'`
+  - Fix `model_cell.value` for `ds_key='bl'` to match those in corresponding `species.redlist_code` (with lookup from `dataset.value_info`):
+    ```r
+    d_spp_bl <- tbl(con_sdm, "species") |>
+    filter(
+        ds_key == "bl"
+    ) |>
+    collect()
+    table(d_spp_bl$redlist_code, useNA = "ifany")
+    ```
+    ```
+    CR  DD  EN  LC  NT  VU
+    3   1  17 456  52  44
+    ```
+- To better utilize range maps (and core area / critical habitat) for the necessary suitability layer, let's create an endemism layer per species that takes the species mask and rescales values from 1 to 50 based on proportion of the mask in the Program Areas study area. So the max value of 50 is highly endemic and a value of 1 is completely dispersed throughout the study area (ie occupying every cell). Should this be non-linearly (eg log) scaled? If there is no IUCN range map (so no mask), then use all the combination of all other distributions to form the mask. This will be a new dataset `ms_endemism` to be added to the `dataset` table.
+- The maximum of `ms_endemism` and any other `is_suit` layers will form the "Merged Suitability Model" (`ds_key='ms_suit'`).
+- We will want to show all these new models and their constituent model layers in the @../apps/mapsp/app.R.
+- All of the proposed new and final models should be constrained 1 to 100 integers, translating to 1 to 100%. 
+
+What else should be considered, modified, better organized in the workflows code, database structure, apps and documentation (seperate task probably, but extra explanatory text could be added with markdown to explain methods for translating into docs elsewhere)?
+
+☐ Endemism  ☐ ER priority  ☐ Score formula  ☐ Endemism type
+
+**Endemism**. For endemism scaling, should the proportion of cells occupied be transformed non-linearly? Log scaling gives better differentiation among rare species (1 cell →
+50, 1000 cells → ~35, 50% of cells → ~12, all cells → 1).
+
+❯ 1. Log-scaled (Recommended)
+     Better differentiation among endemic species; compresses widespread species toward low values
+  2. Linear
+     Simpler; endemism = 50 * (1 - proportion). Species at 50% of cells gets exactly 25.
+
+**ER priority**. When multiple ER layers cover the same cell, should the value come from the highest-priority dataset (by sort_order: US > Intl, NMFS > FWS > IUCN) or the maximum 
+value across layers?                                     
+
+❯ 1. Highest priority (Recommended)
+     Use sort_order: prefer NMFS Core > NMFS CH > FWS CH > FWS Range > BirdLife > IUCN Range      
+  2. Maximum value
+     Take max ER value across all layers covering that cell, regardless of source   
+
+**Score formula**. ms_merge = ms_suit × ms_er / 100 compresses values (suit=50, er=50 → 25). Should calc_scores just sum ms_merge values directly (replacing the current scalar      
+er_score multiplication), or keep suitability and ER separate in the summation?
+
+❯ 1. Sum ms_merge directly         
+     Simpler: SUM(ms_merge.value). The product is pre-computed. Aligns with v_c = Σ(suit*er/100)  
+  2. Keep decomposed
+     SUM(ms_suit.value * ms_er.value / 100). More explicit, allows weighting changes later.
+
+<<<<<<< ADD transcript of my response here >>>>>>>
+
+**Endemism type**. You proposed endemism as 'rescales values from 1 to 50 based on proportion of the mask in the Program Areas'. This is a species-level metric (one score per 
+species applied to all its cells). An alternative is cell-level endemism where each cell gets a different value based on how many other species share it. Which   
+approach?                                                                    
+
+❯ 1. Species-level        
+     One endemism score per species (based on range size). All cells in the species range get the same value. Matches your original proposal.
+  2. Cell-level     
+     Each cell gets a unique endemism value based on local overlap with other species ranges. More complex to compute, spatially richer.
+  3. Both / discuss further                                                          
+     Need to think more about this or combine approaches. 
+
+4. 
+Interesting! I think I'd interpret your notion of "cell-level endemism" as actually a metric of "species richness", not "endemism". A cell-level endemism would calculate endemism first across all species, then add up all layers (and probably rescale). We don't explicitly have richness in @calc_scores.qmd, but it is inferred based on summing across all species layers per taxonomic group -- the more species (ie the greater the species richness) the higher the score. Let's pass on this for now, but please add any of your thinking and rationale to the top of the @calc_scores.qmd under a Future Considerations or ToDo section.
+
+Something else worth noting to include in explanatory text for this species-level endemism is that since we're transforming binary range maps into something usable for suitability, the max value is 50% (ie halfway between absent 0% and present 100%).
 
 
-What else should be considered or modified?
+## 2026-02-13.c merge_models.qmd -> merge_models_prepare.qmd
 
+Presently `@merge_models.qmd` is a mess. It has a bunch of ad-hoc R chunks for updating data. I am about to redesign the merging of models in a drastic way and want to be able to Quarto render this document with tabular summaries as the step prior to score calculation in `@calc_scores.qmd`. Let's move non-essential sections and R chunks to `@merge_models_prepare.qmd` and provide summary information above each R chunk explaining it's purpose. Feel free to fold R chunks into reasonable level 2 and 3 headers for both `@merge_models.qmd` and `@merge_models_prepare.qmd`. Also debug for any inconsistencies and add conditional statements where needed, especially for ad-hoc updates, and/or use `#| eval: false` or `#| eval: !expr {some conditional}`.
 
+* Here's a summary of what was done:
 
+### `merge_models.qmd` (910 lines, 17 chunks) — Merge, Validate & Summarize
+- **Setup**: trimmed libraries, DB connection, section eval flags (`do_merge`, `do_is_ok`)
+- **Add Merged Dataset**: `insert_dataset_merged`, `dataset_metadata`, `iterate_merge_ds_mdl` (all `eval: !expr do_merge`)
+- **Set taxon.is_ok**: `taxon_is_ok` (`eval: !expr do_is_ok`)
+- **Taxon Summary**: always-eval export to CSV
+- **New read-only summary sections**: Dataset Summary, Species Summary (auth coverage, WoRMS marine/extinct), Taxon Table Summary (by sp_cat/is_ok, redlist, extrisk, n_ds), Taxon x Dataset Matrix, Taxon Detail Table (`DT::datatable`)
 
-We still want to apply a mask to species with an IUCN range map (`ds_key`: 'rng_iucn') to the results.
+### `merge_models_prep.qmd` (3488 lines, 46 chunks) — Data Preparation & Ingestion
+- 10 section eval flags controlling all mutating operations (all default `F`)
+- Organized into 12 major sections with descriptive headings
+- Read-only summary chunks (auth_sum, pct_worms, pivoted views) run unconditionally
 
-```r
-d_datasets <- tbl(con_sdm, "dataset") |> collect()
-View(d_datasets)
-d_datasets |>
-  arrange(sort_order) |>
-  select(sort_order, ds_key, name_display, value_info, is_mask, sort_order)
-```
-```
-  sort_order ds_key   name_display          value_info                           is_mask
-       <int> <chr>    <chr>                 <chr>                                <lgl>
-1          0 ms_merge Merged Model          NA                                   FALSE
-2          1 am_0.05  AquaMaps SDM          NA                                   FALSE
-3          2 ca_nmfs  NMFS Core Area        Core: 100                            TRUE
-4          3 ch_nmfs  NMFS Critical Habitat EN:100, TN:50                        TRUE
-5          4 ch_fws   FWS Critical Habitat  EN:100, TN:50                        TRUE
-6          5 rng_fws  FWS Range             EN:100, TN:50, LC:1                  TRUE
-7          6 bl       BirdLife Range        NA                                   TRUE
-8          7 rng_iucn IUCN Range            CR:50, EN:25, VU:5, NT:2, LC:1, DD:1 TRUE
-```
-
- (which could be the same value for the entire distribution, so effectively the same as before)
-
-Code the datasets table to account for which layers `has_er_info`.
-
-ms_merge, 
-
-- For all bird models (dataset.ds_key = "bl")
-
-datasets: am_0.05, bl, ca_nmfs, ch_fws, ch_nmfs, ms_merge, rng_fws, rng_iucn
-
-`msens::compute_er_score()`
+### Bug fixes applied in `merge_models_prep.qmd`:
+1. `is.(itis_id)` → `as.integer(itis_id)` (typo)
+2. `d_bird` undefined — comment added noting it should be `d_b`
+3. Duplicate chunk label `get fws_spp_lists` → renamed to `get_fws_spp_lists_2`
+4. Filter `%in% taxonomic_groups_exclude` keeps instead of excluding — comment added
+5. `dir_fws_spp` undefined — comment added
+6. `con_spp` reconnected without disconnecting — comment added
+7. `duckdb_unregister` before `duckdb_register` — wrapped early unregister in `try()`
 
 ## 2026-02-13.b + schema.qmd
 
@@ -165,9 +223,23 @@ The file includes:
 - **SPP section** (10 tables): mermaid ERD with 5 authority/vernacular pairs (`worms`, `gbif`, `itis`, `botw`, `iucn_redlist`) + tabset with DT tables
 - **`tbl_info()` helper**: for each table shows column name, type, inferred description, `[min, max]` range for numeric/date columns, and top 5 most frequent values (with sampling for tables >5M rows)
 
+The ERD diagram has tiny text and is hard to read. Is there an option to zoom or expand it to full screen and move it around, like Github has for mermaid diagrams? If handling the SVG like this is not easily acheived, perhaps it could be conveted to a figure and        
+  the lightbox Quarto extension applied?
+
+Couldn't you more simply specify PNG format for mermaid? See https://quarto.org/docs/authoring/diagrams.html, ie with: 
+
+```yaml
+---
+format:
+  gfm:
+    mermaid-format: png                                                                                                    
+---
+```
 
 The ERD diagram has tiny text and is hard to read. Is there an option to zoom or expand it to full screen and move it around, like Github has for mermaid diagrams? If handling the SVG like this is not easily acheived, perhaps it could be conveted to a figure and        
-  the lightbox Quarto extension applied?         
+  the lightbox Quarto extension applied? 
+
+Excellent! For numeric columns apply a reasonable rounding  
 
 ## 2026-02-13 add motherduck MCP to claude (but for calcofi for now)
 

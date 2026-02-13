@@ -1,0 +1,3488 @@
+---
+title: "Merge Models: Data Preparation"
+subtitle: "Ad-hoc updates, taxonomic ID resolution, and dataset ingestion into sdm.duckdb"
+format: html
+editor_options:
+  chunk_output_type: console
+---
+
+## Overview
+
+Data preparation steps for building the `taxon` and `taxon_model` tables in
+`sdm.duckdb`. These operations update the database, ingest new datasets, or
+apply ad-hoc fixes. They do **not** need to run every time — set the section
+eval flags in the setup chunk to `TRUE` to re-run a section.
+
+After running the needed prep steps here, render `merge_models.qmd` to merge
+models and produce summaries for `calc_scores.qmd`.
+
+```{r}
+#| label: setup
+librarian::shelf(
+  DBI,
+  dplyr,
+  DT,
+  duckdb,
+  fs,
+  glue,
+  here,
+  knitr,
+  janitor,
+  leaflet,
+  leaflet.extras2,
+  logger,
+  mapview,
+  purrr,
+  readr,
+  readxl,
+  sf,
+  skimr,
+  stringr,
+  terra,
+  tibble,
+  tidyr,
+  quiet = T
+)
+options(readr.show_col_types = F)
+
+is_server <- Sys.info()[["sysname"]] == "Linux"
+dir_private <- ifelse(is_server, "/share/private", "~/My Drive/private")
+dir_data <- ifelse(is_server, "/share/data", "~/My Drive/projects/msens/data")
+v_int <- 3
+v_sfx <- paste0("_v", v_int)
+
+spp_db <- glue("{dir_data}/derived/spp.duckdb")
+sdm_db <- glue("{dir_data}/derived/sdm{v_sfx}.duckdb")
+cell_tif <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
+dir_bl <- glue("{dir_data}/raw/birdlife.org")
+botw_gpkg <- glue("{dir_bl}/BOTW_GPKG_2024_2/BOTW_2024_2.gpkg")
+botw_csv <- glue("{dir_bl}/spp_botw.csv")
+botw_vern_csv <- glue("{dir_bl}/spp_botw_vernacular.csv")
+sci_turtles <- c(
+  "Chelonia mydas", # green
+  "Caretta caretta", # loggerhead
+  "Eretmochelys imbricata", # hawksbill
+  "Lepidochelys kempii", # Kemp's ridley
+  "Lepidochelys olivacea", # olive ridley
+  "Natator depressus", # flatback
+  "Dermochelys coriacea" # leatherback
+)
+
+
+con_spp <- dbConnect(duckdb(dbdir = spp_db, read_only = T))
+# dbListTables(con_spp)
+# [1] "gbif"             "gbif_vernacular"  "itis"             "itis_vernacular"
+# [5] "iucn_redlist"     "iucn_vernacular"  "worms"            "worms_vernacular"
+con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F))
+# con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = T))
+# dbDisconnect(con_sdm, shutdown = T); duckdb_shutdown(duckdb()); rm(con_sdm)
+# dbListTables(con_sdm) |> paste(collapse = ", ")
+# [1] "cell_metric" "dataset"     "metric"      "model"       "model_cell"
+# [6] "species"     "zone"        "zone_cell"   "zone_metric"
+
+# section eval flags (set to TRUE to re-run) ----
+do_taxid_updates   <- F  # taxonomic ID resolution (worms, itis, gbif)
+do_adhoc_fixes     <- F  # manual species corrections
+do_resolve_dupes   <- F  # resolve duplicate IDs across datasets
+do_bird_botwid     <- F  # bird BOTW ID matching
+do_build_taxon     <- F  # build taxon + taxon_model tables
+do_reclassify      <- F  # reclassify turtles/reptiles
+do_redlist_listing <- F  # add redlist_code, extrisk_code, er_score
+do_iucn_insert     <- F  # add IUCN range maps dataset
+do_iucn_extract    <- F  # extract IUCN range rasters (long-running)
+do_iucn_values     <- F  # update IUCN model_cell values
+```
+
+### Dataset and model summary
+
+```{r}
+#| label: dataset_model_summary
+tbl(con_sdm, "model") |>
+  group_by(ds_key) |>
+  summarize(n = n()) |>
+  arrange(ds_key)
+#   ds_key      n
+#   <chr>   <dbl>
+# 1 am_0.05 17550
+# 2 bl        573
+# 3 ch_fws     29
+# 4 ch_nmfs    34
+# 5 rng_fws   106
+
+stopifnot(
+  tbl(con_sdm, "species") |>
+    pull(sp_key) |>
+    duplicated() |>
+    sum() ==
+    0
+)
+```
+
+## Taxonomic ID Updates
+
+### Update WoRMS IDs to accepted names
+
+```{r}
+#| label: worms_id_update
+#| eval: !expr do_taxid_updates
+d <- tbl(con_sdm, "species") |>
+  filter(!is.na(worms_id)) |>
+  collect() # 16,916
+d2 <- d |>
+  left_join(
+    tbl(con_spp, "worms") |>
+      filter(
+        taxonID %in% d$worms_id,
+        taxonID != acceptedNameUsageID
+      ) |>
+      select(
+        taxonID,
+        acceptedNameUsageID
+      ) |>
+      collect(),
+    by = join_by(worms_id == taxonID)
+  ) |>
+  mutate(
+    worms_id_new = coalesce(acceptedNameUsageID, worms_id)
+  ) |>
+  select(sp_key, worms_id, worms_id_new) |>
+  filter(worms_id_new != worms_id)
+# d2
+#   # A tibble: 17 × 3
+#    sp_key       worms_id worms_id_new
+#    <chr>           <int>        <int>
+#  1 W-Msc-342092   342092      1813559
+#  2 W-Msc-139039   139039       405962
+#  3 SLB-4744      1346052      1819943
+#  4 SLB-80061      532730       832052
+#  5 W-Msc-504386   420719       504386
+#  6 W-Por-166666   166666      1814728
+#  7 W-Pol-157378   157378      1812830
+#  8 Fis-29588      271695      1815696
+#  9 Fis-29585      157869      1815701
+# 10 Fis-29594      238345      1815710
+# 11 SLB-93116      531880      1819191
+# 12 W-Pol-330500   330500       130321
+# 13 ITS-660021     515341       589374
+# 14 W-Msc-532730   532730       832052
+# 15 W-Msc-531880   531880      1819191
+# 16 W-Msc-216543   216543       850770
+# 17 W-Msc-507406   507406      1818767
+
+duckdb_register(con_sdm, "d2", d2)
+dbExecute(
+  con_sdm,
+  "UPDATE species
+    SET worms_id = d2.worms_id_new 
+    FROM d2
+    WHERE species.sp_key = d2.sp_key"
+) # 17
+duckdb_unregister(con_sdm, "d2")
+```
+
+### Fill missing WoRMS IDs by scientific name matching
+
+```{r}
+#| label: worms_id_na
+#| eval: !expr do_taxid_updates
+d <- tbl(con_sdm, "species") |>
+  filter(is.na(worms_id)) |>
+  collect() # 1,376
+
+# d$scientific_name_dataset |> str_subset("\\(") |>
+# "Phoca (=Pusa) hispida hispida"   "Branta (=Nesochen) sandvicensis"
+# str_remove_all("\\(=[^)]+\\)") |> str_squish()
+# "Phoca hispida hispida"           "Branta sandvicensis"
+d <- d |>
+  mutate(
+    scientific_name_clean = scientific_name_dataset |>
+      str_remove_all("\\(=[^)]+\\)") |>
+      str_squish()
+  )
+
+d2 <- d |> # names()
+  left_join(
+    tbl(con_spp, "worms") |>
+      filter(scientificName %in% d$scientific_name_clean) |>
+      select(
+        scientificName,
+        worms_id_new = acceptedNameUsageID,
+        worms_scientific_name = acceptedNameUsage,
+        taxonomicStatus
+      ) |>
+      # TODO: append worms_is_marine, worms_is_extinct ----
+      # worms_is_marine  = isMarine,
+      # worms_is_extinct = isExtinct) |>
+      collect(),
+    by = join_by(scientific_name_clean == scientificName)
+  ) |>
+  mutate(
+    taxonomic_status = factor(
+      taxonomicStatus,
+      levels = c(
+        "accepted",
+        "unassessed",
+        "interim unpublished",
+        "temporary name",
+        "uncertain",
+        "taxon inquirendum",
+        "nomen dubium",
+        "alternative representation",
+        "misapplication",
+        "misspelling - incorrect original spelling",
+        "misspelling - incorrect subsequent spelling",
+        "unjustified emendation",
+        "incorrect grammatical agreement of specific epithet",
+        "junior subjective synonym",
+        "junior objective synonym",
+        "junior homonym",
+        "unreplaced junior homonym",
+        "superseded combination",
+        "superseded rank",
+        "nomen nudum",
+        "nomen oblitum",
+        "unavailable name",
+        "unaccepted"
+      ),
+      ordered = T
+    )
+  ) |>
+  slice_min(
+    by = scientific_name_clean,
+    order_by = taxonomic_status,
+    with_ties = F
+  ) |>
+  filter(!is.na(worms_id_new)) |>
+  select(sp_key, worms_id, worms_id_new) # 701
+
+duckdb_register(con_sdm, "d2", d2)
+dbExecute(
+  con_sdm,
+  "UPDATE species
+    SET worms_id = d2.worms_id_new 
+    FROM d2
+    WHERE species.sp_key = d2.sp_key"
+) # 1,359
+duckdb_unregister(con_sdm, "d2")
+```
+
+### Update ITIS IDs to accepted names
+
+```{r}
+#| label: itis_id_update
+#| eval: !expr do_taxid_updates
+d <- tbl(con_sdm, "species") |>
+  filter(!is.na(itis_id)) |>
+  collect() # 134
+d2 <- d |>
+  left_join(
+    tbl(con_spp, "itis") |>
+      filter(
+        taxonID %in% d$itis_id,
+        taxonID != acceptedNameUsageID
+      ) |>
+      select(
+        taxonID,
+        acceptedNameUsageID
+      ) |>
+      collect(),
+    by = join_by(itis_id == taxonID)
+  ) |>
+  mutate(
+    itis_id_new = coalesce(acceptedNameUsageID, itis_id)
+  ) |>
+  select(sp_key, itis_id, itis_id_new) |>
+  filter(itis_id_new != itis_id)
+# 0 rows
+```
+
+### Fill missing ITIS IDs by scientific name matching
+
+```{r}
+#| label: itis_id_na
+#| eval: !expr do_taxid_updates
+d <- tbl(con_sdm, "species") |>
+  filter(is.na(itis_id)) |>
+  collect() # 18,158
+
+# d$scientific_name_dataset |> str_subset("\\(") |>
+# "Phoca (=Pusa) hispida hispida"
+# str_remove_all("\\(=[^)]+\\)") |> str_squish()
+# "Phoca hispida hispida"
+d <- d |>
+  mutate(
+    scientific_name_clean = scientific_name_dataset |>
+      str_remove_all("\\(=[^)]+\\)") |>
+      str_squish()
+  )
+
+d2 <- d |> # names()
+  left_join(
+    tbl(con_spp, "itis") |>
+      filter(scientificName %in% d$scientific_name_clean) |>
+      select(
+        scientificName,
+        itis_id_new = acceptedNameUsageID,
+        taxonomicStatus
+      ) |>
+      collect(),
+    by = join_by(scientific_name_clean == scientificName),
+    relationship = "many-to-many"
+  ) |>
+  mutate(
+    taxonomic_status = factor(
+      taxonomicStatus,
+      levels = c("valid", "accepted", "not accepted", "invalid"),
+      ordered = T
+    )
+  ) |>
+  slice_min(
+    by = scientific_name_clean,
+    order_by = taxonomic_status,
+    with_ties = F
+  ) |>
+  filter(!is.na(itis_id_new)) |>
+  select(sp_key, itis_id, itis_id_new) # 393
+
+duckdb_register(con_sdm, "d2", d2)
+dbExecute(
+  con_sdm,
+  "UPDATE species
+    SET itis_id = d2.itis_id_new 
+    FROM d2
+    WHERE species.sp_key = d2.sp_key"
+) # 393
+duckdb_unregister(con_sdm, "d2")
+```
+
+### Update GBIF IDs to accepted names
+
+```{r}
+#| label: gbif_id_update
+#| eval: !expr do_taxid_updates
+d <- tbl(con_sdm, "species") |>
+  filter(!is.na(gbif_id)) |>
+  collect() # 325
+d2 <- d |>
+  left_join(
+    tbl(con_spp, "gbif") |>
+      filter(
+        taxonID %in% d$gbif_id,
+        !is.na(acceptedNameUsageID)
+      ) |>
+      select(
+        taxonID,
+        acceptedNameUsageID
+      ) |>
+      collect(),
+    by = join_by(gbif_id == taxonID)
+  ) |>
+  mutate(
+    gbif_id_new = coalesce(acceptedNameUsageID, gbif_id)
+  ) |>
+  select(sp_key, gbif_id, gbif_id_new) |>
+  filter(gbif_id_new != gbif_id)
+# 0 rows
+```
+
+### Fill missing GBIF IDs by scientific name matching
+
+```{r}
+#| label: gbif_id_na
+#| eval: !expr do_taxid_updates
+d <- tbl(con_sdm, "species") |>
+  filter(is.na(gbif_id)) |>
+  collect() |>
+  mutate(
+    scientific_name_clean = scientific_name_dataset |>
+      str_remove_all("\\(=[^)]+\\)") |>
+      str_squish()
+  ) # 17,967
+
+d2 <- d |>
+  left_join(
+    tbl(con_spp, "gbif") |>
+      filter(scientificName %in% d$scientific_name_clean) |>
+      select(
+        scientificName,
+        acceptedNameUsageID,
+        taxonID,
+        taxonomicStatus
+      ) |>
+      collect(),
+    by = join_by(scientific_name_clean == scientificName),
+    relationship = "many-to-many"
+  ) |>
+  mutate(
+    acceptedNameUsageID = as.integer(acceptedNameUsageID),
+    gbif_id_new = coalesce(acceptedNameUsageID, taxonID),
+    taxonomic_status = factor(
+      taxonomicStatus,
+      levels = c("valid", "accepted", "synonym", "not accepted", "invalid"),
+      ordered = T
+    )
+  ) |>
+  slice_min(
+    by = scientific_name_clean,
+    order_by = taxonomic_status,
+    with_ties = F
+  ) |>
+  filter(!is.na(gbif_id_new)) |>
+  select(sp_key, gbif_id, gbif_id_new) # 27
+# A tibble: 27 × 3
+#    sp_key     gbif_id gbif_id_new
+#    <chr>        <int>       <int>
+#  1 Fis-153539      NA     7059179
+#  2 Fis-144084      NA     7193206
+#  3 Fis-23839       NA     7193804
+#  4 SLB-141293      NA     9802728
+#  5 ITS-89613       NA     2115695
+#  6 SLB-135613      NA     2668329
+#  7 Fis-23314       NA     7193246
+#  8 SLB-67618       NA     1004077
+#  9 Fis-130709      NA     7193250
+# 10 Fis-23218       NA     7193248
+# ℹ 17 more rows
+
+duckdb_register(con_sdm, "d2", d2)
+dbExecute(
+  con_sdm,
+  "UPDATE species
+    SET gbif_id = d2.gbif_id_new 
+    FROM d2
+    WHERE species.sp_key = d2.sp_key"
+) # 27
+duckdb_unregister(con_sdm, "d2")
+```
+
+### Taxonomic authority coverage summary
+
+```{r}
+#| label: auth_sum
+tbl(con_sdm, "species") |>
+  group_by(sp_cat, ds_key) |>
+  summarize(
+    n = n(),
+    n_worms = sum(!is.na(worms_id), na.rm = T),
+    n_itis = sum(!is.na(itis_id), na.rm = T),
+    n_gbif = sum(!is.na(gbif_id), na.rm = T),
+    n_allna = sum(
+      is.na(worms_id) & is.na(itis_id) & is.na(gbif_id),
+      na.rm = T
+    ),
+    .groups = "drop"
+  ) |>
+  mutate(
+    pct_worms = n_worms / n * 100,
+    pct_itis = n_itis / n * 100,
+    pct_gbif = n_gbif / n * 100,
+    pct_allna = n_allna / n * 100
+  ) |>
+  arrange(sp_cat, ds_key) |>
+  collect() |>
+  print(n = Inf)
+
+#   sp_cat           n n_worms n_itis n_gbif pct_worms pct_itis pct_gbif
+#   <chr>        <dbl>   <dbl>  <dbl>  <dbl>     <dbl>    <dbl>    <dbl>
+# 1 fish          6700    6700    107     84     100      1.60      1.25
+# 2 turtle          49      47     17      5      95.9   34.7      10.2
+# 3 invertebrate  8530    8379    231    187      98.2    2.71      2.19
+# 4 other         1417    1146     35     50      80.9    2.47      3.53
+# 5 coral          819     815      5     11      99.5    0.611     1.34
+# 6 mammal         103     100     12      8      97.1   11.7       7.77
+# 7 bird           674     430    120      7      63.8   17.8       1.04
+
+#    sp_cat   ds_key     n n_worms n_itis n_gbif n_allna pct_worms pct_itis pct_gbif
+#    <chr>    <chr>  <dbl>   <dbl>  <dbl>  <dbl>   <dbl>     <dbl>    <dbl>    <dbl>
+#  1 bird     am_0.…     1       1      0      0       0     100      0        0
+#  2 bird     bl       573     401     21      1     162      70.0    3.66     0.175
+#  3 bird     ch_fws    18       4     18      2       0      22.2  100       11.1
+#  4 bird     rng_f…    82      24     81      4       1      29.3   98.8      4.88
+#  5 coral    am_0.…   807     803      5     11       4      99.5    0.620    1.36
+#  6 coral    ch_nm…    12      12      0      0       0     100      0        0
+#  7 fish     am_0.…  6682    6682     95     84       0     100      1.42     1.26
+#  8 fish     ch_fws     3       3      3      0       0     100    100        0
+#  9 fish     ch_nm…     6       6      0      0       0     100      0        0
+# 10 fish     rng_f…     9       9      9      0       0     100    100        0
+# 11 inverte… am_0.…  8525    8374    227    187     140      98.2    2.66     2.19
+# 12 inverte… ch_nm…     1       1      0      0       0     100      0        0
+# 13 inverte… rng_f…     4       4      4      0       0     100    100        0
+# 14 mammal   am_0.…    85      84      4      8       0      98.8    4.71     9.41
+# 15 mammal   ch_fws     3       3      3      0       0     100    100        0
+# 16 mammal   ch_nm…    11       9      1      0       1      81.8    9.09     0
+# 17 mammal   rng_f…     4       4      4      0       0     100    100        0
+# 18 other    am_0.…  1417    1146     35     50     243      80.9    2.47     3.53
+# 19 turtle   am_0.…    33      31      5      5       2      93.9   15.2     15.2
+# 20 turtle   ch_fws     5       5      5      0       0     100    100        0
+# 21 turtle   ch_nm…     4       4      0      0       0     100      0        0
+# 22 turtle   rng_f…     7       7      7      0       0     100    100        0
+```
+
+### Add WoRMS marine/extinct flags to species
+
+```{r}
+#| label: worms_is_marine
+#| eval: !expr do_taxid_updates
+d <- tbl(con_sdm, "species") |>
+  filter(!is.na(worms_id)) |>
+  collect() # 17,617
+d_cols <- setdiff(names(d), c("worms_is_marine", "worms_is_extinct"))
+
+d2 <- d |> # names()
+  select(all_of(d_cols)) |>
+  left_join(
+    tbl(con_spp, "worms") |>
+      filter(taxonID %in% d$worms_id) |>
+      select(
+        taxonID,
+        worms_is_marine = isMarine,
+        worms_is_extinct = isExtinct
+      ) |>
+      collect(),
+    by = join_by(worms_id == taxonID)
+  ) |>
+  filter(!is.na(worms_is_marine) | !is.na(worms_is_extinct)) |>
+  distinct(worms_id, worms_is_marine, worms_is_extinct) # 17,276
+
+dbExecute(
+  con_sdm,
+  "ALTER TABLE species ADD COLUMN IF NOT EXISTS worms_is_marine BOOLEAN"
+)
+dbExecute(
+  con_sdm,
+  "ALTER TABLE species ADD COLUMN IF NOT EXISTS worms_is_extinct BOOLEAN"
+)
+
+duckdb_register(con_sdm, "d2", d2)
+dbExecute(
+  con_sdm,
+  "UPDATE species
+    SET worms_is_marine  = d2.worms_is_marine ,
+        worms_is_extinct = d2.worms_is_extinct 
+    FROM d2
+    WHERE species.worms_id = d2.worms_id"
+) # 17,544
+duckdb_unregister(con_sdm, "d2")
+```
+
+### WoRMS marine/extinct summary by sp_cat
+
+```{r}
+#| label: pct_worms
+tbl(con_sdm, "species") |>
+  summarize(
+    n = n(),
+    n_worms_marine = sum(worms_is_marine, na.rm = T),
+    n_worms_extinct = sum(worms_is_extinct, na.rm = T)
+  ) |>
+  mutate(
+    pct_worms_marine = n_worms_marine / n * 100,
+    pct_worms_extinct = n_worms_extinct / n * 100
+  )
+#     n n_worms_marine n_worms_extinct pct_worms_marine pct_worms_extinct
+# <dbl>          <dbl>           <dbl>            <dbl>             <dbl>
+# 18292          17387              21             95.1             0.115
+
+tbl(con_sdm, "species") |>
+  group_by(sp_cat) |>
+  summarize(
+    n = n(),
+    n_worms_marine = sum(worms_is_marine, na.rm = T),
+    n_worms_extinct = sum(worms_is_extinct, na.rm = T)
+  ) |>
+  mutate(
+    pct_worms_marine = n_worms_marine / n * 100,
+    pct_worms_extinct = n_worms_extinct / n * 100
+  )
+#   sp_cat           n n_worms_marine n_worms_extinct pct_worms_marine pct_worms_extinct
+#   <chr>        <dbl>          <dbl>           <dbl>            <dbl>             <dbl>
+# 1 invertebrate  8530           8337              21             97.7             0.246
+# 2 other         1417           1145               0             80.8             0
+# 3 coral          819            815               0             99.5             0
+# 4 fish          6700           6699               0            100.0             0
+# 5 turtle          49             46              NA             93.9            NA
+# 6 mammal         103            103               0            100               0
+# 7 bird           674            242              NA             35.9            NA
+```
+
+## Ad-hoc Species Fixes
+
+### Fix bird scientific name (Sula sula)
+
+```{r}
+#| label: bird_sci
+#| eval: !expr do_adhoc_fixes
+tbl(con_sdm, "species") |>
+  filter(sp_cat == "bird", is.na(scientific_name_accepted)) |>
+  glimpse()
+# $ sp_seq                   <int> 10651
+# $ ds_key                   <chr> "am_0.05"
+# $ taxa                     <chr> "ITS-Ave-174707"
+# $ sp_key                   <chr> "ITS-Ave-174707"
+# $ worms_id                 <int> 212596
+# $ gbif_id                  <int> NA
+# $ itis_id                  <int> NA
+# $ scientific_name_dataset  <chr> "Sula sula"
+# $ common_name_dataset      <chr> "red-footed booby"
+# $ scientific_name_accepted <chr> NA
+# $ common_name_accepted     <chr> NA
+# $ iucn_id                  <int> NA
+# $ redlist_code             <chr> "LC"
+# $ redlist_year             <int> 2021
+# $ sp_cat                   <chr> "bird"
+# $ worms_is_marine          <lgl> TRUE
+# $ worms_is_extinct         <lgl> NA
+dbExecute(
+  con_sdm,
+  "UPDATE species
+    SET scientific_name_accepted = scientific_name_dataset,
+        common_name_accepted     = 'Red-footed Booby'
+    WHERE ds_key = 'am_0.05' AND scientific_name_dataset = 'Sula sula'"
+) # 17,544
+
+# d_botw <- read_sf(botw_gpkg, "main_BL_HBW_Checklist_V9") |>
+#   clean_names()
+# names(d_botw)
+#  [1] "seq"                         "order"
+#  [3] "family_name"                 "family"
+#  [5] "subfamily"                   "tribe"
+#  [7] "common_name"                 "scientific_name"
+#  [9] "authority"                   "iucn_red_list_category_2024"
+# [11] "synonyms"                    "alternative_common_names"
+# [13] "taxonomic_sources"           "sis_rec_id"
+# [15] "spc_rec_id"
+
+# NOTE: d_bird is undefined here; should likely be d_b from bird_bl_to_botwid
+d_bird <- d_bird |>
+  mutate(
+    itis_id = as.integer(itis_id),
+    worms_id = as.integer(worms_id),
+    gbif_id = as.integer(gbif_id)
+  )
+
+d_bird |>
+  mutate(itis_na = is.na(itis_id)) |>
+  select(itis_na, ds_key) |>
+  table(useNA = "ifany")
+# FALSE  TRUE
+#    99   575
+```
+
+### Fix deleted WoRMS record
+
+```{r}
+#| label: notbirds_worms_rn_deleted
+#| eval: !expr do_adhoc_fixes
+# AphiaID: 1780766 has been DELETED  - reason: Wrong combination (Dekker, Henk)
+# Please replace it by AphiaID: 607159 (Agathistoma Olsson & Harbison, 1953)
+dbExecute(
+  con_sdm,
+  "UPDATE species SET worms_id = 607159 WHERE worms_id = 1780766"
+) # 1
+```
+
+### Manual fixes for non-birds without WoRMS ID
+
+```{r}
+#| label: notbird_rl_wormsidna
+#| eval: !expr do_adhoc_fixes
+# not bird, worms_id is NA, has redlist code
+d_nb_wn_rl <- tbl(con_sdm, "species") |>
+  filter(
+    is.na(worms_id),
+    !is.na(redlist_code),
+    sp_cat != "bird"
+  ) |>
+  collect()
+
+d_nb_wn_rl |>
+  arrange(
+    sp_cat,
+    scientific_name_dataset,
+    common_name_dataset,
+    ds_key,
+    sp_key
+  ) |>
+  select(
+    sp_cat,
+    scientific_name_dataset,
+    common_name_dataset,
+    ds_key,
+    sp_key
+  ) |>
+  print(n = Inf)
+# # A tibble: 22 × 5
+#    sp_cat       scientific_name_dataset       common_name_dataset        ds_key  sp_key
+#    <chr>        <chr>                         <chr>                      <chr>   <chr>
+#  1 invertebrate Ancistroteuthis lichtensteini angel squid                am_0.05 SLB-71652
+#  2 invertebrate Argonauta cornuta             NA                         am_0.05 SLB-70961
+#  3 invertebrate Holothuria dakarensis         NA                         am_0.05 SLB-66007
+#  4 invertebrate Holothuria dofleinii          NA                         am_0.05 SLB-91447
+#  5 invertebrate Holothuria dura               NA                         am_0.05 SLB-169639
+#  6 invertebrate Holothuria floridana          Florida sea cucumber       am_0.05 SLB-66009
+#  7 invertebrate Holothuria kefersteinii       NA                         am_0.05 SLB-182810
+#  8 invertebrate Holothuria martensii          NA                         am_0.05 SLB-189914
+#  9 invertebrate Holothuria parvula            NA                         am_0.05 SLB-66018
+# 10 invertebrate Holothuria rigida             rigid sea cucumber         am_0.05 SLB-92934
+# 11 mammal       Delphinus capensis            long-beaked common dolphin am_0.05 ITS-Mam-555654
+# 12 other        Halodule uninervis            needle seagrass            am_0.05 Kew-308064
+# 13 other        Halodule wrightii             shoal grass                am_0.05 Kew-308065
+# 14 other        Halophila decipiens           NA                         am_0.05 Kew-308072
+# 15 other        Halophila ovalis              spoon seagrass             am_0.05 Kew-308085
+# 16 other        Halophila spinulosa           fern seagrass              am_0.05 Kew-308090
+# 17 other        Ruppia maritima               NA                         am_0.05 Kew-308804
+# 18 other        Syringodium filiforme         manatee grass              am_0.05 Kew-288211
+# 19 other        Thalassia testudinum          turtle grass               am_0.05 Kew-308879
+# 20 other        Thalassodendron ciliatum      NA                         am_0.05 Kew-293259
+# 21 turtle       Aipysurus eydouxii            spine-tailed seasnake      am_0.05 Rep-467
+# 22 turtle       Hydrophis macdowelli          McDowell's sea snake       am_0.05 Rep-5028
+
+dbExecute(
+  con_sdm,
+  "UPDATE species
+    SET worms_id                 = 255028,
+        scientific_name_accepted = 'Pusa hispida hispida',
+        common_name_accepted     = 'Arctic ringed seal'
+    WHERE ds_key = 'ch_nmfs' AND scientific_name_dataset = 'Phoca (=Pusa) hispida hispida'"
+) # 1
+
+dbExecute(
+  con_sdm,
+  "UPDATE species
+    SET worms_id                 = 137079,
+        scientific_name_accepted = 'Erignathus barbatus',
+        common_name_accepted     = 'bearded seal'
+    WHERE ds_key = 'ch_nmfs' AND scientific_name_dataset = 'Erignathus barbatus nauticus'"
+) # 1
+
+dbExecute(
+  con_sdm,
+  "UPDATE species
+    SET worms_id                 = 137079,
+        scientific_name_accepted = 'Erignathus barbatus',
+        common_name_accepted     = 'bearded seal'
+    WHERE ds_key = 'ch_nmfs' AND scientific_name_dataset = 'Erignathus barbatus nauticus'"
+) # 1
+
+dbExecute(
+  con_sdm,
+  "UPDATE species
+    SET worms_id                 = 344064,
+        scientific_name_accepted = 'Hydrophis mcdowelli',
+        common_name_accepted     = 'McDowell''s sea snake'
+    WHERE ds_key = 'am_0.05' AND scientific_name_dataset = 'Hydrophis macdowelli'"
+) # 1
+
+dbExecute(
+  con_sdm,
+  "UPDATE species
+    SET worms_id                 = 140647,
+        scientific_name_accepted = 'Ancistroteuthis lichtensteinii',
+        common_name_accepted     = 'angel squid'
+    WHERE ds_key = 'am_0.05' AND scientific_name_dataset = 'Ancistroteuthis lichtensteini'"
+) # 1
+
+dbExecute(
+  con_sdm,
+  "UPDATE species
+    SET worms_id                 = 341786,
+        scientific_name_accepted = 'Argonauta nouryi',
+        common_name_accepted     = 'rough-keeled argonaut'
+    WHERE ds_key = 'am_0.05' AND scientific_name_dataset = 'Argonauta cornuta'"
+) # 1
+
+dbExecute(
+  con_sdm,
+  "UPDATE species
+    SET worms_id                 = 124495,
+        scientific_name_accepted = 'Holothuria (Holothuria) dakarensis',
+        common_name_accepted     = NULL
+    WHERE ds_key = 'am_0.05' AND scientific_name_dataset = 'Holothuria dakarensis'"
+) # 1
+
+dbExecute(
+  con_sdm,
+  "UPDATE species
+    SET worms_id                 = 210842,
+        scientific_name_accepted = 'Holothuria (Stauropora) dofleinii',
+        common_name_accepted     = NULL
+    WHERE ds_key = 'am_0.05' AND scientific_name_dataset = 'Holothuria dofleinii'"
+) # 1
+
+dbExecute(
+  con_sdm,
+  "UPDATE species
+    SET worms_id                 = 137094,
+        scientific_name_accepted = 'Delphinus delphis',
+        common_name_accepted     = 'long-beaked common dolphin'
+    WHERE ds_key = 'am_0.05' AND scientific_name_dataset = 'Delphinus capensis'"
+) # 1
+
+d_nb_wn_rl |>
+  arrange(
+    sp_cat,
+    redlist_code,
+    scientific_name_dataset,
+    common_name_dataset,
+    ds_key,
+    sp_key
+  ) |>
+  select(
+    sp_cat,
+    RL = redlist_code,
+    scientific_name_dataset,
+    common_name_dataset,
+    ds_key,
+    sp_key
+  ) |>
+  print(n = Inf)
+# # A tibble: 17 × 6
+#    sp_cat       RL    scientific_name_dataset  common_name_dataset        ds_key  sp_key
+#    <chr>        <chr> <chr>                    <chr>                      <chr>   <chr>
+#  1 invertebrate DD    Holothuria dura          NA                         am_0.05 SLB-169639
+#  2 invertebrate DD    Holothuria kefersteinii  NA                         am_0.05 SLB-182810
+#  3 invertebrate DD    Holothuria martensii     NA                         am_0.05 SLB-189914
+#  4 invertebrate LC    Holothuria floridana     Florida sea cucumber       am_0.05 SLB-66009
+#  5 invertebrate LC    Holothuria parvula       NA                         am_0.05 SLB-66018
+#  6 invertebrate LC    Holothuria rigida        rigid sea cucumber         am_0.05 SLB-92934
+#  7 mammal       DD    Delphinus capensis       long-beaked common dolphin am_0.05 ITS-Mam-555654
+#  8 other        LC    Halodule uninervis       needle seagrass            am_0.05 Kew-308064
+#  9 other        LC    Halodule wrightii        shoal grass                am_0.05 Kew-308065
+# 10 other        LC    Halophila decipiens      NA                         am_0.05 Kew-308072
+# 11 other        LC    Halophila ovalis         spoon seagrass             am_0.05 Kew-308085
+# 12 other        LC    Halophila spinulosa      fern seagrass              am_0.05 Kew-308090
+# 13 other        LC    Ruppia maritima          NA                         am_0.05 Kew-308804
+# 14 other        LC    Syringodium filiforme    manatee grass              am_0.05 Kew-288211
+# 15 other        LC    Thalassia testudinum     turtle grass               am_0.05 Kew-308879
+# 16 other        LC    Thalassodendron ciliatum NA                         am_0.05 Kew-293259
+# 17 turtle       LC    Aipysurus eydouxii       spine-tailed seasnake      am_0.05 Rep-467
+```
+
+## Resolve Duplicate WoRMS IDs Across Datasets
+
+### Identify and resolve within-dataset WoRMS duplicates
+
+```{r}
+#| label: notbirds_wormsid_ds_duplicates
+#| eval: !expr do_resolve_dupes
+# get not birds, with worms_id, across datasets
+# d_notbird |>
+#   mutate(worms_na = is.na(worms_id)) |>
+#   select(worms_na, ds_key) |>
+#   table(useNA = "ifany")
+#         ds_key
+# worms_na am_0.05 ch_fws ch_nmfs rng_fws
+#    FALSE   16852     11       0      24
+#    TRUE      697      0      34       0
+
+# count of species with duplicate worms_id, across datasets
+# tbl(con_sdm, "species") |>
+#   filter(
+#     !is.na(worms_id)) |>
+#   group_by(sp_cat, ds_key, worms_id) |>
+#   summarize(
+#     n = n(),
+#     .groups = "drop") |>
+#   filter(n > 1) |>
+#   collect()
+# # A tibble: 189 × 4
+#    sp_cat       ds_key  worms_id     n
+#    <chr>        <chr>      <int> <dbl>
+#  1 other        am_0.05   157583     2
+#  2 invertebrate am_0.05   140015     2
+#  3 invertebrate am_0.05   117887     2
+#  4 other        am_0.05  1491000     2
+#  5 invertebrate am_0.05   146733     2
+#  6 invertebrate am_0.05   216636     2
+#  7 other        am_0.05   105444     2
+#  8 invertebrate am_0.05   440094     2
+#  9 invertebrate am_0.05   420788     2
+# 10 invertebrate am_0.05   104548     2
+# # ℹ 179 more rows
+# # ℹ Use `print(n = ...)` to see more rows
+
+# dataset key for not birds, without worms_id
+# tbl(con_sdm, "species") |>
+#   filter(
+#     sp_cat != "bird") |>
+#   mutate(
+#     worms_na = is.na(worms_id)) |>
+#   select(ds_key, worms_na) |>
+#   collect() |>
+#   table(useNA = "ifany")
+#          worms_na
+# ds_key    FALSE  TRUE
+#   am_0.05 17126   423
+#   ch_fws     11     0
+#   ch_nmfs    34     0
+#   rng_fws    24     0
+
+# redlist code for not birds, without worms_id, (all AquaMaps)
+# tbl(con_sdm, "species") |>
+#   filter(
+#     is.na(worms_id),
+#     sp_cat != "bird",
+#     ds_key == "am_0.05") |>
+#   mutate(
+#     worms_na = is.na(worms_id)) |>
+#   select(sp_cat, redlist_code) |>
+#   collect() |>
+#   table(useNA = "ifany")
+#               redlist_code
+# sp_cat          DD  LC <NA>
+#   coral          0   0    4
+#   invertebrate   3   3  141
+#   other          0   9  262
+#   turtle         0   1    0
+
+# not birds, with worms_id
+d_nb <- tbl(con_sdm, "species") |>
+  filter(
+    !is.na(worms_id),
+    sp_cat != "bird"
+  ) |> # 17,195
+  left_join(
+    tbl(con_sdm, "model") |>
+      select(mdl_seq, taxa),
+    by = join_by(taxa)
+  ) |>
+  collect() # 17,195
+
+# check mdl_seq is all not NA, and not duplicated
+stopifnot(d_nb |> filter(is.na(mdl_seq)) |> nrow() == 0)
+stopifnot(d_nb |> filter(duplicated(mdl_seq)) |> nrow() == 0)
+
+# get duplicate worms_id in d_nb
+w_dupe_ds <- d_nb |>
+  group_by(worms_id, ds_key) |>
+  summarize(
+    n = n(),
+    .groups = "drop"
+  ) |>
+  filter(n != 1) |>
+  pull(worms_id)
+# length(w_dupe_ds) # 189
+
+# of duplicates, prefer scientific_name_dataset with taxonomicStatus == "accepted"
+d_w_dupe_ds <- d_nb |>
+  filter(
+    worms_id %in% w_dupe_ds,
+    ds_key == "am_0.05"
+  ) |>
+  left_join(
+    tbl(con_spp, "worms") |>
+      filter(taxonID %in% w_dupe_ds) |>
+      select(scientificName, taxonomicStatus) |>
+      collect(),
+    by = join_by(scientific_name_dataset == scientificName)
+  ) |>
+  filter(
+    !is.na(taxonomicStatus),
+    taxonomicStatus == "accepted"
+  )
+stopifnot(sum(duplicated(d_w_dupe_ds$worms_id)) == 0)
+
+# get remaining duplicates, without taxonomicStatus match
+w_dupe_ds2 <- setdiff(w_dupe_ds, d_w_dupe_ds$worms_id)
+
+# get remaining duplicates, as data frame
+d_w_dupe_ds2 <- d_nb |>
+  filter(
+    worms_id %in% w_dupe_ds2,
+    ds_key == "am_0.05"
+  ) |>
+  left_join(
+    tbl(con_spp, "worms") |>
+      filter(taxonID %in% w_dupe_ds2) |>
+      select(taxonID, scientificName) |>
+      collect(),
+    by = join_by(worms_id == taxonID)
+  ) # 42 × 19
+
+# duplicates2: arrange data frame for manually identifying preferred taxa of same worms_id
+d_w_dupe_ds2 |>
+  select(
+    sp_cat,
+    worms_id,
+    sci_ds = scientific_name_dataset,
+    sci_worms = scientificName,
+    cmn_ds = common_name_dataset,
+    rl = redlist_code,
+    taxa
+  ) |>
+  arrange(sp_cat, worms_id, sci_ds)
+w_dupe_ds2_csv <- here("data/aquamaps_worms_duplicate_preferred.csv")
+if (!file.exists(w_dupe_ds2_csv)) {
+  write_csv(d_w_dupe_ds2, w_dupe_ds2_csv)
+}
+# then manually added worms_preferred column with T values
+d_w_dupe_ds2 <- read_csv(w_dupe_ds2_csv)
+# read in edits
+d_am_taxa_worms_pref <- d_w_dupe_ds2 |>
+  filter(worms_preferred == T) |>
+  select(worms_id, taxa) |>
+  bind_rows(
+    # bind with taxonomicStatus == "accepted"
+    d_w_dupe_ds |>
+      select(worms_id, taxa)
+  )
+stopifnot(duplicated(d_am_taxa_worms_pref$worms_id) |> sum() == 0)
+
+# d_nb_0 <- d_nb
+d_nb <- bind_rows(
+  d_nb |> #     d_nb: 17,195 × 18
+    filter(
+      worms_id %in% d_am_taxa_worms_pref$worms_id,
+      taxa %in% d_am_taxa_worms_pref$taxa
+    ), # AM dupes:    189 × 18
+  d_nb |>
+    filter(
+      !worms_id %in% d_am_taxa_worms_pref$worms_id
+    )
+) # notdupes: 16,813
+```
+
+### Pivot non-bird datasets by WoRMS ID
+
+```{r}
+#| label: notbirds_wormsid_ds_pivoted
+# not birds, by dataset pivoted
+d_nb_ds <- d_nb |>
+  group_by(worms_id) |>
+  mutate(
+    n_ds = n()
+  ) |>
+  ungroup() |>
+  pivot_wider(
+    id_cols = c(worms_id, n_ds),
+    names_from = ds_key,
+    values_from = mdl_seq
+  )
+
+d_nb_ds |>
+  arrange(desc(n_ds), worms_id) |>
+  filter(n_ds > 1) |>
+  print(n = 10)
+# OLD: A tibble: 42 × 6
+#    worms_id  n_ds am_0.05 ch_nmfs ch_fws rng_fws
+#       <int> <int>   <int>   <int>  <int>   <int>
+#  1   127186     4    7466   18230  18309   18401
+#  2   137205     4    1173   18243  18291   18342
+#  3   137206     4    1708   18244  18294   18345
+#  4   137207     4    2106   18246  18301   18357
+#  5   137209     4      25   18245  18297   18350
+#  6   159509     3    6479      NA  18313   18415
+#  7   422566     3    7918      NA  18296   18349
+#  8  1805509     3      NA   18226  18287   18318
+#  9   105848     2    7288   18229     NA      NA
+# 10   126505     2     881      NA     NA   18365
+# 11   137079     2     782   18234     NA      NA
+# 12   137085     2      NA      NA  18314   18416
+# 13   137092     2       2   18238     NA      NA
+# 14   137102     2       4   18240     NA      NA
+# 15   137104     2      79   18242     NA      NA
+# 16   137115     2     355   18233     NA      NA
+# 17   137208     2    2551      NA     NA   18376
+# 18   158075     2     970   18228     NA      NA
+# 19   159023     2    1845   18235     NA      NA
+# 20   159222     2    5980   18227     NA      NA
+# 21   206989     2   10777   18213     NA      NA
+# 22   220293     2    2522      NA     NA   18377
+# 23   242600     2      NA      NA  18299   18354
+# 24   254570     2     935      NA     NA   18402
+# 25   254974     2     440   18236     NA      NA
+# 26   254999     2     803   18237     NA      NA
+# 27   274347     2    2516      NA     NA   18385
+# 28   280737     2      NA      NA  18302   18358
+# 29   282844     2    2597      NA     NA   18406
+# 30   288227     2    9656   18215     NA      NA
+# 31   290426     2   13208   18221     NA      NA
+# 32   405012     2   12061   18231     NA      NA
+# 33   418865     2    8056   18218     NA      NA
+# 34   430645     2   11166   18214     NA      NA
+# 35   430653     2   12678   18216     NA      NA
+# 36   730691     2   15414   18220     NA      NA
+# 37   758260     2    3413   18222     NA      NA
+# 38   758261     2    4071   18223     NA      NA
+# 39   758262     2    3791   18224     NA      NA
+# 40  1663107     2    2722   18239     NA      NA
+# 41  1815696     2    6349   18225     NA      NA
+# 42  1815701     2    7347      NA     NA   18317
+
+# NEW: # A tibble: 1,499 × 9
+#    worms_id  n_ds am_0.05 ch_nmfs ch_fws rng_fws ms_merge rng_iucn ca_nmfs
+#       <int> <int>   <int>   <int>  <int>   <int>    <int>    <int>   <int>
+#  1   127186     6    7466   18230  18309   18401    21488    19445      NA
+#  2   137206     6    1708   18244  18294   18345    21490    19858      NA
+#  3   137207     6    2106   18246  18301   18357    21491    19860      NA
+#  4   137209     6      25   18245  18297   18350    21492    19859      NA
+#  5   137205     5    1173   18243  18291   18342    21489       NA      NA
+#  6   105848     4    7288   18229     NA      NA    21493    19723      NA
+#  7   137079     4     782   18234     NA      NA    21494    19018      NA
+#  8   137085     4      NA      NA  18314   18416    21495    19006      NA
+#  9   137092     4       2   18238     NA      NA    21496    19034      NA
+# 10   137102     4       4   18240     NA      NA    21497    19040      NA
+# ℹ 1,489 more rows
+# ℹ Use `print(n = ...)` to see more rows
+```
+
+## Reclassify Turtles vs Reptiles in species Table
+
+### Update species.sp_cat for true turtles
+
+```{r}
+#| label: update_turtle_to_reptile
+#| eval: !expr do_reclassify
+
+# tbl(con_sdm, "species") |>
+#   filter(scientific_name_accepted %in% sci_turtles) |>
+#   count(scientific_name_accepted)
+#
+#   scientific_name_accepted     n
+#   <chr>                    <dbl>
+# 1 Chelonia mydas               5
+# 2 Lepidochelys kempii          3
+# 3 Dermochelys coriacea         5
+# 4 Eretmochelys imbricata       5
+# 5 Caretta caretta              5
+# 6 Lepidochelys olivacea        3
+
+# convert all "turtle" sp_cat to "reptile", b/c some sea snakes
+sci_turtles_str <- paste(sci_turtles, collapse = "','")
+dbExecute(
+  con_sdm,
+  glue(
+    "UPDATE species SET sp_cat = 'turtle' WHERE scientific_name_accepted IN ('{sci_turtles_str}')"
+  )
+) # 49
+```
+
+## Bird Taxonomic ID Resolution
+
+### Convert BirdLife sp_key to botw_id
+
+```{r}
+#| label: bird_bl_to_botwid
+#| eval: !expr do_bird_botwid
+# birds
+d_b <- tbl(con_sdm, "species") |>
+  filter(
+    sp_cat == "bird"
+  ) |>
+  left_join(
+    tbl(con_sdm, "model") |>
+      select(mdl_seq, taxa),
+    by = join_by(taxa)
+  ) |>
+  collect() # 674
+
+# see ingest_taxon.qmd: botw, botw_vernacular -> con_spp
+
+d_b |>
+  group_by(ds_key) |>
+  summarize(
+    n = n(),
+    .groups = "drop"
+  )
+#   ds_key      n
+#   <chr>   <int>
+# 1 am_0.05     1
+# 2 bl        573
+# 3 ch_fws     18
+# 4 rng_fws    82
+
+# convert bl sp_key to botw_id
+dbExecute(
+  con_sdm,
+  "ALTER TABLE species ADD COLUMN IF NOT EXISTS botw_id BIGINT"
+)
+dbExecute(
+  con_sdm,
+  "UPDATE species
+    SET botw_id = REPLACE(sp_key, 'bl:', '')::BIGINT
+    WHERE ds_key = 'bl'"
+) # 573
+```
+
+### Match non-BL birds to BOTW by scientific name
+
+```{r}
+#| label: birds_notbl_to_botwid
+#| eval: !expr do_bird_botwid
+d <- tbl(con_sdm, "species") |>
+  filter(
+    sp_cat == "bird",
+    ds_key != "bl"
+  ) |>
+  collect()
+
+# d$scientific_name_dataset |> str_subset("\\(") |>
+# "Branta (=Nesochen) sandvicensis"  "Phoebastria (=Diomedea) albatrus"
+# str_remove_all("\\(=[^)]+\\)") |> str_squish()
+# "Branta sandvicensis"  "Phoebastria albatrus"
+
+d <- d |>
+  mutate(
+    scientific_name_clean = scientific_name_dataset |>
+      str_remove_all("\\(=[^)]+\\)") |>
+      str_squish()
+  )
+
+d2 <- d |> # names()
+  left_join(
+    tbl(con_spp, "botw") |>
+      filter(scientificName %in% d$scientific_name_clean) |>
+      select(
+        scientificName,
+        botw_id_new = acceptedNameUsageID,
+        botw_scientific_name = acceptedNameUsage
+      ) |>
+      collect(),
+    by = join_by(scientific_name_clean == scientificName)
+  ) |>
+  filter(!is.na(botw_id_new)) |>
+  select(sp_key, botw_id, botw_id_new) # 62
+
+duckdb_register(con_sdm, "d2", d2)
+dbExecute(
+  con_sdm,
+  "UPDATE species
+    SET botw_id = d2.botw_id_new 
+    FROM d2
+    WHERE species.sp_key = d2.sp_key"
+) # 62
+duckdb_unregister(con_sdm, "d2")
+```
+
+### Match non-BL birds to BOTW by common name (dataset)
+
+```{r}
+#| label: birds_notbl_to_botwid_common_ds
+#| eval: !expr do_bird_botwid
+d <- tbl(con_sdm, "species") |>
+  filter(
+    sp_cat == "bird",
+    ds_key != "bl",
+    is.na(botw_id)
+  ) |>
+  collect() |>
+  mutate(
+    common_lwr = str_to_lower(common_name_dataset) |> str_trim()
+  ) # 39
+
+d2 <- d |> # names()
+  left_join(
+    tbl(con_spp, "botw_vernacular") |>
+      mutate(
+        common_lwr = str_to_lower(vernacularName) |> str_trim()
+      ) |>
+      filter(common_lwr %in% d$common_lwr) |>
+      select(
+        botw_id_new = taxonID,
+        common_lwr
+      ) |>
+      collect(),
+    by = join_by(common_lwr)
+  ) |>
+  filter(!is.na(botw_id_new)) |>
+  select(sp_key, botw_id, botw_id_new) # 4
+
+duckdb_register(con_sdm, "d2", d2)
+dbExecute(
+  con_sdm,
+  "UPDATE species
+    SET botw_id = d2.botw_id_new 
+    FROM d2
+    WHERE species.sp_key = d2.sp_key"
+) # 4
+duckdb_unregister(con_sdm, "d2")
+```
+
+### Match non-BL birds to BOTW by common name (accepted)
+
+```{r}
+#| label: birds_notbl_to_botwid_common_acc
+#| eval: !expr do_bird_botwid
+d <- tbl(con_sdm, "species") |>
+  filter(
+    sp_cat == "bird",
+    ds_key != "bl",
+    is.na(botw_id)
+  ) |>
+  collect() |>
+  mutate(
+    common_lwr = str_to_lower(common_name_accepted) |> str_trim()
+  ) # 35
+
+d2 <- d |> # names()
+  left_join(
+    tbl(con_spp, "botw_vernacular") |>
+      mutate(
+        common_lwr = str_to_lower(vernacularName) |> str_trim()
+      ) |>
+      filter(common_lwr %in% d$common_lwr) |>
+      select(
+        botw_id_new = taxonID,
+        common_lwr
+      ) |>
+      collect(),
+    by = join_by(common_lwr)
+  ) |>
+  filter(!is.na(botw_id_new)) |>
+  select(sp_key, botw_id, botw_id_new) # 5
+
+duckdb_register(con_sdm, "d2", d2)
+dbExecute(
+  con_sdm,
+  "UPDATE species
+    SET botw_id = d2.botw_id_new 
+    FROM d2
+    WHERE species.sp_key = d2.sp_key"
+) # 4
+duckdb_unregister(con_sdm, "d2")
+```
+
+### Match non-BL birds to BOTW by removing subspecies
+
+```{r}
+#| label: birds_notbl_to_botwid_rmsubsp
+#| eval: !expr do_bird_botwid
+d <- tbl(con_sdm, "species") |>
+  filter(
+    sp_cat == "bird",
+    ds_key != "bl",
+    is.na(botw_id)
+  ) |>
+  collect() |>
+  mutate(
+    genus = scientific_name_accepted |>
+      str_split_i("\\s", 1),
+    species = scientific_name_accepted |>
+      str_split_i("\\s", 2),
+    genus_species = glue("{genus} {species}")
+  )
+
+d2 <- d |> # names()
+  left_join(
+    tbl(con_spp, "botw") |>
+      filter(scientificName %in% d$genus_species) |>
+      select(
+        scientificName,
+        botw_id_new = acceptedNameUsageID,
+        botw_scientific_name = acceptedNameUsage
+      ) |>
+      collect(),
+    by = join_by(genus_species == scientificName)
+  ) |>
+  filter(!is.na(botw_id_new)) |>
+  select(sp_key, botw_id, botw_id_new) # 30
+
+duckdb_register(con_sdm, "d2", d2)
+dbExecute(
+  con_sdm,
+  "UPDATE species
+    SET botw_id = d2.botw_id_new 
+    FROM d2
+    WHERE species.sp_key = d2.sp_key"
+) # 62
+duckdb_unregister(con_sdm, "d2")
+
+# yay, all matched!
+stopifnot(
+  tbl(con_sdm, "species") |>
+    filter(
+      sp_cat == "bird",
+      is.na(botw_id)
+    ) |>
+    collect() |>
+    nrow() ==
+    0
+)
+```
+
+### Resolve duplicate BOTW IDs across bird datasets
+
+```{r}
+#| label: birds_botwid_ds_duplicates
+#| eval: !expr do_bird_botwid
+# birds, by dataset
+d_b <- tbl(con_sdm, "species") |>
+  filter(
+    sp_cat == "bird",
+    !is.na(botw_id)
+  ) |> # 674
+  left_join(
+    tbl(con_sdm, "model") |>
+      select(mdl_seq, taxa),
+    by = join_by(taxa)
+  ) |>
+  collect() |> # 674
+  group_by(botw_id) |>
+  mutate(
+    n_ds = n()
+  ) |>
+  ungroup()
+
+# pick sp_key from duplicate(ds_key, botw_id), all from rng_fws
+b_ds_dupes <- d_b |>
+  group_by(botw_id, ds_key) |>
+  summarize(
+    n = n(),
+    sp_key_1 = first(sp_key),
+    sp_key_2 = last(sp_key),
+    sp_sci_1 = first(scientific_name_accepted),
+    sp_sci_2 = last(scientific_name_accepted),
+    sp_cmn_1 = first(common_name_accepted),
+    sp_cmn_2 = last(common_name_accepted),
+    .groups = "drop"
+  ) |>
+  filter(n != 1)
+b_ds_dupes |>
+  select(-ds_key, -n)
+# A tibble: 5 × 7
+#    botw_id sp_key_1     sp_key_2     sp_sci_1                         sp_sci_2               sp_cmn_1 sp_cmn_2
+#      <dbl> <chr>        <chr>        <chr>                            <chr>                  <chr>    <chr>
+# 1 22684331 rng_fws:B06R rng_fws:B0FV Coccyzus americanus              Coccyzus americanus    yellow-… Yellow-…
+# 2 22689089 rng_fws:B08B rng_fws:B08L Strix occidentalis caurina       Strix occidentalis oc… Norther… Califor…
+# 3 22692353 rng_fws:B09A rng_fws:B0OB Laterallus jamaicensis           Laterallus jamaicensi… black r… Eastern…
+# 4 22721123 rng_fws:B0NI rng_fws:B00Q Ammospiza maritima macgillivraii Ammospiza maritima mi… MacGill… Cape Sa…
+# 5 22731577 rng_fws:B04B rng_fws:B04A Rallus obsoletus levipes         Rallus obsoletus obso… Light-f… Califor…
+
+d_b <- bind_rows(
+  d_b |> #           d_b: 674 -> 666
+    filter(
+      botw_id %in% b_ds_dupes$botw_id,
+      sp_key %in% b_ds_dupes$sp_key_1
+    ), # rng_fws dupes:   5
+  d_b |>
+    filter(
+      !botw_id %in% b_ds_dupes$botw_id
+    )
+) #      notdupes: 661
+```
+
+### Pivot bird datasets by BOTW ID
+
+```{r}
+#| label: birds_botwid_ds_pivoted
+d_b_ds <- d_b |>
+  pivot_wider(
+    id_cols = c(botw_id, n_ds),
+    names_from = ds_key,
+    values_from = mdl_seq
+  )
+
+d_b_ds |>
+  arrange(desc(n_ds), botw_id) |>
+  filter(n_ds > 1) |>
+  print(n = Inf)
+# A tibble: 49 × 6
+#      botw_id  n_ds rng_fws    bl ch_fws am_0.05
+#        <dbl> <int>   <int> <int>  <int>   <int>
+#  1  22680412     3   18405 18012  18310      NA
+#  2  22680415     3   18390 17929  18307      NA
+#  3  22684331     3   18346    NA     NA      NA
+#  4  22689089     3   18409    NA     NA      NA
+#  5  22692353     3   18374    NA     NA      NA
+#  6  22693363     3   18340 17648  18290      NA
+#  7  22693811     3   18343 17678  18292      NA
+#  8  22694870     3   18336 17626  18289      NA
+#  9  22705959     3   18348 17705  18295      NA
+# 10  22717434     3   18356 17728  18300      NA
+# 11  22725033     3   18344 17680  18293      NA
+# 12  22678620     2   18378 17846     NA      NA
+# 13  22680199     2   18330 17583     NA      NA
+# 14  22681158     2   18352 17826     NA      NA
+# 15  22686259     2   18323 17576     NA      NA
+# 16  22689809     2   18332 17596     NA      NA
+# 17  22691410     2   18396 17967     NA      NA
+# 18  22692705     2   18391 18085     NA      NA
+# 19  22692920     2   18360 17755     NA      NA
+# 20  22693182     2   18384 17875     NA      NA
+# 21  22694455     2   18421 17810     NA      NA
+# 22  22694601     2   18407 18159     NA      NA
+# 23  22694673     2   18408 18032     NA      NA
+# 24  22694875     2   18335 17625     NA      NA
+# 25  22695144     2   18370 17783     NA      NA
+# 26  22695891     2   18338 17639     NA      NA
+# 27  22695929     2   18339 17640     NA      NA
+# 28  22696060     2   18334 17600     NA      NA
+# 29  22696694     2      NA 18038     NA   10651
+# 30  22698017     2   18395 17962     NA      NA
+# 31  22698088     2   18393 17947     NA      NA
+# 32  22698092     2   18394 17953     NA      NA
+# 33  22698335     2   18388 17915     NA      NA
+# 34  22699848     2   18353    NA  18298      NA
+# 35  22703868     2   18382 17869     NA      NA
+# 36  22711585     2   18389    NA  18306      NA
+# 37  22714047     2   18420    NA  18315      NA
+# 38  22721123     2   18326    NA     NA      NA
+# 39  22721618     2   18417 18076     NA      NA
+# 40  22724209     2   18322    NA  18288      NA
+# 41  22725862     2   18414    NA  18312      NA
+# 42  22727969     2   18371 18139     NA      NA
+# 43  22731577     2   18398    NA     NA      NA
+# 44  22733989     2   18387 17904     NA      NA
+# 45  22734130     2   18316 17556     NA      NA
+# 46  62101215     2   18411 18041     NA      NA
+# 47  62120280     2   18363 17761     NA      NA
+# 48 132341128     2   18372 18260     NA      NA
+# 49 132467692     2   18397 18274     NA      NA
+
+# NEW: A tibble: 49 × 7
+#      botw_id  n_ds rng_fws    bl ch_fws ms_merge am_0.05
+#        <dbl> <int>   <int> <int>  <int>    <int>   <int>
+#  1  22680412     4   18405 18012  18310    18430      NA
+#  2  22680415     4   18390 17929  18307    18431      NA
+#  3  22684331     4   18346    NA     NA       NA      NA
+#  4  22689089     4   18409    NA     NA       NA      NA
+#  5  22692353     4   18374    NA     NA       NA      NA
+#  6  22693363     4   18340 17648  18290    18435      NA
+#  7  22693811     4   18343 17678  18292    18436      NA
+#  8  22694870     4   18336 17626  18289    18437      NA
+#  9  22705959     4   18348 17705  18295    18438      NA
+# 10  22717434     4   18356 17728  18300    18439      NA
+# 11  22725033     4   18344 17680  18293    18440      NA
+# 12  22678620     3   18378 17846     NA    18475      NA
+# 13  22680199     3   18330 17583     NA    18476      NA
+# 14  22681158     3   18352 17826     NA    18477      NA
+# 15  22686259     3   18323 17576     NA    18478      NA
+# 16  22689809     3   18332 17596     NA    18479      NA
+# 17  22691410     3   18396 17967     NA    18480      NA
+# 18  22692705     3   18391 18085     NA    18481      NA
+# 19  22692920     3   18360 17755     NA    18482      NA
+# 20  22693182     3   18384 17875     NA    18483      NA
+# 21  22694455     3   18421 17810     NA    18484      NA
+# 22  22694601     3   18407 18159     NA    18485      NA
+# 23  22694673     3   18408 18032     NA    18486      NA
+# 24  22694875     3   18335 17625     NA    18487      NA
+# 25  22695144     3   18370 17783     NA    18488      NA
+# 26  22695891     3   18338 17639     NA    18489      NA
+# 27  22695929     3   18339 17640     NA    18490      NA
+# 28  22696060     3   18334 17600     NA    18491      NA
+# 29  22696694     3      NA 18038     NA    18492   10651
+# 30  22698017     3   18395 17962     NA    18493      NA
+# 31  22698088     3   18393 17947     NA    18494      NA
+# 32  22698092     3   18394 17953     NA    18495      NA
+# 33  22698335     3   18388 17915     NA    18496      NA
+# 34  22699848     3   18353    NA  18298    18497      NA
+# 35  22703868     3   18382 17869     NA    18498      NA
+# 36  22711585     3   18389    NA  18306    18499      NA
+# 37  22714047     3   18420    NA  18315    18500      NA
+# 38  22721123     3   18326    NA     NA       NA      NA
+# 39  22721618     3   18417 18076     NA    18502      NA
+# 40  22724209     3   18322    NA  18288    18503      NA
+# 41  22725862     3   18414    NA  18312    18504      NA
+# 42  22727969     3   18371 18139     NA    18505      NA
+# 43  22731577     3   18398    NA     NA       NA      NA
+# 44  22733989     3   18387 17904     NA    18507      NA
+# 45  22734130     3   18316 17556     NA    18508      NA
+# 46  62101215     3   18411 18041     NA    18509      NA
+# 47  62120280     3   18363 17761     NA    18510      NA
+# 48 132341128     3   18372 18260     NA    18511      NA
+# 49 132467692     3   18397 18274     NA    18512      NA
+```
+
+## Build Taxon Table
+
+### Bind birds + non-birds into unified taxon table
+
+```{r}
+#| label: bind_birds_notbirds_ds
+#| eval: !expr do_build_taxon
+setdiff(names(d_nb_ds), names(d_b_ds)) # "worms_id" "ch_nmfs"
+setdiff(names(d_b_ds), names(d_nb_ds)) # "botw_id"  "bl"
+
+d_nb_cat <- tbl(con_sdm, "species") |>
+  filter(
+    !is.na(sp_cat),
+    sp_cat != "bird"
+  ) |>
+  distinct(worms_id, sp_cat) |>
+  collect()
+
+d_taxon <- bind_rows(
+  d_nb_ds |> # 16,947 × 6
+    rename(
+      taxon_id = worms_id
+    ) |>
+    mutate(
+      taxon_authority = "worms"
+    ) |>
+    left_join(
+      d_nb_cat,
+      by = join_by(taxon_id == worms_id)
+    ),
+  d_b_ds |> #    614 × 6
+    rename(
+      taxon_id = botw_id
+    ) |>
+    mutate(
+      taxon_authority = "botw",
+      sp_cat = "bird"
+    )
+) |>
+  relocate(taxon_id, taxon_authority) # 17,561 × 8
+
+# check if taxon_id is unique, ie botw_id not clashing with worms_id
+stopifnot(sum(duplicated(d_taxon$taxon_id)) == 0)
+
+# assign mdl_seq for taxon with one dataset
+d_taxon <- bind_rows(
+  # 17,561 × 8 -> 9
+  d_taxon |>
+    filter(n_ds == 1) |>
+    mutate(
+      mdl_seq = coalesce(
+        am_0.05,
+        ch_nmfs,
+        ch_fws,
+        rng_fws,
+        bl
+      )
+    ), # 17,470
+  d_taxon |>
+    filter(n_ds > 1)
+) #     91
+```
+
+### Add scientific names from WoRMS
+
+```{r}
+#| label: notbirds_worms_sci
+#| eval: !expr do_build_taxon
+d <- d_taxon |>
+  filter(
+    taxon_authority == "worms"
+  ) |> # 16,947
+  select(taxon_id)
+
+d <- d |>
+  left_join(
+    tbl(con_spp, "worms") |>
+      filter(taxonID %in% d$taxon_id) |>
+      mutate(
+        scientific_name = coalesce(acceptedNameUsage, scientificName)
+      ) |>
+      select(
+        taxon_id = taxonID,
+        scientific_name
+      ) |>
+      collect(),
+    by = join_by(taxon_id)
+  )
+
+stopifnot(sum(is.na(d$scientific_name)) == 0)
+
+d_taxon <- bind_rows(
+  d_taxon |>
+    filter(taxon_authority == "worms") |>
+    left_join(
+      d,
+      by = join_by(taxon_id)
+    ),
+  d_taxon |>
+    filter(taxon_authority != "worms")
+)
+```
+
+### Add scientific names from BOTW
+
+```{r}
+#| label: birds_botw_sci
+#| eval: !expr do_build_taxon
+d <- d_taxon |>
+  filter(
+    taxon_authority == "botw"
+  ) |> # 16,947
+  select(taxon_id)
+
+d <- d |>
+  left_join(
+    tbl(con_spp, "botw") |>
+      filter(taxonID %in% d$taxon_id) |>
+      select(
+        taxon_id = taxonID,
+        scientific_name = scientificName
+      ) |>
+      collect(),
+    by = join_by(taxon_id)
+  )
+
+stopifnot(sum(is.na(d$scientific_name)) == 0)
+
+d_taxon <- bind_rows(
+  d_taxon |>
+    filter(taxon_authority == "botw") |>
+    select(-scientific_name) |>
+    left_join(
+      d,
+      by = join_by(taxon_id)
+    ),
+  d_taxon |>
+    filter(taxon_authority != "botw")
+)
+```
+
+### Add common names from BOTW
+
+```{r}
+#| label: birds_cmn
+#| eval: !expr do_build_taxon
+d <- d_taxon |>
+  filter(
+    taxon_authority == "botw"
+  ) |> # 614
+  select(taxon_id)
+
+d <- d |>
+  left_join(
+    tbl(con_spp, "botw_vernacular") |>
+      filter(taxonID %in% d$taxon_id) |>
+      select(
+        taxon_id = taxonID,
+        common_name = vernacularName,
+        isPreferredName
+      ) |>
+      collect(),
+    by = join_by(taxon_id)
+  ) |>
+  slice_max(
+    by = taxon_id,
+    order_by = isPreferredName,
+    with_ties = F
+  ) |>
+  select(-isPreferredName)
+
+stopifnot(sum(is.na(d$common_name)) == 0)
+# yay, all bird common names matched!
+
+d_taxon <- bind_rows(
+  d_taxon |>
+    filter(taxon_authority == "botw") |>
+    # select(-scientific_name) |>
+    left_join(
+      d,
+      by = join_by(taxon_id)
+    ),
+  d_taxon |>
+    filter(taxon_authority != "botw")
+)
+```
+
+### Add common names from WoRMS + species fallbacks
+
+```{r}
+#| label: notbirds_cmn
+#| eval: !expr do_build_taxon
+d <- d_taxon |>
+  filter(
+    taxon_authority == "worms"
+  ) |>
+  select(taxon_id) # 16,947 x 1
+
+# worms_vernacular ----
+d <- d |>
+  left_join(
+    tbl(con_spp, "worms_vernacular") |>
+      filter(
+        taxonID %in% d$taxon_id,
+        language == "ENG"
+      ) |>
+      select(
+        taxon_id = taxonID,
+        common_name = vernacularName,
+        isPreferredName
+      ) |>
+      collect(),
+    by = join_by(taxon_id)
+  ) |>
+  slice_max(
+    by = taxon_id,
+    order_by = isPreferredName,
+    with_ties = F
+  ) |>
+  select(-isPreferredName) # 16,947 x 2
+
+# TODO: worms_vernacular order_by  = isPreferredName, has_source
+# eg "hump" chosen, not "humpback whale"
+#   taxonID vernacularName  source                                   language isPreferredName
+#     <int> <chr>           <chr>                                    <chr>              <dbl>
+# 1  137092 hump            NA                                       ENG                    0
+# 2  137092 hunch           NA                                       ENG                    0
+# 3  137092 bunch whale     NA                                       ENG                    0
+# 4  137092 humpback whale  North-West Atlantic Ocean species (NWAR… ENG                    0
+# 5  137092 hunchback whale NA                                       ENG                    0
+
+# table(is.na(d$common_name))
+# FALSE  TRUE
+#  5594 11353
+# so 11,353 still without common name
+
+# species.common_name_accepted ----
+w2 <- d |>
+  filter(is.na(common_name)) |>
+  pull(taxon_id)
+
+d2 <- tbl(con_sdm, "species") |>
+  filter(
+    worms_id %in% w2,
+    !is.na(common_name_accepted)
+  ) |>
+  select(
+    taxon_id = worms_id,
+    common_name = common_name_accepted
+  ) |>
+  collect() |>
+  mutate(
+    # src       = "species.common_name_accepted",
+    has_comma = str_detect(common_name, ",")
+  ) |>
+  filter(!is.na(common_name)) |>
+  arrange(taxon_id, has_comma, common_name) |>
+  slice_min(
+    by = taxon_id,
+    order_by = has_comma,
+    with_ties = F
+  ) |> # 16
+  select(-has_comma)
+
+d <- bind_rows(
+  d |>
+    filter(!taxon_id %in% d2$taxon_id),
+  d2
+)
+
+# table(is.na(d$common_name))
+# FALSE  TRUE
+#  5610 11337
+# so 11,337 still without common name
+
+# species.common_name_dataset ----
+w3 <- d |>
+  filter(is.na(common_name)) |>
+  pull(taxon_id)
+
+d3 <- tbl(con_sdm, "species") |>
+  filter(
+    worms_id %in% w3,
+    !is.na(common_name_dataset)
+  ) |>
+  select(
+    taxon_id = worms_id,
+    common_name = common_name_dataset
+  ) |>
+  collect() |>
+  mutate(
+    # src       = "species.common_name_accepted",
+    has_comma = str_detect(common_name, ",")
+  ) |>
+  filter(!is.na(common_name)) |>
+  arrange(taxon_id, has_comma, common_name) |>
+  slice_min(
+    by = taxon_id,
+    order_by = has_comma,
+    with_ties = F
+  ) |> # 16
+  select(-has_comma)
+
+d <- bind_rows(
+  d |>
+    filter(!taxon_id %in% d3$taxon_id),
+  d3
+)
+
+# table(is.na(d$common_name))
+# FALSE  TRUE
+# 10579  6368
+# so 6,368 still without common name
+
+d_taxon <- bind_rows(
+  d_taxon |>
+    filter(taxon_authority == "worms") |>
+    select(-common_name) |>
+    left_join(
+      d,
+      by = join_by(taxon_id)
+    ),
+  d_taxon |>
+    filter(taxon_authority != "worms")
+)
+```
+
+### Write taxon + taxon_model tables to DB
+
+```{r}
+#| label: taxon_to_db
+#| eval: !expr do_build_taxon
+# skim(d_taxon)
+# ── Data Summary ────────────────────────
+#                            Values
+# Name                       d_taxon
+# Number of rows             17561
+# Number of columns          12
+# _______________________
+# Column type frequency:
+#   character                4
+#   numeric                  8
+# ________________________
+# Group variables            None
+#
+# ── Variable type: character ──────────────────────────────────────────────────────
+#   skim_variable   n_missing complete_rate min max empty n_unique whitespace
+# 1 taxon_authority         0         1       4   5     0        2          0
+# 2 sp_cat                  0         1       4  12     0        7          0
+# 3 scientific_name         0         1       6  45     0    17561          0
+# 4 common_name          6368         0.637   3 102     0    10955          0
+#
+# ── Variable type: numeric ────────────────────────────────────────────────────────
+#   skim_variable n_missing complete_rate       mean           sd     p0     p25
+# 1 taxon_id              0       1       1399372.   7630567.     100599 210492
+# 2 n_ds                  0       1             1.01       0.0990      1      1
+# 3 am_0.05             626       0.964      8780.      5080.          1   4372.
+# 4 ch_nmfs           17528       0.00188   18230.         9.86    18213  18222
+# 5 ch_fws            17533       0.00159   18301.         8.45    18287  18294.
+# 6 rng_fws           17460       0.00575   18368.        30.7     18316  18342
+# 7 bl                16990       0.0325    17869.       195.      17554  17704.
+# 8 mdl_seq              91       0.995      9088.      5252.          1   4537.
+#       p50     p75      p100 hist
+# 1 276334  420043  230027154 ▇▁▁▁▁
+# 2      1       1          4 ▇▁▁▁▁
+# 3   8804   13160.     17550 ▇▇▇▇▇
+# 4  18230   18238      18246 ▇▇▇▇▇
+# 5  18300.  18307.     18315 ▇▇▇▇▇
+# 6  18368   18394      18421 ▇▇▇▇▇
+# 7  17860   18014.     18284 ▇▇▇▆▃
+# 8   9114.  13616.     18419 ▇▇▇▇▇
+
+# create taxon_model junction table ----
+ds_keys <- tbl(con_sdm, "dataset") |>
+  filter(!ds_key %in% c("ms_merge")) |>
+  pull(ds_key)
+d_taxon_model <- d_taxon |>
+  select(taxon_id, any_of(ds_keys)) |>
+  pivot_longer(
+    -taxon_id,
+    names_to = "ds_key",
+    values_to = "mdl_seq"
+  ) |>
+  filter(!is.na(mdl_seq))
+
+if (dbExistsTable(con_sdm, "taxon_model")) {
+  dbExecute(con_sdm, "DROP TABLE taxon_model")
+}
+dbWriteTable(con_sdm, "taxon_model", d_taxon_model, overwrite = TRUE)
+dbExecute(
+  con_sdm,
+  "CREATE UNIQUE INDEX idx_taxon_model_tid_dskey ON taxon_model(taxon_id, ds_key)"
+)
+message(glue("taxon_model: {nrow(d_taxon_model)} rows"))
+# taxon_model: 19157 rows
+
+# write taxon table without per-dataset columns ----
+d_taxon_clean <- d_taxon |>
+  select(-any_of(ds_keys))
+
+if (dbExistsTable(con_sdm, "taxon")) {
+  dbExecute(con_sdm, "DELETE FROM taxon")
+}
+
+dbWriteTable(con_sdm, "taxon", d_taxon_clean, append = F, overwrite = T)
+
+# add worms_id column (= taxon_id for non-birds, NA for birds)
+dbExecute(
+  con_sdm,
+  "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS worms_id INTEGER"
+)
+dbExecute(
+  con_sdm,
+  "UPDATE taxon SET worms_id = taxon_id WHERE taxon_authority = 'worms'"
+)
+```
+
+## Reclassify Turtles vs Reptiles in taxon Table
+
+### Reclassify turtles/sea snakes in taxon
+
+```{r}
+#| label: reclassify_turtles_reptiles
+#| eval: !expr do_reclassify
+
+# reclassify reptiles: turtles → sp_cat = "turtle"; sea snakes → excluded
+d_turtles_0 <- tbl(con_sdm, "taxon") |>
+  filter(sp_cat == "turtle") |>
+  select(taxon_id, common_name, scientific_name, is_ok) |>
+  collect()
+message(glue(
+  "Found {nrow(d_turtles_0)} turtle records in taxon (initially; sp_cat = 'turtle')"
+))
+
+d_reptiles <- tbl(con_sdm, "taxon") |>
+  filter(is_ok, sp_cat == "reptile") |>
+  select(taxon_id, common_name, scientific_name, is_ok) |>
+  collect()
+message(glue(
+  "Found {nrow(d_reptiles)} reptile records in accepted taxon (sp_cat = 'reptile', is_ok = TRUE)"
+))
+
+d_turtles <- d_reptiles |>
+  filter(scientific_name %in% sci_turtles)
+message(glue("  - Turtles (to convert from reptile): {nrow(d_turtles)}"))
+
+d_non_turtles <- d_reptiles |>
+  filter(!scientific_name %in% d_turtles$scientific_name)
+message(glue("  - Non-turtles (sea snakes, alligator): {nrow(d_non_turtles)}"))
+
+# turtles -> sp_cat = "turtle"
+if (nrow(d_turtles) > 0) {
+  turtle_ids <- paste(d_turtles$taxon_id, collapse = ", ")
+  dbExecute(
+    con_sdm,
+    glue("UPDATE taxon SET sp_cat = 'turtle' WHERE taxon_id IN ({turtle_ids})")
+  )
+  message(glue("Updated {nrow(d_turtles)} turtles to sp_cat = 'turtle'"))
+}
+
+# sea snakes -> is_ok = FALSE, sp_cat = NULL
+if (nrow(d_non_turtles) > 0) {
+  non_turtle_ids <- paste(d_non_turtles$taxon_id, collapse = ", ")
+  dbExecute(
+    con_sdm,
+    glue(
+      "UPDATE taxon SET is_ok = FALSE WHERE taxon_id IN ({non_turtle_ids})"
+    )
+  )
+  message(glue(
+    "Excluded {nrow(d_non_turtles)} sea snakes/alligator (is_ok = FALSE)"
+  ))
+}
+
+# verify: no "reptile" sp_cat should remain in taxon
+stopifnot(
+  tbl(con_sdm, "taxon") |>
+    filter(is_ok, sp_cat == "reptile") |>
+    count() |>
+    pull(n) ==
+    0
+)
+
+tmp_taxon_csv <- here("data/tmp_taxon.csv")
+tbl(con_sdm, "taxon") |>
+  collect() |>
+  write_csv(tmp_taxon_csv)
+```
+
+## Add Redlist and Listing Data to Taxon
+
+### Add redlist_code to taxon
+
+```{r}
+#| label: taxon_redlist_code
+#| eval: !expr do_redlist_listing
+d <- tbl(con_sdm, "taxon") |>
+  mutate(
+    worms_id = ifelse(taxon_authority == "worms", taxon_id, NA_integer_),
+    botw_id = ifelse(taxon_authority == "botw", taxon_id, NA_integer_)
+  ) |>
+  select(taxon_id, taxon_authority, worms_id, botw_id) |>
+  collect()
+
+d_b <- d |>
+  filter(
+    taxon_authority == "botw",
+    !is.na(botw_id)
+  ) |>
+  select(-worms_id) |>
+  left_join(
+    tbl(con_sdm, "species") |>
+      filter(
+        sp_cat == "bird",
+        !is.na(botw_id),
+        !is.na(redlist_code)
+      ) |>
+      select(botw_id, redlist_code) |>
+      collect(),
+    by = join_by(botw_id)
+  ) |>
+  collect() |>
+  mutate(
+    rl_fct = factor(
+      redlist_code,
+      levels = c("EX", "DD", "LC", "NT", "TN", "VU", "EN", "CR"),
+      ordered = T
+    )
+  ) |> # 674 × 5
+  arrange(taxon_id, rl_fct) |>
+  group_by(taxon_id) |>
+  summarize(
+    # n_rl         = n(),
+    rl_max = max(rl_fct) |> as.character(),
+    # redlist_code = paste(redlist_code, collapse = ', '),
+    .groups = "drop"
+  ) # |>  # 614 × 2
+# arrange(desc(n_rl))
+
+d_w <- d |>
+  filter(
+    taxon_authority == "worms",
+    !is.na(worms_id)
+  ) |>
+  select(-botw_id) |>
+  left_join(
+    tbl(con_sdm, "species") |>
+      filter(
+        sp_cat != "bird",
+        !is.na(worms_id),
+        !is.na(redlist_code)
+      ) |>
+      select(worms_id, redlist_code) |>
+      collect(),
+    by = join_by(worms_id)
+  ) |>
+  collect() |>
+  mutate(
+    rl_fct = factor(
+      redlist_code,
+      levels = c("EX", "DD", "LC", "NT", "TN", "VU", "EN", "CR"),
+      ordered = T
+    )
+  ) |> # 674 × 5
+  arrange(taxon_id, rl_fct) |>
+  group_by(taxon_id) |>
+  summarize(
+    # n_rl         = n(),
+    rl_max = max(rl_fct) |> as.character(),
+    # redlist_code = paste(redlist_code, collapse = ', '),
+    .groups = "drop"
+  ) # |>  # 614 × 2
+# arrange(desc(n_rl))
+
+d2 <- bind_rows(
+  d_b,
+  d_w
+) |>
+  filter(!is.na(rl_max)) |>
+  select(taxon_id, redlist_code = rl_max)
+
+dbExecute(
+  con_sdm,
+  "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS redlist_code VARCHAR"
+)
+
+duckdb_register(con_sdm, "d2", d2)
+dbExecute(
+  con_sdm,
+  "UPDATE taxon
+    SET redlist_code = d2.redlist_code
+    FROM d2
+    WHERE taxon.taxon_id = d2.taxon_id"
+) # OLD: 7,083; NEW: 7139
+duckdb_unregister(con_sdm, "d2")
+```
+
+### Join listing data (extrisk_code, er_score)
+
+LEFT JOIN the `listing` staging table (from `ingest_nmfs-fws-mmpa-mbta-listings.qmd`)
+onto `taxon`. For unmatched taxa, fall back to IUCN `redlist_code`.
+
+```{r}
+#| label: taxon_listing_join
+#| eval: !expr do_redlist_listing
+
+# add new columns for extrisk_code, er_score, is_mmpa, is_mbta, is_bcc
+for (col_sql in c(
+  "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS extrisk_code VARCHAR",
+  "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS er_score INTEGER",
+  "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS is_mmpa BOOLEAN DEFAULT FALSE",
+  "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS is_mbta BOOLEAN DEFAULT FALSE",
+  "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS is_bcc BOOLEAN DEFAULT FALSE"
+)) {
+  dbExecute(con_sdm, col_sql)
+}
+
+# join listing by worms_id (covers both worms and botw taxa via worms_id)
+if (dbExistsTable(con_sdm, "listing")) {
+  dbExecute(
+    con_sdm,
+    "UPDATE taxon SET
+      extrisk_code = l.extrisk_code,
+      er_score     = l.er_score,
+      is_mmpa      = l.is_mmpa,
+      is_mbta      = l.is_mbta,
+      is_bcc       = l.is_bcc
+    FROM listing l
+    WHERE taxon.worms_id = l.worms_id"
+  )
+
+  n_worms <- dbGetQuery(
+    con_sdm,
+    "SELECT count(*) AS n FROM taxon WHERE extrisk_code IS NOT NULL"
+  )$n
+  message(glue("Listing joined by worms_id: {n_worms} taxa"))
+
+  # secondary: join by botw_id for BOTW-only birds not matched above
+  dbExecute(
+    con_sdm,
+    "UPDATE taxon SET
+      extrisk_code = l.extrisk_code,
+      er_score     = l.er_score,
+      is_mmpa      = l.is_mmpa,
+      is_mbta      = l.is_mbta,
+      is_bcc       = l.is_bcc
+    FROM listing l
+    WHERE taxon.taxon_authority = 'botw'
+      AND taxon.taxon_id = l.botw_id
+      AND taxon.extrisk_code IS NULL"
+  )
+
+  n_total <- dbGetQuery(
+    con_sdm,
+    "SELECT count(*) AS n FROM taxon WHERE extrisk_code IS NOT NULL"
+  )$n
+  message(glue(
+    "Listing joined by botw_id: {n_total - n_worms} additional taxa"
+  ))
+  message(glue("Total with US extrisk_code: {n_total} taxa"))
+} else {
+  message("No listing table found; skipping listing join")
+}
+
+# IUCN fallback for unmatched taxa
+dbExecute(
+  con_sdm,
+  "UPDATE taxon SET
+    extrisk_code = 'IUCN:' || redlist_code,
+    er_score     = CASE redlist_code
+      WHEN 'CR' THEN 50
+      WHEN 'EN' THEN 25
+      WHEN 'VU' THEN 5
+      WHEN 'NT' THEN 2
+      ELSE 1 END
+  WHERE extrisk_code IS NULL AND redlist_code IS NOT NULL"
+)
+
+# default for taxa with no listing and no redlist_code
+dbExecute(
+  con_sdm,
+  "UPDATE taxon SET
+    er_score = 1
+  WHERE er_score IS NULL"
+)
+
+# summary
+tbl(con_sdm, "taxon") |>
+  mutate(
+    authority = case_when(
+      str_starts(extrisk_code, "NMFS") ~ "NMFS",
+      str_starts(extrisk_code, "FWS") ~ "FWS",
+      str_starts(extrisk_code, "IUCN") ~ "IUCN",
+      TRUE ~ "none"
+    )
+  ) |>
+  count(authority) |>
+  collect()
+# # A tibble: 4 × 2
+#   authority      n
+#   <chr>      <dbl>
+# 1 NMFS         234
+# 2 IUCN       6,701
+# 3 FWS          252
+# 4 none      10,374
+```
+
+### Add worms_id for birds in taxon
+
+```{r}
+#| label: taxon_worms_id_inclbirds
+#| eval: !expr do_redlist_listing
+d <- tbl(con_sdm, "taxon") |>
+  mutate(
+    worms_id = ifelse(taxon_authority == "worms", taxon_id, NA_integer_),
+    botw_id = ifelse(taxon_authority == "botw", taxon_id, NA_integer_)
+  ) |>
+  select(taxon_id, taxon_authority, worms_id, botw_id) |>
+  collect() # 17,561 × 4
+
+d_b <- d |>
+  filter(
+    taxon_authority == "botw",
+    !is.na(botw_id)
+  ) |>
+  select(-worms_id) |>
+  left_join(
+    tbl(con_sdm, "species") |>
+      filter(
+        sp_cat == "bird",
+        !is.na(worms_id)
+      ) |>
+      select(botw_id, worms_id) |>
+      collect() |>
+      group_by(botw_id) |>
+      summarize(
+        worms_id = first(worms_id)
+      ),
+    by = join_by(botw_id)
+  ) |>
+  filter(!is.na(worms_id)) |>
+  select(taxon_id, worms_id)
+
+d_w <- d |>
+  filter(
+    taxon_authority == "worms",
+    !is.na(worms_id)
+  ) |>
+  select(taxon_id, worms_id)
+
+d2 <- bind_rows(
+  d_b,
+  d_w
+) |>
+  select(taxon_id, worms_id)
+
+stopifnot(sum(duplicated(d2$taxon_id)) == 0)
+
+dbExecute(con_sdm, "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS worms_id BIGINT")
+
+duckdb_register(con_sdm, "d2", d2)
+dbExecute(
+  con_sdm,
+  "UPDATE taxon
+    SET worms_id  = d2.worms_id
+    FROM d2
+    WHERE taxon.taxon_id = d2.taxon_id"
+) # OLD: 17,352; NEW: 17353
+duckdb_unregister(con_sdm, "d2")
+```
+
+### Add marine/extinct flags to taxon
+
+```{r}
+#| label: taxon_is_marine
+#| eval: !expr do_redlist_listing
+d <- tbl(con_sdm, "taxon") |>
+  mutate(
+    worms_id = ifelse(taxon_authority == "worms", taxon_id, NA_integer_),
+    botw_id = ifelse(taxon_authority == "botw", taxon_id, NA_integer_)
+  ) |>
+  select(taxon_id, taxon_authority, worms_id, botw_id) |>
+  collect() # 17,561 × 4
+
+d_b <- d |>
+  filter(
+    taxon_authority == "botw",
+    !is.na(botw_id)
+  ) |>
+  select(-worms_id) |>
+  left_join(
+    tbl(con_sdm, "species") |>
+      filter(
+        sp_cat == "bird",
+        !is.na(worms_id)
+      ) |>
+      select(botw_id, worms_id) |>
+      collect() |>
+      group_by(botw_id) |>
+      summarize(
+        worms_id = first(worms_id)
+      ),
+    by = join_by(botw_id)
+  ) |>
+  filter(!is.na(worms_id))
+
+d_b <- d_b |>
+  left_join(
+    tbl(con_spp, "worms") |>
+      filter(
+        taxonID %in% d_b$worms_id,
+        !is.na(isMarine) | !is.na(isExtinct)
+      ) |>
+      select(
+        worms_id = taxonID,
+        worms_is_marine = isMarine,
+        worms_is_extinct = isExtinct
+      ) |>
+      collect(),
+    by = join_by(worms_id)
+  ) |>
+  collect() # 405 × 6
+
+d_w <- d |>
+  filter(
+    taxon_authority == "worms",
+    !is.na(worms_id)
+  ) |>
+  select(-botw_id)
+
+d_w <- d_w |>
+  left_join(
+    tbl(con_spp, "worms") |>
+      filter(
+        taxonID %in% d_w$worms_id,
+        !is.na(isMarine) | !is.na(isExtinct)
+      ) |>
+      select(
+        worms_id = taxonID,
+        worms_is_marine = isMarine,
+        worms_is_extinct = isExtinct
+      ) |>
+      collect(),
+    by = join_by(worms_id)
+  ) |>
+  collect() # OLD: 16,947 × 5 -> NEW: 16,947 × 5
+
+d2 <- bind_rows(
+  d_b,
+  d_w
+) |>
+  select(taxon_id, worms_is_marine, worms_is_extinct)
+
+stopifnot(sum(duplicated(d2$taxon_id)) == 0)
+
+dbExecute(
+  con_sdm,
+  "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS worms_is_marine BOOLEAN"
+)
+dbExecute(
+  con_sdm,
+  "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS worms_is_extinct BOOLEAN"
+)
+
+duckdb_register(con_sdm, "d2", d2)
+dbExecute(
+  con_sdm,
+  "UPDATE taxon
+    SET worms_is_marine  = d2.worms_is_marine ,
+        worms_is_extinct = d2.worms_is_extinct 
+    FROM d2
+    WHERE taxon.taxon_id = d2.taxon_id"
+) # OLD: 17,352 -> NEW: 17,353
+duckdb_unregister(con_sdm, "d2")
+```
+
+## Get Species Lists: FWS, MMPA, MBTA
+
+- [FWS Species Data Explorer](https://ecos.fws.gov/ecp/report/adhocDocumentation?catalogId=species&reportId=species)\
+  Use the data explorer to construct custom queries into the REST-API. The explorer permits joining data, adding filters, sorting, and changing the export format type (e.g HTML, XML, JSON, or CSV).
+  - [ECOS: ECOS Data Service Documentation](https://ecos.fws.gov/ecp/report/adhocDocumentation?catalogId=species&reportId=species)
+
+- [FWS_Species_Data_Explorer - selected fields in form for csv](https://ecos.fws.gov/ecp/report/adhocCreator?catalogId=species&reportId=species&columns=%2Fspecies@cn,sn,status_category,status,listing_date,dps,is_bcc,alt_status,desc,agency,sid,id,vipcode,range_shapefile,species_last_updated;%2Fspecies%2Ftaxonomy@tsn,kingdom,group,spcode;%2Fspecies%2Fdelisting_info@delisting_date,delisting_reason;%2Fspecies%2Flife_history@habitat_reqs,reprod&sort=%2Fspecies@cn%20asc;%2Fspecies@sn%20asc&distinct=true)
+
+
+```{r}
+#| label: get_fws_spp_lists
+#| eval: !expr do_adhoc_fixes
+
+dir_fws_spp_old <- glue("{dir_data}/raw/fws.gov/species/old")
+
+# get all column names for *.csv in this dir
+flds <- character(0)
+# NOTE: dir_fws_spp is not defined here; see get_fws_spp_lists_2 below
+for (f in fs::dir_ls(dir_fws_spp, glob = "*.csv")) {
+  flds_f <- read_csv(f, n_max = 100) |> names()
+  flds <- c(flds_f, flds)
+}
+flds <- unique(flds) |> sort()
+#  [1] "Common Name"                      "Crithab Status"
+#  [3] "Critical Habitat Zipfile Url"     "Critical Habitat Zipfile Url_url"
+#  [5] "Delisting Date"                   "Delisting Reason"
+#  [7] "ECOS Species ID"                  "Entity Description"
+#  [9] "ESA Listing Date"                 "ESA Listing Status"
+# [11] "Habitat Requirements"             "Lead Agency"
+# [13] "Other Information"                "Proposed ESA Listing Status"
+# [15] "Publication Date"                 "Range Envelope"
+# [17] "Range Shapefile"                  "Range Shapefile Last Updated"
+# [19] "Range Shapefile_url"              "Recovery Priority Number"
+# [21] "Scientific Name"                  "Scientific Name_url"
+# [23] "SP Code"                          "Species Description"
+# [25] "Species Group"                    "Species Last Updated"
+# [27] "Species Population"               "Status Category"
+# [29] "Taxonomic Group"                  "Taxonomic Serial Number"
+# [31] "Taxonomic Serial Number_url"
+
+fws_spp_csv <- glue(
+  "{dir_data}/raw/fws.gov/species/FWS_Species_Data_Explorer.csv"
+)
+d_fws_spp <- read_csv(fws_spp_csv) |>
+  janitor::clean_names()
+
+# skimr::skim(d_fws_spp)
+# ── Data Summary ────────────────────────
+#                            Values
+# Name                       d_fws_spp
+# Number of rows             10998
+# Number of columns          26
+# _______________________
+# Column type frequency:
+#   character                20
+#   Date                     1
+#   logical                  2
+#   numeric                  3
+# ________________________
+# Group variables            None
+
+# ── Variable type: character ──────────────────────────────────────────────────────────────────────────────────────────────
+#    skim_variable               n_missing complete_rate min  max empty n_unique whitespace
+#  1 common_name                         0       1         3   61     0     8319          0
+#  2 scientific_name                     0       1         4  106     0    10726          0
+#  3 scientific_name_url                 0       1        34   38     0    10777          0
+#  4 status_category                   661       0.940     6   36     0        6          0
+#  5 esa_listing_status                  0       1         8   51     0       21          0
+#  6 esa_listing_date                 8391       0.237    10   10     0      705          0
+#  7 proposed_esa_listing_status     10975       0.00209   8   51     0        6          0
+#  8 entity_description               1066       0.903     2  937     0      349          0
+#  9 lead_agency                        37       0.997     3   12     0        3          0
+# 10 vip_code                            0       1         3    3     0       23          0
+# 11 range_shapefile                  3536       0.678    40   89     0     7462          0
+# 12 range_shapefile_url              3536       0.678    85  134     0     7462          0
+# 13 taxonomic_serial_number_url         0       1        80   86     0    10705          0
+# 14 taxonomic_kingdom                   0       1         5    7     0        3          0
+# 15 taxonomic_group                     0       1         5   24     0       21          0
+# 16 sp_code                             0       1         4    4     0    10777          0
+# 17 delisting_date                  10861       0.0125   10   10     0       91          0
+# 18 delisting_reason                10861       0.0125   21  130     0        6          0
+# 19 habitat_requirements            10085       0.0830   15 3862     0      869          0
+# 20 reproductive_strategy           10186       0.0738    7 3972     0      764          0
+
+# ── Variable type: Date ───────────────────────────────────────────────────────────────────────────────────────────────────
+#   skim_variable        n_missing complete_rate min        max        median     n_unique
+# 1 species_last_updated     10713        0.0259 2025-07-23 2026-02-03 2025-11-20       47
+
+# ── Variable type: logical ────────────────────────────────────────────────────────────────────────────────────────────────
+#   skim_variable               n_missing complete_rate   mean count
+# 1 distinct_population_segment         0             1 0.0188 FAL: 10791, TRU: 207
+# 2 is_bcc                              0             1 0.0292 FAL: 10677, TRU: 321
+
+# ── Variable type: numeric ────────────────────────────────────────────────────────────────────────────────────────────────
+#   skim_variable           n_missing complete_rate    mean      sd    p0    p25     p50     p75    p100 hist
+# 1 ecos_species_id                 0             1   5557.   3311.     1  2730.   5466.   8165.   13245 ▇▇▇▆▂
+# 2 ecos_listed_species_id          0             1   5849.   3602.     1  2784.   5586.   8389.   13796 ▇▇▇▅▃
+# 3 taxonomic_serial_number         0             1 303518. 310030. -2064 35190. 176612. 535326. 1262505 ▇▁▃▁▁
+
+# View(d_fws_spp)
+
+# table(d_fws_spp$taxonomic_group)
+#                Algae               Amphibians
+#                    9                      207
+#        Annelid Worms                Arachnids
+#                    2                      149
+#                Birds                    Clams
+#                 1060                      298
+#  Conifers and Cycads                   Corals
+#                   26                       71
+#          Crustaceans         Ferns and Allies
+#                  317                       99
+#               Fishes Flatworms and Roundworms
+#                  887                       10
+#     Flowering Plants                 Hydroids
+#                 4759                        1
+#              Insects                  Lichens
+#                 1243                       39
+#              Mammals               Millipedes
+#                  799                        6
+#             Reptiles                   Snails
+#                  326                      683
+#              Sponges
+#                    7
+
+taxonomic_groups_exclude <- c(
+  "Amphibians",
+  "Arachnids",
+  "Conifers and Cycads",
+  "Ferns and Allies",
+  "Flowering Plants",
+  "Insects",
+  "Lichens",
+  "Millipedes"
+)
+
+# d_fws_spp <- read_csv(fws_spp_csv) |> janitor::clean_names()
+d_fws_spp <- d_fws_spp |>
+# BUG: filter below keeps groups named 'exclude' rather than excluding them;
+# should probably be: filter(!taxonomic_group %in% taxonomic_groups_exclude)
+  filter(taxonomic_group %in% taxonomic_groups_exclude) |> # excludes: 6,528 of 10,998
+  mutate(
+    scientific_name_clean = scientific_name |>
+      str_remove_all("\\(=[^)]+\\)") |>
+      str_remove_all("\\s+ssp\\.$") |>
+      str_remove_all("\\s+sp\\.$") |>
+      str_remove_all("\\s+sp\\.\\s+#?\\d+") |>
+      str_remove_all("\\s+species$") |>
+      str_squish(),
+    itis_id = ifelse(taxonomic_serial_number < 0, NA, taxonomic_serial_number)
+  ) |>
+  mutate(
+    common_name = na_if(common_name, "No common name")
+  )
+
+d_itis_fws <- tbl(con_spp, "itis") |>
+  filter(taxonID %in% na.omit(d_fws_spp$itis_id))
+
+table(is.na(d_fws_spp$itis_id), useNA = "ifany")
+#  FALSE  TRUE
+#  6,037   491
+
+v_fws_itis <- unique(d_fws_spp$taxonomic_serial_number) # 10,705
+itis_ids <- tbl(con_spp, "itis") |>
+  filter(taxonID %in% d_fws_spp$taxonomic_serial_number) |>
+  pull(taxonID)
+length(itis_ids) # OLD: 9,818 -> NEW: 6,002
+itis_missing <- setdiff(v_fws_itis, itis_ids) # all negative values, eg: -1257   -97  -794  -683
+
+# d_fws_spp |>
+#   filter(taxonomic_serial_number %in% itis_missing) |>
+#   View()
+
+# match taxa with worms
+# d_fws_spp |>
+
+sci_paren <- tbl(con_spp, "itis") |>
+  collect() |>
+  filter(str_detect(scientificName, fixed(")"))) |>
+  pull(scientificName)
+
+# filter(taxonID %in% d_fws_spp$taxonomic_serial_number)
+
+# d_fws_spp |>
+#   filter(str_detect(scientific_name, fixed(")")))
+# A tibble: 20 × 28
+
+# left_join(
+#   tbl(con_spp, "worms") |>
+#     filter(scientificName %in% d_rast$scientific_name_clean) |>
+#     select(
+#       scientificName,
+#       worms_id = acceptedNameUsageID,
+#       scientific_name_worms = acceptedNameUsage,
+#       taxonomicStatus,
+#       worms_is_marine = isMarine,
+#       worms_is_extinct = isExtinct
+#     ) |>
+#     collect(),
+#   by = join_by(scientific_name_clean == scientificName)
+# )
+
+# tbl(con_spp, "worms")
+
+# NOTE: con_spp reconnected here, overwriting existing connection without disconnecting
+con_spp <- dbConnect(duckdb(dbdir = spp_db, read_only = T))
+# dbListTables(con_spp)
+# [1] "gbif"             "gbif_vernacular"  "itis"             "itis_vernacular"
+# [5] "iucn_redlist"     "iucn_vernacular"  "worms"            "worms_vernacular"
+
+```
+
+- `Is BCC?` (`is_bcc`): The 1988 amendment to the Fish and Wildlife Conservation Act mandates the FWS to "identify species, subspecies, and populations of all migratory nongame birds that, without additional conservation actions, are likely to become candidates for listing under the Endangered Species Act (ESA) of 1973." Birds of Conservation Concern (BCC) 2008 is the most recent effort to carry out this mandate.
+
+## Add IUCN Range Maps Dataset
+
+### Insert rng_iucn dataset row
+
+```{r}
+#| label: insert_rng_iucn_dataset_row
+#| eval: !expr do_iucn_insert
+ds_key <- "rng_iucn"
+row_dataset <- tibble(
+  ds_key = !!ds_key,
+  name_short = "IUCN Red List Range Maps, 2025-2",
+  name_original = "Digital Distribution Maps on The IUCN Red List of Threatened Species",
+  description = "This dataset contains distribution information on species assessed for The IUCN Red List of Threatened Species™. The maps are developed as part of a comprehensive assessment of global biodiversity in order to highlight taxa threatened with extinction, and thereby promote their conservation.",
+  citation = "IUCN Red List of Threatened Species. Version 2025-2. <www.iucnredlist.org>. Downloaded on 21 January 2026.",
+  source_broad = "IUCN",
+  source_detail = "https://www.iucnredlist.org/resources/spatial-data-download",
+  regions = "Global",
+  response_type = "binary",
+  taxa_groups = "all taxa (except birds)",
+  year_pub = 2025,
+  date_obs_beg = NA,
+  date_obs_end = NA,
+  date_env_beg = NA,
+  date_env_end = NA,
+  link_info = "https://www.iucnredlist.org/resources/spatial-data-download",
+  link_download = NA,
+  link_metadata = NA,
+  links_other = NA,
+  spatial_res_deg = 0.05,
+  temporal_res = "static"
+)
+
+if (dbExistsTable(con_sdm, "dataset")) {
+  dbExecute(con_sdm, glue("DELETE FROM dataset WHERE ds_key = '{ds_key}'"))
+}
+
+dbWriteTable(con_sdm, "dataset", row_dataset, append = TRUE)
+tbl(con_sdm, "dataset") |>
+  select(ds_key, name_short)
+#   ds_key   name_short
+#   <chr>    <chr>
+# 1 am_0.05  AquaMaps suitability for all marine taxa (except birds) globally, 2019
+# 2 bl       BirdLife Birds of the World, 2024
+# 3 ch_fws   FWS Critical Habitat for USA, 2025-05-05
+# 4 ch_nmfs  NMFS Critical Habitat for USA, 2025-05-12
+# 5 rng_fws  FWS Current Range Maps, 2025-07-23
+# 6 ms_merge Marine Sensitivity Merged Model
+# 7 rng_iucn IUCN Red List Range Maps, 2025-2
+```
+
+### Setup IUCN range processing
+
+```{r}
+#| label: setup_rng_iucn
+#| eval: !expr do_iucn_insert
+# TODO: add all IUCN range maps to spatial db table model_cell, not just matching; but then have to link taxon_id to IUCN id
+
+ds_key <- "rng_iucn"
+
+dir_iucn_raw <- glue("{dir_data}/raw/iucnredlist.org")
+dir_iucn_derived <- glue("{dir_data}/derived/iucnredlist.org")
+rng_shps <- list.files(
+  dir_iucn_raw,
+  pattern = "\\.shp$",
+  recursive = T,
+  full.names = T
+)
+flds_req <- c("sci_name", "marine", "yrcompiled", "category")
+default_cell_value <- 50L # TODO: redo based on IUCN categories? For now, only using as mask
+sf_use_s2(F) # prevent invalid geometries, eg MAMMALS_MARINE_ONLY | Skipping invalid geometries with sci_name: Balaena mysticetus, Balaenoptera musculus, Balaenoptera physalus, Eschrichtius robustus, Monodon monoceros, Phocoena phocoena, Delphinus delphis
+
+d_taxon <- tbl(con_sdm, "taxon") |> collect()
+
+r_cell <- rast(cell_tif, lyrs = "cell_id") # [   0, 360]
+r_cell_r <- rotate(r_cell) # [-180, 180]
+ext(r_cell) <- round(ext(r_cell), 3)
+ext(r_cell_r) <- round(ext(r_cell_r), 3)
+```
+
+### Extract IUCN range rasters
+
+```{r}
+#| label: extract_rng_iucn_models
+#| eval: !expr do_iucn_extract
+
+log_txt <- glue("{dir_iucn_derived}/_log {Sys.time()}.txt")
+log_appender(appender_file(log_txt))
+
+# this R loop took 6.2 hrs (with MARINEFISH duplicates): 2026-01-23 00:41 - 2026-01-22 18:30
+for (i in 1:length(rng_shps)) {
+  # i = 9 # EELS.shp # i = 9 # MAMMALS_MARINE_ONLY.shp
+  rng_shp <- rng_shps[i]
+  grp <- basename(rng_shp) |> str_replace_all("\\.shp$", "")
+  grp_gpkg <- glue("{dir_iucn_derived}/{grp}.gpkg")
+  grp_tif <- glue("{dir_iucn_derived}/{grp}.tif")
+
+  log_info("| INIT | {grp} | {i}/{length(rng_shps)}")
+
+  if (file.exists(grp_tif)) {
+    log_info("| SKIP | {grp} | tif already exists")
+    next
+  }
+
+  if (file.exists(grp_gpkg)) {
+    log_info("| INFO | {grp} | gpkg already exists")
+    x <- read_sf(grp_gpkg)
+  } else {
+    a <- read_sf(rng_shp)
+    # st_drop_geometry(a) |>
+    #   filter(sci_name == "Phoca vitulina") |>
+    #   View()
+    flds_notreq <- setdiff(flds_req, names(a))
+
+    # a |> st_drop_geometry() |> names()
+    # a |> st_drop_geometry() |> View()
+
+    if (length(flds_notreq) > 0) {
+      log_error(
+        "| ERROR | {grp} | missing required fields: {paste(flds_notreq, collapse = ', ')}"
+      )
+    }
+
+    # DEBUG ----
+    # a <- a |>
+    #   filter(sci_name %in% c(
+    #     "Balaena mysticetus", "Balaenoptera musculus", "Balaenoptera physalus",
+    #     "Eschrichtius robustus", "Monodon monoceros", "Phocoena phocoena", "Delphinus delphis"))
+    # 18 × 29
+
+    if (any(!st_is_valid(a))) {
+      log_warn(
+        "| WARN | {grp} | repairing invalid geometries before summarizing"
+      )
+      a <- st_make_valid(a)
+    }
+    if (any(!st_is_valid(a))) {
+      # filter out invalid geometries and report on which sci_name
+      invalid_sci <- a %>%
+        filter(!st_is_valid(.)) |>
+        pull(sci_name) |>
+        unique()
+      log_warn(
+        "| SKIP | {grp} | Skipping invalid geometries with sci_name: {paste(invalid_sci, collapse = ', ')}"
+      )
+      a <- a %>%
+        filter(st_is_valid(.))
+    }
+
+    x <- a |>
+      rename(iucn_id = id_no) |>
+      filter(
+        str_to_lower(marine) %in% c("true", "t")
+      ) |>
+      inner_join(
+        d_taxon |>
+          select(taxon_id, scientific_name),
+        by = c("sci_name" = "scientific_name")
+      ) |>
+      # group_by(taxon_id, category) |>
+      group_by(iucn_id, taxon_id, sci_name, category) |>
+      summarize(
+        yrcompiled = max(yrcompiled, na.rm = T),
+        n_shp_rows = n(),
+        .groups = "drop"
+      )
+    # st_drop_geometry(x) |> View()
+    # st_is_valid(x, reason = T)
+
+    log_info("| INFO | {grp} | found {nrow(x)} matching taxa")
+    if (nrow(x) == 0) {
+      log_info("| SKIP | {grp} | no intersecting marine taxa found")
+      next
+    }
+
+    sci_dupes <- x |>
+      filter(sci_name %in% duplicated(x$sci_name)) |>
+      pull(sci_name)
+    if (length(sci_dupes) > 0) {
+      log_error(
+        "| ERROR | {grp} | duplicate `sci_name` in: {paste(sci_dupes, collapse = ', ')}"
+      )
+    }
+
+    if (any(!st_is_valid(x))) {
+      log_warn(
+        "| WARN | {grp} | repairing invalid geometries after summarizing"
+      )
+      x <- st_make_valid(x)
+    }
+    stopifnot(all(st_is_valid(x)))
+
+    # save a copy of the filtered intersected shapefile as a geopackage
+    log_info("| WRITE | {grp} | gpkg")
+    st_write(x, grp_gpkg, delete_dsn = T, quiet = T)
+  }
+
+  # iterate by individual species, otherwise R can crash (eg EELS with 352 species)
+  for (j in 1:nrow(x)) {
+    # j = 1
+    sp_tif <- glue("{dir_iucn_derived}/{grp}/{x$sci_name[j]}.tif")
+    dir.create(dirname(sp_tif), recursive = T, showWarnings = F)
+
+    log_info("| INFO | {grp} | rasterizing {j}/{nrow(x)}: {x$sci_name[j]}")
+    r <- try(
+      rasterize(
+        x |>
+          slice(j),
+        r_cell_r,
+        field = default_cell_value,
+        touches = T,
+        by = "sci_name"
+      ) |>
+        rotate() |>
+        crop(r_cell) |>
+        mask(r_cell),
+      silent = T
+    )
+    # plot(trim(r))
+    if (inherits(r, "try-error")) {
+      log_warn(
+        "| SKIP | {grp} | error in rasterize() of {j}/{nrow(x)} ({x$sci_name[j]}): {r}"
+      )
+      next()
+    }
+    # r_t <- trim(r[[1]]); plot(r_t); mapView(r_t)
+
+    n_notna <- global(r, "notNA") |> as.integer()
+    if (n_notna == 0) {
+      log_info(
+        "| SKIP | {grp} | No layers in rast have notNA after cropping and masking to US EEZ"
+      )
+      next()
+    }
+
+    log_info("| WRITE | {grp} | Writing tif {j}/{nrow(x)}: {x$sci_name[j]}")
+    writeRaster(
+      r,
+      filename = sp_tif,
+      overwrite = T
+    )
+  }
+}
+```
+
+### Insert IUCN range models into DB
+
+```{r}
+#| label: insert_models_iucn_rng
+#| eval: !expr do_iucn_values
+# dbListFields(con_sdm, "model_cell") |> paste(collapse = ", ")
+# mdl_seq cell_id value
+# dbListFields(con_sdm, "model") |> paste(collapse = ", ")
+# mdl_seq, ds_key, taxa, time_period, region, mdl_type, description, date_created
+
+# gpkg has extra columns of data, but also extra rows of species outside US EEZ filtered out from *.tif
+d_gpkg <- tibble(
+  # 573
+  gpkg = dir_ls(dir_iucn_derived, glob = "*.gpkg")
+) |>
+  mutate(
+    grp = str_remove(basename(gpkg), "\\.gpkg$"),
+    data = map(gpkg, \(x) read_sf(x) |> st_drop_geometry())
+  ) |>
+  unnest(data) |> #
+  left_join(
+    d_taxon |>
+      select(scientific_name, sp_cat, mdl_seq),
+    by = join_by(sci_name == scientific_name)
+  )
+# names(d_gpkg) |> paste(collapse = ", ")
+# gpkg, grp, iucn_id, taxon_id, sci_name, category, yrcompiled, n_shp_rows, sp_cat, mdl_seq
+# Note: taxon_id == worms_id (no birds); MARINEFISH* is duplicated from other groups
+stopifnot(sum(duplicated(d_gpkg$sci_name)) == 0)
+
+d_tif <- tibble(
+  # 573
+  tif = dir_ls(dir_iucn_derived, glob = "*.tif", recurse = T)
+) |>
+  mutate(
+    data = map(tif, \(x) tibble(sci_name = names(rast(x))))
+  ) |>
+  unnest(data)
+
+d_spp <- d_gpkg |>
+  inner_join(
+    d_tif,
+    by = join_by(sci_name)
+  ) |>
+  arrange(grp, sci_name)
+
+for (i in 2:nrow(d_spp)) {
+  # i = 1
+
+  sp <- d_spp$sci_name[i]
+  d_sp <- d_spp[i, ]
+  sp_key <- glue("{ds_key}:{sp}")
+  sp_tif <- d_sp$tif
+  r_sp <- rast(sp_tif, lyrs = sp)
+
+  # delete: existing ----
+  mdl_seqs <- tbl(con_sdm, "model") |>
+    filter(ds_key == !!ds_key, taxa == !!sp_key) |>
+    pull(mdl_seq)
+  if (length(mdl_seqs) > 0) {
+    dbExecute(
+      con_sdm,
+      glue("DELETE FROM model WHERE ds_key = '{ds_key}' AND taxa = '{sp_key}'")
+    )
+    dbExecute(
+      con_sdm,
+      glue(
+        "DELETE FROM species WHERE ds_key = '{ds_key}' AND taxa = '{sp_key}'"
+      )
+    )
+    dbExecute(
+      con_sdm,
+      glue(
+        "DELETE FROM model_cell WHERE mdl_seq IN ({paste(mdl_seqs, collapse = ',')})"
+      )
+    )
+  }
+
+  # append: model ----
+  d_model <- tibble(
+    ds_key = ds_key,
+    taxa = sp_key,
+    time_period = "2025",
+    region = "Global",
+    mdl_type = "binary",
+    description = glue(
+      "IUCN Red List (2025-2) range map for {sp}, interpolated to 0.05° resolution"
+    )
+  )
+  dbWriteTable(con_sdm, "model", d_model, append = TRUE)
+
+  # get the mdl_seq that was just created
+  mdl_seq <- dbGetQuery(
+    con_sdm,
+    glue(
+      "
+    SELECT mdl_seq FROM model 
+    WHERE
+      ds_key = '{ds_key}' AND 
+      taxa   = '{sp_key}'
+    ORDER BY mdl_seq DESC LIMIT 1 "
+    )
+  )$mdl_seq
+
+  # d_sp |> glimpse()
+  # Rows: 1
+  # Columns: 11
+  # $ tif        <fs::path> "/Users/bbest/My Drive/projects/msens/data/derived/iucnredlist.org/ABALONES.tif"
+  # $ grp        <chr> "ABALONES"
+  # $ gpkg       <glue> "~/My Drive/projects/msens/data/derived/iucnredlist.org/ABALONES.gpkg"
+  # $ sci_name   <chr> "Haliotis asinina"
+  # $ category   <chr> "LC"
+  # $ yrcompiled <int> 2020
+  # $ n_shp_rows <int> 1
+  # $ taxon_id   <dbl> 147456
+  # $ worms_id   <dbl> 147456
+  # $ sp_cat     <chr> "invertebrate"
+  # $ mdl_seq    <int> 15595
+
+  # append: species ----
+  d_species <- tibble(
+    ds_key = ds_key,
+    taxa = sp_key,
+    sp_key = sp_key,
+    worms_id = d_sp$taxon_id,
+    gbif_id = NA_integer_, # TODO: lookup from GBIF
+    itis_id = NA_integer_, # TODO: lookup from ITIS
+    scientific_name_dataset = sp,
+    common_name_dataset = NA_character_, # TODO: do lookup from WoRMS
+    scientific_name_accepted = sp,
+    common_name_accepted = NA_character_, # TODO: do lookup from WoRMS
+    iucn_id = d_sp$iucn_id,
+    botw_id = NA_integer_,
+    worms_is_marine = NA, # d_sp$"worms_is_marine"
+    worms_is_extinct = NA, # d_sp$"worms_is_extinct"
+    redlist_code = d_sp$category, # TODO: lookup lastest from ITIS
+    redlist_year = d_sp$yrcompiled,
+    sp_cat = d_sp$sp_cat
+  )
+  stopifnot(
+    length(setdiff(names(d_species), dbListFields(con_sdm, "species"))) == 0
+  )
+  stopifnot(
+    setdiff(dbListFields(con_sdm, "species"), names(d_species)) == "sp_seq"
+  )
+  # d_species |> glimpse()
+  dbWriteTable(con_sdm, "species", d_species, append = T)
+  # tbl(con_sdm, "species") |> collect() |> tail()
+  # tbl(con_sdm, "model") |> collect() |> tail()
+
+  # append: model_cell ----
+  d_mdl_cell <- as.data.frame(r_sp, cells = T, na.rm = T) |>
+    tibble() |>
+    select(cell_id = cell) |>
+    mutate(
+      mdl_seq = mdl_seq,
+      value = default_cell_value
+    ) |>
+    arrange(cell_id)
+  dbWriteTable(con_sdm, "model_cell", d_mdl_cell, append = T)
+}
+# Haliotis cracherodii
+# 18513
+# mapView(r_sp, maxpixels = Inf)
+
+```
+
+### Update IUCN model_cell values to match er_score
+
+```{r}
+#| label: update_rng_iucn_to_redlist_value
+#| eval: !expr do_iucn_values
+
+q_spp <- tbl(con_sdm, "species") |>
+  filter(ds_key == "rng_iucn")
+
+# q_spp |>
+#   pull(redlist_code) |>
+#   table()
+# CR  DD   EN     LC  NT  VU
+# 38  46  157  1,143  45  87
+# Note: keeping DD for masking and assigning LC score
+
+taxa <- q_spp |> pull(taxa) |> sort()
+
+d_smry <- tbl(con_sdm, "model") |>
+  filter(ds_key == "rng_iucn") |>
+  left_join(
+    tbl(con_sdm, "model_cell"),
+    by = join_by(mdl_seq)
+  ) |>
+  group_by(taxa) |>
+  summarize(
+    value = mean(value, na.rm = T)
+  ) |>
+  collect()
+table(d_smry$value)
+# BEFORE:
+#      50
+#   1,516
+# AFTER:
+#    20  40      60   80  100
+# 1,189  45      87  157   38
+# NEW before alignment with er_score
+#   OLD: CR:100/EN:80/VU:60/NT:40/LC:20/DD:20
+#   NEW: CR: 50/EN:25/VU: 5/NT: 2/LC: 1/DD:
+# NEW BEFORE: (interrupted at i=808)
+#    20  40  50  60   80  100
+#   537  29 806  60   62   21
+
+for (i in 1:length(taxa)) {
+  #
+  taxon = taxa[i] # taxon = "rng_iucn:Balaenoptera ricei"
+
+  mdl_seq <- tbl(con_sdm, "model") |>
+    filter(
+      ds_key == "rng_iucn",
+      taxa == !!taxon
+    ) |>
+    pull(mdl_seq)
+
+  cell_val <- q_spp |>
+    filter(
+      taxa == !!taxon
+    ) |>
+    mutate(
+      cell_value = case_match(
+        redlist_code,
+        # aligned with er_score from taxon_listing_join (v3 scoring)
+        "CR" ~ 50L, # critically endangered
+        "EN" ~ 25L, # endangered
+        "VU" ~ 5L, # vulnerable
+        "NT" ~ 2L, # near threatened
+        .default = 1L # LC, DD, etc.
+      )
+    ) |>
+    pull(cell_value)
+
+  message(glue(
+    "Updating taxa:'{taxon}' (mdl_seq:{mdl_seq}; {i}/{length(taxa)}) model_cells to value: {cell_val} ~ {Sys.time()}"
+  ))
+
+  dbExecute(
+    con_sdm,
+    glue(
+      "UPDATE model_cell SET value = {cell_val} WHERE mdl_seq = {mdl_seq}"
+    )
+  )
+}
+```
+
+### Define dir_fws_spp
+
+```{r}
+#| label: get_fws_spp_lists_2
+#| eval: !expr do_iucn_values
+
+dir_fws_spp <- glue("{dir_data}/raw/fws.gov/species")
+# read_csv()
+
+```
+
+### Update taxon redlist_code from IUCN range data
+
+```{r}
+#| label: update_rng_iucn_redlist_code_in_taxon
+#| eval: !expr do_iucn_values
+
+d_iucn_chg <- tbl(con_sdm, "taxon") |>
+  select(
+    worms_id,
+    scientific_name,
+    common_name,
+    redlist_code_taxon = redlist_code
+  ) |>
+  inner_join(
+    tbl(con_sdm, "species") |>
+      filter(ds_key == "rng_iucn") |> # collect() # 1,516 x 18
+      select(worms_id, redlist_code_rng = redlist_code),
+    by = join_by(worms_id)
+  ) |>
+  filter(redlist_code_rng != redlist_code_taxon) |>
+  arrange(redlist_code_rng, scientific_name) |>
+  collect()
+# print(d_iucn_chg, n=Inf)
+# # A tibble: 33 × 5
+#    worms_id scientific_name           common_name                  redlist_code_taxon redlist_code_rng
+#       <dbl> <chr>                     <chr>                        <chr>              <chr>
+#  1  1576133 Balaenoptera ricei        Rice's Whale                 EN                 CR
+#  2   105858 Mobula mobular            devil ray                    EN                 CR
+#  3   105859 Mobula tarapacana         sicklefin devil ray          EN                 CR
+#  4   217430 Mobula thurstoni          smoothtail mobula            EN                 CR
+#  5   137102 Orcinus orca              killer whale                 EN                 DD
+#  6   137078 Cystophora cristata       hooded seal                  VU                 EN
+#  7   758260 Orbicella annularis       Coral, lobed star            TN                 EN
+#  8   758261 Orbicella faveolata       Coral, mountainous star      TN                 EN
+#  9   158512 Apristurus brunneus       brown cat shark              DD                 LC
+# 10   271342 Apristurus kampae         Longnose catshark            DD                 LC
+# 11   137206 Chelonia mydas            green turtle                 EN                 LC
+# 12   137115 Delphinapterus leucas     buluga                       EN                 LC
+# 13  1048080 Fimbriaphyllia paradivisa Coral (Euphyllia paradivisa) TN                 LC
+# 14   759975 Goniopora pedunculata     NA                           NT                 LC
+# 15   276694 Heterodontus francisci    horn shark                   DD                 LC
+# 16   886931 Homophyllia bowerbanki    NA                           NT                 LC
+# 17   137092 Megaptera novaeangliae    hump                         EN                 LC
+# 18   158075 Oncorhynchus tshawytscha  Chinook salmon               EN                 LC
+# 19   207267 Psammocora contigua       branched sandpaper coral     NT                 LC
+# 20   254570 Salvelinus malma          dolly varden                 TN                 LC
+# 21   137079 Erignathus barbatus       bearded seal                 TN                 NT
+# 22   254999 Eumetopias jubatus        Steller sea lion             EN                 NT
+# 23   271389 Mustelus lunulatus        sicklefin smoothhound        LC                 NT
+# 24   758262 Orbicella franksi         Coral, boulder star          TN                 NT
+# 25   159019 Pagophilus groenlandicus  harp seal                    LC                 NT
+# 26   137104 Pseudorca crassidens      false killer whale           EN                 NT
+# 27   127186 Salmo salar               silver salmon                EN                 NT
+# 28   137209 Dermochelys coriacea      leatherback turtle           EN                 VU
+# 29   289807 Dichocoenia stokesii      pineapple coral              DD                 VU
+# 30  1663107 Neomonachus schauinslandi Seal, Hawaiian monk          EN                 VU
+# 31   271667 Squatina californica      Pacific angel shark          NT                 VU
+# 32   137085 Ursus maritimus           polar bear                   TN                 VU
+# 33   283213 Zapteryx exasperata       banded guitarfish            DD                 VU
+
+# SQL UPDATE using DuckDB's UPDATE ... FROM syntax
+dbExecute(
+  con_sdm,
+  "
+  UPDATE taxon
+  SET redlist_code = s.redlist_code
+  FROM species s
+  WHERE taxon.worms_id = s.worms_id
+    AND s.ds_key = 'rng_iucn'
+    AND taxon.redlist_code != s.redlist_code
+"
+) # OLD: 33 rows affected. NEW: 17 rows
+```
+
+### Add ESA code to taxon
+
+```{r}
+#| label: add_esa_code_in_taxon
+#| eval: !expr do_iucn_values
+
+# tbl(con_sdm, "taxon")
+
+# pull esa codes from species where ds_key = 'ch_nmfs' or 'ch_fws'
+d_esa <- tbl(con_sdm, "species") |>
+  filter(ds_key %in% c("ch_nmfs", "ch_fws")) |>
+  select(
+    ds_key,
+    worms_id,
+    scientific_name_dataset,
+    common_name_dataset,
+    redlist_code,
+    redlist_year
+  ) |>
+  # prefer NMFS over FWS if both exist
+  arrange(worms_id, desc(ds_key)) |>
+  group_by(worms_id) |>
+  summarize(
+    ds_key = first(ds_key),
+    redlist_code = first(redlist_code),
+    # redlist_year  = last(redlist_year), # TODO: extract year and prefer based on year before agency (NMFS, FWS)
+    # TODO: Charadrius nivosus nivosus (Western Snowy Plover) has no worms_id
+    .groups = "drop"
+  ) |>
+  collect()
+# View(d_esa)
+
+# update taxon table
+dbExecute(con_sdm, "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS esa_code TEXT")
+dbExecute(con_sdm, "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS esa_source TEXT")
+
+try(duckdb_unregister(con_sdm, "d_esa"), silent = TRUE)
+duckdb_register(con_sdm, "d_esa", d_esa)
+dbExecute(
+  con_sdm,
+  "UPDATE taxon
+    SET
+      esa_code   = d_esa.redlist_code,
+      esa_source = d_esa.ds_key
+    FROM d_esa
+    WHERE taxon.worms_id = d_esa.worms_id"
+) # 43 rows affected
+duckdb_unregister(con_sdm, "d_esa")
+```
+
+### Add rng_iucn to taxon_model
+
+```{r}
+#| label: add_rng_iucn_to_taxon
+#| eval: !expr do_iucn_values
+# get IUCN range model mdl_seq values by scientific_name
+d_iucn <- tbl(con_sdm, "model") |>
+  filter(ds_key == "rng_iucn") |>
+  select(mdl_seq, taxa) |>
+  collect() |>
+  mutate(
+    scientific_name = str_remove(taxa, "^rng_iucn:")
+  )
+
+# join taxon_id to IUCN models via scientific_name
+d_iucn_tm <- d_iucn |>
+  inner_join(
+    tbl(con_sdm, "taxon") |>
+      select(taxon_id, scientific_name) |>
+      collect(),
+    by = "scientific_name"
+  ) |>
+  transmute(
+    taxon_id = taxon_id,
+    ds_key = "rng_iucn",
+    mdl_seq = mdl_seq
+  )
+
+# delete existing rng_iucn rows before re-inserting (idempotent re-runs)
+dbExecute(con_sdm, "DELETE FROM taxon_model WHERE ds_key = 'rng_iucn'")
+
+# append rng_iucn rows to taxon_model junction table
+dbWriteTable(con_sdm, "taxon_model", d_iucn_tm, append = TRUE)
+message(glue("Added {nrow(d_iucn_tm)} rng_iucn rows to taxon_model"))
+# Added 1516 rng_iucn rows to taxon_model
+
+# update n_ds from taxon_model
+dbExecute(
+  con_sdm,
+  "UPDATE taxon
+   SET n_ds = tm.n_ds
+   FROM (
+     SELECT taxon_id, COUNT(*) AS n_ds
+     FROM taxon_model
+     GROUP BY taxon_id
+   ) tm
+   WHERE taxon.taxon_id = tm.taxon_id"
+) # 17,561 rows affected
+
+# reset mdl_seq for taxa that now need re-merging (n_ds > 1)
+dbExecute(
+  con_sdm,
+  "UPDATE taxon
+   SET mdl_seq = NULL
+   WHERE n_ds > 1 AND mdl_seq IS NOT NULL"
+) # 1573 rows affected
+```
+
+## Taxon Summary
+
+### Export taxon summary
+
+```{r}
+#| label: taxon_summary
+taxon_csv <- here("data/taxon.csv")
+
+# dbListFields(con_sdm, "taxon") |> paste(collapse = ", ") |> cat()
+d_taxon <- tbl(con_sdm, "taxon") |>
+  select(
+    is_ok,
+    component = sp_cat,
+    common_name,
+    scientific_name,
+    redlist_code_max = redlist_code,
+    extrisk_code,
+    er_score,
+    is_mmpa,
+    is_mbta,
+    is_bcc,
+    worms_is_marine,
+    worms_is_extinct,
+    n_datasets = n_ds,
+    taxon_authority,
+    taxon_id,
+    model_id = mdl_seq
+  ) |>
+  arrange(desc(is_ok), component, common_name) |>
+  collect()
+
+write_csv(d_taxon, taxon_csv)
+
+# d_taxon |>          # 17,561
+#   filter(is_ok) |>  # 17,379
+#   select(component, redlist_code_max) |>
+#   table(useNA = "ifany")
+#               redlist_code_max
+# component        CR   DD   EN   LC   NT   TN   VU <NA>
+#   bird            3    1   53  349   41   11   38    0
+#   coral          16   10  143  201   17    4   20  364
+#   fish           20  242   61 4920   69    2  112 1252
+#   invertebrate    7   84   18  377   16    0   13 7668
+#   mammal          2    4   11   54    5    5    6    1
+#   other           0    0    0    2    0    0    0 1126
+#   reptile         2    0    2   16    0    0    3    8
+
+d_taxon <- read_csv(taxon_csv)
+
+d_taxon_p <- d_taxon |>
+  filter(is_ok) |>
+  select(component, taxon_id) |>
+  inner_join(
+    tbl(con_sdm, "taxon_model") |> collect(),
+    by = "taxon_id"
+  ) |>
+  rename(dataset = ds_key) |>
+  filter(
+    !is.na(taxon_id),
+    !is.na(mdl_seq)
+  ) |>
+  arrange(component, taxon_id)
+
+# d_taxon_p |>
+#   group_by(component) |>
+#   summarize(
+#     n_species = n_distinct(taxon_id),
+#     n_models  = n_distinct(mdl_seq),
+#     .groups = "drop")
+#   component    n_species n_models
+#   <chr>            <int>    <int>
+# 1 bird               496      542
+# 2 coral              775      785
+# 3 fish              6678     6693
+# 4 invertebrate      8183     8184
+# 5 mammal              88      101
+# 6 other             1128     1128
+# 7 reptile             31       47
+#
+# d_taxon_p |>
+#   group_by(dataset) |>
+#   summarize(
+#     n_models  = length(unique(mdl_seq)),
+#     .groups = "drop") |>
+#   print(n = Inf)
+#   dataset      n_models
+#   <chr>           <int>
+# 1 aquamaps        16871
+# 2 birdlife          457
+# 3 fws_crithab        27
+# 4 fws_range          92
+# 5 nmfs_crithab       33
+
+# d_taxon_p |>
+#   group_by(component, dataset) |>
+#   summarize(
+#     n_models  = length(unique(mdl_seq)),
+#     .groups = "drop") |>
+#   print(n = Inf)
+#    component    dataset      n_models
+#    <chr>        <chr>           <int>
+#  1 bird         aquamaps            1
+#  2 bird         birdlife          457
+#  3 bird         fws_crithab        16
+#  4 bird         fws_range          68
+#  5 coral        aquamaps          774
+#  6 coral        nmfs_crithab       11
+#  7 fish         aquamaps         6675
+#  8 fish         fws_crithab         3
+#  9 fish         fws_range           9
+# 10 fish         nmfs_crithab        6
+# 11 invertebrate aquamaps         8179
+# 12 invertebrate fws_range           4
+# 13 invertebrate nmfs_crithab        1
+# 14 mammal       aquamaps           83
+# 15 mammal       fws_crithab         3
+# 16 mammal       fws_range           4
+# 17 mammal       nmfs_crithab       11
+# 18 other        aquamaps         1128
+# 19 reptile      aquamaps           31
+# 20 reptile      fws_crithab         5
+# 21 reptile      fws_range           7
+# 22 reptile      nmfs_crithab        4
+```
+
