@@ -19,7 +19,329 @@
 
 - Migrate to hexagons
 
-## 2026-02-13 apply er_score spatially
+## 2026-02-14 wow, but revert; apply is_mmpa, is_mbta spatially; + libs/paths.R
+
+Wow, that was a truly amazing feat! You executed the objective and tasks very well, but I am afraid that it's too drastic a change for now. Results are expected to be similar to the past and this is too drastic a change in overall results, particularly for sensitive species like Rice's whale, which  only scored 43 for ms_endemism, and 100 for ms_er, so 43 for ms_suit.
+
+Weirdly the NMFS Core Area which was derived from the IUCN both changed shape -- what explains that? The last database backup I have is at `@/Users/bbest/_big/msens/derived/archive_2026-02-12/sdm_2026-02-10.duckdb`, but you'd have to revisit the commit logs to recall what's changed since.
+
+I think we need to fork this current version a new branch "v3b", which I would like to explore more in the future, probably using the global IUCN range maps. I'm also concerned that many species, especially birds with large geographic ranges, only overlap for a few coastal cells, so there endemism scores would get dramatically inflated. Anyways, this is very worthy of future exploration. I do like the data flow you described:
+
+>  Data Flow
+> 
+>  Input layers → classify as is_suit / is_er
+>                       ↓                    ↓
+>                ms_endemism          priority-ordered ER
+>                + any is_suit        per-cell values
+>                       ↓                    ↓
+>                    ms_suit              ms_er
+>                       ↓                    ↓
+>                ms_merge = max(1, round(ms_suit × ms_er / 100))
+>                       ↓
+>                 calc_scores sums ms_merge.value per taxonomic group
+>                 (no more scalar er_score multiplication)
+
+What we need instead is a smaller update that applies the minimum score for applying `is_mmpa` (min 20) and `is_mbta` (min 10) along with the other scoring options in a spatial manner (a la `msens::compute_er_score()`, but spatially) to a single "ms_merge" model, without introducing a new ms_endemism model layer that acts as a substitute for suitability.
+
+It would be great to also have a simple @libs/paths.R to update in the setup of each of the files once and reused across workflows. For instance the current design is flawed:
+
+```r
+v_int <- 3
+v_sfx <- paste0("_v", v_int)
+v_dir <- paste0("v", v_int)
+...
+dir_v <- glue("{dir_derived}/{v_dir}")
+tbl_pra <- glue("ply_programareas_2026{v_sfx}")
+```
+
+It doesn't allow for non-integer versions, like "v3b", and is somewhat duplicative with v_sfx and v_dir. It would be far simpler to have:
+
+```r
+ver <- "3b"
+...
+dir_v <- glue("{dir_derived}/{ver}")
+tbl_pra <- glue("ply_programareas_2026_{ver}")
+```
+
+How would you suggest making a clean seperation with databases and versions while proceeding with developing both the main branch and this 3b?
+
+I wanted to share screenshots of the Rice's whale models (first two), compared to previous desired model (third image)
+
+⏺ Thanks for the screenshots - very helpful. I can clearly see the issues:
+
+  1. Screenshot 1 (v3b): Rice's whale Final Merged Model shows muted olive values (~43) covering a different shape than expected
+  2. Screenshot 2 (v3b): IUCN Range shows value=50 (CR code) but in a completely different, narrower shape along the Florida shelf
+  3. Screenshot 3 (desired/previous): The correct output — bright magenta, value=100 in core area, covering the broad northern Gulf of Mexico. Sidebar shows
+  "Merged Model (IUCN masked)" with max of ca_nmfs, ch_nmfs, rng_iucn
+
+  The IUCN range shape change is concerning — that's not something the code changes should have caused. It might be a data issue from the re-merge overwriting
+  something.
+
+←  ☐ Version naming  ☐ DB restore  ✔ Submit  →
+
+For version naming in libs/paths.R, should ver include the 'v' prefix to match existing paths/tables (ver='v3' gives 'v3/sdm.duckdb' and
+'ply_programareas_2026_v3'), or drop it per your example (ver='3b' gives '3b/sdm.duckdb' and 'ply_programareas_2026_3b')?
+
+❯ 1. Keep 'v' prefix (Recommended)
+     ver='v3' on main, ver='v3b' on branch. Matches all existing directory names and zone table names without renaming anything.
+  2. Drop 'v' prefix
+     ver='3' on main, ver='3b' on branch. Cleaner but requires renaming existing 'v3/' dirs to '3/' and updating zone tables like 'ply_programareas_2026_v3' →
+     'ply_programareas_2026_3'.
+  3. Type something.
+
+For database restoration on main, the archive file is named 'msens_sdm.duckdb' (11.4GB) while the current working db is 'sdm.duckdb' (7.2GB). The size difference 
+suggests the archive may contain additional data. Should we restore from archive, or do you have a specific backup of just the v3 sdm.duckdb?
+
+❯ 1. Restore from archive         
+     Copy archive_2026-02-12/msens_sdm.duckdb → v3/sdm.duckdb. May contain extra data but should have correct v3 state.         
+  2. Use git to revert code only
+     Revert code changes, then re-run merge_models.qmd with do_merge=T on the existing database to regenerate ms_merge models. Slower but rebuilds from source.
+  3. I have another backup     
+     You have a separate sdm.duckdb backup not in the archive directory.
+  4. Type something.       
+
+The file you are pointing at is very old and outdated:
+
+  @/Users/bbest/_big/msens/derived/archive_2026-02-12/msens_sdm.duckdb
+  11.4GB 2025-05-28
+
+The one I was referencing is only a couple of days old, so I am hoping has the correct ca_nmfs habitat pulled from rng_iucn for Rice's whale:
+
+  @/Users/bbest/_big/msens/derived/archive_2026-02-12/sdm_v3_2026-02-12.duckdb
+  2.28 GB 2026-02-12
+
+For this v3b, the @../apps repository and specifically @../apps/mapsp/app.R were updated to accomodate all the new models. Let's also similarly preserve those changes in a new "v3b" branch and revert to "main" just prior.
+
+
+⏺ The plan has been updated to include both the workflows and apps repositories for v3b branching. Let me present it for your approval.
+ Here is Claude's plan:
+ Plan: Fork v3b Branch, Revert Main, Add Spatial MMPA/MBTA Scoring + paths.R
+
+ Context
+
+ The v3b changes (ms_endemism, ms_suit, ms_er separation) were too drastic:
+ - Rice's whale ms_endemism=43 dramatically reduced its merged model from 100 to ~43
+ - IUCN range shape changed unexpectedly (possible data corruption during re-merge)
+ - Coastal birds with large global ranges would get inflated endemism scores
+ - Results diverged too far from the established v3 baseline
+
+ We need to:
+ 1. Preserve v3b work on a branch for future exploration
+ 2. Restore main to the working v3 state
+ 3. Apply a smaller enhancement: spatial MMPA/MBTA minimum scores in ms_merge
+ 4. Create libs/paths.R for shared version/path config
+
+ ---
+ Step 1: Branch & Database Separation
+
+ Git branching — two repositories
+
+ workflows repo (/Users/bbest/Github/MarineSensitivity/workflows/):
+ git checkout -b v3b          # save v3b work on a branch
+ git checkout main
+ git revert HEAD              # reverts commit 6c3e49c0
+
+ apps repo (/Users/bbest/Github/MarineSensitivity/apps/):
+ git checkout -b v3b          # save v3b app.R changes on a branch
+ git checkout main
+ git checkout HEAD~1 -- mapsp/app.R   # restore app.R to pre-v3b state
+
+ Both repos get a v3b branch preserving the full suit/ER separation work.
+
+ Database strategy
+
+ - v3b: Copy current v3/sdm.duckdb (7.2GB, already has v3b data) → v3b/sdm.duckdb
+ - main (v3): Restore from recent backup:
+ ~/_big/msens/derived/archive_2026-02-12/sdm_v3_2026-02-12.duckdb (2.28GB, 2026-02-12)
+ → v3/sdm.duckdb
+ This backup should have the correct ca_nmfs/rng_iucn shapes for Rice's whale.
+ - Each branch's libs/paths.R sets ver to point at its own database directory
+ 
+ Files to modify
+ ┌───────────┬───────────────────────┬──────────────────────────────────────────────────────────────┐ │   Repo    │         File          │                           Changes                            │
+ ├───────────┼───────────────────────┼──────────────────────────────────────────────────────────────┤
+ │ workflows │ libs/paths.R          │ New file — shared version/path config                        │
+ ├───────────┼───────────────────────┼──────────────────────────────────────────────────────────────┤
+ │ workflows │ merge_models.qmd      │ Revert v3b changes; add MMPA/MBTA spatial floors to ms_merge │
+ ├───────────┼───────────────────────┼──────────────────────────────────────────────────────────────┤
+ │ workflows │ merge_models_prep.qmd │ Source libs/paths.R instead of local version vars            │
+ ├───────────┼───────────────────────┼──────────────────────────────────────────────────────────────┤
+ │ workflows │ calc_scores.qmd       │ Revert scoring formula; source libs/paths.R                  │
+ ├───────────┼───────────────────────┼──────────────────────────────────────────────────────────────┤
+ │ workflows │ schema.qmd            │ Revert is_suit/is_er additions; source libs/paths.R          │
+ ├───────────┼───────────────────────┼──────────────────────────────────────────────────────────────┤
+ │ workflows │ Other .qmd files      │ Source libs/paths.R (6+ files use version vars)              │
+ ├───────────┼───────────────────────┼──────────────────────────────────────────────────────────────┤
+ │ apps      │ mapsp/app.R           │ Revert sidebar from Final/Derived/Input back to Values/Mask  │
+ └───────────┴───────────────────────┴──────────────────────────────────────────────────────────────┘
+ ---
+ Step 2: Create libs/paths.R
+
+ File: workflows/libs/paths.R
+
+```r
+ # shared version and path configuration ----
+ # sourced by all workflow notebooks and apps
+
+ ver <- "v3"  # version string; change on branches (e.g., "v3b")
+
+ is_server   <- Sys.info()[["sysname"]] == "Linux"
+ dir_data    <- ifelse(is_server, "/share/data", "~/My Drive/projects/msens/data")
+ dir_derived <- glue::glue("{dir_data}/derived")
+ dir_raw     <- glue::glue("{dir_data}/raw")
+ dir_private <- ifelse(is_server, "/share/private", "~/My Drive/private")
+ dir_big     <- ifelse(is_server, "/share/data/big", "~/_big/msens/derived")
+
+ # versioned directories
+ dir_v     <- glue::glue("{dir_derived}/{ver}")
+ dir_big_v <- ifelse(is_server, dir_v, glue::glue("{dir_big}/{ver}"))
+
+ # databases
+ spp_db <- glue::glue("{dir_big}/spp.duckdb")
+ sdm_db <- glue::glue("{dir_big_v}/sdm.duckdb")
+
+ # zone table names
+ tbl_er  <- glue::glue("ply_ecoregions_2025_{ver}")
+ tbl_pra <- glue::glue("ply_programareas_2026_{ver}")
+ tbl_sr  <- glue::glue("ply_subregions_2026_{ver}")
+
+ Usage in each file — replace the local version block:
+ # BEFORE (in each .qmd setup):
+ v_int <- 3
+ v_sfx <- paste0("_v", v_int)
+ v_dir <- paste0("v", v_int)
+ dir_v <- glue("{dir_derived}/{v_dir}")
+ ...
+
+ # AFTER:
+ source(here("libs/paths.R"))
+ # all version-dependent vars now available
+```
+
+ Naming convention: ver includes the "v" prefix ("v3", "v3b") so that:
+ - glue("ply_programareas_2026_{ver}") → "ply_programareas_2026_v3" (matches existing tables)
+ - glue("{dir_big}/{ver}") → "~/_big/msens/derived/v3" (matches existing directories)
+
+ ---
+ Step 3: Spatial MMPA/MBTA Scoring in ms_merge
+
+ Current behavior
+
+ - ms_merge.value = max of all input layers (AquaMaps, CH, CA, range maps)
+ - cell_metric = SUM(er_score * mc.value) / 100 (scalar er_score from compute_er_score())
+ - MMPA (min 20) and MBTA (min 10) only affect the scalar er_score, not the spatial values
+
+ Problem
+
+ A species that is MMPA-protected (min score 20) but has AquaMaps cells with value=1 contributes:
+ er_score(20) * value(1) / 100 = 0.2 — negligibly small despite legal protection.
+
+ Enhancement
+
+ After computing ms_merge (max of all layers, IUCN masked), apply MMPA/MBTA floors:
+
+```r
+ # in merge_models.qmd, inside the iterate_merge loop, after d_r_sp is computed:
+ if (isTRUE(d_sp$is_mmpa)) {
+   d_r_sp <- d_r_sp |>
+     mutate(value = pmax(value, 20L))
+ }
+ if (isTRUE(d_sp$is_mbta)) {
+   d_r_sp <- d_r_sp |>
+     mutate(value = pmax(value, 10L))
+ }
+```
+
+ Impact analysis
+
+ - Rice's whale (MMPA, er_score=100): All cells already ≥50 (CR), no change. Preserves screenshot 3 behavior.
+ - MMPA-only species with AquaMaps: Low cells (1-19) bump to 20. Gives MMPA-protected species meaningful presence.
+ - MBTA birds: Low cells (1-9) bump to 10. Small but nonzero baseline for protected birds.
+ - calc_scores formula: Unchanged (SUM(er_score * mc.value) / 100). The er_score scalar still captures species-level ER importance.
+
+ ---
+ Step 4: Revert Other v3b Changes
+
+ merge_models.qmd
+
+ - Restore the old iterate_merge_ds_mdl chunk (from git history before commit 6c3e49c0)
+ - Remove: ms_endemism, ms_suit, ms_er, ms_merge intermediate layer sections
+ - Remove: is_suit, is_er columns from dataset_metadata
+ - Remove: BirdLife value fix (save to v3b branch)
+ - Remove: derived_datasets insert (ms_endemism, ms_suit, ms_er rows)
+ - Keep: ms_merge as the only derived dataset
+ - Add: MMPA/MBTA floor logic (Step 3) into the existing merge loop
+
+ calc_scores.qmd
+
+ - Restore: SUM(er.er_score * mc.value) / 100.0 formula
+ - Restore: suit_rl = avg_suit * er_score / 100
+ - Remove: Future Considerations section about endemism (move to v3b)
+
+ schema.qmd
+
+ - Remove: is_suit, is_er from sdm_expected$dataset
+ - Revert: ERD diagram (remove is_suit, is_er, is_mask from dataset entity)
+ - Remove: is_suit, is_er descriptions from infer_desc()
+
+ apps/mapsp/app.R
+
+ - Revert: sidebar from Final/Derived/Input grouping back to Values/Mask grouping
+ - Revert: layer_names, ds_keys_derived, ds_keys_input changes
+ - Revert: radio button label from "Final Merged Model" back to "Merged Model"
+
+ ---
+ Verification
+
+ 1. Database restored: Rice's whale ms_merge shows value=100 in core area, matching screenshot 3
+ 2. IUCN range shape: Restored to correct broad Gulf of Mexico shape
+ 3. MMPA/MBTA floors: For a low-suitability MMPA species, verify cells bumped to min 20
+ 4. calc_scores: Run extrisk metrics, compare to pre-v3b values — should be very similar with small increases for MMPA/MBTA-affected species
+ 5. paths.R: All notebooks use source(here("libs/paths.R")), version vars consistent
+ 6. v3b branch: Separately runnable with ver <- "v3b" and its own database
+
+⏺ Here's a summary of everything completed:
+  Summary                                                                                             Git branching                                                        
+                                                            
+  - workflows: v3b branch created preserving v3b work; main reverted via git revert HEAD
+  - apps: v3b branch created; mapsp/app.R restored to pre-v3b state on main
+
+  Database separation
+
+  - ~/_big/msens/derived/v3b/sdm.duckdb — 6.7GB (v3b data, moved)
+  - ~/_big/msens/derived/v3/sdm.duckdb — 2.1GB (restored from 2026-02-12 backup)
+
+  New file: libs/paths.R
+
+  - Shared version/path config with ver <- "v3", all directory/database paths, zone table names, and v_sfx for backward compatibility
+
+  MMPA/MBTA spatial floors in merge_models.qmd
+
+  - After d_r_sp is computed (IUCN-masked max of all layers), applies:
+    - pmax(value, 20) for MMPA-protected species
+    - pmax(value, 10) for MBTA-protected species
+
+  Files updated to source(here("libs/paths.R")):
+
+  - merge_models.qmd (+ MMPA/MBTA floors)
+  - calc_scores.qmd
+  - schema.qmd
+  - merge_models_prep.qmd
+  - msens-summary_programareas.qmd
+  - render_derived_products.qmd
+  - update_scores.qmd
+  - fix_taxon_model_dups.qmd
+  - ingest_nmfs_core-areas.qmd
+
+  Skipped (un-versioned/dated files):
+
+  - msens-summary_env-national-ocs.qmd, ingest files using old sdm.duckdb paths, explore files
+
+  Not yet committed
+
+  - Both repos have uncommitted changes ready to commit when you're satisfied with the state. The apps repo also has the staged mapsp/app.R revert.
+
+## 2026-02-13 BIG new ms_endemism -> ms_suit; ms_merge = ms_suit * ms_er
 
 Originally species distributions were brought in with cell values representing suitable habitat, starting with AquaMaps (`dataset.ds_key`: 'am_0.05'. Then range maps from BirdLife International (`dataset.ds_key`: 'bl') were ingested (since AquaMaps generally lacks seabirds) with cell values of 50% (halfway between 100% present and 0% absent). Then an extinction risk from IUCN RedList category was transformed to a single scalar value of `rl_score` (1 to 100%) for multiplying by the suitability raster to create the "vulnerability" of a species cell. (This species cell was then summed to taxonomic groups and rescaled by ecoregion max before component weighting to acheive a score.) Here's the relevant excerpt from @workflows/final-report_2025:
 
@@ -139,33 +461,333 @@ Interesting! I think I'd interpret your notion of "cell-level endemism" as actua
 
 Something else worth noting to include in explanatory text for this species-level endemism is that since we're transforming binary range maps into something usable for suitability, the max value is 50% (ie halfway between absent 0% and present 100%).
 
+Actually, thinking about implications for the highly endangered Rice's whale, which only has range maps (ch_nmfs, ca_nmfs, rng_iucn), the suggested scheme would set the ms_endemism (and hence ms_suit) value to something less than 50%, and the ms_er to 100%. Given its high degree of concern and the wide range of uncertainty around range maps, let's instead rescale endemism 10 to 90% and include raationale.
+
+```r
+tbl(con_sdm, "taxon") |>
+  filter(scientific_name == "Balaenoptera ricei") |>
+  select(worms_id = taxon_id) |>
+  left_join(
+    tbl(con_sdm, "species"),
+    by = join_by(worms_id)
+  ) |>
+  select(worms_id, ds_key, taxa) |>
+  collect()
+```
+```
+  worms_id ds_key   taxa
+     <dbl> <chr>    <chr>
+1  1576133 ch_nmfs  ch_nmfs:Balaenoptera ricei
+2  1576133 ca_nmfs  ca_nmfs:Balaenoptera ricei
+3  1576133 rng_iucn rng_iucn:Balaenoptera ricei
+4  1576133 ms_merge ms_merge:1576133
+```
+
+>  Plan: Separate Suitability and Extinction Risk into Distinct Model Layers
+> 
+>  Context
+> 
+>  Currently, model_cell.value conflates two concepts:
+>  - Suitability (likelihood of presence, 0-100) — only truly applies to AquaMaps (am_0.05)
+>  - Extinction risk (conservation status encoded in cell values) — applies to binary range/CH/CA maps where values like 100/50/1 represent ESA listing status
+> 
+>  The current scoring formula SUM(er_score * mc.value) / 100 uses a scalar er_score per species multiplied by the merged model value. This muddies interpretation:
+>   does a cell value represent suitability or risk?
+> 
+>  The goal is to separate into explicit suitability and extinction risk rasters per species, producing a final model: ms_merge = max(1, round(ms_suit × ms_er /
+>  100)).
+> 
+>  Resolved Design Decisions
+> 
+>  - Endemism scaling: Log-scaled (better differentiation among endemic species)
+>  - ER layer priority: Highest-priority by sort_order (US > Intl, NMFS > FWS > IUCN)
+>  - Endemism type: Species-level (one score per species; cell-level is really "species richness" which is already implicitly captured by summing across species
+>  per taxonomic group)
+>  - ms_merge floor: Clamp to minimum 1 so species never "disappear" from the map when suit × er rounds to 0
+>  - ms_suit and ms_er kept as separate interpretable layers — ms_merge = product of the two
+> 
+>  Data Flow
+> 
+>  Input layers → classify as is_suit / is_er
+>                       ↓                    ↓
+>                ms_endemism          priority-ordered ER
+>                + any is_suit        per-cell values
+>                       ↓                    ↓
+>                    ms_suit              ms_er
+>                       ↓                    ↓
+>                ms_merge = max(1, round(ms_suit × ms_er / 100))
+>                       ↓
+>                 calc_scores sums ms_merge.value per taxonomic group
+>                 (no more scalar er_score multiplication)
+> 
+>  ---
+>  Implementation Steps
+> 
+>  1. Database Schema Changes
+> 
+>  File: workflows/merge_models.qmd — dataset_metadata chunk
+> 
+>  Add columns to dataset table: is_er BOOLEAN, is_suit BOOLEAN
+> 
+>  Update metadata tribble:
+> 
+>  metadata <- tribble(
+>    ~ds_key      , ~name_display              , ~value_info                             , ~is_mask , ~is_suit , ~is_er , ~sort_order ,
+>    "am_0.05"    , "AquaMaps SDM"             , NA                                      , FALSE    , TRUE     , FALSE  , 1L          ,
+>    "ca_nmfs"    , "NMFS Core Area"           , "Core: 100"                             , TRUE     , FALSE    , TRUE   , 2L          ,
+>    "ch_nmfs"    , "NMFS Critical Habitat"    , "EN:100, TN:50"                         , TRUE     , FALSE    , TRUE   , 3L          ,
+>    "ch_fws"     , "FWS Critical Habitat"     , "EN:100, TN:50"                         , TRUE     , FALSE    , TRUE   , 4L          ,
+>    "rng_fws"    , "FWS Range"                , "EN:100, TN:50, LC:1"                   , TRUE     , FALSE    , TRUE   , 5L          ,
+>    "bl"         , "BirdLife Range"            , "CR:50, EN:25, VU:5, NT:2, LC:1, DD:1" , TRUE     , FALSE    , TRUE   , 6L          ,
+>    "rng_iucn"   , "IUCN Range"               , "CR:50, EN:25, VU:5, NT:2, LC:1, DD:1" , TRUE     , FALSE    , TRUE   , 7L          ,
+>    "ms_endemism", "Endemism (suitability)"   , "10=dispersed, 90=endemic"              , FALSE    , TRUE     , FALSE  , 10L         ,
+>    "ms_suit"    , "Merged Suitability"       , NA                                      , FALSE    , FALSE    , FALSE  , 11L         ,
+>    "ms_er"      , "Merged Extinction Risk"   , NA                                      , FALSE    , FALSE    , FALSE  , 12L         ,
+>    "ms_merge"   , "Final Merged Model"       , NA                                      , FALSE    , FALSE    , FALSE  , 0L
+>  )
+> 
+>  2. Fix BirdLife Range Map Values
+> 
+>  File: workflows/merge_models.qmd (new chunk before merge iteration)
+> 
+>  Currently BirdLife species all have model_cell.value = 50 regardless of redlist_code. Fix to match rng_iucn scheme:
+> 
+>  bl_value_map <- c(CR = 50L, EN = 25L, VU = 5L, NT = 2L, LC = 1L, DD = 1L)
+> 
+>  Batch update model_cell.value for all BirdLife models joining through model → species.redlist_code.
+> 
+>  Species counts: CR=3, DD=1, EN=17, LC=456, NT=52, VU=44
+> 
+>  3. Create Endemism Layer (ms_endemism)
+> 
+>  File: workflows/merge_models.qmd (new section)
+> 
+>  For each species with is_ok == TRUE:
+> 
+>  1. Determine the mask:
+>    - If species has rng_iucn: use union of all is_mask layers
+>    - If no rng_iucn: use union of ALL distributions as mask
+>  2. Count cells in Program Areas:
+>    - n_sp_cells = mask cells overlapping Program Areas
+>    - n_total_cells = total Program Area cells (constant)
+>  3. Log-scaled endemism (10 to 90):
+>  endemism <- round(pmax(10, pmin(90,
+>    10 + 80 * log(n_total_cells / n_sp_cells) / log(n_total_cells))))
+>  3. Approximate values: 1 cell → 90, 1K cells → ~60, 10K → ~43, 50% → ~22, all → 10
+>  4. Store: All cells in the species mask get the same endemism score. This is a species-level measure.
+> 
+>  Rationale for 10-90 range: Consider Rice's whale (Balaenoptera ricei) — the most critically endangered large whale in the US — which only has range maps
+>  (ch_nmfs, ca_nmfs, rng_iucn) and no SDM. Under a 1-50 scale, its small range would yield moderate endemism (~30-40) but the 50% ceiling would undervalue its
+>  suitability within its known range, especially given the high uncertainty around range maps for rare species. A 10-90 scale:
+>  - Floor of 10 (not 1): Even the most widespread species present throughout the study area should have meaningful suitability — being in a known range is
+>  stronger evidence than absence
+>  - Ceiling of 90 (not 50 or 100): Highly endemic species with tiny ranges likely have high suitability where they are found, though not 100% certainty since
+>  range maps have spatial uncertainty. The 90% ceiling gives highly endangered endemic species like Rice's whale a suitability value that, when combined with its
+>  ER of 100% (NMFS Endangered), produces an ms_merge close to 90 — appropriately reflecting the high concern
+>  - Compared to AquaMaps SDM which can reach 100%, endemism tops at 90% acknowledging that range-map-derived suitability carries more uncertainty than SDM
+>  predictions
+> 
+>  4. Create Merged Suitability Model (ms_suit)
+> 
+>  File: workflows/merge_models.qmd (new section)
+> 
+>  Per species, per cell: ms_suit = max(all is_suit layers for that cell)
+> 
+>  - Species with AquaMaps + ms_endemism: max(AquaMaps, endemism) per cell
+>  - Species with only ms_endemism: just endemism score
+>  - Apply IUCN-range mask (same as current ms_merge logic)
+>  - Values: integer 1-100
+> 
+>  5. Create Merged Extinction Risk Model (ms_er)
+> 
+>  File: workflows/merge_models.qmd (new section)
+> 
+>  Per species:
+> 
+>  1. Collect all is_er layers for this species
+>  2. Per cell: take value from highest-priority (lowest sort_order) ER layer
+>  3. Cells in distribution but with no ER layer coverage:
+>    - If species has any ER layers: assign max(er_score) across all its ER layer values
+>    - If species has no ER layers at all: assign scalar er_score from taxon.er_score (or 1 if NA)
+>  4. Apply same mask logic as ms_suit
+>  5. Values: integer 1-100
+> 
+>  6. Create Final Merged Model (ms_merge)
+> 
+>  File: workflows/merge_models.qmd (replaces current merge iteration)
+> 
+>  '# per cell
+>  ms_merge_value <- pmax(1L, pmin(100L, round(ms_suit * ms_er / 100)))
+> 
+>  The floor of 1 ensures species with low suitability × low ER (e.g., 1% × 1% = 0.01%) still appear on the map rather than rounding to 0 and disappearing.
+> 
+>  7. Update calc_scores.qmd
+> 
+>  File: workflows/calc_scores.qmd
+> 
+>  Scoring formula change: Since ms_merge already incorporates ER per cell, the extrisk metric calculation becomes:
+> 
+>  -- current (remove):
+>  ROUND(SUM(er.er_score * mc.value) / 100.0, 2) AS value
+> 
+>  -- new:
+>  ROUND(SUM(mc.value), 2) AS value
+>  -- where mc.mdl_seq is the ms_merge model for each species
+> 
+>  The zone_taxon calculation similarly simplifies:
+>  - Current: avg_suit * er_score / 100
+>  - New: avg_ms_merge_value / 100 (ER already incorporated)
+> 
+>  Add Future Considerations / TODO section near top of file:
+>  - Cell-level endemism / species richness metric: Currently species richness is implicitly captured by summing species layers per taxonomic group. A future
+>  enhancement could compute explicit richness or cell-level endemism metrics.
+>  - The distinction between "endemism" (range restriction) and "species richness" (how many species share a cell) — the former is a species-level property, the
+>  latter a cell-level property.
+> 
+>  8. Update app.R (mapsp)
+> 
+>  File: apps/mapsp/app.R
+> 
+>  - Add new datasets to query/display: ms_endemism, ms_suit, ms_er
+>  - Update layer selector grouping:
+>    - "Final Model" = ms_merge
+>    - "Derived" = ms_suit, ms_er, ms_endemism
+>    - "Input" = am_0.05, ca_nmfs, ch_nmfs, ch_fws, rng_fws, bl, rng_iucn
+>  - Update species_info sidebar to show new model hierarchy
+>  - The existing taxon_model junction table approach should work — just need to include new ds_keys
+> 
+>  9. Update schema.qmd
+> 
+>  File: workflows/schema.qmd
+> 
+>  - Add is_er, is_suit to sdm_expected$dataset
+>  - Update ERD mermaid diagram (dataset entity)
+>  - Add descriptions in infer_desc(): is_er = "dataset contains extinction risk data", is_suit = "dataset contains suitability data"
+> 
+>  10. Documentation Text
+> 
+>  Add markdown explanatory text in merge_models.qmd for each new section explaining:
+>  - Why suitability and ER are being separated
+>  - The endemism methodology (log scaling, 1-50 range, binary-to-suitability max of 50%)
+>  - The ER priority ordering rationale (US > Intl)
+>  - The ms_merge product formula and floor of 1
+>  - How this changes the scoring pipeline
+> 
+>  Files to Modify:
+> 
+>  - workflows/merge_models.qmd: Add is_er/is_suit columns, BirdLife fix, new ms_endemism/ms_suit/ms_er/ms_merge generation, documentation text
+>  - workflows/schema.qmd: Update expected schema, ERD diagram, column descriptions                                                       │
+>  - workflows/calc_scores.qmd: Change scoring formula, add Future Considerations section                                                      >  - apps/mapsp/app.R: Add new layers, update sidebar model hierarchy                                                                 │
+>  - msens/R/listings.R: compute_er_score() unchanged; used for scalar fallback in ms_er step 5.3                                       │
+>
+>  ---
+>  Verification
+> 
+>  1. BirdLife fix: Query model_cell for a known BirdLife species — confirm values changed from flat 50 to RL-code-appropriate
+>  2. Endemism: Spot-check Rice's whale (small range) → score near 90; a widespread species → near 10
+>  3. ms_suit: For an AquaMaps species, verify ms_suit = max(AquaMaps, endemism) per cell
+>  4. ms_er: For a species with ch_nmfs + rng_iucn, verify ch_nmfs values take priority in overlapping cells
+>  5. ms_merge: Verify = max(1, round(ms_suit × ms_er / 100)), values in 1-100, no zeros
+>  6. calc_scores: Compare old vs new cell_metric values — expect different magnitudes but similar spatial patterns
+>  7. App: Select species with multiple layers, verify all new layers display and switch correctly
+
+⏺ All changes are implemented. Here's a summary of what was done across all files:
+
+  Summary of Changes
+
+  workflows/merge_models.qmd (main changes)
+
+  1. Dataset metadata: Added is_suit and is_er boolean columns to the dataset
+  table. Updated metadata tribble with new columns and added rows for
+  ms_endemism, ms_suit, ms_er derived datasets.
+  2. BirdLife fix: New chunk updates model_cell.value from flat 50 to
+  redlist-code-appropriate values (CR:50, EN:25, VU:5, NT:2, LC:1, DD:1).
+  3. ms_endemism: New section creates log-scaled endemism layer (10-90) per
+  species based on range size relative to total Program Area cells.
+  4. ms_suit: New section creates merged suitability as max(all is_suit layers)
+  per cell, with IUCN mask when available.
+  5. ms_er: New section creates merged extinction risk using priority-ordered ER
+   layers (ca_nmfs > ch_nmfs > ch_fws > rng_fws > bl > rng_iucn), with fallback
+  to scalar er_score for species without ER layers.
+  6. ms_merge: Replaced old merge iteration with new formula: max(1, 
+  round(ms_suit * ms_er / 100)).
+
+  workflows/calc_scores.qmd
+
+  - Scoring formula: Changed from SUM(er.er_score * mc.value) / 100.0 to
+  SUM(mc.value) since ms_merge already incorporates ER per cell.
+  - zone_taxon: Simplified suit_rl = avg_suit (was avg_suit * er_score / 100).
+  - Future Considerations: Added section about cell-level endemism/species
+  richness.
+
+  workflows/schema.qmd
+
+  - Added is_suit and is_er to sdm_expected$dataset column list.
+  - Updated ERD mermaid diagram with is_suit, is_er, is_mask fields on dataset
+  entity.
+  - Added descriptions in infer_desc() for both new columns.
+
+  apps/mapsp/app.R
+
+  - Dataset query now includes is_suit and is_er columns.
+  - Layer grouping reorganized: "Final Model" / "Derived" (ms_suit, ms_er,
+  ms_endemism) / "Input" (am_0.05, ca_nmfs, etc.).
+  - Sidebar species_info shows new model hierarchy with Final Model at top, then
+   Derived layers, then Input layers.
+
+> * All changes are implemented. Here's a summary of what was done across all files:
+> 
+> '## Summary of Changes
+> 
+> '### `workflows/merge_models.qmd` (main changes)
+> 1. **Dataset metadata**: Added `is_suit` and `is_er` boolean columns to the `dataset` table. Updated metadata tribble with new columns and added rows for `ms_endemism`, `ms_suit`, `ms_er` derived datasets.
+> 2. **BirdLife fix**: New chunk updates `model_cell.value` from flat 50 to redlist-code-appropriate values (CR:50, EN:25, VU:5, NT:2, LC:1, DD:1).
+> 3. **ms_endemism**: New section creates log-scaled endemism layer (10-90) per species based on range size relative to total Program Area cells.
+> 4. **ms_suit**: New section creates merged suitability as `max(all is_suit layers)` per cell, with IUCN mask when available.
+> 5. **ms_er**: New section creates merged extinction risk using priority-ordered ER layers (ca_nmfs > ch_nmfs > ch_fws > rng_fws > bl > rng_iucn), with fallback to scalar `er_score` for species without ER layers.
+> 6. **ms_merge**: Replaced old merge iteration with new formula: `max(1, round(ms_suit * ms_er / 100))`.
+> 
+> '### `workflows/calc_scores.qmd`
+> - **Scoring formula**: Changed from `SUM(er.er_score * mc.value) / 100.0` to `SUM(mc.value)` since ms_merge already incorporates ER per cell.
+> - **zone_taxon**: Simplified `suit_rl = avg_suit` (was `avg_suit * er_score / 100`).
+> - **Future Considerations**: Added section about cell-level endemism/species richness.
+> 
+> '### `workflows/schema.qmd`
+> - Added `is_suit` and `is_er` to `sdm_expected$dataset` column list.
+> - Updated ERD mermaid diagram with `is_suit`, `is_er`, `is_mask` fields on `dataset` entity.
+> - Added descriptions in `infer_desc()` for both new columns.
+> 
+> '### `apps/mapsp/app.R`
+> - Dataset query now includes `is_suit` and `is_er` columns.
+> - Layer grouping reorganized: "Final Model" / "Derived" (ms_suit, ms_er, ms_endemism) / "Input" (am_0.05, ca_nmfs, etc.).
+> - Sidebar species_info shows new model hierarchy with Final Model at top, then Derived layers, then Input layers.
 
 ## 2026-02-13.c merge_models.qmd -> merge_models_prepare.qmd
-
+ 
 Presently `@merge_models.qmd` is a mess. It has a bunch of ad-hoc R chunks for updating data. I am about to redesign the merging of models in a drastic way and want to be able to Quarto render this document with tabular summaries as the step prior to score calculation in `@calc_scores.qmd`. Let's move non-essential sections and R chunks to `@merge_models_prepare.qmd` and provide summary information above each R chunk explaining it's purpose. Feel free to fold R chunks into reasonable level 2 and 3 headers for both `@merge_models.qmd` and `@merge_models_prepare.qmd`. Also debug for any inconsistencies and add conditional statements where needed, especially for ad-hoc updates, and/or use `#| eval: false` or `#| eval: !expr {some conditional}`.
 
 * Here's a summary of what was done:
 
-### `merge_models.qmd` (910 lines, 17 chunks) — Merge, Validate & Summarize
-- **Setup**: trimmed libraries, DB connection, section eval flags (`do_merge`, `do_is_ok`)
-- **Add Merged Dataset**: `insert_dataset_merged`, `dataset_metadata`, `iterate_merge_ds_mdl` (all `eval: !expr do_merge`)
-- **Set taxon.is_ok**: `taxon_is_ok` (`eval: !expr do_is_ok`)
-- **Taxon Summary**: always-eval export to CSV
-- **New read-only summary sections**: Dataset Summary, Species Summary (auth coverage, WoRMS marine/extinct), Taxon Table Summary (by sp_cat/is_ok, redlist, extrisk, n_ds), Taxon x Dataset Matrix, Taxon Detail Table (`DT::datatable`)
-
-### `merge_models_prep.qmd` (3488 lines, 46 chunks) — Data Preparation & Ingestion
-- 10 section eval flags controlling all mutating operations (all default `F`)
-- Organized into 12 major sections with descriptive headings
-- Read-only summary chunks (auth_sum, pct_worms, pivoted views) run unconditionally
-
-### Bug fixes applied in `merge_models_prep.qmd`:
-1. `is.(itis_id)` → `as.integer(itis_id)` (typo)
-2. `d_bird` undefined — comment added noting it should be `d_b`
-3. Duplicate chunk label `get fws_spp_lists` → renamed to `get_fws_spp_lists_2`
-4. Filter `%in% taxonomic_groups_exclude` keeps instead of excluding — comment added
-5. `dir_fws_spp` undefined — comment added
-6. `con_spp` reconnected without disconnecting — comment added
-7. `duckdb_unregister` before `duckdb_register` — wrapped early unregister in `try()`
+> '### `merge_models.qmd` (910 lines, 17 chunks) — Merge, Validate & Summarize
+> - **Setup**: trimmed libraries, DB connection, section eval flags (`do_merge`, `do_is_ok`)
+> - **Add Merged Dataset**: `insert_dataset_merged`, `dataset_metadata`, `iterate_merge_ds_mdl` (all `eval: !expr do_merge`)
+> - **Set taxon.is_ok**: `taxon_is_ok` (`eval: !expr do_is_ok`)
+> - **Taxon Summary**: always-eval export to CSV
+> - **New read-only summary sections**: Dataset Summary, Species Summary (auth coverage, WoRMS marine/extinct), Taxon Table Summary (by sp_cat/is_ok, redlist, extrisk, n_ds), Taxon x Dataset Matrix, Taxon Detail Table (`DT::datatable`)
+> 
+> '### `merge_models_prep.qmd` (3488 lines, 46 chunks) — Data Preparation & Ingestion
+> - 10 section eval flags controlling all mutating operations (all default `F`)
+> - Organized into 12 major sections with descriptive headings
+> - Read-only summary chunks (auth_sum, pct_worms, pivoted views) run unconditionally
+> 
+> '### Bug fixes applied in `merge_models_prep.qmd`:
+> 1. `is.(itis_id)` → `as.integer(itis_id)` (typo)
+> 2. `d_bird` undefined — comment added noting it should be `d_b`
+> 3. Duplicate chunk label `get fws_spp_lists` → renamed to `get_fws_spp_lists_2`
+> 4. Filter `%in% taxonomic_groups_exclude` keeps instead of excluding — comment added
+> 5. `dir_fws_spp` undefined — comment added
+> 6. `con_spp` reconnected without disconnecting — comment added
+> 7. `duckdb_unregister` before `duckdb_register` — wrapped early unregister in `try()`
 
 ## 2026-02-13.b + schema.qmd
 
@@ -4189,7 +4811,7 @@ the reference database for the prior version to compare against.
 
  Section 5: Combine and compute extrisk_code
 
- # priority: NMFS EN > FWS EN > NMFS TN > FWS TN > NMFS LC > FWS LC > IUCN
+ `# priority: NMFS EN > FWS EN > NMFS TN > FWS TN > NMFS LC > FWS LC > IUCN
  d_listing <- d_noaa |>
    full_join(d_fws, by = "worms_id") |>
    mutate(
@@ -4263,8 +4885,8 @@ the reference database for the prior version to compare against.
 
  con_ref <- DBI::dbConnect(duckdb::duckdb(
    dbdir = msens::sdm_db_path("2026-01-29"), read_only = TRUE))
- # compare old redlist_code distribution vs new extrisk_code
- # spot-check specific species
+ `# compare old redlist_code distribution vs new extrisk_code
+ `# spot-check specific species
 
  ---
  Part D: Modify merge_models.qmd
@@ -4551,7 +5173,7 @@ https://github.com/CrunchyData/pg_tileserv...
 
 * Function layers hide the source of data from the server, and allow the HTTP client to send in optional parameters to allow more complex SQL functionality. Any function of the form `function(z integer, x integer, y integer, ...)` that returns an MVT `bytea` result can serve as a function layer...
 
-### Function Layers
+` ### Function Layers
 
 By default, `pg_tileserv` will provide access to **only** those functions:
 
@@ -4563,7 +5185,7 @@ In addition, hopefully obviously, for the function to actually be **useful** it 
 
 Functions can also have additional parameters to control the generation of tiles: in fact, the whole reason for function layers is to allow **novel dynamic behaviour**.
 
-#### Function Layer Detail JSON
+`#### Function Layer Detail JSON
 
 In the detail JSON, each function declares information relevant to setting up a map interface for the layer. Because functions generate tiles dynamically, the system cannot auto-discover things like extent or center, unfortunately. However, the custom parameters and defaults can be read from the function definition and exposed in the detail JSON.
 ```json
@@ -4599,7 +5221,7 @@ In the detail JSON, each function declares information relevant to setting up a 
 * `minzoom` and `maxzoom` are just the defaults, as set in the configuration file.
 * `arguments` is a list of argument names, with the data type and default value.
 
-#### Function Layer Examples
+`#### Function Layer Examples
 
 ##### Filtering Example
 
