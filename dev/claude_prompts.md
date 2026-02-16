@@ -21,6 +21,257 @@
 
 - Migrate to hexagons
 
+## 2026-02-16.b update rng_iucn, bl cell values, before merge_model.qmd w/ is_mbta & is_mmpa applied spatially
+
+Before generating the fullly spatially resolved `ms_merge` model in `@merge_models.qmd`, it looks like we need to update the BirdLife (`bl`) and IUCN range maps (`rng_iucn`) to having cell values equivalent to the species `er_score`. Please first confirm by tabulating the values of these models, then adding a run-once chunk in `@merge_models_prep.qmd` to update these values accordingly. Also investigate and update the original creation of these layers, which I believe are in: `@ingest_birdlife.org_botw.qmd` and `@merge_models_prep.qmd` (`insert_rng_iucn_dataset_row` R chunk).
+
+Please outline next steps to update (eg which R chunks to run), and please review all files mentioned (and related) for developing an improved workflow to handle future dataset additions and ad-hoc changes.
+
+Actually, the species distribution models from IUCN (`rng_iucn`, all taxa except birds) and BirdLife International (`bl`, only birds) should both share the same set of IUCN Redlist codes in `species.redlist_code`. These codes should also be entered in `taxon.redlist_code` and are distinct from  `taxon.extrisk_code`, which takes the priority code combined from `taxon.esa_code` (national) > `taxon.redlist_code` (international). The national range datasets with extinction risk (ie `esa_code`) are managed seperately (eg `ca_nmfs`, `ch_nmfs`, `ch_fws`, `rng_fws`). All of these dataset models with an extinction risk score (plus AquaMaps `am_0.05` model) should be input into the `ms_merge` model to attain the max cell values.
+
+⏺ Updated plan  ⎿  /plan to preview                                   
+
+ Here is Claude's plan:
+
+ Plan: **Update BirdLife & IUCN Range Map Cell Values to IUCN Redlist Scores**
+
+ Context
+
+ The `ms_merge` model in `merge_models.qmd` takes the max value across all
+ datasets per species per cell. The scoring system has two tiers:
+
+ - **International (IUCN Redlist)** — used by `bl` and `rng_iucn`:
+ CR=50, EN=25, VU=5, NT=2, LC=1, DD=1
+
+ - **National (US ESA)** — used by `ca_nmfs`, `ch_nmfs`, `ch_fws`, `rng_fws`:
+ EN=100, TN=50, LC=1
+
+ `taxon.extrisk_code` combines these: `esa_code` (national) > `redlist_code`
+ (international), and `taxon.er_score` derives from `extrisk_code`. Each dataset
+ contributes its own authority-appropriate cell values to ms_merge.
+
+ Problem
+
+ - BirdLife (bl): All 573 species have cells hardcoded to 50
+ (ingest_birdlife.org_botw.qmd:247,702). An LC bird (should be 1) gets 50.
+
+ - IUCN Range (rng_iucn): Has an existing update chunk
+ (update_rng_iucn_to_redlist_value, merge_models_prep.qmd:3080-3162)
+ that maps species.redlist_code → IUCN scale. Need to verify it was run
+ and values are correct.
+
+ The dataset.value_info metadata already documents the correct mapping
+ ("CR:50, EN:25, VU:5, NT:2, LC:1, DD:1") for both datasets — the DB values
+ just need to match.
+
+ ---
+ Changes
+
+ 1. Add diagnostic chunk to tabulate current values
+
+ File: merge_models_prep.qmd — add after dataset_model_summary chunk (~line 112)
+ ```r
+ #| label: tabulate_mask_values
+
+ # summarize model_cell values for mask datasets (bl, rng_iucn)
+ for (ds in c("bl", "rng_iucn")) {
+   d <- tbl(con_sdm, "model_cell") |>
+     inner_join(
+       tbl(con_sdm, "model") |> filter(ds_key == !!ds),
+       by = "mdl_seq") |>
+     group_by(value) |>
+     summarize(
+       n_cells  = n(),
+       n_models = n_distinct(mdl_seq),
+       .groups  = "drop") |>
+     arrange(value) |>
+     collect()
+   message(glue("--- {ds} model_cell value distribution ---"))
+   print(d)
+ }
+ ```
+
+ 2. Generalize the redlist_code update to cover both bl and rng_iucn
+
+ File: merge_models_prep.qmd — replace the existing
+ update_rng_iucn_to_redlist_value chunk (lines 3080-3162) with a generalized
+ version that covers both bl and rng_iucn using a single efficient SQL
+ UPDATE per dataset.
+
+ New chunk update_mask_values_to_redlist_score:
+
+ ```r
+ #| label: update_mask_values_to_redlist_score
+ #| eval: !expr do_iucn_values
+
+ # update bl and rng_iucn model_cell values from species.redlist_code
+ # mapping: CR=50, EN=25, VU=5, NT=2, LC/DD/other=1
+ for (ds in c("bl", "rng_iucn")) {
+
+   # before: value distribution
+   d_before <- dbGetQuery(
+     con_sdm,
+     glue("
+       SELECT mc.value, COUNT(*) AS n_cells, COUNT(DISTINCT mc.mdl_seq) AS n_models
+       FROM model_cell mc
+       JOIN model m ON mc.mdl_seq = m.mdl_seq
+       WHERE m.ds_key = '{ds}'
+       GROUP BY mc.value
+       ORDER BY mc.value"))
+   message(glue("--- {ds} BEFORE update ---"))
+   print(tibble(d_before))
+
+   # bulk update using species.redlist_code
+   n_updated <- dbExecute(
+     con_sdm,
+     glue("
+       UPDATE model_cell
+       SET value = CASE s.redlist_code
+         WHEN 'CR' THEN 50
+         WHEN 'EN' THEN 25
+         WHEN 'VU' THEN  5
+         WHEN 'NT' THEN  2
+         ELSE 1 END
+       FROM model m
+       JOIN species s ON m.ds_key = s.ds_key AND m.taxa = s.taxa
+       WHERE model_cell.mdl_seq = m.mdl_seq
+         AND m.ds_key = '{ds}'
+         AND s.redlist_code IS NOT NULL"))
+   message(glue("Updated {ds}: {n_updated} model_cell rows"))
+
+   # after: value distribution
+   d_after <- dbGetQuery(
+     con_sdm,
+     glue("
+       SELECT mc.value, COUNT(*) AS n_cells, COUNT(DISTINCT mc.mdl_seq) AS n_models
+       FROM model_cell mc
+       JOIN model m ON mc.mdl_seq = m.mdl_seq
+       WHERE m.ds_key = '{ds}'
+       GROUP BY mc.value
+       ORDER BY mc.value"))
+   message(glue("--- {ds} AFTER update ---"))
+   print(tibble(d_after))
+ }
+ ```
+ 
+ Key differences from existing chunk:
+ - Covers both bl and rng_iucn (not just rng_iucn)
+ - Uses single SQL UPDATE per dataset (not R loop over each species)
+ - Joins model → species via (ds_key, taxa) to get redlist_code
+ - Before/after diagnostics built in
+
+ 3. Update original BirdLife ingestion for future runs
+
+ File: ingest_birdlife.org_botw.qmd
+
+ - Line 247: Change value = 50L to value = 1L with comment:
+ ```r
+ # placeholder; updated to redlist_code score by merge_models_prep.qmd
+  ```
+ - Line 702: Change value = 50L to value = 1L with same comment
+
+ 4. Update original IUCN ingestion default
+
+ File: merge_models_prep.qmd
+
+ - Line 2737: Change default_cell_value <- 50L to default_cell_value <- 1L
+ with comment:
+ ```r
+ # placeholder; updated to redlist_code score by update_mask_values_to_redlist_score
+ ```
+ 
+ 5. No changes to dataset.value_info metadata
+
+ The existing metadata in merge_models.qmd:124-125 is already correct:
+ "bl"       , "BirdLife Range"  , "CR:50, EN:25, VU:5, NT:2, LC:1, DD:1" , TRUE , 6L ,
+ "rng_iucn" , "IUCN Range"     , "CR:50, EN:25, VU:5, NT:2, LC:1, DD:1" , TRUE , 7L ,
+
+ ---
+ Steps to Run
+
+ After applying code changes:
+
+ 1. Set flags in merge_models_prep.qmd setup chunk:
+   - do_iucn_values <- TRUE
+   - All other flags remain FALSE
+ 2. Run chunks in merge_models_prep.qmd (in order):
+   - setup — connect to DB, load paths
+   - tabulate_mask_values — verify current state (expect bl=50 everywhere;
+ rng_iucn should show mix if previously updated, or 50 if not)
+   - update_mask_values_to_redlist_score — fix values (prints before/after)
+ 3. Run merge in merge_models.qmd:
+   - Set do_merge <- TRUE, do_is_ok <- TRUE
+   - Run all chunks to regenerate ms_merge
+ 4. Verify with spot checks (e.g., an LC bird should now have cell value=1
+ in bl, not 50)
+
+ Render both notebooks in sequence:
+
+```bash
+ cd /Users/bbest/Github/MarineSensitivity/workflows && \
+ quarto render merge_models_prep.qmd && quarto render merge_models.qmd
+```
+
+ Assuming flags already set:
+ - merge_models_prep.qmd: `do_iucn_values <- T` (others F)
+ - merge_models.qmd: `do_merge <- T, do_is_ok <- T`
+
+ The && ensures merge_models.qmd only runs if merge_models_prep.qmd succeeds.
+
+ ---
+ Files Modified
+ File: merge_models_prep.qmd
+ Change: Add tabulate_mask_values chunk; replace update_rng_iucn_to_redlist_value with generalized update_mask_values_to_redlist_score; change default_cell_value from 50 to 1
+ 
+ File: ingest_birdlife.org_botw.qmd
+ Change: Change hardcoded value = 50L to 1L (lines 247, 702)
+ 
+ File: merge_models.qmd
+ Change: No changes needed (metadata already correct)
+ 
+ Improved Workflow for Future Datasets
+
+ ```
+ ingest_birdlife.org_botw.qmd   (bl → model_cell with placeholder=1)
+          ↓
+ merge_models_prep.qmd:
+   1. build_taxon                (taxon + taxon_model tables)
+   2. taxon_redlist_code         (populates taxon.redlist_code)
+   3. taxon_listing_join         (computes extrisk_code, er_score from esa > redlist)
+   4. rng_iucn extraction        (rng_iucn → model_cell with placeholder=1)
+   5. add_rng_iucn_to_taxon      (links rng_iucn to taxon_model)
+   6. update_mask_values          (bl + rng_iucn → redlist_code score)  ← GENERALIZED
+          ↓
+ merge_models.qmd:
+   1. ms_merge                   (max across ALL datasets, masked by range when present)
+   2. taxon.is_ok                (flag valid taxa)
+ ```
+
+ For new international range datasets, add the ds_key to the for loop in
+ update_mask_values_to_redlist_score. National datasets (US ESA) manage their
+ own cell values during ingestion.
+
+⏺ All changes are clean and the file structure is intact. Here's a summary of what was done:
+
+  Files modified:
+
+  1. merge_models_prep.qmd (3 changes):
+    - Line 114-135: Added tabulate_mask_values diagnostic chunk after the dataset_model_summary section — summarizes current model_cell value distributions for bl and rng_iucn
+    - Line 3103-3157: Replaced update_rng_iucn_to_redlist_value (R loop over each species) with update_mask_values_to_redlist_score — single bulk SQL UPDATE per dataset covering both bl and rng_iucn, with before/after diagnostics
+    - Line 2760: Changed default_cell_value <- 50L to 1L for future IUCN range ingestion runs
+  2. ingest_birdlife.org_botw.qmd (2 changes):
+    - Line 247: Changed value = 50L to value = 1L (range polygon method)
+    - Line 702: Changed value = 50L to value = 1L (rasterized method)
+
+  To run the update, follow the steps in the plan:
+  1. Set do_iucn_values <- TRUE in the setup chunk
+  2. Run setup → tabulate_mask_values → update_mask_values_to_redlist_score
+  3. Then re-run merge_models.qmd with do_merge <- TRUE to regenerate ms_merge
+
+Write one liner to render both in sequence, but stop if first fails, in Terminal
+
+
+
 ## 2026-02-16 ah apps/mapsp != investigate_rice.qmd b/c mask to Program Areas
 
 Ah, I see the strange shape I observed for Rice's whale in the mapsp app for v3 current was actually because of masking to the Program Areas. To avoid confusion, let's more explicitly add "Mask:" with "Program Areas" as the default and "Ecoregions" as the alternative. This should be on the same line as "Select Species" (rename to "Species:").
@@ -282,23 +533,16 @@ For this v3b, the @../apps repository and specifically @../apps/mapsp/app.R were
  This backup should have the correct ca_nmfs/rng_iucn shapes for Rice's whale.
  - Each branch's libs/paths.R sets ver to point at its own database directory
  
- Files to modify
- ┌───────────┬───────────────────────┬──────────────────────────────────────────────────────────────┐ │   Repo    │         File          │                           Changes                            │
- ├───────────┼───────────────────────┼──────────────────────────────────────────────────────────────┤
- │ workflows │ libs/paths.R          │ New file — shared version/path config                        │
- ├───────────┼───────────────────────┼──────────────────────────────────────────────────────────────┤
- │ workflows │ merge_models.qmd      │ Revert v3b changes; add MMPA/MBTA spatial floors to ms_merge │
- ├───────────┼───────────────────────┼──────────────────────────────────────────────────────────────┤
- │ workflows │ merge_models_prep.qmd │ Source libs/paths.R instead of local version vars            │
- ├───────────┼───────────────────────┼──────────────────────────────────────────────────────────────┤
- │ workflows │ calc_scores.qmd       │ Revert scoring formula; source libs/paths.R                  │
- ├───────────┼───────────────────────┼──────────────────────────────────────────────────────────────┤
- │ workflows │ schema.qmd            │ Revert is_suit/is_er additions; source libs/paths.R          │
- ├───────────┼───────────────────────┼──────────────────────────────────────────────────────────────┤
- │ workflows │ Other .qmd files      │ Source libs/paths.R (6+ files use version vars)              │
- ├───────────┼───────────────────────┼──────────────────────────────────────────────────────────────┤
- │ apps      │ mapsp/app.R           │ Revert sidebar from Final/Derived/Input back to Values/Mask  │
- └───────────┴───────────────────────┴──────────────────────────────────────────────────────────────┘
+ Files to modify:
+
+ - workflows:libs/paths.R: New file — shared version/path config
+ - workflows:merge_models.qmd: Revert v3b changes; add MMPA/MBTA spatial floors to ms_merge
+ - workflows:merge_models_prep.qmd: Source libs/paths.R instead of local version vars
+ - workflows:calc_scores.qmd: Revert scoring formula; source libs/paths.R
+ - workflows:schema.qmd: Revert is_suit/is_er additions; source libs/paths.R
+ - workflows:Other .qmd files: Source libs/paths.R (6+ files use version vars)
+ - apps:mapsp/app.R: Revert sidebar from Final/Derived/Input back to Values/Mask
+
  ---
  Step 2: Create libs/paths.R
 
@@ -698,17 +942,12 @@ Everything else looks great!
 
  This prevents future corruption if rng_iucn is re-ingested with a new mdl_seq.
 
- ---
- Files to create/modify
- ┌────────────────────────────┬──────────────────────────────────────────────────────────────┐
- │            File            │                            Action                            │
- ├────────────────────────────┼──────────────────────────────────────────────────────────────┤
- │ investigate_ricei.qmd      │ New — diagnostic notebook                                    │
- ├────────────────────────────┼──────────────────────────────────────────────────────────────┤
- │ merge_models.qmd           │ Change taxa filter from is.na(mdl_seq) to is_ok              │
- ├────────────────────────────┼──────────────────────────────────────────────────────────────┤
- │ ingest_nmfs_core-areas.qmd │ Replace hardcoded iucn_mdl_seq <- 19014L with dynamic lookup │
- └────────────────────────────┴──────────────────────────────────────────────────────────────┘
+ Files to create/modify:
+
+ - investigate_ricei.qmd: New — diagnostic notebook
+ - merge_models.qmd: Change taxa filter from is.na(mdl_seq) to is_ok
+ - ingest_nmfs_core-areas.qmd: Replace hardcoded iucn_mdl_seq <- 19014L with dynamic lookup
+ 
  ---
  Verification
 

@@ -74,16 +74,16 @@ con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F))
 # [6] "species"     "zone"        "zone_cell"   "zone_metric"
 
 # section eval flags (set to TRUE to re-run) ----
-do_taxid_updates   <- F  # taxonomic ID resolution (worms, itis, gbif)
-do_adhoc_fixes     <- F  # manual species corrections
-do_resolve_dupes   <- F  # resolve duplicate IDs across datasets
-do_bird_botwid     <- F  # bird BOTW ID matching
-do_build_taxon     <- F  # build taxon + taxon_model tables
-do_reclassify      <- F  # reclassify turtles/reptiles
-do_redlist_listing <- F  # add redlist_code, extrisk_code, er_score
-do_iucn_insert     <- F  # add IUCN range maps dataset
-do_iucn_extract    <- F  # extract IUCN range rasters (long-running)
-do_iucn_values     <- F  # update IUCN model_cell values
+do_taxid_updates <- F # taxonomic ID resolution (worms, itis, gbif)
+do_adhoc_fixes <- F # manual species corrections
+do_resolve_dupes <- F # resolve duplicate IDs across datasets
+do_bird_botwid <- F # bird BOTW ID matching
+do_build_taxon <- F # build taxon + taxon_model tables
+do_reclassify <- F # reclassify turtles/reptiles
+do_redlist_listing <- F # add redlist_code, extrisk_code, er_score
+do_iucn_insert <- F # add IUCN range maps dataset
+do_iucn_extract <- F # extract IUCN range rasters (long-running)
+do_iucn_values <- T # update IUCN model_cell values
 ```
 
 ### Dataset and model summary
@@ -109,6 +109,31 @@ stopifnot(
     sum() ==
     0
 )
+```
+
+### Tabulate mask dataset values
+
+```{r}
+#| label: tabulate_mask_values
+
+# summarize model_cell values for mask datasets (bl, rng_iucn)
+for (ds in c("bl", "rng_iucn")) {
+  d <- tbl(con_sdm, "model_cell") |>
+    inner_join(
+      tbl(con_sdm, "model") |> filter(ds_key == !!ds),
+      by = "mdl_seq"
+    ) |>
+    group_by(value) |>
+    summarize(
+      n_cells = n(),
+      n_models = n_distinct(mdl_seq),
+      .groups = "drop"
+    ) |>
+    arrange(value) |>
+    collect()
+  message(glue("--- {ds} model_cell value distribution ---"))
+  print(d)
+}
 ```
 
 ## Taxonomic ID Updates
@@ -1039,6 +1064,7 @@ d_nb <- bind_rows(
 
 ```{r}
 #| label: notbirds_wormsid_ds_pivoted
+#| eval: !expr do_resolve_dupes
 # not birds, by dataset pivoted
 d_nb_ds <- d_nb |>
   group_by(worms_id) |>
@@ -1458,6 +1484,7 @@ d_b <- bind_rows(
 
 ```{r}
 #| label: birds_botwid_ds_pivoted
+#| eval: !expr do_bird_botwid
 d_b_ds <- d_b |>
   pivot_wider(
     id_cols = c(botw_id, n_ds),
@@ -2590,8 +2617,8 @@ taxonomic_groups_exclude <- c(
 
 # d_fws_spp <- read_csv(fws_spp_csv) |> janitor::clean_names()
 d_fws_spp <- d_fws_spp |>
-# BUG: filter below keeps groups named 'exclude' rather than excluding them;
-# should probably be: filter(!taxonomic_group %in% taxonomic_groups_exclude)
+  # BUG: filter below keeps groups named 'exclude' rather than excluding them;
+  # should probably be: filter(!taxonomic_group %in% taxonomic_groups_exclude)
   filter(taxonomic_group %in% taxonomic_groups_exclude) |> # excludes: 6,528 of 10,998
   mutate(
     scientific_name_clean = scientific_name |>
@@ -2734,7 +2761,7 @@ rng_shps <- list.files(
   full.names = T
 )
 flds_req <- c("sci_name", "marine", "yrcompiled", "category")
-default_cell_value <- 50L # TODO: redo based on IUCN categories? For now, only using as mask
+default_cell_value <- 1L # placeholder; updated to redlist_code score by update_mask_values_to_redlist_score
 sf_use_s2(F) # prevent invalid geometries, eg MAMMALS_MARINE_ONLY | Skipping invalid geometries with sci_name: Balaena mysticetus, Balaenoptera musculus, Balaenoptera physalus, Eschrichtius robustus, Monodon monoceros, Phocoena phocoena, Delphinus delphis
 
 d_taxon <- tbl(con_sdm, "taxon") |> collect()
@@ -2914,7 +2941,7 @@ for (i in 1:length(rng_shps)) {
 
 ```{r}
 #| label: insert_models_iucn_rng
-#| eval: !expr do_iucn_values
+#| eval: !expr do_iucn_extract
 # dbListFields(con_sdm, "model_cell") |> paste(collapse = ", ")
 # mdl_seq cell_id value
 # dbListFields(con_sdm, "model") |> paste(collapse = ", ")
@@ -3077,87 +3104,67 @@ for (i in 2:nrow(d_spp)) {
 
 ```
 
-### Update IUCN model_cell values to match er_score
+### Update bl & rng_iucn model_cell values to redlist score
 
 ```{r}
-#| label: update_rng_iucn_to_redlist_value
+#| label: update_mask_values_to_redlist_score
 #| eval: !expr do_iucn_values
 
-q_spp <- tbl(con_sdm, "species") |>
-  filter(ds_key == "rng_iucn")
-
-# q_spp |>
-#   pull(redlist_code) |>
-#   table()
-# CR  DD   EN     LC  NT  VU
-# 38  46  157  1,143  45  87
-# Note: keeping DD for masking and assigning LC score
-
-taxa <- q_spp |> pull(taxa) |> sort()
-
-d_smry <- tbl(con_sdm, "model") |>
-  filter(ds_key == "rng_iucn") |>
-  left_join(
-    tbl(con_sdm, "model_cell"),
-    by = join_by(mdl_seq)
-  ) |>
-  group_by(taxa) |>
-  summarize(
-    value = mean(value, na.rm = T)
-  ) |>
-  collect()
-table(d_smry$value)
-# BEFORE:
-#      50
-#   1,516
-# AFTER:
-#    20  40      60   80  100
-# 1,189  45      87  157   38
-# NEW before alignment with er_score
-#   OLD: CR:100/EN:80/VU:60/NT:40/LC:20/DD:20
-#   NEW: CR: 50/EN:25/VU: 5/NT: 2/LC: 1/DD:
-# NEW BEFORE: (interrupted at i=808)
-#    20  40  50  60   80  100
-#   537  29 806  60   62   21
-
-for (i in 1:length(taxa)) {
-  #
-  taxon = taxa[i] # taxon = "rng_iucn:Balaenoptera ricei"
-
-  mdl_seq <- tbl(con_sdm, "model") |>
-    filter(
-      ds_key == "rng_iucn",
-      taxa == !!taxon
-    ) |>
-    pull(mdl_seq)
-
-  cell_val <- q_spp |>
-    filter(
-      taxa == !!taxon
-    ) |>
-    mutate(
-      cell_value = case_match(
-        redlist_code,
-        # aligned with er_score from taxon_listing_join (v3 scoring)
-        "CR" ~ 50L, # critically endangered
-        "EN" ~ 25L, # endangered
-        "VU" ~ 5L, # vulnerable
-        "NT" ~ 2L, # near threatened
-        .default = 1L # LC, DD, etc.
-      )
-    ) |>
-    pull(cell_value)
-
-  message(glue(
-    "Updating taxa:'{taxon}' (mdl_seq:{mdl_seq}; {i}/{length(taxa)}) model_cells to value: {cell_val} ~ {Sys.time()}"
-  ))
-
-  dbExecute(
+# update bl and rng_iucn model_cell values from species.redlist_code
+# mapping: CR=50, EN=25, VU=5, NT=2, LC/DD/other=1
+for (ds in c("bl", "rng_iucn")) {
+  # before: value distribution
+  d_before <- dbGetQuery(
     con_sdm,
     glue(
-      "UPDATE model_cell SET value = {cell_val} WHERE mdl_seq = {mdl_seq}"
+      "
+      SELECT mc.value, COUNT(*) AS n_cells, COUNT(DISTINCT mc.mdl_seq) AS n_models
+      FROM model_cell mc
+      JOIN model m ON mc.mdl_seq = m.mdl_seq
+      WHERE m.ds_key = '{ds}'
+      GROUP BY mc.value
+      ORDER BY mc.value"
     )
   )
+  message(glue("--- {ds} BEFORE update ---"))
+  print(tibble(d_before))
+
+  # bulk update using species.redlist_code
+  n_updated <- dbExecute(
+    con_sdm,
+    glue(
+      "
+      UPDATE model_cell
+      SET value = CASE s.redlist_code
+        WHEN 'CR' THEN 50
+        WHEN 'EN' THEN 25
+        WHEN 'VU' THEN  5
+        WHEN 'NT' THEN  2
+        ELSE 1 END
+      FROM model m
+      JOIN species s ON m.ds_key = s.ds_key AND m.taxa = s.taxa
+      WHERE model_cell.mdl_seq = m.mdl_seq
+        AND m.ds_key = '{ds}'
+        AND s.redlist_code IS NOT NULL"
+    )
+  )
+  message(glue("Updated {ds}: {n_updated} model_cell rows"))
+
+  # after: value distribution
+  d_after <- dbGetQuery(
+    con_sdm,
+    glue(
+      "
+      SELECT mc.value, COUNT(*) AS n_cells, COUNT(DISTINCT mc.mdl_seq) AS n_models
+      FROM model_cell mc
+      JOIN model m ON mc.mdl_seq = m.mdl_seq
+      WHERE m.ds_key = '{ds}'
+      GROUP BY mc.value
+      ORDER BY mc.value"
+    )
+  )
+  message(glue("--- {ds} AFTER update ---"))
+  print(tibble(d_after))
 }
 ```
 
