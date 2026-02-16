@@ -1,16 +1,16 @@
 ## 2026-02-? TODO:
 
-- IUCN: apply spatially, eg Laysan albatross
+- [ ] calc_scores.qmd: do_zone_taxon=T, do_parquet=T
 
-- Migrate from pg_tileserv to PMTiles, see:
+- [ ] Migrate from pg_tileserv to PMTiles, see:
   - [Creating PMTiles | Protomaps Docs](https://docs.protomaps.com/pmtiles/create)
   - [CalCOFI README_PLAN](https://calcofi.io/workflows/README_PLAN.html)
 
-- Automate server updates:
+- [ ] Automate server updates:
   - Upload sdm.duckdb to v3/ on server (scp or rsync)
   - Update any Shiny Server config if app paths changed
 
-- Generate GD:data/derived/v3/`README.md` from NEW generate_outputs.qmd
+- [ ] Generate GD:data/derived/v3/`README.md` from NEW generate_outputs.qmd
   - merges output generation from @`calc_scores.qmd` and @`msens-summary_programareas.qmd`
   - to be run after calc_scores.qmd
   - Differentitate in `README.md`:
@@ -19,7 +19,19 @@
     - Figures (*.png, *.pdf)
     - Big files (): too big for Google Drive, internally used
 
+- Migrate to PMTiles off Postgres
+
 - Migrate to hexagons
+
+## 2026-02-16.c
+
+```bash
+cd /Users/bbest/Github/MarineSensitivity/workflows
+quarto render calc_scores.qmd && \
+quarto render msens-summary_programareas.qmd && \
+quarto render render_derived_products.qmd # only for reporting 
+```
+
 
 ## 2026-02-16.b update rng_iucn, bl cell values, before merge_model.qmd w/ is_mbta & is_mmpa applied spatially
 
