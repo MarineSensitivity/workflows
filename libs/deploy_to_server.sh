@@ -16,8 +16,8 @@ SSH_HOST="ubuntu@msens1.marinesensitivity.org"
 
 # local paths ----
 DIR_V="$HOME/My Drive/projects/msens/data/derived/${VER}/"
-DIR_BIG="$HOME/_big/msens/derived/${VER}/"
-DIR_SHARED="$HOME/My Drive/projects/msens/data/derived/r_bio-oracle_planarea.tif"
+DB_BIG="$HOME/_big/msens/derived/${VER}/sdm.duckdb"
+TIF_SHARED="$HOME/My Drive/projects/msens/data/derived/r_bio-oracle_planarea.tif"
 
 # remote paths ----
 REMOTE_DERIVED="/share/data/derived"
@@ -32,16 +32,16 @@ if [[ "$MODE" == "all" || "$MODE" == "data" ]]; then
     "$DIR_V" \
     "$SSH_HOST:$REMOTE_DERIVED/${VER}/"
 
-  echo "=== syncing _big/${VER}/ (sdm.duckdb) to /share/data/big/${VER}/ ==="
+  echo "=== syncing _big/${VER}/sdm.duckdb to /share/data/big/${VER}/ ==="
   rsync -avz --progress \
     -e "ssh -i \"$SSH_KEY\"" \
-    "$DIR_BIG" \
+    "$DB_BIG" \
     "$SSH_HOST:$REMOTE_BIG/${VER}/"
 
-  echo "=== syncing shared input raster ==="
+  echo "=== syncing shared input raster `basename "$TIF_SHARED"` to derived/${VER}/ ==="
   rsync -avz --progress \
     -e "ssh -i \"$SSH_KEY\"" \
-    "$DIR_SHARED" \
+    "$TIF_SHARED" \
     "$SSH_HOST:$REMOTE_DERIVED/"
 fi
 

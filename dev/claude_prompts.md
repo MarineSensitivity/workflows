@@ -406,7 +406,24 @@ cd /Users/bbest/Github/MarineSensitivity/workflows
 quarto render calc_scores.qmd
 ```
 
+I'm getting an error
+80/91 [generate_readme]                                
+Error in `loadNamespace()`:
+! there is no package called 'quarto'
+Backtrace:
+    ▆
+ 1. └─base::loadNamespace(x)
+ 2.   └─base::withRestarts(stop(cond), retry_loadNamespace = function() NULL)
+ 3.     └─base (local) withOneRestart(expr, restarts[[1L]])
+ 4.       └─base (local) doWithOneRestart(return(expr), restart)
+
+Quitting from calc_scores.qmd:3892-3963 [generate_readme]
+Execution halted
+WARN: Error encountered when rendering files
+
 TODO: uncomment default, rm these
+
+
 
 ## 2026-02-16.c quarto render calc_scores, msens-summary_programareas, render_derived_products.qmd
 
