@@ -1,6 +1,18 @@
 ## 2026-02-? TODO:
 
+- [ ] check dir_v: files not updated -- unused vs ungenerated?
+- [ ] run deploy_v3.sh
+- [ ] msens-summary_programareas.qmd: one flower plot version, get center score to mask out
+
+- [ ] update /docs to match current state, updated final report:
+  - max of all datasets.
+  - is_mmpa (20), is_mbta (10)
+  - if rng_iucn, then mask with all ca/ch/rng_* 
+  - Reflects best available information on priorities for US env concern. Not a comprehensive suitability atlas (yet) on.
+
 - [ ] calc_scores.qmd: do_zone_taxon=T, do_parquet=T
+
+- [ ] add icons to edges of flower plots
 
 - [ ] Migrate from pg_tileserv to PMTiles, see:
   - [Creating PMTiles | Protomaps Docs](https://docs.protomaps.com/pmtiles/create)
@@ -19,11 +31,35 @@
     - Figures (*.png, *.pdf)
     - Big files (): too big for Google Drive, internally used
 
-- Migrate to PMTiles off Postgres
-
 - Migrate to hexagons
 
-## 2026-02-16.c
+
+## 2026-02-16.c check derived/v3 files, mv sens-summary_programareas.qmd -> calc_scores.qmd, rm render_derived_products.qmd
+
+Here are the files not updated Today in `@~/My Drive/projects/msens/data/derived/v3` (ie `dir_v` set in `@libs/paths.R`) after rendering `@calc_scores.qmd`, `@msens-summary_programareas.qmd` and `@render_derived_products.qmd`:
+
+```
+README.html
+README.md
+ply_ecoregion_programarea_v3.gpkg
+ply_ecoregions_2025.gpkg
+ply_label_placement_pra.csv
+ply_ecoregion_programarea_v3.csv
+zone_taxon_v3.csv
+subregion_programareas.csv
+```
+
+The `README.md` was generated via Claude once. Let's write the md and rendered html as part of our regular model version output process. Make the writing programmatic (so files included and filenames can change in future iterations).
+
+Besides the `README.md`, was a flag not set to generate these or have they become obsolete? We want all outputs needed for BOEM staff and for the apps (@../apps/mapsp/app.R, @../apps/mapgl/app.R) to be updated 
+
+Let's move `@msens-summary_programareas.qmd` to `@calc_scores.qmd` with extra flags set for generating different categories of outputs, with default = `T`. Please confirm the `@render_derived_products.qmd` is simply descriptive and can be removed without any functional loss.
+
+Also add a flag and section for `deploy_to_server <- F` (default) to execute the @deploy_v3.sh, which should be moved to @libs/deploy_to_server.sh and arguments added for version to deploy.
+
+
+
+## 2026-02-16.c quarto render calc_scores...
 
 ```bash
 cd /Users/bbest/Github/MarineSensitivity/workflows
@@ -31,7 +67,6 @@ quarto render calc_scores.qmd && \
 quarto render msens-summary_programareas.qmd && \
 quarto render render_derived_products.qmd # only for reporting 
 ```
-
 
 ## 2026-02-16.b update rng_iucn, bl cell values, before merge_model.qmd w/ is_mbta & is_mmpa applied spatially
 
@@ -41,7 +76,8 @@ Please outline next steps to update (eg which R chunks to run), and please revie
 
 Actually, the species distribution models from IUCN (`rng_iucn`, all taxa except birds) and BirdLife International (`bl`, only birds) should both share the same set of IUCN Redlist codes in `species.redlist_code`. These codes should also be entered in `taxon.redlist_code` and are distinct from  `taxon.extrisk_code`, which takes the priority code combined from `taxon.esa_code` (national) > `taxon.redlist_code` (international). The national range datasets with extinction risk (ie `esa_code`) are managed seperately (eg `ca_nmfs`, `ch_nmfs`, `ch_fws`, `rng_fws`). All of these dataset models with an extinction risk score (plus AquaMaps `am_0.05` model) should be input into the `ms_merge` model to attain the max cell values.
 
-⏺ Updated plan  ⎿  /plan to preview                                   
+⏺ Updated plan
+ ⎿  /plan to preview                                   
 
  Here is Claude's plan:
 
