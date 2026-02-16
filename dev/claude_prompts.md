@@ -2,7 +2,8 @@
 
 - [ ] check dir_v: files not updated -- unused vs ungenerated?
 - [ ] run deploy_v3.sh
-- [ ] msens-summary_programareas.qmd: one flower plot version, get center score to mask out
+
+- [ ] flower plot mv from calc_scores.qmd to msens::plot_flower() and msens:plot_flowers()
 
 - [ ] update /docs to match current state, updated final report:
   - max of all datasets.
@@ -34,7 +35,7 @@
 - Migrate to hexagons
 
 
-## 2026-02-16.c check derived/v3 files, mv sens-summary_programareas.qmd -> calc_scores.qmd, rm render_derived_products.qmd
+## 2026-02-16.d check derived/v3 files, mv sens-summary_programareas.qmd -> calc_scores.qmd, rm render_derived_products.qmd
 
 Here are the files not updated Today in `@~/My Drive/projects/msens/data/derived/v3` (ie `dir_v` set in `@libs/paths.R`) after rendering `@calc_scores.qmd`, `@msens-summary_programareas.qmd` and `@render_derived_products.qmd`:
 
@@ -57,9 +58,357 @@ Let's move `@msens-summary_programareas.qmd` to `@calc_scores.qmd` with extra fl
 
 Also add a flag and section for `deploy_to_server <- F` (default) to execute the @deploy_v3.sh, which should be moved to @libs/deploy_to_server.sh and arguments added for version to deploy.
 
+←  ☐ Label file  ☐ HTML report  ✔ Submit  →
+
+**Label file**. The `ply_label_placement_pra.csv` is initially auto-generated but then manually edited for label positioning. Should it always 
+regenerate (losing manual edits) or keep the `if (!file.exists())` guard so manual edits persist?
+                                                                     
+❯ 1. Keep guard (Recommended)
+     Only generate if missing — preserves manual label position edits
+  2. Always regenerate
+     Overwrite on every run — manual edits will be lost   
+
+**HTML report**. The `msens-summary_programareas.qmd` currently also renders as a standalone HTML report with inline maps/tables. After merging into
+ calc_scores.qmd, that HTML report won't exist. Is that OK, or should we keep msens-summary as a thin rendering wrapper?         
+                                                                                              
+❯ 1. Drop it (Recommended)                                                                                                       
+     File outputs (PNGs, DOCXs, CSVs) in dir_v are sufficient — no need for inline HTML report                            
+  2. Keep thin wrapper                                      
+     Keep msens-summary_programareas.qmd as a minimal file that sources/renders just the summary sections from calc_scores       
+ 
+←  ☒ Flag design  ☐ Ecoregions gpkg  ✔ Submit  →                                                                                
+                                                                                                                                 
+The unversioned `ply_ecoregions_2025.gpkg` in v3/ appears to be a leftover (code reads ecoregions from v2/). I plan to add a 
+proper versioned export (`ply_ecoregions_2025_v3.gpkg`) to the downloads chunk and delete the unversioned copy. Does that sound  
+right, or is the unversioned file there intentionally?                                                        
+                                                            
+  1. Yes, add versioned export + delete old                                                                                      
+     Add ply_ecoregions_2025_v3.gpkg export from PostGIS to downloads chunk; remove the unversioned leftover
+  2. Keep as-is, just document                                                                                                   
+     The unversioned file may be intentional; just document it in the README
+❯ 3. Since the ecoregions are not getting metrics appended to model the suffix gets 
+     dropped: ply_ecoregions_2025.gpkg. This is more of an input that does not get                                               
+     modified, but is needed by the apps, so let's include it to ensure its in the                                               
+     dir_v    
+
+RE: "Add er_gpkg_v3 path variable" (`er_gpkg_v3 <- glue("{dir_v}/ply_ecoregions_2025{v_sfx}.gpkg")`). Since the ecoregions are not getting metrics appended to model, the suffix gets dropped: `ply_ecoregions_2025.gpkg`. This is more of an input (ie copy of `er_raw_gpkg`) that does not get modified, but is needed by the apps, so let's include it to ensure its in the `dir_v`.
+
+⏺ Plan is now complete with all requested features. Let me submit it for approval.
+
+ Ready to code?
+
+ Here is Claude's plan:
+
+ Plan: Merge msens-summary into calc_scores + Programmatic README
+
+ Context
+
+ After rendering calc_scores.qmd, msens-summary_programareas.qmd, and render_derived_products.qmd, 8 files in dir_v were not
+ updated. This is due to: flags set to F (do_zones, do_zone_taxon), if (!file.exists()) guards that skip regeneration, a missing
+  copy step, and hand-written files (README). The goal is to:
+
+ 1. Consolidate the two-notebook workflow into one (calc_scores.qmd) with category flags (default T)
+ 2. Add programmatic README.md/html generation
+ 3. Remove the purely-descriptive render_derived_products.qmd
+
+ Files Not Updated — Diagnosis
+
+ File: README.md
+ Source: Hand-written
+ Why not updated: No code generates it
+ Action: Add do_readme flag
+ ────────────────────────────────────────
+ File: README.html
+ Source: Hand-written
+ Why not updated: No code generates it
+ Action: Generated from README.md
+ ────────────────────────────────────────
+ File: ply_ecoregion_programarea_v3.gpkg
+ Source: msens-summary read_plys
+ Why not updated: if (!file.exists()) guard
+ Action: Merge with do_summary_data + redo pattern
+ ────────────────────────────────────────
+ File: ply_ecoregions_2025.gpkg
+ Source: Input (no metrics appended)
+ Why not updated: Not copied to dir_v during downloads
+ Action: Add copy from v2/ to dir_v in downloads chunk
+ ────────────────────────────────────────
+ File: ply_label_placement_pra.csv
+ Source: msens-summary ply_lbl_pts
+ Why not updated: if (!file.exists()) guard
+ Action: Merge with do_summary_data (keep file-exists guard — manually adjusted)
+ ────────────────────────────────────────
+ File: ply_ecoregion_programarea_v3.csv
+ Source: msens-summary read_plys
+ Why not updated: if (!file.exists()) guard
+ Action: Merge with do_summary_data + redo pattern
+ ────────────────────────────────────────
+ File: zone_taxon_v3.csv
+ Source: calc_scores zone_taxon
+ Why not updated: do_zone_taxon = F
+ Action: Keep flag — slow, ancillary for mapgl
+ ────────────────────────────────────────
+ File: subregion_programareas.csv
+ Source: calc_scores zones section
+ Why not updated: do_zones = F
+ Action: Keep flag — stable once zones defined
+
+ render_derived_products.qmd — Confirmed Removable
+
+ - All code chunks have eval: false — purely instructional
+ - References stale chunk names (e.g., update_cached_downloads doesn't exist)
+ - Replaced by: inline docs in calc_scores.qmd + programmatic README + derived_products.csv
+ - Action: git rm the file
+
+ Implementation
+
+ Step 1: Add new flags to calc_scores.qmd setup chunk
+
+ File: workflows/calc_scores.qmd (lines 96-103)
+
+ Add after existing flags:
+
+ ```r
+ # summary/visualization flags (merged from msens-summary_programareas.qmd)
+ do_summary_data <- T  # ecoregion × PRA intersections, label points, score tables
+ do_summary_figs <- T  # maps, flower plots, primprod charts, Word/Excel tables
+ do_readme       <- T  # programmatic README.md + README.html
+ ```
+ 
+ Also add redo flags (alongside existing redo_dl in downloads chunk):
+
+ ```r
+ redo_summary_data <- T
+ redo_summary_figs <- T
+ ```
+
+ Add new output path variables (after line 113):
+
+ ```r
+ # summary outputs
+ er_pra_gpkg  <- glue("{dir_v}/ply_ecoregion_programarea{v_sfx}.gpkg")
+ er_pra_csv   <- glue("{dir_v}/ply_ecoregion_programarea{v_sfx}.csv")
+ er_pra_n_csv <- glue("{dir_v}/tbl_er_pra_scores{v_sfx}.csv")
+ pra_n_csv    <- glue("{dir_v}/tbl_pra_scores{v_sfx}.csv")
+ lbls_csv     <- glue("{dir_v}/ply_label_placement_pra.csv")
+ dir_figs     <- here(glue("figs/msens-summary_programareas{v_sfx}"))
+ ```
+
+ Step 2: Add extra packages to setup chunk
+
+ File: workflows/calc_scores.qmd (lines 57-75)
+
+ Add packages that msens-summary uses but calc_scores doesn't:
+
+ ```r
+ flextable, ftExtra, ggiraph, ggplot2, gt, htmlwidgets,
+ kableExtra, knitr, mapgl, mapview, openxlsx, RColorBrewer,
+ scales, shiny, units, webshot2, bslib
+ ```
+
+ Also add conditional mapbox token + dir_figs setup:
+
+ ```r
+ if (do_summary_figs) {
+   mapbox_tkn_txt <- glue("{dir_private}/mapbox_token_bdbest.txt")
+   Sys.setenv(MAPBOX_PUBLIC_TOKEN = readLines(mapbox_tkn_txt))
+   librarian::shelf(mapgl, quiet = T)
+   dir_create(dir_figs)
+ }
+ ```
+
+ Step 3: Add plot_flower() function
+
+ File: workflows/calc_scores.qmd
+
+ Insert the plot_flower() function from msens-summary (lines 98-195) into calc_scores.qmd after the existing # helper functions
+ ---- section (around line 120).
+
+ Step 4: Copy ecoregion gpkg to dir_v in downloads chunk
+
+ File: workflows/calc_scores.qmd (downloads chunk, line 2385)
+
+ Ecoregion polygons don't get metrics appended, so no version suffix. Copy from v2/ source to dir_v:
+ 
+ ```r
+ # * er_gpkg (input, no metrics — just copy to dir_v) ----
+ er_gpkg_dst <- glue("{dir_v}/ply_ecoregions_2025.gpkg")
+ if (!file.exists(er_gpkg_dst)) {
+   message("Copying ecoregion gpkg to dir_v...")
+   file_copy(er_raw_gpkg, er_gpkg_dst)
+ }
+ ```
+
+ Add er_gpkg_dst to the redo_dl deletion list.
+
+ Step 5: Insert merged summary data section
+
+ File: workflows/calc_scores.qmd
+
+ Insert after "Generate downloads" section, before "Map score cells":
+
+ `## Summary data products ----
 
 
-## 2026-02-16.c quarto render calc_scores...
+ Chunks from msens-summary, each with #| eval: !expr do_summary_data:
+
+ 1. summary_data_redo: Delete existing files if redo_summary_data = T (except lbls_csv)
+ 2. read_plys (msens-summary lines 198-260): Ecoregion × PRA intersection → er_pra_gpkg, er_pra_csv
+ 3. ply_lbl_pts (msens-summary lines 261-309): Label placement → lbls_csv (keep if (!file.exists()) guard since manually
+ adjusted)
+ 4. pra_score_table (msens-summary lines 728-821): Score tables → er_pra_n_csv, pra_n_csv
+
+ Step 6: Insert merged summary figs section
+
+ File: workflows/calc_scores.qmd
+
+ Insert after "Summary data products":
+
+ `## Summary figures and tables ----
+
+
+ Chunks from msens-summary, each with #| eval: !expr do_summary_figs:
+
+ 1. map_imgs_pra_ply_l48_ak (lines 314-492): PRA boundary maps (PNG)
+ 2. map_imgs_cell_l48_ak (lines 494-727): Cell score + NPP maps (PNG)
+ 3. flextable_er_pra (lines 825-868): Ecoregion × PRA table (docx)
+ 4. flextable_pra (lines 873-938): PRA table (docx + xlsx)
+ 5. plot_programarea_flowers (lines 943-1154): Flower plots (5 themes × 2 formats)
+ 6. plot_primprod (lines 1159-1257): Primary productivity charts
+ 7. copy_figs_to_dir_v (lines 1262-1271): Copy local figs/ → dir_v/
+
+ Step 7: Add programmatic README generation
+
+ File: workflows/calc_scores.qmd
+
+ Insert after summary figs section:
+ 
+ ```yaml
+ #| label: generate_readme
+ #| eval: !expr do_readme
+ ```
+
+ Implementation:
+ - Read data/derived_products.csv for file descriptions
+ - List actual files in dir_v via fs::dir_ls()
+ - Build markdown table matching filenames to descriptions
+ - Write README.md to dir_v
+ - Render to README.html via quarto::quarto_render()
+ - Include: version info, naming conventions, file listing with descriptions, big-files reference, generation timestamp
+
+ Step 8: Remove render_derived_products.qmd
+
+ git rm workflows/render_derived_products.qmd
+
+
+ Step 9: Update derived_products.csv
+
+ Update data/derived_products.csv to reflect:
+ - ply_ecoregions_2025.gpkg is listed as a copy-to-dir_v step (source: calc_scores.qmd, chunk: downloads)
+ - Summary outputs now sourced from calc_scores.qmd (not msens-summary_programareas.qmd)
+ - README.md and README.html are listed as outputs
+
+ Key Adaptations When Moving Code
+
+ - Remove duplicate source(here("libs/db.R")) — calc_scores already has PostGIS con
+ - Remove duplicate con_sdm <- dbConnect(...) — calc_scores already has con_sdm
+ - Replace sdm_dd with sdm_db (existing variable)
+ - Replace msens-summary's er_gpkg with calc_scores' er_raw_gpkg (both point to v2/)
+ - Compute sp_cats vector once in setup, reuse in summary chunks
+
+ Final section order in calc_scores.qmd
+
+ 1. Setup (packages, paths, flags, helpers incl. plot_flower())
+ 2. Add Zones (do_zones)
+ 3. Calculate Metrics (do_metrics)
+ 4. Add/update zone_taxon (do_zone_taxon)
+ 5. Update PostGIS layers (do_postgis)
+ 6. Generate downloads (do_downloads) — now includes ecoregion gpkg copy
+ 7. Summary data products (do_summary_data) — NEW
+ 8. Summary figures and tables (do_summary_figs) — NEW
+ 9. Generate README (do_readme) — NEW
+ 10. Map score cells (do_map)
+ 11. Parquet export/import (do_parquet)
+ 12. Close Connection
+
+ Verification
+
+ 1. Set all flags to T and run calc_scores.qmd interactively (chunk by chunk)
+ 2. Confirm all files in dir_v have today's date: fs::dir_info(dir_v) |> select(path, modification_time)
+ 3. Confirm README.md and README.html are generated with correct file listings
+ 4. Confirm ply_ecoregions_2025.gpkg is copied to dir_v (refreshed when redo_dl = T)
+ 5. Confirm apps still work: run mapgl/app.R and mapsp/app.R locally
+ 6. Confirm render_derived_products.qmd is removed from git
+
+⏺ Here's a summary of everything that was done:                                                                                  
+                                                                     
+  Changes Made                                                                                                                   
+                                                                      
+  calc_scores.qmd — Main modifications:
+
+  1. Setup chunk: Added 17 extra packages from msens-summary (flextable, ggiraph, ggplot2, gt, mapgl, openxlsx, RColorBrewer,
+  scales, units, webshot2, etc.)
+  2. Flags: Added do_summary_data, do_summary_figs, do_readme, do_deploy (defaults T/T/T/F) and redo flags redo_summary_data,
+  redo_summary_figs
+  3. Output paths: Added er_pra_gpkg, er_pra_csv, er_pra_n_csv, pra_n_csv, lbls_csv, dir_figs
+  4. Helper functions: Added plot_flower() function and conditional mapbox token setup
+  5. Downloads chunk: Added er_gpkg_dst (copies ply_ecoregions_2025.gpkg from v2/ to dir_v) with redo support
+  6. Summary data products section (already from prior session): read_plys, ply_lbl_pts, pra_score_table chunks
+  7. Summary figures section (new): Added summary_figs_redo chunk + all figure/table chunks: map_imgs_pra_ply_l48_ak,
+  map_imgs_cell_l48_ak, flextable_er_pra, flextable_pra, plot_programarea_flowers, plot_primprod, copy_figs_to_dir_v
+  8. Generate README section (already from prior session): Programmatic README.md/html generation
+  9. Deploy section (new): Calls parameterized libs/deploy_to_server.sh
+
+  New file:
+
+  - libs/deploy_to_server.sh — Parameterized deploy script accepting version as first arg
+
+  Removed files:
+
+  - deploy_v3.sh — Replaced by parameterized version
+  - msens-summary_programareas.qmd — Merged into calc_scores.qmd
+  - render_derived_products.qmd — Purely descriptive, replaced by inline docs + README
+  - _output/msens-summary_programareas.html + support files — Stale outputs
+  - _output/render_derived_products.html — Stale output
+
+  Updated:
+
+  - data/derived_products.csv — All sources now reference calc_scores.qmd (already from prior session)
+
+  Fixed:
+
+  - README template referenced undefined v_dir variable — changed to ver
+
+
+TODO: render `calc_scores.qmd` with NEW flags:
+```r
+# NEW
+do_summary_data <-T
+do_summary_figs <-T
+do_readme <-T
+do_deploy <-T
+
+# ENTERED
+do_metrics <- F # YES
+do_zone_taxon <- T # no, b/c slow and ancillary for mapgl
+do_postgis <- T # YES
+do_downloads <- T # YES
+do_summary_data <- T # ecoregion x PRA intersections, label points, score tables
+do_summary_figs <- T # maps, flower plots, primprod charts, Word/Excel tables
+do_readme <- T # programmatic README.md + README.html
+do_map <- T # no, but useful for visual checks during development
+do_parquet <- T # no, but produces smaller faster duckdb
+do_deploy <- T # sync derived data + app code to server
+```
+
+```bash
+cd /Users/bbest/Github/MarineSensitivity/workflows
+quarto render calc_scores.qmd
+```
+
+TODO: uncomment default, rm these
+
+## 2026-02-16.c quarto render calc_scores, msens-summary_programareas, render_derived_products.qmd
 
 ```bash
 cd /Users/bbest/Github/MarineSensitivity/workflows
