@@ -1,5 +1,7 @@
 ## 2026-02-? TODO:
 
+- IUCN: apply spatially, eg Laysan albatross
+
 - Migrate from pg_tileserv to PMTiles, see:
   - [Creating PMTiles | Protomaps Docs](https://docs.protomaps.com/pmtiles/create)
   - [CalCOFI README_PLAN](https://calcofi.io/workflows/README_PLAN.html)
@@ -18,6 +20,129 @@
     - Big files (): too big for Google Drive, internally used
 
 - Migrate to hexagons
+
+## 2026-02-16 ah apps/mapsp != investigate_rice.qmd b/c mask to Program Areas
+
+Ah, I see the strange shape I observed for Rice's whale in the mapsp app for v3 current was actually because of masking to the Program Areas. To avoid confusion, let's more explicitly add "Mask:" with "Program Areas" as the default and "Ecoregions" as the alternative. This should be on the same line as "Select Species" (rename to "Species:").
+
+Let's also update the layer stacking of the map: Program Areas (white outlines) > Ecoregions (black outlines) > raster layer.
+
+⏺ Updated plan                  
+  ⎿  /plan to preview                                                      
+                                                            
+ Here is Claude's plan:
+ Plan: Add Mask Selector to mapsp App                                      
+
+ Context
+
+ The mapsp Shiny app (apps/mapsp/app.R) masks species raster data to Program Areas
+ at line 468: r <- mask(r, r_mask). This caused confusion when viewing Rice's whale —
+ the masked distribution looked like a narrow strip (only the portion within Program Areas),
+ which was mistaken for DB corruption. The raster file r_metrics_v3.tif already contains
+ both programarea_key and ecoregion_key layers. Adding a visible "Mask:" selector makes
+ the masking explicit and lets users toggle between the two spatial extents.
+
+ Changes
+
+ File: apps/mapsp/app.R
+
+ 1. UI: Add "Mask:" selector inline with "Species:"
+
+ Current (lines 235-240):
+ ```r
+ selectizeInput(
+   "sel_sp",
+   "Select Species",
+   choices = NULL,
+   width = "100%"
+ ),
+ ```
+
+ Replace with a fluidRow containing two columns — "Species:" (wide) and "Mask:" (narrow):
+ ```r
+ fluidRow(
+   column(9,
+     selectizeInput(
+       "sel_sp",
+       "Species:",
+       choices = NULL,
+       width   = "100%")),
+   column(3,
+     selectInput(
+       "sel_mask",
+       "Mask:",
+       choices  = c("Program Areas" = "programarea_key",
+                    "Ecoregions"    = "ecoregion_key"),
+       selected = "programarea_key",
+       width    = "100%"))
+ ),
+ ```
+ 2. Data prep: Load both mask layers at startup
+
+ Current (line 116):
+ ```r
+ r_mask <- rast(mask_tif, lyrs = "programarea_key")
+
+ Replace with:
+ r_masks <- list(
+   programarea_key = rast(mask_tif, lyrs = "programarea_key"),
+   ecoregion_key   = rast(mask_tif, lyrs = "ecoregion_key"))
+ ```
+
+ 3. Server: Use input$sel_mask in get_rast()
+
+ Current get_rast() (lines 441-476) — uses fixed r_mask:
+ ```r
+ get_rast <- reactive({
+   req(input$sel_sp, input$ds_layer)
+   ...
+   r <- mask(r, r_mask) # mask to Program Areas   <-- line 468
+   ...
+ })
+ ```
+
+ Change to — add input$sel_mask dependency and select the mask dynamically:
+ ```r
+ get_rast <- reactive({
+   req(input$sel_sp, input$ds_layer, input$sel_mask)
+   ...
+   r_mask <- r_masks[[input$sel_mask]]
+   r <- mask(r, r_mask)
+   ...
+ })
+ ```
+ 
+ 4. Server: Add input$sel_mask to the map update trigger
+
+ Current (line 635):
+ ```r
+ observeEvent(list(input$sel_sp, input$ds_layer), {
+ ```
+
+ Change to:
+ ```r
+ observeEvent(list(input$sel_sp, input$ds_layer, input$sel_mask), {
+ ```
+
+ 5. Confirm layer stacking order
+
+ Desired order (top to bottom): Program Areas outlines > Ecoregion outlines > Raster
+
+ Current code already achieves this:
+ - pra_ln added first (top)
+ - er_ln added with before_id = "pra_ln" (below program areas)
+ - r_lyr added via proxy with before_id = "er_ln" (below ecoregions)
+
+ No changes needed — just verify this is correct.
+
+ Verification
+
+ 1. Run shiny::runApp("../apps/mapsp") from workflows dir
+ 2. Confirm "Species:" and "Mask:" appear side-by-side on the same line
+ 3. Select Rice's whale, confirm default "Program Areas" mask shows narrow strip
+ 4. Switch to "Ecoregions" — should show broader coverage
+ 5. Confirm layer stacking: raster below ecoregion lines below program area lines
+ 6. Confirm URL parameters (?mdl_seq=...) still work correctly
 
 ## 2026-02-14 wow, but revert; apply is_mmpa, is_mbta spatially; + libs/paths.R
 
@@ -340,6 +465,297 @@ For this v3b, the @../apps repository and specifically @../apps/mapsp/app.R were
   Not yet committed
 
   - Both repos have uncommitted changes ready to commit when you're satisfied with the state. The apps repo also has the staged mapsp/app.R revert.
+
+
+Looks generally good, but the duckdb bkup now for v3 seems to have that Rice's whale core area (ca_nmfs) and IUCN range (rng_iucn) model messed up. Here's the
+  next previous database bkup: /Users/bbest/_big/msens/derived/archive_2026-02-12/sdm_2026-02-10.duckdb. I am concerned that other species may be affected, but   
+  suspect that I might've simply ran @ingest_nmfs_core-areas.qmd more than once. Please investigate. Also by reverting to a previous date, can you comb the git
+  logs to suss what needs to be run and updated since that duckdb last modified date?
+
+⏺ Here's my investigation summary:                         
+
+  Investigation Results                                              
+  
+  Rice's whale rng_iucn is NOT corrupted                               
+                                                            
+  The IUCN range for Rice's whale has always been 1969 cells across all three backups:
+  - Jan 29: mdl_seq=19014, 1969 cells (value=100)
+  - Feb 10: mdl_seq=23505, 1969 cells (value=50)
+  - Feb 12: mdl_seq=23505, 1969 cells (value=50)
+
+  Rice's whale has a very restricted range in the Gulf of Mexico, so the IUCN range matching the core area footprint is plausible. The ca_nmfs was intentionally
+  copied from rng_iucn cells (line 82 of ingest_nmfs_core-areas.qmd: "Copy cell_ids from the existing IUCN range map").
+
+  The ms_merge = 3617 cells at value=100 is the correct "good" state (union of ch_nmfs 2677 + rng_iucn/ca_nmfs 1969 with partial overlap).
+
+  Feb 12 backup is the better database
+  ┌──────────────────┬─────────────────────────┬───────────────────────────┐
+  │     Feature      │         Feb 10          │          Feb 12           │
+  ├──────────────────┼─────────────────────────┼───────────────────────────┤
+  │ taxon_model      │ 25,335 (has duplicates) │ 20,758 (cleaned)          │
+  ├──────────────────┼─────────────────────────┼───────────────────────────┤
+  │ is_ok taxa       │ 17,378 (inflated)       │ 9,819 (correct filtering) │
+  ├──────────────────┼─────────────────────────┼───────────────────────────┤
+  │ metrics          │ 43 (stale)              │ 35 (recalculated)         │
+  ├──────────────────┼─────────────────────────┼───────────────────────────┤
+  │ model/model_cell │ identical               │ identical                 │
+  ├──────────────────┼─────────────────────────┼───────────────────────────┤
+  │ zone tables      │ _v3 present             │ _v3 present               │
+  ├──────────────────┼─────────────────────────┼───────────────────────────┤
+  │ dataset metadata │ has sort_order etc      │ has sort_order etc        │
+  └──────────────────┴─────────────────────────┴───────────────────────────┘
+  What changed between Feb 10→12 (commits applied to DB)
+
+  1. 38eab8b2 Feb 11 — fix_taxon_model_dups.qmd: cleaned 4,577 duplicate taxon_model rows
+  2. ef1d7180 Feb 11 — fixed AK/L48 mask for cell score/npp maps
+  3. 27f0ae21 Feb 12 — is_ok=F for reptiles (not turtles), explicit sci_turtles
+  4. a8720716 Feb 12 — debugged calc_scores.qmd, recalculated metrics
+
+  What needs to be re-run after restoring Feb 12 backup
+
+  Since the Feb 12 backup was the last clean state before the v3b experiment, nothing needs to be re-run on the database to get back to the working v3 baseline.
+  The only new thing is the MMPA/MBTA floor code change — to apply it, you'd run merge_models.qmd with do_merge <- T (which recomputes ms_merge for all taxa with
+  is.na(mdl_seq)), then calc_scores.qmd to recalculate metrics.
+
+  However: since the MMPA/MBTA floors only affect species that already have mdl_seq set, you'd need to NULL out mdl_seq for affected species first to trigger
+  re-merging. Want me to add a code chunk for that?
+
+Hmm... a couple things: 1) I neglected to remember that even with `do_merge <- T` only the taxon with `is.null(taxon.mdl_seq)` get updated -- let's change      
+  that to accomodate any changes to the merge model and do for all. 2) Something is seriously wrong with all the Rice's whale inputs. Maybe they have the         
+  same number of cells, but the cells are not where they're supposed to be. I am attaching images of the original data before becoming rasterized into the        
+  database for the critical habitat (ch_nmfs) and the Core Area / IUCN (ca_nmfs / rng_iucn). Perhaps you could make a new notebook like                           
+  @investigate_ricei.qmd to visualize different versions over time from the databases.
+
+⏺ Now I have a clear picture. Looking at the user's images:                                                                                       
+  - The Core Distribution Area (orange, 2nd image) covers a huge swath of the northern Gulf — should be ~10,000+ cells at 0.05°                                   
+  - The Critical Habitat (white strip, 1st image) is a narrow shelf-edge band — 2,677 cells                                                                       
+                                                           
+  But in the database, rng_iucn/ca_nmfs = only 1,969 cells — fewer than the narrow CH strip. That's clearly wrong. The rasterization was corrupted at some point. 
+
+  Let me also check what raw data files are available for comparison.              
+
+To be clear, I did previously successfully ingest the correct rasterizations into the database. Then in the midst of subsequent changes, sometime after     
+  adding @ingest_nmfs_core-areas.qmd these data in the database became corrupted. I don't object to the deep dive into the rasterization, but the problem     
+  occurred after. And I'm not sure if only Rice's whale is affected
+
+I'm not sure I understand "Flag where rng_iucn cells == ca_nmfs cells (corruption indicator)". These should both be the same, since rng_iucn was copied to ca_nmfs for Rice's whale, but a higher NMFS:EN er_code got applied over IUCN:CR. And when I noticed the corruption, they are still both equal, but equally wrong.
+
+And "rng_iucn (should be broad Gulf of Mexico)" is not quite right -- it's a a blob in Eastern Gulf of Mexico, whereas `ch_nmfs` extends across the Gulf.
+
+Everything else looks great!
+
+⏺ Updated plan                                                
+  ⎿  /plan to preview                                                
+ Here is Claude's plan:
+ Plan: Investigate Rice's Whale DB Corruption + Fix Merge Loop 
+
+ Context
+
+ Previous plan (Steps 1-4) has been executed: v3b branched, main reverted, libs/paths.R
+ created, MMPA/MBTA floors added to merge_models.qmd code, .qmd files updated to source
+ paths.R, Feb 12 backup restored to v3/sdm.duckdb.
+
+ Two remaining issues:
+
+ 1. Rice's whale (and possibly other species) have corrupted spatial data in the database.
+ The IUCN range and core area were correctly rasterized and ingested at one point, but
+ subsequent DB operations (likely around ingest_nmfs_core-areas.qmd) corrupted the
+ model_cell data. The rng_iucn for Rice's whale shows only 1,969 cells (identical to
+ ca_nmfs), but the correct IUCN polygon covers ~49,500 km² and should produce ~3,000-4,000
+ cells. The Critical Habitat (ch_nmfs) has 2,677 cells — more than the supposedly-larger
+ IUCN range, which is backwards.
+ 2. merge_models.qmd only re-merges taxa with is.na(mdl_seq), which means taxa that
+ already have a merged model won't be updated when the merge logic changes (e.g., MMPA/MBTA
+ floors). Need to support re-merging all taxa.
+
+ ---
+ Step 1: Create investigate_ricei.qmd
+
+ File: workflows/investigate_ricei.qmd
+
+ A diagnostic notebook to visualize Rice's whale spatial data across database backups and
+ raw source files, to pinpoint when/how the corruption occurred and check if other species
+ are affected.
+
+ Sections
+
+ 1.1 Setup
+
+ librarian::shelf(DBI, dplyr, duckdb, glue, here, leaflet, purrr, sf, terra, tibble, quiet = T)
+ source(here("libs/paths.R"))
+ cell_tif <- glue("{dir_derived}/r_bio-oracle_planarea.tif")
+ r_cell   <- rast(cell_tif, lyrs = "cell_id")
+
+ 1.2 Connect to all available database versions
+
+ Open read-only connections to each backup in ~/_big/msens/derived/archive_2026-02-12/:
+ - sdm_2026-02-10.duckdb (Feb 10)
+ - sdm_v3_2026-02-12.duckdb (Feb 12 — current v3)
+ - sdm_2026-01-29.duckdb (Jan 29)
+ - Current v3: ~/_big/msens/derived/v3/sdm.duckdb
+ - Current v3b: ~/_big/msens/derived/v3b/sdm.duckdb
+
+ 1.3 Rice's whale model_cell comparison across DBs
+
+ For each database version, query Rice's whale (taxon_id=1576133) model_cell data by dataset
+ (rng_iucn, ca_nmfs, ch_nmfs, ms_merge). Show table of n_cells, v_min, v_max per ds_key per
+ DB version. Note: rng_iucn and ca_nmfs should always have identical cell_ids (ca_nmfs was
+ copied from rng_iucn with higher value). The corruption indicator is when the cell COUNT
+ is too low (~1,969 instead of the expected ~3,000-4,000 from the correct polygon).
+
+ 1.4 Visualize Rice's whale spatial layers
+
+ Use terra to map cell_id values back to raster for each layer from the current v3 database:
+ - rng_iucn / ca_nmfs (same cells — blob in eastern Gulf of Mexico, matching NOAA core area)
+ - ch_nmfs (extends across the full northern Gulf shelf edge — the broadest layer)
+ - ms_merge (union of all above, masked by combined rng_iucn + ch_nmfs + ca_nmfs)
+
+ Display with leaflet::plet() or mapview for interactive comparison.
+
+ 1.5 Compare database cells to raw source polygons
+
+ Load the raw shapefiles for visual overlay:
+ - IUCN range: {dir_data}/raw/iucnredlist.org/MAMMALS_MARINE_ONLY/MAMMALS_MARINE_ONLY.shp
+ filtered to sci_name == "Balaenoptera ricei"
+ - Core area: {dir_data}/raw/fisheries.noaa.gov/core-areas/shapefile_Rices_whale_core_distribution_area_Jun19_SERO/...shp
+ - CH: from NMFS_ESA_Critical_Habitat_20230505_2025-07-17.gdb
+
+ Overlay raw polygons on rasterized cells to show the gap.
+
+ 1.6 Check for broader corruption
+
+ Query ALL species that have rng_iucn data and compare:
+ - rng_iucn cell count vs what the rasterized TIF has
+ - Flag species where rng_iucn cell count is suspiciously low relative to the TIF
+ - Check for species where two different ds_keys share identical cell_id sets (like rng_iucn
+ matching ca_nmfs for Rice's whale)
+
+ -- check for species with identical cell sets across datasets
+ WITH ds_cells AS (
+   SELECT tm.taxon_id, m.ds_key, m.mdl_seq, COUNT(mc.cell_id) as n_cells
+   FROM taxon_model tm
+   JOIN model m ON tm.mdl_seq = m.mdl_seq
+   JOIN model_cell mc ON m.mdl_seq = mc.mdl_seq
+   WHERE m.ds_key IN ('rng_iucn', 'ca_nmfs', 'ch_nmfs', 'ch_fws', 'rng_fws')
+   GROUP BY tm.taxon_id, m.ds_key, m.mdl_seq
+ )
+ SELECT a.taxon_id, a.ds_key as ds_a, b.ds_key as ds_b, a.n_cells
+ FROM ds_cells a
+ JOIN ds_cells b ON a.taxon_id = b.taxon_id
+   AND a.ds_key < b.ds_key
+   AND a.n_cells = b.n_cells
+
+ 1.7 Timeline reconstruction
+
+ Correlate git commits with database backup dates to identify which operation caused the
+ corruption. Key git log (after IUCN range ingest):
+ - Jan 22-23: IUCN range rasterization (6.2 hrs) — correct data in TIFs?
+ - Jan 29: backup sdm_2026-01-29.duckdb — rng_iucn already 1969 cells
+ - Feb 10: backup sdm_2026-02-10.duckdb — same
+ - Feb 11: fix_taxon_model_dups.qmd — cleaned duplicates
+ - Feb 12: calc_scores.qmd recalculated — backup sdm_v3_2026-02-12.duckdb
+
+ Check if the rasterized TIF matches the correct polygon or if it was also corrupted
+ (GEOMETRYCOLLECTION issue from sf::summarize() with sf_use_s2(FALSE)).
+
+ ---
+ Step 2: Fix merge_models.qmd to re-merge ALL taxa
+
+ File: workflows/merge_models.qmd
+ Current code (line ~180):
+ d_x <- tbl(con_sdm, "taxon") |>
+   filter(
+     is.na(mdl_seq)
+   ) |>
+   arrange(desc(n_ds), taxon_id) |>
+   collect()
+
+ Change to:
+ d_x <- tbl(con_sdm, "taxon") |>
+   filter(is_ok) |>
+   arrange(desc(n_ds), taxon_id) |>
+   collect()
+
+ This re-merges ALL valid taxa (is_ok=TRUE), not just those missing mdl_seq. The existing
+ delete-before-insert pattern in the loop already handles idempotent re-runs (lines 362-395
+ delete existing ms_merge model/model_cell/species/taxon_model rows before re-creating them).
+
+ Note: This makes do_merge <- T a full rebuild of all ms_merge models (~9,819 taxa).
+ The loop already handles deletion of existing data for each species, so re-running is safe.
+
+ ---
+ Step 3: Fix ingest_nmfs_core-areas.qmd hardcoded mdl_seq
+
+ File: workflows/ingest_nmfs_core-areas.qmd
+ Current code (line 90):
+ iucn_mdl_seq <- 19014L  # hardcoded — breaks if rng_iucn is re-ingested
+
+ Change to — dynamically look up the current rng_iucn mdl_seq:
+ iucn_mdl_seq <- tbl(con_sdm, "taxon_model") |>
+   filter(taxon_id == !!worms_id, ds_key == "rng_iucn") |>
+   pull(mdl_seq)
+ stopifnot(length(iucn_mdl_seq) == 1)
+
+ This prevents future corruption if rng_iucn is re-ingested with a new mdl_seq.
+
+ ---
+ Files to create/modify
+ ┌────────────────────────────┬──────────────────────────────────────────────────────────────┐
+ │            File            │                            Action                            │
+ ├────────────────────────────┼──────────────────────────────────────────────────────────────┤
+ │ investigate_ricei.qmd      │ New — diagnostic notebook                                    │
+ ├────────────────────────────┼──────────────────────────────────────────────────────────────┤
+ │ merge_models.qmd           │ Change taxa filter from is.na(mdl_seq) to is_ok              │
+ ├────────────────────────────┼──────────────────────────────────────────────────────────────┤
+ │ ingest_nmfs_core-areas.qmd │ Replace hardcoded iucn_mdl_seq <- 19014L with dynamic lookup │
+ └────────────────────────────┴──────────────────────────────────────────────────────────────┘
+ ---
+ Verification
+
+ 1. investigate_ricei.qmd: Render and review maps — identify which DB backup (if any) has
+ correct rng_iucn cells, and whether the TIF rasterization itself is correct
+ 2. Broader corruption check: Confirm whether only Rice's whale is affected or if other
+ species also have corrupted rng_iucn data
+ 3. merge_models.qmd: After fixing the taxa filter, running with do_merge <- T should
+ rebuild all ms_merge models for all is_ok taxa
+ 4. ingest_nmfs_core-areas.qmd: Verify the dynamic mdl_seq lookup returns the correct
+ current rng_iucn mdl_seq for Rice's whale
+
+⏺ All three changes are in place. Here's a summary of what was done:
+                                                                                                                                                                  
+  Changes Made                                                                                                                                                    
+                                                                                                                                                              
+  Step 1: Created investigate_ricei.qmd (new file)
+
+  A diagnostic notebook with 7 sections:                                                                                                                          
+  - Setup — loads libraries and cell raster                                                                                                                       
+  - Connect to DB versions — opens read-only connections to all 5 archive/current databases                                                                       
+  - Rice's whale comparison — queries cell counts per ds_key across all DB versions
+  - Spatial visualization — rasterizes each layer from v3 current DB and plots
+  - Raw polygon overlay — loads IUCN shapefile, NMFS core area shapefile, and Critical Habitat GDB; re-rasterizes the IUCN polygon and compares expected vs actual
+   cell counts
+  - Broader corruption check — SQL query to find ALL species with identical cell counts across datasets (the corruption signature) + lists species with fewest
+  rng_iucn cells
+  - Timeline reconstruction — correlates DB backup dates with cell counts to pinpoint when corruption occurred
+
+  Step 2: Fixed merge_models.qmd (line 161-164)
+
+  Changed taxa filter from filter(is.na(mdl_seq)) to filter(is_ok). This means do_merge <- T now re-merges ALL valid taxa (not just unmerged ones), enabling full
+  rebuilds when merge logic changes (e.g., MMPA/MBTA floors).
+
+  Step 3: Fixed ingest_nmfs_core-areas.qmd (line 90)
+
+  Replaced hardcoded iucn_mdl_seq <- 19014L with a dynamic lookup:
+  iucn_mdl_seq <- tbl(con_sdm, "taxon_model") |>
+    filter(taxon_id == !!worms_id, ds_key == "rng_iucn") |>
+    pull(mdl_seq)
+  stopifnot(length(iucn_mdl_seq) == 1)
+  Also updated the header text to remove the hardcoded mdl_seq reference.
+
+Ran into an issue with rendering investigate_ricei.qmd, probably with older db versions being structured differently. Please render and debug until complete.
+
+⏺ The issue is that when all DB queries return empty tibbles (likely because older DBs have different schemas), d_compare ends up with zero columns. Let me read the current file and fix the error handling.
+
 
 ## 2026-02-13 BIG new ms_endemism -> ms_suit; ms_merge = ms_suit * ms_er
 
