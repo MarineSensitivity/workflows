@@ -33,6 +33,784 @@
 
 - Migrate to hexagons
 
+## 2026-02-17.d add a splash page and tour to the apps
+
+Add a splash page to the apps with the overview figure (from https://marinesensitivity.org/docs/figures/overview-methods.svg) and link to this documentation. Add click to an optional tour of the app's functionality using [etiennebacher/conductor](https://github.com/etiennebacher/conductor).
+
+
+⏺ Updated plan
+  ⎿  /plan to preview
+
+ Here is Claude's plan:
+ Plan: Add Splash Page and Conductor Tour to mapgl and mapsp Apps
+
+ Context
+
+ The user wants to add two features to both Shiny apps (apps/mapgl/app.R and apps/mapsp/app.R):
+ 1. A splash page (welcome modal) on app load showing the overview figure from the docs site and a
+ link to the documentation
+ 2. An optional guided tour using etiennebacher/conductor (Shepherd.js wrapper for R/Shiny) triggered
+  by a button click
+
+ Both apps use bslib::page_sidebar() with mapboxglOutput(). Neither currently has a splash screen or
+ tour. The mapgl app already has one showModal() pattern (info dialog at line 1215). Both apps use
+ librarian::shelf() for package management.
+
+ Files to Modify
+
+ - /Users/bbest/Github/MarineSensitivity/apps/mapgl/app.R (1567 lines)
+ - /Users/bbest/Github/MarineSensitivity/apps/mapsp/app.R (832 lines)
+
+ Implementation
+
+ 1. Add conductor to librarian::shelf() in both apps
+
+ mapgl/app.R line 14: add conductor to the shelf call.
+ mapsp/app.R: add conductor to its shelf call.
+
+ 2. Splash Page (Welcome Modal) — both apps
+
+ Use Shiny's showModal(modalDialog(...)) triggered on session start. The modal displays:
+ - The overview figure as an <img> tag pointing to the hosted docs SVG:
+ https://marinesensitivity.org/docs/figures/overview-methods.svg
+ - Brief welcome text describing the app's purpose
+ - A link to the documentation: https://marinesensitivity.org/docs/
+ - Two action buttons at the footer: "Take a Tour" (starts conductor) and "Explore" (dismisses modal)
+
+ Pattern (in server function, at top):
+
+ # welcome modal ----
+ showModal(modalDialog(
+   title    = "Welcome to BOEM Marine Sensitivity",
+   size     = "l",
+   easyClose = TRUE,
+   tags$div(
+     style = "text-align: center;",
+     tags$img(
+       src   = "https://marinesensitivity.org/docs/figures/overview-methods.svg",
+       style = "max-width: 100%; height: auto; margin-bottom: 15px;",
+       alt   = "MST Methods Overview"),
+     tags$p("Brief app-specific description..."),
+     tags$p(
+       "For full methodology, see the ",
+       tags$a(
+         href   = "https://marinesensitivity.org/docs/",
+         target = "_blank",
+         "project documentation"), ".")
+   ),
+   footer = tagList(
+     actionButton("btn_tour", "Take a Tour", icon = icon("route")),
+     modalButton("Explore"))
+ ))
+
+ 3. Conductor Tour Definition — mapgl app
+
+ Define tour outside server (after UI, before server) or at top of server. Steps target existing UI
+ element IDs:
+
+ tour_mapgl <- Conductor$new()$
+   step(
+     title = "Study Area",
+     text  = "Select a study area to focus on a specific subregion of US waters.",
+     el    = "#sel_subregion",
+     position = "right"
+   )$
+   step(
+     title = "Spatial Units",
+     text  = "Toggle between raster cells (0.05°) and program area aggregations.",
+     el    = "#sel_unit",
+     position = "right"
+   )$
+   step(
+     title = "Layer Selection",
+     text  = "Choose which sensitivity metric to display: composite score, individual species
+ categories, or primary productivity.",
+     el    = "#sel_lyr",
+     position = "right"
+   )$
+   step(
+     title = "Map View",
+     text  = "The map displays sensitivity scores across US waters. Click a program area to see its
+ detailed score breakdown.",
+     el    = "#map",
+     position = "top"
+   )$
+   step(
+     title = "Flower Plot",
+     text  = "When a program area is selected, the flower plot shows scores by species category.
+ Petal length = score, center = weighted mean.",
+     el    = "#flower_panel",
+     position = "right"
+   )$
+   step(
+     title = "Species Tab",
+     text  = "Switch to the Species tab to see a sortable table of all species in the selected area
+ with extinction risk details.",
+     el    = ".nav-link:contains('Species')",
+     position = "bottom"
+   )
+
+ 4. Conductor Tour Definition — mapsp app
+
+ tour_mapsp <- Conductor$new()$
+   step(
+     title = "Select a Species",
+     text  = "Search by common or scientific name. Results are grouped by category (bird, fish,
+ mammal, etc.).",
+     el    = "#sel_sp",
+     position = "bottom"
+   )$
+   step(
+     title = "Mask Selection",
+     text  = "Choose whether to overlay BOEM Program Area or Ecoregion boundaries on the map.",
+     el    = "#sel_mask",
+     position = "bottom"
+   )$
+   step(
+     title = "Species Map",
+     text  = "The map shows the species distribution model. Cell values range from 1 (low
+ suitability) to 100 (high suitability). Click cells for details.",
+     el    = "#map",
+     position = "top"
+   )$
+   step(
+     title = "Species Info",
+     text  = "Open the sidebar to see ESA listing, IUCN status, MMPA/MBTA flags, and extinction risk
+ score for the selected species.",
+     el    = ".bslib-sidebar-toggle",
+     position = "right"
+   )
+
+ 5. Tour Trigger — both apps
+
+ In each server function, add:
+ # tour ----
+ observe({
+   removeModal()
+   tour$init()$start()
+ }) |>
+   bindEvent(input$btn_tour)
+
+ Also add useConductor() to the UI (inside page_sidebar()'s first argument area, alongside
+ tags$head()).
+
+ 6. UI Changes Summary
+
+ mapgl/app.R UI — add two items:
+ - useConductor() (after tags$head(...))
+ - Optionally add a persistent help/tour button in the sidebar: actionButton("btn_tour_sidebar", "",
+ icon = icon("circle-question"), class = "btn-sm")
+
+ mapsp/app.R UI — add two items:
+ - useConductor() (after tags$head(...))
+ - Optionally add a persistent help/tour button
+
+ Verification
+
+ 1. Run shiny::runApp(here::here("apps/mapgl")) — confirm:
+   - Splash modal appears on load with overview image and two buttons
+   - "Explore" dismisses the modal
+   - "Take a Tour" dismisses modal and starts conductor tour stepping through sidebar controls, map,
+ flower plot, species tab
+   - Tour can be dismissed at any step
+ 2. Run shiny::runApp(here::here("apps/mapsp")) — confirm same splash + tour behavior
+ 3. Verify overview SVG loads from https://marinesensitivity.org/docs/figures/overview-methods.svg
+ 4. Verify conductor package installs via librarian::shelf(conductor) on first run
+
+In the Splash page add a link to the other app. The Splash page needs to be smaller (so probably figure reduced in size  bit) and centered. The tour is not working. It simply stays gray. No debug messages showing in Console with verbose = T.
+
+⏺ All three fixes applied to both apps:                                                               
+  
+  1. Splash page smaller + centered: Changed size = "l" to size = "m", reduced image to max-width:    
+  80%; max-height: 300px                                        
+  2. Cross-links added:                                                                               
+    - mapgl splash links to https://shiny.marinesensitivity.org/mapsp/ ("Species Distribution app")   
+    - mapsp splash links to https://shiny.marinesensitivity.org/mapgl/ ("Composite Scores app")
+  3. Tour fix: Separated tour$init() (runs at server startup to register JS) from tour$start() (runs
+  on button click). Previously tour$init()$start() was chained inside the observer, which likely meant
+   the JS infrastructure wasn't registered before the tour tried to start.
+
+The Splash page resizing is good, but still staying gray without initiating tour. Revisit documentation and add debugging info when verbose=T.   
+
+⏺ Here's a summary of all the fixes applied to both apps:                                             
+  
+  4 root causes fixed:                                                                                
+                                                                
+  1. Invalid CSS selector (mapgl): .nav-link:contains('Species') is jQuery-only, not valid CSS.       
+  querySelector() throws a DOMException that silently kills the entire tour. Fixed by removing the el 
+  so the Species Tab step shows as a centered popover.
+  2. Timing conflict: removeModal() and tour$start() fired in the same reactive flush. Shepherd's
+  overlay conflicted with Shiny's modal overlay being removed. Fixed with later::later(function() {
+  tour$start() }, delay = 0.5).
+  3. Hidden selectize elements: #sel_subregion, #sel_sp, etc. target the hidden <select> tag (zero
+  dimensions). Shepherd can't position on zero-size elements. Fixed by wrapping inputs in tags$div(id
+  = "tour_xxx", ...) and targeting those visible wrapper divs.
+  4. Shared tour across sessions: Tour object was global, causing state conflicts in multi-session
+  deployments. Fixed by moving Conductor$new() inside the server function.
+
+  Debug messages added: When verbose = T, the R console will now print "conductor tour initialized" on
+   server start and "starting conductor tour" when the button is clicked.
+
+starting conductor tour                                                                             
+  Error in tour$start() : attempt to apply non-function                                           
+  13.                                                                                                 
+  tour$start() at app.R#720                             
+
+⏺ Fixed. The change replaces later::later() (which runs outside the Shiny reactive domain, causing    
+  tour$start to fail) with session$onFlushed() which:
+                                                                                                      
+  1. Waits for the current flush cycle to complete (modal removal finishes)
+  2. Runs within the Shiny session context (so tour$start() can access the session)                   
+  3. once = TRUE ensures it only fires once per click                                                 
+
+  You should now see both "starting conductor tour" and "conductor tour started" in the R console when
+   clicking "Take a Tour".
+
+Update @../docs/index.qmd landing page  with quick links to apps:                                   
+  https://app.marinesensitivity.org/mapgl/, https://app.marinesensitivity.org/mapsp/
+
+⏺ Added an "Interactive Apps" section with quick links to both apps, placed right after the overview  
+  figure and before the book organization description.
+
+
+## 2026-02-17.c update docs/
+
+The documentation in @docs/ (a Quarto book) is out of date with all the latest datasets and scoring applying MMPA and MTBA minimum values (see `msens::compute_er_score()` from @msens/ R package). Review the @docs/ and suggest changes in wording, tables and diagrams. Base updates on all the latest methodologies, particularly from these more recently updated notebook workflows:
+
+- `@workflows/calc_scores.qmd`
+- `@workflows/merge_models.qmd`
+- `@workflows/merge_models_prep.qmd`
+- `@workflows/ingest_taxon.qmd`
+
+Also include this latest overview figure, but revise to show flower plot with varying petal widths and icons on outer edge (see other icons in `@~/My Drive/projects/msens/figures/icons` or use [`rphylopic`](https://rphylopic.palaeoverse.org) R package / search https://www.phylopic.org/ for SVGs):
+
+- `@~/My Drive/projects/msens/figures/overview-v2/mst-methods edit2.svg`
+
+Reference the apps and their functionaliy with screenshots (perhaps with `webshot2` R package):
+
+- `@apps/mapgl/app.R`: general
+- `@apps/mapsp/app.R`: species
+
+Suggest alternative heading structure where appropriate.
+
+Draw also from this somewhat dated report:
+
+- @workflows/final-report_2025.qmd
+
+←  ☐ ER Scale  ☐ Overview fig  ☐ Old apps  ☐ Screenshots  ✔ Submit  →                                                                                             
+                                                                                                                                                                  
+**ER Scale**. The final report uses a simplified 0.2-1.0 extinction risk scale, but `compute_er_score()` uses 1-100 integers with MMPA/MBTA floors. Which scale should the docs 
+present as the primary methodology?                                                                                                                               
+                                                                        
+  1. 1-100 integer scale (Recommended)
+     Document the actual implementation from compute_er_score() with MMPA=20, MBTA=10 floors. More accurate to the code.
+  2. 0.2-1.0 conceptual scale
+     Use the simplified scale from the final report (CR=1.0, EN=0.8, etc.). Cleaner for non-technical readers.
+  3. Both scales
+     Present the conceptual 0-1 scale first, then detail the actual 1-100 implementation with MMPA/MBTA floors.
+❯ 4. Use the 1-100 integer scale, but present it as 1-100%. It is meant to be a scale ranging within 0 to 1. The integer numbers are simply a convenience for reducing storage size in the table and speeding up calculations.
+
+**Overview fig**. For the overview figure, you said 'revise to show flower plot with varying petal widths and icons.' Should I edit the existing SVG or create a new companion flower plot figure?                                                                                                                                               
+                                                                        
+  1. Create companion flower plot     
+     Include the existing overview SVG as-is AND create a separate flower plot figure with icons using R/rphylopic.     
+  2. Create new overview SVG 
+     Create a brand new overview diagram (programmatically in R) that incorporates the flower plot with icons and the full pipeline.
+  3. Manually edit the SVG
+     I'll provide guidance for manually editing the SVG in a vector editor to add the flower plot elements.    
+❯ 4. Leave the existing overview figure. I'm not sure which method will produce the cleanest figure. If you can manage to do this programmatically in R, that would be ideal, but if it does not look clean, then create a companion yourself or suggest manual edits for me to do in InkScape -- whatever looks best.
+
+**Old apps**. What should happen to the 7 old app appendix pages (aoi, bird_hotspots, map, scores, sdm, sdm-cog, vmap)?                                                         
+                                                                                                                                                                  
+  1. Remove from book (Recommended)                                     
+     Remove from _quarto.yml and replace with mapgl + mapsp pages. Old .qmd files stay on disk but aren't in the book.
+❯ 2. Keep as legacy appendix                                                                                            
+     Keep the old pages in a 'Legacy Applications' appendix section alongside the new mapgl/mapsp pages.
+
+**Screenshots**. For app screenshots, should we use live webshot2 captures (requires apps running) or pre-captured static screenshots?                                             
+                                                                                                                                                                  
+  1. Pre-captured static (Recommended)                                  
+     Capture screenshots now and save as PNG files. More reliable for CI/CD builds. Can update later.                 
+  2. Live webshot2 chunks                                                                                               
+     R code chunks with webshot2::webshot() that capture live from running apps. Stays current but requires server.
+❯ 3. Both approaches                                                                                                                
+     Use webshot2 code chunks with eval:false and fallback to pre-captured PNGs. Best of both worlds.  
+
+You say 5 datasets, but there are actually 8 in `tbl(con_sdm, "dataset")` -- info to be used there
+
+You say "Update scope: mention 17,333 species, 0.05° grid, 27 planning areas". Use the new Program Areas (over previous Planning Areas): `@~/My Drive/projects/msens/data/derived/v3/ply_programareas_2026_v3.gpkg` (ie `pra_gpkg` in `@workflows/calc_scores.qmd`). Pull from the database to get the actual species in the whole study area: `r tbl(con_sdm, "taxon") |> filter(is_ok) |> tally() |> pull(n)`: 9,819.
+
+⏺ Plan is now updated with all corrections:                             
+  - 20 Program Areas (not 27 Planning Areas)                                                                                                                      
+  - 9,819 valid species (taxon.is_ok=TRUE), not 17,333                                                                                                            
+  - 8 datasets (7 source + 1 derived merge) from tbl(con_sdm, "dataset")                                                                                          
+  - Program Area terminology throughout (source: ply_programareas_2026_v3.gpkg)                                                                                   
+
+ Ready to code?
+                                                                                                                                                                  
+ Here is Claude's plan:
+
+ Plan: Update MarineSensitivity Documentation Book                      
+
+ Context
+
+ The documentation Quarto book at /docs/ is significantly out of date with the current methodology. The Science section chapters (science.qmd, scoring.qmd,
+ receptors.qmd, exposure.qmd) are mostly empty or skeletal, while the actual methodology has matured through workflow notebooks (calc_scores.qmd,
+ merge_models.qmd, merge_models_prep.qmd, ingest_taxon.qmd) and the msens R package (compute_er_score()). Key gaps include: no MMPA/MBTA/ESA regulatory framework
+  descriptions, no extinction risk scoring formulas/tables, no documentation of the 8 datasets (7 source + 1 derived), no model merging methodology, outdated app
+  references, and missing overview figures. The final report (final-report_2025.qmd) contains much of this content in a format ready to adapt.
+
+ User Preferences (from clarification)
+
+ - ER scoring scale: Use 1-100% (integers are a storage/speed convenience; conceptually 0-1 range)
+ - Overview figure: Include existing mst-methods edit2.svg as-is; attempt programmatic flower plot with icons in R, fallback to InkScape guidance
+ - Old apps: Keep as "Legacy Applications" appendix alongside new mapgl/mapsp pages
+ - Screenshots: webshot2 code chunks (eval:false) plus pre-captured PNG fallbacks
+ - Terminology: "Program Areas" (not "Planning Areas") — source: ply_programareas_2026_v3.gpkg
+ - Species count: 9,819 valid species (taxon.is_ok = TRUE), not 17,333 total from all datasets
+ - Datasets: 8 total in tbl(con_sdm, "dataset") (7 source + 1 derived merge), not 5 as simplified in final report
+
+ Proposed New Book Structure
+
+ Restructure the Science part to match the actual analytical pipeline. The Software part needs minor updates (mainly apps).
+
+ _quarto.yml changes
+ ```yaml
+ chapters:
+   - index.qmd
+   - intro.qmd                    # update with current scope
+   - part: Science
+     chapters:
+       - science.qmd              # keep: conceptual framework + overview figure
+       - data-sources.qmd         # NEW: replaces receptors.qmd — the 7 source datasets + merge
+       - taxonomy.qmd             # NEW: taxonomic integration & validation
+       - extinction-risk.qmd      # NEW: replaces exposure.qmd — ER scoring + MMPA/MBTA
+       - model-merging.qmd        # NEW: merge pipeline, masking, spatial floors
+       - scoring.qmd              # UPDATE: actual scoring methodology + visualization
+       - stressors.qmd            # keep: minor update (placeholder for future phases)
+   - part: Software
+     chapters:
+       - software.qmd             # minor update
+       - server.qmd               # keep as-is
+       - db.qmd                   # keep as-is
+       - workflows.qmd            # keep as-is
+       - apis.qmd                 # keep as-is
+       - libraries.qmd            # minor update
+       - apps.qmd                 # UPDATE: reference mapgl + mapsp with screenshots
+       - docs.qmd                 # keep as-is
+   - summary.qmd                  # UPDATE: write actual summary
+   - references.qmd
+ appendices:
+   - glossary.qmd
+   - part: Applications (Current)
+     chapters:
+       - apps/mapgl.qmd           # NEW: primary general map app
+       - apps/mapsp.qmd           # NEW: primary species map app
+   - part: Applications (Legacy)
+     chapters:
+       - apps/aoi.qmd
+       - apps/bird_hotspots.qmd
+       - apps/map.qmd
+       - apps/scores.qmd
+       - apps/sdm.qmd
+       - apps/sdm-cog.qmd
+       - apps/vmap.qmd
+ ```
+
+ Files to rename/replace:
+ - receptors.qmd → replaced by data-sources.qmd
+ - exposure.qmd → replaced by extinction-risk.qmd
+
+ ---
+ Changes Per File
+
+ 1. intro.qmd — UPDATE
+
+ Current: Brief intro, mentions BOEM, process-not-product philosophy, process.mmd flowchart.
+
+ Changes:
+ - Update scope: mention 9,819 valid species, 0.05° grid, 20 program areas
+ - Add the overview figure (mst-methods edit2.svg) — copy to docs/figures/ and reference
+ - Update process.mmd flowchart to reflect current pipeline (7 source datasets → taxonomy matching → model merging → scoring → visualization)
+ - Add mention of Executive Order 14303 and scientific integrity mandate
+ - Adapt opening paragraphs from final report Abstract/Background
+
+ Source: final-report_2025.qmd lines 143-159
+
+ 2. science.qmd — UPDATE
+
+ Current: V=f(E,S,A) formula, cell vulnerability equation, old Google Drawing figure.
+
+ Changes:
+ - Keep V=f(E,S,A) conceptual framework
+ - Update cell vulnerability formula to match final report notation: $v_c = \sum_1^{S_g} p_{sc} \cdot w_s$
+ - Add bullet explanations of each variable (from final report lines 179-187)
+ - Replace old gdraw_spp-sens_rast-tbl-aoi.svg with the new overview figure or keep both
+ - Add brief descriptions of the three sensitivity components: Species (by category), Habitats (future), Primary Productivity
+ - Add ecoregional rescaling explanation (from final report line 247)
+ - Cross-reference new chapters for details
+
+ Source: final-report_2025.qmd lines 165-188
+
+ 3. data-sources.qmd — NEW (replaces receptors.qmd)
+
+ Content: Comprehensive description of all 8 datasets (7 source + 1 derived merge).
+
+ Sections:
+ - Overview table with all 8 datasets from tbl(con_sdm, "dataset"):
+
+ ┌──────────┬───────────────────────┬─────────────────────────────────────┬─────────┬──────┐
+ │  ds_key  │     Display Name      │         Cell Value Encoding         │ is_mask │ Sort │
+ ├──────────┼───────────────────────┼─────────────────────────────────────┼─────────┼──────┤
+ │ am_0.05  │ AquaMaps SDM          │ Continuous suitability 0-100%       │ FALSE   │ 1    │
+ ├──────────┼───────────────────────┼─────────────────────────────────────┼─────────┼──────┤
+ │ ca_nmfs  │ NMFS Core Area        │ Core: 100%                          │ TRUE    │ 2    │
+ ├──────────┼───────────────────────┼─────────────────────────────────────┼─────────┼──────┤
+ │ ch_nmfs  │ NMFS Critical Habitat │ EN:100%, TN:50%                     │ TRUE    │ 3    │
+ ├──────────┼───────────────────────┼─────────────────────────────────────┼─────────┼──────┤
+ │ ch_fws   │ FWS Critical Habitat  │ EN:100%, TN:50%                     │ TRUE    │ 4    │
+ ├──────────┼───────────────────────┼─────────────────────────────────────┼─────────┼──────┤
+ │ rng_fws  │ FWS Range             │ EN:100%, TN:50%, LC:1%              │ TRUE    │ 5    │
+ ├──────────┼───────────────────────┼─────────────────────────────────────┼─────────┼──────┤
+ │ bl       │ BirdLife Range        │ CR:50%, EN:25%, VU:5%, NT:2%, LC:1% │ TRUE    │ 6    │
+ ├──────────┼───────────────────────┼─────────────────────────────────────┼─────────┼──────┤
+ │ rng_iucn │ IUCN Range            │ CR:50%, EN:25%, VU:5%, NT:2%, LC:1% │ TRUE    │ 7    │
+ ├──────────┼───────────────────────┼─────────────────────────────────────┼─────────┼──────┤
+ │ ms_merge │ Merged Model          │ MAX across source datasets          │ FALSE   │ 0    │
+ └──────────┴───────────────────────┴─────────────────────────────────────┴─────────┴──────┘
+
+ - Per-dataset sections: AquaMaps, NMFS Core Area, NMFS Critical Habitat, FWS Critical Habitat, FWS Range, BirdLife Range, IUCN Range
+ - Note that is_mask=TRUE datasets can serve dual role: contribute to SDM values AND form the spatial mask
+ - Primary Productivity — VGPM model, VIIRS satellite, 2014-2023 (move from receptors.qmd)
+ - Standard 0.05° grid description
+
+ Source: merge_models.qmd lines 117-127 (dataset metadata); final-report_2025.qmd lines 196-265; receptors.qmd (primary productivity)
+
+ 4. taxonomy.qmd — NEW
+
+ Content: Taxonomic integration and validation pipeline.
+
+ Sections:
+ - Taxonomic authorities (WoRMS, GBIF, ITIS, IUCN, BirdLife)
+ - ID resolution cascade (ITIS TSN → WoRMS crosswalk → name match → API)
+ - Species categories (bird, coral, fish, invertebrate, mammal, reptile/turtle, other)
+ - Data quality: duplicate resolution, synonym handling, deprecated names
+ - Key function: msens::match_taxa()
+ - Summary statistics: 9,819 valid species (is_ok=TRUE) from ~17,333 total taxa across all datasets
+
+ Source: final-report_2025.qmd lines 209-219; ingest_taxon.qmd; merge_models_prep.qmd
+
+ 5. extinction-risk.qmd — NEW (replaces exposure.qmd)
+
+ Content: Extinction risk scoring methodology including regulatory frameworks.
+
+ Sections:
+ - Regulatory Framework subsections:
+   - ESA (Endangered Species Act) — EN/TN listings by NMFS and FWS
+   - MMPA (Marine Mammal Protection Act) — all marine mammals protected
+   - MBTA (Migratory Bird Treaty Act) — migratory birds protected
+   - IUCN Red List — international conservation status
+ - Scoring methodology — msens::compute_er_score():
+   - US-listed species: MAX(ESA score, MMPA floor, MBTA floor)
+       - ESA EN=100, TN=50, LC=1
+     - MMPA floor=20, MBTA floor=10
+   - Non-US species: IUCN scale (CR=50, EN=25, VU=5, NT=2, other=1)
+   - Unmatched species: default=1
+ - Scoring table — two tables:
+   a. US-listed species scoring (ESA + MMPA + MBTA)
+   b. IUCN Red List scoring (non-US)
+ - Scale note: Scores are 1-100% (integers stored for efficiency; conceptually a 0-1 probability-like scale)
+
+ Source: msens/R/listings.R; final-report_2025.qmd lines 222-239; ingest_nmfs-fws-listings.qmd; merge_models_prep.qmd
+
+ 6. model-merging.qmd — NEW
+
+ Content: How individual species models are merged into a single distribution per species.
+
+ Sections:
+ - Pipeline overview (mermaid diagram):
+   a. Gather all models per species across 7 source datasets
+   b. Take MAX suitability value per cell across datasets
+   c. Apply IUCN range masking (semi-join with combined mask from IUCN + NMFS CH + FWS CH)
+   d. Apply MMPA spatial minimum floor: pmax(value, 20)
+   e. Apply MBTA spatial minimum floor: pmax(value, 10)
+   f. Persist to model + model_cell tables
+ - Masking logic — when IUCN range exists, SDM is constrained to mask extent
+ - Spatial floor values — explanation of why MMPA/MBTA species get minimum cell values
+ - Valid species filter — is_ok flag: has merged model + marine + not extinct + in program areas
+
+ Source: merge_models.qmd (especially lines 326-334 for MMPA/MBTA floors)
+
+ 7. scoring.qmd — MAJOR UPDATE
+
+ Current: Only discusses treemap and flower plot visualization concepts.
+
+ Changes — restructure into:
+ - Cell-level scoring: extinction risk weighted by species presence, by category
+   - Formula: SUM(er_score * model_cell_value) / 100 per species category
+ - Ecoregional rescaling: normalize to [0-100] within each ecoregion
+   - Formula: (cell_value - ecoregion_min) / (ecoregion_max - ecoregion_min) * 100
+ - Primary productivity scoring: VGPM values as separate metric
+ - Zone aggregation: area-weighted averages to program areas/subregions/ecoregions
+ - Visualization (keep existing content, enhance):
+   - Flower Plot — update with: petal length = component sensitivity score, petal width = weight, center = overall score
+   - Create new flower plot figure with species category icons (bird, fish, mammal, productivity SVGs)
+   - Treemap — keep existing content
+ - Component scores: list the metric keys (extrisk_fish, extrisk_bird, extrisk_mammal, etc.)
+
+ Source: calc_scores.qmd; existing scoring.qmd content
+
+ 8. apps.qmd + New Appendix Pages — UPDATE
+
+ Changes to apps.qmd:
+ - Replace grid listing with descriptions of the two primary apps
+ - Brief overview of mapgl and mapsp with feature highlights
+
+ New apps/mapgl.qmd:
+ - General sensitivity mapping app
+ - Features: multi-resolution (cell/planning area), study area selection, layer selection, flower plot, species table, treemap, CSV export
+ - R code chunk with webshot2::webshot() (eval: false) + pre-captured PNG fallback
+ - Cross-reference to scoring methodology
+
+ New apps/mapsp.qmd:
+ - Species distribution viewer
+ - Features: species selection by category, model display (merged vs individual datasets), IUCN masking toggle, species info panel with ESA/IUCN/MMPA/MBTA flags
+ - R code chunk with webshot2::webshot() (eval: false) + pre-captured PNG fallback
+ - Deep-linking support (URL parameters)
+
+ Source: apps/mapgl/app.R; apps/mapsp/app.R
+
+ 9. summary.qmd — WRITE
+
+ Content:
+ - Key findings: 9,819 valid species mapped at 0.05° resolution across 20 program areas
+ - MMPA/MBTA/ESA integration ensures federally protected species are properly weighted
+ - Ecoregional rescaling enables cross-region comparison
+ - Interactive tools (mapgl, mapsp) for exploration and decision support
+ - Future directions (from final report): OBIS/GBIF validation, H3 hexagons, STAC catalogs, DAG pipelines, expanded stressor-receptor matrices
+
+ Source: final-report_2025.qmd future enhancements section
+
+ 10. glossary.yml — UPDATE
+
+ Add terms:
+ - ESA: Endangered Species Act — US federal law protecting endangered and threatened species
+ - MMPA: Marine Mammal Protection Act — US federal law protecting all marine mammals
+ - MBTA: Migratory Bird Treaty Act — US federal law protecting migratory birds
+ - BOEM: Bureau of Ocean Energy Management
+ - OCSLA: Outer Continental Shelf Lands Act
+ - MST: Marine Sensitivity Toolkit
+ - DuckDB: Embedded analytical database used for scoring computations
+ - Ecoregion: BOEM-defined ecological region for rescaling sensitivity scores
+ - COG: Cloud-Optimized GeoTIFF
+ - SDM: Species Distribution Model
+
+ 11. references.bib — UPDATE
+
+ Add citations (check if missing):
+ - BOEM 2018 (Ecoregions reference)
+ - Niedoroda 2014 (previous RESA method)
+ - Behrenfeld & Falkowski 1997 (VGPM model)
+ - Executive Order 14303
+
+ 12. Figures — NEW/UPDATE
+
+ ┌──────────────────────────────────────────────────────┬──────────────────────────────────────────────────────┬────────────────────────────────────────────────┐
+ │                        Figure                        │                        Action                        │                     Source                     │
+ ├──────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┼────────────────────────────────────────────────┤
+ │ mst-methods edit2.svg → figures/overview-methods.svg │ Copy to docs/figures/                                │ ~/My Drive/projects/msens/figures/overview-v2/ │
+ ├──────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┼────────────────────────────────────────────────┤
+ │ figures/icons/*.svg                                  │ Copy bird, fish, mammal, productivity icons          │ ~/My Drive/projects/msens/figures/icons/       │
+ ├──────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┼────────────────────────────────────────────────┤
+ │ Flower plot with icons                               │ Create R code chunk using rphylopic + existing icons │ New R code in scoring.qmd                      │
+ ├──────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┼────────────────────────────────────────────────┤
+ │ App screenshots (mapgl)                              │ Pre-capture PNGs + webshot2 code (eval:false)        │ R code chunk in apps/mapgl.qmd                 │
+ ├──────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┼────────────────────────────────────────────────┤
+ │ App screenshots (mapsp)                              │ Pre-capture PNGs + webshot2 code (eval:false)        │ R code chunk in apps/mapsp.qmd                 │
+ ├──────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┼────────────────────────────────────────────────┤
+ │ Updated process diagram                              │ Update diagrams/process.mmd                          │ Edit existing mermaid file                     │
+ └──────────────────────────────────────────────────────┴──────────────────────────────────────────────────────┴────────────────────────────────────────────────┘
+
+ 13. Updated diagrams/process.mmd
+
+ Replace current flowchart with one reflecting the actual pipeline:
+
+ 7 Source Datasets (AquaMaps, NMFS Core, NMFS CH, FWS CH, FWS Range, BirdLife, IUCN Range)
+ → Taxonomy Matching (WoRMS, GBIF, ITIS, IUCN, BirdLife)
+ → Model Merging (MAX across datasets + IUCN/CH mask + MMPA/MBTA spatial floors)
+ → Cell Scoring (ER × presence by species category)
+ → Ecoregional Rescaling [0-100%]
+ → Zone Aggregation (program areas, subregions, ecoregions)
+ → Visualization (Flower Plot, Treemap, Interactive Maps)
+
+
+ ---
+ Flower Plot with Icons — Design Notes
+
+ The user wants a flower plot with:
+ - Varying petal widths (representing component weights)
+ - Species category icons on outer edge of petals
+
+ Approach (try programmatic first, fallback to manual):
+ 1. Try R programmatic approach: Use ggplot2 with polar coordinates + rphylopic silhouettes or grImport2 to read existing SVG icons (bird, fish, mammal,
+ productivity from ~/My Drive/projects/msens/figures/icons/). Fetch additional silhouettes from phylopic.org for coral, turtle, invertebrate.
+ 2. If not clean enough: Provide InkScape editing instructions for the user to manually add icons and adjust petal widths on the overview SVG.
+ 3. Place the flower plot figure in scoring.qmd as a documented example of the visualization approach.
+
+ ---
+ Implementation Order
+
+ 1. Copy figures (overview SVG, icons) to docs/figures/
+ 2. Update _quarto.yml with new chapter structure
+ 3. Update intro.qmd with current scope and overview figure
+ 4. Update science.qmd with enhanced formulas and variable descriptions
+ 5. Create data-sources.qmd (adapt from final report + receptors.qmd)
+ 6. Create taxonomy.qmd (adapt from final report)
+ 7. Create extinction-risk.qmd (from msens package + final report)
+ 8. Create model-merging.qmd (from merge_models.qmd workflow)
+ 9. Update scoring.qmd with actual methodology + enhanced visualization
+ 10. Update diagrams/process.mmd
+ 11. Create apps/mapgl.qmd and apps/mapsp.qmd with screenshots
+ 12. Update apps.qmd overview
+ 13. Write summary.qmd
+ 14. Update glossary.yml with new terms
+ 15. Update references.bib if needed
+ 16. Remove old app appendix pages from _quarto.yml
+
+ ---
+ Verification
+
+ 1. quarto render docs/ — confirm the book builds without errors
+ 2. Check all cross-references resolve (@fig-, @tbl-, @eq-*)
+ 3. Verify screenshots render (requires Shiny apps running or pre-captured images)
+ 4. Review extinction risk scoring tables match msens::compute_er_score() logic
+ 5. Confirm MMPA/MBTA descriptions match merge_models.qmd implementation
+ 6. Test glossary terms render with popups
+ 7. Verify all figure paths are correct
+
+ ---
+ Key Files to Modify/Create
+
+ Modify:
+ - /Users/bbest/Github/MarineSensitivity/docs/_quarto.yml
+ - /Users/bbest/Github/MarineSensitivity/docs/intro.qmd
+ - /Users/bbest/Github/MarineSensitivity/docs/science.qmd
+ - /Users/bbest/Github/MarineSensitivity/docs/scoring.qmd
+ - /Users/bbest/Github/MarineSensitivity/docs/apps.qmd
+ - /Users/bbest/Github/MarineSensitivity/docs/summary.qmd
+ - /Users/bbest/Github/MarineSensitivity/docs/glossary.yml
+ - /Users/bbest/Github/MarineSensitivity/docs/diagrams/process.mmd
+
+ Create:
+ - /Users/bbest/Github/MarineSensitivity/docs/data-sources.qmd
+ - /Users/bbest/Github/MarineSensitivity/docs/taxonomy.qmd
+ - /Users/bbest/Github/MarineSensitivity/docs/extinction-risk.qmd
+ - /Users/bbest/Github/MarineSensitivity/docs/model-merging.qmd
+ - /Users/bbest/Github/MarineSensitivity/docs/apps/mapgl.qmd
+ - /Users/bbest/Github/MarineSensitivity/docs/apps/mapsp.qmd
+
+ Copy to docs/figures/:
+ - ~/My Drive/projects/msens/figures/overview-v2/mst-methods edit2.svg
+ - ~/My Drive/projects/msens/figures/icons/bird.svg
+ - ~/My Drive/projects/msens/figures/icons/fish.svg
+ - ~/My Drive/projects/msens/figures/icons/mammal.svg
+ - ~/My Drive/projects/msens/figures/icons/productivity.svg
+
+ Reuse existing functions:
+ - msens::compute_er_score() from /Users/bbest/Github/MarineSensitivity/msens/R/listings.R — document in extinction-risk.qmd
+ - Flower plot JS code from /Users/bbest/Github/MarineSensitivity/apps/mapgl/app.R — adapt for static figure
+
+⏺ No warnings or errors. The book renders cleanly. Let me do a final summary of everything that was
+  done.
+
+  Here's a summary of all changes made:
+
+  Files Modified
+
+  1. _quarto.yml — restructured Science chapters (added data-sources, taxonomy, extinction-risk,
+  model-merging; moved stressors after scoring); added Applications (Current) appendix with mapgl/mapsp;
+   renamed old apps section to Applications (Legacy)
+  2. intro.qmd — rewrote with current scope (9,819 species, 0.05° grid, 20 program areas), overview
+  figure, 7-step pipeline description, Executive Order 14303 mention
+  3. science.qmd — updated V=f(E,S,A) framework with enhanced cell vulnerability formula using final
+  report notation ($v_c = \sum p_{sc} \cdot w_s$), added variable descriptions, sensitivity components
+  list, ecoregional rescaling formula, cross-references to new chapters
+  4. scoring.qmd — complete rewrite with cell-level scoring formula, metric keys table, ecoregional
+  rescaling methodology, zone aggregation, and updated visualization sections (flower plot, treemap,
+  interactive maps)
+  5. apps.qmd — replaced grid listing with descriptions of mapgl and mapsp applications
+  6. stressors.qmd — added {#sec-stressors} label and introductory context paragraph
+  7. summary.qmd — wrote full summary with key findings and future directions
+  8. glossary.yml — added 10 new terms: BOEM, COG, DuckDB, ecoregion, ESA, MBTA, MMPA, MST, OCSLA, SDM
+  9. references.bib — added behrenfeld1997 (VGPM) and niedoroda2014 (RESA)
+  10. diagrams/process.mmd — replaced old flowchart with current pipeline (7 datasets → taxonomy → merge
+   → score → rescale → aggregate → visualize)
+
+  Files Created
+
+  11. data-sources.qmd — comprehensive description of all 8 datasets with table, per-dataset sections,
+  merged model description, standard grid, primary productivity (adapted from receptors.qmd)
+  12. taxonomy.qmd — taxonomic authorities, ID resolution cascade, species categories, data quality,
+  valid species filter
+  13. extinction-risk.qmd — ESA/MMPA/MBTA/IUCN regulatory framework, two-track scoring methodology
+  matching msens::compute_er_score(), scoring tables for US and non-US species
+  14. model-merging.qmd — merge pipeline with mermaid diagram, MAX across datasets, spatial masking,
+  MMPA/MBTA floors, valid species filter criteria
+  15. apps/mapgl.qmd — sensitivity map app documentation with features, webshot2 code chunk (eval:false)
+  16. apps/mapsp.qmd — species viewer app documentation with features, deep-linking, webshot2 code chunk
+   (eval:false)
+
+  Figures Copied
+
+  17. figures/overview-methods.svg — from Google Drive mst-methods edit2.svg
+  18. figures/icons/bird.svg, fish.svg, mammal.svg, productivity.svg — species category icons
+
+  Verification
+
+  The book builds successfully with quarto render --to html — no errors or warnings.
+
+This is an unsatisfying landing page content: "# Preface\n This is a Quarto book." What would work well here -- drop it and go directly to Introduction; expand it to a citation and credits; add the overview figure; or ...?
+
+Figure 1.2 is included, but not referenced with explanatory text (like Figure 1.1)
+
+I don't see the app screenshots in Appendices: Applications (Current).
+
+Where did the flower plots get updated / used?
+
+
+ ☐ Landing page 
+
+For the index.qmd landing page, which approach do you prefer?
+
+  1. Move intro content up
+     Merge the intro text + overview figure into index.qmd as the landing page, drop the separate intro.qmd chapter
+  2. Citation & credits page
+     Keep index.qmd as a brief preface with project citation, funding credits (BOEM-ESP), author info, and the overview figure
+❯ 3. Overview figure + blurb
+     Replace boilerplate with a concise welcome blurb, the overview figure, and 'how to cite' — keep full intro.qmd separate
+  4. Type something.
+
+⏺ There are existing screenshots and flower plots from the workflows. Now let me fix all four issues:           
+
+  1. index.qmd — overview figure + blurb + citation                    
+  2. intro.qmd — add explanatory text for @fig-overview
+  3. apps/mapgl.qmd & mapsp.qmd — use the pre-captured screenshots
+  4. scoring.qmd — replace the old mockup with the actual flower plot output
+
+⏺ Clean build, no warnings or errors. Here's what was fixed:                                                                                                                                                        
+                                                                                                                                                                                                                    
+  1. index.qmd landing page — replaced "This is a Quarto book" with a welcome blurb, the overview figure, book organization pointers, a "How to Cite" block, and Acknowledgments (BOEM-ESP, data providers).        
+                                                                                                                                                                                                                    
+  2. @fig-overview explanatory text — added a paragraph before the figure in intro.qmd describing what the overview diagram shows (left: data sources + taxonomic authorities, center: merging + ER weighting,      
+  right: rescaling + aggregation + visualization).                                                                                                                                                                  
+
+  3. App screenshots — copied pre-captured PNGs from workflows/figs/boem-esi-2025/ into docs/figures/apps/. Both mapgl.qmd and mapsp.qmd now display actual screenshots with @fig- references and explanatory text
+  (mapgl shows the globe view + flower plot for Southern California; mapsp shows the blue whale distribution).
+
+  4. Flower plots — copied the actual programarea_flower-plot_scores_min_line_v3.png from the v3 scoring run to docs/figures/. Updated scoring.qmd to display it as @fig-flower-programareas with text describing
+  the per-program-area patterns (Alaska fish/mammal dominance, Gulf coral/invertebrate contributions). Also cross-references the interactive version in mapgl (@fig-mapgl-flower).
+
+
 ## 2026-02-17.b only subset of components (primprod, fish, other) in {dir_v}/.csv|.xlsx|.docx; show all species categories in score tables + add metric labels
 
 Why are only a subset of components showing up in these results generated by @calc_scores.qmd in `dir_v` = @~/My Drive/projects/msens/data/derived/v3/?
