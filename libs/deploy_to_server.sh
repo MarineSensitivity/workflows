@@ -25,6 +25,10 @@ REMOTE_BIG="/share/data/big"
 
 # sync data ----
 if [[ "$MODE" == "all" || "$MODE" == "data" ]]; then
+  REMOTE_DB="$REMOTE_BIG/${VER}/sdm.duckdb"
+  REMOTE_DB_NEW="${REMOTE_DB}.new"
+
+  # 1. rsync all files to server ----
   echo "=== syncing derived/${VER}/ (small files) ==="
   rsync -avz --progress \
     -e "ssh -i \"$SSH_KEY\"" \
@@ -32,17 +36,49 @@ if [[ "$MODE" == "all" || "$MODE" == "data" ]]; then
     "$DIR_V" \
     "$SSH_HOST:$REMOTE_DERIVED/${VER}/"
 
-  echo "=== syncing _big/${VER}/sdm.duckdb to /share/data/big/${VER}/ ==="
+  echo "=== syncing sdm.duckdb to staging file ==="
   rsync -avz --progress \
     -e "ssh -i \"$SSH_KEY\"" \
+    --exclude='*.wal' \
     "$DB_BIG" \
-    "$SSH_HOST:$REMOTE_BIG/${VER}/"
+    "$SSH_HOST:${REMOTE_DB_NEW}"
 
-  echo "=== syncing shared input raster `basename "$TIF_SHARED"` to derived/${VER}/ ==="
+  echo "=== syncing shared input raster ==="
   rsync -avz --progress \
     -e "ssh -i \"$SSH_KEY\"" \
     "$TIF_SHARED" \
     "$SSH_HOST:$REMOTE_DERIVED/"
+
+  # 2. fix permissions + swap duckdb + restart rstudio ----
+  # shiny needs staff group to read data; setgid ensures new files inherit staff;
+  # rstudio restart picks up new group membership and clean duckdb
+  echo "=== fixing permissions, swapping duckdb, restarting rstudio ==="
+  ssh -i "$SSH_KEY" "$SSH_HOST" bash -s <<DEPLOY
+    set -euo pipefail
+
+    # add shiny to staff group inside rstudio container (idempotent)
+    docker exec rstudio usermod -aG staff shiny 2>/dev/null || true
+
+    # fix group ownership + permissions on synced data
+    sudo chgrp -R staff ${REMOTE_DERIVED} ${REMOTE_BIG}
+    sudo chmod -R g+rX  ${REMOTE_DERIVED} ${REMOTE_BIG}
+
+    # setgid on directories so new files inherit staff group
+    sudo find ${REMOTE_DERIVED} -type d -exec chmod g+s {} +
+    sudo find ${REMOTE_BIG}     -type d -exec chmod g+s {} +
+
+    # fix staged duckdb permissions before swap
+    sudo chgrp staff ${REMOTE_DB_NEW}
+    sudo chmod g+r   ${REMOTE_DB_NEW}
+
+    # stop rstudio, swap duckdb, delete stale WAL, restart
+    cd /share/github/MarineSensitivity/server
+    docker compose stop rstudio
+    rm -f ${REMOTE_DB}.wal
+    mv ${REMOTE_DB_NEW} ${REMOTE_DB}
+    docker compose start rstudio
+    echo "--- rstudio restarted with fixed permissions ---"
+DEPLOY
 fi
 
 # pull app code ----
