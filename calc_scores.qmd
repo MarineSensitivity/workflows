@@ -30,6 +30,14 @@ This notebook calculates scores from models loaded into sdm db and taxon table, 
 - After:
   1. Summary data/figs/README sections are now integrated into this notebook (merged from `msens-summary_programareas.qmd`)
 
+To render this notebook on Ben's laptop:
+
+```bash
+cd ~/Github/MarineSensitivity/workflows
+quarto render calc_scores.qmd
+```
+
+
 ## TODO
 
 - [x] fix "reptile" in flower plots (addressed by merge_models.qmd reclassification)
@@ -108,18 +116,31 @@ stopifnot(all(file_exists(c(cell_tif, pra_raw_gpkg, er_raw_gpkg))))
 # input polygon (from prior step)
 pa_gpkg <- glue("{dir_v}/ply_planareas_2025{v_sfx}.gpkg")
 
-# flags
-do_zones <- F # no, except if new spatial
-do_metrics <- T # YES
-do_zone_taxon <- T # slow in past
-do_postgis <- T # YES
-do_downloads <- T # YES
-do_summary_data <- T # ecoregion x PRA intersections, label points, score tables
-do_summary_figs <- T # maps, flower plots, primprod charts, Word/Excel tables
-do_readme <- T # programmatic README.md + README.html
-do_map <- F # no, but useful for visual checks during development
-do_parquet <- F # no, but produces smaller faster duckdb
-do_deploy <- T # sync derived data + app code to server
+# flags, typical
+# do_zones <- F # no, except if new spatial
+# do_metrics <- T # YES
+# do_zone_taxon <- T # slow in past
+# do_postgis <- T # YES
+# do_downloads <- T # YES
+# do_summary_data <- T # ecoregion x PRA intersections, label points, score tables
+# do_summary_figs <- T # maps, flower plots, primprod charts, Word/Excel tables
+# do_readme <- T # programmatic README.md + README.html
+# do_map <- F # no, but useful for visual checks during development
+# do_parquet <- F # no, but produces smaller faster duckdb
+# do_deploy <- T # sync derived data + app code to server
+
+# flags, fix: show all species categories in score tables + add metric labels
+do_zones <- F # no change
+do_metrics <- F # metrics already calculated correctly in DuckDB
+do_zone_taxon <- F # not affected
+do_postgis <- F # PostGIS tables already have v3 columns
+do_downloads <- F # pra_gpkg already has correct columns
+do_summary_data <- T # YES — score tables need regeneration
+do_summary_figs <- T # YES — DOCX/XLSX/flower plots need regeneration
+do_readme <- F # not affected
+do_map <- F # not affected
+do_parquet <- F # not affected
+do_deploy <- F # can deploy separately
 
 # spatial outputs (year reflects input data vintage, version suffix model version of derived metric columns)
 pra_gpkg <- glue("{dir_v}/ply_programareas_2026{v_sfx}.gpkg")
@@ -2111,6 +2132,52 @@ d_ck |>
 # 7.642  17.372  24.131  26.439  32.972  60.068
 ```
 
+### Metric labels
+
+Add display label columns to metric table as single source of truth for display names used in score tables, Word/Excel output, and flower plots.
+
+```{r}
+#| label: metric_labels
+#| eval: true
+
+# add display label columns to metric table if missing
+for (col in c("metric_title", "metric_abbrev")) {
+  cols <- dbGetQuery(
+    con_sdm,
+    "SELECT column_name FROM information_schema.columns WHERE table_name = 'metric'"
+  )
+  if (!col %in% cols$column_name) {
+    dbExecute(con_sdm, glue("ALTER TABLE metric ADD COLUMN {col} VARCHAR"))
+  }
+}
+
+# populate labels for score-contributing metrics
+metric_labels <- tribble(
+  ~metric_key                                                  , ~metric_title        , ~metric_abbrev ,
+  "score_extriskspcat_primprod_ecoregionrescaled_equalweights" , "Score"              , "Score"        ,
+  "extrisk_bird_ecoregion_rescaled"                            , "Bird"               , "Bird"         ,
+  "extrisk_coral_ecoregion_rescaled"                           , "Coral"              , "Coral"        ,
+  "extrisk_fish_ecoregion_rescaled"                            , "Fish"               , "Fish"         ,
+  "extrisk_invertebrate_ecoregion_rescaled"                    , "Invertebrate"       , "Invertebrate" ,
+  "extrisk_mammal_ecoregion_rescaled"                          , "Mammal"             , "Mammal"       ,
+  "extrisk_other_ecoregion_rescaled"                           , "Other"              , "Other"        ,
+  "extrisk_turtle_ecoregion_rescaled"                          , "Turtle"             , "Turtle"       ,
+  "primprod_ecoregion_rescaled"                                , "Primary Production" , "Prim. Prod."
+)
+
+duckdb_register(con_sdm, "tmp_labels", metric_labels)
+dbExecute(
+  con_sdm,
+  "
+  UPDATE metric
+  SET metric_title  = t.metric_title,
+      metric_abbrev = t.metric_abbrev
+  FROM tmp_labels t
+  WHERE metric.metric_key = t.metric_key"
+)
+duckdb_unregister(con_sdm, "tmp_labels")
+```
+
 ## Add/update `zone_taxon`
 
 For showing species composition per zone (e.g. subregion, planning area, program area) in mapgl app.
@@ -2892,21 +2959,35 @@ if (!file.exists(lbls_csv)) {
 
 d_pra <- read_sf(pra_gpkg) |>
   st_drop_geometry()
-d_er <- read_sf(er_raw_gpkg) |>
-  st_drop_geometry()
-flds <- intersect(names(d_pra), names(d_er)) |>
-  str_subset("rescaled") |>
-  sort() |>
-  rev()
-flds_rn <- flds |>
-  str_replace(
-    "score_extriskspcat_primprod_ecoregionrescaled_equalweights",
-    "score"
-  ) |>
-  str_replace("_ecoregion_rescaled", "") |>
-  str_replace("extrisk_", "") |>
-  setNames(flds)
 
+# get field-to-label mapping from metric table (single source of truth)
+d_metric_labels <- tbl(con_sdm, "metric") |>
+  filter(!is.na(metric_title)) |>
+  select(metric_key, metric_title, metric_abbrev) |>
+  collect()
+
+# fields present in program area data that have labels
+flds <- intersect(names(d_pra), d_metric_labels$metric_key)
+
+# named vector: metric_key -> short name for column renaming
+flds_rn <- d_metric_labels |>
+  filter(metric_key %in% flds) |>
+  mutate(
+    short = metric_key |>
+      str_replace(
+        "score_extriskspcat_primprod_ecoregionrescaled_equalweights",
+        "score"
+      ) |>
+      str_replace("_ecoregion_rescaled", "") |>
+      str_replace("extrisk_", "")
+  ) |>
+  pull(short, name = metric_key)
+
+# ecoregion header rows with NA for all metric columns
+na_cols <- setNames(
+  rep(list(NA_real_), length(flds_rn) + 1),
+  c("area_km2", unname(flds_rn))
+)
 d_er_n <- read_csv(er_pra_csv) |>
   distinct(
     region_key,
@@ -2914,12 +2995,7 @@ d_er_n <- read_csv(er_pra_csv) |>
     ecoregion_key,
     ecoregion_name
   ) |>
-  left_join(
-    d_er |>
-      select(all_of(c("ecoregion_key", "area_km2", flds))) |>
-      rename_with(~ flds_rn[.x], all_of(flds)),
-    by = "ecoregion_key"
-  )
+  bind_cols(as_tibble(na_cols))
 
 d_pra_n <- read_csv(er_pra_csv) |>
   select(
@@ -3432,6 +3508,13 @@ set_flextable_defaults(
   big.mark = ","
 )
 
+# build rename vector from metric table: metric_abbrev -> short_name
+abbrev_rn <- d_metric_labels |>
+  filter(metric_key %in% flds) |>
+  mutate(short = flds_rn[metric_key]) |>
+  filter(short != "score") |>
+  pull(short, name = metric_abbrev)
+
 d_er_pra_n |>
   mutate(
     area_kkm2 = area_km2 / 1000
@@ -3447,17 +3530,8 @@ d_er_pra_n |>
   select(
     Area = row_lbl,
     Score = score,
-    `Prim. Prod.` = primprod,
-    any_of(c(
-      Bird = "bird",
-      Coral = "coral",
-      Fish = "fish",
-      Invertebrate = "invertebrate",
-      Mammal = "mammal",
-      Turtle = "turtle",
-      Other = "other"
-    )),
-    `area (1,000 km^2^)` = area_kkm2
+    all_of(abbrev_rn),
+    `Area (1,000 km^2^)` = area_kkm2
   ) |>
   flextable() |>
   ftExtra::colformat_md(part = "all") |>
@@ -3483,6 +3557,13 @@ set_flextable_defaults(
   big.mark = ","
 )
 
+# build rename vector: metric_title -> short_name
+title_rn <- d_metric_labels |>
+  filter(metric_key %in% flds) |>
+  mutate(short = flds_rn[metric_key]) |>
+  filter(short != "score") |>
+  pull(short, name = metric_title)
+
 d_pra_only <- d_er_pra_n |>
   filter(row_type == "programarea") |>
   arrange(desc(score)) |>
@@ -3502,24 +3583,14 @@ d_pra_only <- d_er_pra_n |>
   select(
     row_lbl,
     score,
-    primprod,
-    any_of(sp_cats),
+    all_of(unname(title_rn)),
     area_kkm2
   ) |>
   distinct() |>
   select(
     `Program Area` = row_lbl,
     Score = score,
-    `Primary Production` = primprod,
-    any_of(c(
-      Bird = "bird",
-      Coral = "coral",
-      Fish = "fish",
-      Invertebrate = "invertebrate",
-      Mammal = "mammal",
-      Turtle = "Turtle",
-      Other = "other"
-    )),
+    all_of(title_rn),
     `Area (1,000 km^2^)` = area_kkm2
   )
 
@@ -3559,7 +3630,10 @@ m_input_seqs <- tbl(con_sdm, "metric") |>
   filter(metric_key %in% metric_input_keys) |>
   pull(metric_seq)
 
-components <- c(str_to_title(sp_cats), "Primary Production")
+# build components from metric table
+components <- d_metric_labels |>
+  filter(metric_key %in% flds, metric_title != "Score") |>
+  pull(metric_title)
 component_cols <- setNames(
   hue_pal()(length(components)),
   components
@@ -3641,6 +3715,17 @@ d_fl <- d_fl |>
   arrange(programarea_key, component) |>
   mutate(even = 1)
 
+# build component display name lookup from metric table
+component_labels <- d_metric_labels |>
+  filter(metric_key %in% flds, metric_title != "Score") |>
+  mutate(
+    component = metric_key |>
+      str_replace("extrisk_", "") |>
+      str_replace("_ecoregion_rescaled", "") |>
+      str_replace("_", " ")
+  ) |>
+  pull(metric_title, name = component)
+
 d_fl <- d_fl |>
   mutate(
     programarea_lbl = factor(
@@ -3648,12 +3733,7 @@ d_fl <- d_fl |>
       levels = d_scores$programarea_key,
       ordered = T
     ),
-    component = case_match(
-      component,
-      "primprod" ~ "Primary Production",
-      .default = component
-    ),
-    component = str_to_title(component)
+    component = component_labels[component]
   ) |>
   arrange(programarea_lbl, component)
 
