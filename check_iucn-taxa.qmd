@@ -1,0 +1,131 @@
+---
+title: "Check IUCN Taxa"
+subtitle: "Diagnostic: IUCN-only species (not NMFS/FWS) with er_score > 1"
+format:
+  html:
+    code-fold: true
+    code-tools: true
+editor_options:
+  chunk_output_type: console
+---
+
+## Overview
+
+Evaluate species that:
+
+- pass quality checks (`is_ok = TRUE`)
+- are **not** listed by NMFS or FWS (`extrisk_code` does not start with `NMFS:` or `FWS:`)
+- have an IUCN code (`extrisk_code` starts with `IUCN:`)
+- have `er_score > 1`
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+
+librarian::shelf(
+  DBI,
+  dplyr,
+  DT,
+  duckdb,
+  glue,
+  here,
+  knitr,
+  stringr,
+  tidyr,
+  quiet = T
+)
+
+source(here("libs/paths.R"))
+
+con_sdm <- dbConnect(duckdb(), sdm_db, read_only = TRUE)
+```
+
+## Query taxa
+
+```{r}
+#| label: query
+
+d <- tbl(con_sdm, "taxon") |>
+  filter(
+    is_ok == TRUE,
+    er_score > 1
+  ) |>
+  collect() |>
+  filter(
+    str_starts(extrisk_code, "IUCN:")
+  )
+
+# extract iucn code from extrisk_code
+d <- d |>
+  mutate(
+    iucn_code = str_remove(extrisk_code, "^IUCN:")
+  )
+
+message(glue("{nrow(d)} IUCN-only taxa with er_score > 1"))
+```
+
+## IUCN codes by species category
+
+```{r}
+#| label: tbl_iucn_by_spcat
+
+d |>
+  count(sp_cat, iucn_code) |>
+  pivot_wider(
+    names_from = iucn_code,
+    values_from = n,
+    values_fill = 0
+  ) |>
+  arrange(sp_cat) |>
+  kable()
+```
+
+## Full listing
+
+```{r}
+#| label: tbl_full
+
+d |>
+  mutate(
+    mapsp = glue(
+      "<a href='https://shiny.marinesensitivity.org/mapsp/?mdl_seq={mdl_seq}'
+         target='_blank'>{mdl_seq}</a>"
+    ),
+    worms = ifelse(
+      !is.na(worms_id),
+      glue(
+        "<a href='https://www.marinespecies.org/aphia.php?p=taxdetails&id={worms_id}'
+           target='_blank'>{worms_id}</a>"
+      ),
+      NA_character_
+    )
+  ) |>
+  select(
+    sp_cat,
+    scientific_name,
+    common_name,
+    mapsp,
+    worms,
+    iucn_code,
+    er_score,
+    is_mmpa,
+    is_mbta,
+    is_bcc
+  ) |>
+  arrange(sp_cat, desc(er_score), scientific_name) |>
+  datatable(
+    escape = FALSE,
+    filter = "top",
+    options = list(
+      pageLength = 25,
+      autoWidth = TRUE
+    )
+  )
+```
+
+```{r}
+#| label: cleanup
+
+dbDisconnect(con_sdm, shutdown = TRUE)
+```
