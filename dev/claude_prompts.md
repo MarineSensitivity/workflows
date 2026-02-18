@@ -33,13 +33,191 @@
 
 - Migrate to hexagons
 
+
+## 2026-02-18 docs rationale MMPA, Non-US species, masking, flower plot, etc.
+
+Incorporate extra rationale into the docs here ./*.qmd where applicable from comments below and in this document with track changes on: `@/Users/bbest/Desktop/msens/proposal_2_Introduction_updated_v2_BB.docx`
+
+Here are extra issues addressed in this docx:
+
+> Risk table — The IUCN scores (CR=50, EN=25, etc.) in the table are dataset cell encodings, not final er_scores. Either correct the values or clarify what they represent. The footnote should be strengthened.
+
+Table 10‑1: Extinction risk codes. US national codes (ESA) are weighted more strongly and preferred over international codes (IUCN), given their spatial specificity and applicability to US regulations. Scores get applied to both cells of binary range maps (including Critical Habitats and Core Areas) and species level weights. 
+
+> w_s formula description — w_s in the vulnerability equation operates on a 0–1 scale internally; the 1–100 er_score is divided by 100. Clarify this to avoid confusing technical reviewers.
+
+I simplified to using 0 to 100%, which conveys the meaning, rather than getting bogged down by the implementation (using integers for the sake of reducing table storage size, speeding up calculations and avoiding excess precision where not applicable). 
+
+> Flower plot petal width — Change "could use petal width" to "uses petal width" — this is implemented in v2, not future work.
+
+The width of each petal represents the component weighting, i.e. weight of each component contributing to the average that is the Program Area score, which for now is equally weighted across components. 
+
+> 27 vs. 20 areas — Explicitly note that v1 referenced 27 OCS Planning Areas while v2 uses 20 BOEM Program Areas, and briefly explain these are different but related geographic frameworks.
+
+Twenty BOEM Program Areas spanning U.S. waters in Alaska, Pacific states and Gulf of America are included in the v2 sensitivity analysis (compared to 27 OCS Planning Areas in v1 that extended to all of Alaska, Gulf of America and Atlantic states). 
+
+> Spatial masking — Call out that v2 now constrains AquaMaps predictions within known species ranges (IUCN/Critical Habitat masks), preventing overestimation of presence — a scientifically significant improvement.
+
+ The merged distribution of sensitivity per species is now masked to expert ranges where available, so suitable habitat is not included outside known ranges. The combination of these improvements delivers a substantially more accurate, comprehensive, and legally grounded assessment of marine sensitivity across U.S. waters.
+
+> Current scope = sensitivity only — State explicitly that the current MST operationalizes the sensitivity component of the V = f(E, S, A) framework, with exposure and adaptive capacity components planned for future phases. This is critical transparency for government officials.
+
+Exposure and adaptive capacity will be explicitly included in future iterations of MST, thus the MST is presently focused on sensitivity.
+For spatial implementation, the sensitivity of a cell (vc)...
+
+
+Ignore the v1/v2 comparison, which is out of sync with the technical versioning (on v3 now) and would only confuse
+
+⏺ Updated plan
+  ⎿ /plan to preview
+
+ Here is Claude's plan:
+
+ Plan: Incorporate Proposal Rationale into MST Docs
+
+ Context
+
+ The proposal document (proposal_2_Introduction_updated_v2_BB.docx) contains important rationale, context, and explanatory language for the Marine Sensitivity
+ Toolkit (MST) that is currently absent from the online documentation .qmd files. The goal is to weave key rationale—especially legal justifications,
+ plain-language explanations, RESA comparison, and decision-support framing—into the existing docs where applicable. No v1/v2 version comparison language will be
+  added (current technical versioning is v3 and version references would confuse).
+
+ ---
+ Changes by File
+
+ 1. intro.qmd — Add RESA comparison and masking note
+
+ After line 3 (the existing first paragraph about OCSLA), add a new paragraph about advancement over prior RESA:
+
+ The MST marks a significant advancement over prior RESA methodologies (BOEM 2018). Earlier approaches often relied on aggregated data from a limited set of
+ broad species groups and surrogate species, lacking spatially explicit information for individual organisms. As a result, previous assessments were typically
+ coarse and areawide, frequently missing critical ecological variation and fine-scale patterns across the OCS. In contrast, the MST uses a high-resolution 0.05°
+ grid (~4 km per cell) on a species level to capture fine-scale conservation concerns and ecological patterns across US waters.
+
+ In line 5 (the species count paragraph), append sentence about masking:
+
+ The merged distribution of sensitivity per species is masked to expert ranges where available, so suitable habitat is not included outside known ranges.
+
+ ---
+ 2. science.qmd — Add plain-language explanations
+
+ After @eq-v (line 13), enhance the existing line 15 to include more detail:
+
+ The more exposed and sensitive an area is—and the less able it is to recover—the more vulnerable it is to impacts from offshore human activities. The MST
+ currently focuses on the sensitivity component, quantifying the intrinsic biological sensitivity of marine ecosystems based on the species present and their
+ conservation status. Exposure and adaptive capacity components are planned for future phases (see @sec-stressors).
+
+ After the $w_s$ bullet (line 29), add plain-language summary:
+
+ In other words, if a cell has many species that are both likely to be present and at high risk of extinction, it gets a higher sensitivity score. This helps
+ identify places where rare or threatened species are concentrated.
+
+ After @eq-rescale explanation (line 48), add:
+
+ Ecoregional rescaling makes it easy to compare areas within the same region, and Program Area aggregation gives an overall sensitivity score for each area,
+ considering both the sensitivity of each part and how big each part is.
+
+ ---
+ 3. extinction-risk.qmd — Add MMPA vs MBTA rationale (key addition)
+
+ After the MMPA section (line 20), add rationale paragraph explaining why MMPA floor > MBTA floor:
+
+ The MMPA floor is intentionally higher than the MBTA floor because the MMPA imposes a stronger statutory standard: it affirmatively requires that all marine
+ mammal populations be maintained at Optimum Sustainable Population levels and mandates active population recovery, whereas the MBTA is primarily a prohibitive
+ take statute. Marine mammals also tend to have lower reproductive rates and longer recovery times than most seabirds, making them intrinsically more sensitive
+ to disturbance.
+
+ ---
+ 4. model-merging.qmd — Enhance masking rationale
+
+ In Step 3: Spatial Masking (line 50-51), enhance the existing sentence:
+
+ Current: "This prevents the AquaMaps SDM (which often has broad environmental envelope predictions) from extending species presence far beyond their known
+ range."
+
+ Add after it: "This ensures that suitable habitat is not included outside known ranges, so that model predictions align with expert knowledge of where species
+ actually occur."
+
+ ---
+ 5. scoring.qmd — Add plain-language explanation and decision-support context
+
+ After the cell-level scoring formula definition (line 20), add:
+
+ In plain terms, for each cell in the ocean the MST adds up the sensitivity contributions of all species found there. If a cell has many species that are both
+ likely to be present and at high risk of extinction, it gets a higher sensitivity score. This helps identify places where rare or threatened species are
+ concentrated.
+
+ After the flower plot description (line 83), add decision-support sentence:
+
+ The flower plot lets decision-makers quickly spot which ecological elements drive sensitivity in an area, aiding better planning and impact assessment.
+
+ ---
+ 6. apps.qmd — Add decision-support framing
+
+ After line 11 (the intro sentence about two primary apps), add:
+
+ These tools allow stakeholders, scientists, and decision-makers to understand the underlying components contributing to an area's sensitivity to offshore energy
+  development, supporting better planning and impact assessment.
+
+ ---
+ Files Modified
+
+ 1. intro.qmd — RESA comparison, masking note
+ 2. science.qmd — plain-language explanations for formulas and rescaling
+ 3. extinction-risk.qmd — MMPA vs MBTA floor rationale
+ 4. model-merging.qmd — masking rationale enhancement
+ 5. scoring.qmd — plain-language explanation, decision-support
+ 6. apps.qmd — decision-support framing
+
+ Verification
+
+ - quarto render on individual changed files to confirm no rendering errors
+ - Visual review of rendered HTML to confirm new text integrates naturally
+ - Check cross-references (@sec-*, @eq-*, @fig-*) still resolve correctly
+
+
+Include (BOEM 2018) in references.bib and properly reference, per       
+https://www.boem.gov/sites/default/files/environmental-stewardship/Environmental-Studies/Pacific-Region/Studies/BOEM-2018-031-Vol1.pdf
+
+⏺ Done. Here's what I changed:                         
+
+  1. references.bib — Added @techreport{morandi2018, ...} entry with the full citation: Morandi et al. (2018), "Environmental Sensitivity and Associated Risk to  
+  Habitats and Species on the Pacific West Coast and Hawaii with Offshore Floating Wind Technologies," OCS Study BOEM 2018-031.
+  2. intro.qmd — Changed the plain text (BOEM 2018) to a proper Quarto citation [@morandi2018], which will render as a linked reference and appear in the         
+  bibliography.
+  
+  
+Tim:
+
+> But for the differential justification MMPA 20;  MBTA 10. I don't think we explained why we chose these values in the documention.  I think I remember we agreed that MMPA is much stricter than the MBTA in terms of its prohibitions, e.g. incidental activities, and more rigorous permitting requirements
+
+> In the IUCN documentation, section 5.2.2 on Non-US Species states that species not listed under US federal law are evaluated based solely on their IUCN Red List category. Could you please confirm whether this means we apply IUCN values exclusively to non-US species? I was under the impression that the IUCN rule could also apply to US species in cases where they do not have an overarching statute governing them.
+Also here: Table 5.3: IUCN-based extinction risk scores for non-US species. The non-US species confuses me because I thought we were using the IUCN for US species too.
+
+**Non-US Species (IUCN)**
+
+Species not listed under US federal law receive a score based solely on their IUCN Red List category:
+
+IUCN-based extinction risk scores for non-US species
+
+->
+
+**Species not federally listed (IUCN)**
+
+Species not federally listed or mentioned by NMFS ([Species Directory | NOAA Fisheries](https://www.fisheries.noaa.gov/species-directory)
+) or FWS ([Species | U.S. Fish & Wildlife Service](https://www.fws.gov/species)
+) fall back to an extinction risk score based on their IUCN Red List category:
+
+IUCN-based extinction risk scores for US species not listed or mentioned by NMFS or FWS.
+
+
 ## 2026-02-17.d add a splash page and tour to the apps
 
 Add a splash page to the apps with the overview figure (from https://marinesensitivity.org/docs/figures/overview-methods.svg) and link to this documentation. Add click to an optional tour of the app's functionality using [etiennebacher/conductor](https://github.com/etiennebacher/conductor).
 
 
 ⏺ Updated plan
-  ⎿  /plan to preview
+  ⎿ /plan to preview
 
  Here is Claude's plan:
  Plan: Add Splash Page and Conductor Tour to mapgl and mapsp Apps
