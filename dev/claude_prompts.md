@@ -34,6 +34,144 @@
 - Migrate to hexagons
 
 
+## 2026-02-19 planarea -> programarea_primprod.csv|png|pdf
+
+Bring in the `pa_zonal_plot` R chunk from @ingest_productivity into calc_scores.qmd with a flag, but apply to the Program Areas (not Planning Areas). Generate the programarea_primprod.csv|png|pdf in the `{dir_v}` folder.
+
+⏺ Both edits look correct. Here's a summary of what was done:                                                                                     
+                                                                                    
+  Flag added (line 144):                                                                                                                          
+  - do_pra_primprod <- T — controls evaluation of the new chunk independently from other flags                                                    
+                                                                                                                                                  
+  Replaced plot_primprod chunk with pra_zonal_plot (lines 3760-3832):                                                                             
+  - Label changed from plot_primprod → pra_zonal_plot
+  - Flag changed from do_summary_figs → do_pra_primprod
+  - Reads Program Area polygons from pra_gpkg (instead of Planning Area pa_gpkg)
+  - Uses programarea_key/programarea_name (instead of planarea_key/planarea_name)
+  - Computes zonal mean NPP directly from individual VGPM year rasters (same approach as ingest_productivity.qmd), then summarizes mean/sd across
+  years
+  - Drops units from both npp_avg and npp_sd before plotting (fixes a potential mixed-types issue in the original)
+  - Outputs directly to {dir_v}/programarea_primprod.csv|png|pdf (no version suffix, no intermediate dir_figs)
+  
+## pg to pmtiles
+
+In @calc_scores.qmd and apps (@../apps/mapsp|mapgl/app.R), migrate injection and use of vector tiles in/out of a spatial database (Postgres/PostGIS/pg_tileserv in @../server/docker-compose.yml) to [creating PMTiles](https://docs.protomaps.com/pmtiles/create) and `mapgl::add_pmtiles_source()`. Fork all affected repos into branch “migrate_postgis_to_pmtiles”.  These new pmtiles should live on Ben’s laptop at ~/_big/msens/derived/v3/pmtiles and similar relative path on server, with deploy script to update from laptop to server.  The tippecanoe and pmtiles binaries should be checked for existence in path, and installed if missing on the Mac laptop with home brew.
+
+## server: + sync.qmd
+
+Add a sync.qmd Quarto notebook to this server repo that describes a server plan for synchronizing a production server internal to the BOEM network with an external development server in a fed-certified cloud provider (already using AWS).
+
+Create a mermaid diagram overview of this synchronization with icons, soothing colors with legend, and relevant subgraphs for in/out BOEM network. This should communicate regular (eg daily or hourly) updating initiated by the internal server:
+- docker image (Shiny), data files (duckdb, gpkg, csv, tif): internal pulls from external
+- log files (for debugging): internal pushes to external
+
+What services are recommended to accomplish the sync? Probably ssh rclone on a cron job for pulling and pushing files. Perhaps Watchtower for sync’ing docker images. Compose scripts and instructions for implementation. 
+
+Implement a pinging strategy so I can become aware of any downtime of the internal production server.
+
+The nexus of actively developed, publicly visible content for this project is with:
+* R Shiny apps: @../apps/mapgl/app.R (https://app.marinesensitivity.org/mapgl), @../apps/mapsp/app.R (https://app.marinesensitivity.org/mapsp)
+* docs: @../docs/ (https://marinesensitivity.org/docs)
+
+Add sections on Motivation (top) and Government Compliance (bottom). The motivation is that the lead contractor of this Marine Sensitivity Toolbox (MST; see @../docs) will be out of the US to have his second child in his wife’s home country of Italy so will be limited to developing on a server outside the government network, so to further the goal of migrating web services to a server internal to BOEM, this server will need to initiate (push/pull) any software or data updates from the developer server external to the BOEM network. The government compliance section should review all the related statutes of IT policy specific to  BOEM.gov / Dept of Interior /.gov and describe how this arrangement is acceptable (or flag issues with proposed resolutions).
+
+Describe the overall server software architecture (use a mermaid diagram) with laptop, external server, internal server. There is currently only one (external) server with software services described in @docker-compose.yml. This for now includes a spatial database stack (Postgres/PostGIS/pg_tileserv), which is getting migrated to a simpler PMTiles (file only) vector tile delivery setup. It also include RStudio for debugging Shiny apps, which is not necessary on the production server.
+
+Create a new prod subfolder with a trimmed down docker-compose.yml for this production server. Show the essential software services: caddy for file serving + reverse proxy, shiny, and communication with data: duckdb for raster, pmtiles for vector and some ancillary gpkg/csv/tif files.
+
+We are also currently using Github Pages to server web content which could be migrated to the internal server (and served with Caddy):
+- MarineSensitivity/MarineSensitivity.github.io: MarineSensitivity.org
+- MarineSensitivity/docs: MarineSensitivity.org/docs
+
+Add a section at very bottom on Issues for lingering questions / concerns:
+- Confirm internal server running Redhat Linux with yum updates and whether ok for external server to continue running in Ubuntu — shouldn’t matter because software services containerized with Docker.
+- Turning on access to web server internally. It seems there are firewall rules restricting server access to web content ports 80 (http://*) and 446 (https://*). How to turn on internally, eg allowing traffic with iptables firewall, internal DNS, etc?
+- Process for turning on externally? The MarineSensitivity.org domain is handled by Ben through SquareSpace. Do we want to keep this or use a BOEM.gov subdomain?
+- … any others that come to mind?
+
+Use Quarto lightbox and mermaid-format: png to allow zooming in on diagrams.
+
+Have Quarto render to html, docx and pdf formats.
+
+⏺ All three formats rendered successfully. Here's a summary of everything created:
+
+  Created files
+
+  sync.qmd (main document)
+
+  The Quarto notebook with 7 major sections:
+
+  1. Motivation — explains the contractor's Italy leave and the need for internal server sync
+  2. Architecture Overview — mermaid diagram showing laptop, external AWS server, and internal BOEM server with all Docker services and data
+  flows; tables comparing current vs target state
+  3. Synchronization Overview — mermaid diagram of the sync flow with legend; summary table of what/direction/tool/schedule/protocol
+  4. Implementation — step-by-step setup: prerequisites, SSH keys, rclone config, sync scripts, Watchtower, cron schedule, monitoring/alerting
+  5. Production Stack — mermaid diagram of the trimmed production Docker services; deployment instructions; static web content migration table
+  6. Government Compliance — reviews FISMA, NIST 800-53, DOI security policy, FedRAMP, TIC 3.0, and BOEM-specific considerations with compliance
+  summary table
+  7. Issues — 8 open items: OS compatibility, firewall rules, domain management, SSH outbound access, Docker registry access, data volume sizing,
+  backup strategy, TLS certificates
+
+  prod/ directory (production server files)
+
+  ┌──────────────────────┬────────────────────────────────────────────────────────────┐
+  │         File         │                          Purpose                           │
+  ├──────────────────────┼────────────────────────────────────────────────────────────┤
+  │ docker-compose.yml   │ Trimmed stack: caddy + shiny only                          │
+  ├──────────────────────┼────────────────────────────────────────────────────────────┤
+  │ Caddyfile            │ Routes for apps, docs/website, file serving                │
+  ├──────────────────────┼────────────────────────────────────────────────────────────┤
+  │ sync-pull.sh         │ Pulls data/pmtiles/website/apps via rclone SFTP            │
+  ├──────────────────────┼────────────────────────────────────────────────────────────┤
+  │ sync-push.sh         │ Pushes sync/shiny/docker logs via rclone SFTP              │
+  ├──────────────────────┼────────────────────────────────────────────────────────────┤
+  │ ping.sh              │ Sends heartbeat JSON every 5 min                           │
+  ├──────────────────────┼────────────────────────────────────────────────────────────┤
+  │ monitor-heartbeat.sh │ Runs on external server; emails if heartbeat stale >15 min │
+  ├──────────────────────┼────────────────────────────────────────────────────────────┤
+  │ watchtower.yml       │ Auto-updates Docker images every 6 hours                   │
+  └──────────────────────┴────────────────────────────────────────────────────────────┘
+
+  Rendered outputs
+
+  - sync.html (2.9 MB, self-contained with embedded mermaid PNGs + lightbox)
+  - sync.docx (701 KB)
+  - sync.pdf (822 KB)
+
+In sync.qmd, let's seperate the GHCR into its own subgraph outside the External Server (AWS). The laptop should show the use of rclone sftp     
+   to server for data, per @../workflows/calc_scores.qmd deploy chunk. Git and github is used for all the Shiny apps code, which could be       
+  pulled also on a more regular basis Github (probably better to show the repos and GHCR as seperate elements within a Github subgraph).          
+
+⏺ All three formats render cleanly. Here's what changed:                                                                                          
+                                                                                                                                                  
+  Updated architecture diagram (fig-architecture)                                                                                                 
+                                                                                                                                                  
+  - GitHub is now its own top-level subgraph (purple) separate from the External Server, containing:                                              
+    - Repositories subgraph: apps, server, docs, MarineSensitivity.github.io                                                                      
+    - CI/CD + GHCR subgraph: GitHub Actions builds, GHCR container registry, GitHub Pages
+  - Laptop now shows two distinct outputs:
+    - rsync via SSH — pushes data files to external server (matching deploy_to_server.sh)
+    - git push — pushes code to GitHub repos
+  - Both servers pull app code from GitHub repos via git pull
+  - Internal server pulls Docker images from GHCR (separate from the external server)
+
+  Updated sync overview diagram (fig-sync)
+
+  - GitHub is now a separate subgraph (purple) with repos and GHCR
+  - Added git pull (app source) as a distinct sync mechanism on the internal server, scheduled hourly via cron
+  - GHCR pulled by Watchtower is now shown going to GitHub, not the external server
+
+  Updated sync summary table
+
+  - Added columns for Source to distinguish between "external server" (rclone sftp) and "GitHub repos" (git pull) and "GitHub GHCR" (Watchtower)
+  - Split "Shiny app source" into git pull from GitHub repos
+  - Added "Server config" row (also git pull)
+
+  Updated sync-pull.sh
+
+  - Replaced rclone-based Shiny app sync with git pull from GitHub for both the apps and server repos
+  - Added the current deploy workflow description to the "Current state" section referencing deploy_to_server.sh
+
 ## 2026-02-18 docs rationale MMPA, Non-US species, masking, flower plot, etc.
 
 Incorporate extra rationale into the docs here ./*.qmd where applicable from comments below and in this document with track changes on: `@/Users/bbest/Desktop/msens/proposal_2_Introduction_updated_v2_BB.docx`
@@ -257,6 +395,7 @@ Add a splash page to the apps with the overview figure (from https://marinesensi
 
  Pattern (in server function, at top):
 
+ ```r
  # welcome modal ----
  showModal(modalDialog(
    title    = "Welcome to BOEM Marine Sensitivity",
@@ -280,6 +419,7 @@ Add a splash page to the apps with the overview figure (from https://marinesensi
      actionButton("btn_tour", "Take a Tour", icon = icon("route")),
      modalButton("Explore"))
  ))
+ ```
 
  3. Conductor Tour Definition — mapgl app
 
@@ -362,12 +502,14 @@ Add a splash page to the apps with the overview figure (from https://marinesensi
  5. Tour Trigger — both apps
 
  In each server function, add:
+ ```r
  # tour ----
  observe({
    removeModal()
    tour$init()$start()
  }) |>
    bindEvent(input$btn_tour)
+ ```
 
  Also add useConductor() to the UI (inside page_sidebar()'s first argument area, alongside
  tags$head()).
