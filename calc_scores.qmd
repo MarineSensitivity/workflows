@@ -142,6 +142,7 @@ do_map <- F # not affected
 do_parquet <- F # not affected
 do_deploy <- F # can deploy separately
 do_pra_primprod <- T # YES — zonal primary productivity for program areas
+do_pmtiles <- T # generate PMTiles archives for mapgl/mapsp apps
 
 # spatial outputs (year reflects input data vintage, version suffix model version of derived metric columns)
 pra_gpkg <- glue("{dir_v}/ply_programareas_2026_{ver}.gpkg")
@@ -2512,6 +2513,83 @@ dbExecute(
     "ALTER TABLE public.{tbl_er} ADD COLUMN IF NOT EXISTS ecoregion_id SERIAL PRIMARY KEY;"
   )
 )
+```
+
+## Generate PMTiles
+
+Static PMTiles archives for mapgl/mapsp apps, replacing PostGIS/pg_tileserv tile pipeline.
+
+```{r}
+#| label: generate_pmtiles
+#| eval: !expr do_pmtiles
+
+# check / install tippecanoe and pmtiles CLI ----
+check_brew_bin <- function(bin) {
+  if (Sys.which(bin) == "") {
+    if (Sys.which("brew") == "")
+      stop(glue("{bin} not found and homebrew not available"))
+    message(glue("installing {bin} via homebrew..."))
+    system2("brew", c("install", bin))
+    stopifnot(Sys.which(bin) != "")
+  }
+  message(glue("{bin}: {Sys.which(bin)}"))
+}
+check_brew_bin("tippecanoe")
+check_brew_bin("pmtiles")
+
+dir_create(dir_pmtiles)
+
+# helper: sf → pmtiles via tippecanoe ----
+sf_to_pmtiles <- function(sf_obj, layer_name, out_dir = dir_pmtiles) {
+  tmp_geojson <- tempfile(fileext = ".geojson")
+  on.exit(unlink(tmp_geojson), add = TRUE)
+
+  out_pmtiles <- glue("{out_dir}/{layer_name}.pmtiles")
+
+  st_write(sf_obj, tmp_geojson, driver = "GeoJSON", delete_dsn = TRUE)
+
+  # tippecanoe: full detail for small polygon layers
+  system2("tippecanoe", c(
+    "-z12", "-Z0",
+    "--no-feature-limit",
+    "--no-tile-size-limit",
+    "-l", layer_name,
+    "-o", out_pmtiles,
+    "--force",
+    tmp_geojson
+  ))
+  stopifnot(file_exists(out_pmtiles))
+  message(glue("wrote {out_pmtiles} ({file_size(out_pmtiles)})"))
+  out_pmtiles
+}
+
+# program areas WITH metrics ----
+d_pra_metrics <- tbl(con_sdm, "zone") |>
+  filter(tbl == !!tbl_pra) |>
+  select(programarea_key = value, zone_seq) |>
+  left_join(
+    tbl(con_sdm, "zone_metric") |>
+      mutate(value = round(value, 1)),
+    by = "zone_seq"
+  ) |>
+  left_join(
+    tbl(con_sdm, "metric") |>
+      select(metric_seq, metric_key),
+    by = "metric_seq"
+  ) |>
+  select(programarea_key, metric_key, value) |>
+  filter(!is.na(programarea_key), !is.na(metric_key), !is.na(value)) |>
+  pivot_wider(names_from = metric_key, values_from = value) |>
+  collect()
+
+pra_sf <- read_sf(pra_gpkg) |>
+  left_join(d_pra_metrics, by = "programarea_key")
+
+sf_to_pmtiles(pra_sf, tbl_pra)
+
+# ecoregions WITHOUT metrics (outlines only) ----
+er_sf <- read_sf(er_raw_gpkg)
+sf_to_pmtiles(er_sf, tbl_er)
 ```
 
 ## Generate downloads

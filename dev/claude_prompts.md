@@ -1,5 +1,11 @@
 ## 2026-02-? TODO:
 
+- [ ] pretty flower plots (email)
+
+- [ ] show OBIS/GBIF obs, esp Rice's whale extra (email)
+
+- [ ] See CA w/ Claude - proj prompts
+
 - [ ] Also consider updating the apps (@../apps/mapgl.R, @../apps/mapsp.R) to using the new `metric.metric_title|metric_abbrev` where applicable (moving away from `layers_v3.csv`)
 
 - [ ] flower plot mv from calc_scores.qmd to msens::plot_flower() and msens:plot_flowers()
@@ -33,6 +39,177 @@
 
 - Migrate to hexagons
 
+## 2026-02-22 update main website
+
+The nexus of actively developed, publicly visible content for this project is with:
+* apps: @apps/mapgl/app.R (https://app.marinesensitivity.org/mapgl), @apps/mapsp/app.R (https://app.marinesensitivity.org/mapsp)
+* docs: @docs/ (https://marinesensitivity.org/docs)
+
+The main website @/marinesensitivity.github.io (https://marinesensitivity.org), which is very out of date and should direct visitors to the documentation and apps. 
+
+Make this a single page Quarto bslib website [draw inspiration from Quarto website] with relevant sections. Include the overview figure (`@~/My Drive/projects/msens/figures/overview-v2/mst-methods edit2.svg`) with a summary of the approach at the top. Use large icon-like buttons for links out to content. Make the page style professional, pleasing and aligned with color, font and logos at https://BOEM.gov. Use bslib with default dark theme (like @apps/mapgl/app.R) and switch for turning to light theme. Introduction of marine biology related iconography or imagery is also welcome. Use quarto lightbox for the overview figure.
+
+Include a News section. Summarize past progress with different app versions (v1, v2, v3) reporting metrics on Planning Areas across all US EEZ (v1) to Program Areas for latest National Plan (v3). Include dates and links to apps.
+
+⏺ Updated plan
+  ⎿  /plan to preview
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Ready to code?
+
+ Here is Claude's plan:
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Plan: Redesign MarineSensitivity.org as Single-Page Quarto bslib Landing Site
+
+ Context
+
+ The main website at https://marinesensitivity.org is very out of date — it currently contains placeholder Quarto template content ("This is a
+ Quarto website") with empty pages. The project has matured significantly with two production Shiny apps (mapgl, mapsp), comprehensive
+ documentation, and is now at v3. The website needs to serve as a professional landing page that directs visitors to the apps and documentation,
+ showcases the methodology, and communicates the project's evolution.
+
+ Approach
+
+ Convert the multi-page Quarto website into a single-page bslib landing site with:
+ - Dark theme default + light theme toggle
+ - BOEM USWDS-aligned color palette (#005ea2 primary blue)
+ - Overview methodology figure with lightbox
+ - Large icon buttons linking to apps and docs
+ - Version history timeline derived from commit history
+ - Simplified CI/CD (no R needed)
+
+ Repository
+
+ /Users/bbest/Github/MarineSensitivity/marinesensitivity.github.io/
+
+ Files to Modify
+
+ 1. _quarto.yml — complete rewrite
+
+ - Change from multi-page navbar site to single-page custom layout
+ - Dark theme listed first (default), light second
+ - Remove navbar (single page with scroll sections)
+ - Enable lightbox (built-in since Quarto 1.4)
+ - Set page-layout: custom for full-width hero
+ - Keep Google Analytics, CNAME, favicon, social metadata
+ - Add resources: [CNAME] so CNAME survives build
+
+ 2. index.qmd — complete rewrite
+
+ Sections (top to bottom):
+ 1. Hero — title "Marine Sensitivity Toolkit", tagline, BOEM logo, dark gradient background over mapgl screenshot
+ 2. Methodology Overview — summary text + overview-methods.svg with {.lightbox}
+ 3. Explore the Data — 3 large cards with Bootstrap Icons:
+   - Composite Scores (mapgl) — bi-globe-americas icon → https://app.marinesensitivity.org/mapgl/
+   - Species Distribution (mapsp) — bi-layers icon → https://app.marinesensitivity.org/mapsp/
+   - Documentation — bi-book icon → https://marinesensitivity.org/docs/
+ 4. About — OCSLA mandate, key stats with marine biology SVG icons (fish, mammal, bird, productivity)
+ 5. Version History — timeline with:
+   - v3 (Feb 2026–present): Program Areas for National OCS Plan, ecoregion rescaling, 7 source datasets merged, ESA/MMPA/MBTA/IUCN extinction
+ risk
+   - v2 (Jan 2026): Transition — Program Areas (2026), individual model layers, model merging
+   - v1 (Sep 2023–Dec 2025): Planning Areas across US EEZ, AquaMaps-based, flower plots, species tables
+
+ 3. styles.scss — new file (replaces empty styles.css)
+
+ - BOEM USWDS colors: $boem-primary: #005ea2, dark/darker/light/lighter variants
+ - Source Sans Pro font family
+ - Hero section: gradient overlay on mapgl-map.png background, centered content
+ - App cards: bordered, hover lift effect, Bootstrap Icon styling
+ - Timeline: vertical line with dot markers, "current" version highlighted
+ - Light theme overrides via [data-bs-theme="light"]
+ - Responsive breakpoints for mobile
+
+ 4. .github/workflows/publish.yml — simplify
+
+ - Switch macOS-latest → ubuntu-latest (faster, no R needed)
+ - Remove R install, renv install steps
+ - Keep only: checkout → Quarto setup → render and publish
+
+ 5. .gitignore — simplify
+
+ Remove R-specific entries, keep: .DS_Store, /.quarto/, _site
+
+ Files to Delete
+
+ - regions.qmd (old placeholder with R/leaflet code)
+ - distributions.qmd (empty placeholder)
+ - sensitivities.qmd (empty placeholder)
+ - about.qmd (empty placeholder)
+ - styles.css (replaced by styles.scss)
+ - .Rprofile (renv bootstrap, no longer needed)
+ - renv.lock (R package lockfile, no longer needed)
+ - renv/ directory (R package management, no longer needed)
+
+ Assets to Copy
+
+ ┌─────────────────────────────────────┬───────────────────────────────┐
+ │               Source                │          Destination          │
+ ├─────────────────────────────────────┼───────────────────────────────┤
+ │ docs/figures/overview-methods.svg   │ images/overview-methods.svg   │
+ ├─────────────────────────────────────┼───────────────────────────────┤
+ │ docs/figures/apps/mapgl-map.png     │ images/mapgl-map.png          │
+ ├─────────────────────────────────────┼───────────────────────────────┤
+ │ docs/figures/icons/bird.svg         │ images/icons/bird.svg         │
+ ├─────────────────────────────────────┼───────────────────────────────┤
+ │ docs/figures/icons/fish.svg         │ images/icons/fish.svg         │
+ ├─────────────────────────────────────┼───────────────────────────────┤
+ │ docs/figures/icons/mammal.svg       │ images/icons/mammal.svg       │
+ ├─────────────────────────────────────┼───────────────────────────────┤
+ │ docs/figures/icons/productivity.svg │ images/icons/productivity.svg │
+ └─────────────────────────────────────┴───────────────────────────────┘
+
+ Keep existing: images/logo_BOEM.png
+
+ Key Technical Notes
+
+ - Bootstrap Icons ship with Bootswatch themes in Quarto — <i class="bi bi-globe-americas"> should work. If not, add CDN link in
+ include-in-header.
+ - Use pagetitle: (not title:) in index.qmd front matter to set browser tab without rendering an H1 (hero section has its own).
+ - The #title-block-header { display: none; } CSS rule suppresses Quarto's default title rendering.
+ - Quarto {.lightbox} attribute on images enables click-to-zoom (built-in since 1.4).
+ - CNAME needs resources: [CNAME] in _quarto.yml to survive the build.
+ - The SVG marine icons (bird, fish, mammal, productivity) have dark fills — may need CSS filter: invert(1) in dark mode for visibility.
+
+ Verification
+
+ 1. Run quarto preview from the repo directory to test locally
+ 2. Verify dark theme renders by default
+ 3. Toggle light/dark theme switch and confirm both look good
+ 4. Click the overview figure to verify lightbox zoom works
+ 5. Verify all 3 app/docs link buttons work
+ 6. Check responsive layout on narrow viewport (mobile)
+ 7. Verify the timeline renders correctly
+ 8. Confirm no R errors (site should be pure HTML, no R execution)
+
+⏺ Everything is in order. Let me provide a summary of what was done.                                                                              
+                                                                                                                                                  
+  ---                                                                                                                                             
+  The MarineSensitivity.org landing page has been completely redesigned. Here's what was done:                                                    
+                                                                                                                                                  
+  Files modified:                                                                                                                                 
+  - _quarto.yml — Single-page layout, dark theme default, lightbox on .lightbox class only, resources: [CNAME], removed navbar                    
+  - index.qmd — Full rewrite with hero, methodology, app cards, about, and version history sections
+  - styles.scss — New file with BOEM USWDS colors, hero gradient, app card grid with hover effects, stat icons, timeline, floating theme toggle,  
+  responsive breakpoints                                                                                                                          
+  - .github/workflows/publish.yml — Simplified to ubuntu-latest, removed R/renv steps                                                             
+  - .gitignore — Removed R-specific entries                                                                                                       
+                                                                                                                                                  
+  Files deleted:                                                                                                                                  
+  - regions.qmd, distributions.qmd, sensitivities.qmd, about.qmd (old placeholders)
+  - styles.css, .Rprofile, renv.lock, renv/ (R package management)
+
+  Assets copied:
+  - images/overview-methods.svg, images/mapgl-map.png (hero background)
+  - images/icons/ — bird, fish, mammal, productivity SVGs
+
+  Preview is running at http://localhost:4321/ — please check:
+  1. Dark theme renders by default
+  2. Theme toggle (top-right circle) switches to light mode
+  3. Click the methodology overview figure for lightbox zoom
+  4. App card links open correctly
+  5. Timeline shows v3 as current (cyan dot)
+  6. Responsive on narrow viewport
 
 ## 2026-02-19 planarea -> programarea_primprod.csv|png|pdf
 
@@ -52,12 +229,480 @@ Bring in the `pa_zonal_plot` R chunk from @ingest_productivity into calc_scores.
   years
   - Drops units from both npp_avg and npp_sd before plotting (fixes a potential mixed-types issue in the original)
   - Outputs directly to {dir_v}/programarea_primprod.csv|png|pdf (no version suffix, no intermediate dir_figs)
-  
-## pg to pmtiles
+
+## 2026-02-22 pg to pmtiles
 
 In @calc_scores.qmd and apps (@../apps/mapsp|mapgl/app.R), migrate injection and use of vector tiles in/out of a spatial database (Postgres/PostGIS/pg_tileserv in @../server/docker-compose.yml) to [creating PMTiles](https://docs.protomaps.com/pmtiles/create) and `mapgl::add_pmtiles_source()`. Fork all affected repos into branch “migrate_postgis_to_pmtiles”.  These new pmtiles should live on Ben’s laptop at ~/_big/msens/derived/v3/pmtiles and similar relative path on server, with deploy script to update from laptop to server.  The tippecanoe and pmtiles binaries should be checked for existence in path, and installed if missing on the Mac laptop with home brew.
 
-## server: + sync.qmd
+● Which apps should be migrated to PMTiles in this pass? The main two (mapsp, mapgl) are clear, but there are also: storymap, aoi, sdm, indicators,
+ indicators/app_mpatlas, and scores — all of which use pg_tileserv tiles. Should we migrate all of them, or just mapsp and mapgl for now?                     
+   → mapsp + mapgl only (Recommended)
+ ● For serving PMTiles on the server, should we use Caddy's static file server (file.marinesensitivity.org already exists with CORS) to serve PMTiles directly via
+  HTTP range requests, or set up a dedicated pmtiles serve endpoint?                 
+   → Use the http.handlers.pmtiles_proxy Caddy module, to get advantages of reverse proxy, the ZXY TileJSON API and the direct http file support via the file     
+   server. Also update the new @server/prod as needed.                                                                                                            
+ ● Should the pg_tileserv, tilecache, and related /tilejson Plumber endpoint be removed/disabled as part of this migration, or kept running for backward          
+ compatibility?                         
+   → Keep running (Recommended)
+
+1. Multiple servers. Regarding:
+
+```r
+ pmtiles_base_url <- ifelse(
+   is_server,
+   "/pmtiles",                                         # prod: relative path on same host
+   "https://pmtiles.marinesensitivity.org")            # dev: dedicated subdomain
+```
+
+There is an added complexity in that now we have 3 machines: laptop, dev server, prod server (see @server/sync.qmd. I’m not sure how to differentiate in R code between dev server (Ubuntu) vs prod server (RHEL).
+
+2. Build ecoregions sf WITHOUT metrics. We are not serving metrics for ecoregions anymore, just the ecoregion outlines.
+
+
+⏺ Updated plan                                                                                                                                                    
+  ⎿  /plan to preview                                                                                                                                             
+                                                                                                                                                                  
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Ready to code?                                                                                                                                                   
+                                                                                                                                                                  
+ Here is Claude's plan:
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Migrate PostGIS/pg_tileserv to PMTiles                                  
+
+ Context
+
+ The current architecture serves vector tiles for the mapgl and mapsp Shiny apps via a multi-hop chain: PostGIS → pg_tileserv → Varnish cache → Caddy reverse
+ proxy. Metric data is computed in DuckDB, pivoted into PostGIS tables (ply_programareas_2026_v3, ply_ecoregions_2025_v3), and served dynamically. This adds
+ operational complexity (SSH tunnel for PostGIS, database upkeep, tilecache invalidation) and tightly couples the web apps to a running database.
+
+ Goal: Replace the PostGIS tile pipeline with static PMTiles archives. The R apps switch from add_vector_source() (TileJSON from pg_tileserv) to
+ add_pmtiles_source() (client-side HTTP range requests against .pmtiles files). A custom Caddy build with http.handlers.pmtiles_proxy provides server-side
+ ZXY/TileJSON endpoints plus raw file serving. PostGIS and pg_tileserv remain running for other apps (aoi, sdm, indicators, scores, storymap).
+
+ Scope: mapsp + mapgl apps only. All other apps stay on pg_tileserv.
+
+ Three Machines
+
+ ┌────────────────────┬────────┬───────────────────────────────────┬───────────────────────────────────────┐
+ │      Machine       │   OS   │          Detection in R           │              PMTiles URL              │
+ ├────────────────────┼────────┼───────────────────────────────────┼───────────────────────────────────────┤
+ │ Laptop             │ macOS  │ is_server = FALSE                 │ https://pmtiles.marinesensitivity.org │
+ ├────────────────────┼────────┼───────────────────────────────────┼───────────────────────────────────────┤
+ │ Dev server (AWS)   │ Ubuntu │ is_server = TRUE, is_prod = FALSE │ https://pmtiles.marinesensitivity.org │
+ ├────────────────────┼────────┼───────────────────────────────────┼───────────────────────────────────────┤
+ │ Prod server (BOEM) │ RHEL 8 │ is_server = TRUE, is_prod = TRUE  │ /pmtiles (relative)                   │
+ └────────────────────┴────────┴───────────────────────────────────┴───────────────────────────────────────┘
+
+ Detection logic:
+ is_server <- Sys.info()[["sysname"]] == "Linux"
+ is_prod   <- is_server && file.exists("/etc/redhat-release")
+
+ Repos & Branches
+
+ Create branch migrate_postgis_to_pmtiles in each:
+
+ ┌───────────┬──────────────────────────────────────┐
+ │   Repo    │                 Path                 │
+ ├───────────┼──────────────────────────────────────┤
+ │ workflows │ ~/Github/MarineSensitivity/workflows │
+ ├───────────┼──────────────────────────────────────┤
+ │ apps      │ ~/Github/MarineSensitivity/apps      │
+ ├───────────┼──────────────────────────────────────┤
+ │ server    │ ~/Github/MarineSensitivity/server    │
+ └───────────┴──────────────────────────────────────┘
+
+ ---
+ File Changes
+
+ 1. workflows/libs/paths.R — add pmtiles paths and server detection
+
+ Add after line 27:
+
+ ```r
+ # server type detection
+ is_prod <- is_server && file.exists("/etc/redhat-release")
+
+ # pmtiles
+ dir_pmtiles <- glue::glue("{dir_big_v}/pmtiles")
+ pmtiles_base_url <- ifelse(
+   is_prod,
+   "/pmtiles",                                # prod: relative path on same host
+   "https://pmtiles.marinesensitivity.org")   # laptop + dev: dedicated subdomain
+ ```
+
+ 2. workflows/calc_scores.qmd — add PMTiles generation section
+
+ a. Add flag (~line 133, alongside other flags):
+ do_pmtiles <- T
+
+ b. Add new section after "Update PostGIS layers" (~line 2508), before "Generate downloads":
+
+ #| label: generate_pmtiles
+ #| eval: !expr do_pmtiles
+
+ ```r
+ # check / install tippecanoe and pmtiles CLI ----
+ check_brew_bin <- function(bin) {
+   if (Sys.which(bin) == "") {
+     if (Sys.which("brew") == "")
+       stop(glue("{bin} not found and homebrew not available"))
+     message(glue("installing {bin} via homebrew..."))
+     system2("brew", c("install", bin))
+     stopifnot(Sys.which(bin) != "")
+   }
+   message(glue("{bin}: {Sys.which(bin)}"))
+ }
+ check_brew_bin("tippecanoe")
+ check_brew_bin("pmtiles")
+
+ dir_create(dir_pmtiles)
+
+ # helper: sf → pmtiles via tippecanoe ----
+ sf_to_pmtiles <- function(sf_obj, layer_name, out_dir = dir_pmtiles) {
+   tmp_geojson <- tempfile(fileext = ".geojson")
+   on.exit(unlink(tmp_geojson), add = TRUE)
+
+   out_pmtiles <- glue("{out_dir}/{layer_name}.pmtiles")
+
+   st_write(sf_obj, tmp_geojson, driver = "GeoJSON", delete_dsn = TRUE)
+
+   # tippecanoe: full detail for small polygon layers
+   system2("tippecanoe", c(
+     "-z12", "-Z0",
+     "--no-feature-limit",
+     "--no-tile-size-limit",
+     "-l", layer_name,
+     "-o", out_pmtiles,
+     "--force",
+     tmp_geojson
+   ))
+   stopifnot(file_exists(out_pmtiles))
+   message(glue("wrote {out_pmtiles} ({file_size(out_pmtiles)})"))
+   out_pmtiles
+ }
+
+ # program areas WITH metrics ----
+ d_pra_metrics <- tbl(con_sdm, "zone") |>
+   filter(tbl == !!tbl_pra) |>
+   select(programarea_key = value, zone_seq) |>
+   left_join(
+     tbl(con_sdm, "zone_metric") |>
+       mutate(value = round(value, 1)),
+     by = "zone_seq"
+   ) |>
+   left_join(
+     tbl(con_sdm, "metric") |>
+       select(metric_seq, metric_key),
+     by = "metric_seq"
+   ) |>
+   select(programarea_key, metric_key, value) |>
+   filter(!is.na(programarea_key), !is.na(metric_key), !is.na(value)) |>
+   pivot_wider(names_from = metric_key, values_from = value) |>
+   collect()
+
+ pra_sf <- read_sf(pra_gpkg) |>
+   left_join(d_pra_metrics, by = "programarea_key")
+
+ sf_to_pmtiles(pra_sf, tbl_pra)
+
+ # ecoregions WITHOUT metrics (outlines only) ----
+ er_sf <- read_sf(er_raw_gpkg)
+ sf_to_pmtiles(er_sf, tbl_er)
+ ```
+
+ 3. workflows/libs/deploy_to_server.sh — add pmtiles rsync
+
+ Add after the "syncing shared input raster" block (~line 50), before "fix permissions":
+
+ ```r
+ echo "=== syncing pmtiles ==="
+ rsync -avz --progress \
+   -e "ssh -i \"$SSH_KEY\"" \
+   "$HOME/_big/msens/derived/${VER}/pmtiles/" \
+   "$SSH_HOST:$REMOTE_DERIVED/${VER}/pmtiles/"
+ ```
+
+ 4. apps/mapgl/app.R — switch to PMTiles sources
+
+ a. Add is_prod + pmtiles_base_url after existing is_server/dir_* block (~line 67):
+
+ ```r
+ is_prod <- is_server && file.exists("/etc/redhat-release")
+ pmtiles_base_url <- ifelse(
+   is_prod,
+   "/pmtiles",
+   "https://pmtiles.marinesensitivity.org")
+ ```
+
+ Note: tbl_er in mapgl is "ply_ecoregions_2025" (no _v3 suffix). The PMTiles filename must match what was generated in calc_scores.qmd. Since paths.R defines
+
+ ```r
+ tbl_er = "ply_ecoregions_2025_v3", the mapgl app needs to use the same name. Add/update:
+ tbl_er  <- glue("ply_ecoregions_2025_{ver}")
+ ```
+
+ b. Replace add_vector_source() calls (~lines 789-796):
+
+ ```r
+ # before:
+ add_vector_source(
+   id = "er_src",
+   url = glue("https://api.marinesensitivity.org/tilejson?table=public.{tbl_er}")
+ ) |>
+ add_vector_source(
+   id = "pra_src",
+   url = glue("https://api.marinesensitivity.org/tilejson?table=public.{tbl_pra}")
+ )
+
+ # after:
+ add_pmtiles_source(
+   id = "er_src",
+   url = glue("{pmtiles_base_url}/{tbl_er}.pmtiles")
+ ) |>
+ add_pmtiles_source(
+   id = "pra_src",
+   url = glue("{pmtiles_base_url}/{tbl_pra}.pmtiles")
+ )
+ ```
+
+ c. Update source_layer references — remove public. prefix:
+
+ ┌───────┬─────────────────────────────────────────┬────────────────────────┐
+ │ Line  │                 Before                  │         After          │
+ ├───────┼─────────────────────────────────────────┼────────────────────────┤
+ │ ~813  │ source_layer = glue("public.{tbl_pra}") │ source_layer = tbl_pra │
+ ├───────┼─────────────────────────────────────────┼────────────────────────┤
+ │ ~821  │ source_layer = glue("public.{tbl_er}")  │ source_layer = tbl_er  │
+ ├───────┼─────────────────────────────────────────┼────────────────────────┤
+ │ ~1065 │ source_layer = glue("public.{tbl_pra}") │ source_layer = tbl_pra │
+ └───────┴─────────────────────────────────────────┴────────────────────────┘
+
+ 5. apps/mapsp/app.R — same pattern
+
+ a. Add is_prod + pmtiles_base_url after is_server/dir_* block (~line 53):
+ 
+ ```r
+ is_prod <- is_server && file.exists("/etc/redhat-release")
+ pmtiles_base_url <- ifelse(
+   is_prod,
+   "/pmtiles",
+   "https://pmtiles.marinesensitivity.org")
+ ```
+
+ b. Replace add_vector_source() calls (~lines 586-597):
+ 
+ ```r
+ add_pmtiles_source(
+   id = "er_src",
+   url = glue("{pmtiles_base_url}/ply_ecoregions_2025{v_sfx}.pmtiles")
+ ) |>
+ add_pmtiles_source(
+   id = "pra_src",
+   url = glue("{pmtiles_base_url}/ply_programareas_2026{v_sfx}.pmtiles")
+ )
+ ```
+
+ c. Update source_layer references — remove public. prefix:
+
+ ┌──────┬────────────────────────────────────────────────────────────┬─────────────────────────────────────────────────────┐
+ │ Line │                           Before                           │                        After                        │
+ ├──────┼────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+ │ ~609 │ source_layer = glue("public.ply_programareas_2026{v_sfx}") │ source_layer = glue("ply_programareas_2026{v_sfx}") │
+ ├──────┼────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+ │ ~617 │ source_layer = glue("public.ply_ecoregions_2025{v_sfx}")   │ source_layer = glue("ply_ecoregions_2025{v_sfx}")   │
+ ├──────┼────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+ │ ~685 │ source_layer = glue("public.ply_ecoregions_2025{v_sfx}")   │ source_layer = glue("ply_ecoregions_2025{v_sfx}")   │
+ └──────┴────────────────────────────────────────────────────────────┴─────────────────────────────────────────────────────┘
+
+ 6. server/caddy/Dockerfile — NEW file
+
+ Custom Caddy build with pmtiles_proxy module:
+
+ ```Dockerfile
+ FROM caddy:builder AS builder
+ RUN xcaddy build --with github.com/protomaps/go-pmtiles/caddy
+
+ FROM caddy:latest
+ COPY --from=builder /usr/bin/caddy /usr/bin/caddy
+ ```
+
+ 7. server/docker-compose.yml — use custom caddy build
+
+ Change caddy service (~line 6):
+
+ ```Dockerfile
+ # before:
+ image: caddy:latest
+
+ # after:
+ build: ./caddy
+ ```
+
+ 8. server/caddy/Caddyfile — add pmtiles subdomain
+
+ Add new block after existing routes:
+
+ ```Caddyfile
+ pmtiles.marinesensitivity.org {
+   import cors
+
+   # server-side tile decoding: ZXY + TileJSON
+   handle_path /tiles/* {
+     pmtiles_proxy {
+       bucket /share/data/derived/v3/pmtiles
+       cache_size 256
+       public_url https://pmtiles.marinesensitivity.org/tiles
+     }
+   }
+
+   # raw .pmtiles file serving for client-side PMTiles protocol (add_pmtiles_source)
+   handle {
+     root * /share/data/derived/v3/pmtiles
+     file_server
+   }
+ }
+ ```
+
+ 9. server/prod/caddy/Dockerfile — NEW file
+
+ Same custom Caddy build:
+
+ ```Dockerfile
+ FROM caddy:builder AS builder
+ RUN xcaddy build --with github.com/protomaps/go-pmtiles/caddy
+
+ FROM caddy:latest
+ COPY --from=builder /usr/bin/caddy /usr/bin/caddy
+ ```
+
+ 10. server/prod/docker-compose.yml — use custom caddy build
+
+ Change caddy service (~line 10):
+ 
+ ```Dockerfile
+ # before:
+ image: caddy:latest
+
+ # after:
+ build: ./caddy
+ ```
+
+ 11. server/prod/Caddyfile — add pmtiles routes
+
+ Add inside :80 { ... } block, before the handle /docs/* route:
+
+ ```Caddyfile
+   # pmtiles: server-side tile decoding (ZXY + TileJSON)
+   handle_path /pmtiles/tiles/* {
+     import cors
+     pmtiles_proxy {
+       bucket /share/data/derived/v3/pmtiles
+       cache_size 256
+       public_url /pmtiles/tiles
+     }
+   }
+
+   # pmtiles: raw file serving for client-side PMTiles protocol
+   handle_path /pmtiles/* {
+     import cors
+     root * /share/data/derived/v3/pmtiles
+     file_server
+   }
+ ```
+
+ ---
+ What's NOT Changed
+
+ - PostGIS, pg_tileserv, tilecache, Varnish — all remain running for other apps
+ - /tilejson Plumber API endpoint — kept for backward compatibility
+ - storymap, aoi, sdm, indicators, scores apps — remain on pg_tileserv
+ - DuckDB metric calculation pipeline — unchanged
+ - sync-pull.sh already syncs *.pmtiles (lines 56-64) — no change needed
+
+ PMTiles Output
+
+ ┌──────────────────────────┬────────────────────────────────────┬──────────────────────────────────────────────────────────────────┐
+ │          Layer           │         Includes Metrics?          │                       Output path (laptop)                       │
+ ├──────────────────────────┼────────────────────────────────────┼──────────────────────────────────────────────────────────────────┤
+ │ ply_programareas_2026_v3 │ Yes (score, extrisk_*, primprod_*) │ ~/_big/msens/derived/v3/pmtiles/ply_programareas_2026_v3.pmtiles │
+ ├──────────────────────────┼────────────────────────────────────┼──────────────────────────────────────────────────────────────────┤
+ │ ply_ecoregions_2025_v3   │ No (outlines + ecoregion_key only) │ ~/_big/msens/derived/v3/pmtiles/ply_ecoregions_2025_v3.pmtiles   │
+ └──────────────────────────┴────────────────────────────────────┴──────────────────────────────────────────────────────────────────┘
+
+ Server path: /share/data/derived/v3/pmtiles/*.pmtiles
+
+ Verification
+
+ 1. PMTiles generation (laptop):
+ ```bash
+ cd ~/Github/MarineSensitivity/workflows
+ quarto render calc_scores.qmd  # with do_pmtiles = T
+ ls -la ~/_big/msens/derived/v3/pmtiles/*.pmtiles
+ pmtiles show ~/_big/msens/derived/v3/pmtiles/ply_programareas_2026_v3.pmtiles
+ ```
+
+ 2. Local tile inspection:
+  ```bash
+  pmtiles serve ~/_big/msens/derived/v3/pmtiles --port 8090
+  # open browser: http://localhost:8090
+  ```
+
+ 3. Deploy to dev server:
+ ```bash 
+ ./libs/deploy_to_server.sh v3 data
+ # rebuild caddy on server:
+ ssh server 'cd /share/github/.../server && docker compose build caddy && docker compose up -d caddy'
+ ```
+
+ 4. Verify Caddy pmtiles_proxy:
+ ```
+ curl -I https://pmtiles.marinesensitivity.org/ply_programareas_2026_v3.pmtiles
+ curl https://pmtiles.marinesensitivity.org/tiles/ply_programareas_2026_v3.json
+ ```
+
+ 5. Test apps — launch mapgl and mapsp locally in RStudio; verify polygon layers render correctly with metric-driven colors and ecoregion outlines.
+
+⏺ All changes are in place. Here's a summary of everything implemented across the three repos:                                                                    
+
+  Changes Summary                                                                                                                                                 
+  workflows repo (branch: migrate_postgis_to_pmtiles)                                                                                                             
+
+  - libs/paths.R — Added is_prod, dir_pmtiles, and pmtiles_base_url after the existing version suffix line                                                        
+  - calc_scores.qmd — Added do_pmtiles = T flag and a full "Generate PMTiles" section (tippecanoe/pmtiles CLI check, sf_to_pmtiles() helper, program areas with
+  metrics, ecoregions without metrics)
+  - libs/deploy_to_server.sh — Added pmtiles rsync block after the shared input raster sync
+
+  apps repo (branch: migrate_postgis_to_pmtiles)
+
+  - mapgl/app.R — Added is_prod/pmtiles_base_url; updated tbl_er to include _v3 suffix; replaced two add_vector_source() → add_pmtiles_source(); removed public.
+  prefix from 3 active source_layer references
+  - mapsp/app.R — Added is_prod/pmtiles_base_url; replaced two add_vector_source() → add_pmtiles_source(); removed public. prefix from 3 active source_layer
+  references
+
+  server repo (branch: migrate_postgis_to_pmtiles)
+
+  - caddy/Dockerfile — NEW: custom Caddy build with pmtiles_proxy module
+  - docker-compose.yml — Changed caddy from image: caddy:latest to build: ./caddy
+  - caddy/Caddyfile — Added pmtiles.marinesensitivity.org block with tile proxy + raw file serving
+  - prod/caddy/Dockerfile — NEW: same custom Caddy build
+  - prod/docker-compose.yml — Changed caddy from image: caddy:latest to build: ./caddy
+  - prod/Caddyfile — Added /pmtiles/tiles/* and /pmtiles/* routes inside the :80 block
+
+Actually, both prod & server run the same OS b/c they're from the same Docker image rocker/geospatial (per @../server/rstudio/Dockerfile,  @../server/prod/shiny/Dockerfile) and even though one lags behind in version they should both be the latest. What's another easy way to distinguish?        
+
+⏺ Good catch — both containers are Debian-based rocker/geospatial, so /etc/redhat-release will never exist inside the container. The simplest approach: set an    
+  environment variable in the prod docker-compose. 
+
+⏺ Updated all three. The detection is now:             
+
+  is_prod <- Sys.getenv("MSENS_ENV") == "prod"                                                                                                                    
+   
+  - Laptop/dev server: MSENS_ENV is unset → "" → FALSE → uses https://pmtiles.marinesensitivity.org                                                               
+  - Prod server: MSENS_ENV=prod set in prod/docker-compose.yml → TRUE → uses /pmtiles (relative)
+
+  This works regardless of the host OS or container base image.
+
+## 2026-02-21 server: + sync.qmd
 
 Add a sync.qmd Quarto notebook to this server repo that describes a server plan for synchronizing a production server internal to the BOEM network with an external development server in a fed-certified cloud provider (already using AWS).
 
@@ -171,6 +816,281 @@ In sync.qmd, let's seperate the GHCR into its own subgraph outside the External 
 
   - Replaced rclone-based Shiny app sync with git pull from GitHub for both the apps and server repos
   - Added the current deploy workflow description to the "Current state" section referencing deploy_to_server.sh
+
+The internal production server will have to run the Shiny apps under a subdirectory, not a subdomain, since I don't have DNS privileges:
+
+- ioemazeudmar01.mms.doi.net/app/mapgl
+- ioemazeudmar01.mms.doi.net/app/mapsp
+
+I also need to build this image and push to GHCR (or Docker Hub) for the first time (presumably on laptop first, then pull and launch on internal server). Please revise with explicit instructions.
+
+The internal server is RHEL 8 and has podman, podman-compose, not docker docker-compose. Update with instructions like podman auto-update. Doesn't seem like Watchtower is the right fit
+
+⏺ All changes are complete. Here's a summary:                                                                                                     
+                                                                                                                                                  
+  Changes made                                                                                                                                    
+                                                                                                                                                  
+  File: prod/docker-compose.yml                                                                                                                   
+  Change: Added io.containers.autoupdate: "registry" label to shiny; updated header comment                                                       
+  ────────────────────────────────────────                                                                                                        
+  File: prod/watchtower.yml                                                                                                                       
+  Change: Deleted — replaced by podman auto-update systemd timer                                                                                  
+  ────────────────────────────────────────                                                                                                        
+  File: prod/ping.sh                                                                                                                              
+  Change: docker inspect → podman inspect; updated comment
+  ────────────────────────────────────────
+  File: prod/sync-push.sh
+  Change: docker logs → podman logs; log filenames docker-* → podman-*; rclone dest /docker → /podman
+  ────────────────────────────────────────
+  File: sync.qmd
+  Change: 20+ edits across prerequisites, Watchtower→auto-update section, deployment commands, image build/push/pull/save/load, 3 Mermaid
+  diagrams,
+    sync summary table, target state table, NIST controls table, data volume table, backup strategy, Issues #1 & #5, and various prose references
+
+  Verification
+
+  - Zero docker references in prod/ files (except the filename docker-compose.yml, which is standard for podman-compose)
+  - Zero Watchtower references in prod/ files
+  - One intentional Watchtower mention in sync.qmd (explanatory context: "This replaces Watchtower...")
+  - External server references still say Docker (unchanged, as intended)
+  - .github/workflows/docker-shiny.yml untouched (builds on GitHub Actions/Ubuntu)
+
+
+  But I have docker on laptop (not podman). Can I still create image and upload to ghcr.io?
+
+  ⏺ Yes — Docker on your laptop works perfectly for building and pushing images to GHCR. The images are OCI-compatible, so docker build + docker    
+  push on your Mac and podman pull on the RHEL server are fully interchangeable.
+                                                                                                                                                  
+  Updated sync.qmd to clarify this:                            
+  - First-time GHCR setup — notes that both docker and podman work; uses docker login for laptop context                                          
+  - Manual build and push — labeled "from developer laptop", uses docker build/docker push                                                        
+  - Pull on internal server — still uses podman (unchanged)
+  - Offline fallback — docker save on laptop, podman load on production server
+
+⏺ Updated plan                                                                                                                                    
+  ⎿  /plan to preview                   
+                                                                                                                                                  
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Ready to code?                                                                                                                                   
+                                                                                                                                                  
+ Here is Claude's plan:                                 
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Plan: Update sync.qmd with deployment lessons learned  
+
+ Context
+
+ During actual deployment of the MST production stack on the BOEM internal server (RHEL 8.10 with Podman), numerous issues were discovered that
+ are not documented in sync.qmd. These include SELinux blocking container volume access, rclone not being in RHEL repos, Python 3.8 being
+ required for podman-compose, R package version pinning from PPM snapshots causing mapgl to be outdated (0.1.3 vs 0.4.4 needed), SSH key
+ bootstrapping complications, and more. The Dockerfile also needs updating: upgrade the base image from rocker/geospatial:4.4.1 to 4.5.2 (R
+ 4.5.2, PPM snapshot ~Jan 2026) and add explicit CRAN override for critical packages.
+
+ Files to modify
+
+ 1. /Users/bbest/Github/MarineSensitivity/server/sync.qmd — primary document (13 edits across 6 sections)
+ 2. /Users/bbest/Github/MarineSensitivity/server/prod/shiny/Dockerfile — upgrade base image + add CRAN override for mapgl/dplyr
+
+ SELinux type note
+
+ svirt_sandbox_file_t (old name) is aliased to container_file_t (modern name) — they are functionally identical. We'll use container_file_t
+ throughout since it's the preferred name and what was actually used on the BOEM server.
+
+ Edits (applied bottom-to-top to avoid line drift)
+
+ Edit 1: Add new Issues 9-11 (append after line 825)
+
+ Add three new issues at end of Issues section:
+
+ - Issue 9: Watchtower incompatibility with Podman — Watchtower requires Docker socket, doesn't work with Podman. Status: Resolved (using podman
+ auto-update instead).
+ - Issue 10: R package freshness in container images — rocker/geospatial pins packages to PPM date snapshot. mapgl installed as 0.1.3 (from
+ 4.4.1's Oct 2024 snapshot) but app needs 0.4.4+. Upgrading to 4.5.2 shifts the snapshot to ~Jan 2026. Explicit CRAN override added as insurance.
+  Cross-ref new @sec-ppm section.
+ - Issue 11: SELinux enforcement on RHEL 8 — SELinux blocks container access to host volumes unless container_file_t context applied. Status:
+ Resolved via chcon commands. Cross-ref new @sec-selinux section.
+
+ Edit 2: Update Issue 6 — disk space (lines ~789-803)
+
+ Add callout warning: root partition is only 17 GB, reached 100% during initial sync. Sync scripts limited to v3 data. Change Action to
+ "Partially resolved" with recommendation for 50+ GB dedicated /share volume.
+
+ Edit 3: Update Issue 1 — OS compatibility (lines ~714-724)
+
+ Add bullet confirming RHEL 8.10 as production OS with key findings (rclone manual install, Python 3.8 for podman-compose, SELinux context).
+ Change Action to "Resolved".
+
+ Edit 4: Add required data files checklist (insert after line ~624)
+
+ New subsection #### Required data files checklist with table of required files:
+ - /share/private/mapbox_token_bdbest.txt (manual copy, not synced — it's a secret)
+ - /share/data/big/v3/sdm.duckdb (rclone sync)
+ - /share/data/derived/v3/*.gpkg, *.csv, *.tif (rclone sync)
+ - apps/mapgl/data/taxonomic_hierarchy_worms_*.csv (git pull)
+
+ Add callout about Mapbox token being a secret not in sync/git.
+ Add note about Shiny app_cache write permission (non-fatal warning).
+
+ Edit 5: Update deployment code block (lines ~605-622)
+
+ Add container registry prompt callout (Podman on RHEL prompts for registry — select docker.io/library/caddy:latest; can configure
+ /etc/containers/registries.conf).
+
+ Update deployment bash block to include:
+ - sudo chcon -R -t container_file_t /share (SELinux)
+ - sudo python3.8 -m podman_compose up -d (not bare podman-compose)
+
+ Edit 6: Update "Pull on internal server" command (line ~582)
+
+ Change podman-compose up -d to sudo python3.8 -m podman_compose up -d.
+
+ Edit 7: Add GHCR visibility callout (after line ~561)
+
+ Add callout: package must be Public on GHCR for unauthenticated pulls, otherwise podman login ghcr.io required.
+
+ Edit 8: Add PPM snapshot subsection (insert after line ~548)
+
+ New #### R package version pinning (PPM snapshots) {#sec-ppm} explaining:
+ - rocker/geospatial uses PPM date-pinned snapshot (repos frozen at image build date)
+ - On 4.4.1: mapgl 0.1.3 installed instead of 0.4.4
+ - Fix: upgraded base image to 4.5.2 (snapshot ~Jan 2026) + added explicit CRAN override as insurance
+ - Dockerfile pattern: Rscript -e "install.packages(c('mapgl', 'dplyr'), repos='https://cran.r-project.org')" after install2.r
+
+ Edit 9: Insert new SELinux subsection (after SSH key setup, before rclone config, ~line 390)
+
+ New ### SELinux context for container volumes {#sec-selinux} with:
+ - Explanation: RHEL 8 SELinux enforcing mode blocks podman containers from reading host-mounted volumes
+ - Fix: sudo chcon -R -t container_file_t /share (preferred modern type name)
+ - Targeted alternatives for specific paths (Caddyfile, /share/caddy, /share/data, /share/private, etc.)
+ - Note: container_file_t is the modern name; svirt_sandbox_file_t is an older alias — both work
+ - Tip: re-run after sync-pull.sh creates new files
+ - Verification: ls -lZ /share/data and sudo ausearch -m avc -ts recent
+
+ Edit 10: Update SSH key setup (lines ~382-389)
+
+ Expand with bootstrap procedure when target only allows key auth:
+ ssh-copy-id -i ~/.ssh/msens_sync.pub \
+   -o "IdentityFile=~/.ssh/msens_key_pair.pem" \
+   ubuntu@msens1.marinesensitivity.org
+ Add chmod 600 for both private keys. Add explanatory paragraph.
+
+ Edit 11: Update Prerequisites bash block (lines ~363-377)
+
+ Rewrite to include:
+ - rclone: official install script (not yum install), with EPEL and manual alternatives as comments
+ - podman: yum install -y podman + UID/GID mapping fix (usermod --add-subuids, podman system migrate)
+ - podman-compose: dnf install python38 + pip3.8 install podman-compose
+ - directories: add /share/caddy/data, /share/caddy/config, /share/private
+ - Add callout about always using sudo python3.8 -m podman_compose on RHEL 8
+
+ Edit 12: Update Dockerfile (prod/shiny/Dockerfile)
+
+ Two changes:
+
+ A) Upgrade base image (line 6):
+ FROM rocker/geospatial:4.5.2
+ (was rocker/geospatial:4.4.1). This gets R 4.5.2 and a PPM snapshot from ~Jan 2026 with much newer packages.
+
+ B) Add CRAN override after line 21 (after install2.r block and its rm):
+ `# override PPM snapshot for packages that need the very latest CRAN version
+ RUN Rscript -e "install.packages(c('mapgl', 'dplyr'), repos='https://cran.r-project.org')"
+
+ Also update the comment at line 2 to reflect the new version:
+ `# based on rocker/geospatial:4.5.2 (R 4.5.2, PPM snapshot ~Jan 2026)
+
+ Verification
+
+ 1. Render sync.qmd: quarto render sync.qmd --to html — confirm no Quarto errors and all cross-references resolve (@sec-ppm, @sec-selinux)
+ 2. Build Docker image locally: docker build --platform linux/amd64 -t ghcr.io/marinesensitivity/shiny:latest ./prod/shiny — confirm base image
+ pulls 4.5.2 and mapgl/dplyr install from CRAN
+ 3. Verify mapgl version in built image: docker run --rm ghcr.io/marinesensitivity/shiny:latest Rscript -e "packageVersion('mapgl')" — should
+ show latest (0.4.4+)
+
+⏺ All edits are complete and verified. Here's a summary of what was changed:                                                                      
+                                                                                                                                                  
+  prod/shiny/Dockerfile:                                                                                                                          
+  - Upgraded base image from rocker/geospatial:4.4.1 to 4.5.2 (R 4.5.2, PPM snapshot ~Jan 2026)                                                   
+  - Added CRAN override for mapgl and dplyr after the install2.r block                                                                            
+  - Updated comment to reflect new version                                                                                                        
+                                                                                                                                                  
+  sync.qmd — 11 edits across 3 sections:                                                                                                          
+                                                                                                                                                  
+  Implementation section:                                                                                                                         
+  - Rewrote Prerequisites with RHEL 8-specific installs (rclone via official script, podman, python3.8 + podman-compose, extra directories) +     
+  callout about sudo python3.8 -m podman_compose
+  - Expanded SSH key setup with bootstrap procedure using .pem key + chmod 600
+  - Added new SELinux subsection ({#sec-selinux}) with chcon commands, verification, and callouts
+
+  Production Stack section:
+  - Added PPM snapshot subsection ({#sec-ppm}) explaining version pinning issue
+  - Added GHCR visibility callout (Public required for unauthenticated pulls)
+  - Updated "Pull on internal server" command to use sudo python3.8 -m podman_compose
+  - Updated deployment code block with SELinux chcon + container registry prompt callout
+  - Added required data files checklist with Mapbox token warning
+
+  Issues section:
+  - Updated Issue 1 (OS compatibility) — confirmed RHEL 8.10 findings, marked Resolved
+  - Updated Issue 6 (disk space) — added root partition warning, marked Partially resolved
+  - Added Issue 9 (Watchtower incompatibility with Podman)
+  - Added Issue 10 (R package freshness / PPM snapshots)
+  - Added Issue 11 (SELinux enforcement on RHEL 8)
+
+  Note: the mermaid-format: png setting in the YAML causes rendering to hang (Chromium issue). Using mermaid-format: js works fine.
+
+Can you put the mermaid diagrams into a seperate folder "diagrams" with a README.md there that includes a standalone high-res rendering of      
+  the diagrams into png for including as image, and if not present in the qmd have a helper function to render (using home brew mermaid          
+  standalone). The existing diagrams are a bit too complicated. Let's put them in a tabset with a new one "Simple" showing as default showing     
+   the simple laptop, Github (repos + GHCR), dev server, [BOEM network: prod server] and push/pull between (without all the details of which      
+  files).
+
+
+⏺ All clean. Here's what was done:                                                                                                                
+                                                                                                                                                  
+  New file: prod/update-images.sh — cron-compatible script that:                                                                                  
+  - Pulls ghcr.io/marinesensitivity/shiny:latest                                                                                                  
+  - Compares image digests (old vs new)                                                                                                           
+  - Only restarts containers if the image actually changed (no-op otherwise)                                                                      
+  - Re-applies SELinux context after restart
+  - Logs everything to /var/log/msens/update-images.log
+
+  sync.qmd updates:
+  - Rewrote the auto-update section with a callout explaining why podman auto-update fails with podman-compose pods
+  - Documented update-images.sh as the replacement
+  - Added 15 3 * * * cron entry (daily at 3:15 AM)
+  - Updated sync summary table, Issue 9, NIST compliance table, and the "Pull on internal server" reference
+
+  For the immediate update on the BOEM server, run:
+
+  sudo podman pull ghcr.io/marinesensitivity/shiny:latest
+  cd /share/github/MarineSensitivity/server/prod
+  sudo python3.8 -m podman_compose down
+  sudo python3.8 -m podman_compose up -d
+
+  Then set up the cron job for future unattended updates:
+
+  ```bash
+  chmod +x /share/github/MarineSensitivity/server/prod/update-images.sh
+  sudo crontab -e
+  ```
+  ```
+  # add: 15 3 * * * /share/github/MarineSensitivity/server/prod/update-images.sh
+  ```
+
+Can you confirm this sync strategy should (in theory) work when we move to a v4?     
+
+⏺ All edits look correct. Here's a summary of what was changed:                                                                                   
+                                                                  
+  prod/sync-pull.sh (3 edits):                                                                                                                    
+  - Line 18: Added DATA_VERSION="v3" variable after the other config variables                                                                    
+  - Lines 29-30: Replaced hardcoded derived/v3 with derived/${DATA_VERSION} in the rclone sync for derived data                                   
+  - Lines 45-46: Replaced hardcoded big/v3 with big/${DATA_VERSION} in the rclone sync for big data                                               
+                                                                                                                                                  
+  sync.qmd (2 edits):
+  - Lines 492-493: Changed data files checklist from hardcoded /share/data/big/v3/... to {version} notation with "currently v3" note
+  - Lines 699-702: Updated disk space callout and action note to reference the DATA_VERSION variable instead of saying "limited to v3 data"
+
+  To migrate to v4 when ready, just change DATA_VERSION="v3" to DATA_VERSION="v4" in prod/sync-pull.sh (and update the Shiny app data paths in the
+   apps repo).
+
 
 ## 2026-02-18 docs rationale MMPA, Non-US species, masking, flower plot, etc.
 

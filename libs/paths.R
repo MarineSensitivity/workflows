@@ -25,3 +25,13 @@ tbl_sr  <- glue::glue("ply_subregions_2026_{ver}")
 
 # version suffix for backward compatibility (e.g., "_v3")
 v_sfx <- glue::glue("_{ver}")
+
+# server type detection (MSENS_ENV=prod set in prod docker-compose.yml)
+is_prod <- Sys.getenv("MSENS_ENV") == "prod"
+
+# pmtiles
+dir_pmtiles <- glue::glue("{dir_big_v}/pmtiles")
+pmtiles_base_url <- ifelse(
+  is_prod,
+  "/pmtiles",                                # prod: relative path on same host
+  "https://pmtiles.marinesensitivity.org")   # laptop + dev: dedicated subdomain

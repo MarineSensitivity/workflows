@@ -49,6 +49,12 @@ if [[ "$MODE" == "all" || "$MODE" == "data" ]]; then
     "$TIF_SHARED" \
     "$SSH_HOST:$REMOTE_DERIVED/"
 
+  echo "=== syncing pmtiles ==="
+  rsync -avz --progress \
+    -e "ssh -i \"$SSH_KEY\"" \
+    "$HOME/_big/msens/derived/${VER}/pmtiles/" \
+    "$SSH_HOST:$REMOTE_DERIVED/${VER}/pmtiles/"
+
   # 2. fix permissions + swap duckdb + restart rstudio ----
   # shiny needs staff group to read data; setgid ensures new files inherit staff;
   # rstudio restart picks up new group membership and clean duckdb
