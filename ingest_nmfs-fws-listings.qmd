@@ -35,7 +35,7 @@ librarian::shelf(
   htmltools,
   janitor,
   litedown,
-  MarineSensitivity / msens,
+  MarineSensitivity/msens,
   readr,
   readxl,
   stringr,
@@ -45,6 +45,7 @@ librarian::shelf(
 )
 
 options(readr.show_col_types = F)
+source(here("libs/paths.R"))
 
 # helper functions ----
 
@@ -99,10 +100,8 @@ common_words <- function(names) {
 
 # paths ----
 
-dir_data <- msens::sdm_db_path() |> dirname() |> dirname()
-
-con_spp <- msens::spp_db_con()
-con_sdm <- msens::sdm_db_con(read_only = FALSE)
+con_spp <- dbConnect(duckdb(dbdir = spp_db, read_only = T))
+con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F))
 
 nmfs_src_csv <- here("data/nmfs_species-directory.csv")
 nmfs_worms_csv <- here("data/nmfs_species-directory_worms-matched.csv")
@@ -183,8 +182,8 @@ d_nmfs <- d_nmfs_raw |>
     common_name = recode_values(
       scientific_name_dataset,
       from = spp_sci_to_cmn$scientific_name_dataset,
-      to = spp_sci_to_cmn$common_name
-    ),
+      to   = spp_sci_to_cmn$common_name,
+      default = common_name),
     # sci_ds: scientific_name_dataset (corrected)
     sci_ds = ifelse(
       !is.na(scientific_name_corrected),
@@ -939,10 +938,11 @@ Priority: NMFS EN > FWS EN > NMFS TN > FWS TN > NMFS LC > FWS LC
 
 # combine NMFS and FWS listings
 d_listing <- d_nw |>
-  select(worms_id, nmfs_esa, is_mmpa) |>
+  select(worms_id, nmfs_esa, is_mmpa, common_name) |>
   full_join(
     d_f_bw |>
-      select(worms_id, botw_id, fws_esa, is_bcc),
+      select(worms_id, botw_id, fws_esa, is_bcc,
+             fws_common_name = common_name),
     by = "worms_id",
     na_matches = "never"
   ) |>
@@ -955,8 +955,11 @@ d_listing <- d_nw |>
   mutate(
     is_mmpa = replace_na(is_mmpa, FALSE),
     is_mbta = replace_na(is_mbta, FALSE),
-    is_bcc  = replace_na(is_bcc, FALSE)
-  )
+    is_bcc  = replace_na(is_bcc, FALSE),
+    # nmfs common_name takes priority over fws
+    common_name = coalesce(common_name, fws_common_name)
+  ) |>
+  select(-fws_common_name)
 
 # assign extrisk_code with priority ordering
 d_listing <- d_listing |>
@@ -1068,7 +1071,8 @@ d_listing_out <- d_listing |>
     er_score,
     is_mmpa,
     is_mbta,
-    is_bcc
+    is_bcc,
+    common_name
   ) |>
   distinct(spp_id, .keep_all = TRUE)
 

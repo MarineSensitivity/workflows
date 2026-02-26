@@ -40,7 +40,230 @@
 - Migrate to hexagons
 
 
-## brydei -> edeni (Bryde's whale)
+## 2026-02-26 common names from NMFS/FWS; drop B. brydei (WoRMS invalid), ∆ B. edeni "smaller Indian fin-whale" -> "Bryde's whale"
+
+While investigating the species _Balaenoptera edeni_, I found a couple of issues.
+
+1. The common name used in the apps and reporting, ie in con_sdm's `taxon.common_name`, should be pulled from the NMFS and FWS listings, ie from sources in @ingest_nmfs-fws-listings.qmd. Perhaps this update should get applied in @calc_scores.qmd. The app currently shows _Balaenoptera edeni_ with the common name "smaller Indian fin-whale", whereas NMFS correctly calls it "Bryde’s Whale": [Bryde’s Whale | NOAA Fisheries](https://www.fisheries.noaa.gov/species/brydes-whale).
+
+2. In the mapsp app (@../apps/mapsp/app.R) the species _Balaenoptera brydei_ with common name "Bryde's whale" is listed under Species and available (`is_ok ==  TRUE`). But this species is listed by [WoRMS - World Register of Marine Species - Balaenoptera brydei Olsen, 1913](https://www.marinespecies.org/aphia.php?p=taxdetails&id=242603) as Status "uncertain > taxon inquirendum". The NMFS page [Bryde’s Whale | NOAA Fisheries](https://www.fisheries.noaa.gov/species/brydes-whale) describes this ambiguity with more detail:
+
+> Bryde’s whales are currently considered monotypic (belonging to one species). Currently, there are two subspecies of Bryde’s whales. Eden’s whale (Balaenoptera edeni) is a smaller form found in the Indian and western Pacific oceans, primarily in coastal waters. The Bryde’s whale (Balaenoptera edeni brydei) is a larger form, found primarily in pelagic waters. The Bryde's whale's "pygmy form" was identified in the late 1970s and early 1980s has been described as a separate species, Omura's whale (Balaenoptera omurai).
+
+I thought that during the ingestion process, only species with a valid `worms_id` were flagged as is_ok=TRUE, but that doesn't seem to be the case. How many are there across `sp_cat`?
+
+
+⏺ Here's a summary of what I found and the proposed plan:
+
+  Your question answered: There are 40 species with is_ok=TRUE and non-accepted WoRMS taxonomicStatus, across:                                                                                                  
+  - invertebrate: 37 (16 alternative representation, 8 taxon inquirendum, 7 nomen dubium, 3 unreplaced junior homonym, 1 each uncertain/unaccepted/temporary name)                                              
+  - mammal: 1 (Balaenoptera brydei, taxon inquirendum)                                                                                                                                                          
+  - other: 2 (taxon inquirendum)                        
+
+  That's 40 out of 9,616 is_ok=TRUE worms-authority species.
+
+  The common name problem is also widespread — the mapsp app already patches 3 species ("hump" → "humpback whale", "black right whale" → "North Atlantic right whale", "Arctic right whale" → "bowhead whale"),
+  and more need fixing ("rorqual aliblanco" → "Minke Whale", "common finwhale" → "Fin Whale", "smaller Indian fin-whale" → "Bryde's Whale").
+
+  The plan has two fixes:
+  1. Propagate NMFS/FWS common names through the listing table into taxon.common_name as a priority override
+  2. Add worms_taxonomicStatus != 'accepted' check to the is_ok logic
+←  ☐ Common names  ☐ WoRMS filter  ✔ Submit  →
+
+**Common names**. For the common_name fix: the NMFS/FWS common names would only cover ~300 NMFS + ~560 FWS listed species. Should we also add the mapsp band-aid fixes (spp_sci_cmn_fixes) into the listing overrides CSV for species not covered by NMFS/FWS data?                                                 
+  1. NMFS/FWS only (Recommended)
+     Only override common_name from the NMFS/FWS listing sources. The 3 band-aid fixes (humpback whale, bowhead whale, N. Atlantic right whale) are already in NMFS data so they'll be covered.
+  2. Add extras to overrides CSV
+     Also add manual common_name overrides in species_overrides_v3.csv for any remaining bad common names not covered by NMFS/FWS.
+❯ 3. NMFS/FWS only, but also report on the applied NMFS/FWS common names for species mentioned in the mapsp/mapgl band-aid fixes (variable `spp_sci_cmn_fixes`) to ensure Ok and remove the soon to be deprecated band-aid fix in the mapsp & mapgl apps.
+
+**WoRMS filter**. For the taxonomicStatus filter: should non-accepted WoRMS taxa be excluded entirely from is_ok, or should some statuses like 'alternative representation' be allowed through?                                                   
+  1. Only 'accepted' allowed (Recommended)
+     Strict: only taxonomicStatus == 'accepted' passes is_ok. Excludes all 40 species. Simplest and most defensible.
+  2. Allow 'alternative representation'                                                                                                                                               
+     Keep the 16 'alternative representation' invertebrates (these are valid taxa with an alternate classification). Filter only truly problematic statuses.
+  3. Allow accepted + unassessed
+     Also allow 'unassessed' (not yet evaluated) in addition to 'accepted'. Currently no is_ok=TRUE species have this status, so no impact.
+Which species have 'alternative representation' and does this mean in the spp duckdb there is a preferred worms_id? I'm generally in favor of keeping, unless there's a duplicate species (we don't want to double count) or preferred worms_id
+
+⏺ Here's what I found about the 40 non-accepted species:
+                                                                                                                                                                                      
+  "alternative representation" (16): All self-referencing (acceptedNameUsage = their own name, no separate accepted worms_id). None have a duplicate accepted species in the taxon    
+  table. These are copepods/invertebrates with an alternate classification but are essentially valid. Safe to keep.
+                                                                                                                                                                                      
+  All others (24): Most are also self-referencing in WoRMS (no separate accepted alternative), but many have problematic statuses:
+  - "taxon inquirendum" (11): includes B. brydei — taxonomy is uncertain. B. brydei specifically overlaps with B. edeni (both have AquaMaps models), causing potential
+  double-counting.
+  - "nomen dubium" (7): names of doubtful application
+  - "unreplaced junior homonym" (3), "uncertain" (1), "unaccepted" (1), "temporary name" (1)
+
+Based on the analysis: keep 'alternative representation' (16 spp, no duplicates, safe) and exclude all other non-accepted statuses (24 spp including B. brydei)?
+                                                                                                                                               
+❯ 1. Yes, keep alt rep only (Recommended)               
+     Keep 'alternative representation' (16 invertebrates, no duplicates). Exclude 24 others: taxon inquirendum (11), nomen dubium (7), unreplaced junior homonym (3), uncertain (1),
+     unaccepted (1), temporary name (1). This removes B. brydei.
+  2. Strict: only 'accepted'
+     Exclude all 40 non-accepted species including the 16 'alternative representation' invertebrates.
+  3. Custom approach
+     You want to specify different rules.
+
+Looks good, but let's keep snakecase `worms_taxonomic_status` (vs worms_taxonomicStatus) in the duckdb tables (so we don't have to quote columns).
+
+⏺ Updated — all references now use worms_taxonomic_status (snake_case) for the DuckDB column name. The R code will map from WoRMS's taxonomicStatus field to this snake_case column.
+                                                                                                                                                                                      
+ Ready to code?
+                                                                                                                                                                                      
+ Here is Claude's plan:                                 
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Fix common names from NMFS/FWS and filter non-accepted WoRMS taxa
+
+ Context
+
+ Two issues found while investigating Balaenoptera edeni:
+
+ 1. Bad common names: taxon.common_name comes from WoRMS vernacular names, which are often obscure or wrong. Examples: "hump" instead of "Humpback Whale", "rorqual aliblanco"
+ instead of "Minke Whale", "smaller Indian fin-whale" instead of "Bryde's Whale", "common finwhale" instead of "Fin Whale". The NMFS species directory and FWS species data have
+ authoritative US common names that should take priority.
+ 2. Non-accepted WoRMS taxa marked is_ok=TRUE: 40 species with WoRMS taxonomicStatus != 'accepted' pass all is_ok checks. Decision: keep "alternative representation" (16
+ invertebrates, no duplicates), exclude the remaining 24 (taxon inquirendum: 11 incl. B. brydei, nomen dubium: 7, unreplaced junior homonym: 3, uncertain: 1, unaccepted: 1,
+ temporary name: 1).
+
+ The mapsp/mapgl apps have band-aid spp_sci_cmn_fixes tribbles to fix 3 whale common names — all 3 are confirmed in NMFS data and will be covered by the proper fix, so the band-aids
+  can be removed.
+
+ Fix 1: Propagate NMFS/FWS common names into listing table and taxon.common_name
+
+ Step 1a: ingest_nmfs-fws-listings.qmd — preserve common names and add to listing table
+
+ Line ~183, ingest_nmfs chunk: The recode_values() call currently overwrites common_name from the raw CSV. Fix by adding default = common_name:
+ common_name = recode_values(
+   scientific_name_dataset,
+   from = spp_sci_to_cmn$scientific_name_dataset,
+   to   = spp_sci_to_cmn$common_name,
+   default = common_name),       # preserve original NMFS common_name
+
+ Line ~941, combine_listings chunk: Carry common_name through the NMFS/FWS join. The d_nw (NMFS) and d_f_bw (FWS) both have common_name — add it to d_listing with NMFS priority:
+ d_listing <- d_nw |>
+   select(worms_id, nmfs_esa, is_mmpa, common_name) |>    # add common_name
+   full_join(
+     d_f_bw |>
+       select(worms_id, botw_id, fws_esa, is_bcc,
+              fws_common_name = common_name),              # rename to avoid clash
+     by = "worms_id", na_matches = "never") |>
+   ...
+   mutate(
+     listing_common_name = coalesce(common_name, fws_common_name))  # NMFS > FWS
+
+ Line ~1060, write_listing chunk: Include listing_common_name (renamed to common_name) in d_listing_out and write to the listing table.
+
+ Step 1b: merge_models_prep.qmd — override taxon.common_name from listing
+
+ In do_redlist_listing section (~line 2225): After the existing UPDATE taxon SET extrisk_code = ..., add a common_name override:
+ dbExecute(con_sdm,
+   "UPDATE taxon
+      SET common_name = l.common_name
+    FROM listing l
+    WHERE taxon.worms_id = l.worms_id
+      AND l.common_name IS NOT NULL
+      AND l.common_name != ''")
+ And similarly for BOTW-only birds via botw_id.
+
+ Step 1c: apps/mapsp/app.R — remove band-aid
+
+ Remove spp_sci_cmn_fixes tribble (lines 156-161) and the recode_values call (lines 166-171). All 3 species are confirmed covered by NMFS:
+ - Eubalaena glacialis → "North Atlantic Right Whale"
+ - Megaptera novaeangliae → "Humpback Whale"
+ - Balaena mysticetus → "Bowhead Whale"
+
+ Step 1d: apps/mapgl/app.R — remove band-aid
+
+ Remove spp_sci_cmn_fixes tribble (lines 1534-1539) and the recode_values call (lines 1555-1561).
+
+ Fix 2: Filter non-accepted WoRMS taxa in is_ok
+
+ Step 2a: merge_models_prep.qmd — add worms_taxonomic_status column to taxon
+
+ In taxon_is_marine section (do_redlist_listing, ~line 2413): Also retrieve taxonomicStatus from spp.worms and store it:
+ dbExecute(con_sdm,
+   "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS worms_taxonomic_status TEXT")
+ Include taxonomicStatus in the same UPDATE that populates worms_is_marine and worms_is_extinct.
+
+ Step 2b: merge_models.qmd — add taxonomicStatus filter to is_ok
+
+ In taxon_is_ok chunk (~line 601), non-birds case_when: Add condition to exclude non-accepted taxa (keeping "alternative representation"):
+ d_w <- d |>
+   filter(taxon_authority == "worms") |>
+   mutate(
+     is_ok = case_when(
+       is.na(taxon_id)                                     ~ F,
+       is.na(mdl_seq)                                      ~ F,
+       !is.na(redlist_code) & redlist_code == "EX"         ~ F,
+       !is.na(worms_id) & worms_is_marine == F             ~ F,
+       !is.na(worms_id) & worms_is_extinct == T            ~ F,
+       !is.na(worms_taxonomic_status) &
+         !worms_taxonomic_status %in%
+           c("accepted", "alternative representation")     ~ F,  # NEW
+       sp_cat == "reptile"                                 ~ F,
+       sp_cat == "turtle"                                  ~ T,
+       .default = T
+     )
+   )
+
+ This excludes 24 species while keeping the 16 "alternative representation" invertebrates (no duplicates, no accepted equivalent in taxon table).
+
+ Files to modify
+
+ ┌──────────────────────────────┬──────────────────────────────────────────────────────────────────────────────────────┐
+ │             File             │                                       Changes                                        │
+ ├──────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+ │ ingest_nmfs-fws-listings.qmd │ Fix recode_values default; carry common_name through to listing table                │
+ ├──────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+ │ merge_models_prep.qmd        │ Add worms_taxonomic_status to taxon; override common_name from listing               │
+ ├──────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+ │ merge_models.qmd             │ Add taxonomicStatus filter to is_ok (keep "accepted" + "alternative representation") │
+ ├──────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+ │ apps/mapsp/app.R             │ Remove spp_sci_cmn_fixes band-aid (lines 156-171)                                    │
+ ├──────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+ │ apps/mapgl/app.R             │ Remove spp_sci_cmn_fixes band-aid (lines 1534-1561)                                  │
+ └──────────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────┘
+
+ Verification
+
+ 1. Re-render ingest_nmfs-fws-listings.qmd — confirm listing table now has common_name column
+ 2. Re-render merge_models_prep.qmd with do_redlist_listing = TRUE — confirm taxon.common_name updates (Bryde's Whale, Humpback Whale, etc.)
+ 3. Re-render merge_models.qmd with do_is_ok = TRUE — confirm B. brydei (242603) now is_ok = FALSE
+ 4. Verify: SELECT sp_cat, COUNT(*) FROM taxon WHERE is_ok GROUP BY sp_cat — expect 24 fewer is_ok=TRUE species
+ 5. Spot-check mapsp/mapgl apps render correctly without band-aid fixes
+
+⏺ All changes are implemented across all 5 files. Here's a summary:                                                                                                                   
+                                                                  
+  Changes Made                                                                                                                                                                        
+                                                                                                                                                                                      
+  Fix 1: Propagate NMFS/FWS common names                                                                                                                                              
+                                                                                                                                                                                      
+  ingest_nmfs-fws-listings.qmd (3 edits):                         
+  1. Line 187: Added default = common_name to recode_values() so original NMFS common names are preserved instead of being wiped for species not in the recode lookup
+  2. Lines 942-963: Added common_name to NMFS select, renamed FWS common_name to fws_common_name, and added coalesce(common_name, fws_common_name) giving NMFS priority
+  3. Line 1076: Added common_name to d_listing_out select so it's written to the listing table
+
+  merge_models_prep.qmd (1 edit at ~line 2266):
+  - Added two dbExecute UPDATE statements after the existing listing join: one overrides taxon.common_name from listing by worms_id, the second catches BOTW-only birds via botw_id
+
+  apps/mapsp/app.R — Removed spp_sci_cmn_fixes tribble (6 lines) and recode_values call (7 lines)
+
+  apps/mapgl/app.R — Removed spp_sci_cmn_fixes tribble (6 lines) and recode_values call (8 lines)
+
+  Fix 2: Filter non-accepted WoRMS taxa
+
+  merge_models_prep.qmd (taxon_is_marine section):
+  - Added taxonomicStatus to both the bird (d_b) and worms (d_w) WoRMS lookups
+  - Broadened the filter (removed the !is.na(isMarine) | !is.na(isExtinct) restriction so taxonomicStatus is always fetched)
+  - Added worms_taxonomic_status to d2, the ALTER TABLE, and the UPDATE statement
+
+  merge_models.qmd (taxon_is_ok chunk):
+  - Added new case_when condition: species with worms_taxonomic_status not in c("accepted", "alternative representation") get is_ok = FALSE — this excludes the 24 problematic taxa
+  while keeping the 16 "alternative representation" invertebrates
+
 
 ## 2026-02-23 fix flower plots
 
@@ -968,7 +1191,7 @@ Let's keep the pmtiles_proxy in Caddy, since I might use that later with clients
    "/pmtiles",
    "https://file.marinesensitivity.org/pmtiles")
  ```
- 
+
  Files Modified
 
  - server/caddy/Caddyfile — add /pmtiles to file server, trim pmtiles subdomain block

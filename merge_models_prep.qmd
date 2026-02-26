@@ -80,10 +80,10 @@ do_resolve_dupes <- F # resolve duplicate IDs across datasets
 do_bird_botwid <- F # bird BOTW ID matching
 do_build_taxon <- F # build taxon + taxon_model tables
 do_reclassify <- F # reclassify turtles/reptiles
-do_redlist_listing <- F # add redlist_code, extrisk_code, er_score
+do_redlist_listing <- T # add redlist_code, extrisk_code, er_score
 do_iucn_insert <- F # add IUCN range maps dataset
 do_iucn_extract <- F # extract IUCN range rasters (long-running)
-do_iucn_values <- T # update IUCN model_cell values
+do_iucn_values <- F # update IUCN model_cell values
 ```
 
 ### Dataset and model summary
@@ -2263,6 +2263,32 @@ if (dbExistsTable(con_sdm, "listing")) {
     "Listing joined by botw_id: {n_total - n_worms} additional taxa"
   ))
   message(glue("Total with US extrisk_code: {n_total} taxa"))
+
+  # override taxon.common_name from listing (NMFS/FWS) by worms_id
+  n_cmn_w <- dbExecute(
+    con_sdm,
+    "UPDATE taxon
+      SET common_name = l.common_name
+    FROM listing l
+    WHERE taxon.worms_id = l.worms_id
+      AND l.common_name IS NOT NULL
+      AND l.common_name != ''"
+  )
+  message(glue("common_name overridden by worms_id: {n_cmn_w} taxa"))
+
+  # override taxon.common_name from listing by botw_id (birds not matched above)
+  n_cmn_b <- dbExecute(
+    con_sdm,
+    "UPDATE taxon
+      SET common_name = l.common_name
+    FROM listing l
+    WHERE taxon.taxon_authority = 'botw'
+      AND taxon.taxon_id = l.botw_id
+      AND l.common_name IS NOT NULL
+      AND l.common_name != ''
+      AND (taxon.common_name IS NULL OR taxon.common_name = '')"
+  )
+  message(glue("common_name overridden by botw_id: {n_cmn_b} taxa"))
 } else {
   message("No listing table found; skipping listing join")
 }
@@ -2413,18 +2439,18 @@ d_b <- d_b |>
   left_join(
     tbl(con_spp, "worms") |>
       filter(
-        taxonID %in% d_b$worms_id,
-        !is.na(isMarine) | !is.na(isExtinct)
+        taxonID %in% d_b$worms_id
       ) |>
       select(
         worms_id = taxonID,
         worms_is_marine = isMarine,
-        worms_is_extinct = isExtinct
+        worms_is_extinct = isExtinct,
+        worms_taxonomic_status = taxonomicStatus
       ) |>
       collect(),
     by = join_by(worms_id)
   ) |>
-  collect() # 405 × 6
+  collect()
 
 d_w <- d |>
   filter(
@@ -2437,24 +2463,24 @@ d_w <- d_w |>
   left_join(
     tbl(con_spp, "worms") |>
       filter(
-        taxonID %in% d_w$worms_id,
-        !is.na(isMarine) | !is.na(isExtinct)
+        taxonID %in% d_w$worms_id
       ) |>
       select(
         worms_id = taxonID,
         worms_is_marine = isMarine,
-        worms_is_extinct = isExtinct
+        worms_is_extinct = isExtinct,
+        worms_taxonomic_status = taxonomicStatus
       ) |>
       collect(),
     by = join_by(worms_id)
   ) |>
-  collect() # OLD: 16,947 × 5 -> NEW: 16,947 × 5
+  collect()
 
 d2 <- bind_rows(
   d_b,
   d_w
 ) |>
-  select(taxon_id, worms_is_marine, worms_is_extinct)
+  select(taxon_id, worms_is_marine, worms_is_extinct, worms_taxonomic_status)
 
 stopifnot(sum(duplicated(d2$taxon_id)) == 0)
 
@@ -2466,16 +2492,21 @@ dbExecute(
   con_sdm,
   "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS worms_is_extinct BOOLEAN"
 )
+dbExecute(
+  con_sdm,
+  "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS worms_taxonomic_status VARCHAR"
+)
 
 duckdb_register(con_sdm, "d2", d2)
 dbExecute(
   con_sdm,
   "UPDATE taxon
-    SET worms_is_marine  = d2.worms_is_marine ,
-        worms_is_extinct = d2.worms_is_extinct 
+    SET worms_is_marine         = d2.worms_is_marine ,
+        worms_is_extinct        = d2.worms_is_extinct ,
+        worms_taxonomic_status  = d2.worms_taxonomic_status
     FROM d2
     WHERE taxon.taxon_id = d2.taxon_id"
-) # OLD: 17,352 -> NEW: 17,353
+)
 duckdb_unregister(con_sdm, "d2")
 ```
 
