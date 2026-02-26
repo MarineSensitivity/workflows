@@ -39,6 +39,9 @@
 
 - Migrate to hexagons
 
+
+## brydei -> edeni (Bryde's whale)
+
 ## 2026-02-23 fix flower plots
 
 Fix the flower plots in @calc_scores.qmd to show the full Program Area like in the attached set of flower plots from previous Planning Areas. 
@@ -47,12 +50,11 @@ Check around code of other attempts to plot the flower plot and obscuring the do
 
 ⏺ Updated plan                                                                  
   ⎿  /plan to preview                                                           
-                                                                                
-────────────────────────────────────────────────────────────────────────────────
+
  Ready to code?                                                                 
                                                                                 
  Here is Claude's plan:                                                         
-╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+
  Fix Flower Plots to Show Full Program Area Names                               
                                                                                 
  Context                                                
@@ -76,6 +78,7 @@ Check around code of other attempts to plot the flower plot and obscuring the do
  After the arrange() call, add a left_join to bring in full names from pra_all
  (which is already fetched at line 3625-3627):
 
+ ```r
  # current end of d_scores pipeline:
    arrange(desc(score), programarea_key)
 
@@ -84,12 +87,14 @@ Check around code of other attempts to plot the flower plot and obscuring the do
    left_join(
      pra_all,
      by = "programarea_key")
+ ```
 
  2. Use programarea_name for facet labels (lines 3670-3674)
 
  Replace the factor creation to use full names with str_wrap() for multi-line
  display:
-
+ 
+ ```r
  # current:
  d_scores$programarea_lbl <- factor(
    d_scores$programarea_key,
@@ -106,11 +111,13 @@ Check around code of other attempts to plot the flower plot and obscuring the do
 
  str_wrap(width = 20) breaks long names across lines to fit within facet strip
  space.
+ ```
 
  3. Update d_fl to use the same labels (lines 3733-3742)
 
  Join via d_scores lookup instead of creating factor from programarea_key:
-
+ 
+ ```r
  # current:
  d_fl <- d_fl |>
    mutate(
@@ -133,6 +140,7 @@ Check around code of other attempts to plot the flower plot and obscuring the do
      component = component_labels[component]
    ) |>
    arrange(programarea_lbl, component)
+ ```
 
  This guarantees the factor levels in d_fl exactly match d_scores.
 
@@ -140,6 +148,7 @@ Check around code of other attempts to plot the flower plot and obscuring the do
 
  Use -Inf/Inf bounds to guarantee full angular coverage in polar coordinates:
 
+ ```r
  # current:
      annotate(
        "rect",
@@ -161,17 +170,20 @@ Check around code of other attempts to plot the flower plot and obscuring the do
        fill  = ifelse(theme_name == "dark", "grey20", "white"),
        color = NA
      ) +
+ ```
 
  Using -Inf/Inf ensures full circle coverage regardless of data range. Also
  adapts fill color for the dark theme.
 
  5. Increase score text size (line 3807)
 
+ ```r
  # current:
        size = 1.5,
 
  # replace with:
        size = 2.5,
+ ```
 
  Larger text for better readability within the white center circle.
 
@@ -408,14 +420,10 @@ There is an added complexity in that now we have 3 machines: laptop, dev server,
 2. Build ecoregions sf WITHOUT metrics. We are not serving metrics for ecoregions anymore, just the ecoregion outlines.
 
 
-⏺ Updated plan                                                                                                                                                    
-  ⎿  /plan to preview                                                                                                                                             
-                                                                                                                                                                  
-──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
- Ready to code?                                                                                                                                                   
-                                                                                                                                                                  
+⏺ Updated plan                                                                                                                                                
+
  Here is Claude's plan:
-╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+
  Migrate PostGIS/pg_tileserv to PMTiles                                  
 
  Context
@@ -850,6 +858,131 @@ Actually, both prod & server run the same OS b/c they're from the same Docker im
   - Prod server: MSENS_ENV=prod set in prod/docker-compose.yml → TRUE → uses /pmtiles (relative)
 
   This works regardless of the host OS or container base image.
+
+I'm trying to understand the pmtiles implementation between:
+
+1. Generation in @workflows/calc_scores.qmd
+2. Serving in servers: dev (@server/caddy/Caddyfile), prod (@server/prod/Caddyfile)
+3. Visualizing apps: mapgl (@apps/mapgl/app.R), mapsp (@apps/mapsp/app.R)
+
+In the Caddyfile, the pmtiles_proxy is for ZXY implementation, which the [`mapgl::add_pmtiles_source()`](https://github.com/walkerke/mapgl/blob/2c9980ddcd41da8d7d1b29f2311bf90cb6adddd2/R/sources.R#L562-L689) uses, but should be using the raw .pmtiles access, which might be better served by as a subfolder of the file directive for the dev server, fine for /pmtiles path in prod server.
+
+Let's keep the pmtiles_proxy in Caddy, since I might use that later with clients like QGIS or leaflet that might not understand raw pmtiles
+
+⏺ Updated plan                                                  
+
+ Here is Claude's plan:
+
+ Plan: Move raw PMTiles serving under file subdomain    
+
+ Context
+
+ The apps (mapgl, mapsp) use mapgl::add_pmtiles_source() which relies on the client-side PMTiles protocol — the browser makes HTTP range requests directly against raw .pmtiles files. This only needs a static
+  file server.
+
+ Currently a dedicated pmtiles.marinesensitivity.org subdomain serves both:
+ - /tiles/* — pmtiles_proxy (server-side ZXY tile decoding, for QGIS/leaflet)
+ - root — raw .pmtiles files (for add_pmtiles_source())
+
+ The user wants to:
+ 1. Keep pmtiles_proxy for future use (QGIS, leaflet, etc.)
+ 2. Move raw .pmtiles file serving to file.marinesensitivity.org/pmtiles/ (dev) — consolidates under the existing file server subdomain
+ 3. Prod /pmtiles path already fine as-is
+
+ Changes
+
+ 1. Dev Caddyfile (server/caddy/Caddyfile)
+
+ Keep pmtiles.marinesensitivity.org block but only for pmtiles_proxy (ZXY tiles). Move raw file serving to file.marinesensitivity.org.
+
+ Update file.marinesensitivity.org block (lines 13-20) — add /pmtiles path, wrap default in handle:
+
+ ```Caddyfile
+ file.marinesensitivity.org {
+   import cors
+
+   # raw pmtiles for client-side PMTiles protocol (add_pmtiles_source)
+   handle_path /pmtiles/* {
+     root * /share/data/derived/v3/pmtiles
+     file_server
+   }
+
+   handle {
+     root * /share/public
+     file_server browse {
+       precompressed zstd br gzip
+     }
+   }
+ }
+ ```
+
+ Update pmtiles.marinesensitivity.org block (lines 67-84) — remove raw file handler, keep only pmtiles_proxy:
+
+ ```Caddyfile
+ pmtiles.marinesensitivity.org {
+   import cors
+
+   # server-side tile decoding: ZXY + TileJSON (for QGIS, leaflet, etc.)
+   handle_path /tiles/* {
+     pmtiles_proxy {
+       bucket /share/data/derived/v3/pmtiles
+       cache_size 256
+       public_url https://pmtiles.marinesensitivity.org/tiles
+     }
+   }
+ }
+ ```
+
+ 2. Prod Caddyfile (server/prod/Caddyfile)
+
+ No changes needed — already has both /pmtiles/tiles/* (pmtiles_proxy) and /pmtiles/* (file_server) and the path-based routing is correct for both.
+
+ 3. Dockerfiles — no changes
+
+ Custom Caddy builds with go-pmtiles/caddy module still needed for pmtiles_proxy.
+
+ 4. workflows/libs/paths.R (line 37)
+
+ Change non-prod URL:
+ ``r
+ pmtiles_base_url <- ifelse(
+   is_prod,
+   "/pmtiles",
+   "https://file.marinesensitivity.org/pmtiles")
+ ```
+
+ 5. apps/mapgl/app.R (lines 69-72)
+
+ ```r
+ pmtiles_base_url <- ifelse(
+   is_prod,
+   "/pmtiles",
+   "https://file.marinesensitivity.org/pmtiles")
+ ```
+
+ 6. apps/mapsp/app.R (lines 55-58)
+
+ ```r
+ pmtiles_base_url <- ifelse(
+   is_prod,
+   "/pmtiles",
+   "https://file.marinesensitivity.org/pmtiles")
+ ```
+ 
+ Files Modified
+
+ - server/caddy/Caddyfile — add /pmtiles to file server, trim pmtiles subdomain block
+ - workflows/libs/paths.R — update pmtiles_base_url
+ - apps/mapgl/app.R — update pmtiles_base_url
+ - apps/mapsp/app.R — update pmtiles_base_url
+
+ Verification
+
+ 1. Confirm https://file.marinesensitivity.org/pmtiles/ply_ecoregions_2025_v3.pmtiles returns the file with Accept-Ranges: bytes header
+ 2. Confirm https://pmtiles.marinesensitivity.org/tiles/ply_ecoregions_2025_v3/{z}/{x}/{y}.pbf still serves ZXY tiles
+ 3. Test mapgl and mapsp apps — PMTiles boundaries should render on the map
+ 4. Verify CORS headers present on pmtiles responses from file subdomain
+
 
 ## 2026-02-21 server: + sync.qmd
 

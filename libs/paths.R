@@ -33,5 +33,5 @@ is_prod <- Sys.getenv("MSENS_ENV") == "prod"
 dir_pmtiles <- glue::glue("{dir_big_v}/pmtiles")
 pmtiles_base_url <- ifelse(
   is_prod,
-  "/pmtiles",                                # prod: relative path on same host
-  "https://pmtiles.marinesensitivity.org")   # laptop + dev: dedicated subdomain
+  "/pmtiles",                                       # prod: relative path on same host
+  "https://file.marinesensitivity.org/pmtiles")     # laptop + dev: file subdomain
