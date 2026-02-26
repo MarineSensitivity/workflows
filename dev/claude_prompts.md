@@ -39,6 +39,155 @@
 
 - Migrate to hexagons
 
+## 2026-02-23 fix flower plots
+
+Fix the flower plots in @calc_scores.qmd to show the full Program Area like in the attached set of flower plots from previous Planning Areas. 
+
+Check around code of other attempts to plot the flower plot and obscuring the donut hole with a white background to show the score in the center more clearly.
+
+⏺ Updated plan                                                                  
+  ⎿  /plan to preview                                                           
+                                                                                
+────────────────────────────────────────────────────────────────────────────────
+ Ready to code?                                                                 
+                                                                                
+ Here is Claude's plan:                                                         
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Fix Flower Plots to Show Full Program Area Names                               
+                                                                                
+ Context                                                
+
+ The flower plots in calc_scores.qmd currently display only short
+ programarea_key codes (e.g., "GAA", "CNA") as facet labels. The user wants
+ them to show full programarea_name values (e.g., "Gulf of Alaska Program Area
+ A") to match the style of previous Planning Area flower plots. Additionally,
+ the white center circle that obscures the donut hole needs improvement for
+ clearer score display.
+
+ File to Modify
+
+ /Users/bbest/Github/MarineSensitivity/workflows/calc_scores.qmd — code chunk
+ plot_programarea_flowers (lines 3618-3839)
+
+ Changes
+
+ 1. Join programarea_name into d_scores (line 3668)
+
+ After the arrange() call, add a left_join to bring in full names from pra_all
+ (which is already fetched at line 3625-3627):
+
+ # current end of d_scores pipeline:
+   arrange(desc(score), programarea_key)
+
+ # change to:
+   arrange(desc(score), programarea_key) |>
+   left_join(
+     pra_all,
+     by = "programarea_key")
+
+ 2. Use programarea_name for facet labels (lines 3670-3674)
+
+ Replace the factor creation to use full names with str_wrap() for multi-line
+ display:
+
+ # current:
+ d_scores$programarea_lbl <- factor(
+   d_scores$programarea_key,
+   levels = d_scores$programarea_key,
+   ordered = T
+ )
+
+ # replace with:
+ d_scores$programarea_lbl <- factor(
+   str_wrap(d_scores$programarea_name, width = 20),
+   levels = str_wrap(d_scores$programarea_name, width = 20),
+   ordered = T
+ )
+
+ str_wrap(width = 20) breaks long names across lines to fit within facet strip
+ space.
+
+ 3. Update d_fl to use the same labels (lines 3733-3742)
+
+ Join via d_scores lookup instead of creating factor from programarea_key:
+
+ # current:
+ d_fl <- d_fl |>
+   mutate(
+     programarea_lbl = factor(
+       programarea_key,
+       levels = d_scores$programarea_key,
+       ordered = T
+     ),
+     component = component_labels[component]
+   ) |>
+   arrange(programarea_lbl, component)
+
+ # replace with:
+ d_fl <- d_fl |>
+   left_join(
+     d_scores |> select(programarea_key, programarea_lbl),
+     by = "programarea_key"
+   ) |>
+   mutate(
+     component = component_labels[component]
+   ) |>
+   arrange(programarea_lbl, component)
+
+ This guarantees the factor levels in d_fl exactly match d_scores.
+
+ 4. Improve white center circle (lines 3795-3803)
+
+ Use -Inf/Inf bounds to guarantee full angular coverage in polar coordinates:
+
+ # current:
+     annotate(
+       "rect",
+       xmin = -20,
+       xmax = 0,
+       ymin = 0,
+       ymax = max(d$ymax),
+       fill = "white",
+       color = NA
+     ) +
+
+ # replace with:
+     annotate(
+       "rect",
+       xmin  = -Inf,
+       xmax  = 0,
+       ymin  = -Inf,
+       ymax  = Inf,
+       fill  = ifelse(theme_name == "dark", "grey20", "white"),
+       color = NA
+     ) +
+
+ Using -Inf/Inf ensures full circle coverage regardless of data range. Also
+ adapts fill color for the dark theme.
+
+ 5. Increase score text size (line 3807)
+
+ # current:
+       size = 1.5,
+
+ # replace with:
+       size = 2.5,
+
+ Larger text for better readability within the white center circle.
+
+ Verification
+
+ 1. Re-render the plot_programarea_flowers chunk in calc_scores.qmd
+ 2. Check the output PNG/PDF files in
+ {dir_figs}/programarea_flower-plot_scores_*.{png,pdf}
+ 3. Verify that:
+   - Facet strips show full program area names (wrapped across lines)
+   - White circle fully covers the donut center
+   - Score numbers are clearly readable at the center
+   - All theme variants (minimal, linedraw, min_line, dark, void) render
+ correctly
+
+
 ## 2026-02-22 update main website
 
 The nexus of actively developed, publicly visible content for this project is with:
