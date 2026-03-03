@@ -114,7 +114,7 @@ Looks good, but let's keep snakecase `worms_taxonomic_status` (vs worms_taxonomi
  Ready to code?
                                                                                                                                                                                       
  Here is Claude's plan:                                 
-╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+
  Fix common names from NMFS/FWS and filter non-accepted WoRMS taxa
 
  Context
@@ -7674,7 +7674,6 @@ Apply to both PostGIS + DuckDB. Update plan with changes to `@workflows/calc_sco
 
  Leave untouched
  
- ┌─────────────────────────────────────────┬───────────────────────────────────────────────────────────────────┐
  │                  Item                   │                              Reason                               │
  ├─────────────────────────────────────────┼───────────────────────────────────────────────────────────────────┤
  │ apps_2026/storymap/                     │ Uses v2 planareas/ecoregions — keep as-is                         │
@@ -7684,8 +7683,7 @@ Apply to both PostGIS + DuckDB. Update plan with changes to `@workflows/calc_sco
  │ server/docker-compose.yml               │ pg_tileserv auto-discovers all tables                             │
  ├─────────────────────────────────────────┼───────────────────────────────────────────────────────────────────┤
  │ DuckDB cell_metric, zone_metric, metric │ Internal computation tables, overwritten each run — not versioned │
- └─────────────────────────────────────────┴───────────────────────────────────────────────────────────────────┘
- ---
+ 
  Files Modified
  File: workflows/calc_scores.qmd
  Changes: Add v_int/v_sfx in setup; version output file paths; add version_zone_tbl chunk; add create_pg_v3_tables chunk; update all
@@ -7915,7 +7913,7 @@ In @apps_2026/mapgl/app.R and @apps_2026/mapsp/app.R, similarly use v_int and v_
  ---
  Leave untouched
  
- ┌─────────────────────────────────────────┬───────────────────────────────────────────────────────────────────┐
+ 
  │                  Item                   │                              Reason                               │
  ├─────────────────────────────────────────┼───────────────────────────────────────────────────────────────────┤
  │ apps_2026/storymap/                     │ Uses v2 planareas/ecoregions — keep as-is                         │
@@ -7925,10 +7923,10 @@ In @apps_2026/mapgl/app.R and @apps_2026/mapsp/app.R, similarly use v_int and v_
  │ server/docker-compose.yml               │ pg_tileserv auto-discovers all tables                             │
  ├─────────────────────────────────────────┼───────────────────────────────────────────────────────────────────┤
  │ DuckDB cell_metric, zone_metric, metric │ Internal computation tables, overwritten each run — not versioned │
- └─────────────────────────────────────────┴───────────────────────────────────────────────────────────────────┘
+ 
  ---
  Files Modified
- ┌───────────────────────────┬─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+ 
  │           File            │                                                                                                       Changes                                                                                                       │
  ├───────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
  │ workflows/calc_scores.qmd │ Add v_int/v_sfx in setup; version output file paths; add version_zone_tbl chunk; add create_pg_v3_tables chunk; update all PostGIS write calls, index calls, gpkg exports, and zone_taxon DuckDB write to use v_sfx │
@@ -7936,7 +7934,7 @@ In @apps_2026/mapgl/app.R and @apps_2026/mapsp/app.R, similarly use v_int and v_
  │ apps_2026/mapgl/app.R     │ Add v_int/v_sfx variables; use glue() with v_sfx in gpkg paths, lyrs_csv, metrics_tif, tilejson URLs, source_layer refs, dbListFields, zone.tbl filter, zone_taxon table name                                       │
  ├───────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
  │ apps_2026/mapsp/app.R     │ Add v_int/v_sfx variables; use glue() with v_sfx in tilejson URLs and source_layer refs                                                                                                                             │
- └───────────────────────────┴─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ 
  Run Sequence
 
  1. Edit calc_scores.qmd as described
