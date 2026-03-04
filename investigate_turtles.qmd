@@ -1,0 +1,723 @@
+---
+title: "Investigate Sea Turtle Model Outputs"
+subtitle: "Diagnose spatial issues in turtle SDM/range models flagged by BOEM reviewers"
+format:
+  html:
+    code-fold: true
+    code-tools: true
+editor_options:
+  chunk_output_type: console
+---
+
+## Overview
+
+BOEM team (Tim White, Gwendolyn Gallagher) raised concerns about sea turtle
+model outputs in v3:
+
+1. **Leatherback** (*Dermochelys coriacea*, mdl_seq 27735): IUCN range map
+   doesn't match the masked model — possible **dateline/antimeridian issue**
+   since the species ranges across the Pacific.
+2. **Hawksbill** (*Eretmochelys imbricata*, mdl_seq 27734): NOAA Fisheries
+   range is more restricted than IUCN — Hawksbill likely only occurs in
+   Southern California, not further north. **IUCN (broad) vs NMFS (narrow)**.
+3. **Olive Ridley** (*Lepidochelys olivacea*, mdl_seq 27749): Model shows
+   presence **north of the Aleutian Islands / Bering Sea**, unsupported by
+   literature.
+4. **General**: Any sea turtle presence north of the Aleutians needs
+   literature justification or model correction.
+
+```{r}
+#| label: setup
+librarian::shelf(
+  DBI,
+  dplyr,
+  duckdb,
+  DT,
+  glue,
+  here,
+  purrr,
+  RColorBrewer,
+  sf,
+  terra,
+  tibble,
+  quiet = T
+)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE
+)
+terraOptions(progress = 0)
+
+source(here("libs/paths.R"))
+
+cell_tif <- glue("{dir_derived}/r_bio-oracle_planarea.tif")
+r_cell <- rast(cell_tif, lyrs = "cell_id")
+
+# iucn paths
+dir_iucn_raw <- glue("{dir_raw}/iucnredlist.org")
+dir_iucn_derived <- glue("{dir_big}/iucnredlist.org")
+
+librarian::shelf(mapgl, quiet = T)
+
+# database connection
+con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = TRUE))
+
+# sea turtle species
+sci_turtles <- c(
+  "Chelonia mydas", # green
+  "Caretta caretta", # loggerhead
+  "Eretmochelys imbricata", # hawksbill
+  "Lepidochelys kempii", # Kemp's ridley
+  "Lepidochelys olivacea", # olive ridley
+  "Natator depressus", # flatback
+  "Dermochelys coriacea"
+) # leatherback
+
+# shared color palette and fixed range (matches apps/mapsp)
+n_cols <- 11
+cols_spectral <- rev(brewer.pal(n_cols, "Spectral"))
+FIXED_RANGE <- c(1, 100)
+
+# helper: convert model_cell rows to a trimmed raster (0-360 coords, no rotate)
+get_rast <- function(mdl_seq) {
+  d <- tbl(con_sdm, "model_cell") |>
+    filter(mdl_seq == !!mdl_seq) |>
+    select(cell_id, value) |>
+    collect()
+  r <- init(r_cell[[1]], NA)
+  r[d$cell_id] <- d$value
+  names(r) <- "value"
+  terra::trim(r)
+}
+
+# helper: add raster with fixed color range (from apps/mapsp)
+add_fixed_range_raster <- function(
+  map,
+  data,
+  id,
+  fixed_range = FIXED_RANGE,
+  colors = cols_spectral,
+  ...
+) {
+  dr <- terra::minmax(data) |> as.numeric()
+  # clamp to fixed range
+  dr[1] <- max(dr[1], fixed_range[1])
+  dr[2] <- min(dr[2], fixed_range[2])
+  n_clrs <- diff(fixed_range) + 1
+  clrs <- colorRampPalette(colors)(n_clrs)
+  clrs_dr <- clrs[seq.int(dr[1], dr[2])]
+
+  map |>
+    add_image_source(
+      id = paste0(id, "_src"),
+      data = terra::clamp(
+        data,
+        lower = fixed_range[1],
+        upper = fixed_range[2],
+        values = TRUE
+      ),
+      colors = clrs_dr
+    ) |>
+    add_raster_layer(
+      id = id,
+      source = paste0(id, "_src"),
+      ...
+    )
+}
+
+# helper: convert 0-360 extent bbox to -180/180 for fit_bounds
+bbox_0360_to_180 <- function(r) {
+  e <- as.vector(ext(r)) # xmin, xmax, ymin, ymax
+  c(
+    ifelse(e[1] > 180, e[1] - 360, e[1]), # xmin
+    e[3], # ymin
+    ifelse(e[2] > 180, e[2] - 360, e[2]), # xmax
+    e[4] # ymax
+  )
+}
+
+# helper: build a mapgl raster map (rasters in 0-360 coords)
+map_rast <- function(r, title = "value") {
+  bbox <- bbox_0360_to_180(r)
+
+  maplibre(
+    style = maptiler_style("bright", variant = "dark")
+  ) |>
+    fit_bounds(bbox, animate = FALSE) |>
+    add_fixed_range_raster(
+      data = r,
+      id = "r_lyr",
+      raster_opacity = 0.7,
+      raster_resampling = "nearest"
+    ) |>
+    mapgl::add_legend(
+      legend_title = title,
+      values = FIXED_RANGE,
+      colors = cols_spectral,
+      position = "bottom-right"
+    ) |>
+    add_fullscreen_control() |>
+    add_navigation_control() |>
+    add_scale_control()
+}
+
+# helper: build a mapgl polygon map
+map_poly <- function(sf_data, title = "IUCN range") {
+  bbox <- st_bbox(sf_data) |> as.numeric()
+
+  maplibre(
+    style = maptiler_style("bright", variant = "dark")
+  ) |>
+    fit_bounds(bbox, animate = FALSE) |>
+    add_fill_layer(
+      id = "range_lyr",
+      source = sf_data,
+      fill_color = "red",
+      fill_opacity = 0.5,
+      popup = "sci_name"
+    ) |>
+    add_fullscreen_control() |>
+    add_navigation_control() |>
+    add_scale_control()
+}
+```
+
+## Query All Turtle Taxa & Models in Database
+
+```{r}
+#| label: turtle_models
+# get turtle taxon records
+d_turtles <- tbl(con_sdm, "taxon") |>
+  filter(sp_cat == "turtle") |>
+  collect()
+
+# get all models per turtle species (taxon_model already has ds_key)
+d_models <- tbl(con_sdm, "taxon_model") |>
+  filter(taxon_id %in% !!d_turtles$taxon_id) |>
+  collect() |>
+  left_join(
+    d_turtles |> select(taxon_id, scientific_name, common_name),
+    by = "taxon_id"
+  )
+
+# cell counts per model
+d_counts <- tbl(con_sdm, "model_cell") |>
+  filter(mdl_seq %in% !!d_models$mdl_seq) |>
+  group_by(mdl_seq) |>
+  summarize(
+    n_cells = n(),
+    v_min = min(value, na.rm = TRUE),
+    v_max = max(value, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  collect()
+
+d_summary <- d_models |>
+  left_join(d_counts, by = "mdl_seq") |>
+  select(
+    scientific_name,
+    common_name,
+    ds_key,
+    mdl_seq,
+    n_cells,
+    v_min,
+    v_max
+  ) |>
+  arrange(scientific_name, ds_key)
+
+datatable(
+  d_summary,
+  caption = "Sea turtle models in sdm.duckdb",
+  filter = "top",
+  options = list(dom = "ft")
+)
+```
+
+## Load IUCN Range Polygons
+
+```{r}
+#| label: load_iucn_polys_tifs
+# turtle shapefiles
+turtle_shp <- glue("{dir_iucn_raw}/TURTLES/TURTLES.shp")
+if (!file.exists(turtle_shp)) {
+  turtle_shp <- Sys.glob(glue("{dir_iucn_raw}/TURTLES*/*.shp"))[1]
+}
+
+sf_turtles_iucn <- NULL
+if (!is.na(turtle_shp) && file.exists(turtle_shp)) {
+  sf_rep <- st_read(turtle_shp, quiet = TRUE)
+  sf_turtles_iucn <- sf_rep |>
+    filter(sci_name %in% sci_turtles)
+  message(glue(
+    "Loaded {nrow(sf_turtles_iucn)} IUCN features for ",
+    "{length(unique(sf_turtles_iucn$sci_name))} turtle species"
+  ))
+} else {
+  message(glue("IUCN TURTLES shapefile not found at {turtle_shp}"))
+}
+
+# check which species have derived tifs
+tif_paths <- tibble(
+  scientific_name = sci_turtles
+) |>
+  mutate(
+    tif = glue("{dir_iucn_derived}/TURTLES/{scientific_name}.tif"),
+    exists = file.exists(tif)
+  )
+
+datatable(
+  tif_paths,
+  caption = "Derived IUCN raster TIFs per turtle species",
+  filter = "top",
+  options = list(dom = "ft")
+)
+```
+
+## Leatherback (*Dermochelys coriacea*) {#sec-leatherback}
+
+::: {.panel-tabset}
+
+### IUCN Polygon
+
+```{r}
+#| label: leatherback_polygon
+sp_sci <- "Dermochelys coriacea"
+sp_lbl <- "Leatherback"
+
+if (!is.null(sf_turtles_iucn)) {
+  sf_sp <- sf_turtles_iucn |> filter(sci_name == sp_sci)
+  if (nrow(sf_sp) > 0) {
+    map_poly(sf_sp, glue("{sp_lbl} IUCN range"))
+  } else {
+    message(glue("No IUCN polygons for {sp_sci}"))
+  }
+}
+```
+
+### IUCN Rasterized vs Merged
+
+```{r}
+#| label: leatherback_iucn_vs_merged
+d_sp <- d_summary |> filter(scientific_name == sp_sci)
+
+mdl_iucn <- d_sp |> filter(ds_key == "rng_iucn") |> pull(mdl_seq)
+mdl_merge <- d_sp |> filter(ds_key == "ms_merge") |> pull(mdl_seq)
+
+if (length(mdl_iucn) > 0 && length(mdl_merge) > 0) {
+  r_iucn <- get_rast(mdl_iucn)
+  r_merge <- get_rast(mdl_merge)
+
+  m1 <- map_rast(r_iucn, glue("{sp_lbl} IUCN rasterized"))
+  m2 <- map_rast(r_merge, glue("{sp_lbl} merged model"))
+  mapgl::compare(m1, m2) |> suppressMessages()
+}
+```
+
+### AquaMaps vs Merged
+
+```{r}
+#| label: leatherback_am_vs_merged
+mdl_am <- d_sp |> filter(ds_key == "am_0.05") |> pull(mdl_seq)
+
+if (length(mdl_am) > 0 && length(mdl_merge) > 0) {
+  r_am <- get_rast(mdl_am)
+  r_merge <- get_rast(mdl_merge)
+
+  m1 <- map_rast(r_am, glue("{sp_lbl} AquaMaps"))
+  m2 <- map_rast(r_merge, glue("{sp_lbl} merged model"))
+  mapgl::compare(m1, m2)
+} else {
+  message(glue("Missing am or ms_merge for {sp_sci}"))
+}
+```
+
+### Dateline Analysis
+  
+```{r}
+#| label: leatherback_dateline
+# check cell counts near the antimeridian (±180° longitude)
+# r_cell uses 0-360 coords; antimeridian is at x=180
+d_iucn <- tbl(con_sdm, "model_cell") |>
+  filter(mdl_seq == !!mdl_iucn) |>
+  select(cell_id, value) |>
+  collect()
+
+# get coordinates of cells
+xy <- xyFromCell(r_cell, d_iucn$cell_id)
+d_iucn$lon_0360 <- xy[, 1]
+d_iucn$lat <- xy[, 2]
+d_iucn <- d_iucn |>
+  mutate(lon = ifelse(lon_0360 > 180, lon_0360 - 360, lon_0360))
+
+# count cells in longitude bins near dateline
+d_dateline <- d_iucn |>
+  mutate(
+    lon_bin = cut(
+      lon,
+      breaks = c(-180, -170, -160, 160, 170, 180),
+      labels = c("-180:-170", "-170:-160", "160:170", "170:180", "near 180")
+    )
+  ) |>
+  filter(!is.na(lon_bin)) |>
+  group_by(lon_bin) |>
+  summarize(
+    n_cells = n(),
+    lat_min = min(lat),
+    lat_max = max(lat),
+    .groups = "drop"
+  )
+
+datatable(
+  d_dateline,
+  caption = glue("{sp_lbl}: cell counts near antimeridian (±180°)")
+)
+
+# show raw IUCN polygon extent if available
+if (!is.null(sf_turtles_iucn)) {
+  sf_sp <- sf_turtles_iucn |> filter(sci_name == sp_sci)
+  bbox <- st_bbox(sf_sp)
+  message(glue(
+    "IUCN polygon bbox: xmin={round(bbox['xmin'], 1)}, ",
+    "xmax={round(bbox['xmax'], 1)}, ",
+    "ymin={round(bbox['ymin'], 1)}, ",
+    "ymax={round(bbox['ymax'], 1)}"
+  ))
+} else {
+  message("No rng_iucn model found for Leatherback")
+}
+```
+
+:::
+
+## Hawksbill (*Eretmochelys imbricata*) {#sec-hawksbill}
+
+::: {.panel-tabset}
+
+### IUCN Range
+
+```{r}
+#| label: hawksbill_polygon
+sp_sci <- "Eretmochelys imbricata"
+sp_lbl <- "Hawksbill"
+
+if (!is.null(sf_turtles_iucn)) {
+  sf_sp <- sf_turtles_iucn |> filter(sci_name == sp_sci)
+  if (nrow(sf_sp) > 0) {
+    map_poly(sf_sp, glue("{sp_lbl} IUCN range"))
+  } else {
+    message(glue("No IUCN polygons for {sp_sci}"))
+  }
+}
+```
+
+### IUCN vs FWS Range
+
+```{r}
+#| label: hawksbill_iucn_vs_fws
+d_sp <- d_summary |> filter(scientific_name == sp_sci)
+
+mdl_iucn <- d_sp |> filter(ds_key == "rng_iucn") |> pull(mdl_seq)
+mdl_fws <- d_sp |> filter(ds_key == "rng_fws") |> pull(mdl_seq)
+
+if (length(mdl_iucn) > 0 && length(mdl_fws) > 0) {
+  r_iucn <- get_rast(mdl_iucn)
+  r_fws <- get_rast(mdl_fws)
+
+  m1 <- map_rast(r_iucn, glue("{sp_lbl} IUCN"))
+  m2 <- map_rast(r_fws, glue("{sp_lbl} FWS range"))
+  mapgl::compare(m1, m2)
+} else {
+  message(glue(
+    "Missing rng_iucn ({length(mdl_iucn)}) or rng_fws ({length(mdl_fws)}) ",
+    "for {sp_sci}. Available ds_keys: {paste(d_sp$ds_key, collapse=', ')}"
+  ))
+}
+```
+
+### AquaMaps vs Merged
+
+```{r}
+#| label: hawksbill_am_vs_merged
+mdl_am <- d_sp |> filter(ds_key == "am_0.05") |> pull(mdl_seq)
+mdl_merge <- d_sp |> filter(ds_key == "ms_merge") |> pull(mdl_seq)
+
+if (length(mdl_am) > 0 && length(mdl_merge) > 0) {
+  r_am <- get_rast(mdl_am)
+  r_merge <- get_rast(mdl_merge)
+
+  m1 <- map_rast(r_am, glue("{sp_lbl} AquaMaps"))
+  m2 <- map_rast(r_merge, glue("{sp_lbl} merged model"))
+  mapgl::compare(m1, m2)
+} else {
+  message(glue("Missing am or ms_merge for {sp_sci}"))
+}
+```
+
+### Pacific North Extent
+
+```{r}
+#| label: hawksbill_north_extent
+# compare IUCN vs FWS range in the Pacific, north of Southern California (~34°N)
+if (length(mdl_iucn) > 0) {
+  d_iucn <- tbl(con_sdm, "model_cell") |>
+    filter(mdl_seq == !!mdl_iucn) |>
+    select(cell_id, value) |>
+    collect()
+
+  xy <- xyFromCell(r_cell, d_iucn$cell_id)
+  d_iucn$lon_0360 <- xy[, 1]
+  d_iucn$lat <- xy[, 2]
+  d_iucn <- d_iucn |>
+    mutate(lon = ifelse(lon_0360 > 180, lon_0360 - 360, lon_0360))
+
+  # cells north of 34°N in the Pacific (lon < -100)
+  d_north_pac <- d_iucn |>
+    filter(lat > 34, lon < -100) |>
+    arrange(desc(lat))
+
+  message(glue(
+    "{sp_lbl} IUCN cells north of 34°N in Pacific: {nrow(d_north_pac)}"
+  ))
+
+  if (nrow(d_north_pac) > 0) {
+    r_north <- init(r_cell[[1]], NA)
+    r_north[d_north_pac$cell_id] <- d_north_pac$value
+    r_north <- terra::trim(r_north)
+    map_rast(r_north, glue("{sp_lbl} IUCN > 34°N Pacific"))
+  }
+
+  # compare with FWS if available
+  if (length(mdl_fws) > 0) {
+    d_fws <- tbl(con_sdm, "model_cell") |>
+      filter(mdl_seq == !!mdl_fws) |>
+      select(cell_id, value) |>
+      collect()
+    xy_fws <- xyFromCell(r_cell, d_fws$cell_id)
+    d_fws$lat <- xy_fws[, 2]
+    d_fws$lon <- ifelse(xy_fws[, 1] > 180, xy_fws[, 1] - 360, xy_fws[, 1])
+
+    d_fws_north <- d_fws |> filter(lat > 34, lon < -100)
+    message(glue(
+      "{sp_lbl} FWS cells north of 34°N in Pacific: {nrow(d_fws_north)}"
+    ))
+  }
+}
+```
+
+:::
+
+## Olive Ridley (*Lepidochelys olivacea*) {#sec-olive-ridley}
+
+::: {.panel-tabset}
+
+### IUCN Range
+
+```{r}
+#| label: olive_polygon
+sp_sci <- "Lepidochelys olivacea"
+sp_lbl <- "Olive Ridley"
+
+if (!is.null(sf_turtles_iucn)) {
+  sf_sp <- sf_turtles_iucn |> filter(sci_name == sp_sci)
+  if (nrow(sf_sp) > 0) {
+    map_poly(sf_sp, glue("{sp_lbl} IUCN range"))
+  } else {
+    message(glue("No IUCN polygons for {sp_sci}"))
+  }
+}
+```
+
+### AquaMaps vs IUCN
+
+```{r}
+#| label: olive_am_vs_iucn
+d_sp <- d_summary |> filter(scientific_name == sp_sci)
+
+mdl_am <- d_sp |> filter(ds_key == "am_0.05") |> pull(mdl_seq)
+mdl_iucn <- d_sp |> filter(ds_key == "rng_iucn") |> pull(mdl_seq)
+
+if (length(mdl_am) > 0 && length(mdl_iucn) > 0) {
+  r_am <- get_rast(mdl_am)
+  r_iucn <- get_rast(mdl_iucn)
+
+  m1 <- map_rast(r_am, glue("{sp_lbl} AquaMaps"))
+  m2 <- map_rast(r_iucn, glue("{sp_lbl} IUCN rasterized"))
+  mapgl::compare(m1, m2)
+} else {
+  message(glue("Missing am or rng_iucn for {sp_sci}"))
+}
+```
+
+### Merged Model
+
+```{r}
+#| label: olive_merged
+mdl_merge <- d_sp |> filter(ds_key == "ms_merge") |> pull(mdl_seq)
+
+if (length(mdl_merge) > 0) {
+  r_merge <- get_rast(mdl_merge)
+  map_rast(r_merge, glue("{sp_lbl} merged model"))
+} else {
+  message(glue("No ms_merge model for {sp_sci}"))
+}
+```
+
+### Bering Sea Cells
+
+```{r}
+#| label: olive_bering
+# identify cells north of ~52°N (Aleutian Islands)
+lat_threshold <- 52
+
+if (length(mdl_merge) > 0) {
+  sp_mdl_seqs <- d_sp$mdl_seq
+
+  d_all <- tbl(con_sdm, "model_cell") |>
+    filter(mdl_seq %in% !!sp_mdl_seqs) |>
+    select(mdl_seq, cell_id, value) |>
+    collect()
+
+  xy <- xyFromCell(r_cell, d_all$cell_id)
+  d_all$lat <- xy[, 2]
+
+  d_bering <- d_all |>
+    filter(lat > lat_threshold) |>
+    left_join(
+      d_sp |> select(mdl_seq, ds_key),
+      by = "mdl_seq"
+    ) |>
+    group_by(ds_key) |>
+    summarize(
+      n_cells = n_distinct(cell_id),
+      lat_min = min(lat),
+      lat_max = max(lat),
+      .groups = "drop"
+    ) |>
+    arrange(desc(n_cells))
+
+  datatable(
+    d_bering,
+    caption = glue("{sp_lbl}: dataset contributions north of {lat_threshold}°N")
+  )
+
+  # map cells north of threshold
+  d_north <- d_all |>
+    filter(lat > lat_threshold, mdl_seq == mdl_merge)
+  if (nrow(d_north) > 0) {
+    r_north <- init(r_cell[[1]], NA)
+    r_north[d_north$cell_id] <- d_north$value
+    r_north <- terra::trim(r_north)
+    map_rast(r_north, glue("{sp_lbl} > {lat_threshold}°N"))
+  }
+}
+```
+
+:::
+
+## All Turtles — North of Aleutians Check
+
+```{r}
+#| label: all_turtles_north
+lat_threshold <- 52
+
+# for each turtle species, count cells above threshold per dataset
+d_north_all <- map_dfr(d_turtles$taxon_id, \(tid) {
+  sp_name <- d_turtles |>
+    filter(taxon_id == tid) |>
+    pull(scientific_name)
+
+  sp_models <- d_models |>
+    filter(taxon_id == tid)
+
+  if (nrow(sp_models) == 0) {
+    return(tibble())
+  }
+
+  d_mc <- tbl(con_sdm, "model_cell") |>
+    filter(mdl_seq %in% !!sp_models$mdl_seq) |>
+    select(mdl_seq, cell_id, value) |>
+    collect()
+
+  if (nrow(d_mc) == 0) {
+    return(tibble())
+  }
+
+  xy <- xyFromCell(r_cell, d_mc$cell_id)
+  d_mc$lat <- xy[, 2]
+
+  d_mc |>
+    filter(lat > lat_threshold) |>
+    left_join(
+      sp_models |> select(mdl_seq, ds_key),
+      by = "mdl_seq"
+    ) |>
+    group_by(ds_key) |>
+    summarize(
+      n_cells = n_distinct(cell_id),
+      lat_max = max(lat),
+      .groups = "drop"
+    ) |>
+    mutate(scientific_name = sp_name)
+})
+
+if (nrow(d_north_all) > 0) {
+  d_north_summary <- d_north_all |>
+    select(scientific_name, ds_key, n_cells, lat_max) |>
+    arrange(scientific_name, desc(n_cells))
+
+  datatable(
+    d_north_summary,
+    caption = glue(
+      "Turtle cells north of {lat_threshold}°N by species and dataset"
+    )
+  )
+} else {
+  message(glue("No turtle cells found north of {lat_threshold}°N"))
+}
+```
+
+## Summary & Recommendations
+
+### Findings
+
+- **Leatherback**: Check whether the IUCN polygon crosses the antimeridian
+  and if the `rasterize() → rotate() → crop() → mask()` pipeline in
+  `merge_models_prep.qmd` (lines 2930-2942) drops cells at ±180° longitude.
+  The dateline analysis table above shows cell counts near the antimeridian.
+
+- **Hawksbill**: Compare the IUCN range extent in the Pacific vs FWS/NMFS
+  range. If IUCN extends significantly north of Southern California (~34°N)
+  in the Pacific while FWS does not, consider using FWS range as an
+  additional spatial constraint or manually clipping the IUCN range.
+
+- **Olive Ridley**: The Bering Sea cells table above shows which dataset(s)
+  contribute cells north of the Aleutian Islands (~52°N). If AquaMaps
+  extends beyond the IUCN mask, verify the mask is correctly applied in
+  `merge_models.qmd` (lines 275-324).
+
+### Proposed Solutions
+
+1. **Leatherback dateline fix**: If cells are missing near ±180°, the IUCN
+   polygon likely needs to be split at the antimeridian before rasterization
+   (use `sf::st_wrap_dateline()` before converting to `terra::vect()`).
+
+2. **Hawksbill range constraint**: Consider using the intersection of IUCN
+   and FWS ranges in the Pacific, or manually restrict the mask to reflect
+   the known US distribution (Southern California and south).
+
+3. **Olive Ridley Bering Sea**: If the merged model includes cells above
+   ~52°N, investigate which source dataset places them there. If AquaMaps
+   habitat suitability leaks through, the IUCN mask should exclude those
+   cells — verify masking logic is working correctly.
+
+4. **General turtle check**: The "All Turtles — North of Aleutians" table
+   above identifies all species and datasets with cells above 52°N. Any
+   species showing presence in the Bering Sea should be flagged for review.
+
+## Cleanup
+
+```{r}
+#| label: disconnect
+dbDisconnect(con_sdm, shutdown = TRUE)
+```
