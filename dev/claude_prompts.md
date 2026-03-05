@@ -39,6 +39,33 @@
 
 - Migrate to hexagons
 
+## 2026-03-04 find turtle range restrictions
+
+I've added a new section `## USGS Gap Analysis Project Species Range Maps CONUS\_2001` with links to range maps and the new data source. Show a map of all these species with shapefiles in @investigate_turtles_extra/ under subfolders like "rLOGTx_CONUS_Range_2001v1" where rLOGTx is the species code for Loggerhead Sea Turtle (_Caretta caretta_). The species codes can be found at @investigate_turtles_extra/ScienceBaseRangeMapCSV_20190408.csv. 
+
+⏺ Added the USGS GAP section with two tabs:
+
+  - All Species — a combined map with all 6 sea turtle species colored distinctly, with a legend and popups showing           
+  common/scientific names
+  - Per Species — individual maps for each of the 6 species (Green, Hawksbill, Kemp's Ridley, Leatherback, Loggerhead, Olive  
+  Ridley)                                                         
+
+  The code reads shapefiles from the investigate_turtles_extra/ subdirectories, dissolves polygons by species for cleaner
+  display, and renders them with maplibre() using add_fill_layer().
+
+There are too many maps in @investigate_turtles.qmd to render. I moved `@investigate_turtles_extra/`  to `@~/My Drive/projects/msens/data/raw/usgs.gov`. Move this section `## USGS Gap Analysis Project Species Range Maps CONUS\_2001` to a new standalone notebook `ingest_usgs-gap-turtles.qmd`. 
+
+Claude Cowork.
+
+In this Marine Sensitivity project, we are zeroing in on the 6 sea turtles showing up as present in the US EEZ and more specifically the BOEM Program Areas. The problem is that the AquaMaps (ds_key = "am_0.05") and IUCN RedList range maps (ds_key = "rng_iucn") can be too permissive spatially. For instance, the Hawksbill Turtle shows up globally in [_Eretmochelys imbricata_ (Hawksbill Turtle) | iucnredlist.org](https://www.iucnredlist.org/species/8005/12881238), including parts of the Pacific NW not thought to exist there, per - [Hawksbill Turtle | fisheries.noaa.gov](https://www.fisheries.noaa.gov/species/hawksbill-turtle#:~:text=of%20the%20species.-,World%20map,-providing%20approximate%20representation). We found 
+
+[Advanced Search Form - ScienceBase-Catalog](https://www.sciencebase.gov/catalog/items/queryForm?parentId=5951527de4b062508e3b1e79&&max=20)
+
+
+
+(see map of ) There is a notebook investigate_turtles.qmd and folder investigate_turtles_extra with the spatial download
+  scientific_name        common_name            <chr>                  <chr>                1 Caretta caretta        Loggerhead Turtle    2 Chelonia mydas         Green Turtle         3 Eretmochelys imbricata Hawksbill Turtle     4 Lepidochelys kempii    Kemp's Ridley Turtle 5 Dermochelys coriacea   Leatherback Turtle   6 Lepidochelys olivacea  Olive Ridley Turtle
+
 ## 2026-03-04 investigate turtles
 
 Fully digest the emails with screenshots and links in `@/Users/bbest/Desktop/msens/2026-03-04 turtle Qs email.pdf`. Create a new investigate_turtles.qmd to interrogate sources in the database and original IUCN range maps with visuals, ie maps, describing discrepancies and proposing solutions.

@@ -1,0 +1,277 @@
+---
+title: "USGS Gap Analysis Project Species Range Maps CONUS_2001"
+subtitle: "Ingest and map sea turtle range shapefiles from USGS GAP"
+format:
+  html:
+    code-fold: true
+    code-tools: true
+editor_options:
+  chunk_output_type: console
+---
+
+## Overview
+
+Dataset:
+
+- [U.S. Geological Survey - Gap Analysis Project Species Range Maps CONUS\_2001 | U.S. Geological Survey](https://www.usgs.gov/data/us-geological-survey-gap-analysis-project-species-range-maps-conus2001)
+- [U.S. Geological Survey - Gap Analysis Project Species Range Maps CONUS\_2001 - ScienceBase-Catalog](https://www.sciencebase.gov/catalog/item/5951527de4b062508e3b1e79)
+
+Species shapefiles:
+
+- [sea turtle - ScienceBase - ScienceBase-Catalog](https://www.sciencebase.gov/catalog/items/get?q=sea%20turtle&max=20&parentId=5951527de4b062508e3b1e79)
+- [Leatherback Sea Turtle (Dermochelys coriacea) rLEATx\_CONUS\_2001v1 Range Map - ScienceBase-Catalog](https://www.sciencebase.gov/catalog/item/59f5ec32e4b063d5d307e4f5)
+- [Loggerhead Sea Turtle (Caretta caretta) rLOGTx\_CONUS\_2001v1 Range Map - ScienceBase-Catalog](https://www.sciencebase.gov/catalog/item/59f5e200e4b063d5d307dc0b)
+- [Green Sea Turtle (Chelonia mydas) rGSTUx\_CONUS\_2001v1 Range Map - ScienceBase-Catalog](https://www.sciencebase.gov/catalog/item/59f5eba8e4b063d5d307e069)
+- [Olive Ridley Sea Turtle (Lepidochelys olivacea) rORSTx\_CONUS\_2001v1 Range Map - ScienceBase-Catalog](https://www.sciencebase.gov/catalog/item/59f5ebabe4b063d5d307e081)
+- [Kemp's Ridley Sea Turtle (Lepidochelys kempii) rKRSTx\_CONUS\_2001v1 Range Map - ScienceBase-Catalog](https://www.sciencebase.gov/catalog/item/59f5ec0fe4b063d5d307e3c1)
+- [Hawksbill Sea Turtle (Eretmochelys imbricata) rHSTUx\_CONUS\_2001v1 Range Map - ScienceBase-Catalog](https://www.sciencebase.gov/catalog/item/59f5ec2ae4b063d5d307e4bd)
+
+## Setup
+
+```{r}
+#| label: setup
+librarian::shelf(
+  dplyr,
+  glue,
+  here,
+  mapgl,
+  purrr,
+  sf,
+  tibble,
+  quiet = T
+)
+
+source(here("libs/paths.R"))
+```
+
+## Load Shapefiles
+
+```{r}
+#| label: load_shapefiles
+
+# sea turtle species codes and shapefile subdirectories
+gap_spp <- tribble(
+  ~code    , ~short_name     , ~common_name               , ~sci_name                ,
+  "rGSTUx" , "Green"         , "Green Sea Turtle"         , "Chelonia mydas"         ,
+  "rHSTUx" , "Hawksbill"     , "Hawksbill Sea Turtle"     , "Eretmochelys imbricata" ,
+  "rKRSTx" , "Kemp's Ridley" , "Kemp's Ridley Sea Turtle" , "Lepidochelys kempii"    ,
+  "rLEATx" , "Leatherback"   , "Leatherback Sea Turtle"   , "Dermochelys coriacea"   ,
+  "rLOGTx" , "Loggerhead"    , "Loggerhead Sea Turtle"    , "Caretta caretta"        ,
+  "rORSTx" , "Olive Ridley"  , "Olive Ridley Sea Turtle"  , "Lepidochelys olivacea"
+)
+
+dir_gap <- glue("{dir_raw}/usgs.gov")
+
+# read all shapefiles and bind into one sf object
+sf_gap <- gap_spp |>
+  purrr::pmap_dfr(\(code, common_name, sci_name, ...) {
+    shp_dir <- glue("{dir_gap}/{code}_CONUS_Range_2001v1")
+    shp_file <- glue("{shp_dir}/{code}_CONUS_Range_2001v1.shp")
+    st_read(shp_file, quiet = TRUE) |>
+      st_transform(4326) |>
+      mutate(
+        common_name = common_name,
+        sci_name = sci_name
+      )
+  })
+
+message(glue(
+  "Loaded {nrow(sf_gap)} features across ",
+  "{length(unique(sf_gap$sci_name))} species"
+))
+
+# dissolve by species for a cleaner overview map
+sf_gap_dissolved <- sf_gap |>
+  group_by(sci_name, common_name) |>
+  summarise(.groups = "drop")
+
+# assign a color per species
+gap_colors <- c(
+  "Chelonia mydas" = "#1b9e77",
+  "Eretmochelys imbricata" = "#d95f02",
+  "Lepidochelys kempii" = "#7570b3",
+  "Dermochelys coriacea" = "#e7298a",
+  "Caretta caretta" = "#66a61e",
+  "Lepidochelys olivacea" = "#e6ab02"
+)
+```
+
+## Maps
+
+::: {.panel-tabset}
+
+### All Species
+
+```{r}
+#| label: map_all
+
+# named colors keyed by common name for legend
+gap_colors_common <- setNames(
+  unname(gap_colors),
+  gap_spp$common_name[match(names(gap_colors), gap_spp$sci_name)]
+)
+
+bbox <- st_bbox(sf_gap_dissolved) |> as.numeric()
+
+# one layer per species with common name as layer id for toggle control
+m_gap <- maplibre(style = maptiler_style("bright", variant = "dark")) |>
+  fit_bounds(bbox, animate = FALSE)
+
+for (j in seq_len(nrow(gap_spp))) {
+  sp_j <- gap_spp$sci_name[j]
+  sp_lbl <- gap_spp$common_name[j]
+  sf_j <- sf_gap_dissolved |> filter(sci_name == sp_j)
+  m_gap <- m_gap |>
+    add_fill_layer(
+      id = sp_lbl,
+      source = sf_j,
+      fill_color = unname(gap_colors[sp_j]),
+      fill_opacity = 0.5,
+      popup = glue("<b>{sp_lbl}</b><br><i>{sp_j}</i>")
+    )
+}
+
+m_gap |>
+  add_layers_control(
+    position = "top-left",
+    collapsible = TRUE
+  ) |>
+  mapgl::add_legend(
+    legend_title = "USGS GAP Range",
+    values = names(gap_colors_common),
+    colors = unname(gap_colors_common),
+    type = "categorical",
+    position = "bottom-right"
+  ) |>
+  add_fullscreen_control() |>
+  add_navigation_control() |>
+  add_scale_control()
+```
+
+### Green
+
+```{r}
+#| label: map_green
+sf_sp <- sf_gap_dissolved |> filter(sci_name == "Chelonia mydas")
+bbox_sp <- st_bbox(sf_sp) |> as.numeric()
+
+maplibre(style = maptiler_style("bright", variant = "dark")) |>
+  fit_bounds(bbox_sp, animate = FALSE) |>
+  add_fill_layer(
+    id = "green",
+    source = sf_sp,
+    fill_color = unname(gap_colors["Chelonia mydas"]),
+    fill_opacity = 0.5,
+    popup = "<b>Green Sea Turtle</b><br><i>Chelonia mydas</i>"
+  ) |>
+  add_fullscreen_control() |>
+  add_navigation_control() |>
+  add_scale_control()
+```
+
+### Hawksbill
+
+```{r}
+#| label: map_hawksbill
+sf_sp <- sf_gap_dissolved |> filter(sci_name == "Eretmochelys imbricata")
+bbox_sp <- st_bbox(sf_sp) |> as.numeric()
+
+maplibre(style = maptiler_style("bright", variant = "dark")) |>
+  fit_bounds(bbox_sp, animate = FALSE) |>
+  add_fill_layer(
+    id = "hawksbill",
+    source = sf_sp,
+    fill_color = unname(gap_colors["Eretmochelys imbricata"]),
+    fill_opacity = 0.5,
+    popup = "<b>Hawksbill Sea Turtle</b><br><i>Eretmochelys imbricata</i>"
+  ) |>
+  add_fullscreen_control() |>
+  add_navigation_control() |>
+  add_scale_control()
+```
+
+### Kemp's Ridley
+
+```{r}
+#| label: map_kemps
+sf_sp <- sf_gap_dissolved |> filter(sci_name == "Lepidochelys kempii")
+bbox_sp <- st_bbox(sf_sp) |> as.numeric()
+
+maplibre(style = maptiler_style("bright", variant = "dark")) |>
+  fit_bounds(bbox_sp, animate = FALSE) |>
+  add_fill_layer(
+    id = "kemps",
+    source = sf_sp,
+    fill_color = unname(gap_colors["Lepidochelys kempii"]),
+    fill_opacity = 0.5,
+    popup = "<b>Kemp's Ridley Sea Turtle</b><br><i>Lepidochelys kempii</i>"
+  ) |>
+  add_fullscreen_control() |>
+  add_navigation_control() |>
+  add_scale_control()
+```
+
+### Leatherback
+
+```{r}
+#| label: map_leatherback
+sf_sp <- sf_gap_dissolved |> filter(sci_name == "Dermochelys coriacea")
+bbox_sp <- st_bbox(sf_sp) |> as.numeric()
+
+maplibre(style = maptiler_style("bright", variant = "dark")) |>
+  fit_bounds(bbox_sp, animate = FALSE) |>
+  add_fill_layer(
+    id = "leatherback",
+    source = sf_sp,
+    fill_color = unname(gap_colors["Dermochelys coriacea"]),
+    fill_opacity = 0.5,
+    popup = "<b>Leatherback Sea Turtle</b><br><i>Dermochelys coriacea</i>"
+  ) |>
+  add_fullscreen_control() |>
+  add_navigation_control() |>
+  add_scale_control()
+```
+
+### Loggerhead
+
+```{r}
+#| label: map_loggerhead
+sf_sp <- sf_gap_dissolved |> filter(sci_name == "Caretta caretta")
+bbox_sp <- st_bbox(sf_sp) |> as.numeric()
+
+maplibre(style = maptiler_style("bright", variant = "dark")) |>
+  fit_bounds(bbox_sp, animate = FALSE) |>
+  add_fill_layer(
+    id = "loggerhead",
+    source = sf_sp,
+    fill_color = unname(gap_colors["Caretta caretta"]),
+    fill_opacity = 0.5,
+    popup = "<b>Loggerhead Sea Turtle</b><br><i>Caretta caretta</i>"
+  ) |>
+  add_fullscreen_control() |>
+  add_navigation_control() |>
+  add_scale_control()
+```
+
+### Olive Ridley
+
+```{r}
+#| label: map_olive
+sf_sp <- sf_gap_dissolved |> filter(sci_name == "Lepidochelys olivacea")
+bbox_sp <- st_bbox(sf_sp) |> as.numeric()
+
+maplibre(style = maptiler_style("bright", variant = "dark")) |>
+  fit_bounds(bbox_sp, animate = FALSE) |>
+  add_fill_layer(
+    id = "olive_ridley",
+    source = sf_sp,
+    fill_color = unname(gap_colors["Lepidochelys olivacea"]),
+    fill_opacity = 0.5,
+    popup = "<b>Olive Ridley Sea Turtle</b><br><i>Lepidochelys olivacea</i>"
+  ) |>
+  add_fullscreen_control() |>
+  add_navigation_control() |>
+  add_scale_control()
+```
+
+:::
