@@ -109,8 +109,9 @@ REMOTE
     APPS_V3="/share/github/MarineSensitivity/apps_v3"
     APPS="/share/github/MarineSensitivity/apps"
 
-    # clone v3 branch if not present
+    # clone v3 branch if not present (remove stale non-git dir if needed)
     if [ ! -d "$APPS_V3/.git" ]; then
+      rm -rf "$APPS_V3"
       git clone --branch v3 --single-branch \
         https://github.com/MarineSensitivity/apps.git "$APPS_V3"
       echo "--- cloned apps v3 branch ---"
