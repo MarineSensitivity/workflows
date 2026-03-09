@@ -2,9 +2,9 @@
 # deploy_to_server.sh — sync versioned derived data + app code to msens server
 #
 # usage:
-#   ./libs/deploy_to_server.sh v3            # sync data + pull apps
-#   ./libs/deploy_to_server.sh v3 data       # sync data only
-#   ./libs/deploy_to_server.sh v3 apps       # pull apps only
+#   ./libs/deploy_to_server.sh v4            # sync data + pull apps
+#   ./libs/deploy_to_server.sh v4 data       # sync data only
+#   ./libs/deploy_to_server.sh v4 apps       # pull apps only
 set -euo pipefail
 
 VER="${1:?usage: deploy_to_server.sh <version> [data|apps|all]}"
@@ -35,6 +35,9 @@ if [[ "$MODE" == "all" || "$MODE" == "data" ]]; then
     --exclude='*.aux.xml' \
     "$DIR_V" \
     "$SSH_HOST:$REMOTE_DERIVED/${VER}/"
+
+  echo "=== ensuring remote dir ${REMOTE_BIG}/${VER} exists ==="
+  ssh -i "$SSH_KEY" "$SSH_HOST" "sudo mkdir -p ${REMOTE_BIG}/${VER} && sudo chown ubuntu:staff ${REMOTE_BIG}/${VER} && sudo chmod g+s ${REMOTE_BIG}/${VER}"
 
   echo "=== syncing sdm.duckdb to staging file ==="
   rsync -avz --progress \
@@ -97,5 +100,34 @@ if [[ "$MODE" == "all" || "$MODE" == "apps" ]]; then
     git checkout main
     git pull origin main
     echo "=== done ==="
+REMOTE
+
+  echo "=== setting up v3 legacy apps ==="
+  ssh -i "$SSH_KEY" "$SSH_HOST" bash -s <<'VERSIONING'
+    set -euo pipefail
+
+    APPS_V3="/share/github/MarineSensitivity/apps_v3"
+    APPS="/share/github/MarineSensitivity/apps"
+
+    # clone v3 branch if not present
+    if [ ! -d "$APPS_V3/.git" ]; then
+      git clone --branch v3 --single-branch \
+        https://github.com/MarineSensitivity/apps.git "$APPS_V3"
+      echo "--- cloned apps v3 branch ---"
+    fi
+
+    # symlinks into shiny-server root (idempotent)
+    ln -sfn "$APPS_V3/mapgl" "$APPS/mapgl_v3"
+    ln -sfn "$APPS_V3/mapsp" "$APPS/mapsp_v3"
+    echo "--- v3 symlinks ready ---"
+VERSIONING
+
+  echo "=== pulling server config + reloading caddy ==="
+  ssh -i "$SSH_KEY" "$SSH_HOST" bash -s <<'REMOTE'
+    cd /share/github/MarineSensitivity/server
+    git fetch origin
+    git pull origin main
+    docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile
+    echo "--- caddy reloaded ---"
 REMOTE
 fi
