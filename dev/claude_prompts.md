@@ -1,4 +1,4 @@
-## 2026-02-? TODO:
+## 2026-03-? TODO:
 
 - [ ] pretty flower plots (email)
 
@@ -38,6 +38,362 @@
     - Big files (): too big for Google Drive, internally used
 
 - Migrate to hexagons
+
+## 2026-03-09 turtles: SWOT Global + NMFS DPS Endangered
+
+Expand upon the `@ingest_turtles-swot-dps.qmd` by reading in the SWOT global distributions of sea turtles at `@~/My Drive/projects/msens/data/raw/swot_seamap.env.duke.edu/swot_distribution`. Note the filenaming of two-letter acronyms, eg `CC` for _Caretta caretta_ in `Global_Distribution_CC.shp`. Use these as a mask to the endangered DPS segments and code the rest of the global distribution as Threatened (after erasing the endangered DPS and combining the two non-overlapping sets of polygons). Convert these into a raster per species and provide idempotent injection into the database of this as a new dataset `rng_turtle_swot_dps` following dataset injection techniques from other recent notebooks. Save the vector as a geopackage with rows unique by species and `esa_code`. Save the vector gpkg and tif rasters in `@~/My Drive/projects/msens/data/derived/turtle_swot_dps`.
+
+⏺ Good. So:                                          
+  - CC (loggerhead): EN + TN DPS → has ArcGIS service       
+  - CM (green): EN + TN DPS → has ArcGIS service            
+  - LO (olive ridley): EN + TN DPS → has ArcGIS service
+  - DC (leatherback): EN only → entire SWOT = EN       
+  - EI (hawksbill): EN only → entire SWOT = EN
+  - LK (Kemp's ridley): EN only → entire SWOT = EN
+  - ND (flatback): Not NMFS-listed (Australian)
+
+Planning:
+──────────────────────────────────────────────────────────────
+←  ☐ ND status  ☐ Value scale  ✔ Submit  →
+
+Natator depressus (Flatback) is Australian and not US
+ESA-listed. How should it be handled?
+
+❯ 1. Skip ND entirely
+     Don't include Flatback in the dataset since it has no US
+     ESA listing
+  2. Include as TN
+     Include with esa_code='TN' and value=70 as a default
+  3. Include as LC
+     Include with esa_code='LC' and value=50 since it's not
+     listed
+←  ☒ ND status  ☐ Value scale  ✔ Submit  →
+
+What value scale should EN and TN polygons use in the raster?
+                                     
+  1. FWS pattern: EN=90, TN=70
+     Matches ingest_fws.gov_range-maps.qmd where EN=90 and 
+     TN=70 represent presence probability                     
+  2. IUCN pattern: EN=25, TN=2
+     Matches rng_iucn scale (CR:50, EN:25, VU:5, NT:2, LC:1, 
+     DD:1) used in the original plan                     
+❯ 3. Simple: EN=100, TN=50
+     Binary high/low weighting for endangered vs threatened 
+  4. Use [`msens::compute_er_score()`](https://marinesensitivity.org/msens/reference/compute_er_score.html) from "NMFS:EN"(100), "NMFS:TN"(50), so if scoring schema changes again in future, will update automatically when re-ingested.
+
+At the end add a comparison of the IUCN range in the database with the new SWOT + DPS for the species using tabsets to quickly visualize and compare. See `@investigate_turtles.qmd` and `ingest_usgs-gap-turtles.qmd` for techniques using `mapgl::compare()`.
+
+
+⏺ Updated plan                                          
+  ⎿  /plan to preview                                                                                                                                             
+                                                                                                                                                                  
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Ready to code?                                                                                                                                                   
+                                                                                                                                                                  
+ Here is Claude's plan:
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Plan: Expand ingest_turtles-swot-dps.qmd with SWOT Global Distributions + DPS Overlay
+
+ Context
+
+ The existing ingest_turtles-swot-dps.qmd fetches NMFS Endangered DPS polygons for 3 turtle species (CC, CM, LO). We need to expand it to combine SWOT global
+ distributions with EN DPS boundaries: EN DPS areas stay EN, the remainder of the SWOT range (after erasing EN DPS) becomes TN. This creates a spatially-explicit
+  EN/TN range per species, rasterized and injected into sdm.duckdb as dataset rng_turtle_swot_dps.
+
+ Data Sources
+
+ SWOT: ~/My Drive/projects/msens/data/raw/swot_seamap.env.duke.edu/swot_distribution/
+ - 6 species (skip ND): Global_Distribution_{CC,CM,DC,EI,LK,LO}.shp
+ - Each has 1 MULTIPOLYGON, WGS-84, minimal attrs (Id, Shape_Leng, Shape_Area)
+
+ DPS (EN): Fetched from ArcGIS FeatureServices (existing notebook fetches these):
+ - CC: SeaTurtleLoggerhead_AllDPS_20250609/FeatureServer → cc_endangered.gpkg
+ - CM: SeaTurtleGreen_AllDPS_20250609/FeatureServer → cm_endangered.gpkg
+ - LO: SeaTurtleOliveRidley_PacificMexicoPopulation/FeatureServer → lo_endangered.gpkg
+
+ Species ESA Status:
+ - CC, CM, LO: mixed EN + TN DPS → spatial overlay needed
+ - DC, EI, LK: EN only → entire SWOT range = EN
+ - ND: skip (Australian, not US ESA-listed)
+
+ Values: Use msens::compute_er_score(): "NMFS:EN" → 100, "NMFS:TN" → 50
+
+ Output
+
+ - Dir: ~/My Drive/projects/msens/data/derived/turtle_swot_dps/
+ - Geopackage: turtle_swot_dps.gpkg — rows unique by sci_name × esa_code
+ - Rasters: {Genus_species}.tif per species (max of EN=100, TN=50)
+ - Database: sdm.duckdb dataset key rng_turtle_swot_dps
+
+ Implementation — Expand ingest_turtles-swot-dps.qmd
+
+ 1. Setup (expand existing setup chunk)
+
+ Add to librarian::shelf(): DBI, duckdb, here, mapgl, msens, terra
+
+ Add after existing setup code:
+
+ ```r
+ source(here("libs/paths.R"))
+ ds_key   <- "rng_turtle_swot_dps"
+ dir_swot <- glue("{dir_raw}/swot_seamap.env.duke.edu/swot_distribution")
+ dir_out  <- glue("{dir_derived}/turtle_swot_dps")
+ dir.create(dir_out, showWarnings = F, recursive = T)
+ cell_tif <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
+
+ swot_spp <- tribble(
+   ~code , ~sci_name                  , ~common_name    , ~shp_name                , ~has_dps , ~esa_pure ,
+   "CC"  , "Caretta caretta"          , "Loggerhead"    , "Global_Distribution_CC"  , TRUE     , NA        ,
+   "CM"  , "Chelonia mydas"           , "Green"         , "Global_Distribution_CM"  , TRUE     , NA        ,
+   "DC"  , "Dermochelys coriacea"     , "Leatherback"   , "Global_Distribution_DC"  , FALSE    , "EN"      ,
+   "EI"  , "Eretmochelys imbricata"   , "Hawksbill"     , "Global_Distribution_EI"  , FALSE    , "EN"      ,
+   "LK"  , "Lepidochelys kempii"      , "Kemp's Ridley" , "Global_Distribution_LK"  , FALSE    , "EN"      ,
+   "LO"  , "Lepidochelys olivacea"    , "Olive Ridley"  , "Global_Distribution_LO"  , TRUE     , NA        )
+ ```
+
+ 2. Load SWOT Global Distributions (new section after DPS fetch)
+
+ ```r
+ sf_swot <- swot_spp |>
+   pmap_dfr(\(code, sci_name, common_name, shp_name, ...) {
+     st_read(glue("{dir_swot}/{shp_name}.shp"), quiet = T) |>
+       st_make_valid() |>
+       mutate(
+         code        = code,
+         sci_name    = sci_name,
+         common_name = common_name) |>
+       select(code, sci_name, common_name, geometry)
+   })
+ ```
+
+ 3. Combine SWOT + DPS (new section)
+
+ For each species, create polygons with esa_code and value columns:
+
+ ```r
+ sf_combined <- pmap_dfr(swot_spp, \(code, sci_name, common_name, shp_name, has_dps, esa_pure) {
+   swot_geom <- sf_swot |> filter(code == !!code)
+
+   if (has_dps) {
+     # read EN DPS, union into single geometry
+     gpkg_en <- glue("{dir_dps}/{tolower(code)}_endangered.gpkg")
+     sf_en   <- read_sf(gpkg_en) |> st_make_valid()
+     en_union <- st_union(sf_en) |> st_make_valid()
+
+     # erase EN areas from SWOT global → TN remainder
+     tn_geom <- st_difference(swot_geom, en_union) |> st_make_valid()
+
+     bind_rows(
+       tn_geom |> mutate(esa_code = "TN", value = msens::compute_er_score("NMFS:TN")),
+       swot_geom |>
+         st_intersection(en_union) |>
+         st_make_valid() |>
+         mutate(esa_code = "EN", value = msens::compute_er_score("NMFS:EN")) |>
+         select(code, sci_name, common_name, esa_code, value, geometry)
+     )
+   } else {
+     # purely EN species — entire SWOT range
+     swot_geom |>
+       mutate(
+         esa_code = esa_pure,
+         value    = msens::compute_er_score(glue("NMFS:{esa_pure}")))
+   }
+ }) |>
+   select(code, sci_name, common_name, esa_code, value, geometry)
+ ```
+
+ 4. Save Geopackage (new section)
+
+ gpkg_out <- glue("{dir_out}/turtle_swot_dps.gpkg")
+ write_sf(sf_combined, gpkg_out, delete_dsn = TRUE)
+
+ 5. Maps (new section)
+
+ Tabset panel with per-species mapgl maps showing EN (red) and TN (orange/yellow) polygons. Follow ingest_usgs-gap-turtles.qmd pattern with add_fill_layer().
+
+ 6. Rasterize (new section)
+
+ ```r
+ r_cell   <- rast(cell_tif, lyrs = "cell_id")
+ r_cell_r <- rotate(r_cell)
+ ext(r_cell_r) <- round(ext(r_cell_r), 3)
+
+ for (i in 1:nrow(swot_spp)) {
+   sp       <- swot_spp[i, ]
+   p_sp     <- sf_combined |> filter(code == sp$code) |> vect()
+   r_tif    <- glue("{dir_out}/{str_replace_all(sp$sci_name, ' ', '_')}.tif")
+
+   r_sp <- rasterize(p_sp, r_cell_r, field = "value", fun = "max", touches = T) |>
+     rotate() |> crop(r_cell) |> mask(r_cell)
+   names(r_sp) <- sp$sci_name
+   writeRaster(r_sp, r_tif, overwrite = T)
+ }
+ ```
+
+ 7. Insert Dataset Row (new section)
+
+ Idempotent delete + insert following ingest_fws.gov_range-maps.qmd lines 224-263:
+
+ ```r
+ con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F))
+
+ row_dataset <- tibble(
+   ds_key          = ds_key,
+   name_short      = "SWOT + NMFS DPS Sea Turtle Distributions",
+   name_original   = "SWOT Global Distributions with NMFS DPS ESA overlay",
+   description     = "SWOT sea turtle global distributions overlaid with NMFS Endangered DPS boundaries. EN DPS areas coded as Endangered (value=100), remainder
+ as Threatened (value=50).",
+   citation        = "Wallace BP et al. (2023) Marine turtle regional management units 2.0. Endangered Species Research 52:209-223. DOI:10.3354/esr01243",
+   source_broad    = "SWOT/NMFS",
+   source_detail   = "seamap.env.duke.edu + fisheries.noaa.gov",
+   regions         = "Global",
+   response_type   = "binary",
+   taxa_groups     = "turtles",
+   year_pub        = 2023,
+   ...NA fields...,
+   spatial_res_deg = 0.05,
+   temporal_res    = "static")
+
+ if (dbExistsTable(con_sdm, "dataset"))
+   dbExecute(con_sdm, glue("DELETE FROM dataset WHERE ds_key = '{ds_key}'"))
+ dbWriteTable(con_sdm, "dataset", row_dataset, append = TRUE)
+ ```
+
+ 8. Insert Species/Model/Model_Cell (new section)
+
+ Following ingest_fws.gov_range-maps.qmd lines 567-686 pattern:
+
+ ```r
+ # attach spp.duckdb for WoRMS lookups
+ dbExecute(con_sdm, glue("ATTACH OR REPLACE DATABASE '{spp_db}' AS spp (READ_ONLY);"))
+
+ for (i in 1:nrow(swot_spp)) {
+   sp      <- swot_spp[i, ]
+   sp_key  <- glue("{ds_key}:{sp$code}")
+   r_sp    <- rast(glue("{dir_out}/{str_replace_all(sp$sci_name, ' ', '_')}.tif"))
+   ext(r_sp) <- round(ext(r_sp), 3)
+
+   # idempotent delete
+   mdl_seqs <- tbl(con_sdm, "model") |>
+     filter(ds_key == !!ds_key, taxa == !!sp_key) |> pull(mdl_seq)
+   if (length(mdl_seqs) > 0) {
+     dbExecute(con_sdm, glue("DELETE FROM model WHERE ds_key = '{ds_key}' AND taxa = '{sp_key}'"))
+     dbExecute(con_sdm, glue("DELETE FROM species WHERE ds_key = '{ds_key}' AND taxa = '{sp_key}'"))
+     dbExecute(con_sdm, glue("DELETE FROM model_cell WHERE mdl_seq IN ({paste(mdl_seqs, collapse=',')})"))
+   }
+
+   # insert model
+   dbWriteTable(con_sdm, "model", tibble(
+     ds_key = ds_key, taxa = sp_key, time_period = "2025",
+     region = "Global", mdl_type = "binary",
+     description = glue("SWOT+DPS range for {sp$sci_name}")), append = T)
+
+   mdl_seq <- dbGetQuery(con_sdm, glue(
+     "SELECT mdl_seq FROM model WHERE ds_key='{ds_key}' AND taxa='{sp_key}'
+      ORDER BY mdl_seq DESC LIMIT 1"))$mdl_seq
+
+   # WoRMS lookup
+   worms_id <- tbl(con_sdm, "spp.worms") |>
+     filter(scientificName == !!sp$sci_name, taxonomicStatus == "accepted") |>
+     pull(acceptedNameUsageID) |> first()
+
+   # insert species
+   dbWriteTable(con_sdm, "species", tibble(
+     ds_key = ds_key, taxa = sp_key, sp_key = sp_key,
+     worms_id = worms_id, gbif_id = NA_integer_, itis_id = NA_integer_, iucn_id = NA_integer_,
+     scientific_name_dataset = sp$sci_name, common_name_dataset = sp$common_name,
+     scientific_name_accepted = sp$sci_name, common_name_accepted = sp$common_name,
+     redlist_code = NA_character_, redlist_year = NA_integer_, sp_cat = "turtle"), append = T)
+
+   # insert model_cell
+   d_mdl_cell <- as.data.frame(r_sp, cells = T, na.rm = T) |> tibble() |>
+     select(cell_id = cell, value = 2) |> mutate(mdl_seq = mdl_seq) |> arrange(cell_id)
+   dbWriteTable(con_sdm, "model_cell", d_mdl_cell, append = T)
+ }
+
+ dbDisconnect(con_sdm, shutdown = TRUE)
+ ```
+ 
+ 9. Compare IUCN vs SWOT+DPS (new section at end)
+
+ Add a comparison section using mapgl::compare() (pattern from investigate_turtles.qmd). Needs helper functions get_rast(), map_rast(), add_fixed_range_raster(),
+  bbox_0360_to_180() from that notebook.
+
+ For each of the 6 species, create a tabset panel with mapgl::compare(m_iucn, m_swot_dps) showing the rasterized IUCN range (left) vs the new SWOT+DPS raster
+ (right). This allows quick visual comparison of how much tighter the SWOT+DPS ranges are.
+
+ ```r
+ # helper functions (copy from investigate_turtles.qmd lines 83-163)
+ get_rast <- function(mdl_seq) { ... }
+ add_fixed_range_raster <- function(map, data, id, ...) { ... }
+ bbox_0360_to_180 <- function(r) { ... }
+ map_rast <- function(r, title = "value") { ... }
+
+ # get IUCN model sequences for turtles
+ d_iucn_mdls <- tbl(con_sdm, "species") |>
+   filter(ds_key == "rng_iucn", sp_cat == "turtle") |>
+   select(scientific_name_accepted, sp_key) |>
+   left_join(tbl(con_sdm, "model") |> select(taxa, mdl_seq), by = c("sp_key" = "taxa")) |>
+   collect()
+ ```
+
+ Then for each species in a tabset:
+
+ ```r
+ # SWOT+DPS raster (just created)
+ r_swot <- rast(glue("{dir_out}/{str_replace_all(sp$sci_name, ' ', '_')}.tif"))
+ ext(r_swot) <- round(ext(r_swot), 3)
+ # already in 0-360 coords from rasterize pipeline
+
+ # IUCN raster (from database)
+ mdl_iucn <- d_iucn_mdls |> filter(scientific_name_accepted == sp$sci_name) |> pull(mdl_seq)
+ r_iucn <- get_rast(mdl_iucn)
+
+ m1 <- map_rast(r_iucn, glue("{sp$common_name} IUCN"))
+ m2 <- map_rast(r_swot, glue("{sp$common_name} SWOT+DPS"))
+ mapgl::compare(m1, m2)
+ ```
+
+ Key Files
+
+ ┌───────────┬───────────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │  Action   │                                                 File                                                  │
+ ├───────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ Edit      │ ingest_turtles-swot-dps.qmd — add sections 1-8 above                                                  │
+ ├───────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ Reference │ libs/paths.R — dir_data, dir_derived, dir_raw, sdm_db, spp_db                                         │
+ ├───────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ Reference │ ingest_fws.gov_range-maps.qmd — rasterize (188-198), dataset (224-263), spp/model/cell loop (567-686) │
+ ├───────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ Reference │ ingest_usgs-gap-turtles.qmd — mapgl maps (100-149)                                                    │
+ ├───────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ Reference │ investigate_turtles.qmd — get_rast(), map_rast(), mapgl::compare() helpers (83-163)                   │
+ └───────────┴───────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+ Verification
+
+ 1. Check gpkg: read_sf(glue("{dir_out}/turtle_swot_dps.gpkg")) — 9 rows (3 species × 2 esa_codes + 3 pure EN species)
+ 2. Check tifs: 6 .tif files in dir_out, each with values in {50, 100}
+ 3. Check dataset: tbl(con_sdm, "dataset") |> filter(ds_key == "rng_turtle_swot_dps") — 1 row
+ 4. Check species: tbl(con_sdm, "species") |> filter(ds_key == "rng_turtle_swot_dps") — 6 rows
+ 5. Check cells: tbl(con_sdm, "model") |> filter(ds_key == "rng_turtle_swot_dps") |> left_join(tbl(con_sdm, "model_cell"), by = "mdl_seq") |> count(taxa) — 6
+ species with cell counts
+ 6. Maps show EN (red) and TN (orange) for CC/CM/LO; solid EN for DC/EI/LK
+ 7. Compare section: mapgl::compare() slider shows IUCN (left) vs SWOT+DPS (right) for each species — SWOT+DPS should be tighter/more constrained
+
+⏺ The notebook has been expanded with all 9 sections from the plan:
+
+  1. Setup — expanded librarian::shelf() with DBI, duckdb, mapgl, msens, RColorBrewer, terra; added ds_key, dir_swot, dir_out, cell_tif, and swot_spp tribble (6  
+  species, skip ND)
+  2. Load SWOT — reads all 6 .shp files into sf_swot                                                                                                              
+  3. Combine SWOT + DPS — spatial overlay: EN DPS clipped from SWOT range (EN=100 via compute_er_score), remainder=TN (50) for CC/CM/LO; pure EN for DC/EI/LK
+  4. Save Geopackage — writes turtle_swot_dps.gpkg
+  5. Maps — tabset with All Species + 6 per-species tabs showing EN (red) and TN (orange) polygons using mapgl::add_fill_layer()
+  6. Rasterize — uses r_cell template, rasterize(field="value", fun="max", touches=T), rotate/crop/mask pipeline, writes .tif per species
+  7. Insert dataset — idempotent delete+insert into sdm.duckdb dataset table
+  8. Insert species/model/model_cell — loop over 6 species with WoRMS lookup, idempotent delete, append to model, species, model_cell
+  9. Compare IUCN vs SWOT+DPS — helper functions (get_rast, add_fixed_range_raster, bbox_0360_to_180, map_rast) copied from investigate_turtles.qmd; tabset with
+  mapgl::compare() slider for each species
 
 ## 2026-03-05 ingest swot turtle global distributions
 
@@ -111,15 +467,6 @@ sp_cat            1    2    5   10   20   25   50  100
   turtle          0    0    0    0    0    0    0    6
 ```
 
-
-https://services2.arcgis.com/C8EMgrsFcRFL6LrL/arcgis/rest/services/SeaTurtleGreen_AllDPS_20250609/FeatureServer
-
-## 2026-03-09 turtles: NMFS DPS Endangered, rest from SWOT Global Distributions
-
-Expand upon the `@ingest_turtles-swot-dps.qmd`
-
-
-`@~/My Drive/projects/msens/data/raw/swot_seamap.env.duke.edu/swot_distribution`
 
 ## 2026-03-04 find turtle range restrictions
 
