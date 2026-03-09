@@ -39,6 +39,289 @@
 
 - Migrate to hexagons
 
+## 2026-03-09.b fix taxon.extrisk_code for turtles and allow global_mask_priority to override rng_iucn
+
+Come up with priority method allowing it to override `rng_iucn` as the mask, since these are more realistically constrained for sea turtle species (vs IUCN applying range to areas too broadly). Investigate best logic in database and in notebooks `@merge_model.qmd`, `@calc_scores.qmd`.
+
+Let's add `dataset.global_mask_priority` (decimal) with the following:
+
+```r
+tribble(
+  ~ds_key              , ~global_mask_priority,
+  "rng_iucn"           , 2.0,
+  "bl"                 , 2.0,
+  "rng_turtle_swot_dps", 1.0)
+```
+
+This way we can coalesce on the highest priority global mask (not just IUCN; including as we move to masking bird SDM models with the "bl" dataset).
+
+Only limit the range of the merged model if another dataset model for the species besides the one with highest global_mask_priority exists. For instance most birds only have a BirdLife (ds_key = "bl") model, so shouldn't be intersected with itself.
+
+Also for the `dataset.value_info`, this should be reflective of the extinction risk code from the taxon table, which should pull from esa_code or redlist_code (when esa_code unavailable) but I am actually confused how all the turtles got an extrisk_code of "NMFS:EN " (with associated score of 100, an inflation of reality for those not actually EN listed by NMFS):
+```r
+tbl(con_sdm, "taxon") |>
+  filter(sp_cat == "turtle") |>
+  select(scientific_name, common_name, esa_code, esa_source, redlist_code, extrisk_code, er_score) |>
+  collect()
+```
+```
+  scientific_name        common_name          esa_code esa_source redlist_code extrisk_code er_score
+  <chr>                  <chr>                <chr>    <chr>      <chr>        <chr>           <int>
+1 Caretta caretta        Loggerhead Turtle    TN       ch_nmfs    VU           NMFS:EN           100
+2 Chelonia mydas         Green Turtle         EN       ch_nmfs    EN           NMFS:EN           100
+3 Eretmochelys imbricata Hawksbill Turtle     EN       ch_nmfs    CR           NMFS:EN           100
+4 Lepidochelys kempii    Kemp's Ridley Turtle NA       NA         CR           NMFS:EN           100
+5 Dermochelys coriacea   Leatherback Turtle   EN       ch_nmfs    EN           NMFS:EN           100
+6 Lepidochelys olivacea  Olive Ridley Turtle  NA       NA         VU           NMFS:EN           100
+```
+
+Thankfully, this looks like a problem only for turtles:
+```r
+tbl(con_sdm, "taxon") |>
+  filter(is_ok) |>
+  select(sp_cat, er_score) |>
+  collect() |>
+  table()
+```
+```
+              er_score
+sp_cat            1    2    5   10   20   25   50  100
+  bird           86   11    7   81    0    8    4    6
+  coral         294   13    3    0    0    6   15    2
+  fish         2940   34   46    0    0   17   16   12
+  invertebrate 5175   14    8    0    0    6    4    1
+  mammal          7    1    0    0   41    0    7   14
+  other         910    0    0    0    0    0    0    0
+  turtle          0    0    0    0    0    0    0    6
+```
+
+● For mixed-DPS turtles (CC, CM, LO), the listing currently takes max(EN,TN)=EN giving er_score=100 for all turtles. Since rng_turtle_swot_dps already encodes
+ spatial EN/TN as cell values (100/50), how should we fix the taxon-level er_score?  
+   → Leave er_score, fix later                                                                   
+ ● For the global_mask_priority, should lower number = higher priority (like you specified: swot_dps=1.0, iucn/bl=2.0), or higher number = higher priority?
+   → Lower = higher priority   
+
+
+I'm not understanding the need for "4. Add rng_turtle_swot_dps to taxon_model" in the merge_models_prep.qmd, which I am unclear about needing for future runs. Could this task be included in @ingest_turtles-swot-dps.qmd instead?
+ 
+⏺ ingest_nmfs_core-areas.qmd adds taxon_model entries during ingest. The rng_iucn section in merge_models_prep.qmd was for a bulk add because IUCN was ingested   
+  before the taxon_model pattern existed. Since ingest_turtles-swot-dps.qmd is a new ingest, it makes sense to add taxon_model entries there.                   
+
+⏺ Updated plan                                                                                                                                                    
+  ⎿  /plan to preview
+                                                                                                                                                                  
+ Ready to code?                                                                                                                                                   
+                                                                                                                                                                  
+ Here is Claude's plan:
+
+ Plan: Global Mask Priority for Merging Models          
+
+ Context
+
+ The merge in merge_models.qmd currently hardcodes rng_iucn as the masking trigger (line 276: has_iucn <- "rng_iucn" %in% d_sp_l$ds_key). For turtles,
+ rng_turtle_swot_dps should override rng_iucn as the global mask because it's more spatially constrained. Similarly, bl (BirdLife) should be usable as a global
+ mask for birds. We need a dataset.global_mask_priority column (lower = higher priority) so the merge picks the best mask per species, and only applies masking
+ when the species has at least one other dataset besides the mask.
+
+ Key Files
+
+ ┌─────────────────────────────────────────┬────────┬───────────────────────────────────────────────────────────────┐
+ │                  File                   │ Action │                            Purpose                            │
+ ├─────────────────────────────────────────┼────────┼───────────────────────────────────────────────────────────────┤
+ │ merge_models.qmd (lines 94-143)         │ Edit   │ Add global_mask_priority column + metadata                    │
+ ├─────────────────────────────────────────┼────────┼───────────────────────────────────────────────────────────────┤
+ │ merge_models.qmd (lines 184-324)        │ Edit   │ Replace has_iucn with priority-based mask selection           │
+ ├─────────────────────────────────────────┼────────┼───────────────────────────────────────────────────────────────┤
+ │ ingest_turtles-swot-dps.qmd (line ~545) │ Edit   │ Add global_mask_priority to dataset row + taxon_model entries │
+ └─────────────────────────────────────────┴────────┴───────────────────────────────────────────────────────────────┘
+
+ Implementation
+
+ 1. Add global_mask_priority column to dataset table
+
+ File: merge_models.qmd — column addition section (around line 94-99)
+
+ Add to the list of new columns:
+ c("global_mask_priority", "DECIMAL")
+
+ 2. Update metadata tribble + UPDATE loop
+
+ File: merge_models.qmd (lines 117-143)
+
+ Add global_mask_priority column to the tribble and rng_turtle_swot_dps row:
+
+ ```r
+ metadata <- tribble(
+   ~ds_key                , ~name_display           , ~value_info                            , ~is_mask , ~sort_order , ~global_mask_priority ,
+   "am_0.05"              , "AquaMaps SDM"          , NA                                     , FALSE    , 1L          , NA                    ,
+   "ca_nmfs"              , "NMFS Core Area"        , "Core: 100"                            , TRUE     , 2L          , NA                    ,
+   "ch_nmfs"              , "NMFS Critical Habitat" , "EN:100, TN:50"                        , TRUE     , 3L          , NA                    ,
+   "ch_fws"               , "FWS Critical Habitat"  , "EN:100, TN:50"                        , TRUE     , 4L          , NA                    ,
+   "rng_fws"              , "FWS Range"             , "EN:100, TN:50, LC:1"                  , TRUE     , 5L          , NA                    ,
+   "bl"                   , "BirdLife Range"        , "CR:50, EN:25, VU:5, NT:2, LC:1, DD:1" , TRUE     , 6L          , 2.0                   ,
+   "rng_iucn"             , "IUCN Range"            , "CR:50, EN:25, VU:5, NT:2, LC:1, DD:1" , TRUE     , 7L          , 2.0                   ,
+   "rng_turtle_swot_dps"  , "SWOT+DPS Turtle Range" , "EN:100, TN:50"                        , TRUE     , 8L          , 1.0                   ,
+   "ms_merge"             , "Merged Model"          , NA                                     , FALSE    , 0L          , NA                    )
+ ```
+
+ Update the UPDATE loop (line 129-143) to also set global_mask_priority:
+ ```r 
+ for (i in 1:nrow(metadata)) {
+   m <- metadata[i, ]
+   vi  <- ifelse(is.na(m$value_info), "NULL", glue("'{m$value_info}'"))
+   gmp <- ifelse(is.na(m$global_mask_priority), "NULL", m$global_mask_priority)
+   dbExecute(
+     con_sdm,
+     glue(
+       "UPDATE dataset
+        SET name_display         = '{m$name_display}',
+            value_info           = {vi},
+            is_mask              = {tolower(m$is_mask)},
+            sort_order           = {m$sort_order},
+            global_mask_priority = {gmp}
+        WHERE ds_key = '{m$ds_key}'"
+     )
+   )
+ }
+ ```
+
+ 3. Replace hardcoded has_iucn with priority-based mask selection
+
+ File: merge_models.qmd (lines 184-324)
+
+ Before the loop (after line 187, alongside ds_keys_mask), hoist the global mask lookup:
+
+ ```r
+ # datasets with global_mask_priority (lower = higher priority)
+ ds_global_masks <- tbl(con_sdm, "dataset") |>
+   filter(!is.na(global_mask_priority)) |>
+   select(ds_key, global_mask_priority) |>
+   collect() |>
+   arrange(global_mask_priority)
+ ```
+
+ Inside the loop (replace lines 275-324), replace:
+ ```r
+ has_iucn <- "rng_iucn" %in% d_sp_l$ds_key
+ if (has_iucn) {
+ ```
+
+ With:
+ ```r
+ # find highest-priority global mask this species has
+ sp_global_masks <- d_sp_l |>
+   inner_join(ds_global_masks, by = "ds_key") |>
+   arrange(global_mask_priority)
+
+ has_global_mask <- nrow(sp_global_masks) > 0
+
+ # only mask if species has at least one SDM dataset besides the global mask
+ # (avoid self-intersection, e.g. birds with only BirdLife)
+ has_other_sdm <- FALSE
+ if (has_global_mask) {
+   best_mask_ds <- sp_global_masks$ds_key[1]
+   other_sdm_ds <- setdiff(ds_sdm_sp, best_mask_ds)
+   has_other_sdm <- length(other_sdm_ds) > 0
+ }
+ 
+ if (has_global_mask && has_other_sdm) {
+ ```
+
+ The rest of the masking logic (lines 278-297: get ds_mask_sp, build q_mask, semi_join) stays the same — it already unions all mask datasets for the species, not
+  just IUCN.
+
+ The else branch (line 321-324) also stays the same.
+
+ 4. Add global_mask_priority + taxon_model entries in ingest_turtles-swot-dps.qmd
+
+ File: ingest_turtles-swot-dps.qmd
+
+ 4a. In the row_dataset tibble (~line 545), add after sort_order = 8L:
+ ```r
+ global_mask_priority = 1.0
+ ```
+
+ 4b. New section "Add taxon_model entries" after the species/model/model_cell insert loop (after dbDisconnect), following the ingest_nmfs_core-areas.qmd pattern
+ (lines 156-173):
+
+ '### Add `taxon_model` entries
+
+ ```r
+ # reconnect (or keep connection open from prior section)
+ con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F))
+
+ # idempotent delete
+ dbExecute(con_sdm, glue(
+   "DELETE FROM taxon_model WHERE ds_key = '{ds_key}'"))
+
+ for (i in 1:nrow(swot_spp)) {
+   sp     <- swot_spp[i, ]
+   sp_key <- glue("{ds_key}:{sp$code}")
+
+   # look up taxon_id by scientific_name
+   tid <- tbl(con_sdm, "taxon") |>
+     filter(scientific_name == !!sp$sci_name) |>
+     pull(taxon_id)
+   if (length(tid) == 0) {
+     message(glue("SKIP {sp$sci_name}: not found in taxon table"))
+     next
+   }
+
+   # look up mdl_seq
+   mdl_seq <- dbGetQuery(con_sdm, glue(
+     "SELECT mdl_seq FROM model
+      WHERE ds_key = '{ds_key}' AND taxa = '{sp_key}'
+      ORDER BY mdl_seq DESC LIMIT 1"))$mdl_seq
+
+   d_tm <- tibble(taxon_id = tid, ds_key = ds_key, mdl_seq = mdl_seq)
+   dbWriteTable(con_sdm, "taxon_model", d_tm, append = TRUE)
+   message(glue("Added taxon_model: {sp$sci_name} taxon_id={tid}, mdl_seq={mdl_seq}"))
+ }
+
+ # update n_ds count
+ dbExecute(con_sdm,
+   "UPDATE taxon
+    SET n_ds = tm.n_ds
+    FROM (
+      SELECT taxon_id, COUNT(*) AS n_ds
+      FROM taxon_model
+      GROUP BY taxon_id
+    ) tm
+    WHERE taxon.taxon_id = tm.taxon_id")
+
+ dbDisconnect(con_sdm, shutdown = TRUE)
+ ```
+
+ Verification
+
+ 1. Schema: `r dbListFields(con_sdm, "dataset")` includes global_mask_priority
+ 2. Dataset values: `r tbl(con_sdm, "dataset") |> select(ds_key, global_mask_priority) |> collect()` shows rng_turtle_swot_dps = 1.0, rng_iucn = 2.0, bl = 2.0,
+ others = NA
+ 3. taxon_model: `r tbl(con_sdm, "taxon_model") |> filter(ds_key == "rng_turtle_swot_dps") |> count()` = 6 rows
+ 4. Turtle merge: Turtles with rng_turtle_swot_dps (priority 1.0) + am_0.05 → masking applied using SWOT+DPS as the primary global mask
+ 5. Bird merge (only BirdLife): Birds with only bl → has_other_sdm = FALSE → no self-masking
+ 6. Bird merge (BirdLife + AquaMaps): Birds with bl + am_0.05 → has_other_sdm = TRUE → BirdLife mask applied to AquaMaps SDM
+ 7. Other species unchanged: Fish/mammals with rng_iucn + am_0.05 → same behavior as before (IUCN mask applied)
+ 8. Render sequence: ingest_turtles-swot-dps.qmd → merge_models.qmd
+
+⏺ All changes look correct. Here's a summary of what was implemented:                                                                                             
+                                                                    
+  merge_models.qmd:                                                                                                                                               
+  1. Line 100 — Added global_mask_priority DECIMAL column to the ALTER TABLE loop                                                                                 
+  2. Lines 118-128 — Updated metadata tribble with global_mask_priority column: rng_turtle_swot_dps = 1.0, bl = 2.0, rng_iucn = 2.0, others = NA                  
+  3. Lines 130-146 — UPDATE loop now also sets global_mask_priority                                                                                               
+  4. Lines 192-197 — Added ds_global_masks lookup before the merge loop
+  5. Lines 285-301 — Replaced hardcoded has_iucn with priority-based mask selection that:
+    - Finds the highest-priority global mask the species has
+    - Only applies masking when the species has at least one other SDM dataset (prevents self-masking)
+  6. Lines 397-405 — Updated model description string from has_iucn_str to has_mask_str
+
+  ingest_turtles-swot-dps.qmd:
+  1. Line 345 — Added global_mask_priority = 1.0 to the dataset row
+  2. New section after line 472 — Added taxon_model entries chunk that registers each turtle species in taxon_model and updates n_ds counts
+
+
+
 ## 2026-03-09 turtles: SWOT Global + NMFS DPS Endangered
 
 Expand upon the `@ingest_turtles-swot-dps.qmd` by reading in the SWOT global distributions of sea turtles at `@~/My Drive/projects/msens/data/raw/swot_seamap.env.duke.edu/swot_distribution`. Note the filenaming of two-letter acronyms, eg `CC` for _Caretta caretta_ in `Global_Distribution_CC.shp`. Use these as a mask to the endangered DPS segments and code the rest of the global distribution as Threatened (after erasing the endangered DPS and combining the two non-overlapping sets of polygons). Convert these into a raster per species and provide idempotent injection into the database of this as a new dataset `rng_turtle_swot_dps` following dataset injection techniques from other recent notebooks. Save the vector as a geopackage with rows unique by species and `esa_code`. Save the vector gpkg and tif rasters in `@~/My Drive/projects/msens/data/derived/turtle_swot_dps`.
@@ -395,78 +678,46 @@ At the end add a comparison of the IUCN range in the database with the new SWOT 
   9. Compare IUCN vs SWOT+DPS — helper functions (get_rast, add_fixed_range_raster, bbox_0360_to_180, map_rast) copied from investigate_turtles.qmd; tabset with
   mapgl::compare() slider for each species
 
-## 2026-03-05 ingest swot turtle global distributions
+⏺ Done. Two changes:            
 
-Ingest the following dataset in a new notebook `ingest_swot-sea-turtle-global-distributions.qmd`:
-
-`@~/My Drive/projects/msens/data/raw/swot_seamap.env.duke.edu/swot_distribution/`
-
-Extract the metadata and citation (see MRU20 ESR 2023.pdf, SWOT_SEAMAP_RMU_DataUseAgreement_Nov2023.docx in the folder) for pushing into the `sdm.duckdb` similar to other recent ingest notebooks.
-
-Define ds_key <- "rng_swot".
-Set is_mask to TRUE and come up with priority method allowing it to override rng_iucn as the mask, since these are more realistically constrained for sea turtle species (vs IUCN applying range to areas too broadly). Investigate best logic in database and in notebooks `@merge_model.qmd`, `@calc_scores.qmd`.
-
-Instead of adding a `mask_replaces` field to the `dataset` table, let's add `global_mask_priority` (decimal) with the following:
-```r
-tribble(
-  ~ds_key,    ~global_mask_priority,
-  "rng_iucn", 1,
-  "bl"      , 1,
-  "rng_swot", 2)
+  1. Removed the entire "Maps — SWOT + DPS Ranges" section (7 tabs × 1 WebGL context each) to avoid the "Too many active WebGL contexts" error.                   
+  2. Fixed bbox in map_rast() to c(-180, 10, -50, 72) (N America: Alaska + CONUS) instead of deriving from each raster's extent. All compare maps now center on N
+  America.
+  
+Whoops, got error rendering:
 ```
-This way we can coalesce on the highest priority global mask (not just IUCN; including as we move to masking bird SDM models with the "bl" dataset).
-
-The most common, intuitive, and widely accepted practice is that a priority numeric field should use ascending order (lower numbers = higher priority), such as 1 for critical, 2 for high, and 3 for low. This convention matches the concept of a "number one" priority (the top item), so let's use this instead:
-```r
-tribble(
-  ~ds_key,    ~global_mask_priority,
-  "rng_iucn", 2.0,
-  "bl"      , 2.0,
-  "rng_swot", 1.0)
+34/35 
+[cleanup]                                                                                                                                     
+  35/35                                                                                                                                                       
+  output file: ingest_turtles-swot-dps.knit.md                                                                                                                    
+                                                                                                                                                              
+  Error in FUN(X[[i]], ...) :                                                                                                                                     
+    Dependency maptiler-geocoding-control 2.1.7 is not disk-based                                                                                             
+  Calls: .main ... dependencies_from_render -> html_dependencies_as_string -> lapply -> FUN                                                                       
+  Execution halted                                                                                                                                                
+  WARN: Error encountered when rendering files                                           
 ```
 
-In the 1c. Maps per species, compare with the "rng_iucn" distributions in bottom layer, which these are improving upon. Show both with some transparency.
+⏺ Update(/Library/Frameworks/R.framework/Versions/4.5-arm64/Resources/library/mapgl/htmlwidgets/maplibregl_compare.yaml)                                          
+  ⎿  Added 1 line, removed 2 lines                                
+      59        - "h3j_h3t.js"                                                                                                                                    
+      60    - name: maptiler-geocoding-control
+      61      version: 2.1.7                                                                                                                                      
+      62 -    src:                                                                                                                                         
+      63 -      href: "https://cdn.maptiler.com/maptiler-geocoding-control/v2.1.7/"
+      62 +    src: "htmlwidgets/lib/maptiler-geocoding-control"
+      63      script:
+      64        - "maplibregl.umd.js"
+      65      stylesheet:
 
-Only limit the range of the merged model if another dataset model for the species besides the one with highest global_mask_priority exists. For instance most birds only have a BirdLife (ds_key = "bl") model, so shouldn't be intersected with itself.
+⏺ Fixed. The bug was in mapgl's maplibregl_compare.yaml — the maptiler-geocoding-control dependency was declared as CDN-based (src: href: 
+  "https://cdn.maptiler.com/...") while the main maplibregl.yaml correctly uses the local disk path (src: "htmlwidgets/lib/maptiler-geocoding-control"). Quarto's
+  dependencies_from_render rejects non-disk-based dependencies.                                                                                                   
+  
+  Patched the compare yaml at /Library/Frameworks/R.framework/Versions/4.5-arm64/Resources/library/mapgl/htmlwidgets/maplibregl_compare.yaml to use the local     
+  path. Note this fix will be lost if you reinstall/update mapgl — worth filing upstream.
 
-Also for the value_info, this should be reflective of the extinction risk code from the taxon table, which should pull from esa_code or redlist_code (when esa_code unavailable) but I am actually confused how all the turtles got an extrisk_code of "NMFS:EN " (with associated score of 100, an inflation of reality for those not actually EN listed by NMFS):
-```r
-tbl(con_sdm, "taxon") |>
-  filter(sp_cat == "turtle") |>
-  select(scientific_name, common_name, esa_code, esa_source, redlist_code, extrisk_code, er_score) |>
-  collect()
-```
-```
-  scientific_name        common_name          esa_code esa_source redlist_code extrisk_code er_score
-  <chr>                  <chr>                <chr>    <chr>      <chr>        <chr>           <int>
-1 Caretta caretta        Loggerhead Turtle    TN       ch_nmfs    VU           NMFS:EN           100
-2 Chelonia mydas         Green Turtle         EN       ch_nmfs    EN           NMFS:EN           100
-3 Eretmochelys imbricata Hawksbill Turtle     EN       ch_nmfs    CR           NMFS:EN           100
-4 Lepidochelys kempii    Kemp's Ridley Turtle NA       NA         CR           NMFS:EN           100
-5 Dermochelys coriacea   Leatherback Turtle   EN       ch_nmfs    EN           NMFS:EN           100
-6 Lepidochelys olivacea  Olive Ridley Turtle  NA       NA         VU           NMFS:EN           100
-```
-
-Thankfully, this looks like a problem only for turtles:
-```r
-tbl(con_sdm, "taxon") |>
-  filter(is_ok) |>
-  select(sp_cat, er_score) |>
-  collect() |>
-  table()
-```
-```
-              er_score
-sp_cat            1    2    5   10   20   25   50  100
-  bird           86   11    7   81    0    8    4    6
-  coral         294   13    3    0    0    6   15    2
-  fish         2940   34   46    0    0   17   16   12
-  invertebrate 5175   14    8    0    0    6    4    1
-  mammal          7    1    0    0   41    0    7   14
-  other         910    0    0    0    0    0    0    0
-  turtle          0    0    0    0    0    0    0    6
-```
-
+  Try re-rendering now.
 
 ## 2026-03-04 find turtle range restrictions
 
