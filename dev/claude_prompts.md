@@ -39,6 +39,88 @@
 
 - Migrate to hexagons
 
+## 2026-03-05 ingest swot turtle global distributions
+
+Ingest the following dataset in a new notebook `ingest_swot-sea-turtle-global-distributions.qmd`:
+
+`@~/My Drive/projects/msens/data/raw/swot_seamap.env.duke.edu/swot_distribution/`
+
+Extract the metadata and citation (see MRU20 ESR 2023.pdf, SWOT_SEAMAP_RMU_DataUseAgreement_Nov2023.docx in the folder) for pushing into the `sdm.duckdb` similar to other recent ingest notebooks.
+
+Define ds_key <- "rng_swot".
+Set is_mask to TRUE and come up with priority method allowing it to override rng_iucn as the mask, since these are more realistically constrained for sea turtle species (vs IUCN applying range to areas too broadly). Investigate best logic in database and in notebooks `@merge_model.qmd`, `@calc_scores.qmd`.
+
+Instead of adding a `mask_replaces` field to the `dataset` table, let's add `global_mask_priority` (decimal) with the following:
+```r
+tribble(
+  ~ds_key,    ~global_mask_priority,
+  "rng_iucn", 1,
+  "bl"      , 1,
+  "rng_swot", 2)
+```
+This way we can coalesce on the highest priority global mask (not just IUCN; including as we move to masking bird SDM models with the "bl" dataset).
+
+The most common, intuitive, and widely accepted practice is that a priority numeric field should use ascending order (lower numbers = higher priority), such as 1 for critical, 2 for high, and 3 for low. This convention matches the concept of a "number one" priority (the top item), so let's use this instead:
+```r
+tribble(
+  ~ds_key,    ~global_mask_priority,
+  "rng_iucn", 2.0,
+  "bl"      , 2.0,
+  "rng_swot", 1.0)
+```
+
+In the 1c. Maps per species, compare with the "rng_iucn" distributions in bottom layer, which these are improving upon. Show both with some transparency.
+
+Only limit the range of the merged model if another dataset model for the species besides the one with highest global_mask_priority exists. For instance most birds only have a BirdLife (ds_key = "bl") model, so shouldn't be intersected with itself.
+
+Also for the value_info, this should be reflective of the extinction risk code from the taxon table, which should pull from esa_code or redlist_code (when esa_code unavailable) but I am actually confused how all the turtles got an extrisk_code of "NMFS:EN " (with associated score of 100, an inflation of reality for those not actually EN listed by NMFS):
+```r
+tbl(con_sdm, "taxon") |>
+  filter(sp_cat == "turtle") |>
+  select(scientific_name, common_name, esa_code, esa_source, redlist_code, extrisk_code, er_score) |>
+  collect()
+```
+```
+  scientific_name        common_name          esa_code esa_source redlist_code extrisk_code er_score
+  <chr>                  <chr>                <chr>    <chr>      <chr>        <chr>           <int>
+1 Caretta caretta        Loggerhead Turtle    TN       ch_nmfs    VU           NMFS:EN           100
+2 Chelonia mydas         Green Turtle         EN       ch_nmfs    EN           NMFS:EN           100
+3 Eretmochelys imbricata Hawksbill Turtle     EN       ch_nmfs    CR           NMFS:EN           100
+4 Lepidochelys kempii    Kemp's Ridley Turtle NA       NA         CR           NMFS:EN           100
+5 Dermochelys coriacea   Leatherback Turtle   EN       ch_nmfs    EN           NMFS:EN           100
+6 Lepidochelys olivacea  Olive Ridley Turtle  NA       NA         VU           NMFS:EN           100
+```
+
+Thankfully, this looks like a problem only for turtles:
+```r
+tbl(con_sdm, "taxon") |>
+  filter(is_ok) |>
+  select(sp_cat, er_score) |>
+  collect() |>
+  table()
+```
+```
+              er_score
+sp_cat            1    2    5   10   20   25   50  100
+  bird           86   11    7   81    0    8    4    6
+  coral         294   13    3    0    0    6   15    2
+  fish         2940   34   46    0    0   17   16   12
+  invertebrate 5175   14    8    0    0    6    4    1
+  mammal          7    1    0    0   41    0    7   14
+  other         910    0    0    0    0    0    0    0
+  turtle          0    0    0    0    0    0    0    6
+```
+
+
+https://services2.arcgis.com/C8EMgrsFcRFL6LrL/arcgis/rest/services/SeaTurtleGreen_AllDPS_20250609/FeatureServer
+
+## 2026-03-09 turtles: NMFS DPS Endangered, rest from SWOT Global Distributions
+
+Expand upon the `@ingest_turtles-swot-dps.qmd`
+
+
+`@~/My Drive/projects/msens/data/raw/swot_seamap.env.duke.edu/swot_distribution`
+
 ## 2026-03-04 find turtle range restrictions
 
 I've added a new section `## USGS Gap Analysis Project Species Range Maps CONUS\_2001` with links to range maps and the new data source. Show a map of all these species with shapefiles in @investigate_turtles_extra/ under subfolders like "rLOGTx_CONUS_Range_2001v1" where rLOGTx is the species code for Loggerhead Sea Turtle (_Caretta caretta_). The species codes can be found at @investigate_turtles_extra/ScienceBaseRangeMapCSV_20190408.csv. 
@@ -64,7 +146,14 @@ In this Marine Sensitivity project, we are zeroing in on the 6 sea turtles showi
 
 
 (see map of ) There is a notebook investigate_turtles.qmd and folder investigate_turtles_extra with the spatial download
-  scientific_name        common_name            <chr>                  <chr>                1 Caretta caretta        Loggerhead Turtle    2 Chelonia mydas         Green Turtle         3 Eretmochelys imbricata Hawksbill Turtle     4 Lepidochelys kempii    Kemp's Ridley Turtle 5 Dermochelys coriacea   Leatherback Turtle   6 Lepidochelys olivacea  Olive Ridley Turtle
+  scientific_name        common_name            
+  <chr>                  <chr>                
+1 Caretta caretta        Loggerhead Turtle    
+2 Chelonia mydas         Green Turtle         
+3 Eretmochelys imbricata Hawksbill Turtle     
+4 Lepidochelys kempii    Kemp's Ridley Turtle 
+5 Dermochelys coriacea   Leatherback Turtle   
+6 Lepidochelys olivacea  Olive Ridley Turtle
 
 ## 2026-03-04 investigate turtles
 
