@@ -39,12 +39,26 @@ if [[ "$MODE" == "all" || "$MODE" == "data" ]]; then
   echo "=== ensuring remote dir ${REMOTE_BIG}/${VER} exists ==="
   ssh -i "$SSH_KEY" "$SSH_HOST" "sudo mkdir -p ${REMOTE_BIG}/${VER} && sudo chown ubuntu:staff ${REMOTE_BIG}/${VER} && sudo chmod g+s ${REMOTE_BIG}/${VER}"
 
-  echo "=== syncing sdm.duckdb to staging file ==="
-  rsync -avz --progress \
+  # dry-run to check if duckdb actually changed
+  echo "=== checking if sdm.duckdb needs syncing ==="
+  DB_CHANGED=$(rsync -avz --dry-run --itemize-changes \
     -e "ssh -i \"$SSH_KEY\"" \
     --exclude='*.wal' \
     "$DB_BIG" \
-    "$SSH_HOST:${REMOTE_DB_NEW}"
+    "$SSH_HOST:${REMOTE_DB}" | grep -c '^>f' || true)
+
+  if [[ "$DB_CHANGED" -gt 0 ]]; then
+    echo "=== syncing sdm.duckdb to staging file ==="
+    rsync -avz --progress \
+      -e "ssh -i \"$SSH_KEY\"" \
+      --exclude='*.wal' \
+      "$DB_BIG" \
+      "$SSH_HOST:${REMOTE_DB_NEW}"
+    DB_NEEDS_SWAP=1
+  else
+    echo "--- sdm.duckdb unchanged, skipping transfer ---"
+    DB_NEEDS_SWAP=0
+  fi
 
   echo "=== syncing shared input raster ==="
   rsync -avz --progress \
@@ -58,10 +72,8 @@ if [[ "$MODE" == "all" || "$MODE" == "data" ]]; then
     "$HOME/_big/msens/derived/${VER}/pmtiles/" \
     "$SSH_HOST:$REMOTE_DERIVED/${VER}/pmtiles/"
 
-  # 2. fix permissions + swap duckdb + restart rstudio ----
-  # shiny needs staff group to read data; setgid ensures new files inherit staff;
-  # rstudio restart picks up new group membership and clean duckdb
-  echo "=== fixing permissions, swapping duckdb, restarting rstudio ==="
+  # 2. fix permissions ----
+  echo "=== fixing permissions ==="
   ssh -i "$SSH_KEY" "$SSH_HOST" bash -s <<DEPLOY
     set -euo pipefail
 
@@ -75,19 +87,29 @@ if [[ "$MODE" == "all" || "$MODE" == "data" ]]; then
     # setgid on directories so new files inherit staff group
     sudo find ${REMOTE_DERIVED} -type d -exec chmod g+s {} +
     sudo find ${REMOTE_BIG}     -type d -exec chmod g+s {} +
-
-    # fix staged duckdb permissions before swap
-    sudo chgrp staff ${REMOTE_DB_NEW}
-    sudo chmod g+r   ${REMOTE_DB_NEW}
-
-    # stop rstudio, swap duckdb, delete stale WAL, restart
-    cd /share/github/MarineSensitivity/server
-    docker compose stop rstudio
-    rm -f ${REMOTE_DB}.wal
-    mv ${REMOTE_DB_NEW} ${REMOTE_DB}
-    docker compose start rstudio
-    echo "--- rstudio restarted with fixed permissions ---"
 DEPLOY
+
+  # 3. swap duckdb + restart rstudio (only if changed) ----
+  if [[ "$DB_NEEDS_SWAP" -eq 1 ]]; then
+    echo "=== swapping duckdb + restarting rstudio ==="
+    ssh -i "$SSH_KEY" "$SSH_HOST" bash -s <<DEPLOY
+      set -euo pipefail
+
+      # fix staged duckdb permissions before swap
+      sudo chgrp staff ${REMOTE_DB_NEW}
+      sudo chmod g+r   ${REMOTE_DB_NEW}
+
+      # stop rstudio, swap duckdb, delete stale WAL, restart
+      cd /share/github/MarineSensitivity/server
+      docker compose stop rstudio
+      rm -f ${REMOTE_DB}.wal
+      mv ${REMOTE_DB_NEW} ${REMOTE_DB}
+      docker compose start rstudio
+      echo "--- rstudio restarted with new duckdb ---"
+DEPLOY
+  else
+    echo "--- skipping duckdb swap + rstudio restart (unchanged) ---"
+  fi
 fi
 
 # pull app code ----

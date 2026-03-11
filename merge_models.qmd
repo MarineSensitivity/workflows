@@ -41,7 +41,7 @@ source(here("libs/paths.R"))
 con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F))
 
 # section eval flags (set to TRUE to re-run) ----
-do_merge <- T # create ms_merge merged models
+do_merge <- T # multiple R chunks to insert new merged dataset; iterate_merge_ds_mdl takes >1 hr
 do_is_ok <- T # flag valid taxa
 ```
 
@@ -164,6 +164,7 @@ ds_key <- "ms_merge"
 
 d_x <- tbl(con_sdm, "taxon") |>
   filter(is_ok) |>
+  # filter(sp_cat == "turtle") |> # DEBUG
   arrange(desc(n_ds), taxon_id) |>
   collect()
 
@@ -197,6 +198,7 @@ ds_global_masks <- tbl(con_sdm, "dataset") |>
   collect() |>
   arrange(global_mask_priority)
 
+t_0 <- Sys.time()
 for (i in 1:nrow(d_x)) {
   # i = 1  # which(str_detect(d_x$scientific_name, ".*ricei")) # i = 1512
 
@@ -301,7 +303,14 @@ for (i in 1:nrow(d_x)) {
 
   if (has_global_mask && has_other_sdm) {
     # get datasets used for mask
-    ds_mask_sp <- intersect(d_sp_l$ds_key, ds_keys_mask)
+    # exclude lower-priority global masks from the mask union
+    lower_global_masks <- sp_global_masks |>
+      filter(ds_key != best_mask_ds) |>
+      pull(ds_key)
+    ds_mask_sp <- setdiff(
+      intersect(d_sp_l$ds_key, ds_keys_mask),
+      lower_global_masks
+    )
 
     # get mdl_seqs for masking datasets
     mask_mdl_seqs <- d_sp_l |>
@@ -362,9 +371,15 @@ for (i in 1:nrow(d_x)) {
   sp_cmn <- d_sp$common_name
   sp_cat <- d_sp$sp_cat
   sp_key <- glue("{ds_key}:{d_sp$taxon_id}")
-  message(glue(
-    "Processing {i}/{nrow(d_x)} [{sp_key}] ({sp_cat}): {sp_cmn} (_{sp_sci}_)"
-  ))
+
+  # show message every 50 iterations or for the first 5 iterations
+  if (i <= 5 || i %% 50 == 0) {
+    eta <- Sys.time() + round((Sys.time() - t_0) / i * (nrow(d_x) - i))
+    message(glue(
+      "Processing {i}/{nrow(d_x)} [{sp_key}] ({sp_cat}): {sp_cmn} (_{sp_sci}_) ~ ETA: {eta}"
+    ))
+    # started ~15:00
+  }
 
   n_cells <- nrow(d_r_sp)
   if (n_cells == 0) {

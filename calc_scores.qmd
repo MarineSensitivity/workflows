@@ -107,42 +107,51 @@ source(here("libs/paths.R"))
 dir_create(dir_v)
 dir_create(dir_big_v)
 
+# copy sdm.duckdb from prior version if missing
+sdm_db_prev <- glue("{dir_big}/{ver_prev}/sdm.duckdb")
+if (!file_exists(sdm_db) && file_exists(sdm_db_prev)) {
+  message(glue("Copying sdm.duckdb from {ver_prev} to {ver}..."))
+  file_copy(sdm_db_prev, sdm_db)
+  message(glue("Copied sdm.duckdb ({file_size(sdm_db)})"))
+}
+
 # inputs (shared, unversioned)
 pra_raw_gpkg <- glue("{dir_raw}/boem.gov/boem_program_areas_2025-11.gpkg")
 cell_tif <- glue("{dir_derived}/r_bio-oracle_planarea.tif")
-er_raw_gpkg <- glue("{dir_v}/../v2/ply_ecoregions_2025.gpkg")
-stopifnot(all(file_exists(c(cell_tif, pra_raw_gpkg, er_raw_gpkg))))
+stopifnot(all(file_exists(c(cell_tif, pra_raw_gpkg))))
 
-# input polygon (from prior step)
-pa_gpkg <- glue("{dir_v}/ply_planareas_2025{v_sfx}.gpkg")
+# version-independent input polygons (find from prior versions)
+# note: search stable prior versions first; current dir_v files on Google Drive
+#   can be evicted during long renders
+find_input <- function(fname, search_dirs) {
+  for (d in search_dirs) {
+    f <- glue("{d}/{fname}")
+    if (file_exists(f)) return(f)
+  }
+  stop(glue(
+    "Input not found: {fname} (searched {paste(search_dirs, collapse=', ')})"
+  ))
+}
+prev_dirs <- glue("{dir_derived}/{c(ver_prev, 'v2', 'v1')}")
+er_raw_gpkg <- find_input("ply_ecoregions_2025.gpkg", prev_dirs)
+pa_gpkg <- find_input("ply_planareas_2025.gpkg", prev_dirs)
 
 # flags, typical
-# do_zones <- F # no, except if new spatial
-# do_metrics <- T # YES
-# do_zone_taxon <- T # slow in past
-# do_postgis <- T # YES
-# do_downloads <- T # YES
-# do_summary_data <- T # ecoregion x PRA intersections, label points, score tables
-# do_summary_figs <- T # maps, flower plots, primprod charts, Word/Excel tables
-# do_readme <- T # programmatic README.md + README.html
-# do_map <- F # no, but useful for visual checks during development
-# do_parquet <- F # no, but produces smaller faster duckdb
-# do_deploy <- T # sync derived data + app code to server
+do_zones <- T # no, except if new spatial or change versions
+do_metrics <- T # YES
+do_zone_taxon <- T # slow in past
+do_postgis <- F # NO, since migrated to pmtiles
+do_downloads <- T # YES
+do_summary_data <- T # ecoregion x PRA intersections, label points, score tables
+do_summary_figs <- T # maps, flower plots, primprod charts, Word/Excel tables
+do_readme <- T # programmatic README.md + README.html
+do_map <- F # no, but useful for visual checks during development
+do_parquet <- T # no, but produces smaller faster duckdb
+do_pmtiles <- F # generate PMTiles archives for mapgl/mapsp apps
+do_pra_primprod <- T # NO, unless zones or primary prod ∆; zonal primary productivity for program areas
+do_deploy <- T # sync derived data + app code to server
 
-# flags, fix: show all species categories in score tables + add metric labels
-do_zones <- F # no change
-do_metrics <- F # metrics already calculated correctly in DuckDB
-do_zone_taxon <- F # not affected
-do_postgis <- F # PostGIS tables already have v3 columns
-do_downloads <- F # pra_gpkg already has correct columns
-do_summary_data <- T # YES — score tables need regeneration
-do_summary_figs <- T # YES — DOCX/XLSX/flower plots need regeneration
-do_readme <- F # not affected
-do_map <- F # not affected
-do_parquet <- F # not affected
-do_deploy <- F # can deploy separately
-do_pra_primprod <- T # YES — zonal primary productivity for program areas
-do_pmtiles <- T # generate PMTiles archives for mapgl/mapsp apps
+stopifnot(!do_pmtiles && do_downloads) # pmtiles should be generated from downloads
 
 # spatial outputs (year reflects input data vintage, version suffix model version of derived metric columns)
 pra_gpkg <- glue("{dir_v}/ply_programareas_2026_{ver}.gpkg")
@@ -309,8 +318,52 @@ if (do_summary_figs) {
 
 con_sdm <- dbConnect(duckdb(), dbdir = sdm_db, read_only = F)
 # dbDisconnect(con_sdm, shutdown = T); duckdb_shutdown(duckdb()); rm(con_sdm)
-source(here("libs/db.R")) # generates Postgres database connection `con`; fails if ssh-msens not connected
-# dbListTables(con_sdm) # dbListTables(con)
+if (do_postgis) {
+  source(here("libs/db.R"))
+} # generates Postgres `con`; fails if ssh-msens not connected
+
+# clean up prior version zone references in DuckDB ----
+zone_tbls_db <- tbl(con_sdm, "zone") |> distinct(tbl) |> pull(tbl)
+
+# rename version-independent zones (ecoregions, planning areas) to remove old suffix
+for (tbl_base in c("ply_ecoregions_2025", "ply_planareas_2025")) {
+  old_tbl <- glue("{tbl_base}_{ver_prev}")
+  if (old_tbl %in% zone_tbls_db) {
+    dbExecute(
+      con_sdm,
+      glue("UPDATE zone SET tbl = '{tbl_base}' WHERE tbl = '{old_tbl}'")
+    )
+    message(glue("Renamed zone tbl: {old_tbl} -> {tbl_base}"))
+  }
+}
+
+# delete old versioned zones (program areas, subregions) — will be recreated
+for (old_tbl in zone_tbls_db[str_detect(zone_tbls_db, glue("_{ver_prev}$"))]) {
+  z_seqs <- tbl(con_sdm, "zone") |>
+    filter(tbl == !!old_tbl) |>
+    pull(zone_seq)
+  if (length(z_seqs) > 0) {
+    seq_list <- paste(z_seqs, collapse = ",")
+    dbExecute(
+      con_sdm,
+      glue("DELETE FROM zone_metric WHERE zone_seq IN ({seq_list})")
+    )
+    dbExecute(
+      con_sdm,
+      glue("DELETE FROM zone_cell   WHERE zone_seq IN ({seq_list})")
+    )
+    dbExecute(
+      con_sdm,
+      glue("DELETE FROM zone        WHERE zone_seq IN ({seq_list})")
+    )
+    # zone_taxon uses zone_tbl column
+    dbExecute(
+      con_sdm,
+      glue("DELETE FROM zone_taxon  WHERE zone_tbl = '{old_tbl}'")
+    )
+    message(glue("Deleted old zone: {old_tbl} ({length(z_seqs)} zones)"))
+  }
+}
 
 sp_cats <- tbl(con_sdm, "taxon") |>
   filter(is_ok) |>
@@ -347,26 +400,26 @@ d_comp <- d_old |>
 write_csv(d_comp, out_csv)
 ```
 
+
+Flags for evaluating R chunks:
+
+- `do_zones`: `r do_zones`
+- `do_metrics`: `r do_metrics`
+- `do_zone_taxon`: `r do_zone_taxon`
+- `do_postgis`: `r do_postgis`
+- `do_downloads`: `r do_downloads`
+- `do_summary_data`: `r do_summary_data`
+- `do_summary_figs`: `r do_summary_figs`
+- `do_readme`: `r do_readme`
+- `do_map`: `r do_map`
+- `do_parquet`: `r do_parquet`
+- `do_deploy`: `r do_deploy`
   
-  Flags for evaluating R chunks:
+## Add Zones
   
-  - `do_zones`: `r do_zones`
-  - `do_metrics`: `r do_metrics`
-  - `do_zone_taxon`: `r do_zone_taxon`
-  - `do_postgis`: `r do_postgis`
-  - `do_downloads`: `r do_downloads`
-  - `do_summary_data`: `r do_summary_data`
-  - `do_summary_figs`: `r do_summary_figs`
-  - `do_readme`: `r do_readme`
-  - `do_map`: `r do_map`
-  - `do_parquet`: `r do_parquet`
-  - `do_deploy`: `r do_deploy`
+### Add `cell` table to DuckDB if missing
   
-  ## Add Zones
-  
-  ### Add `cell` table to DuckDB if missing
-  
-  ```{r}
+```{r}
 #| label: re-add_con_sdm
 #| eval: !expr do_zones
 
@@ -401,7 +454,7 @@ zone_tbls <- tbl(con_sdm, "zone") |>
   distinct(tbl) |>
   pull(tbl)
 
-if (tbl_pra %in% zone_tbls) {
+if (!tbl_pra %in% zone_tbls) {
   source(here("libs/sdm_functions.R"))
   # TODO: move these into msens R
   # - set_geom_ctr_area()
@@ -504,13 +557,13 @@ if (tbl_pra %in% zone_tbls) {
 }
 ```
 
-### Create ply_programareas_2026 in PostGIS database
+### Create ply_programareas_2026 in PostGIS database (deprecated)
 
-For viewing in mapgl and mapsp apps.
+Deprecated: migrated to PMTiles. Kept for reference.
 
 ```{r}
 #| label: create_pg_ply_programareas_2026
-#| eval: !expr do_zones
+#| eval: !expr do_postgis
 
 # devtools::install_local("../msens")
 librarian::shelf(
@@ -524,6 +577,11 @@ librarian::shelf(
 )
 
 source(here("libs/db.R")) # define: con
+
+# load from gpkg if not already in memory (eg zones already existed)
+if (!exists("pra")) {
+  pra <- read_sf(pra_gpkg)
+}
 
 pra |>
   st_write(
@@ -665,11 +723,22 @@ d_sr <- tribble(
 ) # note: subregion_name not used (yet)
 register_zones(d_sr, tbl_sr, "subregion_key")
 
+# load pra from gpkg if not already in memory
+if (!exists("pra")) {
+  if (file_exists(pra_gpkg)) {
+    pra <- read_sf(pra_gpkg)
+  } else {
+    pra_prev <- glue(
+      "{dir_derived}/{ver_prev}/ply_programareas_2026_{ver_prev}.gpkg"
+    )
+    pra <- read_sf(pra_prev)
+  }
+}
+
 # temporarily push tmp_pra into duckdb for later joining
 tmp_pra <- pra |>
   st_drop_geometry() |>
   select(programarea_key, region_key)
-# temporarily push tmp_pra into duckdb for later joining
 copy_to(con_sdm, tmp_pra, "tmp_pra", temporary = T, overwrite = T)
 
 df_z_sr_notusa <- tbl(con_sdm, "zone") |>
@@ -1867,6 +1936,12 @@ z_seqs <- tbl(con_sdm, "zone") |>
     tbl == !!tbl_er
   ) |>
   pull(zone_seq)
+stopifnot(
+  `No ecoregion zones found in zone table — check tbl_er value matches zone$tbl` = length(
+    z_seqs
+  ) >
+    0
+)
 
 # tbl(con_sdm, "metric") |> pull(metric_key) |>  sort()
 
@@ -2515,90 +2590,6 @@ dbExecute(
 )
 ```
 
-## Generate PMTiles
-
-Static PMTiles archives for mapgl/mapsp apps, replacing PostGIS/pg_tileserv tile pipeline.
-
-```{r}
-#| label: generate_pmtiles
-#| eval: !expr do_pmtiles
-
-# check / install tippecanoe and pmtiles CLI ----
-check_brew_bin <- function(bin) {
-  if (Sys.which(bin) == "") {
-    if (Sys.which("brew") == "") {
-      stop(glue("{bin} not found and homebrew not available"))
-    }
-    message(glue("installing {bin} via homebrew..."))
-    system2("brew", c("install", bin))
-    stopifnot(Sys.which(bin) != "")
-  }
-  message(glue("{bin}: {Sys.which(bin)}"))
-}
-check_brew_bin("tippecanoe") # tippecanoe: /opt/homebrew/bin/tippecanoe
-check_brew_bin("pmtiles") # pmtiles:       /opt/homebrew/bin/pmtiles
-
-dir_create(dir_pmtiles)
-
-# helper: sf → pmtiles via tippecanoe ----
-sf_to_pmtiles <- function(sf_obj, layer_name, out_dir = dir_pmtiles) {
-  tmp_geojson <- tempfile(fileext = ".geojson")
-  on.exit(unlink(tmp_geojson), add = TRUE)
-
-  out_pmtiles <- glue("{out_dir}/{layer_name}.pmtiles")
-
-  st_write(sf_obj, tmp_geojson, driver = "GeoJSON") #, delete_dsn = TRUE)
-
-  # tippecanoe: full detail for small polygon layers
-  system2(
-    "tippecanoe",
-    c(
-      "-z12",
-      "-Z0",
-      "--no-feature-limit",
-      "--no-tile-size-limit",
-      "-l",
-      layer_name,
-      "-o",
-      out_pmtiles,
-      "--force",
-      tmp_geojson
-    )
-  )
-  stopifnot(file_exists(out_pmtiles))
-  message(glue("wrote {out_pmtiles} ({file_size(out_pmtiles)})"))
-  out_pmtiles
-}
-
-# program areas WITH metrics ----
-d_pra_metrics <- tbl(con_sdm, "zone") |>
-  filter(tbl == !!tbl_pra) |>
-  select(programarea_key = value, zone_seq) |>
-  left_join(
-    tbl(con_sdm, "zone_metric") |>
-      mutate(value = round(value, 1)),
-    by = "zone_seq"
-  ) |>
-  left_join(
-    tbl(con_sdm, "metric") |>
-      select(metric_seq, metric_key),
-    by = "metric_seq"
-  ) |>
-  select(programarea_key, metric_key, value) |>
-  filter(!is.na(programarea_key), !is.na(metric_key), !is.na(value)) |>
-  pivot_wider(names_from = metric_key, values_from = value) |>
-  collect()
-
-pra_sf <- read_sf(pra_gpkg) |>
-  left_join(d_pra_metrics, by = "programarea_key")
-
-sf_to_pmtiles(pra_sf, tbl_pra)
-
-# ecoregions WITHOUT metrics (outlines only) ----
-er_sf <- read_sf(er_raw_gpkg)
-sf_to_pmtiles(er_sf, tbl_er)
-```
-
 ## Generate downloads
 
 For sharing with BOEM and external partners.
@@ -2627,11 +2618,53 @@ if (redo_dl) {
   }
 }
 
-# * pra_gpkg ----
+# * pra_gpkg (with metrics from DuckDB) ----
 if (!file.exists(pra_gpkg)) {
-  message("Generating Program Areas geopackage...")
-  st_read(con, tbl_pra) |>
-    st_write(pra_gpkg, delete_dsn = T, quiet = T)
+  message("Generating Program Areas geopackage with metrics...")
+
+  # get metrics from DuckDB
+  d_pra_metrics <- tbl(con_sdm, "zone") |>
+    filter(tbl == !!tbl_pra) |>
+    select(programarea_key = value, zone_seq) |>
+    left_join(
+      tbl(con_sdm, "zone_metric") |>
+        mutate(value = round(value, 1)),
+      by = "zone_seq"
+    ) |>
+    left_join(
+      tbl(con_sdm, "metric") |>
+        select(metric_seq, metric_key),
+      by = "metric_seq"
+    ) |>
+    select(programarea_key, metric_key, value) |>
+    filter(!is.na(metric_key), !is.na(value)) |>
+    pivot_wider(names_from = metric_key, values_from = value) |>
+    collect()
+
+  # read base geometry (spatial columns only, no metrics)
+  base_cols <- c(
+    "programarea_id",
+    "region_key",
+    "region_name",
+    "planarea_key",
+    "planarea_name",
+    "programarea_key",
+    "programarea_name",
+    "ctr_lon",
+    "ctr_lat",
+    "area_km2"
+  )
+  pra_prev_gpkg <- glue(
+    "{dir_derived}/{ver_prev}/ply_programareas_2026_{ver_prev}.gpkg"
+  )
+  pra_base <- read_sf(pra_prev_gpkg) |>
+    select(any_of(base_cols))
+
+  # join metrics to geometry
+  pra_out <- pra_base |>
+    left_join(d_pra_metrics, by = "programarea_key")
+
+  st_write(pra_out, pra_gpkg, delete_dsn = T, quiet = T)
 }
 
 # * lyrs_csv ----
@@ -2763,8 +2796,8 @@ if (!file.exists(metrics_pra_tif)) {
   writeRaster(r_metrics_pra, metrics_pra_tif, overwrite = T)
 }
 
-# * er_gpkg_dst (input, no metrics — just copy to dir_v) ----
-if (!file.exists(er_gpkg_dst)) {
+# * er_gpkg_dst (input, no metrics — copy to dir_v for downloads) ----
+if (!file.exists(er_gpkg_dst) && er_raw_gpkg != er_gpkg_dst) {
   message("Copying ecoregion gpkg to dir_v...")
   file_copy(er_raw_gpkg, er_gpkg_dst)
 }
@@ -2831,6 +2864,123 @@ if (!file.exists(pa_metrics_geo)) {
 
   write_sf(pa_metrics, pa_metrics_geo)
 }
+```
+
+## Generate PMTiles
+
+Static PMTiles archives for mapgl/mapsp apps, replacing PostGIS/pg_tileserv tile pipeline.
+
+```{r}
+#| label: generate_pmtiles
+#| eval: !expr do_pmtiles
+
+# check / install tippecanoe and pmtiles CLI ----
+check_brew_bin <- function(bin) {
+  if (Sys.which(bin) == "") {
+    if (Sys.which("brew") == "") {
+      stop(glue("{bin} not found and homebrew not available"))
+    }
+    message(glue("installing {bin} via homebrew..."))
+    system2("brew", c("install", bin))
+    stopifnot(Sys.which(bin) != "")
+  }
+  message(glue("{bin}: {Sys.which(bin)}"))
+}
+check_brew_bin("tippecanoe") # tippecanoe: /opt/homebrew/bin/tippecanoe
+check_brew_bin("pmtiles") # pmtiles:       /opt/homebrew/bin/pmtiles
+
+dir_create(dir_pmtiles)
+
+# helper: sf → pmtiles via tippecanoe ----
+sf_to_pmtiles <- function(sf_obj, layer_name, out_dir = dir_pmtiles) {
+  tmp_geojson <- tempfile(fileext = ".geojson")
+  on.exit(unlink(tmp_geojson), add = TRUE)
+
+  out_pmtiles <- glue("{out_dir}/{layer_name}.pmtiles")
+
+  # wrap polygons crossing the antimeridian so GeoJSON [-180,180] doesn't clip
+  #sf_obj <- st_wrap_dateline(sf_obj, options = c("WRAPDATELINE=YES"))
+
+  st_write(sf_obj, tmp_geojson, driver = "GeoJSON") #, delete_dsn = TRUE)
+
+  # tippecanoe: full detail for small polygon layers
+  system2(
+    "tippecanoe",
+    c(
+      "-z12",
+      "-Z0",
+      "--no-feature-limit",
+      "--no-tile-size-limit",
+      "-l",
+      layer_name,
+      "-o",
+      out_pmtiles,
+      "--force",
+      tmp_geojson
+    )
+  )
+  stopifnot(file_exists(out_pmtiles))
+  message(glue("wrote {out_pmtiles} ({file_size(out_pmtiles)})"))
+  out_pmtiles
+}
+
+# program areas WITH metrics ----
+d_pra_metrics <- tbl(con_sdm, "zone") |>
+  filter(tbl == !!tbl_pra) |>
+  select(programarea_key = value, zone_seq) |>
+  left_join(
+    tbl(con_sdm, "zone_metric") |>
+      mutate(value = round(value, 1)),
+    by = "zone_seq"
+  ) |>
+  left_join(
+    tbl(con_sdm, "metric") |>
+      select(metric_seq, metric_key),
+    by = "metric_seq"
+  ) |>
+  select(programarea_key, metric_key, value) |>
+  filter(!is.na(programarea_key), !is.na(metric_key), !is.na(value)) |>
+  pivot_wider(names_from = metric_key, values_from = value) |>
+  collect()
+
+# load geometry from memory or prior version (pra_gpkg may not exist yet)
+pra_geom <- if (exists("pra")) {
+  pra
+} else if (file_exists(pra_gpkg)) {
+  read_sf(pra_gpkg)
+} else {
+  pra_prev <- glue(
+    "{dir_derived}/{ver_prev}/ply_programareas_2026_{ver_prev}.gpkg"
+  )
+  read_sf(pra_prev)
+}
+
+# strip any existing metric columns before joining fresh ones
+base_cols <- c(
+  "programarea_id",
+  "region_key",
+  "region_name",
+  "planarea_key",
+  "planarea_name",
+  "programarea_key",
+  "programarea_name",
+  "ctr_lon",
+  "ctr_lat",
+  "area_km2"
+)
+pra_sf <- pra_geom |>
+  select(any_of(base_cols)) |>
+  left_join(d_pra_metrics, by = "programarea_key")
+
+# mapView(pra_sf, zcol = "score_extriskspcat_primprod_ecoregionrescaled_equalweights")
+
+sf_to_pmtiles(pra_sf, tbl_pra)
+
+# plot(pra_sf["score_extriskspcat_primprod_ecoregionrescaled_equalweights"])
+
+# ecoregions WITHOUT metrics (outlines only) ----
+er_sf <- read_sf(er_raw_gpkg)
+sf_to_pmtiles(er_sf, tbl_er)
 ```
 
 ## Summary data products
@@ -3622,16 +3772,89 @@ d_pra_only |>
 # browseURL(tbl_docx)
 ```
 
+### Compare scores with previous version
+
+```{r}
+#| label: compare_scores_prev
+#| eval: !expr do_summary_figs
+
+# previous version score csv
+pra_n_csv_prev <- glue(
+  "{dir_derived}/{ver_prev}/tbl_pra_scores_{ver_prev}.csv"
+)
+comp_csv <- glue("{dir_v}/tbl_pra_scores_{ver}_vs_{ver_prev}.csv")
+
+if (file_exists(pra_n_csv_prev) && file_exists(pra_n_csv)) {
+  d_prev <- read_csv(pra_n_csv_prev) |>
+    rename(`Area (1,000 km2)` = `Area (1,000 km^2^)`)
+  d_curr <- read_csv(pra_n_csv) |>
+    rename(`Area (1,000 km2)` = `Area (1,000 km^2^)`)
+
+  # component columns (exclude Program Area and Area)
+  comp_cols <- intersect(
+    setdiff(names(d_prev), c("Program Area", "Area (1,000 km2)")),
+    setdiff(names(d_curr), c("Program Area", "Area (1,000 km2)"))
+  )
+
+  d_comp <- d_prev |>
+    select(`Program Area`, all_of(comp_cols)) |>
+    pivot_longer(
+      cols = all_of(comp_cols),
+      names_to = "Component",
+      values_to = "prev"
+    ) |>
+    full_join(
+      d_curr |>
+        select(`Program Area`, all_of(comp_cols)) |>
+        pivot_longer(
+          cols = all_of(comp_cols),
+          names_to = "Component",
+          values_to = "curr"
+        ),
+      by = c("Program Area", "Component")
+    ) |>
+    mutate(
+      diff = curr - prev
+    ) |>
+    arrange(Component, `Program Area`)
+
+  write_csv(d_comp, comp_csv)
+  message(glue("Wrote score comparison to {comp_csv}"))
+
+  # summary table: wide format with diff per component
+  d_comp_wide <- d_comp |>
+    select(`Program Area`, Component, diff) |>
+    pivot_wider(
+      names_from = Component,
+      values_from = diff
+    ) |>
+    arrange(`Program Area`)
+
+  d_comp_wide |>
+    DT::datatable(
+      caption = glue("Score differences ({ver} - {ver_prev})"),
+      options = list(pageLength = 25, dom = "t")
+    ) |>
+    DT::formatRound(columns = comp_cols, digits = 0)
+} else {
+  message(glue(
+    "Skipping score comparison: ",
+    "prev={file_exists(pra_n_csv_prev)}, ",
+    "curr={file_exists(pra_n_csv)}"
+  ))
+}
+```
+
 ### Program Area flower plots
 
 ```{r}
 #| label: plot_programarea_flowers
 #| eval: !expr do_summary_figs
 
-# pra list from PostGIS
-pra_all <- tbl(con, tbl_pra) |>
-  select(programarea_key, programarea_name) |>
-  collect()
+# pra list from gpkg (previously from PostGIS)
+pra_all <- read_sf(pra_gpkg) |>
+  st_drop_geometry() |>
+  select(programarea_key, programarea_name)
 
 # components
 metric_input_keys <- c(
@@ -4136,7 +4359,7 @@ This cleans up the DuckDB database by exporting tables to Parquet files (with so
 # TODO: model_cell: PARTITION BY (mdl_seq);") # https://duckdb.org/docs/stable/data/parquet/overview
 
 source(here("libs/sdm_functions.R"))
-con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F)) |>
+con_sdm <- dbConnect(duckdb(), dbdir = sdm_db, read_only = F) |>
   load_duckdb_extensions()
 
 # dbListTables(con_sdm)
@@ -4214,6 +4437,9 @@ for (tbl in names(tbl_keys)) {
   dbExecute(con_sdm, sql)
 }
 message(glue("Exporting finished  ~  {Sys.time()}")) # ~ 1 min
+
+dbDisconnect(con_sdm, shutdown = T)
+rm(con_sdm)
 ```
 
 ### Import from Parquet
@@ -4224,18 +4450,26 @@ message(glue("Exporting finished  ~  {Sys.time()}")) # ~ 1 min
 
 # dir_pq and sdm_db defined in setup chunk
 
-if (exists("con_sdm")) {
+# close any existing connection and force GC to clean up orphaned drivers
+if (exists("con_sdm") && dbIsValid(con_sdm)) {
   dbDisconnect(con_sdm, shutdown = T)
+}
+if (exists("con_sdm")) {
   rm(con_sdm)
 }
-duckdb_shutdown(duckdb())
+gc() # flush orphaned duckdb driver instances from earlier chunks
 
 if (file_exists(sdm_db)) {
   file_delete(sdm_db)
 }
+# also remove stale WAL file
+sdm_wal <- paste0(sdm_db, ".wal")
+if (file_exists(sdm_wal)) {
+  file_delete(sdm_wal)
+}
 
 source(here("libs/sdm_functions.R"))
-con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F)) |>
+con_sdm <- dbConnect(duckdb(), dbdir = sdm_db, read_only = F) |>
   load_duckdb_extensions()
 
 # dbExecute(con_sdm, "SET threads = 8;")
@@ -4289,6 +4523,7 @@ for (tbl in names(tbl_seq)) {
     pull(1) +
     1
 
+  dbExecute(con_sdm, glue("DROP SEQUENCE IF EXISTS {id}"))
   sql <- glue("CREATE SEQUENCE {id} START {nxt}")
   message(sql)
   dbExecute(con_sdm, sql)
@@ -4314,7 +4549,14 @@ for (tbl in dbListTables(con_sdm)) {
   }
 }
 
+# checkpoint WAL to main DB file, then shut down driver cleanly
+dbExecute(con_sdm, "CHECKPOINT")
 dbDisconnect(con_sdm, shutdown = T)
+rm(con_sdm)
+gc() # flush duckdb driver finalizer so file handles are fully released
+message(glue(
+  "sdm.duckdb exists: {file_exists(sdm_db)}  size: {file_size(sdm_db)}"
+))
 ```
 
 ## Deploy to server
@@ -4327,6 +4569,13 @@ Sync derived data and app code to the msens server.
 
 deploy_sh <- here("libs/deploy_to_server.sh")
 stopifnot(file_exists(deploy_sh))
+
+# duckdb shutdown may need a moment for file handles to release
+if (!file_exists(sdm_db)) {
+  gc() # flush any orphaned duckdb driver finalizers
+  Sys.sleep(2)
+}
+stopifnot(file_exists(sdm_db))
 system2("bash", args = c(deploy_sh, ver), wait = T)
 ```
 
@@ -4334,5 +4583,7 @@ system2("bash", args = c(deploy_sh, ver), wait = T)
 
 ```{r}
 #| label: cleanup
-dbDisconnect(con_sdm, shutdown = T)
+if (exists("con_sdm") && dbIsValid(con_sdm)) {
+  dbDisconnect(con_sdm, shutdown = T)
+}
 ```
