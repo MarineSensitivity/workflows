@@ -24,6 +24,10 @@ tbl_er <- glue::glue("ply_ecoregions_2025")
 tbl_pra <- glue::glue("ply_programareas_2026_{ver}")
 tbl_sr <- glue::glue("ply_subregions_2026_{ver}")
 
+# pmtiles table names (unversioned — scores joined at render time)
+tbl_er_pm  <- "ply_ecoregions_2025"
+tbl_pra_pm <- "ply_programareas_2026"
+
 # version suffix for backward compatibility (e.g., "_v3")
 v_sfx <- glue::glue("_{ver}")
 

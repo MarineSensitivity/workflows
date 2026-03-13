@@ -1,52 +1,1098 @@
 ## 2026-03-? TODO:
 
-- [ ] mapsp/mapgl: splash ckbox 
-  For the main apps (@mapgl/app.R, @mapsp/app.R) implement a checkbox (default true) that clicking to false disables the Splash modal upon next visit. Add an About link aligned on right inline with title that opens this Splash modal again (so still accessible after checkbox set to false). Move the input_dark_mode next to this.
+- [ ] update docs to v4 with new SWOT-DPS turtle dataset
+- [ ] show metadata per dataset with citations in apps and clearly in docs
 
-- [ ] bind table of values to a pmtiles, so don't need to recreate pmtiles ea time for Program Areas scores
+- [ ] 
+
+- [ ] bind table of values to a pmtiles, so don't need to recreate pmtiles ea time for Program Areas scores; generic pmtiles with injected value updates for mapgl display, hover, click
+   - [ ] also get maps to work in Quarto docs/ 
 
 - [ ] pretty flower plots (email)
+  - [ ] add icons to edges of flower plots
+  - [ ] flower plot mv from calc_scores.qmd to msens::plot_flower() and msens:plot_flowers()
 
 - [ ] show OBIS/GBIF obs, esp Rice's whale extra (email)
 
-- [ ] See CA w/ Claude - proj prompts
+- [ ] fix mapgl hover issue (only see in JS Console)
 
 - [ ] Also consider updating the apps (@../apps/mapgl.R, @../apps/mapsp.R) to using the new `metric.metric_title|metric_abbrev` where applicable (moving away from `layers_v3.csv`)
 
-- [ ] flower plot mv from calc_scores.qmd to msens::plot_flower() and msens:plot_flowers()
-
-- [ ] update /docs to match current state, updated final report:
-  - max of all datasets.
-  - is_mmpa (20), is_mbta (10)
-  - if rng_iucn, then mask with all ca/ch/rng_* 
-  - Reflects best available information on priorities for US env concern. Not a comprehensive suitability atlas (yet) on.
-
-- [ ] calc_scores.qmd: do_zone_taxon=T, do_parquet=T
-
-- [ ] add icons to edges of flower plots
-
-- [ ] Migrate from pg_tileserv to PMTiles, see:
-  - [Creating PMTiles | Protomaps Docs](https://docs.protomaps.com/pmtiles/create)
-  - [CalCOFI README_PLAN](https://calcofi.io/workflows/README_PLAN.html)
-
-- [ ] Automate server updates:
-  - Upload sdm.duckdb to v3/ on server (scp or rsync)
-  - Update any Shiny Server config if app paths changed
-
-- [ ] Generate GD:data/derived/v3/`README.md` from NEW generate_outputs.qmd
-  - merges output generation from @`calc_scores.qmd` and @`msens-summary_programareas.qmd`
-  - to be run after calc_scores.qmd
-  - Differentitate in `README.md`:
-    - Spatial data (, *.tif, *.gpkg)
-    - Tables (*.csv, *.xlsx, *.docx)
-    - Figures (*.png, *.pdf)
-    - Big files (): too big for Google Drive, internally used
-
 - Migrate to hexagons
 
+## 2026-03-13.e add Program Area key/name to app maps
+
+Like in `@../workflows/calc_scores.qmd` "map_imgs_pra_ply_l48_ak" R chunk (attached Image #1), show the Program Area acronym (`programarea_key`) label on the map for `@mapgl/app.R` and `@mapsp/app.R`. On hover/click where applicable, show the full Program Area name (`programarea_name`) with the value.
+
+Don't forget there's also the `msens::add_pmlabel()` function (`@../msens/viz.R`).
+
+We have a problem, Houston. With mapsp, similar error with mapgl. Map blank. 
+Uncaught TypeError: Cannot read properties of undefined (reading 'length').
+
+Also with mapsp:
+Also Error: The layer 'r_lyr' does not exist in the map's style.
+
+## 2026-03-13.d update docs to use proper references across datasets
+
+In `@../docs`, use proper Bibtex references across datasets with Quarto references, including "Wallace et al. 2023". Scan table `dataset` for references and insert any missing into `@@../docs/references.bib`. 
+
+⏺ All 9 proper BibTeX citations are now in place. Here's a summary:
+
+  references.bib — Added 8 new BibTeX entries:
+
+  ┌───────────────┬─────────────────────────────────────────────┐
+  │      Key      │                   Source                    │
+  ├───────────────┼─────────────────────────────────────────────┤
+  │ kaschner2019  │ AquaMaps SDM (am_0.05)                      │
+  ├───────────────┼─────────────────────────────────────────────┤
+  │ nmfs_core2019 │ NMFS Core Area (ca_nmfs)                    │
+  ├───────────────┼─────────────────────────────────────────────┤
+  │ nmfs_ch2025   │ NMFS Critical Habitat (ch_nmfs)             │
+  ├───────────────┼─────────────────────────────────────────────┤
+  │ fws_ch2025    │ FWS Critical Habitat (ch_fws)               │
+  ├───────────────┼─────────────────────────────────────────────┤
+  │ fws_range2025 │ FWS Range (rng_fws)                         │
+  ├───────────────┼─────────────────────────────────────────────┤
+  │ birdlife2024  │ BirdLife Range (bl)                         │
+  ├───────────────┼─────────────────────────────────────────────┤
+  │ iucn2025      │ IUCN Range (rng_iucn)                       │
+  ├───────────────┼─────────────────────────────────────────────┤
+  │ wallace2023   │ SWOT+DPS Turtle Range (rng_turtle_swot_dps) │
+  └───────────────┴─────────────────────────────────────────────┘
+
+  The existing behrenfeld1997 entry was already present for VGPM.
+
+  data-sources.qmd — Added [@citekey] references to every dataset subsection and the Primary
+  Productivity section. Removed the redundant inline "Reference:" bullet from the SWOT+DPS section
+  since [@wallace2023] now handles it via proper Quarto citation rendering.
+
+## 2026-03-13.c update docs to contain this new SWOT-DPS dataset
+
+Update the @../docs to include this new SWOT-DPS dataset ingested with @ingest_turtles-swot-dps.qmd and summarized under v4 of @../MarineSensitivity.github.io/index.qmd.
+
+⏺ All changes are complete. Here's a summary:
+                                                                                                      
+  docs/data-sources.qmd:                                                                  
+  - Updated dataset count from 7+1 to 8+1 in the intro paragraph                                      
+  - Added rng_turtle_swot_dps row to the dataset overview table (sort order 8, Is Mask = Yes)         
+  - Added new subsection SWOT+DPS Turtle Range (#sec-swot-dps) between IUCN Range and Merged Model,   
+  documenting:                                                                                        
+    - Motivation (IUCN/AquaMaps too broad for turtles, differential DPS listing status)
+    - Two data sources (SWOT global distributions + NMFS DPS)
+    - Cell value encoding (EN: 100%, TN: 50%) per species
+    - 6 species covered with codes
+    - Role as global mask replacement for turtles
+    - Citation and link to the ingest workflow
+
+  docs/model-merging.qmd:
+  - Updated mermaid diagram: "7 source datasets" → "8 source datasets", decision node label from
+  "IUCN/CH" → "IUCN, SWOT+DPS, or CH"
+  - Updated Step 1 text to list SWOT+DPS as a possible source
+  - Updated Step 3 masking text to explain that SWOT+DPS replaces IUCN as the global mask specifically
+   for sea turtles
+  - Removed hardcoded species count from pipeline intro
+
+
+## 2026-03-13.b fix README.md to use {ver} metadata from data/derived_products.csv
+
+Fix the @data/derived_products.csv and "generate_readme" chunk of @calc_scores.qmd to work with
+  {ver} that can change 
+
+⏺ Two changes:                         
+                                                                                          
+  1. data/derived_products.csv — Replaced all hardcoded _v3 suffixes with {ver} placeholders (e.g.
+  map_pra_l48_{ver}.png, r_metrics_{ver}.tif). Files without a version suffix (like                   
+  ply_ecoregions_2025.gpkg, subregion_programareas.csv) are left as-is.
+  2. calc_scores.qmd generate_readme chunk — After read_csv(), added mutate(output_file =             
+  glue(output_file), dependencies = glue(dependencies)) to expand {ver} at runtime. Also changed the
+  hardcoded *_v3 naming convention line in the README template to *_{ver}.
+
+## 2026-03-13 fix maps with map_pm*() helper fxns
+
+The R chunk `map_imgs_pra_ply_l48_ak` in `@calc_scores.qmd` is still using the old Postgres vector tile source and API (https://api.marinesensitivity.org/tilejson?...). Update this to use the same mapping function and PMtile vector tile source as the apps (`@../apps/mapgl/app.R`, `@../apps/mapsp/app.R`). Create a new generic function `map_scores()` in the R package `@../msens/` with variables for pmtile source and variable. For now, every time we update the scores, we have to regenerate the pmtiles. Ideally we can simply feed this function a small table of values relating, for instance, `programarea_key` to a score column, eg `score_extriskspcat_primprod_ecoregionrescaled_equalweights`. Then we can use the efficient PMTile vector tile source for mapping, but don't have to regenerate it with each new model iteration.
+
+Also make this function flexible enough to generate the `fig-map-ecoregions-science` in `@../docs/science.qmd`, which uses `map_ecoregions()` defined in `@../docs/libs/functions.R` and the `mapgl::maplibre()` base map.
+
+Also, the PMTiles for ProgramAreas were generated with the `_{ver}` suffix in `@calc_scores.qmd` to indicate they have the model embedded. Since like Ecoregions, this is no longer the case, drop the `_{ver}` suffix from the PMTiles, ie `ply_programareas_2026_v4.pmtiles` -> `ply_programareas_2026.pmtiles`. Make sure to update the apps and calc_scores.qmd. Retain the `_{ver}` suffix for the geopackage since there we do want to include all the latest model score results for distribution.
+
+Rename `map_scores()` to `map_pmtiles()`.
+
+But does the application of this function show both Ecoregion and Program Area pmtiles? I don't see this in the input arguments
+
+ ☐ Outlines                                                                               
+
+Does the `pmtiles_outlines` parameter approach work for your use case? It adds ecoregion or program area outlines as line layers from separate
+ PMTile sources. Or would you prefer a different design?
+
+
+❯ 1. pmtiles_outlines is fine                                                                                                               
+     Pass additional PMTile outline layers as a list. The fill layer is the primary PMTile; outlines are secondary line-only layers.
+  2. Dedicated er/pra params
+     Add explicit pmtiles_url_er and pmtiles_url_pra parameters since these two layers are always used together.
+  3. Single pmtiles_layers list
+     A more general approach: pass a list of layer specs where each can be fill or line, with its own PMTile URL and styling.
+
+⏺ User answered Claude's questions:
+  ⎿  · Does the `pmtiles_outlines` parameter approach work for your use case?
+     It adds ecoregion or program area outlines as line layers from separate
+     PMTile sources. Or would you prefer a different design? → pmtiles_outlines
+      is fine
+
+ Here is Claude's plan:
+
+ Plan: Add map_pmtiles() to msens package + drop _{ver} suffix from PMTiles
+
+ Context
+
+ 1. The map_imgs_pra_ply_l48_ak chunk in calc_scores.qmd uses the old Postgres
+  vector tile API. Needs to switch to PMTiles with scores joined at render
+ time.
+ 2. docs/libs/functions.R map_ecoregions() already uses PMTiles +
+ match_expr(). Should use the shared function.
+ 3. PMTiles for program areas currently include _{ver} suffix and embedded
+ model scores. Since scores will now be joined at render time (like
+ ecoregions), drop the _{ver} suffix from PMTiles filenames. Keep _{ver} for
+ gpkg files which distribute model results.
+
+ Changes overview
+
+ A. New function map_pmtiles() in msens/R/viz.R
+
+ A generic PMTile mapping function that:
+ - Takes a data frame d with a key column and either a score column
+ (continuous) or explicit colors (categorical)
+ - Uses match_expr() to join data to PMTile features at render time — no score
+  columns needed in PMTiles
+ - Accepts a base_map parameter (supports both mapboxgl and maplibre)
+ - Returns the map widget for further piping (symbol layers, controls, etc.)
+ - Supports additional PMTile outline layers via pmtiles_outlines parameter
+
+ B. Drop _{ver} from PMTiles filename
+
+ ply_programareas_2026_v4.pmtiles → ply_programareas_2026.pmtiles
+
+ This requires:
+ 1. A new tbl_pra_pmtiles variable (without _{ver}) for PMTiles references
+ 2. Updating sf_to_pmtiles() call to use the new name and strip metric columns
+ 3. Keeping tbl_pra (with _{ver}) for gpkg distribution
+
+ C. Update consumers of the PMTiles
+
+ Update all references to use the new unversioned PMTiles name.
+
+ ---
+ Files to modify
+
+ 1. msens/R/viz.R — Add map_pmtiles()
+
+ ```r
+ #' Map data on PMTile vector tiles
+ #'
+ #' Create a mapboxgl/maplibre map with polygon fill colors driven by a data
+ #' frame, using PMTile vector tile sources. Data is joined to features at
+ render
+ #' time via match expressions, so PMTiles don't need to be regenerated.
+ #'
+ #' @param d data frame with a key column and either a score or color column
+ #' @param col_key character; name of the key column in `d`
+ #' @param col_value character; name of the score column for continuous
+ coloring (or NULL)
+ #' @param colors character vector of colors per row (or named by key), for
+ categorical coloring (or NULL)
+ #' @param pmtiles_url character; URL to the PMTiles file
+ #' @param source_layer character; source layer name within the PMTiles
+ #' @param base_map a mapboxgl or maplibre map object; if NULL creates
+ mapboxgl(dark, globe)
+ #' @param bounds sf or bbox object to fit map bounds to
+ #' @param filter_keys character vector of keys to show (subset of d)
+ #' @param n_colors integer; number of color steps for continuous mode
+ (default: 11)
+ #' @param palette character; RColorBrewer palette name (default: "Spectral")
+ #' @param reverse_palette logical; reverse palette so red=high (default:
+ TRUE)
+ #' @param fill_opacity numeric (default: 0.7)
+ #' @param outline_color character (default: "white")
+ #' @param outline_width numeric (default: 1)
+ #' @param legend_title character (default: "Score")
+ #' @param legend_position character (default: "bottom-left")
+ #' @param categorical logical; use categorical legend (default: FALSE)
+ #' @param legend_labels character vector of labels for categorical legend
+ #' @param tooltip passed to add_fill_layer
+ #' @param popup passed to add_fill_layer
+ #' @param hover_options passed to add_fill_layer
+ #' @param pmtiles_outlines list of outline layer specs, each with: url,
+ source_layer, line_color, line_width, line_opacity, filter
+ #'
+ #' @return a mapboxgl/maplibre htmlwidget (pipeable for additional layers)
+ #' @importFrom mapgl mapboxgl mapbox_style fit_bounds add_pmtiles_source
+ #'   add_fill_layer add_line_layer add_legend add_categorical_legend
+ #'   add_scale_control match_expr
+ #' @importFrom RColorBrewer brewer.pal
+ #' @importFrom grDevices colorRampPalette
+ #' @export
+ #' @concept viz
+ ```
+
+ Key implementation details:
+ - Continuous mode (col_value provided): compute color ramp, findInterval() to
+  bin scores, map keys→colors
+ - Categorical mode (colors provided): use colors directly via named or
+ positional vector
+ - Fill layer uses match_expr(column = col_key, values = keys, stops =
+ key_colors)
+ - Outline layers via pmtiles_outlines list
+ - Legend: add_legend() for continuous, add_categorical_legend() for
+ categorical
+
+ 2. msens/DESCRIPTION — Add imports
+
+ Add mapgl and RColorBrewer to Imports.
+
+ 3. workflows/calc_scores.qmd — PMTiles generation (line ~2977)
+
+ Change PMTiles generation to use unversioned name and strip metric columns:
+
+ ```r
+ # program areas for pmtiles: base columns only (scores joined at render time)
+ tbl_pra_pm <- "ply_programareas_2026"
+ pra_pm_sf  <- pra_geom |> select(any_of(base_cols))
+ sf_to_pmtiles(pra_pm_sf, tbl_pra_pm)
+ ```
+
+ Keep existing pra_sf (with metrics) for the gpkg write. Keep tbl_pra with
+ _{ver} for gpkg references.
+
+ 4. workflows/calc_scores.qmd — map_imgs_pra_ply_l48_ak chunk (line ~3243)
+
+ Replace entire chunk to use map_pmtiles():
+
+ ```r
+ pmtiles_base_url <- "https://file.marinesensitivity.org/pmtiles/v0.5.0"
+ tbl_pra_pm <- "ply_programareas_2026"
+ tbl_er_pm  <- "ply_ecoregions_2025"
+ var_pra <- "score_extriskspcat_primprod_ecoregionrescaled_equalweights"
+
+ for (is_ak in c(TRUE, FALSE)) {
+   if (is_ak) {
+     pra_area <- pra |> filter(region_key == "AK") |> st_shift_longitude()
+     er_area  <- er  |> filter(region_key == "AK") |> st_shift_longitude()
+     lgnd_pos <- "top-left"
+   } else {
+     box_l48  <- pra |> filter(region_key != "AK") |> st_bbox() |> st_as_sfc()
+     pra_area <- pra |> st_filter(box_l48, .predicate = st_intersects)
+     er_area  <- er  |> st_filter(box_l48, .predicate = st_intersects)
+     lgnd_pos <- "bottom-left"
+   }
+
+   m <- msens::map_pmtiles(
+     d               = pra_area |> sf::st_drop_geometry(),
+     col_key         = "programarea_key",
+     col_value       = var_pra,
+     pmtiles_url     = glue("{pmtiles_base_url}/{tbl_pra_pm}.pmtiles"),
+     source_layer    = tbl_pra_pm,
+     bounds          = er_area,
+     filter_keys     = pra_area$programarea_key,
+     legend_title    = "Score",
+     legend_position = lgnd_pos,
+     pmtiles_outlines = list(
+       list(
+         url          = glue("{pmtiles_base_url}/{tbl_er_pm}.pmtiles"),
+         source_layer = tbl_er_pm,
+         line_color   = "lightgray",
+         line_width   = 5,
+         filter       = c("in", "ecoregion_key", er_area$ecoregion_key))))
+
+   b      <- glue("{dir_figs}/map_pra_{ifelse(is_ak, 'ak', 'l48')}{v_sfx}")
+   b_html <- glue("{b}.html")
+   b_files <- glue("{b}_files")
+   b_png  <- glue("{b}.png")
+   saveWidget(m, b_html, selfcontained = FALSE, background = "transparent")
+   webshot(b_html, b_png, vwidth = 1200, vheight = 800, zoom = 2,
+           selector = "#htmlwidget_container", delay = 2, quiet = TRUE)
+   file_delete(b_html)
+   dir_delete(b_files)
+ }
+ ```
+
+ 5. workflows/libs/paths.R (line 24) — Add unversioned PMTile table name
+
+ tbl_pra_pm <- "ply_programareas_2026"
+
+ 6. apps/mapgl/app.R (line 88, 865) — Use unversioned PMTile name
+
+ Change tbl_pra definition for PMTiles:
+ tbl_pra_pm <- "ply_programareas_2026"
+ Update PMTiles source URL to use tbl_pra_pm. Keep tbl_pra (with _{ver}) for
+ any gpkg/database references.
+
+ 7. apps/mapsp/app.R (line 58, 620) — Same as mapgl
+
+ 8. docs/libs/functions.R — Refactor map_ecoregions()
+
+ Use map_pmtiles() for the core map. Drop _{ver} from PMTile URL. Pipe
+ additional layers (symbol labels, layers control, fullscreen) after:
+
+ ```r
+ map_ecoregions <- function(ver = "v4") {
+   # ... same data loading for er, pra, eco_keys, eco_colors ...
+
+   url_eco <- glue::glue("https://file.marinesensitivity.org/pmtiles/{ver}/ply
+ _ecoregions_2025.pmtiles")
+   url_pra <- glue::glue("https://file.marinesensitivity.org/pmtiles/{ver}/ply
+ _programareas_2026.pmtiles")
+   lyr_eco <- "ply_ecoregions_2025"
+   lyr_pra <- "ply_programareas_2026"
+
+   base <- mapgl::maplibre(
+     style  = mapgl::carto_style("voyager"),
+     bounds = list(c(-190, 15), c(-60, 75)))
+
+   m <- msens::map_pmtiles(
+     d               = er_pra,
+     col_key         = "ecoregion_key",
+     colors          = setNames(eco_colors, eco_keys),
+     pmtiles_url     = url_eco,
+     source_layer    = lyr_eco,
+     base_map        = base,
+     filter_keys     = eco_keys,
+     fill_opacity    = 0.6,
+     outline_color   = "black",
+     outline_width   = 3,
+     legend_title    = "BOEM Ecoregions",
+     legend_position = "bottom-left",
+     categorical     = TRUE,
+     legend_labels   = eco_names,
+     tooltip         = mapgl::concat(...),
+     popup           = mapgl::concat(...),
+     hover_options   = list(fill_opacity = 0.9),
+     pmtiles_outlines = list(
+       list(url = url_pra, source_layer = lyr_pra,
+            line_color = "white", line_width = 1))) |>
+     # pipe additional layers
+     mapgl::add_symbol_layer(...) |>  # eco labels
+     mapgl::add_symbol_layer(...) |>  # pra labels
+     mapgl::add_layers_control(...) |>
+     mapgl::add_fullscreen_control()
+
+   # ... same caption + static png fallback ...
+ }
+ ```
+
+ ---
+ Verification
+
+ 1. devtools::document() in msens — confirm NAMESPACE exports map_pmtiles
+ 2. devtools::install() in msens — clean install
+ 3. Test map_pmtiles() in R console with a simple data frame
+ 4. Render map_imgs_pra_ply_l48_ak chunk — verify PNG output
+ 5. Render fig-map-ecoregions-science — verify interactive map
+ 6. Verify apps still work with updated PMTile references (manual check)
+
+⏺ All changes are implemented. Here's a summary:                               
+                                                                              
+  Changes made                                                                 
+                                                                  
+  1. msens/R/viz.R — Added map_pmtiles() function with:                        
+    - Continuous mode (binned color ramp via col_value) and categorical mode
+  (direct colors)                                                              
+    - match_expr() to join data to PMTile features at render time 
+    - base_map parameter (supports mapboxgl/maplibre, defaults to mapboxgl dark
+   globe)
+    - pmtiles_outlines for additional outline layers
+    - Proper roxygen2 docs with @concept viz
+  2. msens/DESCRIPTION — Added grDevices, mapgl, RColorBrewer to Imports
+  3. msens/NAMESPACE — Auto-generated: exports map_pmtiles, imports from mapgl,
+   RColorBrewer, grDevices
+  4. workflows/libs/paths.R — Added tbl_er_pm and tbl_pra_pm (unversioned
+  PMTile table names)
+  5. workflows/calc_scores.qmd —
+    - PMTiles generation now uses tbl_pra_pm/tbl_er_pm with base columns only
+  (no metrics)
+    - map_imgs_pra_ply_l48_ak chunk replaced: old Postgres vector tile API →
+  msens::map_pmtiles() with PMTiles
+  6. apps/mapgl/app.R — Added tbl_pra_pm, updated PMTiles source URL and
+  source_layer references
+  7. apps/mapsp/app.R — Same as mapgl
+  8. docs/libs/functions.R — Refactored map_ecoregions() to use
+  msens::map_pmtiles() as the core, with symbol layers, layers control, and
+  fullscreen piped after. Dropped _{ver} from PMTile URL.
+
+✻ Worked for 6m 49s                                   
+                                                                              
+⏺ Background command "Install msens package" completed (exit code 0)           
+                                                                              
+⏺ Already retrieved that output — the install completed successfully.          
+  map_pmtiles is confirmed exported and loadable from the msens package.
+
+
+The new maps with `map_pmtiles()` seem to work well, except they are missing the Ecoregion and Program Area labels. Compare `@figs/msens-summary_programareas_v4/map_pra_ak_v4.png` genered with labels in chunk "map_imgs_cell_l48_ak" with `@figs/msens-summary_programareas_v4/map_cell_score_ak_v4.png` (and `@figs/msens-summary_programareas_v4/map_cell_npp_ak_v4.png` from R chunk "plot_programarea_primprod") generated in R chunk "map_imgs_pra_ply_l48_ak" with `map_pmtiles()`. Fix the `msens::map_pmtiles()` to be able to include these labels with positions. Generlize this capability and create a new `msens::map_cells()` function for showing cells. Apply this new function into the apps as well.
+
+Consider helper functions like `add_cells()` or `add_pmtiles()` to add into `msens` library for the apps (`@../apps/mapgl/app.R`, `@../apps/mapsp/app.R`).
+
+⏺ Good. Now I understand the full picture for the apps. The user wants helper functions like add_cells() and add_pmtiles() that work with both initial renders AND proxy updates — composable building blocks rather than monolithic map_cells(). Let me look at the mapsp proxy update pattern too, then update the plan. 
+
+Let's add `add_pmfill()` to the set of composable helper functions (already `add_cells()`, `add_outlines()` -> `add_pmline()`, `add_labels()` -> `add_pmlabel()`) and decompose instances of using `map_pmtiles()` (and its function definition) to using arguments these helper functions satisfy.
+
+Also make these helper functions flexible enough to generate the `fig-map-ecoregions-science` in `@../docs/science.qmd`, which uses `map_ecoregions()` defined in `@../docs/libs/functions.R` with the `mapgl::maplibre()` base map.
+
+│ Plan to implement                                                                                  │
+│                                                                                                    │
+│ Plan: Composable PMTile/raster helpers + labels                                                    │
+│                                                                                                    │
+│ Context                                                                                            │
+│                                                                                                    │
+│ The recently added msens::map_pmtiles() is monolithic — it builds a complete map but can't be used │
+│  piecewise in Shiny proxy updates or mixed with app-specific controls. Maps also lack labels. The  │
+│ user wants a set of composable, pipeable helper functions that:                                    │
+│                                                                                                    │
+│ - Work with both initial map renders AND mapboxgl_proxy() updates                                  │
+│ - Replace the internals of map_pmtiles() and the manual map construction in apps                   │
+│ - Add label support via sf point sources with manual placement offsets                             │
+│                                                                                                    │
+│ Helper functions (msens/R/viz.R)                                                                   │
+│                                                                                                    │
+│ add_pmfill() — PMTile polygon fill with match_expr coloring                                        │
+│                                                                                                    │
+│ Handles: add PMTiles source + fill layer + optional outline, with color ramp computation.          │
+│ Decomposition of the core of map_pmtiles().                                                        │
+│                                                                                                    │
+│ #' Add a PMTile polygon fill layer to a map                                                        │
+│ #'                                                                                                 │
+│ #' @param m map or map_proxy                                                                       │
+│ #' @param url PMTiles URL                                                                          │
+│ #' @param source_layer source layer name                                                           │
+│ #' @param col_key key column name in PMTiles features                                              │
+│ #' @param d data frame with col_key and col_value columns (for match_expr)                         │
+│ #' @param col_value score column for continuous coloring (or NULL)                                 │
+│ #' @param colors named character vector of key→color (for categorical; or NULL)                    │
+│ #' @param filter_keys character vector of keys to include                                          │
+│ #' @param id fill layer id (default: "main_fill")                                                  │
+│ #' @param source_id PMTiles source id (default: "main_src")                                        │
+│ #' @param n_colors,palette,reverse_palette color ramp settings                                     │
+│ #' @param fill_opacity numeric (default: 0.7)                                                      │
+│ #' @param outline_color outline color for a companion line layer (NULL to skip)                    │
+│ #' @param outline_width outline width (default: 1)                                                 │
+│ #' @param tooltip,popup,hover_options passed to add_fill_layer                                     │
+│ #' @param before_id layer to insert before                                                         │
+│ #' @return list(m, rng, colors) — map widget + legend metadata                                     │
+│ #' @export                                                                                         │
+│ #' @concept viz                                                                                    │
+│ add_pmfill <- function(                                                                            │
+│     m, url, source_layer, col_key,                                                                 │
+│     d = NULL, col_value = NULL, colors = NULL, filter_keys = NULL,                                 │
+│     id = "main_fill", source_id = "main_src",                                                      │
+│     n_colors = 11, palette = "Spectral", reverse_palette = TRUE,                                   │
+│     fill_opacity = 0.7,                                                                            │
+│     outline_color = NULL, outline_width = 1,                                                       │
+│     tooltip = NULL, popup = NULL, hover_options = NULL,                                            │
+│     before_id = NULL) {                                                                            │
+│                                                                                                    │
+│   # determine keys                                                                                 │
+│   keys <- filter_keys %||% (if (!is.null(d)) d[[col_key]])                                         │
+│   fill_filter <- if (!is.null(keys)) c("in", col_key, keys)                                        │
+│                                                                                                    │
+│   # compute fill_color expression ----                                                             │
+│   if (!is.null(col_value) && !is.null(d)) {                                                        │
+│     # continuous: bin scores into color ramp                                                       │
+│     pal_colors <- RColorBrewer::brewer.pal(max(n_colors, 3), palette)                              │
+│     if (reverse_palette) pal_colors <- rev(pal_colors)                                             │
+│     ramp <- grDevices::colorRampPalette(pal_colors)(n_colors)                                      │
+│     vals <- d[[col_value]]                                                                         │
+│     rng  <- range(vals, na.rm = TRUE)                                                              │
+│     brks <- seq(rng[1], rng[2], length.out = n_colors)                                             │
+│     bins <- findInterval(vals, brks, all.inside = TRUE)                                            │
+│     key_colors <- stats::setNames(ramp[bins], d[[col_key]])[keys]                                  │
+│     fc <- mapgl::match_expr(column = col_key, values = unname(keys),                               │
+│                             stops = unname(key_colors), default = "#cccccc")                       │
+│     legend_meta <- list(rng = rng, colors = ramp, categorical = FALSE)                             │
+│   } else if (!is.null(colors)) {                                                                   │
+│     # categorical: colors provided directly                                                        │
+│     if (!is.null(names(colors))) {                                                                 │
+│       key_colors <- colors[keys]                                                                   │
+│     } else {                                                                                       │
+│       key_colors <- stats::setNames(colors, keys)                                                  │
+│     }                                                                                              │
+│     fc <- mapgl::match_expr(column = col_key, values = unname(keys),                               │
+│                             stops = unname(key_colors), default = "#cccccc")                       │
+│     legend_meta <- list(colors = unname(key_colors), categorical = TRUE)                           │
+│   }                                                                                                │
+│                                                                                                    │
+│   # add source + fill layer                                                                        │
+│   m <- m |>                                                                                        │
+│     mapgl::add_pmtiles_source(id = source_id, url = url) |>                                        │
+│     mapgl::add_fill_layer(                                                                         │
+│       id = id, source = source_id, source_layer = source_layer,                                    │
+│       fill_color = fc, fill_opacity = fill_opacity,                                                │
+│       filter = fill_filter, before_id = before_id,                                                 │
+│       tooltip = tooltip, popup = popup, hover_options = hover_options)                             │
+│                                                                                                    │
+│   # optional companion outline                                                                     │
+│   if (!is.null(outline_color)) {                                                                   │
+│     ln_id <- sub("_fill$", "_ln", id)                                                              │
+│     if (ln_id == id) ln_id <- paste0(id, "_ln")                                                    │
+│     m <- m |>                                                                                      │
+│       mapgl::add_line_layer(                                                                       │
+│         id = ln_id, source = source_id, source_layer = source_layer,                               │
+│         line_color = outline_color, line_opacity = 1,                                              │
+│         line_width = outline_width, filter = fill_filter)                                          │
+│   }                                                                                                │
+│                                                                                                    │
+│   # attach legend metadata as attribute for downstream legend helpers                              │
+│   attr(m, "legend_meta") <- legend_meta                                                            │
+│   m                                                                                                │
+│ }                                                                                                  │
+│                                                                                                    │
+│ add_pmline() — PMTile line/outline layers                                                          │
+│                                                                                                    │
+│ #' Add PMTile outline line layers to a map                                                         │
+│ #'                                                                                                 │
+│ #' @param m map or map_proxy                                                                       │
+│ #' @param outlines list of specs: url, source_layer, id, source_id,                                │
+│ #'   line_color, line_width, line_opacity, filter, before_id                                       │
+│ #' @return map (pipeable)                                                                          │
+│ #' @export                                                                                         │
+│ #' @concept viz                                                                                    │
+│ add_pmline <- function(m, outlines) {                                                              │
+│   for (i in seq_along(outlines)) {                                                                 │
+│     ol     <- outlines[[i]]                                                                        │
+│     src_id <- ol$source_id %||% paste0("outline_src_", i)                                          │
+│     ln_id  <- ol$id        %||% paste0("outline_ln_", i)                                           │
+│     m <- m |>                                                                                      │
+│       mapgl::add_pmtiles_source(id = src_id, url = ol$url) |>                                      │
+│       mapgl::add_line_layer(                                                                       │
+│         id = ln_id, source = src_id,                                                               │
+│         source_layer = ol$source_layer,                                                            │
+│         line_color   = ol$line_color   %||% "gray",                                                │
+│         line_opacity = ol$line_opacity %||% 1,                                                     │
+│         line_width   = ol$line_width   %||% 1,                                                     │
+│         filter       = ol$filter,                                                                  │
+│         before_id    = ol$before_id)                                                               │
+│   }                                                                                                │
+│   m                                                                                                │
+│ }                                                                                                  │
+│                                                                                                    │
+│ add_pmlabel() — symbol label layers from sf points                                                 │
+│                                                                                                    │
+│ #' Add symbol label layers from sf point data                                                      │
+│ #'                                                                                                 │
+│ #' Auto-detects text_anchor, text_justify, text_offset_right, text_offset_down                     │
+│ #' columns in the source sf for label placement.                                                   │
+│ #'                                                                                                 │
+│ #' @param m map or map_proxy                                                                       │
+│ #' @param labels list of label specs: source (sf), text_field, id,                                 │
+│ #'   text_color, text_size, text_font, text_halo_color, text_halo_width,                           │
+│ #'   text_halo_blur, text_line_height, text_allow_overlap, filter,                                 │
+│ #'   text_anchor, text_justify, text_offset                                                        │
+│ #' @return map (pipeable)                                                                          │
+│ #' @export                                                                                         │
+│ #' @concept viz                                                                                    │
+│ add_pmlabel <- function(m, labels) {                                                               │
+│   for (i in seq_along(labels)) {                                                                   │
+│     lbl    <- labels[[i]]                                                                          │
+│     lbl_id <- lbl$id %||% paste0("label_", i)                                                      │
+│     src    <- lbl$source                                                                           │
+│                                                                                                    │
+│     has_anchor <- "text_anchor" %in% names(src)                                                    │
+│     has_offset <- all(c("text_offset_right", "text_offset_down") %in% names(src))                  │
+│                                                                                                    │
+│     sym_args <- list(                                                                              │
+│       map = m, id = lbl_id, source = src,                                                          │
+│       text_field         = mapgl::get_column(lbl$text_field),                                      │
+│       text_color         = lbl$text_color         %||% "white",                                    │
+│       text_allow_overlap = lbl$text_allow_overlap  %||% TRUE,                                      │
+│       filter = lbl$filter)                                                                         │
+│                                                                                                    │
+│     for (nm in c("text_size", "text_font", "text_halo_color",                                      │
+│                  "text_halo_width", "text_halo_blur", "text_line_height"))                         │
+│       sym_args[[nm]] <- lbl[[nm]]                                                                  │
+│                                                                                                    │
+│     sym_args$text_anchor  <- lbl$text_anchor  %||%                                                 │
+│       if (has_anchor) mapgl::get_column("text_anchor")                                             │
+│     sym_args$text_justify <- lbl$text_justify %||%                                                 │
+│       if ("text_justify" %in% names(src)) mapgl::get_column("text_justify")                        │
+│     if (!is.null(lbl$text_offset)) {                                                               │
+│       sym_args$text_offset <- lbl$text_offset                                                      │
+│     } else if (has_offset) {                                                                       │
+│       sym_args$text_offset <- list(                                                                │
+│         mapgl::get_column("text_offset_right"),                                                    │
+│         mapgl::get_column("text_offset_down"))                                                     │
+│     }                                                                                              │
+│                                                                                                    │
+│     sym_args <- sym_args[!vapply(sym_args, is.null, logical(1))]                                   │
+│     m <- do.call(mapgl::add_symbol_layer, sym_args)                                                │
+│   }                                                                                                │
+│   m                                                                                                │
+│ }                                                                                                  │
+│                                                                                                    │
+│ add_cells() — raster cell layer                                                                    │
+│                                                                                                    │
+│ #' Add a raster cell layer to a map                                                                │
+│ #'                                                                                                 │
+│ #' @param m map or map_proxy                                                                       │
+│ #' @param r terra SpatRaster                                                                       │
+│ #' @param colors character vector of colors                                                        │
+│ #' @param id layer id (default: "r_lyr")                                                           │
+│ #' @param source_id source id (default: "r_src")                                                   │
+│ #' @param raster_opacity numeric (default: 0.8)                                                    │
+│ #' @param raster_resampling character (default: "nearest")                                         │
+│ #' @param before_id layer to insert before                                                         │
+│ #' @param ... additional args to add_raster_layer                                                  │
+│ #' @return map (pipeable)                                                                          │
+│ #' @export                                                                                         │
+│ #' @concept viz                                                                                    │
+│ add_cells <- function(                                                                             │
+│     m, r, colors,                                                                                  │
+│     id = "r_lyr", source_id = "r_src",                                                             │
+│     raster_opacity = 0.8, raster_resampling = "nearest",                                           │
+│     before_id = NULL, ...) {                                                                       │
+│   m |>                                                                                             │
+│     mapgl::add_image_source(id = source_id, data = r, colors = colors) |>                          │
+│     mapgl::add_raster_layer(                                                                       │
+│       id = id, source = source_id,                                                                 │
+│       raster_opacity = raster_opacity,                                                             │
+│       raster_resampling = raster_resampling,                                                       │
+│       before_id = before_id, ...)                                                                  │
+│ }                                                                                                  │
+│                                                                                                    │
+│ map_cells() — convenience constructor (composes helpers)                                           │
+│                                                                                                    │
+│ #' Map raster cells with outlines and labels                                                       │
+│ #' @export                                                                                         │
+│ #' @concept viz                                                                                    │
+│ map_cells <- function(                                                                             │
+│     r, colors = NULL, base_map = NULL, bounds = NULL,                                              │
+│     raster_opacity = 0.9, raster_resampling = "nearest",                                           │
+│     n_colors = 11, palette = "Spectral", reverse_palette = TRUE,                                   │
+│     legend_title = "Score", legend_position = "bottom-left",                                       │
+│     legend_values = NULL, pmtiles_outlines = NULL, labels = NULL) {                                │
+│                                                                                                    │
+│   if (is.null(colors)) {                                                                           │
+│     pal <- RColorBrewer::brewer.pal(max(n_colors, 3), palette)                                     │
+│     if (reverse_palette) pal <- rev(pal)                                                           │
+│     colors <- grDevices::colorRampPalette(pal)(n_colors)                                           │
+│   }                                                                                                │
+│   if (is.null(legend_values))                                                                      │
+│     legend_values <- terra::minmax(r) |> as.numeric()                                              │
+│                                                                                                    │
+│   m <- base_map %||% mapgl::mapboxgl(                                                              │
+│     style = mapgl::mapbox_style("dark"), projection = "globe")                                     │
+│   if (!is.null(bounds))                                                                            │
+│     m <- m |> mapgl::fit_bounds(bbox = bounds)                                                     │
+│                                                                                                    │
+│   m <- m |> add_cells(r, colors, raster_opacity = raster_opacity,                                  │
+│                        raster_resampling = raster_resampling)                                      │
+│   if (!is.null(pmtiles_outlines))                                                                  │
+│     m <- m |> add_pmline(pmtiles_outlines)                                                         │
+│   if (!is.null(labels))                                                                            │
+│     m <- m |> add_pmlabel(labels)                                                                  │
+│                                                                                                    │
+│   m |>                                                                                             │
+│     mapgl::add_legend(legend_title, values = legend_values,                                        │
+│                       colors = colors, position = legend_position) |>                              │
+│     mapgl::add_scale_control(position = "bottom-right")                                            │
+│ }                                                                                                  │
+│                                                                                                    │
+│ map_pmtiles() — rewrite as thin wrapper                                                            │
+│                                                                                                    │
+│ map_pmtiles <- function(...same params...) {                                                       │
+│   m <- base_map %||% mapgl::mapboxgl(...)                                                          │
+│   if (!is.null(bounds)) m <- m |> mapgl::fit_bounds(bbox = bounds)                                 │
+│                                                                                                    │
+│   m <- m |> add_pmfill(                                                                            │
+│     url = pmtiles_url, source_layer = source_layer, col_key = col_key,                             │
+│     d = d, col_value = col_value, colors = colors, filter_keys = filter_keys,                      │
+│     n_colors = n_colors, palette = palette, reverse_palette = reverse_palette,                     │
+│     fill_opacity = fill_opacity, outline_color = outline_color,                                    │
+│     outline_width = outline_width, tooltip = tooltip, popup = popup,                               │
+│     hover_options = hover_options)                                                                 │
+│                                                                                                    │
+│   legend_meta <- attr(m, "legend_meta")                                                            │
+│                                                                                                    │
+│   if (!is.null(pmtiles_outlines))                                                                  │
+│     m <- m |> add_pmline(pmtiles_outlines)                                                         │
+│   if (!is.null(labels))                                                                            │
+│     m <- m |> add_pmlabel(labels)                                                                  │
+│                                                                                                    │
+│   # legend from metadata                                                                           │
+│   if (legend_meta$categorical) {                                                                   │
+│     m <- m |> mapgl::add_categorical_legend(...)                                                   │
+│   } else {                                                                                         │
+│     m <- m |> mapgl::add_legend(...)                                                               │
+│   }                                                                                                │
+│   m |> mapgl::add_scale_control(position = "bottom-right")                                         │
+│ }                                                                                                  │
+│                                                                                                    │
+│ ---                                                                                                │
+│ Decomposing call sites                                                                             │
+│                                                                                                    │
+│ docs/libs/functions.R map_ecoregions() (~line 83)                                                  │
+│                                                                                                    │
+│ Replace msens::map_pmtiles(...) with composable pipeline. This uses mapgl::maplibre() (not         │
+│ mapboxgl) — all helpers accept both widget types since they only call mapgl::add_* functions.      │
+│ Labels here come from PMTile feature attributes (not sf points), so mapgl::add_symbol_layer() is   │
+│ called directly rather than add_pmlabel().                                                         │
+│                                                                                                    │
+│   eco_filter <- c("in", "ecoregion_key", eco_keys)                                                 │
+│                                                                                                    │
+│   m <- base |>                                                                                     │
+│     msens::add_pmfill(                                                                             │
+│       url          = url_eco,                                                                      │
+│       source_layer = lyr_eco,                                                                      │
+│       col_key      = "ecoregion_key",                                                              │
+│       colors       = stats::setNames(eco_colors, eco_keys),                                        │
+│       filter_keys  = eco_keys,                                                                     │
+│       fill_opacity = 0.6,                                                                          │
+│       outline_color = "black",                                                                     │
+│       outline_width = 3,                                                                           │
+│       tooltip = mapgl::concat(                                                                     │
+│         mapgl::get_column("ecoregion_name"),                                                       │
+│         " (", mapgl::get_column("ecoregion_key"), ")"),                                            │
+│       popup = mapgl::concat(                                                                       │
+│         "<strong>", mapgl::get_column("ecoregion_name"), "</strong><br>",                          │
+│         "Key: ",    mapgl::get_column("ecoregion_key"), "<br>",                                    │
+│         "Region: ", mapgl::get_column("region_name")),                                             │
+│       hover_options = list(fill_opacity = 0.9)) |>                                                 │
+│     msens::add_pmline(list(                                                                        │
+│       list(url = url_pra, source_layer = lyr_pra,                                                  │
+│            id = "pra_ln", source_id = "pra_src",                                                   │
+│            line_color = "white", line_width = 1))) |>                                              │
+│     # ecoregion labels from PMTile features (bold black)                                           │
+│     mapgl::add_symbol_layer(                                                                       │
+│       id           = "eco_lbl",                                                                    │
+│       source       = "main_src",                                                                   │
+│       source_layer = lyr_eco,                                                                      │
+│       text_field   = mapgl::get_column("ecoregion_key"),                                           │
+│       text_size    = 14,                                                                           │
+│       text_font    = list("Open Sans Bold"),                                                       │
+│       text_color   = "black",                                                                      │
+│       text_halo_color = "white",                                                                   │
+│       text_halo_width = 2,                                                                         │
+│       text_allow_overlap = FALSE,                                                                  │
+│       filter       = eco_filter) |>                                                                │
+│     # program area labels from PMTile features                                                     │
+│     mapgl::add_symbol_layer(                                                                       │
+│       id           = "pra_lbl",                                                                    │
+│       source       = "pra_src",                                                                    │
+│       source_layer = lyr_pra,                                                                      │
+│       text_field   = mapgl::get_column("programarea_key"),                                         │
+│       text_size    = 11,                                                                           │
+│       text_font    = list("Open Sans Semibold"),                                                   │
+│       text_color   = "#333333",                                                                    │
+│       text_halo_color = "white",                                                                   │
+│       text_halo_width = 1.5,                                                                       │
+│       text_allow_overlap = FALSE) |>                                                               │
+│     mapgl::add_layers_control(                                                                     │
+│       layers = list(                                                                               │
+│         "Ecoregion fills"       = "main_fill",                                                     │
+│         "Ecoregion outlines"    = "main_ln",                                                       │
+│         "Ecoregion labels"      = "eco_lbl",                                                       │
+│         "Program Area outlines" = "pra_ln",                                                        │
+│         "Program Area labels"   = "pra_lbl")) |>                                                   │
+│     mapgl::add_fullscreen_control() |>                                                             │
+│     mapgl::add_categorical_legend(                                                                 │
+│       legend_title = "BOEM Ecoregions",                                                            │
+│       values       = eco_names,                                                                    │
+│       colors       = eco_colors,                                                                   │
+│       position     = "bottom-left")                                                                │
+│                                                                                                    │
+│ Layer IDs match the existing layers_control: main_fill, main_ln (from add_pmfill() defaults),      │
+│ pra_ln (explicit id in add_pmline()), eco_lbl, pra_lbl.                                            │
+│                                                                                                    │
+│ calc_scores.qmd map_imgs_pra_ply_l48_ak (~line 3245)                                               │
+│                                                                                                    │
+│ Replace msens::map_pmtiles(...) with composable pipeline + labels. Add d_lbls, er_pts_area,        │
+│ pra_pts_area construction:                                                                         │
+│                                                                                                    │
+│ d_lbls <- read_csv(lbls_csv)                                                                       │
+│ var_pra <- "score_extriskspcat_primprod_ecoregionrescaled_equalweights"                            │
+│                                                                                                    │
+│ for (is_ak in c(TRUE, FALSE)) {                                                                    │
+│   # ... area filtering + label point construction ...                                              │
+│                                                                                                    │
+│   m <- mapboxgl(style = mapbox_style("dark"), projection = "globe") |>                             │
+│     fit_bounds(bbox = er_area) |>                                                                  │
+│     msens::add_pmfill(                                                                             │
+│       url = glue("{pmtiles_base_url}/{ver}/{tbl_pra_pm}.pmtiles"),                                 │
+│       source_layer = tbl_pra_pm, col_key = "programarea_key",                                      │
+│       d = pra_area |> st_drop_geometry(), col_value = var_pra,                                     │
+│       filter_keys = pra_area$programarea_key) |>                                                   │
+│     msens::add_pmline(list(                                                                        │
+│       list(url = glue("{pmtiles_base_url}/{ver}/{tbl_er_pm}.pmtiles"),                             │
+│            source_layer = tbl_er_pm, line_color = "lightgray",                                     │
+│            line_width = 5,                                                                         │
+│            filter = c("in", "ecoregion_key", er_area$ecoregion_key)))) |>                          │
+│     msens::add_pmlabel(list(                                                                       │
+│       list(source = pra_pts_area, text_field = "programarea_key"),                                 │
+│       list(source = er_pts_area,  text_field = "ecoregion_name",                                   │
+│            text_color = "black", text_halo_color = "lightgray",                                    │
+│            text_halo_width = 2, text_halo_blur = 2,                                                │
+│            text_line_height = 1.5, text_size = 20))) |>                                            │
+│     mapgl::add_legend("Score", values = ..., colors = ...,                                         │
+│                       position = lgnd_pos) |>                                                      │
+│     mapgl::add_scale_control(position = "bottom-right")                                            │
+│ }                                                                                                  │
+│                                                                                                    │
+│ Need to extract rng and ramp from add_pmfill() for the legend. Use attr(m, "legend_meta").         │
+│                                                                                                    │
+│ calc_scores.qmd map_imgs_cell_l48_ak (~line 3427)                                                  │
+│                                                                                                    │
+│ Replace ~80-line manual pipeline with msens::map_cells():                                          │
+│                                                                                                    │
+│ m <- msens::map_cells(                                                                             │
+│   r = r_area, colors = cols_r, bounds = er_area,                                                   │
+│   raster_opacity = 0.9, legend_title = title,                                                      │
+│   legend_position = lgnd_pos, legend_values = rng_r,                                               │
+│   pmtiles_outlines = list(                                                                         │
+│     list(url = glue("{pmtiles_base_url}/{ver}/{tbl_er_pm}.pmtiles"),                               │
+│          source_layer = tbl_er_pm, line_color = "lightgray",                                       │
+│          line_width = 5, filter = er_filter),                                                      │
+│     list(url = glue("{pmtiles_base_url}/{ver}/{tbl_pra_pm}.pmtiles"),                              │
+│          source_layer = tbl_pra_pm, line_color = "black",                                          │
+│          line_width = 1, filter = pra_filter)),                                                    │
+│   labels = list(                                                                                   │
+│     list(source = pra_pts_area, text_field = "programarea_key"),                                   │
+│     list(source = er_pts_area, text_field = "ecoregion_name",                                      │
+│          text_color = "black", text_halo_color = "lightgray",                                      │
+│          text_halo_width = 2, text_halo_blur = 2,                                                  │
+│          text_line_height = 1.5, text_size = 20)))                                                 │
+│                                                                                                    │
+│ apps/mapgl/app.R — Initial render (~line 846)                                                      │
+│                                                                                                    │
+│ Use composable helpers with explicit IDs so proxy code stays compatible:                           │
+│                                                                                                    │
+│ output$map <- renderMapboxgl({                                                                     │
+│   r <- r_init                                                                                      │
+│   n_cols <- 11                                                                                     │
+│   cols_r <- rev(RColorBrewer::brewer.pal(n_cols, "Spectral"))                                      │
+│   rng_r  <- minmax(r) |> as.numeric() |> signif(digits = 3)                                        │
+│                                                                                                    │
+│   mapboxgl(                                                                                        │
+│     style = mapbox_style("dark"),                                                                  │
+│     projection = ifelse(input$tgl_sphere, "globe", "mercator")                                     │
+│   ) |>                                                                                             │
+│     fit_bounds(st_bbox(r) |> as.numeric()) |>                                                      │
+│     msens::add_pmline(list(                                                                        │
+│       list(url = glue("{pmtiles_base_url}/{tbl_pra_pm}.pmtiles"),                                  │
+│            source_layer = tbl_pra_pm, id = "pra_ln", source_id = "pra_src",                        │
+│            line_color = "white", line_width = 1),                                                  │
+│       list(url = glue("{pmtiles_base_url}/{tbl_er}.pmtiles"),                                      │
+│            source_layer = tbl_er, id = "er_ln", source_id = "er_src",                              │
+│            line_color = "black", line_width = 3, before_id = "pra_ln"))) |>                        │
+│     msens::add_cells(r, cols_r, raster_opacity = 0.6, before_id = "er_ln") |>                      │
+│     mapgl::add_legend(                                                                             │
+│       get_lyr_name(lyr_default), values = rng_r,                                                   │
+│       colors = cols_r, position = "bottom-right") |>                                               │
+│     add_fullscreen_control() |>                                                                    │
+│     add_navigation_control() |>                                                                    │
+│     add_scale_control() |>                                                                         │
+│     add_layers_control(layers = list(                                                              │
+│       "Program Area outlines" = "pra_ln",                                                          │
+│       "Ecoregions outlines"   = "er_ln",                                                           │
+│       "Raster cell values"    = "r_lyr")) |>                                                       │
+│     add_geocoder_control(placeholder = "Go to location")                                           │
+│ })                                                                                                 │
+│                                                                                                    │
+│ Proxy cell update (~line 962): Replace add_image_source() + add_raster_layer() with                │
+│ msens::add_cells():                                                                                │
+│                                                                                                    │
+│ map_proxy |>                                                                                       │
+│   msens::add_cells(r, cols_r, raster_opacity = 0.6, before_id = "er_ln") |>                        │
+│   mapgl::add_legend(...) |> ...                                                                    │
+│                                                                                                    │
+│ Layer IDs stay er_ln, pra_ln, r_lyr — all proxy references remain unchanged.                       │
+│                                                                                                    │
+│ apps/mapsp/app.R — Initial render (~line 605)                                                      │
+│                                                                                                    │
+│ Replace manual add_pmtiles_source() + add_line_layer() calls with msens::add_pmline():             │
+│                                                                                                    │
+│ output$map <- renderMapboxgl({                                                                     │
+│   mapboxgl(                                                                                        │
+│     style = mapbox_style("dark"),                                                                  │
+│     projection = ifelse(input$tgl_sphere, "globe", "mercator"),                                    │
+│     zoom = 3.5, center = c(-106, 40.1)                                                             │
+│   ) |>                                                                                             │
+│     msens::add_pmline(list(                                                                        │
+│       list(url = glue("{pmtiles_base_url}/{tbl_pra_pm}.pmtiles"),                                  │
+│            source_layer = tbl_pra_pm, id = "pra_ln", source_id = "pra_src",                        │
+│            line_color = "white", line_width = 1),                                                  │
+│       list(url = glue("{pmtiles_base_url}/{tbl_er}.pmtiles"),                                      │
+│            source_layer = tbl_er, id = "er_ln", source_id = "er_src",                              │
+│            line_color = "black", line_width = 3, before_id = "pra_ln"))) |>                        │
+│     add_fullscreen_control() |> ...                                                                │
+│ })                                                                                                 │
+│                                                                                                    │
+│ Keep add_fixed_range_raster() in proxy updates (specific to mapsp's 1-100 range).                  │
+│                                                                                                    │
+│ ---                                                                                                │
+│ Files to modify                                                                                    │
+│                                                                                                    │
+│ ┌───────────────────────────┬────────────────────────────────────────────────────────────────────┐ │
+│ │           File            │                               Change                               │ │
+│ ├───────────────────────────┼────────────────────────────────────────────────────────────────────┤ │
+│ │ msens/R/viz.R             │ Add add_pmfill(), add_pmline(), add_pmlabel(), add_cells(),        │ │
+│ │                           │ map_cells(); refactor map_pmtiles() to use helpers                 │ │
+│ ├───────────────────────────┼────────────────────────────────────────────────────────────────────┤ │
+│ │ msens/DESCRIPTION         │ Add terra to Imports                                               │ │
+│ ├───────────────────────────┼────────────────────────────────────────────────────────────────────┤ │
+│ │ workflows/calc_scores.qmd │ Decompose map_pmtiles() call in pra chunk + add labels; use        │ │
+│ │                           │ map_cells() in cell chunk                                          │ │
+│ ├───────────────────────────┼────────────────────────────────────────────────────────────────────┤ │
+│ │ docs/libs/functions.R     │ Decompose map_pmtiles() call in map_ecoregions() to add_pmfill() + │ │
+│ │                           │  add_pmline() + direct symbol layers                               │ │
+│ ├───────────────────────────┼────────────────────────────────────────────────────────────────────┤ │
+│ │ apps/mapgl/app.R          │ Use add_pmline() + add_cells() in initial render and proxy         │ │
+│ ├───────────────────────────┼────────────────────────────────────────────────────────────────────┤ │
+│ │ apps/mapsp/app.R          │ Use add_pmline() in initial render                                 │ │
+│ └───────────────────────────┴────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                    │
+│ Verification                                                                                       │
+│                                                                                                    │
+│ 1. devtools::document() + devtools::install() — confirm exports: add_pmfill, add_pmline,           │
+│ add_pmlabel, add_cells, map_cells, map_pmtiles                                                     │
+│ 2. Render map_imgs_pra_ply_l48_ak — labels in map_pra_ak_v4.png                                    │
+│ 3. Render map_imgs_cell_l48_ak — labels + raster in map_cell_score_ak_v4.png                       │
+│ 4. Render fig-map-ecoregions-science in docs — verify interactive map                              │
+│ 5. Run mapgl app — verify initial render + cell/pra layer switching                                │
+│ 6. Run mapsp app — verify initial render + species raster updates       
+
+⏺ Everything looks correct. Let me do a quick summary of all changes made.
+                                                                                                      
+  Here's a summary of all changes:                                                        
+                                                                                                      
+  msens/R/viz.R — Added 5 new composable helper functions and refactored map_pmtiles():               
+  - add_pmfill() — PMTile polygon fill with match_expr coloring; attaches legend_meta attribute for   
+  downstream legend construction                                                                      
+  - add_pmline() — PMTile outline line layers from a list of specs
+  - add_pmlabel() — Symbol label layers from sf point data with auto-detection of per-feature
+  placement columns
+  - add_cells() — Raster cell layer (image source + raster layer)
+  - map_cells() — Convenience constructor composing add_cells() + add_pmline() + add_pmlabel() +
+  legend
+  - map_pmtiles() — Refactored to be a thin wrapper around add_pmfill() + add_pmline() +
+  add_pmlabel(); added labels parameter
+
+  msens/DESCRIPTION — Added terra to Imports
+
+  docs/libs/functions.R — map_ecoregions() decomposed from msens::map_pmtiles() to msens::add_pmfill()
+   + msens::add_pmline() + direct symbol layers + explicit categorical legend. Layer IDs now:
+  main_fill, main_ln, pra_ln, eco_lbl, pra_lbl
+
+  workflows/calc_scores.qmd:
+  - map_imgs_pra_ply_l48_ak — Replaced msens::map_pmtiles() with msens::add_pmfill() +
+  msens::add_pmline() pipeline with explicit legend from legend_meta
+  - map_imgs_cell_l48_ak — Replaced ~80-line manual pipeline with msens::map_cells() using PMTile
+  outlines and sf point labels
+
+  apps/mapgl/app.R:
+  - Initial render: Replaced manual source/layer calls with msens::add_pmline() + msens::add_cells()
+  - Proxy update: Replaced add_image_source() + add_raster_layer() with msens::add_cells()
+
+  apps/mapsp/app.R — Initial render: Replaced manual add_pmtiles_source() + add_line_layer() calls
+  with msens::add_pmline()
+
+  All layer IDs are preserved so existing proxy code and layers_control references remain compatible.
+
+
+Add labels to "map_imgs_pra_ply_l48_ak" chunk map outputs like in "map_imgs_cell_l48_ak" R chunk outputs.
+
+⏺ Done. The map_imgs_pra_ply_l48_ak chunk now:
+                                                                                          
+  1. Loads d_lbls from lbls_csv
+  2. Constructs er_pts_area and pra_pts_area (with label placement offsets) for each AK/L48 iteration 
+  — same pattern as the cell chunk
+  3. Adds labels via msens::add_pmlabel() with:                                                       
+    - Program area keys (white text, default style)               
+    - Ecoregion names (black text with lightgray halo, size 20)
+
+## 2026-03-12 add checkbox
+
+For the main apps (`@mapgl/app.R`, `@mapsp/app.R`) implement a checkbox (default true) that clicking to false disables the Splash modal upon next visit. Remembering this option for the user's next visit will presumably rely on cookies in some way. Add an About link aligned on right inline with title that opens this Splash modal again (so still accessible after checkbox set to false). Move the `input_dark_mode` next to this.
+
+Here is Claude's plan:
+
+ Plan: Splash Modal Persistence & Header Layout
+
+ Context
+
+ Both main apps (mapgl/app.R, mapsp/app.R) show a welcome splash modal on every visit with no way to suppress it. The dark mode toggle lives in the sidebar. We
+ need to: (1) add a checkbox to disable the splash on future visits via localStorage, (2) add an "About" link in the header to reopen the modal, and (3) move the
+  dark mode toggle to the header next to About.
+
+ Approach
+
+ 1. Add JavaScript for localStorage in tags$head()
+
+ Each app gets inline JS that:
+ - On shiny:connected, reads localStorage key (e.g. msens_mapgl_show_splash) and sets Shiny.setInputValue('show_splash_pref', ...)
+ - Registers a saveSplashPref custom message handler to write to localStorage
+
+ mapgl: Add tags$script() alongside existing tags$style() in tags$head() (~line 541)
+ mapsp: Extend existing tags$script() block in tags$head() (~line 208)
+
+ 2. Restructure title in page_sidebar()
+
+ Replace the simple string title with a flexbox div containing:
+ - Title text (left)
+ - About actionLink + input_dark_mode (right, via margin-left: auto)
+
+ mapgl (line 561): title = glue(...) → flexbox div
+ mapsp (lines 215-216): titlePanel(glue(...)) → title = div(...)
+
+ 3. Remove input_dark_mode from sidebar
+
+ mapgl: Delete lines 597-600
+ mapsp: Delete lines 225-228
+
+ 4. Define show_welcome() helper in each app
+
+ Extract the modal content into a function. Add a checkboxInput("chk_show_splash", "Show this welcome screen on startup", value = TRUE) at the bottom of the
+ modal body. Each app keeps its own content (different description paragraphs and cross-links).
+
+ 5. Conditional modal on startup
+
+ Replace unconditional showModal(modalDialog(...)) with:
+ observe({
+   if (isTRUE(input$show_splash_pref))
+     show_welcome()
+ }) |> bindEvent(input$show_splash_pref, once = TRUE)
+
+ 6. About link observer
+
+ observe({ show_welcome() }) |> bindEvent(input$btn_about)
+
+ 7. Save checkbox preference
+
+ observe({
+   session$sendCustomMessage(
+     "saveSplashPref",
+     tolower(as.character(input$chk_show_splash)))
+ }) |> bindEvent(input$chk_show_splash)
+
+ 8. Tour button — no changes needed
+
+ Existing btn_tour observers work correctly since bindEvent fires on any click of the recreated button.
+
+ Files to Modify
+
+ - /Users/bbest/Github/MarineSensitivity/apps/mapgl/app.R — UI (lines 540-601), server (lines 665-760)
+ - /Users/bbest/Github/MarineSensitivity/apps/mapsp/app.R — UI (lines 201-268), server (lines 270-341)
+
+ Verification
+
+ 1. Run each app locally (shiny::runApp("apps/mapgl"), shiny::runApp("apps/mapsp"))
+ 2. Confirm splash shows on first visit (localStorage empty)
+ 3. Uncheck "Show this welcome screen on startup", close modal
+ 4. Refresh — splash should NOT appear
+ 5. Click "About" in header — splash reopens with checkbox unchecked
+ 6. Re-check checkbox, refresh — splash appears again
+ 7. Confirm dark mode toggle works in new header position
+ 8. Confirm "Take a Tour" still works from both startup modal and About-triggered modal
+
+How can the checkbox (and its text) be moved to left-align in @../apps/mapgl/app.R? Similarly update to left-aligned bullet points in @../apps/mapsp/app.R 
+
+Also center the buttons below the footer  
 
 ## 2026-03-11 add v4 summary to homepage
-
 
 Help summarize the following into a v4 update as as of 2026-03-10  in Version History to `@index.qmd`:
 
@@ -75,6 +1121,8 @@ Maybe I need to rebuild the server docker caddy instance?
   cd ~/Github/MarineSensitivity/workflows
   ./libs/deploy_to_server.sh v4 data
   2. Or just sync pmtiles + reload Caddy manually:
+
+  ```bash
   SSH_KEY="$HOME/My Drive/private/msens_key_pair.pem"
   SSH_HOST="ubuntu@msens1.marinesensitivity.org"
 
@@ -93,7 +1141,8 @@ Maybe I need to rebuild the server docker caddy instance?
   /share/data/derived/v4/pmtiles"
   ssh -i "$SSH_KEY" "$SSH_HOST" "cd /share/github/MarineSensitivity/server && docker compose exec caddy caddy reload
   --config /etc/caddy/Caddyfile"
-
+  ```
+  
   You don't need to rebuild the Caddy container - the config already has the v4 paths. You just need to ensure the
   pmtiles files are actually on the server at /share/data/derived/v4/pmtiles/. A Caddy reload (not rebuild) after
   deploying should be sufficient.

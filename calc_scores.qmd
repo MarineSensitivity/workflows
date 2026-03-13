@@ -137,9 +137,9 @@ er_raw_gpkg <- find_input("ply_ecoregions_2025.gpkg", prev_dirs)
 pa_gpkg <- find_input("ply_planareas_2025.gpkg", prev_dirs)
 
 # flags, typical
-do_zones <- T # no, except if new spatial or change versions
-do_metrics <- T # YES
-do_zone_taxon <- T # slow in past
+do_zones <- F # no, except if new spatial or change versions
+do_metrics <- F # YES
+do_zone_taxon <- F # slow in past
 do_postgis <- F # NO, since migrated to pmtiles
 do_downloads <- T # YES
 do_summary_data <- T # ecoregion x PRA intersections, label points, score tables
@@ -151,7 +151,7 @@ do_pmtiles <- F # generate PMTiles archives for mapgl/mapsp apps
 do_pra_primprod <- T # NO, unless zones or primary prod ∆; zonal primary productivity for program areas
 do_deploy <- T # sync derived data + app code to server
 
-stopifnot(!do_pmtiles && do_downloads) # pmtiles should be generated from downloads
+stopifnot(!do_pmtiles || (do_pmtiles && do_downloads)) # pmtiles should be generated from downloads
 
 # spatial outputs (year reflects input data vintage, version suffix model version of derived metric columns)
 pra_gpkg <- glue("{dir_v}/ply_programareas_2026_{ver}.gpkg")
@@ -2974,13 +2974,15 @@ pra_sf <- pra_geom |>
 
 # mapView(pra_sf, zcol = "score_extriskspcat_primprod_ecoregionrescaled_equalweights")
 
-sf_to_pmtiles(pra_sf, tbl_pra)
+# program areas for pmtiles: base columns only (scores joined at render time)
+pra_pm_sf <- pra_geom |> select(any_of(base_cols))
+sf_to_pmtiles(pra_pm_sf, tbl_pra_pm)
 
 # plot(pra_sf["score_extriskspcat_primprod_ecoregionrescaled_equalweights"])
 
 # ecoregions WITHOUT metrics (outlines only) ----
 er_sf <- read_sf(er_raw_gpkg)
-sf_to_pmtiles(er_sf, tbl_er)
+sf_to_pmtiles(er_sf, tbl_er_pm)
 ```
 
 ## Summary data products
@@ -3243,23 +3245,15 @@ if (redo_summary_figs) {
 #| label: map_imgs_pra_ply_l48_ak
 #| eval: !expr do_summary_figs
 
+var_pra <- "score_extriskspcat_primprod_ecoregionrescaled_equalweights"
 d_lbls <- read_csv(lbls_csv)
 
-var_pra <- "score_extriskspcat_primprod_ecoregionrescaled_equalweights"
-n_cols <- 11
-rng_pra <- pra |>
-  pull({{ var_pra }}) |>
-  range()
-cols_pra <- rev(RColorBrewer::brewer.pal(n_cols, "Spectral"))
-brks_pra <- seq(rng_pra[1], rng_pra[2], length.out = n_cols)
-
-for (is_ak in c(T, F)) {
+for (is_ak in c(TRUE, FALSE)) {
   if (is_ak) {
-    # alaska
-    er_area <- er |>
+    pra_area <- pra |>
       filter(region_key == "AK") |>
       st_shift_longitude()
-    pra_area <- pra |>
+    er_area <- er |>
       filter(region_key == "AK") |>
       st_shift_longitude()
 
@@ -3280,16 +3274,14 @@ for (is_ak in c(T, F)) {
 
     lgnd_pos <- "top-left"
   } else {
-    # lower 48
-    box_lower48 <- pra |>
+    box_l48 <- pra |>
       filter(region_key != "AK") |>
       st_bbox() |>
       st_as_sfc()
-
-    er_area <- er |>
-      st_filter(box_lower48, .predicate = st_intersects)
     pra_area <- pra |>
-      st_filter(box_lower48, .predicate = st_intersects)
+      st_filter(box_l48, .predicate = st_intersects)
+    er_area <- er |>
+      st_filter(box_l48, .predicate = st_intersects)
 
     er_pts_area <- er_pts |>
       filter(ecoregion_key %in% er_area$ecoregion_key) |>
@@ -3306,104 +3298,59 @@ for (is_ak in c(T, F)) {
 
     lgnd_pos <- "bottom-left"
   }
-  scale_pos <- "bottom-right"
-
-  er_url <- glue(
-    "https://api.marinesensitivity.org/tilejson?table=public.{tbl_er}&use_cache=FALSE"
-  )
-  pra_url <- glue(
-    "https://api.marinesensitivity.org/tilejson?table=public.{tbl_pra}&use_cache=FALSE"
-  )
-  er_filter <- c("in", "ecoregion_key", er_area$ecoregion_key)
-  pra_filter <- c("in", "programarea_key", pra_area$programarea_key)
 
   m <- mapboxgl(
     style = mapbox_style("dark"),
     projection = "globe"
   ) |>
     fit_bounds(bbox = er_area) |>
-    add_vector_source(
-      id = "pra_src",
-      url = pra_url
-    ) |>
-    add_vector_source(
-      id = "er_src",
-      url = er_url
-    ) |>
-    add_fill_layer(
-      id = "pra_fill",
-      source = "pra_src",
-      source_layer = glue("public.{tbl_pra}"),
-      filter = pra_filter,
-      fill_color = mapgl::interpolate(
-        column = var_pra,
-        values = brks_pra,
-        stops = cols_pra
+    msens::add_pmfill(
+      url = glue("{pmtiles_base_url}/{ver}/{tbl_pra_pm}.pmtiles"),
+      source_layer = tbl_pra_pm,
+      col_key = "programarea_key",
+      d = pra_area |> sf::st_drop_geometry(),
+      col_value = var_pra,
+      filter_keys = pra_area$programarea_key
+    )
+
+  legend_meta <- attr(m, "legend_meta")
+
+  m <- m |>
+    msens::add_pmline(list(
+      list(
+        url = glue("{pmtiles_base_url}/{ver}/{tbl_er_pm}.pmtiles"),
+        source_layer = tbl_er_pm,
+        line_color = "lightgray",
+        line_width = 5,
+        filter = c("in", "ecoregion_key", er_area$ecoregion_key)
       )
-    ) |>
-    add_line_layer(
-      id = "er_ln",
-      source = "er_src",
-      source_layer = glue("public.{tbl_er}"),
-      filter = er_filter,
-      line_color = "lightgray",
-      line_opacity = 1,
-      line_width = 5
-    ) |>
-    add_line_layer(
-      id = "pra_ln",
-      source = "pra_src",
-      source_layer = glue("public.{tbl_pra}"),
-      filter = pra_filter,
-      line_color = "black",
-      line_opacity = 1,
-      line_width = 1
-    ) |>
-    add_symbol_layer(
-      id = "pra_symbol",
-      source = pra_pts_area,
-      filter = pra_filter,
-      text_field = get_column("programarea_key"),
-      text_allow_overlap = T,
-      text_anchor = get_column("text_anchor"),
-      text_justify = get_column("text_justify"),
-      text_offset = list(
-        get_column("text_offset_right"),
-        get_column("text_offset_down")
+    )) |>
+    msens::add_pmlabel(list(
+      list(source = pra_pts_area, text_field = "programarea_key"),
+      list(
+        source = er_pts_area,
+        text_field = "ecoregion_name",
+        text_color = "black",
+        text_halo_color = "lightgray",
+        text_halo_width = 2,
+        text_halo_blur = 2,
+        text_line_height = 1.5,
+        text_size = 20
       )
-    ) |>
-    add_symbol_layer(
-      id = "er_symbol",
-      source = er_pts_area,
-      filter = er_filter,
-      text_field = get_column("ecoregion_name"),
-      text_color = "black",
-      text_allow_overlap = T,
-      text_anchor = get_column("text_anchor"),
-      text_justify = get_column("text_justify"),
-      text_offset = list(
-        get_column("text_offset_right"),
-        get_column("text_offset_down")
-      ),
-      text_halo_color = "lightgray",
-      text_halo_width = 2,
-      text_halo_blur = 2,
-      text_line_height = 1.5,
-      text_size = 20
-    ) |>
+    )) |>
     mapgl::add_legend(
       "Score",
-      values = rng_pra,
-      colors = cols_pra,
+      values = legend_meta$rng,
+      colors = legend_meta$colors,
       position = lgnd_pos
     ) |>
-    add_scale_control(position = scale_pos)
+    mapgl::add_scale_control(position = "bottom-right")
 
   b <- glue("{dir_figs}/map_pra_{ifelse(is_ak, 'ak', 'l48')}{v_sfx}")
   b_html <- glue("{b}.html")
   b_files <- glue("{b}_files")
   b_png <- glue("{b}.png")
-  saveWidget(m, b_html, selfcontained = F, background = "transparent")
+  saveWidget(m, b_html, selfcontained = FALSE, background = "transparent")
   webshot(
     b_html,
     b_png,
@@ -3412,7 +3359,7 @@ for (is_ak in c(T, F)) {
     zoom = 2,
     selector = "#htmlwidget_container",
     delay = 2,
-    quiet = T
+    quiet = TRUE
   )
   file_delete(b_html)
   dir_delete(b_files)
@@ -3541,96 +3488,47 @@ for (is_vgpm in c(T, F)) {
     }
     scale_pos <- "bottom-right"
 
-    er_url <- glue(
-      "https://api.marinesensitivity.org/tilejson?table=public.{tbl_er}&use_cache=FALSE"
-    )
-    pra_url <- glue(
-      "https://api.marinesensitivity.org/tilejson?table=public.{tbl_pra}&use_cache=FALSE"
-    )
     er_filter <- c("in", "ecoregion_key", er_area$ecoregion_key)
     pra_filter <- c("in", "programarea_key", pra_area$programarea_key)
 
-    m <- mapboxgl(
-      style = mapbox_style("dark"),
-      projection = "globe"
-    ) |>
-      fit_bounds(bbox = er_area) |>
-      add_image_source(
-        id = "r_src",
-        data = r_area,
-        colors = cols_r
-      ) |>
-      add_vector_source(
-        id = "pra_src",
-        url = pra_url
-      ) |>
-      add_vector_source(
-        id = "er_src",
-        url = er_url
-      ) |>
-      add_raster_layer(
-        id = "r_lyr",
-        source = "r_src",
-        raster_opacity = 0.9,
-        raster_resampling = "nearest"
-      ) |>
-      add_line_layer(
-        id = "er_ln",
-        source = "er_src",
-        source_layer = glue("public.{tbl_er}"),
-        filter = er_filter,
-        line_color = "lightgray",
-        line_opacity = 1,
-        line_width = 5
-      ) |>
-      add_line_layer(
-        id = "pra_ln",
-        source = "pra_src",
-        source_layer = glue("public.{tbl_pra}"),
-        filter = pra_filter,
-        line_color = "black",
-        line_opacity = 1,
-        line_width = 1
-      ) |>
-      add_symbol_layer(
-        id = "pra_symbol",
-        source = pra_pts_area,
-        filter = pra_filter,
-        text_field = get_column("programarea_key"),
-        text_allow_overlap = T,
-        text_anchor = get_column("text_anchor"),
-        text_justify = get_column("text_justify"),
-        text_offset = list(
-          get_column("text_offset_right"),
-          get_column("text_offset_down")
-        )
-      ) |>
-      add_symbol_layer(
-        id = "er_symbol",
-        source = er_pts_area,
-        filter = er_filter,
-        text_field = get_column("ecoregion_name"),
-        text_color = "black",
-        text_allow_overlap = T,
-        text_anchor = get_column("text_anchor"),
-        text_justify = get_column("text_justify"),
-        text_offset = list(
-          get_column("text_offset_right"),
-          get_column("text_offset_down")
+    m <- msens::map_cells(
+      r = r_area,
+      colors = cols_r,
+      bounds = er_area,
+      raster_opacity = 0.9,
+      legend_title = title,
+      legend_position = lgnd_pos,
+      legend_values = rng_r,
+      pmtiles_outlines = list(
+        list(
+          url = glue("{pmtiles_base_url}/{ver}/{tbl_er_pm}.pmtiles"),
+          source_layer = tbl_er_pm,
+          line_color = "lightgray",
+          line_width = 5,
+          filter = er_filter
         ),
-        text_halo_color = "lightgray",
-        text_halo_width = 2,
-        text_halo_blur = 2,
-        text_line_height = 1.5,
-        text_size = 20
-      ) |>
-      mapgl::add_legend(
-        title,
-        values = rng_r,
-        colors = cols_r,
-        position = lgnd_pos
-      ) |>
-      add_scale_control(position = scale_pos)
+        list(
+          url = glue("{pmtiles_base_url}/{ver}/{tbl_pra_pm}.pmtiles"),
+          source_layer = tbl_pra_pm,
+          line_color = "black",
+          line_width = 1,
+          filter = pra_filter
+        )
+      ),
+      labels = list(
+        list(source = pra_pts_area, text_field = "programarea_key"),
+        list(
+          source = er_pts_area,
+          text_field = "ecoregion_name",
+          text_color = "black",
+          text_halo_color = "lightgray",
+          text_halo_width = 2,
+          text_halo_blur = 2,
+          text_line_height = 1.5,
+          text_size = 20
+        )
+      )
+    )
 
     b <- glue(
       "{dir_figs}/map_cell_{ifelse(is_vgpm, 'npp', 'score')}_{ifelse(is_ak, 'ak', 'l48')}{v_sfx}"
@@ -4188,7 +4086,13 @@ Programmatically generate `README.md` and `README.html` for the versioned output
 dp_csv <- here("data/derived_products.csv")
 stopifnot(file_exists(dp_csv))
 
-d_dp <- read_csv(dp_csv)
+# read and expand {ver} placeholders in output_file and dependencies
+d_dp <- read_csv(dp_csv) |>
+  rowwise() |>
+  mutate(
+    output_file = glue(output_file),
+    dependencies = glue(dependencies)) |>
+  ungroup()
 
 # list actual files in dir_v (non-recursive, exclude README itself)
 v_files <- dir_ls(dir_v, recurse = F) |>
@@ -4237,7 +4141,7 @@ readme_lines <- c(
     - `tbl_*`: tabular summary data (CSV) 
     - `layers_*`: layer metadata for metrics and species
     - `zone_taxon_*`: zone × taxon matrix
-    - `*_v3`: version 3 model outputs
+    - `*_{ver}`: version {ver} model outputs
     
     ## Large files
     
