@@ -14,11 +14,193 @@
 
 - [ ] show OBIS/GBIF obs, esp Rice's whale extra (email)
 
-- [ ] fix mapgl hover issue (only see in JS Console)
+- [ ] fix mapgl hover issue (only see in JS Console); apps_v3/libs/patch_mapgl.R (uncommitted)
 
 - [ ] Also consider updating the apps (@../apps/mapgl.R, @../apps/mapsp.R) to using the new `metric.metric_title|metric_abbrev` where applicable (moving away from `layers_v3.csv`)
 
 - Migrate to hexagons
+
+
+## 2026-03-16 cleanup full disk on server
+
+The disk on my Ubuntu server is full:
+
+```bash
+df -H
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root        21G  7.0G   14G  34% /
+tmpfs           8.4G     0  8.4G   0% /dev/shm
+tmpfs           3.4G  1.9M  3.4G   1% /run
+tmpfs           5.3M     0  5.3M   0% /run/lock
+/dev/xvda15     110M  6.4M  104M   6% /boot/efi
+/dev/xvdb       215G  215G   25k 100% /share
+tmpfs           1.7G  4.1k  1.7G   1% /run/user/1000
+
+```
+
+Help me identify the biggest files for possible deletion
+
+The `/dev/xvdb` volume mounted at `/share` is completely full. Here are the commands to identify what's eating up space:
+
+**1. Top-level directories by size**
+```bash
+du -h --max-depth=1 /share | sort -rh | head -20
+```
+
+```
+212G	/share
+99G	/share/postgis
+39G	/share/data
+37G	/share/docker
+29G	/share/postgis_backups
+9.2G	/share/github
+1.3G	/share/public
+19M	/share/pgadmin
+4.0M	/share/logs
+176K	/share/caddy
+20K	/share/private
+0	/share/shiny_apps
+0	/share/.Rproj.user
+```
+
+**2. Drill into the biggest directory (replace `<big_dir>`)**
+```bash
+du -h --max-depth=1 /share/postgis_backups | sort -rh | head -20
+```
+
+du -h --max-depth=1 /share/<big_dir> | sort -rh | head -20
+
+```bash
+du -h --max-depth=1 /share/postgis_backups | sort -rh | head -20
+29G	/share/postgis_backups
+12G	/share/postgis_backups/monthly
+5.8G	/share/postgis_backups/weekly
+5.8G	/share/postgis_backups/daily
+5.7G	/share/postgis_backups/last
+
+cd /share/postgis_backups/monthly
+ls -la
+drwxr-xr-x 2 lxd 999        168 Mar 11 00:14 .
+drwxrwxrwx 6 lxd 999         60 Oct 26  2023 ..
+-rw-r--r-- 1 lxd 999 3060644487 Nov 30 00:14 msens-202511.sql.gz
+-rw-r--r-- 1 lxd 999 3060644487 Dec 31 00:14 msens-202512.sql.gz
+-rw-r--r-- 1 lxd 999 3067343394 Jan 31 00:14 msens-202601.sql.gz
+-rw-r--r-- 1 lxd 999 3103473372 Feb 28 00:14 msens-202602.sql.gz
+-rw-r--r-- 4 lxd 999 3110172215 Mar 11 00:14 msens-202603.sql.gz
+rm -rf msens-202512.sql.gz msens-202602.sql.gz
+```
+
+
+**3. Find the largest individual files anywhere under `/share`**
+```bash
+find /share -type f -printf '%s %p\n' | sort -rn | head -30 | awk '{printf "%.1fG\t%s\n", $1/1024/1024/1024, $2}'
+```
+
+**4. Find files by type that are common space hogs**
+```bash
+# Large logs
+find /share -name "*.log" -o -name "*.log.*" | xargs du -sh 2>/dev/null | sort -rh | head -20
+
+# Docker layers / images (if applicable)
+find /share -name "*.tar" -o -name "*.tar.gz" | xargs du -sh 2>/dev/null | sort -rh | head -10
+```
+
+**5. Quick summary — find anything over 1GB**
+```bash
+find /share -type f -size +1G -printf '%s\t%p\n' | sort -rn | awk '{printf "%.1fG\t%s\n", $1/1024/1024/1024, $2}'
+```
+
+Run command #1 first to get a high-level breakdown, then use #2 to recurse into the biggest offenders. Once you paste results back I can help you figure out what's safe to delete or move.
+
+
+Help me cleanup unused docker images, containers, etc
+
+```
+root@msens1:~# df -h
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root        20G  6.5G   13G  34% /
+tmpfs           7.9G     0  7.9G   0% /dev/shm
+tmpfs           3.2G  1.8M  3.2G   1% /run
+tmpfs           5.0M     0  5.0M   0% /run/lock
+/dev/xvda15     105M  6.1M   99M   6% /boot/efi
+/dev/xvdb       200G  195G  5.8G  98% /share
+overlay         200G  195G  5.8G  98% /share/docker/overlay2/9ae42186c61acc8c7f4ca86d08afa040de390fe359f389bf0b86386b01b5716a/merged
+overlay         200G  195G  5.8G  98% /share/docker/overlay2/90e1b22f6ff6da915d081d40c9d7d1f75a4cdbb9cc289f8db18a8c8216c8ed9b/merged
+overlay         200G  195G  5.8G  98% /share/docker/overlay2/e68fbc1841aafe611a9d5821a51343b409c55c1b958688aba1619cff3be29f4f/merged
+overlay         200G  195G  5.8G  98% /share/docker/overlay2/a2bd248ea0706ad17ec8b06a751ac85e349f39f5314f1987d0ed6d705e9a2a89/merged
+overlay         200G  195G  5.8G  98% /share/docker/overlay2/e25cb9f8506595ee6609df82354ac4ad830af9de8efefa20c2bfe8029b3742f9/merged
+overlay         200G  195G  5.8G  98% /share/docker/overlay2/5067b5e71a976f7d09859f4ccfbcf87dda581e4fcd327f89e631efdb852cb3ce/merged
+overlay         200G  195G  5.8G  98% /share/docker/overlay2/5d26193a662a53cfa31e6df0b872cf19c149406211b7cbca245bc7f07d2a05d6/merged
+overlay         200G  195G  5.8G  98% /share/docker/overlay2/793e4dc33bb3727e0c0318f89aef66ef500c8873bb9a799e92d304c29b97427b/merged
+overlay         200G  195G  5.8G  98% /share/docker/overlay2/839216560d126421f873e3416648713fb1cf4e9a8af9e38a6f4640fddfe0fc2b/merged
+overlay         200G  195G  5.8G  98% /share/docker/overlay2/b5f419e70c3b295881bbd1a8d69956f210bab8044250ea5787ebb55d490c8983/merged
+tmpfs           1.6G  4.0K  1.6G   1% /run/user/1000
+```
+
+The overlay filesystems confirm Docker is consuming most of your `/share` volume. Here's a systematic cleanup approach:
+
+**Step 1 — See what Docker is using (safe, read-only)**
+```bash
+docker system df
+```
+
+```
+TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE
+Images          14        9         13.86GB   1.556GB (11%)
+Containers      10        10        1.494GB   0B (0%)
+Local Volumes   16        3         80.18kB   80.18kB (100%)
+Build Cache     80        0         6.93GB    6.93GB
+```
+
+**Step 2 — Nuclear option: prune everything unused at once**
+```bash
+docker system prune -a --volumes
+```
+This removes: stopped containers, unused networks, dangling + unreferenced images, and unused volumes. **It will not touch running containers.**
+
+---
+
+If you want to be more surgical:
+
+**Containers only**
+```bash
+# List stopped containers first
+docker ps -a --filter "status=exited" --format "table {{.ID}}\t{{.Names}}\t{{.Size}}\t{{.CreatedAt}}"
+
+# Remove stopped containers
+docker container prune
+```
+
+**Images only**
+```bash
+# List dangling (untagged) images
+docker images -f "dangling=true"
+
+# Remove dangling only
+docker image prune
+
+# Remove ALL unused images (including tagged ones not used by any container)
+docker image prune -a
+```
+
+**Volumes only**
+```bash
+# List unused volumes
+docker volume ls -f "dangling=true"
+
+# Remove unused volumes
+docker volume prune
+```
+
+**Logs (often overlooked)**
+```bash
+# Find bloated container logs
+find /share/docker/containers -name "*.log" -type f | xargs du -sh | sort -rh | head -20
+```
+
+---
+
+I'd recommend running `docker system df` first and sharing the output — it'll show exactly how much space images vs containers vs volumes vs build cache are each consuming, so you know where the biggest wins are before deleting anything.
 
 ## 2026-03-13.e add Program Area key/name to app maps
 
@@ -31,6 +213,13 @@ Uncaught TypeError: Cannot read properties of undefined (reading 'length').
 
 Also with mapsp:
 Also Error: The layer 'r_lyr' does not exist in the map's style.
+
+Let's cache these values so doesn't recalculate unless cache csv missing
+
+Make sure the centroid gets computed from [0,360], not [-180,180]
+
+⏺ Centroids will now be computed in [0,360] longitude space (via st_shift_longitude()) before
+  extracting coordinates. This ensures Alaska program areas get correct label positions.
 
 ## 2026-03-13.d update docs to use proper references across datasets
 

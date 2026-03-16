@@ -140,9 +140,9 @@ REMOTE
     fi
 
     # symlinks into shiny-server root (idempotent)
-    ln -sfn "$APPS_V3/mapgl" "$APPS/mapgl_v3"
-    ln -sfn "$APPS_V3/mapsp" "$APPS/mapsp_v3"
-    echo "--- v3 symlinks ready ---"
+    #ln -sfn "$APPS_V3/mapgl" "$APPS/mapgl_v3"
+    #ln -sfn "$APPS_V3/mapsp" "$APPS/mapsp_v3"
+    #echo "--- v3 symlinks ready ---"
 VERSIONING
 
   echo "=== pulling server config + reloading caddy ==="
