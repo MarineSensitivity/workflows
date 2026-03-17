@@ -43,7 +43,7 @@ source(here("libs/paths.R"))
 con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F))
 
 # section eval flags (set to TRUE to re-run) ----
-do_merge <- T # multiple R chunks to insert new merged dataset; iterate_merge_ds_mdl takes >1 hr
+do_merge_turtles <- T # multiple R chunks to insert new merged dataset; iterate_merge_ds_mdl takes >1 hr
 do_is_ok <- T # flag valid taxa
 ```
 
@@ -53,7 +53,7 @@ do_is_ok <- T # flag valid taxa
 
 ```{r}
 #| label: insert_dataset_merged
-#| eval: !expr do_merge
+#| eval: !expr do_merge_turtles
 ds_key <- "ms_merge"
 row_dataset <- tibble(
   ds_key = !!ds_key,
@@ -91,7 +91,7 @@ dbWriteTable(con_sdm, "dataset", row_dataset, append = TRUE)
 
 ```{r}
 #| label: dataset_metadata
-#| eval: !expr do_merge
+#| eval: !expr do_merge_turtles
 
 # add metadata columns to dataset table ----
 for (col_def in list(
@@ -157,7 +157,7 @@ tbl(con_sdm, "dataset") |>
 
 ```{r}
 #| label: update_turtle_rng_iucn
-#| eval: !expr do_merge
+#| eval: !expr do_merge_turtles
 
 # TODO: systematically reconcile rng_iucn values with latest IUCN Red List API
 #   assessments (rredlist R package). IUCN shapefile `category` can lag behind
@@ -175,13 +175,14 @@ tbl(con_sdm, "dataset") |>
 # is_turtle: override rng_iucn cell values with latest IUCN website assessments
 #   for v4c, generalize this to all species using IUCN API
 d_turtle_iucn <- tribble(
-  ~scientific_name          , ~iucn_code,
-  "Chelonia mydas"          , "LC",  # iucnredlist.org/species/4615/285108125
-  "Eretmochelys imbricata"  , "CR",  # iucnredlist.org/species/8005/12881238
-  "Lepidochelys kempii"     , "CR",  # iucnredlist.org/species/11533/155057916
-  "Dermochelys coriacea"    , "VU",  # iucnredlist.org/species/6494/43526147
-  "Caretta caretta"         , "VU",  # iucnredlist.org/species/3897/119333622
-  "Lepidochelys olivacea"   , "VU")  # iucnredlist.org/species/11534/3292503
+  ~scientific_name         , ~iucn_code ,
+  "Chelonia mydas"         , "LC"       , # iucnredlist.org/species/4615/285108125
+  "Eretmochelys imbricata" , "CR"       , # iucnredlist.org/species/8005/12881238
+  "Lepidochelys kempii"    , "CR"       , # iucnredlist.org/species/11533/155057916
+  "Dermochelys coriacea"   , "VU"       , # iucnredlist.org/species/6494/43526147
+  "Caretta caretta"        , "VU"       , # iucnredlist.org/species/3897/119333622
+  "Lepidochelys olivacea"  , "VU"
+) # iucnredlist.org/species/11534/3292503
 
 # get rng_iucn mdl_seq for each turtle taxon
 d_turtle_mdl <- tbl(con_sdm, "taxon") |>
@@ -190,11 +191,13 @@ d_turtle_mdl <- tbl(con_sdm, "taxon") |>
   inner_join(
     tbl(con_sdm, "taxon_model") |>
       filter(ds_key == "rng_iucn"),
-    by = "taxon_id") |>
+    by = "taxon_id"
+  ) |>
   collect() |>
   inner_join(d_turtle_iucn, by = "scientific_name") |>
   mutate(
-    value = msens::compute_er_score(glue("IUCN:{iucn_code}")))
+    value = msens::compute_er_score(glue("IUCN:{iucn_code}"))
+  )
 
 # update rng_iucn cell values per turtle species
 for (j in 1:nrow(d_turtle_mdl)) {
@@ -203,10 +206,13 @@ for (j in 1:nrow(d_turtle_mdl)) {
     con_sdm,
     glue(
       "UPDATE model_cell SET value = {r$value}
-       WHERE mdl_seq = {r$mdl_seq}"))
+       WHERE mdl_seq = {r$mdl_seq}"
+    )
+  )
   message(glue(
     "  updated {r$scientific_name} rng_iucn (mdl_seq={r$mdl_seq}): ",
-    "IUCN:{r$iucn_code} -> value={r$value} ({n} cells)"))
+    "IUCN:{r$iucn_code} -> value={r$value} ({n} cells)"
+  ))
 }
 ```
 
@@ -214,7 +220,7 @@ for (j in 1:nrow(d_turtle_mdl)) {
 
 ```{r}
 #| label: iterate_merge_ds_mdl
-#| eval: !expr do_merge
+#| eval: !expr do_merge_turtles
 ds_key <- "ms_merge"
 
 # cell_tif <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
@@ -223,7 +229,7 @@ ds_key <- "ms_merge"
 
 d_x <- tbl(con_sdm, "taxon") |>
   filter(is_ok) |>
-  # filter(sp_cat == "turtle") |> # DEBUG
+  filter(sp_cat == "turtle") |>
   arrange(desc(n_ds), taxon_id) |>
   collect()
 
@@ -811,7 +817,6 @@ taxa_in_pra <- tbl(con_sdm, "taxon_model") |>
   inner_join(
     tbl(con_sdm, "zone") |>
       filter(
-        tbl == !!glue("ply_programareas_2026{v_sfx}"),
         fld == "programarea_key"
       ) |>
       select(zone_seq),

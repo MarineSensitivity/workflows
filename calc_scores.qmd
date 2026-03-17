@@ -81,7 +81,7 @@ librarian::shelf(
   leaflet,
   logger,
   mapview,
-  openxlsx,
+  writexl,
   purrr,
   quarto,
   RColorBrewer,
@@ -137,8 +137,8 @@ er_raw_gpkg <- find_input("ply_ecoregions_2025.gpkg", prev_dirs)
 pa_gpkg <- find_input("ply_planareas_2025.gpkg", prev_dirs)
 
 # flags, typical
-do_zones <- F # no, except if new spatial or change versions
-do_metrics <- F # YES
+do_zones <- F # no, except if new spatial zones added
+do_metrics <- T # YES
 do_zone_taxon <- F # slow in past
 do_postgis <- F # NO, since migrated to pmtiles
 do_downloads <- T # YES
@@ -337,32 +337,21 @@ for (tbl_base in c("ply_ecoregions_2025", "ply_planareas_2025")) {
   }
 }
 
-# delete old versioned zones (program areas, subregions) — will be recreated
+# rename versioned zones (program areas, subregions) from ver_prev to ver
 for (old_tbl in zone_tbls_db[str_detect(zone_tbls_db, glue("_{ver_prev}$"))]) {
-  z_seqs <- tbl(con_sdm, "zone") |>
-    filter(tbl == !!old_tbl) |>
-    pull(zone_seq)
-  if (length(z_seqs) > 0) {
-    seq_list <- paste(z_seqs, collapse = ",")
-    dbExecute(
-      con_sdm,
-      glue("DELETE FROM zone_metric WHERE zone_seq IN ({seq_list})")
+  new_tbl <- str_replace(old_tbl, glue("_{ver_prev}$"), glue("_{ver}"))
+  dbExecute(
+    con_sdm,
+    glue("UPDATE zone SET tbl = '{new_tbl}' WHERE tbl = '{old_tbl}'")
+  )
+  # zone_taxon uses zone_tbl column
+  dbExecute(
+    con_sdm,
+    glue(
+      "UPDATE zone_taxon SET zone_tbl = '{new_tbl}' WHERE zone_tbl = '{old_tbl}'"
     )
-    dbExecute(
-      con_sdm,
-      glue("DELETE FROM zone_cell   WHERE zone_seq IN ({seq_list})")
-    )
-    dbExecute(
-      con_sdm,
-      glue("DELETE FROM zone        WHERE zone_seq IN ({seq_list})")
-    )
-    # zone_taxon uses zone_tbl column
-    dbExecute(
-      con_sdm,
-      glue("DELETE FROM zone_taxon  WHERE zone_tbl = '{old_tbl}'")
-    )
-    message(glue("Deleted old zone: {old_tbl} ({length(z_seqs)} zones)"))
-  }
+  )
+  message(glue("Renamed zone tbl: {old_tbl} -> {new_tbl}"))
 }
 
 sp_cats <- tbl(con_sdm, "taxon") |>
@@ -2746,14 +2735,20 @@ if (!file.exists(metrics_tif)) {
       ) |>
       select(all_of(c("cell_id", zone_fld)))
 
+    lvls <- levels(d[[zone_fld]])
+    if (length(lvls) == 0) {
+      message(glue("Skipping {zone_fld}: no zone data found"))
+      next
+    }
+
     r <- init(r_cell[[1]], NA) # |> as.factor() #sort(unique(d$value)))
     # r$chr <- NA_character_ # ensure chr type
     r[d$cell_id] <- d[[zone_fld]]
     varnames(r) <- zone_fld
     names(r) <- zone_fld
     levels(r) <- tibble(
-      id = 1:length(levels(d[[zone_fld]])),
-      "{zone_fld}" := levels(d[[zone_fld]])
+      id = seq_along(lvls),
+      "{zone_fld}" := lvls
     )
     lst[[zone_fld]] <- r
   }
@@ -3314,7 +3309,7 @@ for (is_ak in c(TRUE, FALSE)) {
   ) |>
     fit_bounds(bbox = er_area) |>
     msens::add_pmfill(
-      url = glue("{pmtiles_base_url}/{ver}/{tbl_pra_pm}.pmtiles"),
+      url = glue("{pmtiles_base_url}/{tbl_pra_pm}.pmtiles"),
       source_layer = tbl_pra_pm,
       col_key = "programarea_key",
       d = pra_area |> sf::st_drop_geometry(),
@@ -3327,7 +3322,7 @@ for (is_ak in c(TRUE, FALSE)) {
   m <- m |>
     msens::add_pmline(list(
       list(
-        url = glue("{pmtiles_base_url}/{ver}/{tbl_er_pm}.pmtiles"),
+        url = glue("{pmtiles_base_url}/{tbl_er_pm}.pmtiles"),
         source_layer = tbl_er_pm,
         line_color = "lightgray",
         line_width = 5,
@@ -3510,14 +3505,14 @@ for (is_vgpm in c(T, F)) {
       legend_values = rng_r,
       pmtiles_outlines = list(
         list(
-          url = glue("{pmtiles_base_url}/{ver}/{tbl_er_pm}.pmtiles"),
+          url = glue("{pmtiles_base_url}/{tbl_er_pm}.pmtiles"),
           source_layer = tbl_er_pm,
           line_color = "lightgray",
           line_width = 5,
           filter = er_filter
         ),
         list(
-          url = glue("{pmtiles_base_url}/{ver}/{tbl_pra_pm}.pmtiles"),
+          url = glue("{pmtiles_base_url}/{tbl_pra_pm}.pmtiles"),
           source_layer = tbl_pra_pm,
           line_color = "black",
           line_width = 1,
@@ -3685,16 +3680,24 @@ d_pra_only |>
 #| label: compare_scores_prev
 #| eval: !expr do_summary_figs
 
-# previous version score csv
-pra_n_csv_prev <- glue(
-  "{dir_derived}/{ver_prev}/tbl_pra_scores_{ver_prev}.csv"
-)
-comp_csv <- glue("{dir_v}/tbl_pra_scores_{ver}_vs_{ver_prev}.csv")
+# compare pra scores between two versions ----
+# returns list with long (d_comp), wide diff (d_comp_wide), and
+# wide prev/curr/diff (d_comp_pvt) data frames; NULL if files missing
+compare_scores <- function(ver_curr, ver_prev) {
+  csv_curr <- glue("{dir_derived}/{ver_curr}/tbl_pra_scores_{ver_curr}.csv")
+  csv_prev <- glue("{dir_derived}/{ver_prev}/tbl_pra_scores_{ver_prev}.csv")
 
-if (file_exists(pra_n_csv_prev) && file_exists(pra_n_csv)) {
-  d_prev <- read_csv(pra_n_csv_prev) |>
+  if (!file_exists(csv_prev) || !file_exists(csv_curr)) {
+    message(glue(
+      "Skipping {ver_curr} vs {ver_prev}: ",
+      "prev={file_exists(csv_prev)}, curr={file_exists(csv_curr)}"
+    ))
+    return(NULL)
+  }
+
+  d_prev <- read_csv(csv_prev, show_col_types = FALSE) |>
     rename(`Area (1,000 km2)` = `Area (1,000 km^2^)`)
-  d_curr <- read_csv(pra_n_csv) |>
+  d_curr <- read_csv(csv_curr, show_col_types = FALSE) |>
     rename(`Area (1,000 km2)` = `Area (1,000 km^2^)`)
 
   # component columns (exclude Program Area and Area)
@@ -3703,12 +3706,16 @@ if (file_exists(pra_n_csv_prev) && file_exists(pra_n_csv)) {
     setdiff(names(d_curr), c("Program Area", "Area (1,000 km2)"))
   )
 
+  # use version names for value columns (e.g., Score_v4b, Score_v4)
+  v_c <- ver_curr
+  v_p <- ver_prev
+
   d_comp <- d_prev |>
     select(`Program Area`, all_of(comp_cols)) |>
     pivot_longer(
       cols = all_of(comp_cols),
       names_to = "Component",
-      values_to = "prev"
+      values_to = v_p
     ) |>
     full_join(
       d_curr |>
@@ -3716,19 +3723,20 @@ if (file_exists(pra_n_csv_prev) && file_exists(pra_n_csv)) {
         pivot_longer(
           cols = all_of(comp_cols),
           names_to = "Component",
-          values_to = "curr"
+          values_to = v_c
         ),
       by = c("Program Area", "Component")
     ) |>
     mutate(
-      diff = curr - prev
+      diff = .data[[v_c]] - .data[[v_p]]
     ) |>
     arrange(Component, `Program Area`)
 
+  comp_csv <- glue("{dir_v}/tbl_pra_scores_{ver_curr}_vs_{ver_prev}.csv")
   write_csv(d_comp, comp_csv)
   message(glue("Wrote score comparison to {comp_csv}"))
 
-  # summary table: wide format with diff per component
+  # wide diff table
   d_comp_wide <- d_comp |>
     select(`Program Area`, Component, diff) |>
     pivot_wider(
@@ -3737,18 +3745,199 @@ if (file_exists(pra_n_csv_prev) && file_exists(pra_n_csv)) {
     ) |>
     arrange(`Program Area`)
 
-  d_comp_wide |>
+  # wide prev/curr/diff pivot (like Excel comparison) ----
+  # only rows where Score differs; columns: Score_v4b, Score_v4, Score_diff, ...
+  pra_diff <- d_comp |>
+    filter(Component == "Score", diff != 0) |>
+    pull(`Program Area`)
+
+  score_diff_col <- glue("Score_diff")
+
+  if (length(pra_diff) > 0) {
+    d_comp_pvt <- d_comp |>
+      filter(`Program Area` %in% pra_diff) |>
+      pivot_wider(
+        names_from = Component,
+        values_from = c(all_of(v_p), all_of(v_c), diff),
+        names_glue = "{Component}_{.value}"
+      ) |>
+      # rename ver columns: Score_v4 / Score_v4b / Score_diff
+      rename_with(
+        ~ str_replace(.x, glue("_{v_p}$"), glue("_{v_p}")),
+        ends_with(glue("_{v_p}"))
+      ) |>
+      rename_with(
+        ~ str_replace(.x, glue("_{v_c}$"), glue("_{v_c}")),
+        ends_with(glue("_{v_c}"))
+      ) |>
+      select(
+        `Program Area`,
+        starts_with("Score_"),
+        !starts_with("Score_")
+      ) |>
+      arrange(desc(.data[[score_diff_col]]))
+
+    pvt_xlsx <- glue(
+      "{dir_v}/tbl_pra_scores_{ver_curr}_vs_{ver_prev}_pivot.xlsx"
+    )
+    write_xlsx(d_comp_pvt, pvt_xlsx)
+    message(glue("Wrote pivot comparison to {pvt_xlsx}"))
+  } else {
+    d_comp_pvt <- NULL
+    message(glue("No score differences between {ver_curr} and {ver_prev}"))
+  }
+
+  list(
+    d_comp = d_comp,
+    d_comp_wide = d_comp_wide,
+    d_comp_pvt = d_comp_pvt,
+    comp_cols = comp_cols,
+    ver_curr = ver_curr,
+    ver_prev = ver_prev
+  )
+}
+
+# compare ver vs ver_prev (v4b vs v4) ----
+res <- compare_scores(ver, ver_prev)
+if (!is.null(res)) {
+  res$d_comp_wide |>
     DT::datatable(
-      caption = glue("Score differences ({ver} - {ver_prev})"),
+      caption = glue("Score differences ({res$ver_curr} - {res$ver_prev})"),
       options = list(pageLength = 25, dom = "t")
     ) |>
-    DT::formatRound(columns = comp_cols, digits = 0)
-} else {
-  message(glue(
-    "Skipping score comparison: ",
-    "prev={file_exists(pra_n_csv_prev)}, ",
-    "curr={file_exists(pra_n_csv)}"
-  ))
+    DT::formatRound(columns = res$comp_cols, digits = 0)
+}
+```
+
+```{r}
+#| label: compare_scores_prev_pivot
+#| eval: !expr do_summary_figs
+
+# pivot table: rows where scores differ (ver vs ver_prev) ----
+if (!is.null(res) && !is.null(res$d_comp_pvt)) {
+  res$d_comp_pvt |>
+    DT::datatable(
+      caption = glue(
+        "Score pivot where different ({res$ver_curr} vs {res$ver_prev})"
+      ),
+      options = list(pageLength = 25, dom = "t", scrollX = TRUE)
+    ) |>
+    DT::formatRound(
+      columns = setdiff(names(res$d_comp_pvt), "Program Area"),
+      digits = 0
+    )
+}
+```
+
+```{r}
+#| label: compare_scores_v3
+#| eval: !expr do_summary_figs
+
+# compare ver vs v3 ----
+res_v3 <- compare_scores(ver, "v3")
+if (!is.null(res_v3)) {
+  res_v3$d_comp_wide |>
+    DT::datatable(
+      caption = glue(
+        "Score differences ({res_v3$ver_curr} - {res_v3$ver_prev})"
+      ),
+      options = list(pageLength = 25, dom = "t")
+    ) |>
+    DT::formatRound(columns = res_v3$comp_cols, digits = 0)
+}
+```
+
+```{r}
+#| label: compare_scores_v3_pivot
+#| eval: !expr do_summary_figs
+
+# pivot table: rows where scores differ (ver vs v3) ----
+if (!is.null(res_v3) && !is.null(res_v3$d_comp_pvt)) {
+  res_v3$d_comp_pvt |>
+    DT::datatable(
+      caption = glue(
+        "Score pivot where different ({res_v3$ver_curr} vs {res_v3$ver_prev})"
+      ),
+      options = list(pageLength = 25, dom = "t", scrollX = TRUE)
+    ) |>
+    DT::formatRound(
+      columns = setdiff(names(res_v3$d_comp_pvt), "Program Area"),
+      digits = 0
+    )
+}
+```
+
+### Multi-version comparison pivot
+
+```{r}
+#| label: compare_scores_multi
+#| eval: !expr do_summary_figs
+
+# multi-version pivot: Score and Turtle across v3, v4, v4b ----
+vers_compare <- c("v3", "v4", ver)
+csvs <- glue("{dir_derived}/{vers_compare}/tbl_pra_scores_{vers_compare}.csv")
+names(csvs) <- vers_compare
+
+if (all(file_exists(csvs))) {
+  # read all versions into one long table
+  d_all <- imap_dfr(csvs, \(f, v) {
+    read_csv(f, show_col_types = FALSE) |>
+      rename(`Area (1,000 km2)` = `Area (1,000 km^2^)`) |>
+      select(`Program Area`, Score, Turtle) |>
+      mutate(ver = v)
+  })
+
+  # pivot wide: Score_v3, Score_v4, Score_v4b, Turtle_v3, ...
+  d_wide <- d_all |>
+    pivot_wider(
+      names_from = ver,
+      values_from = c(Score, Turtle),
+      names_glue = "{.value}_{ver}"
+    )
+
+  # add diff columns
+  d_wide <- d_wide |>
+    mutate(
+      Score_v4_v3 = Score_v4 - Score_v3,
+      Score_v4b_v3 = Score_v4b - Score_v3,
+      Turtle_v4_v3 = Turtle_v4 - Turtle_v3,
+      Turtle_v4b_v3 = Turtle_v4b - Turtle_v3
+    ) |>
+    select(
+      `Program Area`,
+      Score_v3,
+      Score_v4,
+      Score_v4_v3,
+      Score_v4b,
+      Score_v4b_v3,
+      Turtle_v3,
+      Turtle_v4,
+      Turtle_v4_v3,
+      Turtle_v4b,
+      Turtle_v4b_v3
+    ) |>
+    arrange(desc(Score_v4b_v3))
+
+  # write xlsx
+  multi_xlsx <- glue("{dir_v}/tbl_pra_scores_v3_vs_v4_v4b.xlsx")
+  write_xlsx(d_wide, multi_xlsx)
+  message(glue("Wrote multi-version comparison to {multi_xlsx}"))
+
+  # display
+  num_cols <- setdiff(names(d_wide), "Program Area")
+  d_wide |>
+    DT::datatable(
+      caption = "Program Area scores: v3 vs v4 vs v4b (Score and Turtle)",
+      options = list(pageLength = 25, dom = "t", scrollX = TRUE)
+    ) |>
+    DT::formatRound(columns = num_cols, digits = 0) |>
+    DT::formatStyle(
+      columns = num_cols[str_detect(num_cols, "_v[34]")],
+      backgroundColor = DT::styleInterval(
+        c(-0.5, 0.5),
+        c("#f4cccc", "white", "#d9ead3")
+      )
+    )
 }
 ```
 
@@ -4100,7 +4289,8 @@ d_dp <- read_csv(dp_csv) |>
   rowwise() |>
   mutate(
     output_file = glue(output_file),
-    dependencies = glue(dependencies)) |>
+    dependencies = glue(dependencies)
+  ) |>
   ungroup()
 
 # list actual files in dir_v (non-recursive, exclude README itself)

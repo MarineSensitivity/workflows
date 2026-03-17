@@ -39,15 +39,29 @@ if [[ "$MODE" == "all" || "$MODE" == "data" ]]; then
   echo "=== ensuring remote dir ${REMOTE_BIG}/${VER} exists ==="
   ssh -i "$SSH_KEY" "$SSH_HOST" "sudo mkdir -p ${REMOTE_BIG}/${VER} && sudo chown ubuntu:staff ${REMOTE_BIG}/${VER} && sudo chmod g+s ${REMOTE_BIG}/${VER}"
 
-  # dry-run to check if duckdb actually changed
+  # check if remote duckdb exists and matches local
   echo "=== checking if sdm.duckdb needs syncing ==="
-  DB_CHANGED=$(rsync -avz --dry-run --itemize-changes \
-    -e "ssh -i \"$SSH_KEY\"" \
-    --exclude='*.wal' \
-    "$DB_BIG" \
-    "$SSH_HOST:${REMOTE_DB}" | grep -c '^>f' || true)
+  REMOTE_EXISTS=$(ssh -i "$SSH_KEY" "$SSH_HOST" "test -f ${REMOTE_DB} && echo yes || echo no")
+  LOCAL_SIZE=$(stat -f%z "$DB_BIG" 2>/dev/null || stat -c%s "$DB_BIG")
+  echo "    local:  ${DB_BIG} (${LOCAL_SIZE} bytes)"
+  echo "    remote: ${REMOTE_DB} (exists: ${REMOTE_EXISTS})"
 
-  if [[ "$DB_CHANGED" -gt 0 ]]; then
+  if [[ "$REMOTE_EXISTS" == "no" ]]; then
+    DB_NEEDS_SYNC=1
+    echo "    -> remote missing, will transfer"
+  else
+    REMOTE_SIZE=$(ssh -i "$SSH_KEY" "$SSH_HOST" "stat -c%s ${REMOTE_DB}")
+    echo "    remote size: ${REMOTE_SIZE} bytes"
+    if [[ "$LOCAL_SIZE" != "$REMOTE_SIZE" ]]; then
+      DB_NEEDS_SYNC=1
+      echo "    -> size differs, will transfer"
+    else
+      DB_NEEDS_SYNC=0
+      echo "    -> size matches, skipping transfer"
+    fi
+  fi
+
+  if [[ "$DB_NEEDS_SYNC" -eq 1 ]]; then
     echo "=== syncing sdm.duckdb to staging file ==="
     rsync -avz --progress \
       -e "ssh -i \"$SSH_KEY\"" \
@@ -66,11 +80,11 @@ if [[ "$MODE" == "all" || "$MODE" == "data" ]]; then
     "$TIF_SHARED" \
     "$SSH_HOST:$REMOTE_DERIVED/"
 
-  echo "=== syncing pmtiles ==="
+  echo "=== syncing pmtiles (shared) ==="
   rsync -avz --progress \
     -e "ssh -i \"$SSH_KEY\"" \
-    "$HOME/_big/msens/derived/${VER}/pmtiles/" \
-    "$SSH_HOST:$REMOTE_DERIVED/${VER}/pmtiles/"
+    "$HOME/My Drive/projects/msens/data/derived/pmtiles/" \
+    "$SSH_HOST:$REMOTE_DERIVED/pmtiles/"
 
   # 2. fix permissions ----
   echo "=== fixing permissions ==="

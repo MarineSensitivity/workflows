@@ -34,8 +34,8 @@ v_sfx <- glue::glue("_{ver}")
 # server type detection (MSENS_ENV=prod set in prod docker-compose.yml)
 is_prod <- Sys.getenv("MSENS_ENV") == "prod"
 
-# pmtiles
-dir_pmtiles <- glue::glue("{dir_big_v}/pmtiles")
+# pmtiles (shared across versions — geometry only, scores joined at render time)
+dir_pmtiles <- glue::glue("{dir_derived}/pmtiles")
 pmtiles_base_url <- ifelse(
   is_prod,
   "/pmtiles", # prod: relative path on same host

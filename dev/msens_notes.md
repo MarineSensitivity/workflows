@@ -20,6 +20,98 @@
 
 - Migrate to hexagons
 
+## 2026-03-17.d v4b: do_merge_turtles in merge_models.qmd; compare_scores_prev vs v4,v3 & pivot in calc_scores.qmd
+
+Convert compare_scores_prev into a function with ver and ver_prev as arguments. Run this by default 
+ on ver and ver_prev already set in libs/paths.R. For this version v4b, also include comparison with  
+ver_prev = v3. Also add a new section that pivots both where scores differ like                       
+@'/Users/bbest/Library/CloudStorage/GoogleDrive-ben@ecoquants.com/My                                  
+Drive/projects/msens/data/derived/v4/tbl_pra_scores_v4_vs_v3_turtle-score.xlsx'
+
+⏺ Changes made to calc_scores.qmd:                                                                    
+                                                                  
+  1. compare_scores(ver_curr, ver_prev) function — encapsulates the comparison logic, returns         
+  long/wide/pivot data frames, writes CSV + Excel                                                     
+  2. Default call — compare_scores(ver, ver_prev) (v4b vs v4)                                         
+  3. v3 call — compare_scores(ver, "v3") (v4b vs v3)                                                  
+  4. Pivot sections — for each comparison, a separate chunk shows a DT::datatable with                
+  {Component}_{prev|curr|diff} columns, filtered to only Program Areas where Score differs, sorted by 
+  largest Score diff descending. Also writes to _pivot.xlsx.      
+
+Update with simpler writexl (to be installed with librarian::shelf())                               
+                                                                        
+⏺ openxlsx is still used on line 3677 with a namespaced call, so removing it from shelf() is fine —   
+  it'll load on demand. Done: swapped openxlsx → writexl in the shelf and the compare_scores function
+  now uses write_xlsx().   
+
+⏺ Render completed successfully. The changes:
+
+  1. Version-named columns: Score_v4b, Score_v4, Score_diff (instead of Score_prev, Score_curr,
+  Score_diff)
+  2. Empty-diff guard: When no scores differ (like v4b vs v4 currently), the pivot returns NULL and
+  displays a message instead of crashing
+  3. Zone rename fix: Versioned zones are renamed (_v4 → _v4b) instead of deleted
+    
+
+⏺ Here's a summary of all changes:
+
+  libs/paths.R: dir_pmtiles → {dir_derived}/pmtiles (shared, unversioned)
+
+  calc_scores.qmd: pmtiles URLs changed from {pmtiles_base_url}/{ver}/ → {pmtiles_base_url}/
+
+  apps/mapsp/app.R & apps/mapgl/app.R: pmtiles_base_url drops /{ver} suffix
+
+  server/caddy/Caddyfile & server/prod/Caddyfile: Added new /pmtiles/* route pointing to /share/data/derived/pmtiles; kept legacy
+  /pmtiles/v4/* and /pmtiles/v3/* for backward compat
+
+  Local: Copied pmtiles to ~/My Drive/projects/msens/data/derived/pmtiles/
+
+  On the server you'll need to:
+  1. mkdir -p /share/data/derived/pmtiles && cp /share/data/derived/v4/pmtiles/* /share/data/derived/pmtiles/
+  2. Reload Caddy: docker exec caddy caddy reload --config /etc/caddy/Caddyfile
+
+
+
+## 2026-03-17.c create `v4` archive, promote `v4b` to main workflows
+
+I want this version `v4b` to be the current active version (so main branch), and create workflows   
+and apps archive of `v4` (ie branch) 
+
+⏺ Here's the current state:                                     
+                                                                                                      
+  - Workflows: main and v4b are at the same commit (1cf4076b). You have uncommitted v4b changes in    
+  calc_scores.qmd, merge_models.qmd, libs/paths.R, dev/msens_notes.md, and new docs/ directory.
+  - Apps: main is at f4e0848. No v4b branch exists. Has archive branches v2, v3, v3b.                 
+                                                                                                      
+  Here's the plan:
+                                                                                                      
+  1. Both repos: Create v4 branch from current main and push (archives v4 state)                      
+──────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Scope                                                                                              
+                                                                  
+Should I also commit your uncommitted v4b changes and merge them into main? Or just create the v4     
+archive branches for now?                                                                             
+  
+  1. Archive only                                                                                     
+     Just create and push v4 archive branches in both repos. You'll handle committing and merging v4b 
+     later.
+❯ 2. Full promotion
+     Create v4 archives, commit the v4b changes, merge v4b into main, and push everything.
+
+⏺ Done. Here's the summary:                                                                           
+  
+  Workflows repo:                                                                                     
+  - v4 branch → 1cf4076b (archived v4 state)                      
+  - main → 20525ca8 (v4b turtle multiplicative merge, now active)                                     
+  - v4b → same as main                                            
+                                                                                                      
+  Apps repo:                                                                                          
+  - v4 branch → f4e0848 (archived v4 state)                                                           
+  - main → unchanged (no v4b changes in apps)                                                         
+                                                                  
+  One remaining unstaged change: dev/msens_notes.md has a minor modification not included in the      
+  commit. Want me to handle that too?       
+
 
 ## 2026-03-17.b create Github Issue for generating version `v4c` (branch of workflows and apps) to update all species
 
