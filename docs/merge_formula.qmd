@@ -1,0 +1,120 @@
+---
+title: "Merge Formula Design"
+subtitle: "Multiplicative merge approach for species distribution models"
+format:
+  html:
+    code-fold: true
+---
+
+## Overview
+
+This document describes the evolution of the merge formula used to combine
+species distribution models (SDMs) with extinction risk (ER) data.
+
+## v4: Max-Value Merge (baseline)
+
+Takes `max(value)` across ALL datasets (including mask/range datasets) for each
+grid cell. Because mask datasets encode extinction risk as cell values (e.g.,
+SWOT+DPS: EN=100, TN=50; IUCN: CR=50, EN=25), the max operation effectively
+sets a **floor** at the ER value.
+
+**Problem**: Artificially high values in marginal habitat. For example, Alaska
+cells with AquaMaps suitability=1 get value=50 or 100 for turtles.
+
+## v4b: Turtles-Only Multiplicative Merge
+
+### Formula
+
+```
+merged_value = pmax(1, round(er_value * suit_value / 100))
+```
+
+- **er_value**: From SWOT+DPS (EN=100, TN=50)
+- **suit_value**: From AquaMaps (0-100); cells in SWOT but outside AquaMaps get
+  suit=1
+- Both treated as percentages: EN(100%) * suit(1%) = 1%
+- Critical habitat cells (ch_nmfs, ch_fws, ca_nmfs) **override** -- keep
+  original values, unioned via max
+- **Minimum value of 1**: Any cell where species has data always gets at least 1
+
+Non-turtle species: unchanged v4 `max()` approach.
+
+### Example Values
+
+| Scenario | v4 (max) | v4b (multiplicative) |
+|---|---|---|
+| Green turtle, EN DPS, Alaska (suit=1) | max(1, 100) = **100** | round(100*1/100) = **1** |
+| Green turtle, TN, Gulf of Mexico (suit=80) | max(80, 50) = **80** | round(50*80/100) = **40** |
+| Green turtle, EN DPS, Florida (suit=95) | max(95, 100) = **100** | round(100*95/100) = **95** |
+| Green turtle, critical habitat cell (ch=100) | max(suit, 100) = **100** | **100** (override) |
+
+### Scoring Changes
+
+For turtles (`is_er_spatial = TRUE`), ER is already baked into cell values, so
+`calc_scores.qmd` skips the additional er_score multiplication:
+
+- `extrisk` metric: `SUM(mc.value)` instead of `SUM(er.er_score * mc.value) / 100`
+- `zone_taxon`: `suit_rl = avg_suit` instead of `suit_rl = avg_suit * er_score / 100`
+
+## v4c: All-Species Multiplicative Merge (planned)
+
+### Formula (same as v4b, applied universally)
+
+```
+merged_value = pmax(1, round(er_value * suit_value / 100))
+```
+
+Minimum value of 1 guaranteed for all cells with any data.
+
+### Design Decisions
+
+1. **ER always baked in**: Multiply by scalar `er_score` for species without
+   spatial ER data, so calc_scores NEVER multiplies by er_score again.
+   `suit_rl = avg_suit` universally.
+
+2. **Critical habitat override**: ch_nmfs, ch_fws, ca_nmfs cells keep their
+   original values via max union.
+
+3. **MMPA/MBTA floors still apply**: `pmax(value, 20)` for MMPA,
+   `pmax(value, 10)` for MBTA after multiplicative merge.
+
+### Scenario Table
+
+| Has spatial ER? | Has suitability? | Species example | ER value | Suit value | Merged value |
+|---|---|---|---|---|---|
+| Yes (SWOT+DPS) | Yes (AquaMaps) | Green turtle | Cell-specific (50/100) | Cell-specific (1-100) | round(er * suit / 100) |
+| Yes (IUCN range) | Yes (AquaMaps) | Atlantic cod (CR) | 50 (from rng_iucn) | 80 (from am_0.05) | round(50 * 80 / 100) = 40 |
+| Yes (BirdLife) | No | Piping plover (EN) | 25 (from bl) | **??? (see below)** | ??? |
+| No | Yes (AquaMaps) | Unassessed fish | scalar er_score (e.g., 1) | 80 | round(1 * 80 / 100) = 1 |
+| No | No | -- | -- | -- | No data, skip |
+| Yes (ch_nmfs) | Yes (AquaMaps) | Salmon (EN) crit hab | 100 (override) | any | **100** (override) |
+
+### Open Question: "Range but no suitability" (457 birds)
+
+Most birds (457 of ~458) have BirdLife range but NO AquaMaps. Options:
+
+- **suit=100**: Treat as "present with certainty" -> merged = er_value unchanged.
+  Same as current v4.
+- **suit=50**: Arbitrary average suitability -> merged = er/2.
+- **Use endemism proxy**: v3b had an `ms_endemism` layer based on log-scaled
+  range restriction as a suitability proxy. **However, the v3b endemism layer is
+  flawed**: it clips to the US EEZ, so the true global geographic range is
+  unknown. This is further complicated by birds, which typically have ranges
+  spanning land (which gets clipped by the EEZ boundary), making the
+  endemism/range-restriction calculation inaccurate.
+
+**This is the key design question for v4c and should be resolved before
+implementation.**
+
+### Dataset Classification
+
+| ds_key | is_suit | is_er |
+|---|---|---|
+| am_0.05 | TRUE | FALSE |
+| ca_nmfs | FALSE | TRUE |
+| ch_nmfs | FALSE | TRUE |
+| ch_fws | FALSE | TRUE |
+| rng_fws | FALSE | TRUE |
+| bl | FALSE | TRUE |
+| rng_iucn | FALSE | TRUE |
+| rng_turtle_swot_dps | FALSE | TRUE |

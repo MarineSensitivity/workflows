@@ -9,13 +9,15 @@ editor_options:
   chunk_output_type: console
 ---
 
-## Overview
+## Overview (`v4b`: `is_turtle` = TRUE)
 
 Merge species distribution models from multiple datasets, flag valid taxa
 (`is_ok`), and produce tabular summaries as input to `calc_scores.qmd`.
 
 Data preparation steps (taxonomic ID resolution, ad-hoc species fixes,
 dataset ingestion) are in `merge_models_prep.qmd`.
+
+**`v4b`**. For turtles, this workflow implements a "multiplicative merge" approach that integrates the SWOT+DPS ER surface with suitability surfaces from other datasets, while still allowing critical habitat cells to override via max. For non-turtles, the workflow implements a "max merge" approach that simply takes the maximum value across all datasets for each cell, with masking based on global mask priority when applicable. The max merge approach is unchanged from previous versions.
 
 ```{r}
 #| label: setup
@@ -151,6 +153,63 @@ tbl(con_sdm, "dataset") |>
   collect()
 ```
 
+### Update turtle rng_iucn values
+
+```{r}
+#| label: update_turtle_rng_iucn
+#| eval: !expr do_merge
+
+# TODO: systematically reconcile rng_iucn values with latest IUCN Red List API
+#   assessments (rredlist R package). IUCN shapefile `category` can lag behind
+#   the current website assessment. Known mismatches beyond turtles include:
+#   - Chinook Salmon: shapefile LC(1) vs latest IUCN assessment TBD
+#   - Killer Whale: shapefile DD(1) vs latest IUCN assessment TBD
+#   - Beluga Whale: shapefile LC(1) vs latest IUCN assessment TBD
+#   - Humpback Whale: shapefile LC(1) vs latest IUCN assessment TBD
+#   - Steller Sea Lion: shapefile NT(2) vs latest IUCN assessment TBD
+#   - False Killer Whale: shapefile NT(2) vs latest IUCN assessment TBD
+#   - Bearded Seal: shapefile NT(2) vs latest IUCN assessment TBD
+#   - Boulder Star Coral: shapefile NT(2) vs latest IUCN assessment TBD
+#   - Dolly Varden: shapefile LC(1) vs latest IUCN assessment TBD
+
+# is_turtle: override rng_iucn cell values with latest IUCN website assessments
+#   for v4c, generalize this to all species using IUCN API
+d_turtle_iucn <- tribble(
+  ~scientific_name          , ~iucn_code,
+  "Chelonia mydas"          , "LC",  # iucnredlist.org/species/4615/285108125
+  "Eretmochelys imbricata"  , "CR",  # iucnredlist.org/species/8005/12881238
+  "Lepidochelys kempii"     , "CR",  # iucnredlist.org/species/11533/155057916
+  "Dermochelys coriacea"    , "VU",  # iucnredlist.org/species/6494/43526147
+  "Caretta caretta"         , "VU",  # iucnredlist.org/species/3897/119333622
+  "Lepidochelys olivacea"   , "VU")  # iucnredlist.org/species/11534/3292503
+
+# get rng_iucn mdl_seq for each turtle taxon
+d_turtle_mdl <- tbl(con_sdm, "taxon") |>
+  filter(sp_cat == "turtle") |>
+  select(taxon_id, scientific_name) |>
+  inner_join(
+    tbl(con_sdm, "taxon_model") |>
+      filter(ds_key == "rng_iucn"),
+    by = "taxon_id") |>
+  collect() |>
+  inner_join(d_turtle_iucn, by = "scientific_name") |>
+  mutate(
+    value = msens::compute_er_score(glue("IUCN:{iucn_code}")))
+
+# update rng_iucn cell values per turtle species
+for (j in 1:nrow(d_turtle_mdl)) {
+  r <- d_turtle_mdl[j, ]
+  n <- dbExecute(
+    con_sdm,
+    glue(
+      "UPDATE model_cell SET value = {r$value}
+       WHERE mdl_seq = {r$mdl_seq}"))
+  message(glue(
+    "  updated {r$scientific_name} rng_iucn (mdl_seq={r$mdl_seq}): ",
+    "IUCN:{r$iucn_code} -> value={r$value} ({n} cells)"))
+}
+```
+
 ### Iterate merge across taxa
 
 ```{r}
@@ -203,6 +262,7 @@ for (i in 1:nrow(d_x)) {
   # i = 1  # which(str_detect(d_x$scientific_name, ".*ricei")) # i = 1512
 
   d_sp <- d_x |> slice(i)
+  is_turtle <- d_sp$sp_cat == "turtle"
   # d_sp |> glimpse()
   # Rows: 1
   # Columns: 18
@@ -270,91 +330,153 @@ for (i in 1:nrow(d_x)) {
   # 4 ch_nmfs       3    90    90 ch_nmfs (3 cells, 90 - 90)
   # 5 rng_fws     264    50    90 rng_fws (264 cells, 50 - 90)
 
-  # datasets used for SDM
-  ds_sdm_sp <- intersect(d_sp_l$ds_key, ds_keys_sdm)
+  if (is_turtle) {
+    # turtle multiplicative merge (v4b) ----
+    # merged_value = pmax(1, round(er_value * suit_value / 100))
+    # critical habitat cells override via max
 
-  sdm_mdl_seqs <- d_sp_l |>
-    filter(ds_key %in% ds_sdm_sp) |>
-    pull(mdl_seq)
+    # suitability surface: non-mask SDM datasets (e.g., am_0.05)
+    ds_suit_sp <- intersect(d_sp_l$ds_key, setdiff(ds_keys_sdm, ds_keys_mask))
+    # ER surface: SWOT+DPS
+    ds_er_sp <- intersect(d_sp_l$ds_key, "rng_turtle_swot_dps")
+    # critical habitat datasets
+    ds_ch_sp <- intersect(d_sp_l$ds_key, c("ch_nmfs", "ch_fws", "ca_nmfs"))
+    # all datasets used (for description)
+    ds_sdm_sp <- unique(c(ds_suit_sp, ds_er_sp, ds_ch_sp))
 
-  # query of SDM with max value across all datasets
-  q_sdm <- tbl(con_sdm, "model_cell") |>
-    filter(
-      mdl_seq %in% sdm_mdl_seqs
-    ) |>
-    group_by(cell_id) |>
-    summarize(value = max(value, na.rm = T), .groups = "drop")
+    if (length(ds_er_sp) > 0) {
+      er_mdl_seqs <- d_sp_l |>
+        filter(ds_key %in% ds_er_sp) |>
+        pull(mdl_seq)
+      d_er <- tbl(con_sdm, "model_cell") |>
+        filter(mdl_seq %in% er_mdl_seqs) |>
+        select(cell_id, er_value = value) |>
+        collect()
 
-  # find highest-priority global mask this species has
-  sp_global_masks <- d_sp_l |>
-    inner_join(ds_global_masks, by = "ds_key") |>
-    arrange(global_mask_priority)
+      if (length(ds_suit_sp) > 0) {
+        suit_mdl_seqs <- d_sp_l |>
+          filter(ds_key %in% ds_suit_sp) |>
+          pull(mdl_seq)
+        d_suit <- tbl(con_sdm, "model_cell") |>
+          filter(mdl_seq %in% suit_mdl_seqs) |>
+          group_by(cell_id) |>
+          summarize(suit_value = max(value, na.rm = T), .groups = "drop") |>
+          collect()
+        d_r_sp <- d_er |>
+          left_join(d_suit, by = "cell_id") |>
+          mutate(
+            suit_value = coalesce(suit_value, 1L),
+            value = pmax(
+              1L,
+              as.integer(round(
+                er_value * suit_value / 100
+              ))
+            )
+          ) |>
+          select(cell_id, value)
+      } else {
+        # no suitability: suit=1 everywhere
+        d_r_sp <- d_er |>
+          mutate(
+            value = pmax(1L, as.integer(round(er_value * 1L / 100)))
+          ) |>
+          select(cell_id, value)
+      }
+    } else {
+      # no SWOT+DPS (unlikely): fall back to max of all SDMs
+      sdm_mdl_seqs <- d_sp_l |>
+        filter(ds_key %in% intersect(d_sp_l$ds_key, ds_keys_sdm)) |>
+        pull(mdl_seq)
+      d_r_sp <- tbl(con_sdm, "model_cell") |>
+        filter(mdl_seq %in% sdm_mdl_seqs) |>
+        group_by(cell_id) |>
+        summarize(value = max(value, na.rm = T), .groups = "drop") |>
+        collect()
+    }
 
-  has_global_mask <- nrow(sp_global_masks) > 0
+    # union critical habitat cells (override via max)
+    if (length(ds_ch_sp) > 0) {
+      ch_mdl_seqs <- d_sp_l |>
+        filter(ds_key %in% ds_ch_sp) |>
+        pull(mdl_seq)
+      d_ch <- tbl(con_sdm, "model_cell") |>
+        filter(mdl_seq %in% ch_mdl_seqs) |>
+        group_by(cell_id) |>
+        summarize(value = max(value, na.rm = T), .groups = "drop") |>
+        collect()
+      d_r_sp <- bind_rows(d_r_sp, d_ch) |>
+        group_by(cell_id) |>
+        summarize(value = max(value, na.rm = T), .groups = "drop")
+    }
 
-  # only mask if species has at least one SDM dataset besides the global mask
-  # (avoid self-intersection, e.g. birds with only BirdLife)
-  has_other_sdm <- FALSE
-  if (has_global_mask) {
-    best_mask_ds <- sp_global_masks$ds_key[1]
-    other_sdm_ds <- setdiff(ds_sdm_sp, best_mask_ds)
-    has_other_sdm <- length(other_sdm_ds) > 0
-  }
+    has_global_mask <- FALSE
+    has_other_sdm <- FALSE
+  } else {
+    # non-turtle max merge (v4 approach, unchanged) ----
 
-  if (has_global_mask && has_other_sdm) {
-    # get datasets used for mask
-    # exclude lower-priority global masks from the mask union
-    lower_global_masks <- sp_global_masks |>
-      filter(ds_key != best_mask_ds) |>
-      pull(ds_key)
-    ds_mask_sp <- setdiff(
-      intersect(d_sp_l$ds_key, ds_keys_mask),
-      lower_global_masks
-    )
+    # datasets used for SDM
+    ds_sdm_sp <- intersect(d_sp_l$ds_key, ds_keys_sdm)
 
-    # get mdl_seqs for masking datasets
-    mask_mdl_seqs <- d_sp_l |>
-      filter(ds_key %in% ds_mask_sp) |>
+    sdm_mdl_seqs <- d_sp_l |>
+      filter(ds_key %in% ds_sdm_sp) |>
       pull(mdl_seq)
 
-    q_mask <- tbl(con_sdm, "model_cell") |>
-      filter(mdl_seq %in% mask_mdl_seqs) |>
-      distinct(cell_id) |>
-      mutate(value = 1)
-
-    # get SDM cells with mask applied
-    d_r_sp <- q_sdm |>
-      semi_join(
-        q_mask,
-        by = join_by(cell_id)
+    # query of SDM with max value across all datasets
+    q_sdm <- tbl(con_sdm, "model_cell") |>
+      filter(
+        mdl_seq %in% sdm_mdl_seqs
       ) |>
-      collect()
+      group_by(cell_id) |>
+      summarize(value = max(value, na.rm = T), .groups = "drop")
 
-    # visual checks ----
-    # # r_sdm_mask
-    # r <- init(r_cell[[1]], NA)
-    # r[d_r_sp$cell_id] <- d_r_sp$value
-    # r <- trim(r) |> rotate()
-    # plet(r)
-    #
-    # # r_mask
-    # d_mask <- q_mask |> collect()
-    # r <- init(r_cell[[1]], NA)
-    # r[d_mask$cell_id] <- d_mask$value
-    # names(r) <- "mask"
-    # r_mask <- trim(r) |> rotate()
-    # plet(r_mask)
-    #
-    # # r_sdm
-    # d_sdm <- q_sdm |> collect()
-    # r <- init(r_cell[[1]], NA)
-    # r[d_sdm$cell_id] <- d_sdm$value
-    # names(r) <- "sdm"
-    # r_sdm <- trim(r) |> rotate()
-    # plet(r_sdm)
-  } else {
-    # no global mask or no other SDM to mask — just max value of all SDMs
-    d_r_sp <- collect(q_sdm)
+    # find highest-priority global mask this species has
+    sp_global_masks <- d_sp_l |>
+      inner_join(ds_global_masks, by = "ds_key") |>
+      arrange(global_mask_priority)
+
+    has_global_mask <- nrow(sp_global_masks) > 0
+
+    # only mask if species has at least one SDM dataset besides the global mask
+    # (avoid self-intersection, e.g. birds with only BirdLife)
+    has_other_sdm <- FALSE
+    if (has_global_mask) {
+      best_mask_ds <- sp_global_masks$ds_key[1]
+      other_sdm_ds <- setdiff(ds_sdm_sp, best_mask_ds)
+      has_other_sdm <- length(other_sdm_ds) > 0
+    }
+
+    if (has_global_mask && has_other_sdm) {
+      # get datasets used for mask
+      # exclude lower-priority global masks from the mask union
+      lower_global_masks <- sp_global_masks |>
+        filter(ds_key != best_mask_ds) |>
+        pull(ds_key)
+      ds_mask_sp <- setdiff(
+        intersect(d_sp_l$ds_key, ds_keys_mask),
+        lower_global_masks
+      )
+
+      # get mdl_seqs for masking datasets
+      mask_mdl_seqs <- d_sp_l |>
+        filter(ds_key %in% ds_mask_sp) |>
+        pull(mdl_seq)
+
+      q_mask <- tbl(con_sdm, "model_cell") |>
+        filter(mdl_seq %in% mask_mdl_seqs) |>
+        distinct(cell_id) |>
+        mutate(value = 1)
+
+      # get SDM cells with mask applied
+      d_r_sp <- q_sdm |>
+        semi_join(
+          q_mask,
+          by = join_by(cell_id)
+        ) |>
+        collect()
+    } else {
+      # no global mask or no other SDM to mask — just max value of all SDMs
+      d_r_sp <- collect(q_sdm)
+    }
   }
 
   # apply MMPA/MBTA spatial minimum floors ----
@@ -436,9 +558,17 @@ for (i in 1:nrow(d_x)) {
     time_period = "2025",
     region = "USA",
     mdl_type = "mixed",
-    description = glue(
-      "Marine Sensitivity merged model with max values from datasets: {paste(ds_sdm_sp, collapse = ', ')}{has_mask_str}"
-    )
+    description = if (is_turtle) {
+      glue(
+        "Marine Sensitivity merged model with multiplicative merge ",
+        "(er * suit / 100) from datasets: {paste(ds_sdm_sp, collapse = ', ')}"
+      )
+    } else {
+      glue(
+        "Marine Sensitivity merged model with max values from datasets: ",
+        "{paste(ds_sdm_sp, collapse = ', ')}{has_mask_str}"
+      )
+    }
   )
   dbWriteTable(con_sdm, "model", d_model, append = TRUE)
   # tbl(con_sdm, "model") |> collect() |> tail()
@@ -716,6 +846,18 @@ dbExecute(
     WHERE taxon.taxon_id = d2.taxon_id"
 ) # 17,561
 duckdb_unregister(con_sdm, "d2")
+
+# add is_er_spatial flag (TRUE for turtles where ER is spatially ----
+# differentiated per-cell from mask datasets; FALSE for species using
+# uniform species-level scalar er_score)
+dbExecute(
+  con_sdm,
+  "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS is_er_spatial BOOLEAN"
+)
+dbExecute(
+  con_sdm,
+  "UPDATE taxon SET is_er_spatial = (sp_cat = 'turtle')"
+)
 ```
 
 ## Taxon Summary
