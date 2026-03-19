@@ -2183,24 +2183,108 @@ dbExecute(
   )
 )
 
-# calculate average score per program area
+# calculate pct-area-weighted score per program area
+# weight each component by the fraction of the PA's cells with non-NA data
+# e.g., turtles only cover a small fraction of some Alaska PAs, eg St. George Basin (GEO)
 dbExecute(
   con_sdm,
   glue(
     "
+  WITH
+  -- total coverage per program area (sum of pct_covered across all cells)
+  zone_total AS (
+    SELECT zone_seq, SUM(pct_covered) AS total_coverage
+    FROM zone_cell
+    WHERE zone_seq IN ({paste(z_seqs, collapse = ',')})
+    GROUP BY zone_seq
+  ),
+  -- coverage with non-NA data per (zone, component metric)
+  zone_metric_coverage AS (
+    SELECT
+      zc.zone_seq,
+      cm.metric_seq,
+      SUM(zc.pct_covered) AS metric_coverage
+    FROM zone_cell zc
+    JOIN cell_metric cm ON zc.cell_id = cm.cell_id
+    WHERE
+      zc.zone_seq IN ({paste(z_seqs, collapse = ',')})
+      AND cm.metric_seq IN ({paste(m_input_seqs, collapse = ',')})
+      AND cm.value IS NOT NULL
+    GROUP BY zc.zone_seq, cm.metric_seq
+  ),
+  -- zone_metric values with pct_area weight
+  weighted_metrics AS (
+    SELECT
+      zm.zone_seq,
+      zm.metric_seq,
+      zm.value,
+      zmc.metric_coverage / zt.total_coverage AS pct_area
+    FROM zone_metric zm
+    JOIN zone_total zt
+      ON zm.zone_seq = zt.zone_seq
+    JOIN zone_metric_coverage zmc
+      ON zm.zone_seq    = zmc.zone_seq
+      AND zm.metric_seq = zmc.metric_seq
+    WHERE
+      zm.metric_seq IN ({paste(m_input_seqs, collapse = ',')})
+      AND zm.zone_seq IN ({paste(z_seqs, collapse = ',')})
+      AND zm.value IS NOT NULL
+  )
   INSERT INTO zone_metric (zone_seq, metric_seq, value)
-  SELECT 
+  SELECT
     zone_seq,
-    {m_seq} as metric_seq,
-    SUM(value) / COUNT(value) as value
-  FROM zone_metric zm
-  WHERE 
-    metric_seq IN ({paste(m_input_seqs, collapse = ',')}) 
-    AND zone_seq IN ({paste(z_seqs, collapse = ',')})
-    AND value IS NOT NULL
+    {m_seq} AS metric_seq,
+    SUM(value * pct_area) / SUM(pct_area) AS value
+  FROM weighted_metrics
   GROUP BY zone_seq"
   )
 ) # 20
+
+# check pct_area weights per PA and component
+d_pct <- dbGetQuery(
+  con_sdm,
+  glue(
+    "
+  WITH
+  zone_total AS (
+    SELECT zone_seq, SUM(pct_covered) AS total_coverage
+    FROM zone_cell
+    WHERE zone_seq IN ({paste(z_seqs, collapse = ',')})
+    GROUP BY zone_seq
+  ),
+  zone_metric_coverage AS (
+    SELECT zc.zone_seq, cm.metric_seq,
+      SUM(zc.pct_covered) AS metric_coverage
+    FROM zone_cell zc
+    JOIN cell_metric cm ON zc.cell_id = cm.cell_id
+    WHERE zc.zone_seq IN ({paste(z_seqs, collapse = ',')})
+      AND cm.metric_seq IN ({paste(m_input_seqs, collapse = ',')})
+      AND cm.value IS NOT NULL
+    GROUP BY zc.zone_seq, cm.metric_seq
+  )
+  SELECT z.value AS programarea_key, m.metric_key,
+    ROUND(zmc.metric_coverage / zt.total_coverage * 100, 1) AS pct_area
+  FROM zone_metric_coverage zmc
+  JOIN zone_total zt ON zmc.zone_seq = zt.zone_seq
+  JOIN zone z ON zmc.zone_seq = z.zone_seq
+  JOIN metric m ON zmc.metric_seq = m.metric_seq
+  ORDER BY z.value, m.metric_key"
+  )
+)
+
+d_pct |>
+  mutate(
+    metric_key = str_replace_all(
+      metric_key,
+      c(
+        "extrisk_" = "",
+        "_ecoregion_rescaled" = "",
+        "primprod" = "prim_prod"
+      )
+    )
+  ) |>
+  pivot_wider(names_from = metric_key, values_from = pct_area) |>
+  print(n = Inf)
 
 # check the new metric
 d_ck <- tbl(con_sdm, "metric") |>

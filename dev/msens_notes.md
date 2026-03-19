@@ -20,6 +20,52 @@
 
 - Migrate to hexagons
 
+
+## 2026-03-19 percent Program Area
+
+In [Image #1] you can see that for the turtle component, only a small fraction overlaps the GEO (St George Basin) Program Area and not quite all of the ALA (Aleutian Arc) Program Area. When calculating the component score in @calc_scores.qmd, eg turtle score (after Ecoregional weighting, but before overall Program Area score), apply a percent area weighting based on the number of pixels present in the non-NA component score contributing to the Program Area.
+
+⏺ The edit looks correct. Here's a summary of the change:                       
+                                                                  
+  What changed (calc_scores.qmd line ~2186):                                    
+                                                                                
+  The Program Area score calculation in                                         
+  calc_programarea_score_from_programarea_metrics was changed from a simple     
+  equal-weight average:                                                         
+                                                                  
+  SUM(value) / COUNT(value)
+                                                                                
+  to a percent-area-weighted average:
+                                                                                
+  SUM(value * pct_area) / SUM(pct_area)                           
+                                                                                
+  where pct_area = fraction of each PA's cells (by pct_covered) that have non-NA
+   data for each component metric.                                              
+                                                                                
+  How it works:                                                   
+  1. zone_total CTE: computes total cell coverage per PA (SUM(pct_covered))
+  2. zone_metric_coverage CTE: computes cell coverage with non-NA data per (PA, 
+  component) pair                                                              
+  3. weighted_metrics CTE: joins zone_metric values with their pct_area =       
+  metric_coverage / total_coverage                                        
+  4. Final INSERT: SUM(value * pct_area) / SUM(pct_area) — weighted average     
+                                                                           
+  Effect: For GEO (St George Basin) where turtle data covers only a small       
+  fraction of cells, the turtle component will be down-weighted proportionally. 
+  PAs with full coverage for all components will see minimal change. A          
+  diagnostic table of pct_area values (percent of PA covered by each component) 
+  is printed for verification.                                    
+
+  Not changed: The cell-level combined score (cell_metric_score chunk) remains a
+   simple AVG(value), which is correct at the cell level since each cell either
+  has data for a component or doesn't.    
+
+## 2026-03-18 + DPS ref to docs
+
+Add reference to the NMFS Distinct Population Segments (DPS) used for the `rng_turtle_swot_dps` dataset. We pulled "Endangered" ESA listing polygons from the following NOAA spatial data catalog:
+
+https://noaa.maps.arcgis.com/home/search.html?searchTerm=turtle+dps
+
 ## 2026-03-17.d v4b: do_merge_turtles in merge_models.qmd; compare_scores_prev vs v4,v3 & pivot in calc_scores.qmd
 
 Convert compare_scores_prev into a function with ver and ver_prev as arguments. Run this by default 
