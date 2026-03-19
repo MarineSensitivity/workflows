@@ -21,6 +21,49 @@
 - Migrate to hexagons
 
 
+## 2026-03-19.b fix `is_mmpa` for walrus and other mammals
+
+The walrus did not get the minimum value of 20, as it should have per `msens::compute_er_score()` because I flagged application to MMPA with field `taxon.is_mmpa` based on the [NOAA/NMFS Species directory](https://www.fisheries.noaa.gov/species-directory/), which when you look more specifically at the **Marine Mammals** tab has an exception I should've noticed before:
+
+> NOAA Fisheries has jurisdiction over approximately 119 marine mammal species, while the U.S Fish and Wildlife Service has jurisdiction over polar bears, walruses, sea otters, manatees, and dugongs.
+
+So we need to update accordingly, and could more simply do it per `sp_cat = "mammal"`.
+
+Fix where needed, but probably `@merge_models.qmd` / `@calc_scores.qmd`.
+
+⏺ Both edits are done. Here's a summary:                   
+
+  Problem: Walrus (and polar bear, sea otter, manatee, dugong) are USFWS-jurisdiction marine 
+  mammals that don't appear in the NMFS species directory. So is_mmpa was FALSE for them,
+  meaning the MMPA minimum floor of 20 was never applied.                                    
+                                                                  
+  Fix — two files:                                                                           
+  
+  1. merge_models.qmd:489 — Spatial floor: changed condition from isTRUE(d_sp$is_mmpa) to    
+  d_sp$sp_cat == "mammal". All marine mammals now get pmax(value, 20L) applied to their cell
+  values during model merge.                                                                 
+  2. calc_scores.qmd:1063 — Extinction risk score: added sp_cat to the select and a
+  pmax(er_score, 20) for mammals before computing cell-level metrics. This ensures the       
+  er_score used in SUM(er_score * value) / 100 respects the MMPA floor even for mammals whose
+   stored er_score was computed without it.                                                  
+                                                                  
+  Note: The MBTA floor (is_mbta, 10) in merge_models.qmd:493 is left unchanged since that    
+  flag comes from a different source and birds are the only sp_cat affected. The
+  compute_er_score() function in msens::listings.R still accepts is_mmpa — you may want to   
+  update it separately if you want the package to reflect this logic too.
+
+Please update code fix to using `msens::compute_er_score()` for determining value to apply. For now, the value is **20**, but could change in future.
+
+⏺ Done. Both files now derive floor values from msens::compute_er_score():
+
+  - merge_models.qmd: Spatial floor uses msens::compute_er_score("NMFS:LC", is_mmpa = TRUE)  
+  (currently 20) instead of hardcoded 20L. Same pattern for the MBTA floor (is_mbta = TRUE,
+  currently 10).                                                                             
+  - calc_scores.qmd: Recomputes er_score for all mammals via      
+  msens::compute_er_score(extrisk_code, is_mmpa = TRUE, is_mbta = is_mbta), using each       
+  species' actual extrisk_code and is_mbta flag but forcing is_mmpa = TRUE. This way if the
+  MMPA value changes in the package, both files pick it up automatically.
+
 ## 2026-03-19 percent Program Area
 
 In [Image #1] you can see that for the turtle component, only a small fraction overlaps the GEO (St George Basin) Program Area and not quite all of the ALA (Aleutian Arc) Program Area. When calculating the component score in @calc_scores.qmd, eg turtle score (after Ecoregional weighting, but before overall Program Area score), apply a percent area weighting based on the number of pixels present in the non-NA component score contributing to the Program Area.
@@ -33,30 +76,34 @@ In [Image #1] you can see that for the turtle component, only a small fraction o
   calc_programarea_score_from_programarea_metrics was changed from a simple     
   equal-weight average:                                                         
                                                                   
+  ```sql
   SUM(value) / COUNT(value)
+  ```
                                                                                 
   to a percent-area-weighted average:
                                                                                 
+  ```sql
   SUM(value * pct_area) / SUM(pct_area)                           
+  ```
                                                                                 
-  where pct_area = fraction of each PA's cells (by pct_covered) that have non-NA
-   data for each component metric.                                              
+  where `pct_area` = fraction of each PA's cells (by pct_covered) that have non-NA
+  data for each component metric.                                              
                                                                                 
   How it works:                                                   
-  1. zone_total CTE: computes total cell coverage per PA (SUM(pct_covered))
-  2. zone_metric_coverage CTE: computes cell coverage with non-NA data per (PA, 
+  1. `zone_total` CTE: computes total cell coverage per PA (SUM(pct_covered))
+  2. `zone_metric_coverage` CTE: computes cell coverage with non-NA data per (PA, 
   component) pair                                                              
-  3. weighted_metrics CTE: joins zone_metric values with their pct_area =       
+  3. `weighted_metrics` CTE: joins zone_metric values with their pct_area =       
   metric_coverage / total_coverage                                        
-  4. Final INSERT: SUM(value * pct_area) / SUM(pct_area) — weighted average     
+  4. Final INSERT: `SUM(value * pct_area) / SUM(pct_area)` — weighted average     
                                                                            
-  Effect: For GEO (St George Basin) where turtle data covers only a small       
-  fraction of cells, the turtle component will be down-weighted proportionally. 
+  Effect: For **GEO** (St George Basin) where turtle data covers only a small       
+  fraction of cells, the turtle component will be **down-weighted proportionally**. 
   PAs with full coverage for all components will see minimal change. A          
-  diagnostic table of pct_area values (percent of PA covered by each component) 
+  diagnostic table of `pct_area` values (percent of PA covered by each component) 
   is printed for verification.                                    
 
-  Not changed: The cell-level combined score (cell_metric_score chunk) remains a
+  _**Not changed**_: The **cell-level combined score** (`cell_metric_score` chunk) remains a
    simple AVG(value), which is correct at the cell level since each cell either
   has data for a component or doesn't.    
 
