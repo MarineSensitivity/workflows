@@ -84,6 +84,8 @@ do_redlist_listing <- T # add redlist_code, extrisk_code, er_score
 do_iucn_insert <- F # add IUCN range maps dataset
 do_iucn_extract <- F # extract IUCN range rasters (long-running)
 do_iucn_values <- F # update IUCN model_cell values
+do_iucn_missing <- F # ingest only missing mammal IUCN ranges (fast)
+do_iucn_no_eez <- T # backfill 0-cell rng_iucn entries for species outside US EEZ
 ```
 
 ### Dataset and model summary
@@ -2793,7 +2795,7 @@ rng_shps <- list.files(
 )
 flds_req <- c("sci_name", "marine", "yrcompiled", "category")
 default_cell_value <- 1L # placeholder; updated to redlist_code score by update_mask_values_to_redlist_score
-sf_use_s2(F) # prevent invalid geometries, eg MAMMALS_MARINE_ONLY | Skipping invalid geometries with sci_name: Balaena mysticetus, Balaenoptera musculus, Balaenoptera physalus, Eschrichtius robustus, Monodon monoceros, Phocoena phocoena, Delphinus delphis
+sf_use_s2(F) # prevent invalid geometries; curved geom fix now handles COMPOUNDCURVE/CURVEPOLYGON (previously skipped: Balaena mysticetus, Balaenoptera musculus, Balaenoptera physalus, Eschrichtius robustus, Monodon monoceros, Phocoena phocoena, Delphinus delphis, Phoca vitulina)
 
 d_taxon <- tbl(con_sdm, "taxon") |> collect()
 
@@ -2832,9 +2834,47 @@ for (i in 1:length(rng_shps)) {
     x <- read_sf(grp_gpkg)
   } else {
     a <- read_sf(rng_shp)
-    # st_drop_geometry(a) |>
-    #   filter(sci_name == "Phoca vitulina") |>
-    #   View()
+
+    # fix curved geometries (MULTISURFACE, COMPOUNDCURVE, CURVEPOLYGON)
+    # same approach as ingest_birdlife.org_botw.qmd surf2poly()
+    geom_types <- st_geometry_type(a) |> as.character() |> unique()
+    curved_types <- c(
+      "MULTISURFACE",
+      "COMPOUNDCURVE",
+      "CURVEPOLYGON",
+      "CIRCULARSTRING"
+    )
+    if (any(curved_types %in% geom_types)) {
+      log_info(
+        "| FIX | {grp} | converting curved geometries: {paste(intersect(curved_types, geom_types), collapse = ', ')}"
+      )
+      out_geom_txt <- a |>
+        sf::st_geometry() |>
+        sf::st_as_text() |>
+        gsub(pattern = "MULTISURFACE (", replacement = "", fixed = TRUE) |>
+        gsub(pattern = "COMPOUNDCURVE (", replacement = "", fixed = TRUE) |>
+        gsub(pattern = "CURVEPOLYGON (", replacement = "", fixed = TRUE)
+      a <- a |>
+        sf::st_set_geometry(
+          value = sf::st_as_sfc(out_geom_txt, crs = sf::st_crs(a))
+        )
+      idx_line <- which(sf::st_geometry_type(a) == "LINESTRING")
+      if (length(idx_line) > 0) {
+        a_ok <- a[-idx_line, ]
+        a_line <- a |>
+          dplyr::slice(idx_line) |>
+          sf::st_cast(to = "POLYGON") |>
+          sf::st_cast(to = "MULTIPOLYGON")
+        a <- rbind(a_ok, a_line)
+      }
+      a <- a |>
+        sf::st_cast("MULTIPOLYGON") |>
+        sf::st_make_valid()
+      log_info(
+        "| FIX | {grp} | curved geometry conversion complete, {sum(!st_is_valid(a))} still invalid"
+      )
+    }
+
     flds_notreq <- setdiff(flds_req, names(a))
 
     # a |> st_drop_geometry() |> names()
@@ -3007,8 +3047,11 @@ d_tif <- tibble(
   ) |>
   unnest(data)
 
+# left_join so species with IUCN range outside US EEZ (no tif) still get
+# model + taxon_model entries with 0 cells — merge logic then clips AquaMaps
+# to empty mask → 0 merged cells → is_ok=FALSE via "no distribution in PRA"
 d_spp <- d_gpkg |>
-  inner_join(
+  left_join(
     d_tif,
     by = join_by(sci_name)
   ) |>
@@ -3020,8 +3063,7 @@ for (i in 2:nrow(d_spp)) {
   sp <- d_spp$sci_name[i]
   d_sp <- d_spp[i, ]
   sp_key <- glue("{ds_key}:{sp}")
-  sp_tif <- d_sp$tif
-  r_sp <- rast(sp_tif, lyrs = sp)
+  has_tif <- !is.na(d_sp$tif)
 
   # delete: existing ----
   mdl_seqs <- tbl(con_sdm, "model") |>
@@ -3054,7 +3096,8 @@ for (i in 2:nrow(d_spp)) {
     region = "Global",
     mdl_type = "binary",
     description = glue(
-      "IUCN Red List (2025-2) range map for {sp}, interpolated to 0.05° resolution"
+      "IUCN Red List (2025-2) range map for {sp}, interpolated to 0.05° resolution",
+      if (!has_tif) " [range outside US EEZ — 0 cells]" else ""
     )
   )
   dbWriteTable(con_sdm, "model", d_model, append = TRUE)
@@ -3064,28 +3107,13 @@ for (i in 2:nrow(d_spp)) {
     con_sdm,
     glue(
       "
-    SELECT mdl_seq FROM model 
+    SELECT mdl_seq FROM model
     WHERE
-      ds_key = '{ds_key}' AND 
+      ds_key = '{ds_key}' AND
       taxa   = '{sp_key}'
     ORDER BY mdl_seq DESC LIMIT 1 "
     )
   )$mdl_seq
-
-  # d_sp |> glimpse()
-  # Rows: 1
-  # Columns: 11
-  # $ tif        <fs::path> "/Users/bbest/My Drive/projects/msens/data/derived/iucnredlist.org/ABALONES.tif"
-  # $ grp        <chr> "ABALONES"
-  # $ gpkg       <glue> "~/My Drive/projects/msens/data/derived/iucnredlist.org/ABALONES.gpkg"
-  # $ sci_name   <chr> "Haliotis asinina"
-  # $ category   <chr> "LC"
-  # $ yrcompiled <int> 2020
-  # $ n_shp_rows <int> 1
-  # $ taxon_id   <dbl> 147456
-  # $ worms_id   <dbl> 147456
-  # $ sp_cat     <chr> "invertebrate"
-  # $ mdl_seq    <int> 15595
 
   # append: species ----
   d_species <- tibble(
@@ -3093,17 +3121,17 @@ for (i in 2:nrow(d_spp)) {
     taxa = sp_key,
     sp_key = sp_key,
     worms_id = d_sp$taxon_id,
-    gbif_id = NA_integer_, # TODO: lookup from GBIF
-    itis_id = NA_integer_, # TODO: lookup from ITIS
+    gbif_id = NA_integer_,
+    itis_id = NA_integer_,
     scientific_name_dataset = sp,
-    common_name_dataset = NA_character_, # TODO: do lookup from WoRMS
+    common_name_dataset = NA_character_,
     scientific_name_accepted = sp,
-    common_name_accepted = NA_character_, # TODO: do lookup from WoRMS
+    common_name_accepted = NA_character_,
     iucn_id = d_sp$iucn_id,
     botw_id = NA_integer_,
-    worms_is_marine = NA, # d_sp$"worms_is_marine"
-    worms_is_extinct = NA, # d_sp$"worms_is_extinct"
-    redlist_code = d_sp$category, # TODO: lookup lastest from ITIS
+    worms_is_marine = NA,
+    worms_is_extinct = NA,
+    redlist_code = d_sp$category,
     redlist_year = d_sp$yrcompiled,
     sp_cat = d_sp$sp_cat
   )
@@ -3113,25 +3141,32 @@ for (i in 2:nrow(d_spp)) {
   stopifnot(
     setdiff(dbListFields(con_sdm, "species"), names(d_species)) == "sp_seq"
   )
-  # d_species |> glimpse()
   dbWriteTable(con_sdm, "species", d_species, append = T)
-  # tbl(con_sdm, "species") |> collect() |> tail()
-  # tbl(con_sdm, "model") |> collect() |> tail()
 
-  # append: model_cell ----
-  d_mdl_cell <- as.data.frame(r_sp, cells = T, na.rm = T) |>
-    tibble() |>
-    select(cell_id = cell) |>
-    mutate(
-      mdl_seq = mdl_seq,
-      value = default_cell_value
-    ) |>
-    arrange(cell_id)
-  dbWriteTable(con_sdm, "model_cell", d_mdl_cell, append = T)
+  # append: taxon_model ----
+  d_taxon_model <- tibble(
+    taxon_id = d_sp$taxon_id,
+    ds_key = ds_key,
+    mdl_seq = mdl_seq
+  )
+  dbWriteTable(con_sdm, "taxon_model", d_taxon_model, append = TRUE)
+
+  # append: model_cell (only if range overlaps US EEZ) ----
+  if (has_tif) {
+    sp_tif <- d_sp$tif
+    r_sp <- rast(sp_tif, lyrs = sp)
+    d_mdl_cell <- as.data.frame(r_sp, cells = T, na.rm = T) |>
+      tibble() |>
+      select(cell_id = cell) |>
+      mutate(
+        mdl_seq = mdl_seq,
+        value = default_cell_value
+      ) |>
+      arrange(cell_id)
+    dbWriteTable(con_sdm, "model_cell", d_mdl_cell, append = T)
+  }
+  # species with no tif get model + taxon_model but 0 model_cell rows
 }
-# Haliotis cracherodii
-# 18513
-# mapView(r_sp, maxpixels = Inf)
 
 ```
 
@@ -3197,6 +3232,411 @@ for (ds in c("bl", "rng_iucn")) {
   message(glue("--- {ds} AFTER update ---"))
   print(tibble(d_after))
 }
+```
+
+### Ingest missing mammal IUCN range maps
+
+Quickly ingest IUCN range maps for mammal species that have `is_ok=TRUE` in the
+taxon table but are missing a `rng_iucn` entry. Uses the newer MAMMALS_PART1/PART2
+shapefiles which have clean Polygon geometry (no curved geometry issues).
+
+Set `do_iucn_missing <- TRUE` in the flags chunk to run.
+
+```{r}
+#| label: setup_iucn_missing
+#| eval: !expr do_iucn_missing
+
+ds_key <- "rng_iucn"
+dir_iucn_raw <- glue("{dir_data}/raw/iucnredlist.org")
+dir_iucn_derived <- glue("{dir_data}/derived/iucnredlist.org")
+default_cell_value <- 1L
+sf_use_s2(F)
+
+d_taxon <- tbl(con_sdm, "taxon") |> collect()
+
+r_cell <- rast(cell_tif, lyrs = "cell_id")
+r_cell_r <- rotate(r_cell)
+ext(r_cell) <- round(ext(r_cell), 3)
+ext(r_cell_r) <- round(ext(r_cell_r), 3)
+
+# mammals with is_ok=TRUE but no rng_iucn
+d_have_iucn <- tbl(con_sdm, "taxon_model") |>
+  filter(ds_key == "rng_iucn") |>
+  select(taxon_id) |>
+  collect()
+
+d_missing_mammals <- d_taxon |>
+  filter(
+    is_ok,
+    sp_cat == "mammal",
+    !taxon_id %in% d_have_iucn$taxon_id
+  )
+
+message(glue(
+  "{nrow(d_missing_mammals)} mammals with is_ok=TRUE missing rng_iucn"
+))
+
+# find MAMMALS_PART* shapefiles
+mammal_shps <- list.files(
+  dir_iucn_raw,
+  pattern = "MAMMALS_PART.*\\.shp$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+message(glue(
+  "mammal shapefiles: {paste(basename(mammal_shps), collapse = ', ')}"
+))
+```
+
+```{r}
+#| label: extract_insert_iucn_missing
+#| eval: !expr do_iucn_missing
+
+if (nrow(d_missing_mammals) > 0 && length(mammal_shps) > 0) {
+  # read and combine MAMMALS_PART* shapefiles
+  a_all <- bind_rows(lapply(mammal_shps, read_sf))
+
+  # fix curved geometries if present (safety net)
+  geom_types <- st_geometry_type(a_all) |> as.character() |> unique()
+  curved_types <- c(
+    "MULTISURFACE",
+    "COMPOUNDCURVE",
+    "CURVEPOLYGON",
+    "CIRCULARSTRING"
+  )
+  if (any(curved_types %in% geom_types)) {
+    message("fixing curved geometries...")
+    out_geom_txt <- a_all |>
+      sf::st_geometry() |>
+      sf::st_as_text() |>
+      gsub(pattern = "MULTISURFACE (", replacement = "", fixed = TRUE) |>
+      gsub(pattern = "COMPOUNDCURVE (", replacement = "", fixed = TRUE) |>
+      gsub(pattern = "CURVEPOLYGON (", replacement = "", fixed = TRUE)
+    a_all <- a_all |>
+      sf::st_set_geometry(
+        value = sf::st_as_sfc(out_geom_txt, crs = sf::st_crs(a_all))
+      )
+    idx_line <- which(sf::st_geometry_type(a_all) == "LINESTRING")
+    if (length(idx_line) > 0) {
+      a_ok <- a_all[-idx_line, ]
+      a_line <- a_all |>
+        dplyr::slice(idx_line) |>
+        sf::st_cast(to = "POLYGON") |>
+        sf::st_cast(to = "MULTIPOLYGON")
+      a_all <- rbind(a_ok, a_line)
+    }
+    a_all <- a_all |>
+      sf::st_cast("MULTIPOLYGON") |>
+      sf::st_make_valid()
+  }
+
+  if (any(!st_is_valid(a_all))) {
+    a_all <- st_make_valid(a_all)
+  }
+
+  # filter to marine species matching missing mammals
+  x <- a_all |>
+    rename(iucn_id = id_no) |>
+    filter(
+      str_to_lower(marine) %in% c("true", "t"),
+      sci_name %in% d_missing_mammals$scientific_name
+    ) |>
+    inner_join(
+      d_missing_mammals |>
+        select(taxon_id, scientific_name),
+      by = c("sci_name" = "scientific_name")
+    ) |>
+    group_by(iucn_id, taxon_id, sci_name, category) |>
+    summarize(
+      yrcompiled = max(yrcompiled, na.rm = TRUE),
+      n_shp_rows = n(),
+      .groups = "drop"
+    )
+
+  if (any(!st_is_valid(x))) {
+    x <- st_make_valid(x)
+  }
+
+  message(glue("found {nrow(x)} missing mammals in shapefiles"))
+
+  grp <- "MAMMALS_MISSING"
+  dir.create(
+    glue("{dir_iucn_derived}/{grp}"),
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+
+  for (j in seq_len(nrow(x))) {
+    sp <- x$sci_name[j]
+    sp_key <- glue("{ds_key}:{sp}")
+    sp_tif <- glue("{dir_iucn_derived}/{grp}/{sp}.tif")
+
+    message(glue("  [{j}/{nrow(x)}] rasterizing {sp}..."))
+
+    # rasterize ----
+    r <- try(
+      rasterize(
+        x |> slice(j),
+        r_cell_r,
+        field = default_cell_value,
+        touches = TRUE,
+        by = "sci_name"
+      ) |>
+        rotate() |>
+        crop(r_cell) |>
+        mask(r_cell),
+      silent = TRUE
+    )
+
+    if (inherits(r, "try-error")) {
+      message(glue("  SKIP: rasterize error for {sp}: {r}"))
+      next
+    }
+
+    n_notna <- global(r, "notNA") |> as.integer()
+    has_eez_cells <- n_notna > 0
+
+    if (has_eez_cells) {
+      writeRaster(r, filename = sp_tif, overwrite = TRUE)
+    }
+
+    # delete existing rng_iucn if present (shouldn't be, but safety) ----
+    mdl_seqs_old <- tbl(con_sdm, "model") |>
+      filter(ds_key == !!ds_key, taxa == !!sp_key) |>
+      pull(mdl_seq)
+    if (length(mdl_seqs_old) > 0) {
+      dbExecute(
+        con_sdm,
+        glue(
+          "DELETE FROM taxon_model WHERE ds_key = '{ds_key}' AND taxon_id = {x$taxon_id[j]}"
+        )
+      )
+      dbExecute(
+        con_sdm,
+        glue(
+          "DELETE FROM model WHERE ds_key = '{ds_key}' AND taxa = '{sp_key}'"
+        )
+      )
+      dbExecute(
+        con_sdm,
+        glue(
+          "DELETE FROM species WHERE ds_key = '{ds_key}' AND taxa = '{sp_key}'"
+        )
+      )
+      dbExecute(
+        con_sdm,
+        glue(
+          "DELETE FROM model_cell WHERE mdl_seq IN ({paste(mdl_seqs_old, collapse = ',')})"
+        )
+      )
+    }
+
+    # insert: model (always — even with 0 EEZ cells, so merge clips AquaMaps) ----
+    d_model <- tibble(
+      ds_key = ds_key,
+      taxa = sp_key,
+      time_period = "2025",
+      region = "Global",
+      mdl_type = "binary",
+      description = glue(
+        "IUCN Red List (2025-2) range map for {sp}, interpolated to 0.05° resolution",
+        if (!has_eez_cells) " [range outside US EEZ — 0 cells]" else ""
+      )
+    )
+    dbWriteTable(con_sdm, "model", d_model, append = TRUE)
+
+    mdl_seq <- dbGetQuery(
+      con_sdm,
+      glue(
+        "SELECT mdl_seq FROM model
+       WHERE ds_key = '{ds_key}' AND taxa = '{sp_key}'
+       ORDER BY mdl_seq DESC LIMIT 1"
+      )
+    )$mdl_seq
+
+    # insert: species ----
+    d_sp <- x[j, ]
+    d_species <- tibble(
+      ds_key = ds_key,
+      taxa = sp_key,
+      sp_key = sp_key,
+      worms_id = d_sp$taxon_id,
+      gbif_id = NA_integer_,
+      itis_id = NA_integer_,
+      scientific_name_dataset = sp,
+      common_name_dataset = NA_character_,
+      scientific_name_accepted = sp,
+      common_name_accepted = NA_character_,
+      iucn_id = d_sp$iucn_id,
+      botw_id = NA_integer_,
+      worms_is_marine = NA,
+      worms_is_extinct = NA,
+      redlist_code = d_sp$category,
+      redlist_year = d_sp$yrcompiled,
+      sp_cat = "mammal"
+    )
+    dbWriteTable(con_sdm, "species", d_species, append = TRUE)
+
+    # insert: taxon_model (always — links species to rng_iucn even with 0 cells) ----
+    d_taxon_model <- tibble(
+      taxon_id = d_sp$taxon_id,
+      ds_key = ds_key,
+      mdl_seq = mdl_seq
+    )
+    dbWriteTable(con_sdm, "taxon_model", d_taxon_model, append = TRUE)
+
+    # insert: model_cell (only if range overlaps US EEZ) ----
+    if (has_eez_cells) {
+      r_sp <- rast(sp_tif, lyrs = sp)
+      d_mdl_cell <- as.data.frame(r_sp, cells = TRUE, na.rm = TRUE) |>
+        tibble() |>
+        select(cell_id = cell) |>
+        mutate(
+          mdl_seq = mdl_seq,
+          value = default_cell_value
+        )
+      dbWriteTable(con_sdm, "model_cell", d_mdl_cell, append = TRUE)
+
+      rl_value <- switch(
+        as.character(d_sp$category),
+        "CR" = 50L,
+        "EN" = 25L,
+        "VU" = 5L,
+        "NT" = 2L,
+        1L
+      )
+      dbExecute(
+        con_sdm,
+        glue(
+          "UPDATE model_cell SET value = {rl_value} WHERE mdl_seq = {mdl_seq}"
+        )
+      )
+
+      message(glue(
+        "  OK: {sp} — mdl_seq={mdl_seq}, {n_notna} cells, ",
+        "category={d_sp$category}, value={rl_value}"
+      ))
+    } else {
+      message(glue(
+        "  OK (0 EEZ cells): {sp} — mdl_seq={mdl_seq}, ",
+        "range outside US EEZ, model+taxon_model inserted"
+      ))
+    }
+  }
+}
+```
+
+### Backfill 0-cell rng_iucn entries for species outside US EEZ
+
+One-time backfill: species whose IUCN range was rasterized during ingestion but
+produced 0 cells in the US EEZ were previously skipped entirely. This chunk
+reads the log-derived CSV and inserts `model` + `species` + `taxon_model` rows
+(with 0 `model_cell` rows) so the merge logic clips their AquaMaps predictions
+to an empty mask → 0 merged cells → `is_ok=FALSE`.
+
+Set `do_iucn_no_eez <- FALSE` after running once.
+
+```{r}
+#| label: backfill_iucn_no_eez
+#| eval: !expr do_iucn_no_eez
+
+ds_key <- "rng_iucn"
+
+d_no_eez <- read_csv(
+  here("data/iucn_no_eez_species.csv"),
+  show_col_types = FALSE
+)
+
+d_taxon <- tbl(con_sdm, "taxon") |> collect()
+
+# species already with rng_iucn in database (skip those)
+d_have_iucn <- tbl(con_sdm, "taxon_model") |>
+  filter(ds_key == "rng_iucn") |>
+  select(taxon_id) |>
+  collect()
+
+# match CSV against taxon table, exclude species that already have rng_iucn
+d_backfill <- d_taxon |>
+  filter(
+    scientific_name %in% d_no_eez$scientific_name,
+    !taxon_id %in% d_have_iucn$taxon_id
+  ) |>
+  select(taxon_id, scientific_name, sp_cat, redlist_code)
+
+message(glue(
+  "{nrow(d_backfill)} species to backfill with 0-cell rng_iucn entries ",
+  "(out of {nrow(d_no_eez)} in CSV, {nrow(d_have_iucn)} already have rng_iucn)"
+))
+# 2,247 species to backfill with 0-cell rng_iucn entries (out of 2,247 in CSV, 1,519 already have rng_iucn)
+# done: 2247 species now have 0-cell rng_iucn entries
+
+for (i in seq_len(nrow(d_backfill))) {
+  sp <- d_backfill$scientific_name[i]
+  sp_key <- glue("{ds_key}:{sp}")
+  tid <- d_backfill$taxon_id[i]
+
+  # insert: model ----
+  d_model <- tibble(
+    ds_key = ds_key,
+    taxa = sp_key,
+    time_period = "2025",
+    region = "Global",
+    mdl_type = "binary",
+    description = glue(
+      "IUCN Red List (2025-2) range map for {sp}, ",
+      "interpolated to 0.05° resolution ",
+      "[range outside US EEZ — 0 cells]"
+    )
+  )
+  dbWriteTable(con_sdm, "model", d_model, append = TRUE)
+
+  mdl_seq <- dbGetQuery(
+    con_sdm,
+    glue(
+      "SELECT mdl_seq FROM model
+     WHERE ds_key = '{ds_key}' AND taxa = '{sp_key}'
+     ORDER BY mdl_seq DESC LIMIT 1"
+    )
+  )$mdl_seq
+
+  # insert: species ----
+  d_species <- tibble(
+    ds_key = ds_key,
+    taxa = sp_key,
+    sp_key = sp_key,
+    worms_id = tid,
+    gbif_id = NA_integer_,
+    itis_id = NA_integer_,
+    scientific_name_dataset = sp,
+    common_name_dataset = NA_character_,
+    scientific_name_accepted = sp,
+    common_name_accepted = NA_character_,
+    iucn_id = NA_integer_,
+    botw_id = NA_integer_,
+    worms_is_marine = NA,
+    worms_is_extinct = NA,
+    redlist_code = d_backfill$redlist_code[i],
+    redlist_year = NA_integer_,
+    sp_cat = d_backfill$sp_cat[i]
+  )
+  dbWriteTable(con_sdm, "species", d_species, append = TRUE)
+
+  # insert: taxon_model (0 cells in model_cell) ----
+  d_taxon_model <- tibble(
+    taxon_id = tid,
+    ds_key = ds_key,
+    mdl_seq = mdl_seq
+  )
+  dbWriteTable(con_sdm, "taxon_model", d_taxon_model, append = TRUE)
+
+  if (i %% 100 == 0 || i == nrow(d_backfill)) {
+    message(glue("  backfilled {i}/{nrow(d_backfill)}"))
+  }
+}
+
+message(glue(
+  "done: {nrow(d_backfill)} species now have 0-cell rng_iucn entries"
+))
 ```
 
 ### Define dir_fws_spp

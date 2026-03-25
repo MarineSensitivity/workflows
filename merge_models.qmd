@@ -43,7 +43,10 @@ source(here("libs/paths.R"))
 con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F))
 
 # section eval flags (set to TRUE to re-run) ----
-do_merge_turtles <- T # multiple R chunks to insert new merged dataset; iterate_merge_ds_mdl takes >1 hr
+do_merge_all <- T # re-merge all taxa (runs setup chunks + full iterate loop, >1 hr)
+do_merge_turtles <- F # re-merge turtles only (multiplicative suitability × extinction risk)
+do_merge_mammals <- T # re-merge mammals only (MMPA floor fix: all mammals are MMPA-protected)
+do_merge <- do_merge_all || do_merge_turtles || do_merge_mammals
 do_is_ok <- T # flag valid taxa
 ```
 
@@ -53,7 +56,7 @@ do_is_ok <- T # flag valid taxa
 
 ```{r}
 #| label: insert_dataset_merged
-#| eval: !expr do_merge_turtles
+#| eval: !expr do_merge_all
 ds_key <- "ms_merge"
 row_dataset <- tibble(
   ds_key = !!ds_key,
@@ -91,7 +94,7 @@ dbWriteTable(con_sdm, "dataset", row_dataset, append = TRUE)
 
 ```{r}
 #| label: dataset_metadata
-#| eval: !expr do_merge_turtles
+#| eval: !expr do_merge_all
 
 # add metadata columns to dataset table ----
 for (col_def in list(
@@ -157,7 +160,7 @@ tbl(con_sdm, "dataset") |>
 
 ```{r}
 #| label: update_turtle_rng_iucn
-#| eval: !expr do_merge_turtles
+#| eval: !expr (do_merge_all || do_merge_turtles)
 
 # TODO: systematically reconcile rng_iucn values with latest IUCN Red List API
 #   assessments (rredlist R package). IUCN shapefile `category` can lag behind
@@ -220,16 +223,30 @@ for (j in 1:nrow(d_turtle_mdl)) {
 
 ```{r}
 #| label: iterate_merge_ds_mdl
-#| eval: !expr do_merge_turtles
+#| eval: !expr do_merge
 ds_key <- "ms_merge"
 
 # cell_tif <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
 # r_cell <- rast(cell_tif)
 # ext(r_cell) <- round(ext(r_cell), 3)
 
+# determine which sp_cats to merge based on flags
+if (do_merge_all) {
+  merge_sp_cats <- NULL # no filter — all taxa
+} else {
+  merge_sp_cats <- c()
+  if (do_merge_turtles) {
+    merge_sp_cats <- c(merge_sp_cats, "turtle")
+  }
+  if (do_merge_mammals) merge_sp_cats <- c(merge_sp_cats, "mammal")
+}
+
 d_x <- tbl(con_sdm, "taxon") |>
-  filter(is_ok) |>
-  filter(sp_cat == "turtle") |>
+  filter(is_ok)
+if (!is.null(merge_sp_cats)) {
+  d_x <- d_x |> filter(sp_cat %in% merge_sp_cats)
+}
+d_x <- d_x |>
   arrange(desc(n_ds), taxon_id) |>
   collect()
 
@@ -514,13 +531,8 @@ for (i in 1:nrow(d_x)) {
     # started ~15:00
   }
 
-  n_cells <- nrow(d_r_sp)
-  if (n_cells == 0) {
-    message(glue("No cells for {sp_sci} ({i}/{nrow(d_x)})"))
-    next()
-  }
-
-  # delete: existing ----
+  # delete: existing merged model (must happen before zero-cells check,
+  # otherwise stale merged models persist for species clipped to 0 cells) ----
   mdl_seqs <- tbl(con_sdm, "model") |>
     filter(ds_key == !!ds_key, taxa == !!sp_key) |>
     pull(mdl_seq)
@@ -553,6 +565,12 @@ for (i in 1:nrow(d_x)) {
         "UPDATE taxon SET mdl_seq = NULL WHERE mdl_seq IN ({paste(mdl_seqs, collapse = ',')})"
       )
     )
+  }
+
+  n_cells <- nrow(d_r_sp)
+  if (n_cells == 0) {
+    message(glue("No cells for {sp_sci} ({i}/{nrow(d_x)})"))
+    next()
   }
 
   # append: model ----

@@ -1,0 +1,403 @@
+---
+title: "Investigate IUCN Range Map Masking"
+subtitle: "Impact of IUCN range masking on species removed from US EEZ analysis"
+format:
+  html:
+    code-fold: true
+    code-tools: true
+editor_options:
+  chunk_output_type: console
+---
+
+## Overview
+
+Two issues were discovered with IUCN range map ingestion in
+`merge_models_prep.qmd` that caused spurious AquaMaps SDM predictions to
+persist in the US EEZ for species that don't actually occur there:
+
+1. **Missing mammal shapefiles** — 3 mammals (*Phoca vitulina* (harbor seal),
+   *Trichechus manatus* (West Indian manatee), *Pusa hispida* (ringed seal))
+   were present in the newer
+   [IUCN Spatial Download](https://www.iucnredlist.org/resources/spatial-data-download)
+   `MAMMALS.zip` but not in the originally downloaded
+   `MAMMALS_MARINE_ONLY.zip` & `MAMMALS_MARINE_AND_TERRESTRIAL.zip`. These
+   species now have rng_iucn entries with cells in the US EEZ, and their
+   merged models are properly clipped.
+
+2. **Species with IUCN ranges outside the US EEZ** — 2,247 species across all
+   taxa groups (fish, corals, invertebrates, mammals, etc.) had IUCN range
+   polygons that produced 0 cells when rasterized to the US EEZ grid. These
+   were previously skipped entirely during ingestion, leaving their AquaMaps
+   predictions unmasked (e.g., *Sotalia guianensis* appearing in the Gulf of
+   America). Now these species have 0-cell rng_iucn entries in the database,
+   so the merge clips AquaMaps to an empty mask → 0 merged cells →
+   `is_ok=FALSE`.
+
+This notebook quantifies the impact: how many species were affected, broken
+down by component (`sp_cat`), and how many had their merged models truncated.
+
+```{r}
+#| label: setup
+#| warning: false
+
+librarian::shelf(
+  DBI,
+  dplyr,
+  duckdb,
+  DT,
+  glue,
+  here,
+  readr,
+  stringr,
+  tibble,
+  tidyr,
+  quiet = T)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+source(here("libs/paths.R"))
+
+con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = TRUE))
+```
+
+## 1. Species with 0-cell rng_iucn (range outside US EEZ)
+
+These are species whose IUCN expert range polygon does not intersect the US EEZ
+at all. They have `rng_iucn` model entries in the database with 0 rows in
+`model_cell`.
+
+```{r}
+#| label: zero_cell_iucn
+
+# all rng_iucn models with their cell counts
+d_iucn_models <- tbl(con_sdm, "taxon_model") |>
+  filter(ds_key == "rng_iucn") |>
+  left_join(
+    tbl(con_sdm, "model_cell") |>
+      group_by(mdl_seq) |>
+      summarize(n_cells = n(), .groups = "drop"),
+    by = "mdl_seq") |>
+  collect() |>
+  mutate(n_cells = coalesce(n_cells, 0L))
+
+d_taxon <- tbl(con_sdm, "taxon") |> collect()
+
+d_iucn_spp <- d_iucn_models |>
+  left_join(
+    d_taxon |>
+      select(taxon_id, scientific_name, common_name, sp_cat, is_ok),
+    by = "taxon_id")
+
+d_zero_cell <- d_iucn_spp |>
+  filter(n_cells == 0)
+
+d_zero_cell |>
+  count(sp_cat, name = "n_species") |>
+  arrange(desc(n_species)) |>
+  datatable(
+    caption = glue(
+      "{nrow(d_zero_cell)} species with 0-cell rng_iucn ",
+      "(IUCN range outside US EEZ), by component"),
+    options = list(dom = "t"))
+```
+
+## 2. Merged models truncated
+
+Species that previously had a merged model (`ms_merge` with cells) but now
+have no merged model because the IUCN mask clipped them to 0 cells. We
+identify these as species with 0-cell rng_iucn that are now `is_ok=FALSE`.
+
+```{r}
+#| label: truncated
+
+# species with 0-cell rng_iucn that had AquaMaps predictions (am_0.05)
+d_am <- tbl(con_sdm, "taxon_model") |>
+  filter(ds_key == "am_0.05") |>
+  select(taxon_id, am_mdl_seq = mdl_seq) |>
+  collect()
+
+d_had_aquamaps <- d_zero_cell |>
+  inner_join(d_am, by = "taxon_id")
+
+# of those, how many now have is_ok=FALSE?
+d_truncated <- d_had_aquamaps |>
+  filter(!is_ok)
+
+d_truncated |>
+  count(sp_cat, name = "n_truncated") |>
+  arrange(desc(n_truncated)) |>
+  datatable(
+    caption = glue(
+      "{nrow(d_truncated)} species with AquaMaps in US EEZ truncated by ",
+      "0-cell IUCN mask (now is_ok=FALSE), by component"),
+    options = list(dom = "t"))
+```
+
+### Truncated species listing
+
+```{r}
+#| label: truncated_listing
+
+app_base <- "https://app.marinesensitivity.org/mapsp"
+
+d_truncated_tbl <- d_truncated |>
+  mutate(
+    species = glue(
+      "<a href='{app_base}/?mdl_seq={am_mdl_seq}' target='_blank'>",
+      "<em>{scientific_name}</em></a>")) |>
+  select(
+    species, common_name, component = sp_cat,
+    am_mdl_seq) |>
+  arrange(component, common_name)
+
+datatable(
+  d_truncated_tbl,
+  caption = glue(
+    "{nrow(d_truncated_tbl)} species truncated by 0-cell IUCN mask ",
+    "(click species for AquaMaps model in app)"),
+  escape  = FALSE,
+  filter  = "top",
+  options = list(
+    dom        = "ftp",
+    pageLength = 25))
+```
+
+### Stale ms_merge check
+
+Verify that truncated species had their old merged models properly deleted.
+
+```{r}
+#| label: stale_merge_check
+
+d_stale <- d_truncated |>
+  inner_join(
+    tbl(con_sdm, "taxon_model") |>
+      filter(ds_key == "ms_merge") |>
+      select(taxon_id, mdl_seq) |>
+      collect(),
+    by = "taxon_id",
+    suffix = c("_iucn", "_merge")) |>
+  inner_join(
+    tbl(con_sdm, "model_cell") |>
+      group_by(mdl_seq) |>
+      summarize(n_merge_cells = n(), .groups = "drop") |>
+      collect(),
+    by = c("mdl_seq_merge" = "mdl_seq"))
+
+if (nrow(d_stale) > 0) {
+  datatable(
+    d_stale |>
+      select(scientific_name, common_name, sp_cat, n_merge_cells),
+    caption = glue(
+      "WARNING: {nrow(d_stale)} species still have stale ms_merge cells"),
+    options = list(dom = "ft", pageLength = 20))
+} else {
+  cat(glue(
+    "all truncated species have no stale ms_merge entries ",
+    "— merge cleanup is complete.\n"))
+}
+```
+
+## 3. Impact on Program Area scores (v5 → v6)
+
+Despite 371 species changing from `is_ok=TRUE` to `is_ok=FALSE`, the impact on
+Program Area component scores is **negligible**. Only Southern California (SOC)
+shows a visible change in rounded integer scores. This section explains why.
+
+### Species count changes (v5 → v6)
+
+```{r}
+#| label: is_ok_changes
+
+# connect to v5 for comparison
+sdm_db_v5 <- gsub(ver, ver_prev, sdm_db)
+con_v5 <- dbConnect(duckdb(dbdir = sdm_db_v5, read_only = TRUE))
+
+d_v5 <- tbl(con_v5, "taxon") |>
+  select(taxon_id, scientific_name, sp_cat,
+         is_ok_v5 = is_ok) |>
+  collect()
+d_v6 <- d_taxon |>
+  select(taxon_id, is_ok_v6 = is_ok)
+
+d_cmp <- d_v5 |> inner_join(d_v6, by = "taxon_id")
+
+d_lost <- d_cmp |> filter(is_ok_v5 & !is_ok_v6)
+
+d_lost |>
+  count(sp_cat, name = "n_lost") |>
+  arrange(desc(n_lost)) |>
+  datatable(
+    caption = glue(
+      "{nrow(d_lost)} species changed is_ok TRUE → FALSE (v5 → v6), by component"),
+    options = list(dom = "t"))
+```
+
+### Score differences per Program Area and component
+
+```{r}
+#| label: score_diff
+
+tbl_pra_v5 <- gsub(ver, ver_prev, tbl_pra)
+
+get_zt <- function(con, tbl_z) {
+  dbGetQuery(con, paste0(
+    "SELECT zone_value AS pra, sp_cat, ",
+    "COUNT(*) AS n_spp, ",
+    "ROUND(AVG(suit_rl), 6) AS avg_score ",
+    "FROM zone_taxon ",
+    "WHERE zone_tbl = '", tbl_z, "' ",
+    "GROUP BY zone_value, sp_cat ",
+    "ORDER BY zone_value, sp_cat"))
+}
+
+d_zt5 <- get_zt(con_v5, tbl_pra_v5) |>
+  rename(n5 = n_spp, s5 = avg_score)
+d_zt6 <- get_zt(con_sdm, tbl_pra) |>
+  rename(n6 = n_spp, s6 = avg_score)
+
+d_zt <- d_zt5 |>
+  full_join(d_zt6, by = c("pra", "sp_cat")) |>
+  mutate(
+    n_diff = coalesce(n6, 0L) - coalesce(n5, 0L),
+    s_diff = round(coalesce(s6, 0) - coalesce(s5, 0), 6)) |>
+  filter(n_diff != 0 | s_diff != 0) |>
+  arrange(pra, sp_cat)
+
+datatable(
+  d_zt,
+  caption = glue(
+    "{nrow(d_zt)} PRA × component rows with changes ",
+    "(n_diff = species count change, s_diff = avg score change)"),
+  filter  = "top",
+  options = list(dom = "ftp", pageLength = 20)) |>
+  formatRound(columns = c("s5", "s6", "s_diff"), digits = 4)
+```
+
+### Why the impact is negligible
+
+The removed species all had very low `suit_rl` scores (suitability × extinction
+risk). They were range-edge artifacts from AquaMaps with minimal suitability
+values in US waters, typically LC (Least Concern) with suitability of 1–5 out
+of 100, producing `suit_rl` contributions near 0.0003.
+
+```{r}
+#| label: why_negligible
+
+# show that removed species had low scores in v5
+d_lost_scores <- dbGetQuery(con_v5, paste0(
+  "SELECT sp_scientific, sp_cat, zone_value AS pra, ",
+  "suit_rl, avg_suit, er_score ",
+  "FROM zone_taxon ",
+  "WHERE zone_tbl = '", tbl_pra_v5, "' ",
+  "AND sp_scientific IN (",
+  paste0("'", d_lost$scientific_name, "'", collapse = ","), ")"))
+
+d_score_summary <- d_lost_scores |>
+  as_tibble() |>
+  group_by(sp_cat) |>
+  summarize(
+    n_zone_entries  = n(),
+    mean_suit_rl    = round(mean(suit_rl, na.rm = TRUE), 6),
+    mean_avg_suit   = round(mean(avg_suit, na.rm = TRUE), 4),
+    mean_er_score   = round(mean(er_score, na.rm = TRUE), 2),
+    .groups = "drop") |>
+  arrange(desc(n_zone_entries))
+
+datatable(
+  d_score_summary,
+  caption = glue(
+    "average scores of removed species in v5 zone_taxon — ",
+    "very low suit_rl confirms range-edge artifacts"),
+  options = list(dom = "t")) |>
+  formatRound(columns = c("mean_suit_rl"), digits = 6)
+```
+
+Because each Program Area has hundreds to thousands of species per component,
+removing a few dozen low-scoring species barely moves the averaged component
+scores. For example, SOC has 1,168 fish; removing 156 with near-zero scores
+shifts the fish average by only +0.001 on a 0–1 scale. Only Southern California
+crosses an integer rounding boundary in the final 0–100 display (coral: 15→18,
+fish: 24→23).
+
+**Bottom line**: the fix is correct and important for data integrity — it removes
+species that expert IUCN range maps say do not occur in US waters. The
+quantitative impact on final scores is negligible because the removed species
+were AquaMaps edge-of-range artifacts with minimal suitability values.
+
+## 4. Newly ingested mammals
+
+Three mammals missing from the original IUCN download but present in the newer
+`MAMMALS.zip`:
+
+```{r}
+#| label: new_mammals
+
+new_mammals <- c("Phoca vitulina", "Trichechus manatus", "Pusa hispida")
+
+d_new <- d_iucn_spp |>
+  filter(scientific_name %in% new_mammals) |>
+  select(scientific_name, common_name, sp_cat, is_ok, n_cells)
+
+datatable(
+  d_new,
+  caption = "3 mammals newly ingested from MAMMALS.zip (with US EEZ cells)",
+  options = list(dom = "t"))
+```
+
+## 5. Full summary
+
+```{r}
+#| label: full_summary
+
+n_total_iucn <- nrow(d_iucn_spp)
+n_zero       <- nrow(d_zero_cell)
+n_with_cells <- n_total_iucn - n_zero
+n_had_am     <- nrow(d_had_aquamaps)
+n_truncated  <- nrow(d_truncated)
+n_stale      <- nrow(d_stale)
+n_lost       <- nrow(d_lost)
+
+v5_ok <- sum(d_cmp$is_ok_v5)
+v6_ok <- sum(d_cmp$is_ok_v6)
+
+cat(glue(
+  "## summary\n\n",
+  "- total species with rng_iucn in database: {n_total_iucn}\n",
+  "  - with US EEZ cells: {n_with_cells}\n",
+  "  - with 0 cells (range outside US EEZ): {n_zero}\n",
+  "- of 0-cell species, had AquaMaps in US EEZ: {n_had_am}\n",
+  "- of those, now is_ok=FALSE (truncated): {n_truncated}\n",
+  "- stale ms_merge entries remaining: {n_stale}\n",
+  "- is_ok=TRUE species: v5={v5_ok}, v6={v6_ok} (net change: {v6_ok - v5_ok})\n",
+  "- species changed is_ok TRUE→FALSE: {n_lost}\n",
+  "- score impact: negligible (removed species were AquaMaps edge-of-range ",
+  "artifacts with near-zero suitability × extinction risk)\n\n"))
+
+# breakdown by component
+d_summary <- d_iucn_spp |>
+  group_by(sp_cat) |>
+  summarize(
+    n_total      = n(),
+    n_with_cells = sum(n_cells > 0),
+    n_zero_cell  = sum(n_cells == 0),
+    n_is_ok_T    = sum(is_ok, na.rm = TRUE),
+    n_is_ok_F    = sum(!is_ok, na.rm = TRUE),
+    .groups      = "drop") |>
+  arrange(desc(n_total))
+
+datatable(
+  d_summary,
+  caption = glue(
+    "rng_iucn species by component: total, with/without US EEZ cells, ",
+    "is_ok status"),
+  options = list(dom = "t"))
+```
+
+```{r}
+#| label: cleanup
+#| include: false
+
+dbDisconnect(con_v5, shutdown = TRUE)
+dbDisconnect(con_sdm)
+```

@@ -1,8 +1,8 @@
 # shared version and path configuration ----
 # sourced by all workflow notebooks and apps
 
-ver <- "v4b" # version string; change on branches (e.g., "v3b")
-ver_prev <- "v4" # previous version (for copying inputs to new version)
+ver <- "v6" # version string; change on branches (e.g., "v3b")
+ver_prev <- "v5" # previous version (for copying inputs to new version)
 
 is_server <- Sys.info()[["sysname"]] == "Linux"
 dir_data <- ifelse(is_server, "/share/data", "~/My Drive/projects/msens/data")
@@ -25,7 +25,7 @@ tbl_pra <- glue::glue("ply_programareas_2026_{ver}")
 tbl_sr <- glue::glue("ply_subregions_2026_{ver}")
 
 # pmtiles table names (unversioned — scores joined at render time)
-tbl_er_pm  <- "ply_ecoregions_2025"
+tbl_er_pm <- "ply_ecoregions_2025"
 tbl_pra_pm <- "ply_programareas_2026"
 
 # version suffix for backward compatibility (e.g., "_v3")

@@ -139,7 +139,7 @@ pa_gpkg <- find_input("ply_planareas_2025.gpkg", prev_dirs)
 # flags, typical
 do_zones <- F # no, except if new spatial zones added
 do_metrics <- T # YES
-do_zone_taxon <- F # slow in past
+do_zone_taxon <- T # slow in past
 do_postgis <- F # NO, since migrated to pmtiles
 do_downloads <- T # YES
 do_summary_data <- T # ecoregion x PRA intersections, label points, score tables
@@ -148,7 +148,7 @@ do_readme <- T # programmatic README.md + README.html
 do_map <- F # no, but useful for visual checks during development
 do_parquet <- T # no, but produces smaller faster duckdb
 do_pmtiles <- F # generate PMTiles archives for mapgl/mapsp apps
-do_pra_primprod <- T # NO, unless zones or primary prod ∆; zonal primary productivity for program areas
+do_pra_primprod <- F # NO, unless zones or primary prod ∆; zonal primary productivity for program areas
 do_deploy <- T # sync derived data + app code to server
 
 stopifnot(!do_pmtiles || (do_pmtiles && do_downloads)) # pmtiles should be generated from downloads
@@ -158,7 +158,7 @@ pra_gpkg <- glue("{dir_v}/ply_programareas_2026_{ver}.gpkg")
 sr_gpkg <- glue("{dir_v}/ply_subregions_2026_{ver}.gpkg")
 
 # computed outputs (version suffix only — no obvious input year)
-sr_pra_csv <- glue("{dir_v}/subregion_programareas.csv")
+sr_pra_csv <- find_input("subregion_programareas.csv", c(dir_v, prev_dirs))
 metrics_tif <- glue("{dir_v}/r_metrics_{ver}.tif")
 metrics_pra_tif <- glue("{dir_v}/r_metrics_programareas_{ver}.tif")
 zone_taxon_csv <- glue("{dir_v}/zone_taxon_{ver}.csv")
@@ -177,6 +177,7 @@ tbl_er <- glue("ply_ecoregions_2025")
 pp_csv <- glue("{dir_v}/programarea_primprod.csv")
 pp_png <- glue("{dir_v}/programarea_primprod.png")
 pp_pdf <- glue("{dir_v}/programarea_primprod.pdf")
+component_pct_pra_csv <- glue("{dir_v}/tbl_component_pct_programarea_{ver}.csv")
 
 # redo flags for summary sections
 redo_summary_data <- T
@@ -1930,6 +1931,182 @@ d_ck |>
 # 1.195  11.186  21.902  27.317  41.150  91.748
 ```
 
+### Apply pct_area weighting to ProgramArea component metrics
+
+Weight each component's PA-level metric by the fraction of the PA's cells that have non-NA data for that component, so components with limited spatial coverage (e.g., turtles in GEO) are down-weighted before score aggregation.
+
+```{r}
+#| label: apply_pctarea_to_programarea_components
+#| eval: !expr do_metrics
+
+# get zone_seqs for program areas
+z_seqs <- tbl(con_sdm, "zone") |>
+  filter(tbl == !!tbl_pra) |>
+  pull(zone_seq)
+
+# component metric keys to weight
+component_keys <- c(
+  glue("extrisk_{sp_cats}_ecoregion_rescaled"),
+  "primprod_ecoregion_rescaled"
+)
+
+message(glue(
+  "Applying pct_area weighting to {length(component_keys)} component metrics across {length(z_seqs)} program areas..."
+))
+
+for (m_key in component_keys) {
+  # m_key = component_keys[1]
+
+  m_seq <- tbl(con_sdm, "metric") |>
+    filter(metric_key == !!m_key) |>
+    pull(metric_seq)
+  stopifnot(length(m_seq) == 1)
+
+  # create _prepctareaweighting metric to preserve original values
+  m_key_pre <- glue("{m_key}_prepctareaweighting")
+  m_seq_pre <- tbl(con_sdm, "metric") |>
+    filter(metric_key == !!m_key_pre) |>
+    pull(metric_seq)
+
+  if (length(m_seq_pre) == 0) {
+    dbExecute(
+      con_sdm,
+      glue(
+        "INSERT INTO metric (metric_key, description)
+      VALUES ('{m_key_pre}', 'Pre-pct_area weighting backup of {m_key}')"
+      )
+    )
+    m_seq_pre <- tbl(con_sdm, "metric") |>
+      filter(metric_key == !!m_key_pre) |>
+      pull(metric_seq)
+  }
+
+  # delete existing _prepctareaweighting values for PA zones
+  dbExecute(
+    con_sdm,
+    glue(
+      "DELETE FROM zone_metric
+    WHERE metric_seq = {m_seq_pre}
+      AND zone_seq IN ({paste(z_seqs, collapse = ',')})"
+    )
+  )
+
+  # copy current values to _prepctareaweighting
+  dbExecute(
+    con_sdm,
+    glue(
+      "INSERT INTO zone_metric (zone_seq, metric_seq, value)
+    SELECT zone_seq, {m_seq_pre} AS metric_seq, value
+    FROM zone_metric
+    WHERE metric_seq = {m_seq}
+      AND zone_seq IN ({paste(z_seqs, collapse = ',')})"
+    )
+  )
+
+  # update _ecoregion_rescaled values in place: value = value * pct_area
+  dbExecute(
+    con_sdm,
+    glue(
+      "
+    UPDATE zone_metric
+    SET value = zone_metric.value * sub.pct_area
+    FROM (
+      WITH
+      zone_total AS (
+        SELECT zone_seq, SUM(pct_covered) AS total_coverage
+        FROM zone_cell
+        WHERE zone_seq IN ({paste(z_seqs, collapse = ',')})
+        GROUP BY zone_seq
+      ),
+      zone_metric_coverage AS (
+        SELECT zc.zone_seq,
+          SUM(zc.pct_covered) AS metric_coverage
+        FROM zone_cell zc
+        JOIN cell_metric cm ON zc.cell_id = cm.cell_id
+        WHERE zc.zone_seq IN ({paste(z_seqs, collapse = ',')})
+          AND cm.metric_seq = {m_seq}
+          AND cm.value IS NOT NULL
+        GROUP BY zc.zone_seq
+      )
+      SELECT
+        zmc.zone_seq,
+        zmc.metric_coverage / zt.total_coverage AS pct_area
+      FROM zone_metric_coverage zmc
+      JOIN zone_total zt ON zmc.zone_seq = zt.zone_seq
+    ) AS sub
+    WHERE zone_metric.zone_seq = sub.zone_seq
+      AND zone_metric.metric_seq = {m_seq}
+      AND zone_metric.zone_seq IN ({paste(z_seqs, collapse = ',')})"
+    )
+  )
+
+  message(glue("  Applied pct_area to {m_key}"))
+}
+
+# write pct_area diagnostics CSV
+d_pct <- dbGetQuery(
+  con_sdm,
+  glue(
+    "
+  WITH
+  zone_total AS (
+    SELECT zone_seq, SUM(pct_covered) AS total_coverage
+    FROM zone_cell
+    WHERE zone_seq IN ({paste(z_seqs, collapse = ',')})
+    GROUP BY zone_seq
+  ),
+  zone_metric_coverage AS (
+    SELECT zc.zone_seq, cm.metric_seq,
+      SUM(zc.pct_covered) AS metric_coverage
+    FROM zone_cell zc
+    JOIN cell_metric cm ON zc.cell_id = cm.cell_id
+    WHERE zc.zone_seq IN ({paste(z_seqs, collapse = ',')})
+      AND cm.metric_seq IN (
+        SELECT metric_seq FROM metric
+        WHERE metric_key IN ({paste0(\"'\", component_keys, \"'\", collapse = ',')})
+      )
+      AND cm.value IS NOT NULL
+    GROUP BY zc.zone_seq, cm.metric_seq
+  )
+  SELECT
+    z.value    AS programarea_key,
+    m.metric_key,
+    zm_pre.value AS value_pre,
+    ROUND(zmc.metric_coverage / zt.total_coverage, 4) AS pct_area,
+    zm.value   AS value_post
+  FROM zone_metric_coverage zmc
+  JOIN zone_total zt ON zmc.zone_seq = zt.zone_seq
+  JOIN zone z ON zmc.zone_seq = z.zone_seq
+  JOIN metric m ON zmc.metric_seq = m.metric_seq
+  JOIN zone_metric zm
+    ON zmc.zone_seq = zm.zone_seq
+    AND zmc.metric_seq = zm.metric_seq
+  JOIN metric m_pre
+    ON m_pre.metric_key = m.metric_key || '_prepctareaweighting'
+  JOIN zone_metric zm_pre
+    ON zmc.zone_seq  = zm_pre.zone_seq
+    AND m_pre.metric_seq = zm_pre.metric_seq
+  ORDER BY z.value, m.metric_key"
+  )
+)
+write_csv(d_pct, component_pct_pra_csv)
+
+d_pct |>
+  mutate(
+    metric_key = str_replace_all(
+      metric_key,
+      c(
+        "extrisk_" = "",
+        "_ecoregion_rescaled" = "",
+        "primprod" = "prim_prod"
+      )
+    )
+  ) |>
+  select(programarea_key, metric_key, pct_area) |>
+  pivot_wider(names_from = metric_key, values_from = pct_area) |>
+  print(n = Inf)
+```
+
 ### Calculate Ecoregion metrics contributing to score based on cell metrics
 
 ```{r}
@@ -2194,108 +2371,23 @@ dbExecute(
   )
 )
 
-# calculate pct-area-weighted score per program area
-# weight each component by the fraction of the PA's cells with non-NA data
-# e.g., turtles only cover a small fraction of some Alaska PAs, eg St. George Basin (GEO)
+# simple average of component metrics (pct_area already baked into each component)
 dbExecute(
   con_sdm,
   glue(
-    "
-  WITH
-  -- total coverage per program area (sum of pct_covered across all cells)
-  zone_total AS (
-    SELECT zone_seq, SUM(pct_covered) AS total_coverage
-    FROM zone_cell
-    WHERE zone_seq IN ({paste(z_seqs, collapse = ',')})
-    GROUP BY zone_seq
-  ),
-  -- coverage with non-NA data per (zone, component metric)
-  zone_metric_coverage AS (
-    SELECT
-      zc.zone_seq,
-      cm.metric_seq,
-      SUM(zc.pct_covered) AS metric_coverage
-    FROM zone_cell zc
-    JOIN cell_metric cm ON zc.cell_id = cm.cell_id
-    WHERE
-      zc.zone_seq IN ({paste(z_seqs, collapse = ',')})
-      AND cm.metric_seq IN ({paste(m_input_seqs, collapse = ',')})
-      AND cm.value IS NOT NULL
-    GROUP BY zc.zone_seq, cm.metric_seq
-  ),
-  -- zone_metric values with pct_area weight
-  weighted_metrics AS (
-    SELECT
-      zm.zone_seq,
-      zm.metric_seq,
-      zm.value,
-      zmc.metric_coverage / zt.total_coverage AS pct_area
-    FROM zone_metric zm
-    JOIN zone_total zt
-      ON zm.zone_seq = zt.zone_seq
-    JOIN zone_metric_coverage zmc
-      ON zm.zone_seq    = zmc.zone_seq
-      AND zm.metric_seq = zmc.metric_seq
-    WHERE
-      zm.metric_seq IN ({paste(m_input_seqs, collapse = ',')})
-      AND zm.zone_seq IN ({paste(z_seqs, collapse = ',')})
-      AND zm.value IS NOT NULL
-  )
-  INSERT INTO zone_metric (zone_seq, metric_seq, value)
+    "INSERT INTO zone_metric (zone_seq, metric_seq, value)
   SELECT
     zone_seq,
     {m_seq} AS metric_seq,
-    SUM(value * pct_area) / SUM(pct_area) AS value
-  FROM weighted_metrics
+    SUM(value) / COUNT(value) AS value
+  FROM zone_metric
+  WHERE
+    metric_seq IN ({paste(m_input_seqs, collapse = ',')})
+    AND zone_seq IN ({paste(z_seqs, collapse = ',')})
+    AND value IS NOT NULL
   GROUP BY zone_seq"
   )
 ) # 20
-
-# check pct_area weights per PA and component
-d_pct <- dbGetQuery(
-  con_sdm,
-  glue(
-    "
-  WITH
-  zone_total AS (
-    SELECT zone_seq, SUM(pct_covered) AS total_coverage
-    FROM zone_cell
-    WHERE zone_seq IN ({paste(z_seqs, collapse = ',')})
-    GROUP BY zone_seq
-  ),
-  zone_metric_coverage AS (
-    SELECT zc.zone_seq, cm.metric_seq,
-      SUM(zc.pct_covered) AS metric_coverage
-    FROM zone_cell zc
-    JOIN cell_metric cm ON zc.cell_id = cm.cell_id
-    WHERE zc.zone_seq IN ({paste(z_seqs, collapse = ',')})
-      AND cm.metric_seq IN ({paste(m_input_seqs, collapse = ',')})
-      AND cm.value IS NOT NULL
-    GROUP BY zc.zone_seq, cm.metric_seq
-  )
-  SELECT z.value AS programarea_key, m.metric_key,
-    ROUND(zmc.metric_coverage / zt.total_coverage * 100, 1) AS pct_area
-  FROM zone_metric_coverage zmc
-  JOIN zone_total zt ON zmc.zone_seq = zt.zone_seq
-  JOIN zone z ON zmc.zone_seq = z.zone_seq
-  JOIN metric m ON zmc.metric_seq = m.metric_seq
-  ORDER BY z.value, m.metric_key"
-  )
-)
-
-d_pct |>
-  mutate(
-    metric_key = str_replace_all(
-      metric_key,
-      c(
-        "extrisk_" = "",
-        "_ecoregion_rescaled" = "",
-        "primprod" = "prim_prod"
-      )
-    )
-  ) |>
-  pivot_wider(names_from = metric_key, values_from = pct_area) |>
-  print(n = Inf)
 
 # check the new metric
 d_ck <- tbl(con_sdm, "metric") |>
@@ -3801,7 +3893,7 @@ compare_scores <- function(ver_curr, ver_prev) {
     setdiff(names(d_curr), c("Program Area", "Area (1,000 km2)"))
   )
 
-  # use version names for value columns (e.g., Score_v4b, Score_v4)
+  # use version names for value columns (e.g., Score_v4, Score_v4)
   v_c <- ver_curr
   v_p <- ver_prev
 
@@ -3841,7 +3933,7 @@ compare_scores <- function(ver_curr, ver_prev) {
     arrange(`Program Area`)
 
   # wide prev/curr/diff pivot (like Excel comparison) ----
-  # only rows where Score differs; columns: Score_v4b, Score_v4, Score_diff, ...
+  # only rows where Score differs; columns: Score_v4, Score_v4, Score_diff, ...
   pra_diff <- d_comp |>
     filter(Component == "Score", diff != 0) |>
     pull(`Program Area`)
@@ -3856,7 +3948,7 @@ compare_scores <- function(ver_curr, ver_prev) {
         values_from = c(all_of(v_p), all_of(v_c), diff),
         names_glue = "{Component}_{.value}"
       ) |>
-      # rename ver columns: Score_v4 / Score_v4b / Score_diff
+      # rename ver columns: Score_v4 / Score_v4 / Score_diff
       rename_with(
         ~ str_replace(.x, glue("_{v_p}$"), glue("_{v_p}")),
         ends_with(glue("_{v_p}"))
@@ -3892,7 +3984,7 @@ compare_scores <- function(ver_curr, ver_prev) {
   )
 }
 
-# compare ver vs ver_prev (v4b vs v4) ----
+# compare ver vs ver_prev (v5 vs v4) ----
 res <- compare_scores(ver, ver_prev)
 if (!is.null(res)) {
   res$d_comp_wide |>
@@ -3968,7 +4060,7 @@ if (!is.null(res_v3) && !is.null(res_v3$d_comp_pvt)) {
 #| label: compare_scores_multi
 #| eval: !expr do_summary_figs
 
-# multi-version pivot: Score and Turtle across v3, v4, v4b ----
+# multi-version pivot: Score and Turtle across v3, v4, v5 ----
 vers_compare <- c("v3", "v4", ver)
 csvs <- glue("{dir_derived}/{vers_compare}/tbl_pra_scores_{vers_compare}.csv")
 names(csvs) <- vers_compare
@@ -3982,7 +4074,7 @@ if (all(file_exists(csvs))) {
       mutate(ver = v)
   })
 
-  # pivot wide: Score_v3, Score_v4, Score_v4b, Turtle_v3, ...
+  # pivot wide: Score_v3, Score_v4, Score_v5, Turtle_v3, ...
   d_wide <- d_all |>
     pivot_wider(
       names_from = ver,
@@ -3991,30 +4083,31 @@ if (all(file_exists(csvs))) {
     )
 
   # add diff columns
+  v_cur <- ver
   d_wide <- d_wide |>
     mutate(
       Score_v4_v3 = Score_v4 - Score_v3,
-      Score_v4b_v3 = Score_v4b - Score_v3,
+      "Score_{v_cur}_v3" := .data[[glue("Score_{v_cur}")]] - Score_v3,
       Turtle_v4_v3 = Turtle_v4 - Turtle_v3,
-      Turtle_v4b_v3 = Turtle_v4b - Turtle_v3
+      "Turtle_{v_cur}_v3" := .data[[glue("Turtle_{v_cur}")]] - Turtle_v3
     ) |>
     select(
       `Program Area`,
       Score_v3,
       Score_v4,
       Score_v4_v3,
-      Score_v4b,
-      Score_v4b_v3,
+      !!glue("Score_{v_cur}"),
+      !!glue("Score_{v_cur}_v3"),
       Turtle_v3,
       Turtle_v4,
       Turtle_v4_v3,
-      Turtle_v4b,
-      Turtle_v4b_v3
+      !!glue("Turtle_{v_cur}"),
+      !!glue("Turtle_{v_cur}_v3")
     ) |>
-    arrange(desc(Score_v4b_v3))
+    arrange(desc(.data[[glue("Score_{v_cur}_v3")]]))
 
   # write xlsx
-  multi_xlsx <- glue("{dir_v}/tbl_pra_scores_v3_vs_v4_v4b.xlsx")
+  multi_xlsx <- glue("{dir_v}/tbl_pra_scores_v3_vs_v4_{ver}.xlsx")
   write_xlsx(d_wide, multi_xlsx)
   message(glue("Wrote multi-version comparison to {multi_xlsx}"))
 
@@ -4022,12 +4115,14 @@ if (all(file_exists(csvs))) {
   num_cols <- setdiff(names(d_wide), "Program Area")
   d_wide |>
     DT::datatable(
-      caption = "Program Area scores: v3 vs v4 vs v4b (Score and Turtle)",
+      caption = glue(
+        "Program Area scores: v3 vs v4 vs {ver} (Score and Turtle)"
+      ),
       options = list(pageLength = 25, dom = "t", scrollX = TRUE)
     ) |>
     DT::formatRound(columns = num_cols, digits = 0) |>
     DT::formatStyle(
-      columns = num_cols[str_detect(num_cols, "_v[34]")],
+      columns = num_cols[str_detect(num_cols, "_v")],
       backgroundColor = DT::styleInterval(
         c(-0.5, 0.5),
         c("#f4cccc", "white", "#d9ead3")
@@ -4557,7 +4652,8 @@ This cleans up the DuckDB database by exporting tables to Parquet files (with so
 # TODO: model_cell: PARTITION BY (mdl_seq);") # https://duckdb.org/docs/stable/data/parquet/overview
 
 source(here("libs/sdm_functions.R"))
-con_sdm <- dbConnect(duckdb(), dbdir = sdm_db, read_only = F) |>
+drv_export <- duckdb(dbdir = sdm_db, read_only = FALSE)
+con_sdm <- dbConnect(drv_export) |>
   load_duckdb_extensions()
 
 # dbListTables(con_sdm)
@@ -4636,8 +4732,11 @@ for (tbl in names(tbl_keys)) {
 }
 message(glue("Exporting finished  ~  {Sys.time()}")) # ~ 1 min
 
-dbDisconnect(con_sdm, shutdown = T)
+dbDisconnect(con_sdm)
 rm(con_sdm)
+duckdb::duckdb_shutdown(drv_export)
+rm(drv_export)
+gc()
 ```
 
 ### Import from Parquet
@@ -4648,14 +4747,15 @@ rm(con_sdm)
 
 # dir_pq and sdm_db defined in setup chunk
 
-# close any existing connection and force GC to clean up orphaned drivers
+# close any existing connection
 if (exists("con_sdm") && dbIsValid(con_sdm)) {
-  dbDisconnect(con_sdm, shutdown = T)
+  dbDisconnect(con_sdm)
 }
 if (exists("con_sdm")) {
   rm(con_sdm)
 }
-gc() # flush orphaned duckdb driver instances from earlier chunks
+gc()
+Sys.sleep(1)
 
 if (file_exists(sdm_db)) {
   file_delete(sdm_db)
@@ -4667,8 +4767,15 @@ if (file_exists(sdm_wal)) {
 }
 
 source(here("libs/sdm_functions.R"))
-con_sdm <- dbConnect(duckdb(), dbdir = sdm_db, read_only = F) |>
+# create a fresh database and immediately checkpoint to ensure the main file
+# exists on disk (duckdb WAL-only mode never creates the .duckdb file otherwise)
+drv_import <- duckdb(dbdir = sdm_db, read_only = FALSE)
+con_sdm <- dbConnect(drv_import) |>
   load_duckdb_extensions()
+dbExecute(con_sdm, "CHECKPOINT")
+stopifnot(
+  `sdm_db not created after initial CHECKPOINT` = file_exists(sdm_db)
+)
 
 # dbExecute(con_sdm, "SET threads = 8;")
 # dbExecute(con_sdm, "SET memory_limit = '20GB';")
@@ -4747,11 +4854,19 @@ for (tbl in dbListTables(con_sdm)) {
   }
 }
 
-# checkpoint WAL to main DB file, then shut down driver cleanly
+# checkpoint WAL to main DB file, then shut down cleanly
 dbExecute(con_sdm, "CHECKPOINT")
-dbDisconnect(con_sdm, shutdown = T)
+dbDisconnect(con_sdm)
 rm(con_sdm)
-gc() # flush duckdb driver finalizer so file handles are fully released
+duckdb::duckdb_shutdown(drv_import)
+rm(drv_import)
+gc()
+Sys.sleep(1)
+stopifnot(
+  `sdm_db missing after import_parquet CHECKPOINT+shutdown` = file_exists(
+    sdm_db
+  )
+)
 message(glue(
   "sdm.duckdb exists: {file_exists(sdm_db)}  size: {file_size(sdm_db)}"
 ))
@@ -4769,11 +4884,19 @@ deploy_sh <- here("libs/deploy_to_server.sh")
 stopifnot(file_exists(deploy_sh))
 
 # duckdb shutdown may need a moment for file handles to release
-if (!file_exists(sdm_db)) {
+for (i in 1:5) {
+  if (file_exists(sdm_db)) {
+    break
+  }
   gc() # flush any orphaned duckdb driver finalizers
   Sys.sleep(2)
+  message(glue("waiting for sdm_db ({i}/5)..."))
 }
-stopifnot(file_exists(sdm_db))
+stopifnot(
+  `sdm_db not found after parquet import — check import_parquet chunk` = file_exists(
+    sdm_db
+  )
+)
 system2("bash", args = c(deploy_sh, ver), wait = T)
 ```
 
