@@ -20,6 +20,435 @@
 
 - Migrate to hexagons
 
+## 2026-04-03 show_study-area.qmd with ply_planareas_2025 extended to shore
+
+Update `show_study-area.qmd` to show the Proposed Planning Areas across entire US EEZ, and slightly beyond:
+
+  `@~/My Drive/projects/msens/data/derived/v1/ply_planareas_2025.gpkg`
+
+Mention that this was created in `ingest_productivity.qmd`, the rendered version of which is veiewable at https://marinesensitivity.org/workflows/ingest_productivity.html.
+
+Create another layer that extends this to the shore:
+
+  `@~/My Drive/projects/msens/data/derived/v1/ply_planareas_2025_toshore.gpkg`
+
+Use the high-resolution [Natural Earth](https://www.naturalearthdata.com/) from R packages `rnaturalearth` and `rnaturalearthhires` to get the shoreline. 
+
+Note that distances from shoreline of existing federal waters in `ply_planareas_2025.gpkg` vary according to:
+
+  - In most US states (e.g., Atlantic and Pacific coasts), state waters extend `3 nm` from the baseline. Federal waters begin here and extend to 200 nm.
+  - Nautical Mile Limit: **Texas**, the **Gulf Coast of Florida**, and **Puerto Rico** have extended state jurisdiction, with federal waters beginning `9 nm` offshore.
+
+Use [`mregions2`](https://docs.ropensci.org/mregions2/) to clip the coastal buffer (buffer - land) to the US EEZ.
+
+⏺ Here's what the updated `show_study-area.qmd` does:
+
+  **Planning Areas** (`ply_planareas_2025.gpkg`): Read directly and displayed as
+  steelblue fill polygons with dark outlines. Notes it was created in
+  ingest_productivity.qmd.
+
+  **To-shore extension** (`ply_planareas_2025_toshore.gpkg`): Created by:
+  1. Getting high-res US land from `rnaturalearth`/`rnaturalearthhires` (scale 10,
+  filtered by US sovereignty to include territories)
+  2. Getting US EEZ from `mregions2` (`sovereign1 = 'United States'`)
+  3. Buffering each PA by 0.3° (~12nm) to cover both the 3nm and 9nm state
+  waters gaps
+  4. Subtracting land, then clipping to the EEZ
+  5. Cached — only computed if the gpkg doesn't exist yet
+
+  Map: Both layers shown on a MapLibre map — toshore in light blue underneath,
+  planning areas in steelblue on top, with tooltips/popups for `planarea_name`.
+
+But how to handle the overlapping buffers between Planning Areas extendend to shore? Explore use of `sf::st_triangulate()` and/or `sf::st_voronoi()` to obtain Thiessen Polygons:
+
+- [Does st\\_voronoi work incorrectly on sfc? · Issue #824 · r-spatial/sf](https://github.com/r-spatial/sf/issues/824)
+- [Almeida100/Buffer-Without-Overlaps: This plugin creates a buffer around features of given type, without overlaps and with flat end caps.](https://github.com/Almeida100/Buffer-Without-Overlaps)
+
+These Planning Areas actually extend beyond the EEZ offshore so doing `st_intersection(eez)` would clip them. Want to retain which Planning Area nearshore, but probably need to intersect with a land buffer (to get only nearshore areas vs also including offshore areas at 200 NM edge of the EEZ).
+
+⏺ Key changes from the previous version:
+
+  1. Buffer land, not PAs — defines the nearshore zone as `st_buffer(land, 0.3) ∩ EEZ - land`, so we only get the coastal water strip (~12nm from shore) without clipping the original PA geometries                                  
+  2. Voronoi partition — `st_voronoi()` on `st_point_on_surface(pa)` creates Thiessen polygons that partition the nearshore among PAs. Per the sf#824 issue, points are first combined via `st_union()` so Voronoi operates on all points collectively, then reordered back to match PAs using `st_intersects()`  
+  3. No EEZ clipping of PAs — the original PA geometries are preserved as-is (they extend beyond EEZ). Only the nearshore extension is clipped to EEZ (to exclude foreign waters)
+  4. No overlaps — each piece of nearshore is assigned to exactly one PA via its Voronoi cell before being unioned with the original PA geometry  
+
+Looks like we need to employ `sf::st_make_valid()` and possibly `sf::sf_use_s2(FALSE)`. Debug and render to completion, doing everything possible to faithfully render Planning Areas extended to shore.
+
+6/9 [extend-to-shore]    
+Error in `scan()`:
+! scan() expected 'a real', got '29.864932812453088.'
+Backtrace:
+    ▆
+ 1. ├─sf::st_make_valid(...)
+ 2. ├─sf::st_difference(...)
+ 3. ├─sf::st_intersection(st_buffer(land, 0.3), eez)
+ 4. ├─sf:::st_intersection.sfc(st_buffer(land, 0.3), eez)
+ 5. │ └─sf:::geos_op2_geom("intersection", x, y, ...)
+ 6. │   ├─sf::st_sfc(CPL_geos_op2(op, x, y), crs = st_crs(x))
+ 7. │   └─sf:::CPL_geos_op2(op, x, y)
+ 8. └─sf (local) `<fn>`("TopologyException: side location conflict at -85.040017679054827 29.864932812453088. This can occur if the input geometry is invalid.")
+ 9.   └─base::scan(text = lst[[length(lst)]], quiet = TRUE)
+Error:
+! TopologyException: side location conflict at -85.040017679054827 29.864932812453088. This can occur if the input geometry is invalid.
+Backtrace:
+    ▆
+ 1. ├─sf::st_make_valid(...)
+ 2. ├─sf::st_difference(...)
+ 3. ├─sf::st_intersection(st_buffer(land, 0.3), eez)
+ 4. ├─sf:::st_intersection.sfc(st_buffer(land, 0.3), eez)
+ 5. │ └─sf:::geos_op2_geom("intersection", x, y, ...)
+ 6. │   ├─sf::st_sfc(CPL_geos_op2(op, x, y), crs = st_crs(x))
+ 7. │   └─sf:::CPL_geos_op2(op, x, y)
+ 8. └─sf (local) `<fn>`("TopologyException: side location conflict at -85.040017679054827 29.864932812453088. This can occur if the input geometry is invalid.")
+
+Quitting from show_study-area.qmd:47-107 [extend-to-shore]
+
+⏺ Changes to fix the TopologyException:   
+
+  1. sf_use_s2(FALSE) moved before loading geometries — ensures all operations 
+  use planar GEOS, avoiding s2/GEOS mixing
+  2. st_make_valid() on both land and eez after union — fixes any              
+  self-intersections in the source data                                        
+  3. st_snap_to_grid(x, 1e-6) on land buffer, eez, and land — reduces
+  coordinate precision to eliminate the floating-point conflicts that cause    
+  "side location conflict" errors                                 
+  4. Intermediate st_make_valid() between st_intersection and st_difference —  
+  the intersection result can have new topology issues                         
+  5. tryCatch wrappers in the per-PA loop — if any individual PA still hits a
+  topology edge case, it falls back to the original geometry rather than       
+  aborting
+
+Looks like you need to load `lwgeom` to make `st_snap_to_grid()` available. Like I requested before, please debug and iteratively run `quarto render show_study-area.qmd` to evaluate any other bugs to competion.
+
+```
+processing file: show_study-area.qmd
+1/9                      
+2/9 [setup]              
+3/9                      
+4/9 [read-planning-areas]
+5/9                      
+6/9 [extend-to-shore]    
+Error in `st_snap_to_grid()`:
+! could not find function "st_snap_to_grid"
+
+Quitting from show_study-area.qmd:47-119 [extend-to-shore]
+Execution halted
+```
+
+⏺ Rendered to completion:                                                      
+                                                                          
+  - ply_planareas_2025_toshore.gpkg created (7.1 MB)                           
+  - show_study-area.html output (76 MB, embed-resources with map tiles)        
+                                                                               
+  The fix was replacing st_snap_to_grid() (requires projected CRS) with        
+  st_buffer(x, 0) |> st_make_valid() — the standard GEOS trick for cleaning    
+  topology issues in longlat geometries. 
+
+[Image #3] Turn off warnings (or otherwise silence sf operations) and turn  
+  on a layers control. Oddly, I am not seeing the Planning Areas filled in 
+
+⏺ Three issues: (1) suppress warnings, (2) PA fill not rendering (likely
+  geometry type issue — the gpkg has "Unknown" geometry type), (3) add layer
+  control. Let me check mapgl's layer control API.
+
+⏺ Rendered successfully. Three fixes applied:
+
+  1. Warnings silenced — #| warning: false and #| message: false on all chunks
+  2. PA fill fix — st_cast("MULTIPOLYGON") on the PA data after reading. The
+  gpkg had geometry type "Unknown (any)" which mapgl couldn't render as fill
+  3. Layers control — add_layers_control() with named layers: "To Shore",
+  "Planning Areas", "PA Outlines"
+
+The full extent to the nearshore is captured, but the assignment to          
+  Planning Area (PA) is off, as you can see with these nearshore incursions    
+  of SOC north into CEC, CEC north into NOC and NOC north into WAO -- those
+  horizontal boundaries should continue to shore. Try to fix this with
+  Theissen polygon logic and show the full toshore polygons on the map color
+  coded by unique planarea_key [Image #5]
+
+⏺ st_line_sample doesn't support longlat. I'll use st_segmentize +
+  st_cast("POINT") to extract dense boundary vertices instead.
+
+⏺ 0.05° is too fine for boundaries spanning the whole US EEZ — blew memory. The
+   existing PA vertices should already be dense enough. Let me just extract
+  them directly.
+
+⏺ ~900K vertices — too many for Voronoi. Need to subsample boundary points to a
+   manageable number.  
+
+⏺ Mixed coordinate dimensions in st_coordinates. Let me use st_cast to POINT
+  instead.
+
+⏺ Rendered successfully. The approach now:                                     
+                                                                               
+  1. Subsampled boundary vertices (~200 per PA) as Voronoi seeds instead of a  
+  single centroid — the Voronoi partition follows the direction of PA boundary
+  lines rather than creating arbitrary curved boundaries                       
+  2. Dissolved by planarea_key — all Voronoi cells for the same PA merge into
+  one territory polygon                                                        
+  3. Color-coded by planarea_key using match_expr() with hcl.colors("Dynamic") 
+  palette                                                                      
+  4. Layer control with PA fill, outlines, and toshore outlines                
+                                                                               
+  The horizontal boundaries between SOC/CEC/NOC/WAO should now extend straight 
+  to shore since the Voronoi is seeded from the actual boundary vertices, not  
+  distant centroids.
+
+Almost there! Per [Image #6], there are erroneous slivers from the voronoi buffer process falsely overrwriting the original PA. Seems like pa_toshore needs to be differenced from pa and then unioned to pa to get proper representation, including some PAs dropping entirely from Alaska [Image #7] (presumably because of dateline issues around buffer).
+
+⏺ Two issues to fix:
+
+  1. Slivers: the Voronoi nearshore overlaps existing PA territory → need to
+  subtract all PAs from nearshore first, so Voronoi only partitions the gap
+  2. Alaska dropouts: antimeridian artifacts → need to ensure original PA is
+  always preserved
+
+⏺ Three PAs (ALA, BOW, HAW) went empty — the global st_make_valid() at the end
+  is corrupting antimeridian-crossing geometries. Let me fix the safety logic.
+
+⏺ Mixed geometry types preventing write. Need to cast before saving.
+
+⏺ Three PAs still going empty. The union produces GEOMETRYCOLLECTION with
+  linestring artifacts (dateline), then st_collection_extract("POLYGON") finds
+  nothing. Need a final empty-revert.
+
+⏺ Root cause: ALA, BOW, HAW span -180 to 180 (cross antimeridian). Planar union
+   corrupts them, and st_is_empty lies about them. Fix: skip dateline-crossing
+  PAs in the union loop, remove the unnecessary st_cast that also corrupts
+  them.
+
+⏺ Now fix the union loop to skip dateline-crossing PAs, and remove the per-row
+  type fix.
+
+⏺ All 36 PAs preserved. No slivers, no dropouts:
+
+  - 22 PAs grew with nearshore extensions (up to +69.8% for COK, +17.5% for
+  FLS)
+  - 14 PAs unchanged (either dateline-crossing or no nearshore territory to
+  claim)
+  - Zero shrinkage — the nearshore_gap = nearshore - union(all PAs) ensures
+  Voronoi only partitions water not already assigned to a PA
+  - Dateline PAs (ALA, BOW, HAW) keep their original geometry intact by
+  skipping the planar union
+
+To map, `add_symbol_layer()` of `pa.planarea_key`.
+
+⏺ Rendered. Added add_symbol_layer with planarea_key labels using
+  st_point_on_surface() for label placement, plus white halo for readability.
+  Labels are toggleable in the layers control.
+
+  Regarding st_centroid() vs st_point_on_surface() — for these PAs,
+  st_centroid() would actually be fine and probably better for label placement
+  (more visually centered). I used st_point_on_surface() out of habit since it
+  guarantees the point falls inside the polygon (useful for concave shapes),
+  but PA polygons are mostly convex so centroids would land inside them anyway.
+   The PA data also already has ctr_lon/ctr_lat centroid columns that could be
+  used directly. Want me to switch to st_centroid() or use the existing
+  centroid columns?
+
+✻ Cooked for 1m 58s
+
+❯ Actually, per                                                                
+https://github.com/r-spatial/sf/issues/1302#issuecomment-599226372 let's leave 
+ it as you did: I believe what you are after is `st_point_on_surface`. It is a 
+ best approximation of a centroid guaranteed to be inside a (multi)polygon.    
+See [here](https://gis.stackexchange.com/questions/76498/how-is-st-pointonsurf 
+ace-calculated) for how it is calculated.                                      
+
+⏺ Good call — st_point_on_surface() is the right choice. Guaranteed inside the
+  polygon, which matters for irregularly shaped PAs like the Aleutian ones.
+
+Would still like to work through a few oddities:
+
+- [Image #8] Missing Key West, Dry Tortugas National Park off Eastern Gulf of America (EGA)
+- [Image #9] Land should be clipped out of Puerto Rico (PUR).
+- [Image #10] Santa Barbara Island missing in Southern California (SOC)
+- [Image #11] Southern part of Farrallon Islands missing in Central California (CEC)
+- [Image #12] Aleutian Arc (ALA) has nearshore that is erroneously assigned St. George Basin (GEO) and rest is missing. This is presumably because it is a PA on the antimeridian, but this could probably still be merged if clipped to the reasonable global bounding box (ie extent -180,180) before being joined to rest of PAs.
+
+Looks like we need to use https://www.naturalearthdata.com/downloads/10m-physical-vectors/10m-minor-islands/ 
+
+⏺ Great find. countries + minor_islands covers Key West and Santa Barbara      
+  Island. Dry Tortugas and Farallons are still too small for Natural Earth. Let
+   me finalize the plan. 
+
+I'm hoping the following new Natural Earth layer for National Parks adds Key West, Santa Barbara, Farallon, Dry Tortugas:
+
+https://www.naturalearthdata.com/http//www.naturalearthdata.com/download/10m/cultural/ne_10m_parks_and_protected_lands.zip
+source: https://www.naturalearthdata.com/downloads/10m-cultural-vectors/parks-and-protected-lands/
+
+Try this:
+https://catalog.data.gov/dataset/national-park-boundaries
+
+⏺ Updated plan
+  ⎿  /plan to preview
+
+ Ready to code?
+
+ Here is Claude's plan:
+
+ Fix PA-to-Shore: Islands, Land Clipping, Dateline
+
+ Summary of changes to show_study-area.qmd extend-to-shore chunk
+
+ 1. Better land: ne_countries + ne_download(minor_islands)
+
+ Fixes Santa Barbara Island, Key West. Used for land buffer and land
+ subtraction.
+
+ 2. Supplement nearshore with NPS + NOAA marine boundaries
+
+ NPS DRTO boundary and NOAA Greater Farallones sanctuary are marine areas —
+ add them directly to the nearshore zone (not to land). This fills gaps near
+ Dry Tortugas and Farallon Islands.
+ - NPS: ArcGIS REST API for DRTO, CHIS, GUIS
+ - NOAA: onmsR sanctuaries GeoJSON (Greater Farallones, Florida Keys)
+
+ 3. Subtract land from final pa_toshore
+
+ Per-row st_difference(land) after union loop. Fixes Puerto Rico land
+ coverage. Skip dateline PAs.
+
+ 4. Handle ALA dateline
+
+ - Wrap ALA boundary points into [-180,180] for Voronoi participation
+ - Use st_shift_longitude() on nearshore territory before union with ALA
+ - Don't skip dateline PAs anymore
+
+ Verification
+
+ Delete cached gpkg, render, verify all 36 PAs preserved, visually check
+ PR/Dry Tortugas/Farallons/ALA.
+
+ Context
+
+ The show_study-area.qmd generates ply_planareas_2025_toshore.gpkg by
+ extending Planning Areas to shore using Voronoi-partitioned nearshore zones.
+ Five issues remain:
+ 1. Missing nearshore around small islands (Key West, Santa Barbara, Farallon,
+  Dry Tortugas)
+ 2. Puerto Rico land not clipped from PUR PA
+ 3. ALA (Aleutian Arc) nearshore wrongly assigned to GEO
+
+ File to modify
+
+ /Users/bbest/Github/MarineSensitivity/workflows/show_study-area.qmd — the
+ extend-to-shore chunk only.
+
+ Investigation results
+
+ - ne_countries(sovereignty="USA") alone misses small islands
+ - Adding ne_download(scale=10, type="minor_islands", category="physical")
+ (2,795 features) fixes Santa Barbara Island and adds many other small islands
+ - Key West is actually in ne_countries with precise coords (-81.80, 24.555)
+ - ne_download(type="parks_and_protected_lands_area") doesn't add anything
+ beyond what minor_islands already covers
+ - Dry Tortugas and Farallon Islands remain absent from all Natural Earth data
+  (accept as limitation — too small)
+ - PUR PA polygon covers PR land — need st_difference(land) on final output
+ - ALA clipped to valid bbox produces valid 870 Mkm² geometry
+
+ Changes
+
+ 1. Supplement land with minor islands + NPS boundaries (~line 60)
+
+ Three land sources combined:
+ - ne_countries(scale=10, sovereignty="USA") — main US land
+ - ne_download(scale=10, type="minor_islands", category="physical") — 2,795
+ small islands globally (fixes Santa Barbara Island)
+ - NPS boundaries via ArcGIS API (Dry Tortugas NP, Channel Islands NP, etc.) —
+  fixes Dry Tortugas
+
+ land_countries <- ne_countries(scale=10, sovereignty="United States of
+ America", returnclass="sf") |>
+   st_geometry()
+ land_minor <- ne_download(scale=10, type="minor_islands",
+ category="physical", returnclass="sf") |>
+   st_geometry()
+
+ # NPS park boundaries for coastal parks with islands (Dry Tortugas, Channel
+ Is, etc.)
+ nps_url <- paste0(
+   "https://services1.arcgis.com/fBc8EJBxQRMcHlei/arcgis/rest/services/",
+   "NPS_Land_Resources_Division_Boundary_and_Tract_Data_Service/FeatureServer/
+ 2/query",
+   "?where=UNIT_CODE%20IN%20(%27DRTO%27,%27CHIS%27,%27GUIS%27)&outFields=UNIT_
+ NAME&f=geojson")
+ land_nps <- tryCatch(
+   read_sf(nps_url) |> st_geometry(),
+   error = function(e) st_sfc(crs = st_crs(land_countries)))
+
+ land <- c(land_countries, land_minor, land_nps) |>
+   st_union() |> st_make_valid()
+
+ Note: Farallon Islands (FWS NWR, not NPS) remain absent — too small for
+ Natural Earth and not in NPS data.
+
+ 2. Wrap dateline PA points into [-180,180] for Voronoi (~line 88-104)
+
+ Inside the pts_list lapply, after building the st_sf result, check if the PA
+ crosses the dateline and wrap X coordinates > 180 by subtracting 360:
+
+ bb <- st_bbox(pa[i, ])
+ if (bb["xmin"] < -170 && bb["xmax"] > 170) {
+   coords <- st_coordinates(result)
+   coords[, "X"] <- ifelse(coords[, "X"] > 180, coords[, "X"] - 360, coords[,
+ "X"])
+   result <- st_sf(
+     planarea_key = result$planarea_key,
+     geometry = st_sfc(lapply(seq_len(nrow(coords)), function(j)
+ st_point(coords[j,])), crs = st_crs(pa)))
+ }
+
+ This ensures ALA boundary points participate in the Voronoi instead of being
+ outside the envelope.
+
+ 3. Handle dateline PAs in union loop (~line 142)
+
+ Replace the next skip with st_shift_longitude() to shift nearshore territory
+ into ALA's 0-360 coordinate space before unioning:
+
+ if (is_dateline) {
+   coast_shifted <- st_shift_longitude(st_geometry(coast_i)) |>
+ st_make_valid()
+   new_geom <- tryCatch(
+     st_union(c(st_geometry(pa)[i], coast_shifted)) |> st_make_valid(),
+     error = function(e) NULL)
+ } else {
+   # existing union logic
+ }
+
+ 4. Subtract land from final pa_toshore (~after union loop)
+
+ Add per-row st_difference(land) after the union loop to remove land from all
+ PAs (fixes PR). Skip dateline PAs to avoid coordinate space conflicts:
+
+ for (i in seq_len(nrow(pa_toshore))) {
+   bb <- st_bbox(pa_toshore[i, ])
+   if (bb["xmin"] < -170 && bb["xmax"] > 170) next
+   new_geom <- tryCatch(
+     st_difference(st_geometry(pa_toshore)[i], land) |> st_make_valid(),
+     error = function(e) NULL)
+   if (!is.null(new_geom) && length(new_geom) > 0 &&
+       inherits(new_geom[[1]], c("POLYGON", "MULTIPOLYGON"))) {
+     st_geometry(pa_toshore)[i] <- new_geom
+   }
+ }
+
+ Verification
+
+ 1. Delete cached ply_planareas_2025_toshore.gpkg
+ 2. quarto render show_study-area.qmd
+ 3. Check: all 36 PAs preserved, none shrunk
+ 4. Visual: PR land clipped, Key West/Santa Barbara nearshore present, ALA has
+  nearshore
+
+```bash
+tail -50 cat /private/tmp/claude-501/-Users-bbest-Github-MarineSensitivity-workflows/4929e361-6723-4352-ac3e-3ca5f824e075/tasks/bv49b7wei.output
+```
+
+
 ## 2026-03-25.b update v6 description, docs
 
 Ok, we're finally ready to commit **v6**. Come up with a good commit message and version description for `@../MarineSensitivity.github.io/index.qmd`. Also update the `@../docs/` to reflect the latest changes, ie removing any species from analysis with global range maps (for now just IUCN) that fall outside the US EEZ and BOEM Program Areas.
@@ -81,6 +510,29 @@ I'm a bit confused by the mention of the 2,248 species with IUCN range maps outs
   - Score impact negligible across all Program Areas.
 
   Shall I proceed with the commits across all four repos?
+
+yes
+
+⏺ All four repos committed and pushed:
+
+  ┌─────────────────────────────┬──────────┬─────────────────────────────────────────────────────────┐
+  │            Repo             │  Commit  │                         Summary                         │
+  ├─────────────────────────────┼──────────┼─────────────────────────────────────────────────────────┤
+  │ workflows                   │ cf44e56d │ v6 pipeline: backfill, merge fix, new notebooks, v5/v6  │
+  │                             │          │ figs                                                    │
+  ├─────────────────────────────┼──────────┼─────────────────────────────────────────────────────────┤
+  │ docs                        │ 8a6928c  │ Species count 9,819→9,424; range-outside-EEZ filter     │
+  │                             │          │ documented                                              │
+  ├─────────────────────────────┼──────────┼─────────────────────────────────────────────────────────┤
+  │ MarineSensitivity.github.io │ 250099e  │ v6 version history entry                                │
+  ├─────────────────────────────┼──────────┼─────────────────────────────────────────────────────────┤
+  │ apps                        │ 4b058ba  │ "Model not found" modal for invalid mdl_seq URLs        │
+  └─────────────────────────────┴──────────┴─────────────────────────────────────────────────────────┘
+
+please create a v5 branch of the apps
+
+⏺ Done. Branch v5 created at commit 62cccb3 (the last commit before the v6 changes) and pushed to
+  origin.
 
 ## 2026-03-25 add mapsp app disclaimer for missing model
 

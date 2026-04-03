@@ -1,0 +1,298 @@
+---
+title: "Study Area"
+format:
+  html:
+    embed-resources: true
+---
+
+## Proposed Planning Areas
+
+The [Proposed Planning Areas](https://marinesensitivity.org/workflows/ingest_productivity.html)
+span the US Exclusive Economic Zone (EEZ), originally created in
+[`ingest_productivity.qmd`](https://marinesensitivity.org/workflows/ingest_productivity.html).
+
+The "to shore" extension fills the gap between federal planning areas and the
+coastline, which varies by jurisdiction:
+
+- **Most US coasts**: state waters extend **3 nautical miles** from shore
+- **Texas, Gulf coast of Florida, Puerto Rico**: state waters extend
+  **9 nautical miles** from shore
+
+Nearshore territory is partitioned among Planning Areas using Voronoi
+tessellation (`st_voronoi()`) seeded from densely sampled PA boundary points,
+so nearshore boundaries follow the natural extension of PA boundaries to shore.
+
+```{r}
+#| label: setup
+#| warning: false
+#| message: false
+librarian::shelf(
+  dplyr,
+  mapgl,
+  mregions2,
+  rnaturalearth,
+  rnaturalearthhires,
+  sf,
+  quiet = T
+)
+
+dir_data <- "~/My Drive/projects/msens/data/derived/v1"
+pa_gpkg <- file.path(dir_data, "ply_planareas_2025.gpkg")
+pa_toshore_gpkg <- file.path(dir_data, "ply_planareas_2025_toshore.gpkg")
+```
+
+```{r}
+#| label: read-planning-areas
+#| warning: false
+#| message: false
+pa <- read_sf(pa_gpkg)
+```
+
+```{r}
+#| label: extend-to-shore
+#| warning: false
+#| message: false
+if (!file.exists(pa_toshore_gpkg)) {
+  sf_use_s2(FALSE)
+
+  # high-res land: Natural Earth countries + minor islands (≤2 km²)
+  land_countries <- ne_countries(
+    scale       = 10,
+    sovereignty = "United States of America",
+    returnclass = "sf") |>
+    st_geometry()
+  land_minor <- ne_download(
+    scale    = 10,
+    type     = "minor_islands",
+    category = "physical",
+    returnclass = "sf") |>
+    st_geometry()
+  land <- c(land_countries, land_minor) |>
+    st_union() |>
+    st_make_valid()
+
+  # US EEZ from mregions2
+  eez <- mrp_get("eez", cql_filter = "sovereign1 = 'United States'") |>
+    st_geometry() |>
+    st_union() |>
+    st_make_valid()
+
+  # zero-width buffer to clean up topology
+  land     <- st_buffer(land, 0) |> st_make_valid()
+  eez      <- st_buffer(eez, 0)  |> st_make_valid()
+  land_buf <- st_buffer(land, 0.3) |> st_make_valid()
+
+  # nearshore zone: buffer land ~12nm (0.3°), clip to US EEZ, subtract land
+  nearshore <- st_intersection(land_buf, eez) |>
+    st_make_valid() |>
+    st_difference(land) |>
+    st_make_valid()
+
+  # supplement nearshore with NPS + NOAA marine boundaries for islands
+  # too small for Natural Earth (Dry Tortugas, Farallons, Florida Keys)
+  nps_url <- paste0(
+    "https://services1.arcgis.com/fBc8EJBxQRMcHlei/arcgis/rest/services/",
+    "NPS_Land_Resources_Division_Boundary_and_Tract_Data_Service/",
+    "FeatureServer/2/query",
+    "?where=UNIT_CODE+IN+(%27DRTO%27,%27CHIS%27,%27GUIS%27)",
+    "&outFields=UNIT_NAME&f=geojson")
+  noaa_url <- paste0(
+    "https://raw.githubusercontent.com/noaa-onms/onmsR/",
+    "master/data-raw/sanctuaries.geojson")
+
+  nps_marine <- tryCatch(
+    read_sf(nps_url) |> st_geometry() |> st_union() |> st_make_valid(),
+    error = function(e) st_sfc(crs = 4326))
+  noaa_marine <- tryCatch({
+    sanc <- read_sf(noaa_url)
+    # only Greater Farallones + Florida Keys (the relevant sanctuaries)
+    # only Greater Farallones (covers Farallon Islands)
+    sanc <- sanc[sanc$sanctuary == "Greater Farallones", ]
+    sanc |> st_geometry() |> st_union() |> st_make_valid()
+  }, error = function(e) st_sfc(crs = 4326))
+
+  # add marine park/sanctuary areas to nearshore (minus land);
+  # these are already within US EEZ so no need to clip to eez
+  marine_supp <- tryCatch(
+    c(nps_marine, noaa_marine) |>
+      st_union() |>
+      st_make_valid() |>
+      st_difference(land) |>
+      st_make_valid(),
+    error = function(e) st_sfc(crs = 4326))
+  nearshore <- st_union(nearshore, marine_supp) |> st_make_valid()
+
+  # voronoi from subsampled PA boundary vertices so that nearshore
+  # boundaries naturally extend the existing PA boundary lines to shore;
+  # subsample to ~200 vertices per PA for tractable Voronoi computation
+  pts_list <- lapply(seq_len(nrow(pa)), function(i) {
+    pts_i <- tryCatch(
+      st_cast(st_geometry(pa)[i], "MULTIPOINT") |>
+        st_cast("POINT"),
+      error = function(e) st_sfc(crs = st_crs(pa)))
+    n <- length(pts_i)
+    if (n < 2) return(NULL)
+    step <- max(1, floor(n / 200))
+    idx  <- seq(1, n, by = step)
+    result <- st_sf(
+      planarea_key = rep(pa$planarea_key[i], length(idx)),
+      geometry     = pts_i[idx])
+
+    # wrap dateline-spanning PA points into [-180, 180] for Voronoi
+    bb <- st_bbox(pa[i, ])
+    if (bb["xmin"] < -170 && bb["xmax"] > 170) {
+      coords <- st_coordinates(result)
+      coords[, "X"] <- ifelse(
+        coords[, "X"] > 180, coords[, "X"] - 360, coords[, "X"])
+      result <- st_sf(
+        planarea_key = result$planarea_key,
+        geometry     = st_sfc(
+          lapply(seq_len(nrow(coords)), function(j) st_point(coords[j, ])),
+          crs = st_crs(pa)))
+    }
+    result
+  })
+  pa_pts_all <- do.call(rbind, Filter(Negate(is.null), pts_list))
+  message("  voronoi seed points: ", nrow(pa_pts_all))
+
+  # build voronoi tessellation (sf#824: must union points first)
+  envelope  <- st_as_sfc(st_bbox(nearshore))
+  pts_union <- st_union(pa_pts_all)
+  vor_cells <- st_voronoi(pts_union, envelope = envelope) |>
+    st_collection_extract()
+
+  # assign each voronoi cell to its seed point's PA (first match for
+  # shared boundary points)
+  cell_matches <- st_intersects(vor_cells, pa_pts_all)
+  cell_idx     <- sapply(cell_matches, `[`, 1)
+  keep         <- !is.na(cell_idx)
+  vor_sf <- st_sf(
+    planarea_key = pa_pts_all$planarea_key[cell_idx[keep]],
+    geometry     = vor_cells[keep])
+
+  # dissolve voronoi cells by PA → one territory polygon per PA
+  vor_dissolved <- vor_sf |>
+    group_by(planarea_key) |>
+    summarize(.groups = "drop") |>
+    st_make_valid()
+
+  # nearshore gap: only the nearshore NOT already covered by any PA
+  # (prevents voronoi slivers from overwriting original PA territory)
+  pa_union      <- st_union(pa) |> st_make_valid()
+  nearshore_gap <- st_difference(nearshore, pa_union) |> st_make_valid()
+
+  # clip voronoi territories to the nearshore gap only
+  nearshore_by_pa <- st_intersection(vor_dissolved, nearshore_gap) |>
+    st_make_valid()
+
+  # union each PA with its nearshore gap territory
+  pa_toshore <- pa
+  for (i in seq_len(nrow(pa))) {
+    key_i   <- pa$planarea_key[i]
+    coast_i <- nearshore_by_pa |> filter(planarea_key == key_i)
+    if (nrow(coast_i) == 0) next
+
+    bb          <- st_bbox(pa[i, ])
+    is_dateline <- bb["xmin"] < -170 && bb["xmax"] > 170
+
+    if (is_dateline) {
+      # shift nearshore territory to 0-360 space to match PA geometry
+      coast_geom <- tryCatch(
+        st_shift_longitude(st_geometry(coast_i)) |> st_make_valid(),
+        error = function(e) NULL)
+    } else {
+      coast_geom <- st_geometry(coast_i)
+    }
+
+    if (!is.null(coast_geom)) {
+      new_geom <- tryCatch(
+        st_union(c(st_geometry(pa)[i], coast_geom)) |> st_make_valid(),
+        error = function(e) NULL)
+      if (!is.null(new_geom) && length(new_geom) > 0 &&
+          inherits(new_geom[[1]], "MULTIPOLYGON")) {
+        st_geometry(pa_toshore)[i] <- new_geom
+      }
+    }
+  }
+
+  # subtract land from final output so PAs are ocean-only (fixes PR, etc.)
+  for (i in seq_len(nrow(pa_toshore))) {
+    bb <- st_bbox(pa_toshore[i, ])
+    if (bb["xmin"] < -170 && bb["xmax"] > 170) next  # skip dateline PAs
+    new_geom <- tryCatch(
+      st_difference(st_geometry(pa_toshore)[i], land) |> st_make_valid(),
+      error = function(e) NULL)
+    if (!is.null(new_geom) && length(new_geom) > 0 &&
+        inherits(new_geom[[1]], c("POLYGON", "MULTIPOLYGON"))) {
+      st_geometry(pa_toshore)[i] <- new_geom
+    }
+  }
+
+  sf_use_s2(TRUE)
+
+  write_sf(pa_toshore, pa_toshore_gpkg)
+} else {
+  pa_toshore <- read_sf(pa_toshore_gpkg)
+}
+```
+
+```{r}
+#| label: map
+#| warning: false
+#| message: false
+
+# color palette and label points for planning areas
+pa_keys <- sort(unique(pa_toshore$planarea_key))
+pa_colors <- hcl.colors(length(pa_keys), palette = "Dynamic")
+
+sf_use_s2(FALSE)
+pa_labels <- pa |>
+  select(planarea_key) |>
+  st_point_on_surface()
+sf_use_s2(TRUE)
+
+maplibre(
+  style = maptiler_style("bright"),
+  center = c(-95, 38),
+  zoom = 2
+) |>
+  add_fill_layer(
+    id = "pa_toshore_fill",
+    source = pa_toshore,
+    fill_color = match_expr(
+      column = "planarea_key",
+      values = pa_keys,
+      stops = pa_colors
+    ),
+    fill_opacity = 0.5,
+    tooltip = "planarea_name",
+    popup = "planarea_name"
+  ) |>
+  add_line_layer(
+    id = "pa_outline",
+    source = pa,
+    line_color = "darkblue",
+    line_width = 1
+  ) |>
+  add_symbol_layer(
+    id = "pa_labels",
+    source = pa_labels,
+    text_field = get_column("planarea_key"),
+    text_size = 12,
+    text_color = "black",
+    text_halo_color = "white",
+    text_halo_width = 1,
+    text_allow_overlap = TRUE
+  ) |>
+  add_layers_control(
+    position = "top-left",
+    layers = c(
+      "PA to Shore" = "pa_toshore_fill",
+      "PA Outlines" = "pa_outline",
+      "PA Labels" = "pa_labels"
+    )
+  ) |>
+  add_fullscreen_control() |>
+  add_navigation_control() |>
+  add_scale_control()
+```
