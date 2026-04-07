@@ -134,23 +134,13 @@ if (!file.exists(pa_toshore_gpkg)) {
     if (n < 2) return(NULL)
     step <- max(1, floor(n / 200))
     idx  <- seq(1, n, by = step)
-    result <- st_sf(
+    # skip dateline-spanning PAs — their wrapped points cause Voronoi artifacts
+    bb <- st_bbox(pa[i, ])
+    if (bb["xmin"] < -170 && bb["xmax"] > 170) return(NULL)
+
+    st_sf(
       planarea_key = rep(pa$planarea_key[i], length(idx)),
       geometry     = pts_i[idx])
-
-    # wrap dateline-spanning PA points into [-180, 180] for Voronoi
-    bb <- st_bbox(pa[i, ])
-    if (bb["xmin"] < -170 && bb["xmax"] > 170) {
-      coords <- st_coordinates(result)
-      coords[, "X"] <- ifelse(
-        coords[, "X"] > 180, coords[, "X"] - 360, coords[, "X"])
-      result <- st_sf(
-        planarea_key = result$planarea_key,
-        geometry     = st_sfc(
-          lapply(seq_len(nrow(coords)), function(j) st_point(coords[j, ])),
-          crs = st_crs(pa)))
-    }
-    result
   })
   pa_pts_all <- do.call(rbind, Filter(Negate(is.null), pts_list))
   message("  voronoi seed points: ", nrow(pa_pts_all))
@@ -188,25 +178,34 @@ if (!file.exists(pa_toshore_gpkg)) {
   # union each PA with its nearshore gap territory
   pa_toshore <- pa
   for (i in seq_len(nrow(pa))) {
-    key_i   <- pa$planarea_key[i]
-    coast_i <- nearshore_by_pa |> filter(planarea_key == key_i)
-    if (nrow(coast_i) == 0) next
-
     bb          <- st_bbox(pa[i, ])
     is_dateline <- bb["xmin"] < -170 && bb["xmax"] > 170
 
     if (is_dateline) {
-      # shift nearshore territory to 0-360 space to match PA geometry
-      coast_geom <- tryCatch(
-        st_shift_longitude(st_geometry(coast_i)) |> st_make_valid(),
-        error = function(e) NULL)
-    } else {
-      coast_geom <- st_geometry(coast_i)
+      # dateline PAs: use st_wrap_dateline to split into valid halves
+      # (sf#609), fill polygon holes (islands), then erase land
+      new_geom <- tryCatch({
+        g <- st_wrap_dateline(st_geometry(pa)[i]) |> st_make_valid()
+        # fill holes: keep only exterior rings
+        parts <- lapply(g[[1]], function(p) st_polygon(list(p[[1]])))
+        filled <- st_sfc(st_multipolygon(parts), crs = st_crs(pa)) |>
+          st_make_valid()
+        st_difference(filled, land) |> st_make_valid()
+      }, error = function(e) NULL)
+      if (!is.null(new_geom) && length(new_geom) > 0 &&
+          !all(st_is_empty(new_geom))) {
+        st_geometry(pa_toshore)[i] <- new_geom
+      }
+      next
     }
 
-    if (!is.null(coast_geom)) {
+    # non-dateline PAs: use Voronoi-assigned nearshore
+    key_i   <- pa$planarea_key[i]
+    coast_i <- nearshore_by_pa |> filter(planarea_key == key_i)
+    if (nrow(coast_i) > 0) {
       new_geom <- tryCatch(
-        st_union(c(st_geometry(pa)[i], coast_geom)) |> st_make_valid(),
+        st_union(c(st_geometry(pa)[i], st_geometry(coast_i))) |>
+          st_make_valid(),
         error = function(e) NULL)
       if (!is.null(new_geom) && length(new_geom) > 0 &&
           inherits(new_geom[[1]], "MULTIPOLYGON")) {
@@ -215,10 +214,10 @@ if (!file.exists(pa_toshore_gpkg)) {
     }
   }
 
-  # subtract land from final output so PAs are ocean-only (fixes PR, etc.)
+  # subtract land from non-dateline PAs so output is ocean-only (fixes PR)
   for (i in seq_len(nrow(pa_toshore))) {
     bb <- st_bbox(pa_toshore[i, ])
-    if (bb["xmin"] < -170 && bb["xmax"] > 170) next  # skip dateline PAs
+    if (bb["xmin"] < -170 && bb["xmax"] > 170) next
     new_geom <- tryCatch(
       st_difference(st_geometry(pa_toshore)[i], land) |> st_make_valid(),
       error = function(e) NULL)
@@ -228,9 +227,47 @@ if (!file.exists(pa_toshore_gpkg)) {
     }
   }
 
+  # erase dateline PA footprints from neighboring PAs (remove slivers)
+  for (i in seq_len(nrow(pa_toshore))) {
+    bb <- st_bbox(pa_toshore[i, ])
+    if (!(bb["xmin"] < -170 && bb["xmax"] > 170)) next
+    dl_geom <- st_geometry(pa_toshore)[i]
+    if (st_is_empty(dl_geom)) next
+    for (j in seq_len(nrow(pa_toshore))) {
+      if (i == j) next
+      st_geometry(pa_toshore)[j] <- tryCatch(
+        st_difference(st_geometry(pa_toshore)[j], dl_geom) |>
+          st_make_valid(),
+        error = function(e) st_geometry(pa_toshore)[j])
+    }
+  }
+
+  # ensure all geometries are MULTIPOLYGON for gpkg output
+  for (i in seq_len(nrow(pa_toshore))) {
+    g <- st_geometry(pa_toshore)[[i]]
+    if (!inherits(g, "MULTIPOLYGON")) {
+      g_fixed <- tryCatch(
+        st_collection_extract(st_sfc(g, crs = st_crs(pa)), "POLYGON") |>
+          st_union() |> st_cast("MULTIPOLYGON"),
+        error = function(e) st_geometry(pa)[i])
+      if (length(g_fixed) == 0 || st_is_empty(g_fixed))
+        g_fixed <- st_geometry(pa)[i]
+      st_geometry(pa_toshore)[i] <- g_fixed
+    }
+  }
+
   sf_use_s2(TRUE)
 
   write_sf(pa_toshore, pa_toshore_gpkg)
+
+  # dissolved study area (all PAs merged into one polygon)
+  sf_use_s2(FALSE)
+  ply_boem <- pa_toshore |>
+    st_union() |>
+    st_make_valid() |>
+    st_sf(geometry = _)
+  write_sf(ply_boem, file.path(dir_data, "ply_boem-usa.gpkg"))
+  sf_use_s2(TRUE)
 } else {
   pa_toshore <- read_sf(pa_toshore_gpkg)
 }
