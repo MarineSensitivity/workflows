@@ -20,11 +20,1303 @@
 
 - Migrate to hexagons
 
-## 2026-04-09 final-report_2025
+## 2026-04-09.b score by user-drawn polygons
 
-Let's fix the following in `final-report_2025.qmd`:
+Add UI and server-side functions to `@../apps/mapgl` for enabling a user to draw a polygon (with `mapgl::add_draw_control()`) and extract/color its score with flower plot generation and species table. 
 
-- The boem2018 reference is not found. That should be morandi2018 (found also in `@../docs/references.bib`
+Eventually, we'd like to enable multiple polygons and even user-uploaded shapefiles or user-selectable features (from as yet to be introduced alternative boundary layers) for generating reports based on user-determined polygons (vs existing BOEM Program Areas). For another project I had the Shiny app collect the user-drawn polygon(s) and add other parameters for submitting to a seperately running API endpoint (with R Plumber package) that generated reports (from parameterized Quarto documents). I'm not wed to this strategy and open to other suggests, but that other project is  online at https://marineenergy.apps.integral-corp.com, source on Github at https://github.com/marineenergy and local repos cloned to `@~/Github/marineenergy`. Let's keep in mind this broader scope so we don't build something that becomes unweildy later. I would also like to hear suggestions on how best to architect the full scope. We'd probably have to enable authentication to allow users to upload files and recover or link to reports, which I previously have done using [firebase](https://github.com/JohnCoene/firebase/) R package to allow Google/Github/Facebook logins (and not deal with storing user passwords), but I see that it has been 3 years since updated; but also see these: [kennedymwavu/firebase.auth.rest: R Wrapper for Firebase Authentication REST API](https://github.com/kennedymwavu/firebase.auth.rest), [Kohze/fireData: Firebase + R](https://github.com/Kohze/fireData).
+
+←  ☐ Code home  ☐ UX model  ☐ Polygon color  ☐ Phase 2 arch  ✔ Submit  →
+                                                                               
+**Code home** Where should the new polygon-scoring functions live?
+                                                                               
+  1. msens R package (Recommended)                                           
+     Add cells_in_polygon(), scores_for_cells(), species_for_cells() to
+     msens/R/scores.R. Reusable later from Plumber, background tasks, or Quarto
+      reports. Requires devtools::document() + devtools::install() to test.
+  2. Inline in apps/mapgl/app.R
+     Define helpers near the existing plot_flower() function. Faster to iterate
+      (no package reload), but you'll have to extract them later when the
+     broader scope arrives.
+❯ 3. Both: prototype inline, then move
+     Build & validate inside app.R first; once working, move to msens package
+     as a follow-up commit. Two-step but lower risk.
+
+**UX model** How should the user enter and exit drawn-polygon mode?
+                                                                               
+❯ 1. Always-on draw, auto-switch (Recommended)                               
+     Draw control is always visible. Drawing a polygon automatically takes over
+      the flower plot + species table. Deleting it reverts to the prior        
+     cell/Program Area selection. Most natural; matches mapgl idiom.       
+  2. Explicit 'Drawn polygon' option in sel_unit dropdown
+     Add a third option to the existing 'Spatial units' dropdown. User must    
+     select it before drawing. Cleaner separation from existing modes but adds 
+     a click.              
+  3. Separate toggle/tab              
+     Put draw + drawn-polygon outputs in their own card/tab so they don't     
+     compete with cell/Program Area views at all.
+
+**Polygon color** Should the drawn polygon be visually colored by its aggregate score, or only 
+displayed in the flower plot?                                                  
+                                                                             
+  1. Flower plot only (Recommended for Phase 1)                                
+     Draw control's default outline color stays. Score only appears in the     
+     flower plot center + tooltip. Simplest, no fragile interaction with the 
+     draw control's internal layers.                     
+❯ 2. Recolor polygon by score                                                  
+     Overlay a fill layer keyed to the polygon hash, colored from the same     
+     palette as the cell raster. More visual feedback but more code; the draw 
+     control's layers can be tricky to override.
+
+**Phase 2 arch** For Phase 2 report rendering (future, not this PR), which architecture should 
+we plan toward?                                                                
+                                                                             
+❯ 1. shiny::ExtendedTask + mirai (Recommended)                                 
+     Render parameterized Quarto in a background task inside the same Shiny    
+     app. One container, no API server, modern Shiny pattern. Easy to swap to 
+     Plumber later if scale demands.                     
+  2. Plumber API + bg Rscript (marineenergy pattern)                           
+     Separate Plumber endpoint that forks an Rscript to render Quarto, with    
+     client-side polling. Battle-tested at marineenergy.app, scales           
+     horizontally, but adds 4 moving parts (API server, render script, shared 
+     filesystem, polling) you don't need yet.                                 
+  3. Decide later — just reserve the seam                                      
+     Put scoring in msens:: now and don't commit to a rendering architecture 
+     until you actually have a parameterized Quarto template to render.  
+
+- [`mirai`](https://mirai.r-lib.org/index.html) R package
+  Minimalist Async Evaluation Framework for R
+
+Let's also change the default view to the entire study area (ie extending to Alaska, Hawaii, Puerto Rico and island territories -- is that still in the db or do we need to pull from a previous version), and add a semi-transparent gray overlay for the area that has cell values but extends beyond the current Program Areas.
+
+⏺ Updated plan                                                                 
+  ⎿  /plan to preview                                                          
+                                                                               
+⏺ Now let me load and call ExitPlanMode to request approval.  
+                                                                               
+───────────────────────────────────────────────────────────────────────────────
+ Ready to code?                                                                
+                                                                               
+ Here is Claude's plan:                                 
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Plan: User-drawn polygon scoring + full-extent default view in apps/mapgl
+
+ Context
+
+ The apps/mapgl Shiny app currently lets users see flower-plot scores and
+ species tables for two pre-defined spatial units: raster cells (0.05°) and
+ BOEM Program Areas. Three things need to change:
+
+ 1. User-drawn polygons: Add a third mode where users draw an arbitrary
+ polygon and get the same flower-plot + species-table outputs, computed live
+ from cell-level data. This is also a foothold for a larger ambition: multiple
+  polygons, shapefile/GeoJSON uploads, parameterized Quarto reports, and
+ (eventually) authenticated user accounts.
+ 2. Default view = full study area: Today the app starts zoomed to the "USA"
+ subregion bbox (xmin=167.6, xmax=275.4, ymin=24.2, ymax=82.5), which excludes
+  Hawaii (~200°E), Puerto Rico (~294°E), Guam (~144°E), and American Samoa
+ (~-17°S). The underlying cell raster actually covers xmin=141.1, xmax=296.25,
+  ymin=-17.7, ymax=82.6 — the full federal-waters extent including all
+ territories. We just need to use the full extent as the default.
+ 3. Gray overlay for cells outside Program Areas: v6 has cell-level metric
+ values for 662,075 cells but only 20 v6 Program Areas (all in Alaska +
+ Pacific California). 313,043 cells (~47%) have metric values but lie outside
+ any current Program Area — this includes the entire Atlantic, Gulf of
+ America, Hawaii, Puerto Rico, and the Pacific Island Territories. The user
+ wants a semi-transparent gray overlay over those cells so the gap between "we
+  have data" and "we have a Program Area" is visible.
+
+ Where the territory data lives — answered
+
+ - Cell-level scores for the full study area: ✅ already in v6
+ ~/_big/msens/derived/v6/sdm.duckdb (cell_metric table, 662k cells covering
+ full extent including Atlantic, Hawaii, PR, territories). No need to pull
+ from a previous version for the gray overlay or for polygon scoring.
+ - Program Area polygons for the territories: ❌ NOT in v6. v6 ships only 20
+ program areas (AK + CA). v1 has 36 Planning Areas (planarea_key) — a
+ different schema concept — which include the Atlantic + Hawaii + Pacific
+ Islands. Pulling those into v6 is a separate effort; out of scope for this
+ PR, but called out below as a follow-up.
+
+ Architectural pre-decisions (from user)
+
+ User selected:
+ - Code home: prototype inline in app.R, then extract to msens package as a
+ follow-up commit
+ - UX model: always-on draw control with auto-mode-switch (draw → score;
+ delete → revert)
+ - Polygon visualization: recolor the drawn polygon by its aggregate score
+ - Phase 2 reports: shiny::ExtendedTask + mirai (not a separate Plumber API)
+
+ Phase 1: implementation
+
+ A. Default view = full study area extent
+
+ In apps/mapgl/app.R:
+
+ 1. Compute and cache the full-extent bbox alongside the existing subregion
+ bboxes. After the existing d_sr_bb block (line ~550), compute the bbox of all
+  cells with metric values:
+
+ # full study area bbox = bbox of all cells with metric values
+ sr_bb_full_csv <- here("mapgl/cache/full_extent_bbox.csv")
+ if (!file_exists(sr_bb_full_csv)) {
+   cells_with_metrics <- tbl(con_sdm, "cell_metric") |>
+     distinct(cell_id) |> pull(cell_id)
+   r_full <- r_cell[["cell_id"]]
+   r_full[!(values(r_full)[, 1] %in% cells_with_metrics)] <- NA
+   bb <- as.numeric(ext(trim(r_full)))   # xmin, xmax, ymin, ymax
+   write_csv(tibble(xmin = bb[1], xmax = bb[2], ymin = bb[3], ymax = bb[4]),
+             sr_bb_full_csv)
+ }
+ bb_full <- read_csv(sr_bb_full_csv)
+ 2. Use the full bbox in output$map (line 894 area). Replace bbox <-
+ st_bbox(r) |> as.numeric() with the full-extent bbox so the initial
+ fit_bounds() call shows the entire study area on first load. The reactive
+ map-update path (line 940 observeEvent) already re-fits to the selected
+ subregion's bbox when the user picks one, so subregion zoom-in still works.
+ 3. Add a "Full study area" entry as the first option in sr_choices (line
+ 336):
+ sr_choices <- c(
+   "Full study area"   = "FULL",   # new default
+   "All USA"           = "USA",
+   "Alaska"            = "AK",
+   "Gulf of America"   = "GA",
+   "Pacific"           = "PA")
+ 3. Then handle "FULL" in the subregion-bbox lookup (lines 985-988 region) by
+ selecting bb_full instead of a row from d_sr_bb. The cell-raster fetcher
+ get_rast(..., subregion_key) (line ~129) needs to accept "FULL" and return
+ the un-cropped raster (or simply skip the subregion crop). I'll need to read
+ get_rast() carefully to wire this up correctly.
+
+ B. Gray overlay for cells with values outside Program Areas
+
+ Compute a binary "out-of-program-area" raster once at startup (cached to
+ disk), then add it as a separate raster layer with gray fill and ~30%
+ opacity, toggleable from the layer control.
+
+ 1. Compute the cached overlay raster (in the global section near line 500):
+ r_outside_pra_tif <- here("mapgl/cache/r_cells_outside_pra.tif")
+ if (!file_exists(r_outside_pra_tif)) {
+   # cells in cell_metric NOT in any program-area zone_cell
+   pra_zone_seqs <- tbl(con_sdm, "zone") |>
+     filter(fld == "programarea_key") |> pull(zone_seq)
+   cells_in_pra <- tbl(con_sdm, "zone_cell") |>
+     filter(zone_seq %in% pra_zone_seqs) |>
+     distinct(cell_id) |> pull(cell_id)
+   cells_with_metrics <- tbl(con_sdm, "cell_metric") |>
+     distinct(cell_id) |> pull(cell_id)
+   cells_outside <- setdiff(cells_with_metrics, cells_in_pra)
+
+   r_out <- r_cell[["cell_id"]]
+   r_out[!(values(r_out)[, 1] %in% cells_outside)] <- NA
+   r_out[!is.na(r_out)] <- 1L
+   writeRaster(trim(r_out), r_outside_pra_tif, overwrite = TRUE,
+               datatype = "INT1U")
+ }
+ r_outside_pra <- rast(r_outside_pra_tif)
+ 2. Add the overlay as a map layer in output$map (line ~918, before
+ add_cells() so the score raster paints on top):
+ |>
+   msens::add_cells(
+     r_outside_pra,
+     cols = "#888888",
+     raster_opacity = 0.3,
+     layer_id = "outside_pra_lyr",
+     before_id = "er_ln") |>
+ 2. msens::add_cells() already exists and is used elsewhere; I'll need to
+ confirm it accepts a single fill color and a custom layer_id (and pass
+ through to a flat-fill layer rather than a Spectral palette). If not, write a
+  small wrapper that adds a raster source and a raster-color paint expression
+ with one stop.
+ 3. Expose the overlay in add_layers_control (line 928-934):
+ layers = list(
+   "Program Area outlines"     = "pra_ln",
+   "Program Area labels"       = "pra_lbl",
+   "Ecoregions outlines"       = "er_ln",
+   "Raster cell values"        = "r_lyr",
+   "Cells outside Program Areas (gray)" = "outside_pra_lyr")
+ 3. On by default; user can hide it. Same treatment in the reactive update
+ path at lines 989-996.
+ 4. Tooltip / explanation: add a one-line note next to the layer toggle (or in
+  the About dialog) explaining that the gray cells have scores but no v6
+ Program Area assignment. Phrased neutrally so it doesn't read as a bug.
+
+ C. User-drawn polygon scoring
+
+ The cell-click flower plot (apps/mapgl/app.R:1271-1287) and species table
+ (:1490-1531) already contain ~95% of the logic. The only change is cell_id ==
+  X → cell_id %in% Y plus optional weighting by pct_covered from the cell
+ intersection. Per the user's "prototype inline first" decision, the helpers
+ go in app.R for this PR and get extracted into msens:: as a follow-up commit.
+
+ C1. Helper functions (inline in app.R, near plot_flower() at line 181)
+
+ # given an sf polygon and the cell raster, return cells + pct_covered
+ cells_in_polygon <- function(poly, r_cell_id) {
+   # poly: sf object (any CRS, will be reprojected)
+   # r_cell_id: SpatRaster of cell IDs
+   poly_t <- poly |> sf::st_transform(crs(r_cell_id))
+   r_cov  <- terra::rasterize(
+     vect(poly_t), r_cell_id, cover = TRUE, touches = TRUE)
+   r_id_vals  <- values(r_cell_id)[, 1]
+   r_cov_vals <- values(r_cov)[, 1]
+   keep <- !is.na(r_cov_vals) & r_cov_vals > 0
+   tibble(
+     cell_id     = r_id_vals[keep],
+     pct_covered = round(r_cov_vals[keep] * 100))
+ }
+
+ # weighted-mean aggregation of cell_metric for a set of cells; returns
+ # a flower-plot-ready tibble (component, score, even)
+ scores_for_cells <- function(con, cells,
+                              metric_pattern = "_ecoregion_rescaled$") {
+   cells_t <- copy_to(con, cells, name = "tmp_drawn_cells",
+                      overwrite = TRUE, temporary = TRUE)
+   d <- tbl(con, "metric") |>
+     filter(str_detect(metric_key, metric_pattern)) |>
+     inner_join(tbl(con, "cell_metric"), by = "metric_seq") |>
+     inner_join(cells_t, by = "cell_id") |>
+     group_by(metric_key) |>
+     summarize(
+       score = sum(value * pct_covered, na.rm = TRUE) /
+               sum(pct_covered, na.rm = TRUE),
+       .groups = "drop") |>
+     collect() |>
+     mutate(
+       component = metric_key |>
+         str_replace("extrisk_", "") |>
+         str_replace("_ecoregion_rescaled", "") |>
+         str_replace("_", " "),
+       even = 1) |>
+     filter(component != "all")
+   d
+ }
+
+ # species table aggregation — mirrors apps/mapgl/app.R:1490-1531 but
+ # generalized to multiple cells with pct_covered weighting
+ species_for_cells <- function(con, cells) {
+   cells_t <- copy_to(con, cells, name = "tmp_drawn_cells_spp",
+                      overwrite = TRUE, temporary = TRUE)
+   tbl_taxon <- tbl(con, "taxon") |>
+     filter(is_ok) |>
+     select(sp_cat, sp_common = common_name, sp_scientific = scientific_name,
+            taxon_id, taxon_authority, er_code = extrisk_code, er_score,
+            is_mmpa, is_mbta, mdl_seq) |>
+     mutate(er_score = er_score / 100)
+   tbl(con, "model_cell") |>
+     inner_join(cells_t,         by = "cell_id") |>
+     inner_join(tbl_taxon,       by = join_by(mdl_seq)) |>
+     inner_join(tbl(con, "cell") |> select(cell_id, area_km2),
+                by = join_by(cell_id)) |>
+     group_by(mdl_seq, sp_cat, sp_common, sp_scientific, taxon_id,
+              taxon_authority, er_code, er_score, is_mmpa, is_mbta) |>
+     summarize(
+       area_km2 = sum(area_km2 * pct_covered / 100, na.rm = TRUE),
+       avg_suit = sum(value * pct_covered, na.rm = TRUE) /
+                  sum(pct_covered, na.rm = TRUE) / 100,
+       .groups = "drop") |>
+     collect() |>
+     mutate(
+       suit_er      = avg_suit * er_score,
+       suit_er_area = avg_suit * er_score * area_km2) |>
+     group_by(sp_cat) |>
+     mutate(cat_suit_er_area = sum(suit_er_area, na.rm = TRUE)) |>
+     ungroup() |>
+     mutate(pct_cat = suit_er_area / cat_suit_er_area)
+ }
+
+ These reproduce the formulas already in apps/mapgl/app.R:1271-1287 and
+ :1490-1531 and the zone-aggregation pattern in
+ workflows/calc_scores.qmd:1886-1904. They're free of Shiny dependencies, so
+ the follow-up move into msens/R/scores.R is a copy-paste plus
+ @export/@concept scores annotations.
+
+ C2. UI and server wiring in app.R
+
+ 1. Add draw control to the mapboxgl pipeline (insert after
+ add_layers_control() at line 935):
+ |>
+   add_draw_control(
+     position    = "top-right",
+     fill_color  = "#fbb03b",
+     line_color  = "#fbb03b",
+     fill_opacity = 0.2)
+ 2. Extend rx (line 843):
+ rx <- reactiveValues(
+   clicked_pa     = NULL,
+   clicked_pra    = NULL,
+   clicked_cell   = NULL,
+   drawn_polygon  = NULL,    # list(sf, cells, hash, mean_score)
+   spp_tbl        = NULL,
+   spp_tbl_hdr    = NULL,
+   spp_tbl_filename = NULL)
+ 3. Observer for the draw event (new block near line 1200):
+ observeEvent(input$map_drawn_features, {
+   feats <- get_drawn_features(mapboxgl_proxy("map"))
+   if (is.null(feats) || nrow(feats) == 0) {
+     # polygon deleted: clear and revert
+     rx$drawn_polygon <- NULL
+     mapboxgl_proxy("map") |>
+       clear_layer("drawn_score_lyr") |>
+       clear_layer("drawn_score_src")
+     return()
+   }
+   # take the most recent feature (phase 1: one polygon at a time)
+   poly  <- feats[nrow(feats), ]
+   cells <- cells_in_polygon(poly, r_cell[["cell_id"]])
+   if (nrow(cells) == 0) {
+     showNotification("Drawn polygon doesn't overlap any scored cells.",
+                      type = "warning")
+     return()
+   }
+   # also compute mean score for color
+   d_sc <- scores_for_cells(con_sdm, cells)
+   mean_score <- weighted.mean(d_sc$score, d_sc$even, na.rm = TRUE)
+   rx$drawn_polygon <- list(
+     sf         = poly,
+     cells      = cells,
+     hash       = digest::digest(sf::st_as_text(sf::st_geometry(poly))),
+     mean_score = mean_score,
+     d_scores   = d_sc)
+   # auto-switch: clear single-cell + program-area selection
+   rx$clicked_cell <- NULL
+   rx$clicked_pra  <- NULL
+   # paint the polygon by its aggregate score (see C3 below)
+   paint_drawn_polygon(mapboxgl_proxy("map"), poly, mean_score)
+ })
+ 4. Flower plot (output$plot_flower, line 1256): add a new branch at the top,
+ before the cell branch:
+ if (!is.null(rx$drawn_polygon)) {
+   d_fl <- rx$drawn_polygon$d_scores   # already computed
+   if (nrow(d_fl) > 0) {
+     return(d_fl |> plot_flower(
+       fld_category = component, fld_height = score, fld_width = even,
+       tooltip_expr = "{component}: {round(score, 2)}",
+       title = glue("Drawn polygon ({nrow(rx$drawn_polygon$cells)} cells, mean
+  score {round(rx$drawn_polygon$mean_score, 1)})")))
+   }
+ }
+ 5. Species table (get_spp_tbl(), line 1426): add a branch at the top:
+ if (!is.null(rx$drawn_polygon)) {
+   rx$spp_tbl_hdr <- glue("Species for drawn polygon
+ ({nrow(rx$drawn_polygon$cells)} cells)")
+   rx$spp_tbl_filename <- glue("species_drawn-{rx$drawn_polygon$hash}")
+   d_spp <- species_for_cells(con_sdm, rx$drawn_polygon$cells)
+   # fall through to the existing rename/select block at line 1588
+ }
+
+ C3. Color the drawn polygon by its score
+
+ Add a helper near the click handler:
+
+ paint_drawn_polygon <- function(proxy, poly, mean_score) {
+   # use the same Spectral palette as the cell raster
+   cols <- rev(RColorBrewer::brewer.pal(11, "Spectral"))
+   # interpolate score (0-100) to a hex color
+   pal  <- scales::col_numeric(cols, domain = c(0, 100), na.color = "#888888")
+   fill <- pal(mean_score)
+   proxy |>
+     clear_layer("drawn_score_lyr") |>
+     clear_layer("drawn_score_src") |>
+     add_source(id = "drawn_score_src", data = poly) |>
+     add_fill_layer(
+       id           = "drawn_score_lyr",
+       source       = "drawn_score_src",
+       fill_color   = fill,
+       fill_opacity = 0.55,
+       before_id    = "pra_ln")   # under the program-area outlines
+ }
+
+ Why a separate source/layer rather than restyling the draw control's internal
+  layers: the draw control's layers (gl-draw-polygon-fill-active.cold, etc.)
+ are owned by mapbox-gl-draw and don't accept arbitrary paint expressions
+ cleanly. A sibling fill layer keyed on the polygon hash is robust and gives
+ full control over color/opacity/legend.
+
+ Critical files to modify
+
+ - Modify: /Users/bbest/Github/MarineSensitivity/apps/mapgl/app.R
+   - Line ~336: add "Full study area" = "FULL" to sr_choices (first entry)
+   - Line ~500: compute & cache r_outside_pra raster
+   - Line ~550: cache bb_full (full-extent bbox)
+   - Line ~129: extend get_rast() to handle "FULL" subregion key
+   - Line ~181: add cells_in_polygon(), scores_for_cells(),
+ species_for_cells(), paint_drawn_polygon() helpers
+   - Line ~843: extend rx reactiveValues with drawn_polygon
+   - Line ~894: change initial bbox to bb_full; add outside_pra_lyr overlay
+   - Line ~918: add gray overlay layer; update add_layers_control entries
+   - Line ~935: insert add_draw_control() in the pipeline
+   - Line ~985: handle "FULL" subregion in the bbox lookup branch
+   - Line ~1200: new observeEvent(input$map_drawn_features, ...)
+   - Line ~1256: drawn-polygon branch in output$plot_flower
+   - Line ~1426: drawn-polygon branch in get_spp_tbl()
+ - New caches (gitignored or committed to mapgl/cache/):
+   - mapgl/cache/full_extent_bbox.csv
+   - mapgl/cache/r_cells_outside_pra.tif
+
+ Phase 1 follow-up commit (same PR or next)
+
+ Extract cells_in_polygon(), scores_for_cells(), species_for_cells() from
+ app.R into a new file msens/R/scores.R, with roxygen2 docs and @concept
+ scores. Run devtools::document() and update msens/DESCRIPTION Imports as
+ needed (terra, sf, dbplyr should already be there or transitively available).
+  Replace the inline definitions in app.R with msens:: calls. This separation
+ matters for Phase 2 because the Quarto report and any future Plumber endpoint
+  will call the same functions.
+
+ Phase 2: roadmap (not implemented in this PR)
+
+ Step 1 — Multiple polygons: change rx$drawn_polygon (singular) to
+ rx$drawn_polygons (list keyed by feature id from input$map_drawn_features);
+ add a small DT picker so the flower plot / species table reflects the
+ selected polygon. The draw control already supports multiple features.
+
+ Step 2 — File upload: fileInput accepting .geojson, .kml, .zip (shapefile
+ bundle); read with sf::st_read(); push features into the draw control via
+ mapgl::add_features_to_draw(). Same downstream code path as drawn polygons.
+
+ Step 3 — Reports: parameterized Quarto template at apps/mapgl/report.qmd
+ whose params are cells (list of cell_ids), polygon_wkt, title, email. Render
+ with shiny::ExtendedTask + mirai so the UI never blocks. Save to
+ apps/mapgl/reports/{hash}.html and surface a download link via
+ bslib::input_task_button. The msens:: scoring functions are already
+ Shiny-free, so the Quarto template just calls them directly. No separate API
+ server needed.
+
+ Step 4 — Auth + persistence (deferred until needed): firebase (JohnCoene) is
+ unmaintained. If/when persistence is needed, use
+ kennedymwavu/firebase.auth.rest (lighter weight, actively maintained) — or
+ hand off auth to the hosting platform (Posit Connect, ShinyProxy) for zero R
+ code.
+
+ Step 5 — Plumber API split (only if scale demands it): lift report rendering
+ into a Plumber API following the marineenergy pattern
+ (~/Github/marineenergy/api/plumber.R:183-252). Because the scoring functions
+ already live in msens::, the Plumber endpoint becomes a thin wrapper. Don't
+ do this preemptively.
+
+ Out-of-scope but worth tracking
+
+ - Restoring Atlantic / Hawaii / Puerto Rico / Pacific Island Program Area
+ polygons in v6. v1 has 36 Planning Areas (planarea_key) — a different schema
+ concept — that would need to be ported into v6 as Program Areas. The gray
+ overlay in this PR makes the data gap visible without needing to do that
+ work. Suggest a separate ticket for the v6 schema extension.
+
+ Verification
+
+ 1. shiny::runApp("apps/mapgl") — initial map loads at the full study-area
+ extent (Aleutians to Caribbean, equator-ish to Arctic). Hawaii, Puerto Rico,
+ and the Pacific Island Territories are all visible on the first paint.
+ 2. The gray overlay shows up over Atlantic, Gulf of America, Hawaii, Puerto
+ Rico, and Pacific Island Territories — and is absent over the AK + CA Program
+  Areas. Toggleable from the layer control.
+ 3. Subregion dropdown still works: selecting "Alaska" or "Pacific" zooms in
+ to the existing bboxes; selecting "Full study area" zooms back out.
+ 4. Draw control appears top-right. Draw a polygon over a single cell — flower
+  plot + species table should match what you get by clicking that same cell in
+  cell mode (sanity check that the new path matches the old path on the
+ trivial case).
+ 5. Draw a polygon spanning multiple cells inside a Program Area — scores fall
+  within the range of constituent cells, species count ≤ union of cells'
+ species.
+ 6. Draw a polygon that crosses multiple Program Areas — scores reasonable,
+ species table includes taxa from both.
+ 7. Draw a polygon over the gray-overlay region (e.g. Atlantic, Hawaii) —
+ should also return scores, since the underlying cells have metric values even
+  though no Program Area covers them.
+ 8. The drawn polygon is recolored from the Spectral palette by its mean
+ score; deleting it removes the recolored fill and reverts the flower plot /
+ species table to whatever cell or Program Area was previously selected.
+ 9. After Phase 1 follow-up: devtools::document(); devtools::check() on msens
+ — no new errors / warnings.
+
+
+## 2026-04-09 final-report_2025 edits
+
+Please fix the following in `@final-report_2025.qmd`:
+
+- The `[@boem2018]` reference is not found -- should be `[@morandi2018]` (found also in `@../docs/references.bib`).
+- Drop references to the following datasets which were only incorporated after v1, unless mentioning in Conclusions / Next Steps: 
+  * NMFS Critical Habitat
+  * FWS Critical Habitat
+  * FWS Current Range Maps
+- Confirm species counts and spatial extent by interrogating the v1 database (`@~/_big/msens/derived/v1/sdm.duckdb`)
+- Drop "Climate Adaptation" because of political sensitivity with the current administration.
+- Look for areas duplication within the body of the text and suggest possible consolidations.
+- Look for sparsely described sections and suggest text expansions
+
+←  ☐ PA count  ☐ Species counts  ☐ Post-v1 mention  ✔ Submit  →
+
+**PA count** The v1 planning-areas geopackage actually contains 36 features (regions AK / AT
+ / GA / PA), but the report inconsistently says 26 (line 167) and 27 (lines
+159, 297, 561, 577). How should I reconcile this?
+
+  1. Standardize to 27
+     Keep '27 BOEM OCS Planning Areas (19 lower 48 + 8 Alaska)', fix the line
+     167 typo of '26' to '27'. Pacific Islands excluded from headline count.
+  2. Update to 36
+     Replace all mentions with '36 OCS Planning Areas across 4 BOEM regions
+     (Alaska, Atlantic, Gulf of America, Pacific)' to match the v1 geopackage
+     exactly.             
+  3. Leave PA counts alone                                                   
+     Don't touch any planning-area numbers in this pass — only fix the other 
+     issues.
+❯ 4. Ah, most of the results are based on reporting at the continental USA and Alaska levels. We do want to mention how we ingested distributions to the full extent of the USA federal waters, including territories (ie 36), but herein only show descriptive maps and flower plots for those in the 27 Planning Areas (19 lower 48 + 8 Alaska), except as seen in the app (Figures 10 through 13).
+
+**Species counts** For the species category counts in the Conclusions (line 507), the current
+report says '505 birds, 819 corals, 99 mammals, 42 turtles' but the v1 database
+ (am_0.05 + bl) gives different distinct-worms counts. Which count should I
+use?
+
+❯ 1. Distinct worms_id (Recommended)
+     Use 6,676 fish / 8,239 invert / 401 birds / 774 corals / 84 mammals / 32
+     turtles / 1,129 other = 17,335 unique species. Most defensible against v1
+     db.
+  2. Model-row counts
+     Use 6,682 fish / 8,525 invert / 574 birds / 807 corals / 85 mammals / 33
+     turtles / 1,417 other. Closer to existing report fishes/inverts numbers
+     but counts duplicates across datasets.
+  3. Keep current numbers
+     Don't update the breakdown — only change the 17,333 total. The current
+     category counts may be from a separate authoritative source I haven't
+     found.
+
+**Post-v1 mention** Where should the post-v1 datasets (NMFS CH, FWS CH, FWS Range) be re-mentioned,
+ if at all?                                                                    
+                                                                            
+  1. Next Steps only
+     Add a single Next Steps bullet describing them as a planned enhancement 
+     (Phase 2).                     
+❯ 2. Conclusions + Next Steps                                                 
+     Mention briefly in Conclusions as already-incorporated post-v1 work, AND  
+     in Next Steps for further refinement.
+  3. Drop entirely   
+     Remove all mentions; do not reference them anywhere in the document. 
+
+Whoah! I'm just seeing that the v1 database is a stub 12 KB file `@~/_big/msens/derived/v1/sdm.duckdb`. I just overwrote that file with the 2 GB full version from the server. Please update the plan after inspecting this database.
+
+Ok, so the v1 database got forked off later after ingesting those, but I     
+  don't think they got used in the score calculations for it at the time of    
+  actually releasing v1 close to the end of this contract period               
+                                                                               
+⏺ Got it — the v1 db file has the ingested datasets but the v1                 
+  contract-deliverable scores only used AquaMaps + BirdLife. Let me confirm by 
+  checking which datasets actually fed into the metric/zone_metric tables, then
+   update the plan.
+
+The `@_output/NT-23-03_metadata.xml` generated by `@final-report_2025_build.R` looks like it only contains placeholders, not requested content. Please update values with those entered in `@_output/NT-23-03_DataDictionary_manual-edits.xlsx`, which is an edited version of `@_output/NT-23-03_DataDictionary.xlsx`, since most cells where misaligned because of sectional rows. I also updated some cell content  -- only column B of Data Dictionary Template sheet. Can you fix `final-report_2025_build.R` to use these values for auto-generating `@_output/NT-23-03_DataDictionary.xlsx`?
+
+Update `final-report_2025_build.R` to:
+- NOT produce the **zip** `NT-23-03_StudyFootprint.zip` (Will do that later in Google Drive, outside Github repo and after inspection) have a flag for skipping
+- Add flag `redo_footprint_gdb <- FALSE` to control whether the footprint geodatabase should get regenerated even if already created, otherwise skip.
+
+←  ☐ DD source path  ☐ Sequencing  ✔ Submit  →                                 
+                                                                               
+**DD source path** Where should the authoritative data-dictionary values workbook live for the    
+build script to read from?                              
+                                                                               
+  1. libs/NT-23-03_DataDictionary_values.xlsx (Recommended)
+     Move the manual-edits xlsx to libs/ alongside the ESP template. Treats it
+     as a project input, git-tracked, safe from `_output/` cleanups.
+  2. Keep at _output/NT-23-03_DataDictionary_manual-edits.xlsx
+     Build script reads from _output/. Easier for now (no file move) but
+     fragile — a clean of _output/ will lose it.
+  3. dev/NT-23-03_DataDictionary_values.xlsx
+     Move to dev/ where other in-progress materials live. Project input, but
+     separate from libs/ template.
+❯ 4. Let's use `libs/NT-23-03_DataDictionary_values.xlsx`, except rename it to `MSTv1-2025-09_DataDictionary_values.xlsx` and for that matter rename the Title throughout to "Marine Sensitivity Toolkit, v1"
+
+**Sequencing** Should I work on Part A (QMD edits) and Part B (build script) in one go, or    
+split them across separate edit sessions?               
+                                                                               
+❯ 1. Both in one go (Recommended)                          
+     Apply Part A then Part B in a single session. Verify by running the build
+     script end-to-end at the end (which renders the QMD as a side-effect).
+  2. Part B first, then Part A                                
+     Fix the build script first (so future renders use correct metadata), then 
+     do the QMD content edits separately.       
+  3. Part A only this session               
+     Just do the QMD edits now. Defer Part B to a separate session.
+
+⏺ Updated plan                                       
+  ⎿  /plan to preview                                                          
+
+ Here is Claude's plan:                                                        
+
+ **Final Report 2025 — QMD edits + Build Script fixes**
+                                                        
+ Context                                                                       
+
+ Two related work streams for the BOEM 2025 Final Report (NT-23-03):
+
+ 1. **`final-report_2025.qmd`** needs editorial corrections: a broken citation,
+ dataset scoping to v1, removing politically sensitive content, verified
+ species counts from the v1 db, and an editorial pass to consolidate
+ duplication and expand sparse sections.**
+ 2. **`final-report_2025_build.R`** has two bugs that produced a
+ `_output/NT-23-03_metadata.xml` containing only placeholders rather than real**
+ values, plus a misaligned `_output/NT-23-03_DataDictionary.xlsx`. The user
+ manually fixed the data dictionary in
+ `_output/NT-23-03_DataDictionary_manual-edits.xlsx` and now wants the build
+ script to (a) treat that file as the authoritative content source, (b) use
+ those values to populate both the auto-generated
+ `_output/NT-23-03_DataDictionary.xlsx` and `_output/NT-23-03_metadata.xml`, (c)
+ skip the StudyFootprint zip (which the user will produce in Google Drive),
+ and (d) skip GDB regeneration unless an explicit flag is set.
+
+ ---
+ **Part A — Edits to `final-report_2025.qmd`**
+
+ Files to modify
+
+ - `/Users/bbest/Github/MarineSensitivity/workflows/final-report_2025.qmd` (main
+  report)
+ - `/Users/bbest/Github/MarineSensitivity/workflows/references.bib` (add
+ `morandi2018`; not currently present)
+
+ **Verified facts from v1 database**
+
+ The v1 database ~/_big/msens/derived/v1/sdm.duckdb (newly restored to 2 GB
+ from server) contains the authoritative v1 scoring results. The zone_taxon
+ table — which holds the species that were actually scored into v1
+ Planning-Area metrics — has exactly 17,333 distinct species, matching the
+ report's headline number precisely.
+
+ v1 species actually scored (`zone_taxon`):
+
+ ┌──────────────┬─────────────┐
+ │    sp_cat    │ distinct sp │
+ ├──────────────┼─────────────┤
+ │ fish         │       6,672 │
+ ├──────────────┼─────────────┤
+ │ invertebrate │       8,179 │
+ ├──────────────┼─────────────┤
+ │ other        │       1,128 │
+ ├──────────────┼─────────────┤
+ │ coral        │         775 │
+ ├──────────────┼─────────────┤
+ │ bird         │         460 │
+ ├──────────────┼─────────────┤
+ │ mammal       │          88 │
+ ├──────────────┼─────────────┤
+ │ reptile      │          31 │
+ ├──────────────┼─────────────┤
+ │ Total        │      17,333 │
+ └──────────────┴─────────────┘
+
+ Datasets that contributed models to v1 zone_taxon (i.e. that fed the scores):
+
+ ┌──────────┬────────────────────────┬─────────────────────────┐
+ │  ds_key  │ n_models in zone_taxon │    role in v1 scores    │
+ ├──────────┼────────────────────────┼─────────────────────────┤
+ │ am_0.05  │                 16,822 │ dominant (AquaMaps)     │
+ ├──────────┼────────────────────────┼─────────────────────────┤
+ │ bl       │                    389 │ dominant (BirdLife)     │
+ ├──────────┼────────────────────────┼─────────────────────────┤
+ │ ms_merge │                     84 │ merged-model bridge     │
+ ├──────────┼────────────────────────┼─────────────────────────┤
+ │ ch_fws   │                      4 │ minor pilot integration │
+ ├──────────┼────────────────────────┼─────────────────────────┤
+ │ ch_nmfs  │                      3 │ minor pilot integration │
+ ├──────────┼────────────────────────┼─────────────────────────┤
+ │ rng_fws  │                     31 │ minor pilot integration │
+ └──────────┴────────────────────────┴─────────────────────────┘
+
+ **Important nuance** (per user clarification): NMFS CH, FWS CH, and FWS Range
+ Maps were ingested into v1 and a small number of their models (38 total out
+ of 17,333) reached the v1 scored output, but at the time v1 was released the
+ CH/FWS work was at pilot scale. The dominant v1 deliverable was AquaMaps +
+ BirdLife + the merged bridge (17,295 of 17,333 = 99.8%). We will drop CH/FWS
+ from the body and reframe them as "post-v1 enhancement" in Conclusions / Next
+  Steps.
+
+ - Spatial grid: 2006 × 3103 = 6,224,618 cells (verified at
+ ingest_aquamaps_to_sdm_duckdb.qmd:520). Correct as written.
+ - Cells with model data in v1 db = 661,372 — populated subset, not the raster
+  footprint, so the 6.2M figure stays.
+ - v1 planning areas geopackage at ~/My
+ Drive/projects/msens/data/derived/v1/ply_planareas_2025.gpkg has 36 features.
+  Per user: distributions ingested for all 36 (lower 48 + Alaska + Pacific
+ Island territories); maps and flower plots in this report summarize only the
+ 27 Planning Areas (19 lower 48 + 8 Alaska); apps expose all 36.
+
+ The report's current category counts (505 birds, 819 corals, 99 mammals, 42
+ turtles) do NOT match any v1-db query — they appear to be stale numbers from
+ an earlier internal cut.
+
+ **QMD edits**
+
+ A1. Fix [@boem2018] → [@morandi2018]
+
+ Two occurrences:
+ - final-report_2025.qmd:151: previous Relative Environmental Sensitivity
+ Analysis (RESA) [@boem2018]
+ - final-report_2025.qmd:279: species composition [@boem2018]
+
+ Both replace with [@morandi2018]. Add this entry to
+ /Users/bbest/Github/MarineSensitivity/workflows/references.bib (verbatim from
+  /Users/bbest/Github/MarineSensitivity/docs/references.bib:219-227):
+
+ ```bibtex
+ @techreport{morandi2018,
+     title = {Environmental Sensitivity and Associated Risk to Habitats and
+ Species on the Pacific West Coast and Hawaii with Offshore Floating Wind
+ Technologies},
+     author = {Morandi, A. and Berkman, S. and Rowe, J. and Balouskus, R. and
+ Etkin, D. S. and Moelter, C. and Reich, D.},
+     year = {2018},
+     number = {OCS Study BOEM 2018-031},
+     institution = {US Department of the Interior, Bureau of Ocean Energy
+ Management, Pacific OCS Region},
+     address = {Camarillo, CA},
+     url = {https://www.boem.gov/sites/default/files/environmental-stewardship
+ /Environmental-Studies/Pacific-Region/Studies/BOEM-2018-031-Vol1.pdf}
+ }
+ ```
+
+ A2. Drop post-v1 datasets (NMFS CH, FWS CH, FWS Range) from main body
+
+ - Lines 211-215 (Methods → Species Distribution Models): delete the three
+ paragraphs describing NMFS CH, FWS CH, FWS Range. Keep AquaMaps (line 207)
+ and BirdLife (line 209).
+ - Line 205: change "17,333 species distribution models from five
+ complementary data sources" → "17,333 species distribution models from two
+ complementary data sources".
+ - Line 217: keep the 6.2M cell statement but drop the "five datasets all
+ standardized" framing.
+ - Lines 324-336 (@tbl-datasets): remove the three rows for NMFS CH, FWS CH,
+ FWS Range. Update total row at line 337. Trim caption (line 340) to drop
+ CH-specific language.
+ - Line 507 (Conclusions → Taxonomic Comprehensiveness): replace species
+ counts with v1 zone_taxon distinct counts:
+
+ ▎ Coverage of 17,333 species across all major marine taxa (6,672 fishes,
+ 8,179 invertebrates, 460 birds, 775 corals, 88 mammals, 31 turtles, plus
+ 1,128 other marine taxa)
+
+ - Drop the second sentence ("Critical Habitat and ESA range maps provide
+ legally-mandated coverage…").
+ - Mention in Conclusions (around line 503 in "Rapid Species-at-Risk
+ Assessment"): add a sentence noting post-v1 work has integrated NMFS CH, FWS
+ CH, FWS Range:
+
+ ▎ Subsequent post-v1 development has integrated NMFS Critical Habitat, U.S.
+ Fish and Wildlife Service Critical Habitat, and FWS Current Range Maps to
+ provide direct linkage to ESA-listed species protections.
+ - Mention in Next Steps (after line 547): add a bullet:
+
+ ▎ - Refining regulatory and listed-species coverage by maintaining up-to-date
+  integration of NMFS Critical Habitat, FWS Critical Habitat, and FWS Current
+ Range Maps as new designations and assessments are issued.
+
+ A3. Drop "Climate Adaptation" subsection
+
+ Delete final-report_2025.qmd:531 (the **Climate Adaptation**: … paragraph
+ under "Foundation for Mitigation and Adaptive Management"). Adjacent
+ paragraphs need no rewording.
+
+ A4. Consolidate duplication
+
+ - "17,333 species" repetition (lines 145, 157, 205, 337, 475, 507): cite
+ exact number once in Methods (205) and once in Conclusions (475/507). Use
+ "over 17,000 species distribution models" in Abstract (145) and Background
+ (157).
+ - "0.05° grid" + km equivalent (lines 145, 153, 217, 297, 505): give precise
+ pitch (2006 × 3103 cells; 2.0–5.5 km, finer at higher latitudes) once in
+ Methods → Spatial Aggregation (217). Elsewhere use "fine-scale 0.05° grid (~5
+  km)".
+ - OCSLA Section 18(a)(2)(G) (lines 149, 475): full citation in Background
+ only; in Conclusions opening say "BOEM's statutory mandate under the Outer
+ Continental Shelf Lands Act".
+ - Executive Order 14303 (lines 151, 159, 430, 489): full reference in
+ Background once; trim line 159; merge EO framing in Reproducible
+ Infrastructure (430) into Conclusions → "Meeting Executive Order 14303
+ Requirements" subsection (489).
+ - BOEM Ecoregions definition (lines 279, 297): full definition in Geographic
+ Scope (297, with [@morandi2018]); reduce line 279 to "BOEM Ecoregions,
+ defined in Geographic Scope below,".
+ - Planning area counts (lines 159, 167, 297, 561, 577): standardize on "all
+ 27 BOEM OCS Planning Areas (19 lower 48 + 8 Alaska)" for the reported maps
+ and flower plots. Fix line 167 ("26 OCS planning areas" → "27 OCS planning
+ areas").
+ - Add a clarifying sentence in Methods → Geographic Scope (around line 297):
+ species distributions were ingested across the full 36 OCS Planning Areas
+ (lower 48, Alaska, and U.S. Pacific Island territories) but the descriptive
+ maps and flower plots in this report summarize only the continental U.S. and
+ Alaska Planning Areas (27); the interactive applications expose the full
+ territorial extent.
+
+ A5. Expand sparse sections
+
+ Add 1–3 sentences each:
+
+ - Server (lines 434-437): Docker rationale (rapid spin-up, reproducible BOEM
+ hand-off), services list, production posture.
+ - Database (lines 439-441): Postgres-vs-DuckDB role split (PostGIS
+ transactional vector; DuckDB columnar/spatial analytical), ~3 GB current
+ footprint, daily backups.
+ - Workflows (lines 443-446): example notebook names, executable Quarto +
+ R/Python convention, inspection-and-archive purpose.
+ - Maps of Environmental Sensitivity by Pixel (lines 362-374): 2-3 sentences
+ before figures noting spatial gradients, hotspot locations, contiguous-US vs
+ Alaska contrast.
+ - Maps of Environmental Sensitivity by Planning Area (lines 376-388): which
+ Planning Areas rank highest/lowest, how aggregation differs from pixel
+ scores.
+ - Online Mapping Application (line 400): interactive features (filter by
+ taxonomic group, hover values, click-through to species cards) before
+ screenshots.
+ - Map of Study Area (lines 575-577): rationale for BOEM Planning Areas as
+ study unit, dateline handling for Alaska / Pacific Islands.
+
+ ---
+ **Part B — Edits to `final-report_2025_build.R`**
+
+ Bug analysis
+
+ B1. Metadata XML replacement is broken
+
+ final-report_2025_build.R:682 calls xml_ns_strip(xml) and then queries
+ .//CharacterString[text()='X']. This silently fails because xml_ns_strip()
+ does NOT rewrite element names — element nodes remain <gco:CharacterString>
+ in the underlying tree, so the unprefixed XPath finds 0 matches. Verified by
+ running the existing logic against the current _output/NT-23-03_metadata.xml:
+  0 of the ~60 placeholders have been replaced.
+
+ The fix is to use local-name() predicates:
+ .//*[local-name()='CharacterString' and text()='X']. Same change for Date,
+ DateTime, description, beginPosition, endPosition selectors at lines 684-720.
+
+ B2. Data Dictionary row offset is off by one
+
+ final-report_2025_build.R:587-595 reads the dictionary template with colNames
+  = FALSE (so row 1 of the data frame is row 1 of the spreadsheet), finds the
+ field via which(startsWith(...)), then writes with startRow = row_idx[1] + 1.
+  The +1 is wrong — every value lands one row below its label. Hence the
+ user's complaint that "most cells were misaligned because of sectional rows"
+ (in fact, every cell, not just sectional rows). Fix: drop the +1 so startRow
+ = row_idx[1].
+
+ B3. Hardcoded dd_values list is the wrong source of truth
+
+ The script currently hardcodes ~60 fields in
+ final-report_2025_build.R:501-583. The user has now manually maintained
+ _output/NT-23-03_DataDictionary_manual-edits.xlsx and wants that file to be
+ authoritative going forward. The hardcoded dd_values list and the parallel
+ xml_replacements list at lines 609-679 should be replaced by a single read of
+  the manual-edits xlsx.
+
+ There are also DD ↔ XML field-name mismatches that the current script's two
+ parallel lists papered over:
+
+ ┌───────────────────────────────────────┬─────────────────────────────────┐
+ │         DD field name (col A)         │      XML placeholder name       │
+ ├───────────────────────────────────────┼─────────────────────────────────┤
+ │ metadataPOCContactName                │ metadataPOCName                 │
+ ├───────────────────────────────────────┼─────────────────────────────────┤
+ │ studyFootprintMethodDefinition        │ studyFootprintMethodDescription │
+ ├───────────────────────────────────────┼─────────────────────────────────┤
+ │ DataContentType                       │ dataContentType                 │
+ ├───────────────────────────────────────┼─────────────────────────────────┤
+ │ spatiaExtentNorth (DD typo)           │ spatialExtentNorth              │
+ ├───────────────────────────────────────┼─────────────────────────────────┤
+ │ (none — derived from                  │ PIName                          │
+ │ PIPrimaryContactName)                 │                                 │
+ └───────────────────────────────────────┴─────────────────────────────────┘
+
+ These need explicit mapping in the script.
+
+ B4. Authoritative-source location
+
+ The manual-edits xlsx is currently in _output/, which is conventionally a
+ generated-output dir (and not git-tracked at the file level). Putting an
+ input there is fragile — a rm -rf _output/ would lose it. Recommended: move
+ it to libs/NT-23-03_DataDictionary_values.xlsx (alongside the existing
+ libs/ESP Report Template 2025_1 tech.docx) and treat it as a project input.
+ Will ask user before moving (see open question below).
+
+ Build-script edits
+
+ B5. Add control flags near the top of the script (after META)
+
+ Insert after final-report_2025_build.R:61:
+ ```r
+ # build-time flags ----
+ skip_zip            <- TRUE   # do NOT build NT-23-03_StudyFootprint.zip
+                               #   (will be assembled in Google Drive after
+ inspection)
+ redo_footprint_gdb  <- FALSE  # if FALSE, reuse existing GDB at gdb_path;
+                               #   set TRUE to force regeneration
+ DD_VALUES_PATH      <- file.path(DIR_WF,
+ "libs/NT-23-03_DataDictionary_values.xlsx")
+                               # authoritative manual-curated source for DD +
+ XML
+ ```
+
+ (The DD_VALUES_PATH location depends on the open question below — if user
+ prefers to leave the file in _output/, change accordingly.)
+
+ B6. Replace hardcoded dd_values list with a read of the authoritative xlsx
+
+ Replace final-report_2025_build.R:496-583 with logic that:
+
+ 1. Reads DD_VALUES_PATH (the user-curated workbook).
+ 2. Reads the "Data Dictionary Template" sheet (col A = field names, col B =
+ values).
+ 3. Builds a named list dd_values from the non-empty col A → col B pairs
+ (skipping section header rows where col B is empty).
+ 4. Copies the user-curated workbook to _output/NT-23-03_DataDictionary.xlsx
+ as the auto-generated artifact (since it's already correctly aligned and
+ contains all the user-curated content). This is simpler than re-writing into
+ a fresh template.
+
+ Sketch (replaces lines 496-603):
+ ```r
+ # 4b. read authoritative data dictionary values ----
+ stopifnot(
+   "DD values file not found" = file_exists(DD_VALUES_PATH))
+
+ dd_sheet <- read.xlsx(
+   DD_VALUES_PATH, sheet = "Data Dictionary Template",
+   colNames = FALSE, skipEmptyRows = FALSE)
+
+ # trim trailing "--See ... tab--" annotations from field names so we get
+ # clean keys like "disciplineKeywords" not "disciplineKeywords\n--See..."
+ clean_key <- function(x) sub("\\s*--.*$", "", trimws(x))
+
+ dd_values <- list()
+ for (i in seq_len(nrow(dd_sheet))) {
+   key <- clean_key(dd_sheet[i, 1])
+   val <- dd_sheet[i, 2]
+   if (is.na(key) || nchar(key) == 0) next
+   if (is.na(val) || nchar(as.character(val)) == 0) next
+   # skip section header rows by detecting that col A is a sentence not a
+ fieldname
+   if (grepl("\\s", key)) next
+   dd_values[[key]] <- as.character(val)
+ }
+ cat("  Loaded", length(dd_values), "values from", DD_VALUES_PATH, "\n")
+
+ # auto-generate the output data dictionary by copying the curated source
+ dd_out <- file.path(DIR_OUT, glue("{META$study_no}_DataDictionary.xlsx"))
+ file_copy(DD_VALUES_PATH, dd_out, overwrite = TRUE)
+ cat("  Saved data dictionary:", dd_out, "\n")
+ ```
+ This eliminates the +1 alignment bug entirely (no per-cell write loop) and
+ removes the hardcoded dd_values list.
+
+ B7. Rewrite XML replacement to use local-name() and the loaded dd_values
+
+ Replace final-report_2025_build.R:605-732 with logic that:
+
+ 1. Reads the XML template.
+ 2. Builds a DD-key → XML-placeholder mapping for the few fields where names
+ differ.
+ 3. For each XML placeholder, finds the value in dd_values (via the mapping if
+  needed), then runs the replacement using local-name() XPath.
+ 4. Writes the resulting XML.
+
+ Sketch:
+ ```r
+ # 4c. fill metadata XML ----
+ xml <- read_xml(XML_TPL)
+
+ # DD field name -> XML placeholder name (only for mismatches)
+ dd_to_xml <- c(
+   metadataPOCContactName         = "metadataPOCName",
+   studyFootprintMethodDefinition = "studyFootprintMethodDescription",
+   DataContentType                = "dataContentType",
+   spatiaExtentNorth              = "spatialExtentNorth",
+   PIPrimaryContactName           = "PIName"
+   # (PIPrimaryContactName also fills its identical-named XML placeholder
+   #  via the default rule below — no extra mapping needed)
+ )
+
+ # build (xml_placeholder -> value) lookup
+ xml_replacements <- list()
+ for (dd_key in names(dd_values)) {
+   xml_key <- if (dd_key %in% names(dd_to_xml)) dd_to_xml[[dd_key]] else
+ dd_key
+   xml_replacements[[xml_key]] <- dd_values[[dd_key]]
+ }
+ # also fill XML placeholders that map from a different DD field
+ # (e.g. PIName alias of PIPrimaryContactName when not already covered)
+ if (!"PIName" %in% names(xml_replacements) &&
+ !is.null(dd_values$PIPrimaryContactName)) {
+   xml_replacements[["PIName"]] <- dd_values$PIPrimaryContactName
+ }
+
+ # replace placeholders using local-name() (works through the gco:/gmd:
+ namespaces)
+ n_replaced <- 0
+ for (placeholder in names(xml_replacements)) {
+   value <- xml_replacements[[placeholder]]
+   xpath <- glue(
+     ".//*[(local-name()='CharacterString' or local-name()='Date' or ",
+     "local-name()='DateTime' or local-name()='description' or ",
+     "local-name()='beginPosition' or local-name()='endPosition') and ",
+     "text()='{placeholder}']")
+   nodes <- xml_find_all(xml, xpath)
+   for (node in nodes) {
+     xml_set_text(node, value)
+     n_replaced <- n_replaced + 1
+   }
+ }
+ cat("  Replaced", n_replaced, "XML placeholders\n")
+
+ # also replace the obligation/contract number pattern
+ credit_nodes <- xml_find_all(xml,
+   ".//*[local-name()='CharacterString' and contains(text(), 'MXXYYXXXXX')]")
+ for (node in credit_nodes) {
+   txt <- xml_text(node)
+   xml_set_text(node, gsub("MXXYYXXXXX", META$contract_no, txt))
+ }
+
+ xml_out <- file.path(DIR_OUT, glue("{META$study_no}_metadata.xml"))
+ write_xml(xml, xml_out)
+ cat("  Saved metadata XML:", xml_out, "\n")
+ ```
+
+ B8. Wrap GDB regeneration with redo_footprint_gdb flag
+
+ In final-report_2025_build.R:471-494, wrap the GDB-creation block:
+
+ ```r
+ # 4a. convert GeoPackage to FileGDB ----
+ gdb_path <- file.path(DIR_OUT, glue("{META$study_no}_StudyFootprint.gdb"))
+
+ if (redo_footprint_gdb || !dir_exists(gdb_path)) {
+   pa <- st_read(GPKG_PATH, quiet = TRUE)
+   cat("  Read GeoPackage:", nrow(pa), "features\n")
+   study_area <- pa |>
+     st_union() |>
+     st_sf(geometry = _) |>
+     mutate(
+       FootPrintID   = 1L,
+       Region        = "National",
+       StudiesID     = META$study_no,
+       DateCompleted = META$period_end,
+       Method        = "GIS-ready boundary") |>
+     select(FootPrintID, Region, StudiesID, DateCompleted, Method, geometry)
+   if (dir_exists(gdb_path)) dir_delete(gdb_path)
+   st_write(study_area, dsn = gdb_path, layer = "StudyFootprint",
+     driver = "OpenFileGDB", quiet = TRUE)
+   cat("  Created FileGDB:", gdb_path, "\n")
+ } else {
+   cat("  Reusing existing FileGDB:", gdb_path,
+       "(set redo_footprint_gdb <- TRUE to regenerate)\n")
+ }
+ ```
+
+ B9. Skip the StudyFootprint zip when skip_zip is TRUE
+
+ Wrap final-report_2025_build.R:734-754 with if (!skip_zip) { ... }. Update
+ the trailing summary block at lines 793-796 to omit Footprint: line when
+ skip_zip is TRUE (or print "skipped (set skip_zip <- FALSE to build)").
+
+ User clarifications applied (Part B)
+
+ - Authoritative DD file path: libs/MSTv1-2025-09_DataDictionary_values.xlsx.
+ Move (rename) _output/NT-23-03_DataDictionary_manual-edits.xlsx →
+ libs/MSTv1-2025-09_DataDictionary_values.xlsx. Both will be tracked in git
+ going forward.
+ - Project title rename: change "Environmental Sensitivity Model" → "Marine
+ Sensitivity Toolkit, v1" everywhere it appears as the project/study title.
+
+ Title rename — additional changes
+
+ In final-report_2025.qmd:
+
+ - final-report_2025.qmd:2: title: "Environmental Sensitivity Model
+ (NT-23-03)" → title: "Marine Sensitivity Toolkit, v1 (NT-23-03)"
+
+ (Other occurrences of "Marine Sensitivity Toolkit (MST)" inside body prose
+ stay as-is — those are the methodology name, not the title. Only the YAML
+ title and any "Environmental Sensitivity Model" mentions need updating;
+ existing body prose already says "Marine Sensitivity Toolkit".)
+
+ In final-report_2025_build.R:
+
+ - final-report_2025_build.R:26: study_title = "Environmental Sensitivity
+ Model" → study_title = "Marine Sensitivity Toolkit, v1"
+ - The XML_TPL path at line 17 (footprint/studyTitle-(1).xml) is the template
+ filename and stays as-is — that's an external BOEM spec file path.
+
+ In libs/MSTv1-2025-09_DataDictionary_values.xlsx (after move):
+
+ The user already updated col B values for studyTitle and finalReportTitle to
+ "Marine Sensitivity Toolkit" in the manual edits. As part of the move/rename,
+  I'll also update those two cells to "Marine Sensitivity Toolkit, v1" so the
+ metadata XML and DD output carry the new title. Specifically:
+
+ - Row with col A studyTitle → col B Marine Sensitivity Toolkit, v1
+ - Row with col A finalReportTitle → col B Marine Sensitivity Toolkit, v1
+
+ Updated DD_VALUES_PATH in build script
+
+ DD_VALUES_PATH <- file.path(DIR_WF,
+ "libs/MSTv1-2025-09_DataDictionary_values.xlsx")
+
+ ---
+ Verification
+
+ After Part A (QMD edits)
+
+ 1. quarto render final-report_2025.qmd --to html — check:
+   - No [@boem2018] warnings (Citation 'boem2018' not found).
+   - [@morandi2018] resolves and renders in the bibliography section.
+   - @tbl-datasets renders with two rows + total.
+   - No mention of NMFS CH / FWS CH / FWS Range outside Conclusions/Next
+ Steps.
+   - "Climate Adaptation" no longer appears.
+   - Species count 17,333 reads consistently in Methods, @tbl-datasets, and
+ Conclusions.
+ 2. Re-render to --to docx and --to pdf (via Rscript final-report_2025_build.R
+  once Part B is in) to confirm template integrity.
+ 3. Spot-check Conclusions species breakdown against the v1 db:
+ library(DBI); library(duckdb)
+ con <- dbConnect(duckdb::duckdb(), "~/_big/msens/derived/v1/sdm.duckdb",
+ read_only=TRUE)
+ dbGetQuery(con, "
+   SELECT sp_cat, COUNT(DISTINCT sp_scientific) AS n
+   FROM zone_taxon GROUP BY sp_cat ORDER BY sp_cat")
+ 4. git diff final-report_2025.qmd — confirm only intended sections changed.
+
+ After Part B (build script edits)
+
+ 1. Run Rscript final-report_2025_build.R end-to-end. Expect console output:
+   - Loaded N values from .../NT-23-03_DataDictionary_values.xlsx
+   - Saved data dictionary: .../NT-23-03_DataDictionary.xlsx
+   - Replaced N XML placeholders (should be ~50–60, not 0)
+   - Saved metadata XML: .../NT-23-03_metadata.xml
+   - Reusing existing FileGDB: (since redo_footprint_gdb <- FALSE by default
+ and the GDB already exists)
+   - No mention of NT-23-03_StudyFootprint.zip (since skip_zip <- TRUE)
+ 2. Open _output/NT-23-03_metadata.xml and grep for placeholder strings like
+ metadataPOCName, studyTitle, abstract — they should all be replaced with real
+  values, not the literal placeholder names.
+ 3. Open _output/NT-23-03_DataDictionary.xlsx in Excel — confirm col B values
+ land in the same rows as their col A field names (no off-by-one).
+ 4. Confirm _output/NT-23-03_StudyFootprint.zip is NOT created.
+ 5. Re-run with redo_footprint_gdb <- TRUE once and confirm the GDB is
+ rebuilt.
+
+⏺ All 18 tasks done. Summary of changes:
+
+  Part A — final-report_2025.qmd editorial pass
+
+  - [@boem2018] → [@morandi2018] (lines 151, 273); added morandi2018 entry to
+  references.bib
+  - YAML title → "Marine Sensitivity Toolkit, v1 (NT-23-03)"
+  - Methods Species Distribution section: dropped NMFS CH, FWS CH, FWS Range
+  paragraphs; trimmed lead-in to "two complementary data sources"
+  - @tbl-datasets: removed three rows; trimmed caption
+  - Conclusions Taxonomic Comprehensiveness: updated species counts to v1
+  zone_taxon distinct counts (6,672 fish / 8,179 invert / 460 birds / 775
+  corals / 88 mammals / 31 turtles / 1,128 other = 17,333)
+  - Added post-v1 dataset mention in Conclusions and a Next Steps bullet
+  - Removed Climate Adaptation paragraph
+  - Consolidated duplications (17,333 species, 0.05° grid, OCSLA, EO 14303,
+  BOEM Ecoregions definition); fixed PA count typo (26→27); tightened
+  Background, Abstract, Reproducible Infrastructure intro, Best Available
+  Science
+  - Added Geographic Scope clarifying sentence: distributions ingested for all
+  36 PAs but maps/flower plots herein show only 27 (lower 48 + Alaska); apps
+  expose all 36
+  - Expanded sparse sections: Maps by Pixel, Maps by PA, Online Mapping
+  Application, Server, Database, Workflows, Map of Study Area
+
+  Part B — final-report_2025_build.R fixes
+
+  - Moved _output/NT-23-03_DataDictionary_manual-edits.xlsx →
+  libs/MSTv1-2025-09_DataDictionary_values.xlsx and updated studyTitle +
+  finalReportTitle cells to "Marine Sensitivity Toolkit, v1"
+  - Added control flags: skip_zip <- TRUE, redo_footprint_gdb <- FALSE,
+  DD_VALUES_PATH
+  - META$study_title → "Marine Sensitivity Toolkit, v1"
+  - Replaced ~100 lines of hardcoded dd_values with a read of DD_VALUES_PATH
+  (eliminates the +1 row offset bug entirely; the curated workbook is now
+  copied as the auto-generated artifact)
+  - Rewrote XML replacement to use local-name() XPath (the old xml_ns_strip() +
+   .//CharacterString approach silently returned 0 matches, so 0 placeholders
+  were ever filled)
+  - Added dd_to_xml alias map for the four DD↔XML field-name mismatches
+  - Wrapped GDB regeneration with redo_footprint_gdb || !dir_exists(gdb_path)
+  so it skips by default
+  - Wrapped zip block with if (!skip_zip) and updated the trailing summary
+
+  Verified end-to-end
+
+  - Phase 4 isolated test: loaded 63 values from the curated xlsx, replaced 63
+  XML placeholders (was 0 before), zero unfilled placeholder candidates remain
+  in the output. Spot checks: metadataPOCName=Timothy White, studyTitle=Marine
+  Sensitivity Toolkit, v1, abstract is full prose, dateStamp=2026-04-07.
+  - quarto render final-report_2025.qmd --to html succeeds; rendered title is
+  "Marine Sensitivity Toolkit, v1 (NT-23-03)"; no missing-citation warnings.
+  - git diff --stat: final-report_2025.qmd -45/+48, final-report_2025_build.R
+  -255/+133 (net trim of ~120 lines), references.bib +10.
+
+  Note: I haven't run the full build script end-to-end (Phases 1-3 invoke
+  quarto render --to docx, the body-XML caption-fix loop, the ESP template
+  merge, and the Microsoft Word AppleScript PDF conversion). When you next run
+  Rscript final-report_2025_build.R, expect to see Loaded 63 values from
+  MSTv1-2025-09_DataDictionary_values.xlsx, Replaced 63 XML placeholders,
+  Reusing existing FileGDB:, and Skipping StudyFootprint zip in the Phase 4
+  console output.
+
+  Recalled 2 memories (ctrl+o to expand)
+
+⏺ Let me update the project memory with the key changes from this session.
+
+  Wrote 1 memory (ctrl+o to expand)
+
+⏺ Memory updated. Everything is now in place: QMD edits applied, build script
+  fixes applied, DD values workbook moved/renamed/title-updated, end-to-end
+  Phase 4 verified (63 placeholders replaced, 0 unfilled), and quarto render
+  --to html succeeds with no missing-citation warnings.
+
+  When you run the full build next, you should see:
+  === Phase 4: ESP Study Footprint ===
+    Reusing existing FileGDB: ..._StudyFootprint.gdb
+      (set redo_footprint_gdb <- TRUE to regenerate)
+    Loaded 63 values from MSTv1-2025-09_DataDictionary_values.xlsx
+    Saved data dictionary: ..._DataDictionary.xlsx
+    Replaced 63 XML placeholders
+    Saved metadata XML: ..._metadata.xml
+    Skipping StudyFootprint zip (set skip_zip <- FALSE to build it).
+
+=== ESP Report Checklist QA ===
+Open the DOCX in Word and verify:
+  [ ] 1.  General: Uses 2025 ESP template styles
+  [ ] 2.  File Format: DOCX + PDF, no password, 8.5x11, 1-inch margins
+  [ ] 3.  Section 508: Run Word accessibility checker (Review > Check Accessibility)
+  [ ] 4.  Page Numbers: Per template
+  [ ] 5.  Copyrighted Material: All figures are project-generated
+  [ ] 6.  Front Cover: No additions, date = publication month/year
+  [ ] 7.  Back Cover: No alterations
+  [ ] 8.  Title Page: All fields completed
+  [ ] 9.  Technical Summary: 1.5-3 pages, all fields filled
+  [ ] 10. Frontmatter: Update fields (Ctrl+A, F9) for TOC/LOF/LOT
+  [ ] 11. References: Author-Year, CSE 8th ed
+  [ ] 12. Appendices: N/A or numbered
+  [ ] 13. Volumes: Single volume
+  [ ] 14. Numbers: Commas, leading zeros
+  [ ] 15. Equations: Word equation editor or image with alt text
+  [ ] 16. Abbreviations: Spelled out first use + list
+  [ ] 17. Tables/Figures: Referenced in text, close to reference
+  [ ] 18. Table Titles: Above table, same page, Table Title style
+  [ ] 19. Table Notes: Table Notes style
+  [ ] 20. Figure Captions: Below figure, same page, Figure Caption style
+  [ ] 21. Figure Notes: Figure Notes style
+  [ ] 22. Tables: Real tables, no merge/split/empty, repeat headers
+  [ ] 23. Figures: Single image, alt text, border, inline wrap
+  [ ] 24. Hyperlinks: Active, descriptive text
+
+IMPORTANT: After opening in Word, press Ctrl+A then F9 to update all fields
+(TOC, LOF, LOT, cross-references, page numbers).
+
 
 ## 2026-04-08 server full 
 

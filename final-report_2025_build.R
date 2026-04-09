@@ -7,23 +7,29 @@ librarian::shelf(
   quiet = TRUE)
 
 # paths ----
-DIR_WF     <- "/Users/bbest/Github/MarineSensitivity/workflows"
-DIR_SPECS  <- "~/My Drive/projects/msens/docs/2025 final report/specs"
-DIR_OUT    <- file.path(DIR_WF, "_output")
-TPL_FULL   <- file.path(DIR_WF, "libs/ESP Report Template 2025_1.docx")
-TPL_TECH   <- file.path(DIR_WF, "libs/ESP Report Template 2025_1 tech.docx")
-GPKG_PATH  <- "~/My Drive/projects/msens/data/derived/v1/ply_planareas_2025.gpkg"
-COVER_IMG  <- file.path(DIR_WF, "../docs/figures/overview-methods.png")
-XML_TPL    <- file.path(DIR_SPECS, "footprint/studyTitle-(1).xml")
-XLSX_TPL   <- file.path(DIR_SPECS, "footprint/ESPISDataDictionary_2019.xlsx")
-QMD_FILE   <- file.path(DIR_WF, "final-report_2025.qmd")
+DIR_WF         <- "/Users/bbest/Github/MarineSensitivity/workflows"
+DIR_SPECS      <- "~/My Drive/projects/msens/docs/2025 final report/specs"
+DIR_OUT        <- file.path(DIR_WF, "_output")
+TPL_FULL       <- file.path(DIR_WF, "libs/ESP Report Template 2025_1.docx")
+TPL_TECH       <- file.path(DIR_WF, "libs/ESP Report Template 2025_1 tech.docx")
+GPKG_PATH      <- "~/My Drive/projects/msens/data/derived/v1/ply_planareas_2025.gpkg"
+COVER_IMG      <- file.path(DIR_WF, "../docs/figures/overview-methods.png")
+XML_TPL        <- file.path(DIR_SPECS, "footprint/studyTitle-(1).xml")
+DD_VALUES_PATH <- file.path(DIR_WF, "libs/MSTv1-2025-09_DataDictionary_values.xlsx")
+QMD_FILE       <- file.path(DIR_WF, "final-report_2025.qmd")
+
+# build-time flags ----
+skip_zip           <- TRUE   # do NOT build NT-23-03_StudyFootprint.zip
+                             #   (assembled in Google Drive after inspection)
+redo_footprint_gdb <- FALSE  # if FALSE, reuse existing GDB at gdb_path;
+                             #   set TRUE to force regeneration
 
 dir_create(DIR_OUT)
 
 # contract metadata ----
 META <- list(
   study_no       = "NT-23-03",
-  study_title    = "Environmental Sensitivity Model",
+  study_title    = "Marine Sensitivity Toolkit, v1",
   contract_no    = "140M0123P0018",
   pub_no         = "BOEM 2025-XXX",
   pub_date       = "April 2025",
@@ -471,257 +477,110 @@ if (file_exists(out_pdf)) {
 cat("\n=== Phase 4: ESP Study Footprint ===\n")
 
 # 4a. convert GeoPackage to FileGDB ----
-pa <- st_read(GPKG_PATH, quiet = TRUE)
-cat("  Read GeoPackage:", nrow(pa), "features\n")
-
-# dissolve to single study area polygon
-study_area <- pa |>
-  st_union() |>
-  st_sf(geometry = _) |>
-  mutate(
-    FootPrintID   = 1L,
-    Region        = "National",
-    StudiesID     = META$study_no,
-    DateCompleted = META$period_end,
-    Method        = "GIS-ready boundary") |>
-  select(FootPrintID, Region, StudiesID, DateCompleted, Method, geometry)
-
 gdb_path <- file.path(DIR_OUT, glue("{META$study_no}_StudyFootprint.gdb"))
-if (dir_exists(gdb_path)) dir_delete(gdb_path)
 
-st_write(study_area, dsn = gdb_path, layer = "StudyFootprint",
-  driver = "OpenFileGDB", quiet = TRUE)
-cat("  Created FileGDB:", gdb_path, "\n")
+if (redo_footprint_gdb || !dir_exists(gdb_path)) {
+  pa <- st_read(GPKG_PATH, quiet = TRUE)
+  cat("  Read GeoPackage:", nrow(pa), "features\n")
 
-# 4b. fill data dictionary XLSX ----
-wb <- loadWorkbook(XLSX_TPL)
+  # dissolve to single study area polygon
+  study_area <- pa |>
+    st_union() |>
+    st_sf(geometry = _) |>
+    mutate(
+      FootPrintID   = 1L,
+      Region        = "National",
+      StudiesID     = META$study_no,
+      DateCompleted = META$period_end,
+      Method        = "GIS-ready boundary") |>
+    select(FootPrintID, Region, StudiesID, DateCompleted, Method, geometry)
 
-# the "Data Dictionary Template" sheet has fields in column A (X1)
-# and user values go in column B
-dd_values <- list(
-  metadataFileIdentifier             = UUIDgenerate(),
-  metadataPOCRegionalOrProgramOffice = META$cor_org,
-  metadataPOCStreetAddress           = META$cor_street,
-  metadataPOCCity                    = META$cor_city,
-  metadataPOCState                   = META$cor_state,
-  metadataPOCCountry                 = META$cor_country,
-  metadataPOCPostalCode              = META$cor_zip,
-  metadataPOCPrimaryPhone            = META$cor_phone,
-  metadataPOCEmailAddress            = META$cor_email,
-  metadataPOCContactName             = META$cor_name,
-  metadataPOCContactTitle            = META$cor_title,
-  metadataCreationDate               = format(Sys.Date(), "%Y-%m-%d"),
-  studyTitle                         = META$study_title,
-  dataCreationDate                   = META$period_end,
-  NSLNumber                          = META$study_no,
-  PIOrganization                     = META$pi_org,
-  PIStreetAddress                    = META$pi_street,
-  PICity                             = META$pi_city,
-  PIState                            = META$pi_state,
-  PICountry                          = META$pi_country,
-  PIPostalCode                       = META$pi_zip,
-  PIPrimaryPhone                     = "",
-  PIEmailAddress                     = META$pi_email,
-  PIPrimaryContactName               = META$pi_name,
-  PIPrimaryContactTitle              = META$pi_title,
-  PIDepartment                       = "",
-  abstract                           = ABSTRACT,
-  acknowledgement                    = paste(
-    "This work was supported by BOEM ESP under Contract",
-    META$contract_no),
-  BOEMPOCRegionalOrProgramOffice     = META$cor_org,
-  BOEMPOCStreetAddress               = META$cor_street,
-  BOEMPOCCity                        = META$cor_city,
-  BOEMPOCState                       = META$cor_state,
-  BOEMPOCCountry                     = META$cor_country,
-  BOEMPOCPostalCode                  = META$cor_zip,
-  BOEMPOCPrimaryPhone                = META$cor_phone,
-  BOEMPOCEmailAddress                = META$cor_email,
-  BOEMPOCName                        = META$cor_name,
-  BOEMPOCContactTitle                = META$cor_title,
-  themeKeywords                      = paste(
-    "marine sensitivity", "species distribution models",
-    "environmental sensitivity", "extinction risk",
-    "primary productivity", sep = "; "),
-  disciplineKeywords                 = "Marine Biology",
-  placeKeywords                      = paste(
-    "Outer Continental Shelf",
-    "United States Exclusive Economic Zone", sep = "; "),
-  surveyType                         = "modeling; GIS",
-  DataContentSubject                 = paste(
-    "Living Resources>Marine Habitats",
-    "Living Resources>Marine Organisms", sep = "; "),
-  DataContentType                    = "Biota",
-  ISOTopicCategory                   = "biota; oceans",
-  spatialExtentWest                  = META$bbox_w,
-  spatialExtentEast                  = META$bbox_e,
-  spatialExtentSouth                 = META$bbox_s,
-  spatiaExtentNorth                  = META$bbox_n,
-  studyFootprintCreationDate         = format(Sys.Date(), "%Y-%m-%d"),
-  studyFootprintUniqueID             = glue("{META$study_no}-StudyFootprint"),
-  basisOfTemporalExtent              = paste(
-    "Period of performance for study contract", META$contract_no),
-  beginDate                          = META$period_start,
-  endDate                            = META$period_end,
-  finalReportTitle                   = paste(
-    META$study_title, glue("({META$study_no})"), "Final Report"),
-  publicationDate                    = "2025",
-  BOEMPublicationNumber              = META$pub_no,
-  finalReportAuthor                  = META$pi_initials,
-  studyFootprintScope                = "applicable area",
-  studyFootprintMethod               = "GIS-ready boundary",
-  studyFootprintMethodDefinition     = paste(
-    "The study footprint was delineated using BOEM OCS Planning Area",
-    "boundaries as authoritative GIS polygon features."),
-  dataPOCEvaluation                  = paste(
-    "Study footprint verified against BOEM Planning Area boundaries"),
-  evaluationDateAndTime              = paste0(
-    format(Sys.Date(), "%Y-%m-%d"), "T00:00:00"),
-  explanationOfFootprintAcceptance   = paste(
-    "Study footprint matches the union of all 27 BOEM OCS Planning Area",
-    "boundaries used in the sensitivity analysis.")
-)
-
-# read the template sheet to get field names and their row positions
-dd_sheet <- read.xlsx(wb, sheet = "Data Dictionary Template",
-  colNames = FALSE, skipEmptyRows = FALSE)
-
-for (field_name in names(dd_values)) {
-  # use startsWith for matching since some fields have annotation text appended
-  row_idx <- which(startsWith(dd_sheet[[1]], field_name))
-  if (length(row_idx) >= 1) {
-    writeData(wb, sheet = "Data Dictionary Template",
-      x = dd_values[[field_name]],
-      startCol = 2, startRow = row_idx[1] + 1)  # +1 for header row
-  } else {
-    cat(glue("  Warning: field '{field_name}' not found in data dictionary\n"))
-  }
+  if (dir_exists(gdb_path)) dir_delete(gdb_path)
+  st_write(study_area, dsn = gdb_path, layer = "StudyFootprint",
+    driver = "OpenFileGDB", quiet = TRUE)
+  cat("  Created FileGDB:", gdb_path, "\n")
+} else {
+  cat("  Reusing existing FileGDB:", gdb_path,
+      "\n    (set redo_footprint_gdb <- TRUE to regenerate)\n")
 }
 
+# 4b. read authoritative data dictionary values ----
+# the user-curated workbook at DD_VALUES_PATH is the source of truth for all
+# field values used in both the output data dictionary and the metadata XML.
+stopifnot(
+  "DD values file not found" = file_exists(DD_VALUES_PATH))
+
+dd_sheet <- read.xlsx(
+  DD_VALUES_PATH, sheet = "Data Dictionary Template",
+  colNames = FALSE, skipEmptyRows = FALSE)
+
+# strip trailing "--See ... tab--" annotations so keys are plain field names
+clean_key <- function(x) sub("\\s*--.*$", "", trimws(x))
+
+dd_values <- list()
+for (i in seq_len(nrow(dd_sheet))) {
+  key <- clean_key(dd_sheet[i, 1])
+  val <- dd_sheet[i, 2]
+  if (is.na(key) || nchar(key) == 0) next
+  if (is.na(val) || nchar(as.character(val)) == 0) next
+  # skip section header rows (col A is a sentence, not a camelCase fieldname)
+  if (grepl("\\s", key)) next
+  dd_values[[key]] <- as.character(val)
+}
+cat("  Loaded", length(dd_values), "values from",
+    basename(DD_VALUES_PATH), "\n")
+
+# auto-generate the output data dictionary by copying the curated source
 dd_out <- file.path(DIR_OUT, glue("{META$study_no}_DataDictionary.xlsx"))
-saveWorkbook(wb, dd_out, overwrite = TRUE)
+file_copy(DD_VALUES_PATH, dd_out, overwrite = TRUE)
 cat("  Saved data dictionary:", dd_out, "\n")
 
 # 4c. fill metadata XML ----
+# the XML template has placeholder text equal to camelCase field names; we
+# replace them with values from dd_values. xml_ns_strip() does NOT actually
+# rewrite element names from <gco:CharacterString> to <CharacterString>, so
+# we use local-name() predicates to match across the gco/gmd namespaces.
 xml <- read_xml(XML_TPL)
 
-# build replacement map: placeholder -> value
-xml_replacements <- c(
-  # metadata POC
-  "metadataPOCName"                    = META$cor_name,
-  "metadataPOCRegionalOrProgramOffice" = META$cor_org,
-  "metadataPOCContactTitle"            = META$cor_title,
-  "metadataPOCPrimaryPhone"            = META$cor_phone,
-  "metadataPOCStreetAddress"           = META$cor_street,
-  "metadataPOCCity"                    = META$cor_city,
-  "metadataPOCState"                   = META$cor_state,
-  "metadataPOCPostalCode"              = META$cor_zip,
-  "metadataPOCCountry"                 = META$cor_country,
-  "metadataPOCEmailAddress"            = META$cor_email,
-  "metadataCreationDate"               = format(Sys.Date(), "%Y-%m-%d"),
-  # study identification
-  "studyTitle"                         = META$study_title,
-  "dataCreationDate"                   = META$period_end,
-  "NSLYear"                            = "2023",
-  "NSLNumber"                          = META$study_no,
-  # PI
-  "PIName"                             = META$pi_name,
-  "PIPrimaryContactName"               = META$pi_name,
-  "PIOrganization"                     = META$pi_org,
-  "PIPrimaryPhone"                     = "",
-  "PIStreetAddress"                    = META$pi_street,
-  "PICity"                             = META$pi_city,
-  "PIState"                            = META$pi_state,
-  "PIPostalCode"                       = META$pi_zip,
-  "PICountry"                          = META$pi_country,
-  "PIEmailAddress"                     = META$pi_email,
-  # BOEM POC
-  "BOEMPOCName"                        = META$cor_name,
-  "BOEMPOCRegionalOrProgramOffice"     = META$cor_org,
-  "BOEMPOCPrimaryPhone"                = META$cor_phone,
-  "BOEMPOCStreetAddress"               = META$cor_street,
-  "BOEMPOCCity"                        = META$cor_city,
-  "BOEMPOCState"                       = META$cor_state,
-  "BOEMPOCPostalCode"                  = META$cor_zip,
-  "BOEMPOCCountry"                     = META$cor_country,
-  "BOEMPOCEmailAddress"                = META$cor_email,
-  # abstract and content
-  "abstract"                           = ABSTRACT,
-  # spatial extent
-  "spatialExtentWest"                  = META$bbox_w,
-  "spatialExtentEast"                  = META$bbox_e,
-  "spatialExtentSouth"                 = META$bbox_s,
-  "spatialExtentNorth"                 = META$bbox_n,
-  # temporal extent
-  "beginDate"                          = META$period_start,
-  "endDate"                            = META$period_end,
-  "basisOfTemporalExtent"              = paste(
-    "Period of performance for study contract", META$contract_no),
-  # footprint metadata
-  "studyFootprintCreationDate"         = format(Sys.Date(), "%Y-%m-%d"),
-  "studyFootprintUniqueID"             = glue("{META$study_no}-StudyFootprint"),
-  "studyFootprintScope"                = "applicable area",
-  "studyFootprintMethod"               = "GIS-ready boundary",
-  "studyFootprintMethodDescription"    = paste(
-    "The study footprint was delineated using BOEM OCS Planning Area",
-    "boundaries as authoritative GIS polygon features."),
-  "dataPOCEvaluation"                  = paste(
-    "Study footprint verified against BOEM Planning Area boundaries"),
-  "evaluationDateAndTime"              = paste0(
-    format(Sys.Date(), "%Y-%m-%d"), "T00:00:00"),
-  "explanationOfFootprintAcceptance"   = paste(
-    "Study footprint matches BOEM OCS Planning Area boundaries"),
-  # publication
-  "finalReportTitle"                   = paste(
-    META$study_title, glue("({META$study_no})"), "Final Report"),
-  "publicationDate"                    = "2025",
-  "BOEMPublicationNumber"              = META$pub_no
-)
+# DD field name -> XML placeholder name (only for the few mismatches)
+dd_to_xml <- c(
+  metadataPOCContactName         = "metadataPOCName",
+  studyFootprintMethodDefinition = "studyFootprintMethodDescription",
+  DataContentType                = "dataContentType",
+  spatiaExtentNorth              = "spatialExtentNorth")
 
-# strip namespaces for simpler XPath
-xml_ns_strip(xml)
+# build (xml_placeholder -> value) lookup, applying any DD->XML aliases
+xml_replacements <- list()
+for (dd_key in names(dd_values)) {
+  xml_key <- if (dd_key %in% names(dd_to_xml)) dd_to_xml[[dd_key]] else dd_key
+  xml_replacements[[xml_key]] <- dd_values[[dd_key]]
+}
+# the XML PIName placeholder takes the PIPrimaryContactName value
+if (!"PIName" %in% names(xml_replacements) &&
+    !is.null(dd_values$PIPrimaryContactName)) {
+  xml_replacements[["PIName"]] <- dd_values$PIPrimaryContactName
+}
 
-# replace placeholder text in all text nodes
+# replace placeholders using local-name() (works across gco:/gmd: namespaces)
+n_replaced <- 0
 for (placeholder in names(xml_replacements)) {
   value <- xml_replacements[[placeholder]]
-
-  # find in CharacterString elements
-  nodes <- xml_find_all(xml, glue(
-    ".//CharacterString[text()='{placeholder}']"))
-  for (node in nodes) xml_set_text(node, value)
-
-  # find in Date elements
-  nodes <- xml_find_all(xml, glue(
-    ".//Date[text()='{placeholder}']"))
-  for (node in nodes) xml_set_text(node, value)
-
-  # find in DateTime elements
-  nodes <- xml_find_all(xml, glue(
-    ".//DateTime[text()='{placeholder}']"))
-  for (node in nodes) xml_set_text(node, value)
-
-  # find in Decimal elements
-  nodes <- xml_find_all(xml, glue(
-    ".//Decimal[text()='{placeholder}']"))
-  for (node in nodes) xml_set_text(node, value)
-
-  # find in description elements
-  nodes <- xml_find_all(xml, glue(
-    ".//description[text()='{placeholder}']"))
-  for (node in nodes) xml_set_text(node, value)
-
-  # find in beginPosition / endPosition (GML temporal)
-  nodes <- xml_find_all(xml, glue(
-    ".//beginPosition[text()='{placeholder}']"))
-  for (node in nodes) xml_set_text(node, value)
-  nodes <- xml_find_all(xml, glue(
-    ".//endPosition[text()='{placeholder}']"))
-  for (node in nodes) xml_set_text(node, value)
+  xpath <- glue(
+    ".//*[(local-name()='CharacterString' or local-name()='Date' or ",
+    "local-name()='DateTime' or local-name()='Decimal' or ",
+    "local-name()='description' or local-name()='beginPosition' or ",
+    "local-name()='endPosition') and text()='{placeholder}']")
+  nodes <- xml_find_all(xml, xpath)
+  for (node in nodes) {
+    xml_set_text(node, value)
+    n_replaced <- n_replaced + 1
+  }
 }
+cat("  Replaced", n_replaced, "XML placeholders\n")
 
 # also replace the obligation/contract number pattern
 credit_nodes <- xml_find_all(xml,
-  ".//CharacterString[contains(text(), 'MXXYYXXXXX')]")
+  ".//*[local-name()='CharacterString' and contains(text(), 'MXXYYXXXXX')]")
 for (node in credit_nodes) {
   txt <- xml_text(node)
   xml_set_text(node, gsub("MXXYYXXXXX", META$contract_no, txt))
@@ -733,25 +592,27 @@ cat("  Saved metadata XML:", xml_out, "\n")
 
 # 4d. package as ZIP ----
 zip_file <- file.path(DIR_OUT, glue("{META$study_no}_StudyFootprint.zip"))
-if (file_exists(zip_file)) file_delete(zip_file)
 
-# get relative paths for zip
-old_wd <- getwd()
-setwd(DIR_OUT)
+if (skip_zip) {
+  cat("  Skipping StudyFootprint zip",
+      "(set skip_zip <- FALSE to build it).\n")
+  if (file_exists(zip_file)) file_delete(zip_file)
+} else {
+  if (file_exists(zip_file)) file_delete(zip_file)
 
-zip_files <- c(
-  basename(gdb_path),
-  basename(dd_out),
-  basename(xml_out))
+  # get relative paths for zip
+  old_wd <- getwd()
+  setwd(DIR_OUT)
 
-# for GDB (directory), need to include all files within
-gdb_files <- dir_ls(basename(gdb_path), recurse = TRUE)
-zip_inputs <- c(gdb_files, basename(dd_out), basename(xml_out))
+  # for GDB (directory), need to include all files within
+  gdb_files  <- dir_ls(basename(gdb_path), recurse = TRUE)
+  zip_inputs <- c(gdb_files, basename(dd_out), basename(xml_out))
 
-zip(basename(zip_file), zip_inputs)
-setwd(old_wd)
+  zip(basename(zip_file), zip_inputs)
+  setwd(old_wd)
 
-cat("  Saved footprint package:", zip_file, "\n")
+  cat("  Saved footprint package:", zip_file, "\n")
+}
 
 # =============================================================================
 # PHASE 5: QA checklist summary
@@ -791,6 +652,13 @@ IMPORTANT: After opening in Word, press Ctrl+A then F9 to update all fields
 
 cat("\n=== Build complete ===\n")
 cat("Output files:\n")
-cat("  Report DOCX:", out_docx, "\n")
-cat("  Report PDF: ", out_pdf, "\n")
-cat("  Footprint:  ", zip_file, "\n")
+cat("  Report DOCX:    ", out_docx, "\n")
+cat("  Report PDF:     ", out_pdf, "\n")
+cat("  Data Dictionary:", dd_out, "\n")
+cat("  Metadata XML:   ", xml_out, "\n")
+cat("  Footprint GDB:  ", gdb_path, "\n")
+if (skip_zip) {
+  cat("  Footprint ZIP:   skipped (skip_zip <- TRUE)\n")
+} else {
+  cat("  Footprint ZIP:  ", zip_file, "\n")
+}
