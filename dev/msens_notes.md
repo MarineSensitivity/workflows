@@ -1,4 +1,4 @@
-## 2026-03-? TODO:
+## TODO
 
 - [ ] update docs to v4 with new SWOT-DPS turtle dataset
 - [ ] show metadata per dataset with citations in apps and clearly in docs
@@ -19,6 +19,744 @@
 - [ ] Also consider updating the apps (@../apps/mapgl.R, @../apps/mapsp.R) to using the new `metric.metric_title|metric_abbrev` where applicable (moving away from `layers_v3.csv`)
 
 - Migrate to hexagons
+
+## 2026-04-09 final-report_2025
+
+Let's fix the following in `final-report_2025.qmd`:
+
+- The boem2018 reference is not found. That should be morandi2018 (found also in `@../docs/references.bib`
+
+## 2026-04-08 server full 
+
+It looks like the server disk is full.                                                                                                  
+
+```
+ubuntu@msens1:~$ df -H                                                                                                                    
+Filesystem      Size  Used Avail Use% Mounted on                                                                                          
+/dev/root        21G  6.8G   14G  33% /                                                                                                   
+tmpfs           8.4G     0  8.4G   0% /dev/shm                                                                                            
+tmpfs           3.4G  1.9M  3.4G   1% /run                                                                                                
+tmpfs           5.3M     0  5.3M   0% /run/lock                                                                                           
+/dev/xvda15     110M  6.4M  104M   6% /boot/efi                                                                                           
+/dev/xvdb       215G  212G  3.3G  99% /share                                                                                              
+tmpfs           1.7G  4.1k  1.7G   1% /run/user/1000                                                                                      
+```
+
+I have a shell shortcut `ssh-msens` to log onto the server. Can you help me assess the culprit files and a path forward to clear the files, 
+ prevent future inflation of files, and/or necesary expansion of the hard drive. The server setup is in @../server
+
+ ←  ☐ Old versions  ☐ GBIF zip  ✔ Submit  →
+
+**Old versions** Which old sdm.duckdb versions in /share/data/big/ can be safely deleted? Currently v1 through v6 exist (each 2-3.3 GB). The v1 apps are
+archived at app.marinesensitivity.org/mapgl_v1 - do they still need the v1 data on this server?
+
+  1. Keep only v5 + v6 (Recommended)
+     Delete v1, v2, v3, v4, v4b (~15 GB freed). The archived v1 app URLs would need their own data source or stop working.
+  2. Keep v1 + v5 + v6
+     Delete v2, v3, v4, v4b (~12 GB freed). Preserves data for the archived v1 app.
+  3. Keep all, just cleanup other areas
+     Don't touch versioned data. Focus on backups, GBIF zip, and old snapshots instead.
+❯ 4. Keep v1 + v5 + v6. Look to clean up others like backups, GBIF zip, and old snapshots 
+
+**GBIF zip** The GBIF download is 8.6 GB (zip) + 3.1 GB (extracted). Can the zip be deleted since the extracted data exists?                         
+                                                                                               
+  1. Delete the zip
+     Keep the extracted folder, remove the 8.6 GB zip file.
+❯ 2. Delete both                                                                                                          
+     Remove the entire 12 GB gbifdownload directory if it was a one-time import.
+  3. Keep both                                                                     
+     Don't touch GBIF data.
+
+⏺ Updated plan                          
+  ⎿  /plan to preview
+
+ Ready to code?                                                                                                                            
+                                                                                                                                           
+ Here is Claude's plan:                                                                                                                    
+
+ **Plan: Server Disk Cleanup (/share at 99%)**
+
+ Context
+
+ The `/share` volume on msens1 (AWS, /dev/xvdb) is 200GB with 197GB used (99%). This blocks normal operations. The goal is to free
+ significant space immediately, then prevent future recurrence.
+
+ Disk Usage Breakdown
+
+ ┌───────────────────────────┬────────┬───────────────────────────────────────────────────┐
+ │           Path            │  Size  │                    Description                    │
+ ├───────────────────────────┼────────┼───────────────────────────────────────────────────┤
+ │ /share/data/big/          │ 21 GB  │ 7 versions of sdm.duckdb (v1–v6, each 2–3.3 GB)   │
+ ├───────────────────────────┼────────┼───────────────────────────────────────────────────┤
+ │ /share/postgis_backups/   │ 24 GB  │ 8 × 2.9 GB compressed DB backups                  │
+ ├───────────────────────────┼────────┼───────────────────────────────────────────────────┤
+ │ /share/data/derived/      │ 14 GB  │ Old DuckDB snapshots + aquamaps data              │
+ ├───────────────────────────┼────────┼───────────────────────────────────────────────────┤
+ │ /share/data/gbifdownload/ │ 12 GB  │ One GBIF download (8.6 GB zip + 3.1 GB extracted) │
+ ├───────────────────────────┼────────┼───────────────────────────────────────────────────┤
+ │ /share/github/workflows/  │ 3.7 GB │ Workflow data + rendered output                   │
+ ├───────────────────────────┼────────┼───────────────────────────────────────────────────┤
+ │ /share/data/raw/          │ 1.3 GB │ Raw source data                                   │
+ ├───────────────────────────┼────────┼───────────────────────────────────────────────────┤
+ │ /share/data/ricei/        │ 2 GB   │ Rice's whale data                                 │
+ ├───────────────────────────┼────────┼───────────────────────────────────────────────────┤
+ │ Docker images (on root)   │ ~14 GB │ rstudio 5.9 GB, plumber 4.9 GB, etc.              │
+ └───────────────────────────┴────────┴───────────────────────────────────────────────────┘
+
+ Step 1: Immediate Cleanup (~60 GB recoverable)
+
+ Run via ssh-msens:
+
+ ~~1a. sdm.duckdb versions — KEEP ALL~~
+
+ All versions in /share/data/big/ (21 GB) are retained. Enough savings from other areas.
+
+ 1b. Remove old DuckDB snapshots in derived/ (~6 GB)
+
+ These are dated snapshots superseded by the versioned copies in big/:
+ rm /share/data/derived/sdm_2026-01-13.duckdb
+ rm /share/data/derived/sdm_2026-01-23.duckdb
+ rm /share/data/derived/sdm_v3_2026-02-12.duckdb
+ Savings: ~6 GB
+
+ 1c. Remove entire GBIF download (~12 GB)
+
+ This was a one-time import; both zip and extracted data can go:
+ rm -rf /share/data/gbifdownload
+ Savings: ~12 GB
+
+ 1d. Reduce backup retention (~15 GB)
+
+ Currently 4 daily + 2 weekly + 2 monthly = 8 × 2.9 GB = 23 GB. Keep only 2 daily + 1 weekly + 1 monthly:
+ ```bash
+ # remove excess backups
+ cd /share/postgis_backups
+ rm daily/msens-20260404.sql.gz daily/msens-20260405.sql.gz
+ rm weekly/msens-202612.sql.gz
+ rm monthly/msens-202601.sql.gz
+ ```
+ Savings: ~12 GB
+
+ 1e. Clean derived/aquamaps if redundant (~4.6 GB)
+
+ Check if /share/data/derived/aquamaps/ (4.6 GB) is still needed or superseded by the DuckDB:
+ du -sh /share/data/derived/aquamaps/
+ ls /share/data/derived/aquamaps/
+ If these are intermediate files already ingested into sdm.duckdb, remove them.
+ Potential savings: ~4.6 GB
+
+ 1f. Prune unused Docker images
+
+ docker image prune -a --filter "until=720h"  # remove images >30 days unused
+ Potential savings: varies (on root, not /share)
+
+ Step 2: Prevent Future Inflation
+
+ 2a. Reduce backup retention in docker-compose.yml
+
+ Edit /share/github/MarineSensitivity/server/docker-compose.yml:
+ ```yaml
+ pgbkups:
+   environment:
+     - BACKUP_KEEP_DAYS=2    # was 2, keep as-is
+     - BACKUP_KEEP_WEEKS=1   # reduce from 2 to 1
+     - BACKUP_KEEP_MONTHS=2  # reduce from 4 to 2
+ ```
+ This saves ~6 GB ongoing (from 8 to 5 backups × 2.9 GB).
+
+ 2b. Add a cleanup script
+
+ Create `/share/github/MarineSensitivity/server/cleanup.sh` that:
+ - Reports current disk usage
+ - Lists old data versions for review
+ - Removes DuckDB snapshots older than 60 days
+ - Prunes Docker images
+
+ 2c. Add disk monitoring to heartbeat
+
+ The existing prod/ping.sh writes heartbeat.json every 5 min. Add disk usage to it so it can be monitored.
+
+ Step 3: Volume Expansion (if needed)
+
+ If cleanup isn't sufficient or the data continues to grow:
+ - AWS EBS volumes can be expanded online without downtime
+ - Expand /dev/xvdb from 200 GB to 300–400 GB via AWS Console
+ - Then resize the filesystem: sudo resize2fs /dev/xvdb
+ - No reboot required
+
+ Verification
+
+ After cleanup:
+ ```bash
+ df -h /share
+ # should show ~60 GB freed (from 3 GB to ~60 GB available)
+ ```
+
+ Critical Files
+
+ - /Users/bbest/Github/MarineSensitivity/server/docker-compose.yml — backup retention settings
+ - /Users/bbest/Github/MarineSensitivity/server/prod/sync-pull.sh — data sync (what gets pulled)
+ - /Users/bbest/Github/MarineSensitivity/server/prod/ping.sh — heartbeat monitoring
+
+⏺ Here's a summary of what was done:                                                                                                       
+                                                                  
+  Disk freed: ~30 GB (99% → 85%)                                                                                                           
+   
+  ┌────────────────────────────────────────────┬────────┐                                                                                  
+  │                   Action                   │ Freed  │         
+  ├────────────────────────────────────────────┼────────┤
+  │ Removed 3 old DuckDB snapshots in derived/ │ ~6 GB  │
+  ├────────────────────────────────────────────┼────────┤
+  │ Removed GBIF download (zip + extracted)    │ ~12 GB │                                                                                  
+  ├────────────────────────────────────────────┼────────┤                                                                                  
+  │ Removed 4 excess backup files              │ ~12 GB │                                                                                  
+  ├────────────────────────────────────────────┼────────┤                                                                                  
+  │ Removed aquamaps zip                       │ ~1 GB  │         
+  └────────────────────────────────────────────┴────────┘                                                                                  
+                                                                  
+  Prevention: Reduced backup retention in `docker-compose.yml`:                                                                              
+  - BACKUP_KEEP_WEEKS: 2 → 1
+  - BACKUP_KEEP_MONTHS: 4 → 2                                                                                                              
+  - This prevents ~9 GB of backup accumulation going forward      
+                                                                                                                                           
+  The `docker-compose.yml` change needs to be committed and the `pgbkups` container restarted on the server for the new retention to take      
+  effect. Want me to commit this change and deploy it?
+
+Yes!
+
+⏺ Done. Committed, pushed, pulled on server, and pgbkups container restarted with the new retention policy.                                
+                                                                                                                                         
+  Final state: /share at 85% with 31 GB free (was 99% / 3 GB free).
+
+## 2026-04-07 final-report_2025.docx
+
+Help me produce the 2025 final report from version 1 (`v1`) of the Marine Sensitivity Toolkit. The end goal is to generate the following products:
+
+- **Final report** Word document + PDF that uses the 2025 ESP Report Template
+- **ESP Study Footprint** using the template + data dictionary Excel spreadsheet + metadata XML file
+
+There are several source materials to draw from:
+
+- **Final report** 
+  * content:
+    - `@final-report_2025.qmd` and its rendered `@./_output/final-report_2025.docx`
+    - `@~/My Drive/projects/msens/docs/2025 final report/final-report_2025_TPW_BDB-2025-11-19.docx`
+    - `@../docs/` (more recent documentation going up to latest v6)      
+  * template:
+    - `@~/My Drive/projects/msens/docs/2025 final report/specs/ESP Report Template 2025_1.docx`
+    - `@~/My Drive/projects/msens/docs/2025 final report/specs/ESP Report Checklist 2025.pdf`
+    
+- **ESP Study Footprint**
+  * content: `@~/My Drive/projects/msens/data/derived/v1/ply_planareas_2025.gpkg`
+  * template:
+    - `@~/My Drive/projects/msens/docs/2025 final report/specs/ESP Report and Footprint Specifications _ Bureau of Ocean Energy Management.pdf`
+    - `@~/My Drive/projects/msens/docs/2025 final report/specs/footprint/ESPISDataDictionary_2019.xlsx`
+    - `@~/My Drive/projects/msens/docs/2025 final report/specs/footprint/ESPISMetadata_2019.xml`
+    - `@~/My Drive/projects/msens/docs/2025 final report/specs/footprint/StandardFootprints.gdb`
+    
+I have also installed the Google Workspace CLI (`gws` at `/opt/homebrew/bin/gws`) to facilitate interactions with Google Workspace services. Hopefully you have full capabilities to programmatically edit Microsoft Word docs and Excel spreadsheets.
+
+←  ☐ Content  ☐ Footprint  ☐ Metadata  ☐ Approach  ✔ Submit  →
+
+**Content** The QMD has placeholder sections for Objectives, Study Products, and Map of Study Area. The reviewed draft (TPW_BDB-2025-11-19.docx) also
+has 14 reviewer comments. How should we handle content completeness?
+
+  1. Use QMD as-is
+     Keep the current QMD content, including placeholders. Focus on formatting and template compliance rather than new content.
+❯ 2. Fill placeholders + address comments
+     Fill in Objectives, Study Products, Map of Study Area sections and address the 14 reviewer comments from the TPW draft.
+  3. Fill placeholders only
+     Fill in the placeholder sections drawing from docs/ content but don't address reviewer comments.
+
+**Footprint** The ESP footprint template requires an ArcGIS geodatabase (.gdb). We have a GeoPackage (.gpkg). R's sf package can write shapefiles but not .gdb natively. What format should we target?                    
+
+  1. Shapefile (.shp)
+     Widely compatible alternative to .gdb. Can be created with R sf. May need COR approval for deviation from template.       
+  2. GeoPackage (.gpkg)                  
+     Modern OGC standard. Already have the data in this format. May need COR approval for deviation.                        
+❯ 3. ESRI GDB via GDAL     
+     Attempt to write .gdb using GDAL's OpenFileGDB driver (available in recent GDAL/sf). Matches template exactly.
+
+**Metadata** For the metadata XML and title page, I'll need study-specific details. Do you have the contract number (NT-23-03?), PI name, BOEM COR/PO name, and other admin details ready, or should I use placeholders?  
+
+  1. Use placeholders
+     Insert placeholder values (e.g., [CONTRACT NUMBER], [PI NAME]) for you to fill in later.                                  
+  2. I'll provide details now            
+     I'll type the contract number, PI, COR, dates, and other admin fields in my next message.                              
+❯ 3. Extract these metadata from the contract here: `@~/My Drive/contracts/msens/D01-140M0123P0018-FE.pdf`
+
+**Approach** What's the primary approach for building the final DOCX? Quarto renders body content well but can't populate front/back covers, title page table, or technical summary from the ESP template.                 
+
+  1. Quarto + R officer post-process (Recommended)
+     Render body from QMD, then use R officer package to merge into the full ESP template with populated front matter, title page, and 
+     technical summary.                  
+  2. Pure R officer                                                                                                         
+     Build the entire document programmatically in R using officer, inserting content section by section. More control but more work.
+  3. Quarto only + manual fixes                                                                                                           
+     Render from Quarto and document the manual fixes needed in Word for front matter, covers, etc.                                       
+❯ 4. Yes to Quarto + R officer post-process. Modify `@final-report_2025.qmd` as the authoritative body QMD.
+
+The notebook `@show_study-area.qmd` starts with the original 27 Planning Areas of interest for this 2025 final report, which are also located at `@~/My Drive/projects/msens/data/derived/v1/ply_planareas_2025.gpkg`, but then the notebook principally extends these to the nearshore environment, which will get used in future, NOT for this 2025 final report.
+
+This report should reference the following links:
+- archived applications:
+  - https://app.marinesensitivity.org/mapgl_v1: composite scores (v1)
+  - https://app.marinesensitivity.org/mapsp_v1: species distributions (v1)
+- latest:
+  - https://marinesensitivity.org: landing page
+  - https://app.marinesensitivity.org/mapgl: composite scores (latest)
+  - https://app.marinesensitivity.org/mapsp: species distributions (latest)
+  - https://marinesensitivity.org/docs/: documentation
+
+Issues like the Pacific Walrus distribution into the Gulf of America got subsequently addressed by masking the AquaMaps distributions to the IUCN RedList global range maps.
+
+Let's also use this figure for the final report document cover image:
+- `@../docs/figures/overview-methods.png` (or `@../docs/figures/overview-methods.svg`)
+
+⏺ Now let me submit the updated plan for approval.                                                                                        
+                                                        
+ Ready to code?                                         
+                                                                                                                                          
+ Here is Claude's plan:                                 
+
+ **Plan: BOEM 2025 Final Report (NT-23-03) Production**
+
+ Context
+
+ BOEM contract 140M0123P0018 requires delivery of a Final Report for study NT-23-03 "Environmental Sensitivity Model" (Phase 1, v1). The
+ report must conform to the 2025 ESP Report Template and 24-item checklist. Three deliverables are needed: (1) Final Report DOCX + PDF,
+ (2) ESP Study Footprint geodatabase + data dictionary + metadata XML. The QMD body content exists but needs reviewer comment fixes and
+ placeholder completion. The approach is Quarto render + R officer post-processing to merge into the full ESP template.
+
+ Key context:
+ - The study footprint uses the original 27 OCS Planning Areas from ply_planareas_2025.gpkg (NOT the extended-to-shore version from
+ show_study-area.qmd)
+ - The Pacific Walrus distribution issue was already resolved by masking AquaMaps distributions to IUCN RedList global range maps
+ - Cover image: ../docs/figures/overview-methods.png (methodology overview diagram)
+ - App URLs:
+   - Archived v1: https://app.marinesensitivity.org/mapgl_v1 (scores), https://app.marinesensitivity.org/mapsp_v1 (species)
+   - Latest: https://app.marinesensitivity.org/mapgl, https://app.marinesensitivity.org/mapsp
+   - Landing: https://marinesensitivity.org
+   - Docs: https://marinesensitivity.org/docs/
+
+ ---
+ Step 1: QMD Content Edits
+
+ Edit /Users/bbest/Github/MarineSensitivity/workflows/final-report_2025.qmd to address 14 reviewer comments (Timothy White, 2025-11-05)
+ and fill placeholder sections:
+
+ 1a. Fill # Objectives (line 161, currently empty)
+
+ Insert 4 objectives from SOW section 2.2:
+ - Develop/recommend options for replacing/supplementing BOEM ESI methodologies
+ - Analyze relative environmental sensitivity in the 26 OCS planning areas
+ - Produce scientifically valid, transparent, repeatable results; post reproducible R code to GitHub
+ - Create multi-use decision support dashboard and interactive application
+
+ 1b. Fill # Study Products (line 539-541, currently [text])
+
+ List deliverables: Final Report (DOCX/PDF), ESP Study Footprint (GDB/XLSX/XML), interactive web apps (mapgl, mapsp), GitHub repos, msens
+  R package, API endpoints, project documentation site.
+
+ 1c. Fill # Map of Study Area (line 547-549)
+
+ Reference the existing study area map from show_study-area.qmd output or embed a PNG of all 27 Planning Areas. Use
+ figs/study-area-map.png (generate if needed) with @fig-study-area cross-ref.
+
+ 1d. Address remaining reviewer comments in QMD body
+
+ - Comment 2/3/4/7/9: Expand "Spatial Aggregation and Rescaling" section (~line 246) with a worked numeric example of
+ pixel→ecoregion→Planning Area aggregation, a conceptual flow diagram, and a table showing which Planning Areas belong to each ecoregion.
+ - Comment 5: Strengthen "Reproducible Infrastructure" section (~line 388) with explicit EO 14303 framing and GitHub repo links.
+ - Comment 6: Convert bare .qmd filenames to active hyperlinks:
+ [ingest_aquamaps_to_sdm_duckdb.qmd](https://marinesensitivity.org/workflows/ingest_aquamaps_to_sdm_duckdb.html).
+ - Comment 8: In Data Quality section (~line 253), note that the Pacific Walrus and similar issues were addressed by masking AquaMaps
+ distributions to IUCN RedList global range maps. Update language to reflect this fix rather than flagging for future revision.
+ - Comment 10: In flower plot section (~line 352), add link to archived v1 app (https://app.marinesensitivity.org/mapgl_v1) and explain
+ petal length = component score, center = overall score.
+ - Comment 11: Fix broken link at line ~383. Update all app URLs throughout the QMD to use the correct archived v1 URLs
+ (app.marinesensitivity.org/mapgl_v1, app.marinesensitivity.org/mapsp_v1) for screenshots/references from the v1 report, and reference
+ the latest URLs where appropriate.
+ - Comment 12: Add caveat in Conclusions that MST is a Phase 1 deliverable; analyses continue to be refined.
+ - Comment 13: Strengthen lease area identification text (~line 479) emphasizing low-sensitivity spectrum.
+ - Comment 14: Trim Next Steps section to a brief forward-looking paragraph; remove detailed Phase 2 technical plans.
+
+ 1e. Remove "DRAFT" from title
+
+ Change YAML title: from "BOEM Marine Sensitivity Toolkit - DRAFT Final Report, 2025" to "Environmental Sensitivity Model (NT-23-03)".
+
+ 1f. Add cover image to YAML or front matter
+
+ Use ../docs/figures/overview-methods.png as the optional front cover image in the ESP template (element 5: [insert optional image]).
+
+ ---
+ Step 2: Create Build Script
+
+ Create /Users/bbest/Github/MarineSensitivity/workflows/final-report_2025_build.R
+
+ This R script orchestrates the entire build. Sections:
+
+ 2a. Setup
+
+ ```r
+ librarian::shelf(
+   officer, xml2, sf, openxlsx, glue, fs, dplyr, uuid,
+   quiet = TRUE)
+
+ Define paths and contract metadata as constants:
+ - DIR_SPECS  <- "~/My Drive/projects/msens/docs/2025 final report/specs"
+ - DIR_OUT    <- "_output"
+ - TPL_FULL   <- "libs/ESP Report Template 2025_1.docx" (elements 1-138)
+ - GPKG_PATH  <- "~/My Drive/projects/msens/data/derived/v1/ply_planareas_2025.gpkg"
+ ```
+
+ 2b. Render body-only DOCX from QMD
+
+ ```r
+ system("quarto render final-report_2025.qmd --to docx --metadata toc:false --metadata lof:false --metadata lot:false")
+ file_rename("_output/final-report_2025.docx", "_output/final-report_2025_body.docx")
+ ```
+
+ The --metadata toc:false lof:false lot:false flags suppress Quarto's TOC/LOF/LOT since the ESP template provides its own.
+
+ 2c. Merge body into full ESP template using officer
+
+ Strategy: Open the full template, remove sample body content (elements 48-74: from "Heading 1 [Style Definitions Guidance]" through
+ "Appendix A: Title"), then insert the Quarto-rendered body DOCX at that position.
+
+ Template structure (key elements):
+  1-5:   Front cover (pub number, title, date, image)
+  6-10:  Publication Info, Contributors, Acknowledgments
+ 11-12:  Technical Summary heading
+ 13-30:  Technical Summary fields (Abstract, Background, Objectives, Methods, Results, Conclusions, Study Products, Additional Products,
+ Map of Study Area)
+ 31-40:  Contents/TOC field codes, LOF, LOT, Abbreviations TOC entries
+ 41-47:  List of Figures heading, LOF field, List of Tables heading, LOT field, List of Abbreviations heading, BOEM abbreviation entry
+ 48-74:  *** SAMPLE BODY CONTENT (to be replaced) ***
+ 75-82:  Back cover (DOI statements)
+ 83-138: Title page table cells
+
+ Steps:
+ 1. read_docx(TPL_FULL)
+ 2. Loop cursor_reach() + body_remove() to delete elements 48-74 (sample headings, paragraphs, sample table, sample figure)
+ 3. Position cursor after element 47 (last abbreviation entry)
+ 4. body_add_docx(src = "_output/final-report_2025_body.docx") to insert body
+
+ 2d. Fill title page table (elements 83-138)
+
+ Use body_replace_all_text() for unique placeholder strings, or direct XML manipulation for table cells:
+
+ ┌────────────────────────────────┬──────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │      Template placeholder      │                                              Value                                               │
+ ├────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ BOEM 20xx-xxx                  │ BOEM 2025-XXX (TBD from BOEM)                                                                    │
+ ├────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ [insert optional image]        │ Insert ../docs/figures/overview-methods.png                                                      │
+ │ (element 5)                    │                                                                                                  │
+ ├────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ Month Year (element 4)         │ April 2025                                                                                       │
+ ├────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ [month year] (element 85)      │ April 2025                                                                                       │
+ ├────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ Title (element 83 context)     │ Marine Sensitivity Toolkit
+ ├────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ Authors (element 86 context)   │ Best BB                                                                                          │
+ ├────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ Agreement/Contract (element 87 │ 140M0123P0018                                                                                    │
+ │  context)                      │                                                                                                  │
+ ├────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ [organization(s) and           │ EcoQuants LLC\n211 W Gutierrez St\nSanta Barbara CA 93101-3487                                   │
+ │ address(es)]                   │                                                                                                  │
+ ├────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ Published by city (element 93) │ Sterling, VA                                                                                     │
+ ├────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ Citation (element 98)          │ Best BB, White TP. 2025. Marine Sensitivity Toolkit. Sterling (VA): US Department of the         │
+ │                                │ Interior, Bureau of Ocean Energy Management. xx p. Report No.: OCS Study BOEM 2025-XXX. Contract │
+ │                                │ No.:140M0123P0018.                                                                               │
+ ├────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ Disclaimer (element 107)       │ Use contracts disclaimer text                                                                    │
+ ├────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ Keywords (element 113 context) │ marine sensitivity, species distribution models, environmental sensitivity index, OCS, BOEM,     │
+ │                                │ extinction risk, primary productivity                                                            │
+ └────────────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+ 2e. Fill Technical Summary (elements 13-30)
+
+ Replace each [text] or [Insert text...] placeholder with condensed content (total 1.5-3 pages):
+ - Abstract: 1 paragraph from QMD Abstract
+ - Background: 1 paragraph from QMD Background
+ - Objectives: 4 bullet points from Step 1a
+ - Methods: 1 paragraph summarizing the MST framework
+ - Results: 1 paragraph on species counts, maps, apps
+ - Conclusions: 1 paragraph on EO 14303 alignment and FAIR principles
+ - Study Products: deliverables list
+ - Map of Study Area: reference to figure in report body
+
+ 2f. Fill List of Abbreviations (element 46-47)
+
+ Add ~20 abbreviation entries using body_add_par() with style "Acronym List":
+ BOEM, COG, ESA, ESP, FAIR, FWS, GBIF, IUCN, MST, NMFS, NPP, OBIS, OCS, OCSLA, RESA, STAC, VGPM, WoRMS, etc.
+
+ 2g. Figure compliance (Section 508)
+
+ For each image in the document XML:
+ - Set alt text via wp:docPr description attribute
+ - Ensure inline wrapping (wp:inline not wp:anchor)
+ - Add border if missing
+
+ 2h. Save final DOCX
+
+ print(doc, target = file.path(DIR_OUT, "BOEM_2025-XXX_FinRpt.docx"))
+
+ ---
+ Step 3: PDF Conversion
+
+ Convert the final DOCX to PDF using Microsoft Word via AppleScript:
+
+ ```r
+ system('osascript -e \'
+   tell application "Microsoft Word"
+     open POSIX file "/path/to/BOEM_2025-XXX_FinRpt.docx"
+     save as active document file name POSIX file "/path/to/BOEM_2025-XXX_FinRpt.pdf" file format format PDF
+     close active document saving no
+   end tell
+ \'')
+ ```
+
+ Fallback: quarto render final-report_2025.qmd --to pdf
+
+ ---
+ Step 4: ESP Study Footprint Package
+
+ 4a. Convert GeoPackage to ESRI FileGDB
+
+ Source: ~/My Drive/projects/msens/data/derived/v1/ply_planareas_2025.gpkg (36 features, WGS 84)
+
+ ```r
+ pa <- st_read(GPKG_PATH)
+ # dissolve to single study area polygon
+ study_area <- pa |>
+   st_union() |>
+   st_sf() |>
+   mutate(
+     FootPrintID   = 1L,
+     Region        = "National",
+     StudiesID     = "NT-23-03",
+     DateCompleted = "2025-09-24",
+     Method        = "GIS-ready boundary")
+ st_write(study_area, file.path(DIR_OUT, "NT-23-03_StudyFootprint.gdb"),
+   layer = "StudyFootprint", driver = "OpenFileGDB")
+ ```
+
+ Confirmed: GDAL 3.8.5, OpenFileGDB driver write=TRUE.
+
+ 4b. Fill Data Dictionary XLSX
+
+ Template: specs/footprint/ESPISDataDictionary_2019.xlsx → "Data Dictionary Template" sheet, column B (PUT.YOUR.INFO.IN.THIS.COLUMN!!)
+
+ 67 rows of metadata fields to populate. Key values:
+ - metadataFileIdentifier: generate UUID
+ - metadataPOC*: Stephanie Brock, BOEM ESP, Sterling VA
+ - study*: "Environmental Sensitivity Model", NT-23-03
+ - PI*: Ben Best, EcoQuants LLC, Santa Barbara CA
+ - BOEMPOC*: Stephanie Brock, BOEM ESP
+ - abstract: condensed MST description
+ - spatial extent: W=-180, E=180, S=-17.555, N=82.477
+ - temporal: 2023-09-25 to 2025-09-24
+ - keywords: marine sensitivity, species distribution models, etc.
+ - footprint scope: "applicable area"
+ - footprint method: "GIS-ready boundary"
+
+ ```r
+ wb <- loadWorkbook(file.path(DIR_SPECS, "footprint/ESPISDataDictionary_2019.xlsx"))
+ # write values to column B of "Data Dictionary Template" sheet
+ # ... (row-by-row using writeData)
+ saveWorkbook(wb, file.path(DIR_OUT, "NT-23-03_DataDictionary.xlsx"), overwrite = TRUE)
+ ```
+
+ 4c. Fill Metadata XML
+
+ Template: specs/footprint/studyTitle-(1).xml (858 lines, ISO 19115)
+
+ Use xml2::read_xml() then find-and-replace ~40 placeholder strings (e.g., metadataPOCName → Stephanie Brock, studyTitle → Environmental
+ Sensitivity Model, etc.). Handle namespaces with xml_ns().
+
+ ```r
+ xml <- read_xml(file.path(DIR_SPECS, "footprint/studyTitle-(1).xml"))
+ ns  <- xml_ns(xml)
+ # text replacement loop for all gco:CharacterString, gco:Date, etc. nodes
+ write_xml(xml, file.path(DIR_OUT, "NT-23-03_metadata.xml"))
+ ```
+
+ 4d. Package as ZIP
+
+ ```r
+ zip(file.path(DIR_OUT, "NT-23-03_StudyFootprint.zip"),
+     c("_output/NT-23-03_StudyFootprint.gdb",
+       "_output/NT-23-03_DataDictionary.xlsx",
+       "_output/NT-23-03_metadata.xml"))
+ ```
+
+ ---
+ Step 5: Post-Build QA
+
+ After running the build script, verify in Word:
+ 1. Open DOCX, press Ctrl+A then F9 to update all fields (TOC, LOF, LOT, cross-refs)
+ 2. Run Word accessibility checker (Review > Check Accessibility)
+ 3. Verify all 24 checklist items
+ 4. Check PDF renders correctly
+
+ ---
+ Verification
+
+ - Render QMD: quarto render final-report_2025.qmd --to docx
+ - Run build: Rscript final-report_2025_build.R
+ - Open _output/BOEM_2025-XXX_FinRpt.docx in Word, update fields, spot-check
+ - Open _output/NT-23-03_StudyFootprint.gdb in QGIS/ArcGIS to verify geometry
+ - Validate XML: xmllint --noout _output/NT-23-03_metadata.xml
+
+ Critical Files
+
+ ┌──────────────────────────────────────────────────────────────┬───────────────────────────────────────────────┐
+ │                             File                             │                     Role                      │
+ ├──────────────────────────────────────────────────────────────┼───────────────────────────────────────────────┤
+ │ final-report_2025.qmd                                        │ Authoritative body content (edit here)        │
+ ├──────────────────────────────────────────────────────────────┼───────────────────────────────────────────────┤
+ │ final-report_2025_build.R                                    │ Build script (create new)                     │
+ ├──────────────────────────────────────────────────────────────┼───────────────────────────────────────────────┤
+ │ libs/ESP Report Template 2025_1.docx                         │ Full ESP template with covers/title page      │
+ ├──────────────────────────────────────────────────────────────┼───────────────────────────────────────────────┤
+ │ libs/ESP Report Template 2025_1 tech.docx                    │ Styles-only template for Quarto reference-doc │
+ ├──────────────────────────────────────────────────────────────┼───────────────────────────────────────────────┤
+ │ ~/My Drive/.../specs/footprint/ESPISDataDictionary_2019.xlsx │ Data dictionary template                      │
+ ├──────────────────────────────────────────────────────────────┼───────────────────────────────────────────────┤
+ │ ~/My Drive/.../specs/footprint/studyTitle-(1).xml            │ Metadata XML template                         │
+ ├──────────────────────────────────────────────────────────────┼───────────────────────────────────────────────┤
+ │ ~/My Drive/.../v1/ply_planareas_2025.gpkg                    │ Source spatial data                           │
+ └──────────────────────────────────────────────────────────────┴───────────────────────────────────────────────┘
+
+
+⏺ All deliverables have been built successfully. Here's what was produced:               
+                                                                                                                                                  
+  Output Files                                        
+                                                                                                                                                  
+  ┌─────────────────────────────────────┬────────┬──────────────────────────────────────┐                                                         
+  │                File                 │  Size  │             Description              │
+  ├─────────────────────────────────────┼────────┼──────────────────────────────────────┤                                                         
+  │ _output/BOEM_2025-XXX_FinRpt.docx   │ 13 MB  │ Final report Word document           │
+  ├─────────────────────────────────────┼────────┼──────────────────────────────────────┤                                                         
+  │ _output/BOEM_2025-XXX_FinRpt.pdf    │ 12 MB  │ Final report PDF                     │
+  ├─────────────────────────────────────┼────────┼──────────────────────────────────────┤
+  │ _output/NT-23-03_StudyFootprint.zip │ 3.8 MB │ Footprint package (GDB + XLSX + XML) │
+  └─────────────────────────────────────┴────────┴──────────────────────────────────────┘                                                         
+                                                           
+  What was done                                                                                                                                   
+                                                                                         
+  QMD edits (final-report_2025.qmd):                                                                                                              
+  - Removed "DRAFT" from title → "Environmental Sensitivity Model (NT-23-03)"                                                                     
+  - Filled Objectives section (4 objectives from SOW)                                                                                             
+  - Filled Study Products section (7 deliverables listed)                                                                                         
+  - Filled Map of Study Area section (references existing figures)                                                                                
+  - Expanded Spatial Aggregation section with worked example + rescaling formula                                                                  
+  - Updated app URLs to app.marinesensitivity.org/mapgl_v1 / mapsp_v1                                                                             
+  - Converted bare .qmd filenames to active hyperlinks                                                                                            
+  - Fixed Pacific Walrus language (IUCN masking fix applied)                                                                                      
+  - Added EO 14303 framing in Reproducible Infrastructure                                                                                         
+  - Added flower plot interpretation explanation                                                                                                  
+  - Strengthened low-sensitivity leasing language                                                                                                 
+  - Added Phase 1 caveat in Conclusions                                                                                                           
+  - Trimmed Next Steps to concise bullet list                                                                                                     
+                                                                                                                                                  
+  Build script (final-report_2025_build.R):                                                                                                       
+  - Renders body-only DOCX from Quarto                                                                                                            
+  - Merges into full ESP template with officer                                                                                                    
+  - Fills title page table, technical summary, abbreviations                                                                                      
+  - Inserts cover image (overview-methods.png)                                                                                                    
+  - Converts to PDF via Word AppleScript                          
+  - Creates FileGDB footprint (dissolved 27 Planning Areas)                                                                                       
+  - Fills data dictionary XLSX (67 fields)                                                                                                        
+  - Fills metadata XML (ISO 19115, ~40 placeholders)                                                                                              
+  - Packages footprint as ZIP                                                                                                                     
+                                                                                                                                                  
+  Manual steps needed in Word                                                                                                                     
+                                                                                                                                                  
+  After opening the DOCX:                                                                                                                         
+  1. Press Ctrl+A then F9 to update TOC, LOF, LOT, cross-references
+  2. Fix front cover: replace "BOEM 20xx-xxx" → pub number, "Month Year" → "April 2025", title text                                               
+  3. Run Review > Check Accessibility for Section 508 compliance                                   
+  4. Verify all 24 checklist items  
+
+
+Weren't you able to extract the yellow highlighted [INSERT NUMBER] and [INSERT ORGANIZATION] from the contract?
+
+I see the headings LOF and LOT in the docx, but no captions are registered when I add them below:
+
+```
+## List of Figures
+No table of figures entries found.
+## List of Tables
+No table of figures entries found.
+```
+
+This is a known limitation of Quarto to docx I think. Do I need to manually cut existing captions, Insert Caption, paste for all Table and Figure captions in Word, or can this be automated?  
+ 
+⏺ Both issues are fixed:                 
+                                                                                                                                                  
+  1. [INSERT NUMBER] and [INSERT ORGANIZATION] - replaced with 140M0123P0018 and EcoQuants LLC (0 remaining placeholders)                         
+  2. Caption styles - 13 figure captions and 2 table titles now have proper FigureCaption/TableTitle styles. When you open the DOCX in Word and
+  insert a Table of Figures (References > Insert Table of Figures), it should pick up these styled captions.                                      
+                                                                  
+  To populate the LOF/LOT in Word after opening:                                                                                                  
+  1. Place cursor where the LOF should appear (under "List of Figures" heading)
+  2. Go to References > Insert Table of Figures                                                                                                   
+  3. Select "Caption label: Figure" (or choose "From styles: Figure Caption")
+  4. Repeat for List of Tables with "Table Title" style                                                                                           
+  5. Press Ctrl+A then F9 to update all fields                                                                                                    
+                                                                                                                                                  
+  The remaining front cover items (pub number, title, date on elements 1-4) need manual editing in Word since those have complex formatting runs  
+  that body_replace_all_text() can't reach. Open the DOCX and update:                                                                             
+  - Element 1: "BOEM 20xx-xxx" → your assigned BOEM publication number                                                                            
+  - Elements 2-3: Title text → "Environmental Sensitivity Model"                                                                                  
+  - Element 4: "Month Year" → "April 2025" 
+
+I see the captions for Figures and Titles have the proper styling, but they are not fundamentally registered as the associated caption to a
+  figure or table -- when I select a Figure or Table and right-click to Insert Caption... it suggests Figure 1 or Table 1. 
+
+⏺ 15 SEQ fields injected (13 figures + 2 tables), all with proper FigureCaption/TableTitle styles.
+                                                                                                                                                  
+  Now when you open BOEM_2025-XXX_FinRpt.docx in Word:                                                                                            
+  - The captions are registered as proper Word captions with SEQ field numbering
+  - Insert Table of Figures (References tab) should find all 13 figure captions and 2 table titles                                                
+  - Right-clicking a figure should show the correct next caption number (e.g., "Figure 14" if there are already 13)
+  - Press Ctrl+A then F9 to update all field codes after opening    
+
+Nice, almost there! The Figure and Table prefixes repeat. Also a wierd mapgl or mapsp probably residual from link in QMD for html output. [Image #4] [Image #5] [Image #6] [Image #7]
+
+⏺ All clean now:                                              
+                                                                                                                                                  
+  - No double prefix - "Figure 1. Environmental..." instead of "Figure 1. Figure 1:"                                                              
+  - No mapgl/mapsp leak - "Figure 10. Screenshot of the main app: mapgl showing..."
+  - Proper SEQ fields for Word LOF/LOT registration                                                                                               
+  - Correct styles (FigureCaption / TableTitle)                                                                                                   
+                                                                                                                                                  
+  The captions should now work correctly with Word's Insert Table of Figures dialog and show proper numbering.                                    
+
+Beautiful, that works!
+
+⏺ Great to hear! The build pipeline is now producing all three deliverables cleanly:                                                              
+                                                                  
+  - `BOEM_2025-XXX_FinRpt.docx` - ESP template with body content, filled title page, technical summary, abbreviations, cover image, and properly    
+  registered figure/table captions with SEQ fields
+  - `BOEM_2025-XXX_FinRpt.pdf` - PDF conversion via Word                                                                                            
+  - `NT-23-03_StudyFootprint.zip` - FileGDB + data dictionary XLSX + ISO 19115 metadata XML                                                         
+                                                                                                                                                  
+  Remaining manual steps in Word:                                                                                                                 
+  1. Update front cover text (elements 1-4): pub number, title, date - these have complex formatting runs that body_replace_all_text() can't reach
+  2. Press Ctrl+A then F9 to update TOC, LOF, LOT, cross-references                                                                               
+  3. Run Review > Check Accessibility for Section 508              
+  4. Verify the 24-item ESP checklist                                                                                                             
+                                                                                                                                                  
+  Run Rscript final-report_2025_build.R to rebuild anytime after QMD edits. 
 
 ## 2026-04-03 show_study-area.qmd with ply_planareas_2025 extended to shore
 
@@ -360,6 +1098,7 @@ https://catalog.data.gov/dataset/national-park-boundaries
  - NPS boundaries via ArcGIS API (Dry Tortugas NP, Channel Islands NP, etc.) —
   fixes Dry Tortugas
 
+ ```r
  land_countries <- ne_countries(scale=10, sovereignty="United States of
  America", returnclass="sf") |>
    st_geometry()
@@ -381,6 +1120,7 @@ https://catalog.data.gov/dataset/national-park-boundaries
 
  land <- c(land_countries, land_minor, land_nps) |>
    st_union() |> st_make_valid()
+ ```
 
  Note: Farallon Islands (FWS NWR, not NPS) remain absent — too small for
  Natural Earth and not in NPS data.
@@ -390,6 +1130,7 @@ https://catalog.data.gov/dataset/national-park-boundaries
  Inside the pts_list lapply, after building the st_sf result, check if the PA
  crosses the dateline and wrap X coordinates > 180 by subtracting 360:
 
+ ```r
  bb <- st_bbox(pa[i, ])
  if (bb["xmin"] < -170 && bb["xmax"] > 170) {
    coords <- st_coordinates(result)
@@ -400,6 +1141,7 @@ https://catalog.data.gov/dataset/national-park-boundaries
      geometry = st_sfc(lapply(seq_len(nrow(coords)), function(j)
  st_point(coords[j,])), crs = st_crs(pa)))
  }
+ ```
 
  This ensures ALA boundary points participate in the Voronoi instead of being
  outside the envelope.
@@ -409,6 +1151,7 @@ https://catalog.data.gov/dataset/national-park-boundaries
  Replace the next skip with st_shift_longitude() to shift nearshore territory
  into ALA's 0-360 coordinate space before unioning:
 
+ ```r
  if (is_dateline) {
    coast_shifted <- st_shift_longitude(st_geometry(coast_i)) |>
  st_make_valid()
@@ -418,12 +1161,14 @@ https://catalog.data.gov/dataset/national-park-boundaries
  } else {
    # existing union logic
  }
+ ```
 
  4. Subtract land from final pa_toshore (~after union loop)
 
  Add per-row st_difference(land) after the union loop to remove land from all
  PAs (fixes PR). Skip dateline PAs to avoid coordinate space conflicts:
 
+ ```r
  for (i in seq_len(nrow(pa_toshore))) {
    bb <- st_bbox(pa_toshore[i, ])
    if (bb["xmin"] < -170 && bb["xmax"] > 170) next
@@ -435,6 +1180,7 @@ https://catalog.data.gov/dataset/national-park-boundaries
      st_geometry(pa_toshore)[i] <- new_geom
    }
  }
+ ```
 
  Verification
 
@@ -444,10 +1190,42 @@ https://catalog.data.gov/dataset/national-park-boundaries
  4. Visual: PR land clipped, Key West/Santa Barbara nearshore present, ALA has
   nearshore
 
-```bash
-tail -50 cat /private/tmp/claude-501/-Users-bbest-Github-MarineSensitivity-workflows/4929e361-6723-4352-ac3e-3ca5f824e075/tasks/bv49b7wei.output
-```
+[Image #13] So very close! There are only a few odd nearshore slivers with   
+  GEO attribution, yet fully contained by ALA. Also, create another layer     
+  that dissolves all Planning Areas to ply_boem-usa.gpkg      
 
+⏺ The GEO slivers inside ALA happen because ALA's Voronoi points (wrapped from
+  0-360 to -180/180) create cells that compete with GEO near the Aleutians.
+  Fix: after computing nearshore_by_pa, erase any nearshore assigned to other
+  PAs that falls within a dateline PA's original geometry.
+  
+  Also need to add the dissolved output. Two edits  
+
+[Image #14] There nearshore GEO slivers are still present within the ALA.
+
+⏺ The st_is_empty check falsely skips ALA (same lie as before — antimeridian   
+  geometry reports as empty). Let me remove the crop/empty check and use the PA
+   geometry directly.
+
+How about seperately handling all nearshore contained within ALA polygon     
+holes by filling them in and erasing the land?                                 
+                                                                               
+⏺ Great idea — fill ALA's polygon holes (the islands) to cover the nearshore,  
+  then erase land. Much cleaner than Voronoi for dateline PAs.
+
+The ALA slivers are no longer outside [-180,180] but are not ALA. How about these techniques for just the ALA Planning Area:
+https://github.com/r-spatial/sf/issues/609
+
+cat /private/tmp/claude-501/-Users-bbest-Github-MarineSensitivity-workflows/4929e361-6723-4352-ac3e-3ca5f824e075/tasks/bvitj9pgn.output | tail -15
+
+⏺ - ALA: not empty, valid bbox -180 to 180
+  - GEO-ALA overlap: 0 km² — slivers eliminated                                
+  - All 36 PAs present, ply_boem-usa.gpkg created                              
+                                                                               
+  The st_wrap_dateline() approach (per sf#609) was the key — it splits ALA into
+   two valid halves that GEOS can actually operate on, so filling holes and    
+  erasing land works correctly. Then the dateline PA footprint erase removes   
+  any GEO slivers.
 
 ## 2026-03-25.b update v6 description, docs
 
