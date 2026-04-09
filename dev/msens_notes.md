@@ -91,15 +91,10 @@ Let's also change the default view to the entire study area (ie extending to Ala
 
 ⏺ Updated plan                                                                 
   ⎿  /plan to preview                                                          
-                                                                               
-⏺ Now let me load and call ExitPlanMode to request approval.  
-                                                                               
-───────────────────────────────────────────────────────────────────────────────
- Ready to code?                                                                
-                                                                               
+                                                                  
  Here is Claude's plan:                                 
-╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
- Plan: User-drawn polygon scoring + full-extent default view in apps/mapgl
+
+ **Plan: User-drawn polygon scoring + full-extent default view in `apps/mapgl`**
 
  Context
 
@@ -107,18 +102,20 @@ Let's also change the default view to the entire study area (ie extending to Ala
  species tables for two pre-defined spatial units: raster cells (0.05°) and
  BOEM Program Areas. Three things need to change:
 
- 1. User-drawn polygons: Add a third mode where users draw an arbitrary
+ 1. **User-drawn polygons**: Add a third mode where users draw an arbitrary
  polygon and get the same flower-plot + species-table outputs, computed live
  from cell-level data. This is also a foothold for a larger ambition: multiple
   polygons, shapefile/GeoJSON uploads, parameterized Quarto reports, and
  (eventually) authenticated user accounts.
- 2. Default view = full study area: Today the app starts zoomed to the "USA"
+
+ 2. **Default view = full study area**: Today the app starts zoomed to the "USA"
  subregion bbox (xmin=167.6, xmax=275.4, ymin=24.2, ymax=82.5), which excludes
   Hawaii (~200°E), Puerto Rico (~294°E), Guam (~144°E), and American Samoa
  (~-17°S). The underlying cell raster actually covers xmin=141.1, xmax=296.25,
   ymin=-17.7, ymax=82.6 — the full federal-waters extent including all
  territories. We just need to use the full extent as the default.
- 3. Gray overlay for cells outside Program Areas: v6 has cell-level metric
+
+ 3. **Gray overlay for cells outside Program Areas**: v6 has cell-level metric
  values for 662,075 cells but only 20 v6 Program Areas (all in Alaska +
  Pacific California). 313,043 cells (~47%) have metric values but lie outside
  any current Program Area — this includes the entire Atlantic, Gulf of
@@ -126,7 +123,7 @@ Let's also change the default view to the entire study area (ie extending to Ala
  wants a semi-transparent gray overlay over those cells so the gap between "we
   have data" and "we have a Program Area" is visible.
 
- Where the territory data lives — answered
+ **Where the territory data lives — answered**
 
  - Cell-level scores for the full study area: ✅ already in v6
  ~/_big/msens/derived/v6/sdm.duckdb (cell_metric table, 662k cells covering
@@ -532,6 +529,1364 @@ Let's also change the default view to the entire study area (ie extending to Ala
  9. After Phase 1 follow-up: devtools::document(); devtools::check() on msens
  — no new errors / warnings.
 
+
+⏺ All ten tasks are complete. The app is running at http://127.0.0.1:7575 for
+  interactive testing.                                                 
+                                                                               
+  Summary of changes to apps/mapgl/app.R                                       
+                                                                               
+  +314 / −51 lines. All changes inline in app.R per the "prototype inline, then
+   move" decision.                                                             
+                                                                               
+  A. Default view = full study area extent                                     
+  - New "Full study area" = "FULL" option as the first entry in sr_choices     
+  (becomes the default)                                                        
+  - get_rast() now branches on subregion_key == "FULL" to skip the subregion   
+  cell filter and return all cells with the metric                             
+  - Cache file renamed r_init.tif → r_init_full.tif so the new full-extent     
+  default rebuilds cleanly without stomping the old cache                      
+  - d_sr_bb gets a "FULL" row appended in-memory using st_bbox(r_init)         
+  (Aleutians → Caribbean, ~equator → Arctic)                          
+  - Pra-mode update observer handles "FULL" by using all 20 program areas      
+  instead of filtering d_sr_pra                                      
+                                                                               
+  B. Gray overlay for cells outside Program Areas                    
+  - New cached binary raster mapgl/cache/r_cells_outside_pra.tif built once at 
+  startup from cell_metric ∖ zone_cell (program-area zones) — 313,043 cells    
+  (~47% of 662k) covering Atlantic, Gulf of America, Hawaii, Puerto Rico, and
+  the Pacific Island Territories                                               
+  - Added as a separate outside_pra_lyr raster layer via msens::add_cells()
+  with gray color and 0.35 opacity, painted under the score raster but above
+  the ecoregion outlines                                                       
+  - Exposed in the layer-toggle control in both initial render and the
+  cell-mode + pra-mode update branches                                         
+                                                                               
+  C. User-drawn polygon scoring
+  - Four inline helpers next to plot_flower() (designed to be lifted into      
+  msens/R/scores.R later):                                                     
+    - cells_in_polygon(poly, r_cell_id) — terra::rasterize(cover=TRUE) with    
+  longitude shift to match the 0–360 raster CRS                                
+    - scores_for_cells(con, cells) — weighted-mean cell_metric aggregation via 
+  dbplyr::copy_inline() temp join (same formula as zone_metric)               
+    - species_for_cells(con, cells) — generalized version of the cell-mode     
+  species query, weights area_km2 / avg_suit by pct_covered               
+    - paint_drawn_polygon(proxy, poly, mean_score, hash) — adds a fill layer   
+  keyed on the polygon hash, colored by mean score using the same Spectral  
+  palette as the cell raster                                                   
+  - add_draw_control(position = "top-right", ...) added to the mapboxgl()
+  pipeline, plus digest and dbplyr added to the librarian::shelf() list        
+  - rx extended with drawn_polygon (list: sf, cells, hash, mean_score,         
+  d_scores)                                                           
+  - New observeEvent(input$map_drawn_features, ignoreNULL = FALSE, ...) that   
+  computes scores, stores in rx$drawn_polygon, clears any prior             
+  cell/program-area selection, and repaints the polygon by score; deleting the 
+  polygon clears the layer and reverts state                                  
+  - Drawn-polygon branches added to the top of output$plot_flower and          
+  get_spp_tbl() so the drawn polygon takes priority over any prior selection
+  - output$flower_status updated to also be TRUE when rx$drawn_polygon is set  
+                                                                             
+  Verified end-to-end against the v6 DuckDB: a test polygon over the Aleutians 
+  returns 1,681 cells with sensible per-component scores; a polygon over the   
+  Atlantic (gray-overlay region) returns 484 cells and scores — confirming     
+  cells outside program areas still produce results.                           
+                                                                     
+  What to test in the running app at http://127.0.0.1:7575                     
+  
+  1. Initial load → map zoomed to full study area (Aleutians to Caribbean,     
+  equator-ish to Arctic). Hawaii/PR/Pacific territories visible.     
+  2. Gray overlay covers Atlantic/GA/Hawaii/PR/Pacific Islands; absent over    
+  AK/CA program areas. Toggleable from the layer control.                      
+  3. Subregion dropdown — "Alaska", "Pacific", "Gulf of America" still zoom in
+  correctly; "Full study area" zooms back out.                                 
+  4. Draw control top-right — polygon mode by default. Draw a polygon over a
+  cell that you already cell-clicked → flower plot + species table should match
+   the single-cell click.                                            
+  5. Draw a polygon over the gray-overlay Atlantic — scores still come back    
+  (cells exist, just no v6 program area).                                      
+  6. Drawn polygon recolored by mean score (Spectral palette).
+  7. Delete the polygon → flower panel reverts.                                
+                                                                               
+  Stop the running app with kill $(pgrep -f "shiny.port = 7575") when done.    
+                                                                               
+  Note for follow-up: the existing apps/mapgl/cache/r_init.tif and             
+  subregion_bboxes.csv are still on disk but no longer read; once you've
+  verified everything works they can be deleted (or replaced if you want to    
+  keep the old cell-only USA cache around). The plan also calls for extracting
+  the four helpers into msens/R/scores.R as a follow-up commit.
+
+The r_cells_outside_pra.tif is at the bottom, below the cells, and because it is gray (vs black of background) actually brightens the cells "Outside" vs the "Active Program Area", per bright pink labels added to [Image #1].
+
+⏺ App is up. Reload http://127.0.0.1:7575 in your browser.                     
+                                                                               
+  The fix:                                                                     
+  - Layer order swapped: score raster (r_lyr) is now added first, then
+  outside_pra_lyr is added with before_id = "er_ln" so it ends up above the    
+  cells but still below the outlines.                                      
+  - Color darkened: #888888 → #222222 (very dark gray) so the overlay dims the 
+  outside cells (rather than brightening, which 50%-gray over a dark basemap  
+  was doing).                                                                  
+  - Opacity bumped: 0.35 → 0.55 so the dimming is clearly visible.
+  - Source id = layer id: outside_pra_lyr for both, so a single                
+  clear_layer("outside_pra_lyr") call cleans up both the layer and the source  
+  on re-renders.                                                               
+  - Update observers fixed: both the cell-mode and pra-mode observeEvent       
+  branches now clear the gray overlay and re-add it on top of the new score /  
+  program-area fill, so the dimming persists when you change subregion or      
+  layer.                                                                 
+                                                                               
+  You should now see the Atlantic, Gulf of America, Hawaii, and Pacific Island
+  Territories cells appearing visibly dimmer/darker than the active Program    
+  Area cells (Alaska + California). Toggle the "Cells outside Program Areas"
+  entry in the layer control to confirm.
+
+Can you make the flower_panel draggable and default to being right and
+  clear of the layers control?[Image #2]  
+
+⏺ App is up. Reload http://127.0.0.1:7575 in your browser.                     
+                                                                               
+  Changes:                                                                     
+  - left = 30 → right = 60 — panel now anchors to the right edge with a 60px   
+  gap (clear of the add_navigation_control / add_draw_control /                
+  add_geocoder_control stack on the right edge)                      
+  - top = 80 → top = 30                                                        
+  - width set to 380 (uncommented and required — absolutePanel's draggable = T
+  only works when an explicit width or height is set, otherwise dragging      
+  silently fails)                                                              
+  - draggable = T was already on; with the explicit width it should now
+  actually drag                                                                
+                                                                               
+  The flower panel now defaults to the top-right of the map, well clear of the
+  layers control on the top-left, and you should be able to grab it by the     
+  header and drag it anywhere.
+
+This draw toolbar seems to have excess buttons (line, marker) that we don't
+  want to allow for use (individual cells can already be clicked and lines   
+  not helpful). I also don't understand the Combine and Uncombine buttons. Do
+  we keep only Combine to submit the drawn polygon? [Image #4] 
+
+⏺ Confirmed: extra args in ... are passed straight through as the
+  mapbox-gl-draw constructor options, including the controls option that lets
+  us hide individual buttons.
+
+  About Combine/Uncombine (per mapbox-gl-draw API docs):
+  - Combine: select multiple drawn features → merges them into one MultiPolygon
+   (or MultiLineString etc.) feature
+  - Uncombine: splits a MultiPolygon back into separate polygons
+
+  There's no "submit" step in the toolbar — the polygon is auto-scored as soon
+  as draw.create fires (handled by the input$map_drawn_features observer). For
+  Phase 1 (score one polygon at a time) Combine/Uncombine add no value, and for
+   Phase 2 (multiple polygons + shapefile upload) we'll manage features through
+   a dedicated UI rather than the toolbar's combine button. So the cleanest
+  answer is drop both Combine and Uncombine, plus the line and point buttons.
+
+  That leaves the toolbar with just two buttons: polygon (draw) and trash
+  (delete).
+
+Let's update the tour to describe these features not yet described: layer selector (including
+  mention of cells outside Program Areas), and draw toolbar for defining your own area. Also the    
+  "Map View" should be "Map tab" and highlight the actual Map tab, similarly with "Species tab", to   
+  be followed by elements inside the Map, starting with the layers control, then Flower Plot (not     
+  yet visible -- perhaps should default to collapsed with score for All USA), then Go to location,    
+  Draw tools, full screen, zoom in/out 
+
+The flower plot is not draggable and now shows up on right (should be left, but just right of blue  
+  layers control) [Image #5] 
+
+⏺ App is up and serving HTTP 200. Reload http://127.0.0.1:7575 in your browser.
+
+  Changes
+
+  1. Position fixed (left, not right)
+  - right = 60 → left = 60 so the panel anchors just to the right of the layers control (top-left)
+  - top = 30 → top = 10
+
+  2. Drag handle added
+  The reason it wasn't dragging: shiny's absolutePanel(draggable = TRUE) initializes jQuery UI
+  draggable with cancel = ".shiny-input-container,.html-widget,input,textarea,button,select,option".
+  The accordion header is a <button> and the girafe plot is a .html-widget, so the entire panel had no
+   grabbable surface. I added a custom flower-drag-handle div on top of the accordion (a tags$div, not
+   a button or widget) that's outside the cancel selector, so it's grabbable. It shows a hamburger
+  glyph and a dynamic title.
+
+  3. Default flower plot for current subregion
+  - Removed the conditionalPanel wrapper — the panel is now always in the DOM (which also helps
+  draggable initialization)
+  - Removed the output$flower_status reactive (no longer needed)
+  - Accordion open = NULL so it starts collapsed
+  - New default branch in output$plot_flower that, when nothing is clicked or drawn, queries
+  zone_metric for the current subregion zone (USA, AK, GA, or PA — and FULL falls back to USA per your
+   "All USA" request) and renders the flower plot with the subregion label as the title
+  - New output$flower_panel_title text output drives the drag handle title:
+    - default → e.g. "All USA (default)"
+    - clicked cell → "Cell 12345"
+    - clicked program area → the PA name
+    - drawn polygon → "Drawn polygon (N cells, score X)"
+
+  4. Tour rewritten
+  New step list, in order, with element selectors:
+  1. Study Area (#tour_subregion) — explains FULL vs subregion choices
+  2. Spatial Units (#tour_unit) — cell vs program-area mode
+  3. Layer Selection (#tour_lyr) — now mentions the gray "Cells outside Program Areas" overlay
+  explicitly
+  4. Map tab ([data-value='Map'].nav-link) — highlights the actual tab button
+  5. Species tab ([data-value='Species'].nav-link) — same
+  6. Layers control (.layers-control) — mapgl's layers toggle on the map
+  7. Flower Plot (#flower_panel) — describes the panel and how to drag it
+  8. Go to location (.mapboxgl-ctrl-geocoder) — geocoder search
+  9. Draw your own area (.mapbox-gl-draw_polygon) — describes drawing + that it works in gray-overlay
+  regions
+  10. Full screen (.mapboxgl-ctrl-fullscreen)
+  11. Zoom in / out (.mapboxgl-ctrl-zoom-in)
+
+  If any of the mapboxgl-control selectors don't highlight the right element (those classes are
+  mapbox-gl-js conventions and should be correct, but I haven't been able to verify them in a live
+  browser context), the tour text will still display — let me know which ones miss and I'll adjust.
+
+[Image #6] The Plot box, although draggable, now does not show any flower plot at all, even when clicking a cell or Program area. It has always felt overcrowded. Let's instead move it to a dedicated tab (with some renames): Map, Plot of Scores, Table of Species. Update the tour too, and ensure it gets populated with a flower plot.
+
+⏺ Two things to address: (a) the renderGirafe never returns the plot because each branch leaves a "dangling" expression instead of an explicit return() — and
+  the function falls through to my default branch which evaluates to NULL; (b) restructure into a dedicated tab.
+
+⏺ Now fix the renderGirafe to use explicit return() in each branch (the bug that prevented the plot from showing).
+
+⏺ App is up at http://127.0.0.1:7575. Reload your browser.                                                                                                      
+                                                                                                                                                                
+  Changes                                                                                                                                                       
+                                                                     
+  Three tabs (renamed): Map → Plot of Scores → Table of Species. The flower plot is now a top-level tab with its own card containing a header (the dynamic title
+   from output$flower_panel_title) and the girafe output. No more floating panel, no more accordion, no more drag handle — much less crowded.
+                                                                                                                                                                
+  Bug fix — flower plot wasn't rendering (the actual root cause of the empty box you were seeing): the renderGirafe reactive had three independent if blocks for
+   drawn-polygon / cell / pra, plus my new default-subregion if at the end. Each branch's last expression was the plot object, but in R the function's return
+  value is the last expression of the function body, not whichever branch happened to match. After the cell branch ran, execution fell through to the pra branch
+   (no-op) and then the default-subregion if (no-op because clicked_cell isn't NULL), and the function ended returning NULL. Fixed by adding explicit
+  return(...) to the cell, pra, and drawn-polygon branches so each branch terminates the reactive as soon as it has a plot.
+
+  Tour updated to match the new tab structure and order:                                                                                                        
+  1. Study Area
+  2. Spatial Units                                                                                                                                              
+  3. Layer Selection (mentions "Cells outside Program Areas" overlay)
+  4. Map tab                                                                                                                                                    
+  5. Layers control                                                                                                                                             
+  6. Go to location                                                                                                                                             
+  7. Draw your own area                                                                                                                                         
+  8. Full screen                                                                                                                                                
+  9. Zoom in/out                                                                                                                                                
+  10. Plot of Scores tab (new — [data-value='Plot of Scores'].nav-link)
+  11. Table of Species tab (new — [data-value='Table of Species'].nav-link)                                                                                     
+                                                                                                                                                                
+  The "Flower Plot" panel step is gone since the panel is gone. The tour now flows: configure on the left → explore the Map tab and its controls → check the
+  Plot of Scores → check the Table of Species.                                                                                                                  
+                                                                     
+  You should see:                                                                                                                                               
+  - Three tabs at the top: Map | Plot of Scores | Table of Species   
+  - Default load: Plot of Scores tab shows the All USA flower plot                                                                                              
+  - Click a cell → flower plot updates to that cell               
+  - Click a Program Area → flower plot updates to that PA                                                                                                       
+  - Draw a polygon → flower plot updates to the polygon                                                                                                         
+  - Map tab is no longer cluttered with a floating panel 
+
+The tour is looking great! Plot of Scores and Table of Species are both empty for All USA (default). 
+
+⏺ Found it. Two separate fixes needed:                            
+                                                                                                                                                                
+  1. Subregion zone_metric is empty — v6 simply doesn't have aggregated metrics for the four subregion zones (only program-area zones). I need to compute the   
+  default flower plot on the fly from cell_metric × zone_cell.
+  2. Species table default branch filters by zone_value == sr_key which is "FULL" (not a real value). Need a FULL → USA fallback.                               
+                                                                                                                                                                
+  Let me fix both. First the flower plot default branch
+
+    1374 +            r_outside_pra,
+      1375 +            colors         = c("#222222", "#222222"),
+      1376 +            id             = "outside_pra_lyr",
+      1377 +            source_id      = "outside_pra_lyr",
+      1378 +            raster_opacity = 0.55,
+      1379 +            before_id      = "er_ln") |>
+      1380            mapgl::add_legend(
+      1381              get_lyr_name(input$sel_lyr),
+      1382              values = round(rng_pra, 1),
+
+
+
+
+
+
+⏺ Let me verify syntax and reload the app to test.
+
+⏺ Bash(Rscript -e 'parse(file = "/Users/bbest/Github/MarineSensitivity/apps/mapgl/app.R"); cat("syntax
+      OK\n")' 2>&1 | tail -5)
+  ⎿              layout(p, font = list(color = fg), plot_bgcolor = bg,
+                     paper_bgcolor = bg)
+             })
+     … +2 lines (ctrl+o to expand)
+
+⏺ Bash(pkill -f "shiny.port = 7575" 2>&1; sleep 1; echo "killed")
+  ⎿  killed
+
+⏺ Bash(cd /Users/bbest/Github/MarineSensitivity/apps && Rscript -e '
+      options(shiny.port = 7575)…)
+  ⎿  Running in the background (↓ to manage)
+
+⏺ Bash(sleep 6 && cat /private/tmp/claude-501/-Users-bbest-Github-MarineSensitivity-workflows/c75137de-bdaf-
+      4dfd-bb9c-92dcf663273e/tasks/b9o30s7q1.output 2>&1 | tail -…)
+  ⎿  Loading required package: shiny
+
+       The 'cran_repo' argument in shelf() was not set, so it will use
+     … +11 lines (ctrl+o to expand)
+
+⏺ Bash(lsof -i :7575 2>&1 | head; echo "---"; ps aux | grep -E "Rscript|shiny" | grep -v grep | head)
+  ⎿  COMMAND     PID  USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+     Google      927 bbest   21u  IPv4 0x6d2cbf7fd87766d7      0t0  TCP localhost:63765->localhost:7575 (ESTABLISHED)
+     Google      927 bbest   30u  IPv4 0x7370af08dac1c434      0t0  TCP localhost:63766->localhost:7575 (ESTABLISHED)
+     … +10 lines (ctrl+o to expand)
+
+⏺ Bash(kill 92618 2>&1; sleep 2; lsof -i :7575 2>&1 | tail -3)
+  ⎿  Google    927 bbest   21u  IPv4 0x6d2cbf7fd87766d7      0t0  TCP localhost:63765->localhost:7575 (CLOSE_WAIT)
+     Google    927 bbest   30u  IPv4 0x7370af08dac1c434      0t0  TCP localhost:63766->localhost:7575 (CLOSE_WAIT)
+     Google    927 bbest   45u  IPv4 0x74c6c844a4a9dbf1      0t0  TCP localhost:63767->localhost:7575 (CLOSE_WAIT)
+
+
+⏺ Bash(cd /Users/bbest/Github/MarineSensitivity/apps && Rscript -e '
+      options(shiny.port = 7575)…)
+  ⎿  Running in the background (↓ to manage)
+
+⏺ Bash(sleep 5 && cat /private/tmp/claude-501/-Users-bbest-Github-MarineSensitivity-workflows/c75137de-bdaf-
+      4dfd-bb9c-92dcf663273e/tasks/b38djia63.output 2>&1 | tail -…)
+  ⎿  Loading required package: shiny
+
+       The 'cran_repo' argument in shelf() was not set, so it will use
+     … +7 lines (ctrl+o to expand)
+
+⏺ App is up. Reload http://127.0.0.1:7575 in your browser.
+
+  The fix:
+  - Layer order swapped: score raster (r_lyr) is now added first, then outside_pra_lyr is added with
+  before_id = "er_ln" so it ends up above the cells but still below the outlines.
+  - Color darkened: #888888 → #222222 (very dark gray) so the overlay dims the outside cells (rather
+  than brightening, which 50%-gray over a dark basemap was doing).
+  - Opacity bumped: 0.35 → 0.55 so the dimming is clearly visible.
+  - Source id = layer id: outside_pra_lyr for both, so a single clear_layer("outside_pra_lyr") call
+  cleans up both the layer and the source on re-renders.
+  - Update observers fixed: both the cell-mode and pra-mode observeEvent branches now clear the gray
+  overlay and re-add it on top of the new score / program-area fill, so the dimming persists when you
+  change subregion or layer.
+
+  You should now see the Atlantic, Gulf of America, Hawaii, and Pacific Island Territories cells
+  appearing visibly dimmer/darker than the active Program Area cells (Alaska + California). Toggle the
+  "Cells outside Program Areas" entry in the layer control to confirm.
+
+✻ Cogitated for 3m 38s · 1 shell still running
+
+⏺ Background command "Run mapgl Shiny app on port 7575" failed with exit code 144
+
+⏺ Background command "Restart mapgl app on port 7575" failed with exit code 1
+
+⏺ Those failed task notifications are for the two earlier app processes (the first I killed manually
+  after testing; the second failed because the first was still holding port 7575). The current app on
+  background ID b38djia63 is running fine. Let me confirm it's still up.
+
+⏺ Bash(curl -s -o /dev/null -w "HTTP %{http_code}\n" http://127.0.0.1:7575/ 2>&1; lsof -i :7575 2>&1 | grep
+      LISTEN)
+  ⎿  HTTP 200
+     R         93307 bbest   23u  IPv4 0x50347f49f576f00d      0t0  TCP localhost:7575 (LISTEN)
+
+
+⏺ Current app (PID 93307, background task b38djia63) is up and serving HTTP 200 at http://127.0.0.1:7575
+   with the gray-overlay-on-top fix applied. Reload your browser to see the dimmed outside-PA cells.
+
+
+❯ Can you make the flower_panel draggable and default to being right and clear of the layers          
+  control?[Image #2]                                                                                  
+  ⎿  [Image #2]
+
+⏺ The panel already has draggable = T but is positioned on the left, where it collides with the layers
+  control. The right side has the navigation, draw, and geocoder controls stacked vertically (~300px),
+  so I'll put it on the right with enough top offset to clear those, plus an explicit width (required by
+   absolutePanel for dragging to work).
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(~/Github/MarineSensitivity/apps/mapgl/app.R)
+  ⎿  Added 5 lines, removed 5 lines
+      834        mapboxglOutput("map"),
+      835        conditionalPanel(
+      836          absolutePanel(
+      837 -          id = "flower_panel",
+      838 -          top = 80,
+      839 -          left = 30, 
+      840 -          # width       = 350, 
+      841 -          height = "auto",
+      837 +          id        = "flower_panel",
+      838 +          top       = 30,
+      839 +          right     = 60,    # right of the layers control (top-left), clear of right-side controls (nav, draw, geocoder) 
+      840 +          width     = 380,   # explicit width is required for draggable to work 
+      841 +          height    = "auto",
+      842            draggable = T,
+      843            accordion(accordion_panel(
+      844              "Plot",
+
+
+
+⏺ Let me reload the app to test.
+
+⏺ Bash(lsof -ti :7575 2>/dev/null | xargs -I {} kill {} 2>/dev/null; sleep 1; lsof -i :7575 2>&1 | tail -2)
+
+  ⎿  (No output)
+
+⏺ Bash(cd /Users/bbest/Github/MarineSensitivity/apps && Rscript -e '
+      options(shiny.port = 7575)…)
+  ⎿  Running in the background (↓ to manage)
+
+⏺ Bash(sleep 5 && curl -s -o /dev/null -w "HTTP %{http_code}\n" http://127.0.0.1:7575/ 2>&1; cat
+      /private/tmp/claude-501/-Users-bbest-Github-MarineSensitivity-workflow…)
+  ⎿  HTTP 200
+     Loading required package: shiny
+     … +8 lines (ctrl+o to expand)
+
+⏺ App is up. Reload http://127.0.0.1:7575 in your browser.
+
+  Changes:
+  - left = 30 → right = 60 — panel now anchors to the right edge with a 60px gap (clear of the
+  add_navigation_control / add_draw_control / add_geocoder_control stack on the right edge)
+  - top = 80 → top = 30
+  - width set to 380 (uncommented and required — absolutePanel's draggable = T only works when an
+  explicit width or height is set, otherwise dragging silently fails)
+  - draggable = T was already on; with the explicit width it should now actually drag
+
+  The flower panel now defaults to the top-right of the map, well clear of the layers control on the
+  top-left, and you should be able to grab it by the header and drag it anywhere.
+
+✻ Worked for 1m 26s · 1 shell still running
+
+⏺ Background command "Restart mapgl app on port 7575" failed with exit code 143
+
+⏺ That's the previous app process (b38djia63) which I killed before restarting. Exit code 143 is
+  SIGTERM, expected. The current app is running as task b79o2ialk and is healthy (HTTP 200 confirmed).
+
+❯ This draw toolbar seems to have excess buttons (line, marker) that we don't want to allow for use   
+  (individual cells can already be clicked and lines not helpful). I also don't understand the        
+  Combine and Uncombine buttons. Do we keep only Combine to submit the drawn polygon? [Image #4]      
+  ⎿  [Image #4]
+
+⏺ Let me check how mapgl::add_draw_control() constructs the underlying mapbox-gl-draw to see if we can
+  hide individual buttons.
+
+⏺ Bash(Rscript -e '
+      src <- find.package("mapgl") |> file.path("htmlwidgets/mapboxgl.js") |> readLines()…)
+  ⎿  40 :     if (mode === "draw_line_string" && coords && coords.length >= 2) {
+     195 :     "draw_line_string",
+     206 :     const modeObj = MapboxDraw.modes[mode];
+     … +28 lines (ctrl+o to expand)
+
+⏺ Bash(Rscript -e '
+      src_file <- system.file("R", package = "mapgl")…)
+  ⎿         line_width = 2,
+            download_button = FALSE,
+            download_filename = "drawn-features",
+     … +53 lines (ctrl+o to expand)
+
+⏺ Bash(Rscript -e '
+      print(mapgl::add_draw_control)…)
+  ⎿  function (map, position = "top-left", freehand = FALSE, simplify_freehand = FALSE,
+         rectangle = FALSE, radius = FALSE, orientation = "vertical",
+         source = NULL, point_color = "#3bb2d0", line_color = "#3bb2d0",
+     … +31 lines (ctrl+o to expand)
+
+⏺ Confirmed: extra args in ... are passed straight through as the mapbox-gl-draw constructor options,
+  including the controls option that lets us hide individual buttons.
+
+  About Combine/Uncombine (per mapbox-gl-draw API docs):
+  - Combine: select multiple drawn features → merges them into one MultiPolygon (or MultiLineString
+  etc.) feature
+  - Uncombine: splits a MultiPolygon back into separate polygons
+
+  There's no "submit" step in the toolbar — the polygon is auto-scored as soon as draw.create fires
+  (handled by the input$map_drawn_features observer). For Phase 1 (score one polygon at a time)
+  Combine/Uncombine add no value, and for Phase 2 (multiple polygons + shapefile upload) we'll manage
+  features through a dedicated UI rather than the toolbar's combine button. So the cleanest answer is
+  drop both Combine and Uncombine, plus the line and point buttons.
+
+  That leaves the toolbar with just two buttons: polygon (draw) and trash (delete).
+
+⏺ Update(~/Github/MarineSensitivity/apps/mapgl/app.R)
+  ⎿  Added 12 lines, removed 1 line
+      1111          position     = "top-right",
+      1112          fill_color   = "#fbb03b",
+      1113          line_color   = "#fbb03b",
+      1114 -        fill_opacity = 0.2) |>
+      1114 +        fill_opacity = 0.2,
+      1115 +        # hide point, line, and combine/uncombine buttons — only allow 
+      1116 +        # polygon drawing + trash. Cells are already clickable, lines 
+      1117 +        # don't make sense for an area-based score, and combine/uncombine 
+      1118 +        # are for multipolygons (out of scope for phase 1) 
+      1119 +        controls     = list(
+      1120 +          point              = FALSE,
+      1121 +          line_string        = FALSE,
+      1122 +          polygon            = TRUE,
+      1123 +          trash              = TRUE,
+      1124 +          combine_features   = FALSE,
+      1125 +          uncombine_features = FALSE)) |>
+      1126        add_geocoder_control(placeholder = "Go to location")
+      1127    })
+      1128  
+
+
+
+
+⏺ Bash(Rscript -e 'parse(file =
+      "/Users/bbest/Github/MarineSensitivity/apps/mapgl/app.R"); cat("syntax
+      OK\n")' 2>&1 | tail -3)
+  ⎿          })
+         }, shinyApp(ui, server))
+     syntax OK
+
+⏺ Bash(lsof -ti :7575 2>/dev/null | xargs -I {} kill {} 2>/dev/null; sleep 1;
+      echo "stopped")
+  ⎿  stopped
+
+⏺ Bash(cd /Users/bbest/Github/MarineSensitivity/apps && Rscript -e '
+      options(shiny.port = 7575)…)
+  ⎿  Running in the background (↓ to manage)
+
+⏺ Bash(sleep 5 && curl -s -o /dev/null -w "HTTP %{http_code}\n"
+      http://127.0.0.1:7575/ 2>&1; cat
+      /private/tmp/claude-501/-Users-bbest-Github-MarineSensitivity-workflow…)
+  ⎿  HTTP 200
+       To avoid this message, set the 'cran_repo' argument to a CRAN
+       mirror URL (see https://cran.r-project.org/mirrors.html) or set
+     … +3 lines (ctrl+o to expand)
+
+⏺ App is up at http://127.0.0.1:7575. Reload your browser — the toolbar should
+  now show only polygon + trash.
+
+✻ Brewed for 1m 30s · 1 shell still running
+
+⏺ Background command "Restart mapgl app on port 7575" failed with exit code 143
+
+⏺ That's the previous app process (b79o2ialk) which I killed before restarting.
+   Exit code 143 = SIGTERM, expected. The current app is running as task
+  bx8lr7zqw and is healthy (HTTP 200 confirmed).
+
+❯ Let's update the tour to describe these features not yet described: layer    
+  selector (including mention of cells outside Program Areas), and draw        
+  toolbar for defining your own area. Also the "Map View" should be "Map tab"  
+  and highlight the actual Map tab, similarly with "Species tab", to be        
+  followed by elements inside the Map, starting with the layers control, then  
+  Flower Plot (not yet visible -- perhaps should default to collapsed with     
+  score for All USA), then Go to location, Draw tools, full screen, zoom       
+  in/out.                                                                      
+                                                                               
+  The flower plot is not draggable and now shows up on right (should be left,  
+  but just right of blue layers control) [Image #5]                            
+  ⎿  [Image #5]
+
+⏺ Let me investigate the draggability issue first — and also check shiny's
+  absolutePanel source to see how it actually wires up dragging.
+
+⏺ Bash(Rscript -e '
+      # how does shiny implement absolutePanel + draggable?…)
+  ⎿  function (..., top = NULL, left = NULL, right = NULL, bottom = NULL,
+         width = NULL, height = NULL, draggable = FALSE, fixed = FALSE,
+         cursor = c("auto", "move", "default", "inherit"))
+     … +22 lines (ctrl+o to expand)
+
+⏺ Several distinct issues. Let me investigate a few before editing.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Now let me check what CSS classes mapgl applies to its controls (layers
+  control, geocoder, draw, fullscreen, zoom).
+
+⏺ Bash(curl -s http://127.0.0.1:7575/ -o /tmp/shiny_response.html && grep -oE
+      '(mapboxgl-ctrl-[a-z-]+|class="[^"]*ctrl[^"]*")' /tmp/shiny_response.html
+       2>&1 | sort -u…)
+  ⎿  ---
+
+     [ layers-control ]
+     … +10 lines (ctrl+o to expand)
+
+⏺ Bash(Rscript -e '
+      src <- find.package("mapgl") |> file.path("htmlwidgets/mapboxgl.js") |>
+      readLines()…)
+  ⎿  [FullscreenControl] (n=2)
+       1851 : const fullscreen = new mapboxgl.FullscreenControl();
+       3822 : const fullscreen = new mapboxgl.FullscreenControl();
+     … +9 lines (ctrl+o to expand)
+
+⏺ Now I have enough context. Let me make all the changes in sequence. First,
+  fix the panel position and add a clear drag handle by restructuring the panel
+   content (the issue is that buttons + html-widgets are in shiny's cancel
+  selector for .draggable, leaving no grabbable surface).
+
+⏺ Update(~/Github/MarineSensitivity/apps/mapgl/app.R)
+  ⎿  Added 29 lines, removed 19 lines
+      832      nav_panel(
+      833        "Map",
+      834        mapboxglOutput("map"),
+      835 -      conditionalPanel( 
+      836 -        absolutePanel( 
+      837 -          id        = "flower_panel", 
+      838 -          top       = 30, 
+      839 -          right     = 60,    # right of the layers control (top-left), clear of right-side controls (nav, draw, geocoder) 
+      840 -          width     = 380,   # explicit width is required for draggable to work 
+      841 -          height    = "auto", 
+      842 -          draggable = T, 
+      843 -          accordion(accordion_panel( 
+      844 -            "Plot", 
+      835 +      absolutePanel(
+      836 +        id        = "flower_panel",
+      837 +        top       = 10,
+      838 +        left      = 60,     # just right of the layers control (top-left) 
+      839 +        width     = 380,    # explicit width required for draggable to work 
+      840 +        height    = "auto",
+      841 +        draggable = T,
+      842 +        cursor    = "move",
+      843 +        # custom drag handle on top: shiny's draggable cancels button / 
+      844 +        # input / html-widget elements, so we need a non-cancellable bar 
+      845 +        # for the user to grab 
+      846 +        tags$div(
+      847 +          class = "flower-drag-handle",
+      848 +          style = paste(
+      849 +            "padding: 6px 10px; background: rgba(20,20,20,0.85);",
+      850 +            "color: #eee; cursor: move; border-radius: 4px 4px 0 0;",
+      851 +            "border: 1px solid rgba(255,255,255,0.15); border-bottom: none;",
+      852 +            "font-size: 0.9em; font-weight: 500;"),
+      853 +          tags$span(
+      854 +            style = "margin-right: 6px; opacity: 0.7;",
+      855 +            HTML("&#9776;")),   # hamburger / drag glyph 
+      856 +          textOutput("flower_panel_title", inline = TRUE)),
+      857 +        accordion(
+      858 +          id          = "flower_accordion",
+      859 +          open        = NULL,   # all panels closed by default 
+      860 +          accordion_panel(
+      861 +            value = "flower",
+      862 +            title = "Plot",
+      863              card(
+      846 -              # style       = "resize:vertical;", 
+      864                full_screen = T,
+      848 -              # card_header(class = "bg-dark", "Score"), 
+      865                card_body(
+      850 -                girafeOutput("plot_flower", height = "100%")
+      851 -              ) 
+      852 -            ) 
+      853 -          )) 
+      854 -        ), 
+      855 -        condition = 'output.flower_status' 
+      856 -      ) 
+      866 +                girafeOutput("plot_flower", height = "300px"))))))
+      867      ),
+      868      nav_panel(
+      869        "Species",
+
+⏺ Now add the dynamic title output and the default-flower-plot subregion
+  branch. First let me add the flower_panel_title server output and remove
+  flower_status (no longer needed).
+
+⏺ Update(~/Github/MarineSensitivity/apps/mapgl/app.R)
+  ⎿  Added 14 lines, removed 10 lines
+      1019      spp_tbl_filename = NULL
+      1020    )
+      1021  
+      1022 -  output$flower_status <- reactive({ 
+      1023 -    if ( 
+      1024 -      !is.null(rx$clicked_pa) || 
+      1025 -        !is.null(rx$clicked_pra) || 
+      1026 -        !is.null(rx$clicked_cell) || 
+      1027 -        !is.null(rx$drawn_polygon) 
+      1028 -    ) { 
+      1029 -      return(T) 
+      1022 +  # dynamic title shown in the flower panel drag handle 
+      1023 +  output$flower_panel_title <- renderText({
+      1024 +    if (!is.null(rx$drawn_polygon)) {
+      1025 +      glue("Drawn polygon ({nrow(rx$drawn_polygon$cells)} cells, ",
+      1026 +           "score {round(rx$drawn_polygon$mean_score)})")
+      1027 +    } else if (!is.null(rx$clicked_cell)) {
+      1028 +      glue("Cell {rx$clicked_cell$cell_id}")
+      1029 +    } else if (!is.null(rx$clicked_pra)) {
+      1030 +      glue("{rx$clicked_pra$properties$programarea_name}")
+      1031 +    } else {
+      1032 +      sr_key <- input$sel_subregion %||% "FULL" 
+      1033 +      sr_lbl <- if (sr_key == "FULL") "All USA" else 
+      1034 +        names(sr_choices)[sr_choices == sr_key]
+      1035 +      glue("{sr_lbl} (default)")
+      1036      }
+      1031 -    F 
+      1037    })
+      1033 -  outputOptions(output, "flower_status", suspendWhenHidden = FALSE) 
+      1038  
+      1039    # * get_rast_rx ----
+      1040    get_rast_rx <- reactive({
+
+
+
+⏺ Now add the default-subregion branch to the flower plot reactive. Looking at
+  the existing structure:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Now I have the structure clear. The flower plot reactive ends at line 1671. I
+   need to add a default subregion branch at the very end (after the cell and
+  pra branches, only if nothing matched). Let me add it right before the
+  closing }).
+
+⏺ Update(~/Github/MarineSensitivity/apps/mapgl/app.R)
+  ⎿  Added 43 lines
+      1668          }
+      1669        }
+      1670      }
+      1671 + 
+      1672 +    # ** subregion default ---- 
+      1673 +    # nothing clicked / drawn: show pre-computed zone_metric for the 
+      1674 +    # current subregion (FULL falls back to the USA subregion zone) 
+      1675 +    if (is.null(rx$drawn_polygon) &&
+      1676 +        is.null(rx$clicked_cell)  &&
+      1677 +        is.null(rx$clicked_pra)) {
+      1678 +      sr_key   <- input$sel_subregion %||% "FULL" 
+      1679 +      z_sr_key <- if (sr_key == "FULL") "USA" else sr_key
+      1680 +      sr_lbl   <- if (sr_key == "FULL") "All USA" else 
+      1681 +        names(sr_choices)[sr_choices == sr_key]
+      1682 +      z_seq <- tbl(con_sdm, "zone") |>
+      1683 +        filter(
+      1684 +          tbl == !!tbl_sr,
+      1685 +          fld == "subregion_key",
+      1686 +          value == !!z_sr_key) |>
+      1687 +        pull(zone_seq)
+      1688 +      if (length(z_seq) > 0) {
+      1689 +        d_fl <- tbl(con_sdm, "metric") |>
+      1690 +          filter(str_detect(metric_key, ".*_ecoregion_rescaled$")) |>
+      1691 +          left_join(tbl(con_sdm, "zone_metric"), by = "metric_seq") |>
+      1692 +          filter(zone_seq == !!z_seq) |>
+      1693 +          select(metric_key, score = value) |>
+      1694 +          mutate(
+      1695 +            component = metric_key |>
+      1696 +              str_replace("extrisk_", "") |>
+      1697 +              str_replace("_ecoregion_rescaled", "") |>
+      1698 +              str_replace("_", " "),
+      1699 +            even = 1) |>
+      1700 +          filter(component != "all") |>
+      1701 +          collect()
+      1702 +        if (nrow(d_fl) > 0) {
+      1703 +          return(
+      1704 +            d_fl |>
+      1705 +              plot_flower(
+      1706 +                fld_category = component,
+      1707 +                fld_height   = score,
+      1708 +                fld_width    = even,
+      1709 +                tooltip_expr = "{component}: {round(score, 2)}",
+      1710 +                title        = sr_lbl))
+      1711 +        }
+      1712 +      }
+      1713 +    }
+      1714    })
+      1715  
+      1716    # click_info ----
+
+⏺ Let me check nav_panel to see if it accepts a value parameter for tab
+  targeting.
+
+⏺ Bash(Rscript -e 'print(args(bslib::nav_panel)); cat("\n---\n");
+      print(args(bslib::navset_card_tab))' 2>&1 | head -20)
+  ⎿  function (title, ..., value = title, icon = NULL)
+     NULL
+     … +5 lines (ctrl+o to expand)
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+⏺ The tab links have data-value="Map" and data-value="Species". Selectors
+  [data-value="Map"].nav-link and [data-value="Species"].nav-link will work for
+   the tour. Let me also confirm the layers control class and find the geocoder
+   control class.
+
+⏺ Bash(grep -oE
+      'layers-control[^"]*|mapboxgl-ctrl-[a-z-]+|maplibregl-ctrl-[a-z-]+'
+      /tmp/shiny_response.html 2>&1 | sort -u | head -20; echo "---"; Rscript
+      -e '
+      src <-…)
+  ⎿  ---
+     1439 : // Add geocoder control if enabled
+     1440 : if (x.geocoder_control) {
+     … +4 lines (ctrl+o to expand)
+
+⏺ Now let me update the tour with the new step list and selectors.
+
+⏺ Update(~/Github/MarineSensitivity/apps/mapgl/app.R)
+  ⎿  Added 56 lines, removed 29 lines
+       959    }) |> bindEvent(input$chk_show_splash)
+       960  
+       961    # conductor tour ----
+       962 -  tour <- Conductor$new()$step(
+       963 -    title = "Study Area", 
+       964 -    text = "Select a study area to focus on a specific subregion of US waters.", 
+       965 -    el = "#tour_subregion", 
+       966 -    position = "right" 
+       967 -  )$step( 
+       968 -    title = "Spatial Units", 
+       969 -    text = "Toggle between raster cells (0.05\u00b0) and program area aggregations.", 
+       970 -    el = "#tour_unit", 
+       971 -    position = "right" 
+       972 -  )$step( 
+       973 -    title = "Layer Selection", 
+       974 -    text = "Choose which sensitivity metric to display: composite score, individual species categories, or primary productivity.", 
+       975 -    el = "#tour_lyr", 
+       976 -    position = "right" 
+       977 -  )$step( 
+       978 -    title = "Map View", 
+       979 -    text = "The map displays sensitivity scores across US waters. Click a program area to see its detailed score breakdown.", 
+       980 -    el = "#map", 
+       981 -    position = "top" 
+       982 -  )$step( 
+       983 -    title = "Flower Plot", 
+       984 -    text = "When a program area is selected, the flower plot shows scores by species category. Petal length = score, center = weighted mean."
+           -, 
+       985 -    el = "#flower_panel", 
+       986 -    position = "right" 
+       987 -  )$step( 
+       988 -    title = "Species Tab", 
+       989 -    text = "Switch to the Species tab to see a sortable table of all species in the selected area with extinction risk details." 
+       990 -  ) 
+       962 +  tour <- Conductor$new()$
+       963 +    step(
+       964 +      title    = "Study Area",
+       965 +      text     = "Pick a region to focus on. 'Full study area' shows all US federal waters from the Aleutians to the Caribbean and out to the
+           + Pacific Island Territories. The other choices zoom into a single subregion.",
+       966 +      el       = "#tour_subregion",
+       967 +      position = "right")$
+       968 +    step(
+       969 +      title    = "Spatial Units",
+       970 +      text     = "Toggle between fine-grained raster cells (0.05\u00b0) and aggregated BOEM Program Area polygons. Cell mode lets you click a
+           +ny pixel; Program Area mode shows pre-aggregated zone scores.",
+       971 +      el       = "#tour_unit",
+       972 +      position = "right")$
+       973 +    step(
+       974 +      title    = "Layer Selection",
+       975 +      text     = "Choose which sensitivity metric to display \u2014 composite score, individual species categories (bird, fish, mammal, etc.)
+           +, or primary productivity. Note that some cells (Atlantic, Gulf of America, Hawaii, Puerto Rico, Pacific Islands) have scores but lie outside
+           + any v6 BOEM Program Area; they appear dimmed under a 'Cells outside Program Areas' overlay.",
+       976 +      el       = "#tour_lyr",
+       977 +      position = "right")$
+       978 +    step(
+       979 +      title    = "Map tab",
+       980 +      text     = "The Map tab is where you explore scores spatially \u2014 click cells, click Program Areas, draw polygons.",
+       981 +      el       = "[data-value='Map'].nav-link",
+       982 +      position = "bottom")$
+       983 +    step(
+       984 +      title    = "Species tab",
+       985 +      text     = "Switch to the Species tab to see a sortable, downloadable table of every species in the currently selected area, with extin
+           +ction-risk codes, areas, and per-category contributions.",
+       986 +      el       = "[data-value='Species'].nav-link",
+       987 +      position = "bottom")$
+       988 +    step(
+       989 +      title    = "Layers control",
+       990 +      text     = "Toggle individual map layers on and off \u2014 program area outlines, ecoregion outlines, raster cells, and the gray 'Cells
+           + outside Program Areas' overlay.",
+       991 +      el       = ".layers-control",
+       992 +      position = "right")$
+       993 +    step(
+       994 +      title    = "Flower Plot",
+       995 +      text     = "Aggregated sensitivity scores for the current selection, broken out by species category. Petal length = score (0\u2013100);
+           + center number = weighted mean. The header shows what's currently scored (defaults to 'All USA'). Click the 'Plot' bar to expand it. Drag the
+           + dark header to move the panel anywhere on the map.",
+       996 +      el       = "#flower_panel",
+       997 +      position = "right")$
+       998 +    step(
+       999 +      title    = "Go to location",
+      1000 +      text     = "Search for a place name and the map will fly there \u2014 useful for jumping to a specific Program Area, port, or feature."
+           +,
+      1001 +      el       = ".mapboxgl-ctrl-geocoder",
+      1002 +      position = "left")$
+      1003 +    step(
+      1004 +      title    = "Draw your own area",
+      1005 +      text     = "Click the polygon tool, then click on the map to define vertices and double-click to finish. The flower plot and species ta
+           +ble will update to show scores for whatever cells your polygon covers \u2014 even in the gray-overlay regions outside the Program Areas. Use
+           +the trash icon to delete the polygon and revert to the prior selection.",
+      1006 +      el       = ".mapbox-gl-draw_polygon",
+      1007 +      position = "left")$
+      1008 +    step(
+      1009 +      title    = "Full screen",
+      1010 +      text     = "Expand the map to fill the entire window.",
+      1011 +      el       = ".mapboxgl-ctrl-fullscreen",
+      1012 +      position = "left")$
+      1013 +    step(
+      1014 +      title    = "Zoom in / out",
+      1015 +      text     = "Zoom and reset the view. You can also use the mouse wheel, pinch gesture, or double-click.",
+      1016 +      el       = ".mapboxgl-ctrl-zoom-in",
+      1017 +      position = "left")
+      1018    tour$init()
+      1019    if (verbose) {
+      1020      message("conductor tour initialized")
+
+⏺ Now syntax check, restart the app, and verify.
+
+⏺ Bash(Rscript -e 'parse(file =
+      "/Users/bbest/Github/MarineSensitivity/apps/mapgl/app.R"); cat("syntax
+      OK\n")' 2>&1 | tail -3)
+  ⎿          })
+         }, shinyApp(ui, server))
+     syntax OK
+
+⏺ Bash(lsof -ti :7575 2>/dev/null | xargs -I {} kill {} 2>/dev/null; sleep 1)
+  ⎿  (No output)
+
+⏺ Bash(cd /Users/bbest/Github/MarineSensitivity/apps && Rscript -e '
+      options(shiny.port = 7575)…)
+  ⎿  Running in the background (↓ to manage)
+
+⏺ Bash(sleep 5 && curl -s -o /dev/null -w "HTTP %{http_code}\n"
+      http://127.0.0.1:7575/ 2>&1; cat
+      /private/tmp/claude-501/-Users-bbest-Github-MarineSensitivity-workflow…)
+  ⎿  HTTP 200
+     Loading required package: shiny
+     … +8 lines (ctrl+o to expand)
+
+⏺ App is up and serving HTTP 200. Reload http://127.0.0.1:7575 in your browser.
+
+  Changes
+
+  1. Position fixed (left, not right)
+  - right = 60 → left = 60 so the panel anchors just to the right of the layers control (top-left)
+  - top = 30 → top = 10
+
+  2. Drag handle added
+  The reason it wasn't dragging: shiny's absolutePanel(draggable = TRUE) initializes jQuery UI draggable with cancel =
+  ".shiny-input-container,.html-widget,input,textarea,button,select,option". The accordion header is a <button> and the girafe plot is a .html-widget, so the
+  entire panel had no grabbable surface. I added a custom flower-drag-handle div on top of the accordion (a tags$div, not a button or widget) that's outside the
+   cancel selector, so it's grabbable. It shows a hamburger glyph and a dynamic title.
+
+  3. Default flower plot for current subregion
+  - Removed the conditionalPanel wrapper — the panel is now always in the DOM (which also helps draggable initialization)
+  - Removed the output$flower_status reactive (no longer needed)
+  - Accordion open = NULL so it starts collapsed
+  - New default branch in output$plot_flower that, when nothing is clicked or drawn, queries zone_metric for the current subregion zone (USA, AK, GA, or PA —
+  and FULL falls back to USA per your "All USA" request) and renders the flower plot with the subregion label as the title
+  - New output$flower_panel_title text output drives the drag handle title:
+    - default → e.g. "All USA (default)"
+    - clicked cell → "Cell 12345"
+    - clicked program area → the PA name
+    - drawn polygon → "Drawn polygon (N cells, score X)"
+
+  4. Tour rewritten
+  New step list, in order, with element selectors:
+  1. Study Area (#tour_subregion) — explains FULL vs subregion choices
+  2. Spatial Units (#tour_unit) — cell vs program-area mode
+  3. Layer Selection (#tour_lyr) — now mentions the gray "Cells outside Program Areas" overlay explicitly
+  4. Map tab ([data-value='Map'].nav-link) — highlights the actual tab button
+  5. Species tab ([data-value='Species'].nav-link) — same
+  6. Layers control (.layers-control) — mapgl's layers toggle on the map
+  7. Flower Plot (#flower_panel) — describes the panel and how to drag it
+  8. Go to location (.mapboxgl-ctrl-geocoder) — geocoder search
+  9. Draw your own area (.mapbox-gl-draw_polygon) — describes drawing + that it works in gray-overlay regions
+  10. Full screen (.mapboxgl-ctrl-fullscreen)
+  11. Zoom in / out (.mapboxgl-ctrl-zoom-in)
+
+  If any of the mapboxgl-control selectors don't highlight the right element (those classes are mapbox-gl-js conventions and should be correct, but I haven't
+  been able to verify them in a live browser context), the tour text will still display — let me know which ones miss and I'll adjust.
+
+✻ Brewed for 6m 30s · 1 shell still running
+
+⏺ Background command "Restart mapgl app" failed with exit code 143
+
+⏺ That's the previous app (bx8lr7zqw) that I killed before restarting. Exit code 143 = SIGTERM, expected. The current app is running as bwam3y89z and is healthy
+   (HTTP 200 confirmed).
+
+❯ [Image #6] The Plot box, although draggable, now does not show any flower plot at all, even when clicking a cell or Program area. It has always felt a        
+  overcrowded. Let's instead move it to a dedicated tab (with some renames): Map, Plot of Scores, Table of Species. Update the tour too, and ensure it gets     
+  populated with a flower plot.                                                                                                                                 
+  ⎿  [Image #6]
+
+⏺ Two things to address: (a) the renderGirafe never returns the plot because each branch leaves a "dangling" expression instead of an explicit return() — and
+  the function falls through to my default branch which evaluates to NULL; (b) restructure into a dedicated tab.
+
+  Let me first restructure the navset and remove the absolutePanel.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(~/Github/MarineSensitivity/apps/mapgl/app.R)
+  ⎿  Added 17 lines, removed 35 lines
+      828    ),
+      829  
+      830    navset_card_tab(
+      831 +    id          = "main_tabs",
+      832      full_screen = TRUE,
+      833      nav_panel(
+      833 -      "Map", 
+      834 -      mapboxglOutput("map"), 
+      835 -      absolutePanel( 
+      836 -        id        = "flower_panel", 
+      837 -        top       = 10, 
+      838 -        left      = 60,     # just right of the layers control (top-left) 
+      839 -        width     = 380,    # explicit width required for draggable to work 
+      840 -        height    = "auto", 
+      841 -        draggable = T, 
+      842 -        cursor    = "move", 
+      843 -        # custom drag handle on top: shiny's draggable cancels button / 
+      844 -        # input / html-widget elements, so we need a non-cancellable bar 
+      845 -        # for the user to grab 
+      846 -        tags$div( 
+      847 -          class = "flower-drag-handle", 
+      848 -          style = paste( 
+      849 -            "padding: 6px 10px; background: rgba(20,20,20,0.85);", 
+      850 -            "color: #eee; cursor: move; border-radius: 4px 4px 0 0;", 
+      851 -            "border: 1px solid rgba(255,255,255,0.15); border-bottom: none;", 
+      852 -            "font-size: 0.9em; font-weight: 500;"), 
+      853 -          tags$span( 
+      854 -            style = "margin-right: 6px; opacity: 0.7;", 
+      855 -            HTML("&#9776;")),   # hamburger / drag glyph 
+      856 -          textOutput("flower_panel_title", inline = TRUE)), 
+      857 -        accordion( 
+      858 -          id          = "flower_accordion", 
+      859 -          open        = NULL,   # all panels closed by default 
+      860 -          accordion_panel( 
+      861 -            value = "flower", 
+      862 -            title = "Plot", 
+      863 -            card( 
+      864 -              full_screen = T, 
+      865 -              card_body( 
+      866 -                girafeOutput("plot_flower", height = "300px")))))) 
+      834 +      title = "Map",
+      835 +      value = "Map",
+      836 +      mapboxglOutput("map")
+      837      ),
+      838      nav_panel(
+      869 -      "Species", 
+      839 +      title = "Plot of Scores",
+      840 +      value = "Plot of Scores",
+      841        card(
+      842 +        full_screen = T,
+      843 +        card_header(textOutput("flower_panel_title", inline = TRUE)),
+      844 +        card_body(
+      845 +          girafeOutput("plot_flower", height = "100%")
+      846 +        )
+      847 +      )
+      848 +    ),
+      849 +    nav_panel(
+      850 +      title = "Table of Species",
+      851 +      value = "Table of Species",
+      852 +      card(
+      853          card_header(
+      854            span(
+      855              textOutput("spp_tbl_hdr", inline = T),
+
+⏺ Now fix the renderGirafe to use explicit return() in each branch (the bug that prevented the plot from showing).
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Now I'll add return() to the cell and pra branches so each properly returns its plot object.
+
+⏺ Update(~/Github/MarineSensitivity/apps/mapgl/app.R)
+  ⎿  Added 9 lines, removed 8 lines
+      1595          collect()
+      1596  
+      1597        if (nrow(d_fl) > 0) {
+      1598 -        d_fl |> 
+      1599 -          plot_flower( 
+      1600 -            fld_category = component, 
+      1601 -            fld_height = score, 
+      1602 -            fld_width = even, 
+      1603 -            tooltip_expr = "{component}: {round(score, 2)}", 
+      1604 -            title = glue("Cell ID: {cell_id} (x: {lng}, y: {lat})") 
+      1605 -          ) 
+      1598 +        return(
+      1599 +          d_fl |>
+      1600 +            plot_flower(
+      1601 +              fld_category = component,
+      1602 +              fld_height = score,
+      1603 +              fld_width = even,
+      1604 +              tooltip_expr = "{component}: {round(score, 2)}",
+      1605 +              title = glue("Cell ID: {cell_id} (x: {lng}, y: {lat})")
+      1606 +            ))
+      1607        }
+      1608        # } else if (input$sel_unit == "pa" && !is.null(rx$clicked_pa)) {
+      1609        #   # get data for planning area
+
+⏺ Update(~/Github/MarineSensitivity/apps/mapgl/app.R)
+  ⎿  Added 8 lines, removed 7 lines
+      1668            collect()
+      1669  
+      1670          if (nrow(d_fl) > 0) {
+      1671 -          d_fl |> 
+      1672 -            plot_flower( 
+      1673 -              fld_category = component, 
+      1674 -              fld_height   = score, 
+      1675 -              fld_width    = even, 
+      1676 -              tooltip_expr = "{component}: {round(score, 2)}", 
+      1677 -              title        = pra_name) 
+      1671 +          return(
+      1672 +            d_fl |>
+      1673 +              plot_flower(
+      1674 +                fld_category = component,
+      1675 +                fld_height   = score,
+      1676 +                fld_width    = even,
+      1677 +                tooltip_expr = "{component}: {round(score, 2)}",
+      1678 +                title        = pra_name))
+      1679          }
+      1680        }
+      1681      }
+
+⏺ Now update the tour to reflect the new tab structure (Map → Plot of Scores → Table of Species) and remove the obsolete "Flower Plot" panel step.
+
+⏺ Update(~/Github/MarineSensitivity/apps/mapgl/app.R)
+  ⎿  Added 12 lines, removed 12 lines
+      963        el       = "[data-value='Map'].nav-link",
+      964        position = "bottom")$
+      965      step(
+      966 -      title    = "Species tab", 
+      967 -      text     = "Switch to the Species tab to see a sortable, downloadable table of every species in the currently selected area, with extinc
+          -tion-risk codes, areas, and per-category contributions.", 
+      968 -      el       = "[data-value='Species'].nav-link", 
+      969 -      position = "bottom")$ 
+      970 -    step( 
+      966        title    = "Layers control",
+      967        text     = "Toggle individual map layers on and off \u2014 program area outlines, ecoregion outlines, raster cells, and the gray 'Cells
+           outside Program Areas' overlay.",
+      968        el       = ".layers-control",
+      969        position = "right")$
+      970      step(
+      976 -      title    = "Flower Plot", 
+      977 -      text     = "Aggregated sensitivity scores for the current selection, broken out by species category. Petal length = score (0\u2013100);
+          -center number = weighted mean. The header shows what's currently scored (defaults to 'All USA'). Click the 'Plot' bar to expand it. Drag the d
+          -ark header to move the panel anywhere on the map.", 
+      978 -      el       = "#flower_panel", 
+      979 -      position = "right")$ 
+      980 -    step( 
+      971        title    = "Go to location",
+      972        text     = "Search for a place name and the map will fly there \u2014 useful for jumping to a specific Program Area, port, or feature.",
+      973        el       = ".mapboxgl-ctrl-geocoder",
+      974        position = "left")$
+      975      step(
+      976        title    = "Draw your own area",
+      987 -      text     = "Click the polygon tool, then click on the map to define vertices and double-click to finish. The flower plot and species tab
+          -le will update to show scores for whatever cells your polygon covers \u2014 even in the gray-overlay regions outside the Program Areas. Use th
+          -e trash icon to delete the polygon and revert to the prior selection.", 
+      977 +      text     = "Click the polygon tool, then click on the map to define vertices and double-click to finish. The Plot of Scores and Table of
+          + Species tabs will update to show results for whatever cells your polygon covers \u2014 even in the gray-overlay regions outside the Program A
+          +reas. Use the trash icon to delete the polygon and revert to the prior selection.",
+      978        el       = ".mapbox-gl-draw_polygon",
+      979        position = "left")$
+      980      step(
+     ...
+       986        title    = "Zoom in / out",
+       987        text     = "Zoom and reset the view. You can also use the mouse wheel, pinch gesture, or double-click.",
+       988        el       = ".mapboxgl-ctrl-zoom-in",
+       999 -      position = "left") 
+       989 +      position = "left")$
+       990 +    step(
+       991 +      title    = "Plot of Scores tab",
+       992 +      text     = "Switch here to see the flower plot of aggregated sensitivity scores for the current selection, broken out by species catego
+           +ry. Petal length = score (0\u2013100); center number = weighted mean. Defaults to 'All USA' until you click a cell, click a Program Area, or
+           +draw a polygon.",
+       993 +      el       = "[data-value='Plot of Scores'].nav-link",
+       994 +      position = "bottom")$
+       995 +    step(
+       996 +      title    = "Table of Species tab",
+       997 +      text     = "A sortable, downloadable table of every species in the currently selected area, with extinction-risk codes, areas, and per-
+           +category contributions.",
+       998 +      el       = "[data-value='Table of Species'].nav-link",
+       999 +      position = "bottom")
+      1000    tour$init()
+      1001    if (verbose) {
+      1002      message("conductor tour initialized")
+
+⏺ Syntax check, then restart.
+
+⏺ Bash(Rscript -e 'parse(file = "/Users/bbest/Github/MarineSensitivity/apps/mapgl/app.R"); cat("syntax OK\n")' 2>&1 | tail -3)
+  ⎿          })
+         }, shinyApp(ui, server))
+     syntax OK
+
+⏺ Bash(lsof -ti :7575 2>/dev/null | xargs -I {} kill {} 2>/dev/null; sleep 1)
+  ⎿  (No output)
+
+⏺ Bash(cd /Users/bbest/Github/MarineSensitivity/apps && Rscript -e '
+      options(shiny.port = 7575)…)
+  ⎿  Running in the background (↓ to manage)
+
+⏺ Bash(sleep 5 && curl -s -o /dev/null -w "HTTP %{http_code}\n" http://127.0.0.1:7575/ 2>&1; cat
+      /private/tmp/claude-501/-Users-bbest-Github-MarineSensitivity-workflow…)
+  ⎿  HTTP 200
+       The 'cran_repo' argument in shelf() was not set, so it will use
+       cran_repo = 'https://cran.r-project.org' by default.
+     … +6 lines (ctrl+o to expand)
+
+⏺ App is up at http://127.0.0.1:7575. Reload your browser.
+
+  Changes
+
+  Three tabs (renamed): Map → Plot of Scores → Table of Species. The flower plot is now a top-level tab with its own card containing a header (the dynamic title
+   from output$flower_panel_title) and the girafe output. No more floating panel, no more accordion, no more drag handle — much less crowded.
+
+  Bug fix — flower plot wasn't rendering (the actual root cause of the empty box you were seeing): the renderGirafe reactive had three independent if blocks for
+   drawn-polygon / cell / pra, plus my new default-subregion if at the end. Each branch's last expression was the plot object, but in R the function's return
+  value is the last expression of the function body, not whichever branch happened to match. After the cell branch ran, execution fell through to the pra branch
+   (no-op) and then the default-subregion if (no-op because clicked_cell isn't NULL), and the function ended returning NULL. Fixed by adding explicit
+  return(...) to the cell, pra, and drawn-polygon branches so each branch terminates the reactive as soon as it has a plot.
+
+  Tour updated to match the new tab structure and order:
+  1. Study Area
+  2. Spatial Units
+  3. Layer Selection (mentions "Cells outside Program Areas" overlay)
+  4. Map tab
+  5. Layers control
+  6. Go to location
+  7. Draw your own area
+  8. Full screen
+  9. Zoom in/out
+  10. Plot of Scores tab (new — [data-value='Plot of Scores'].nav-link)
+  11. Table of Species tab (new — [data-value='Table of Species'].nav-link)
+
+  The "Flower Plot" panel step is gone since the panel is gone. The tour now flows: configure on the left → explore the Map tab and its controls → check the
+  Plot of Scores → check the Table of Species.
+
+  You should see:
+  - Three tabs at the top: Map | Plot of Scores | Table of Species
+  - Default load: Plot of Scores tab shows the All USA flower plot
+  - Click a cell → flower plot updates to that cell
+  - Click a Program Area → flower plot updates to that PA
+  - Draw a polygon → flower plot updates to the polygon
+  - Map tab is no longer cluttered with a floating panel
+
+✻ Sautéed for 2m 47s · 1 shell still running
+
+⏺ Background command "Restart app" failed with exit code 143
+
+⏺ That's the previous app process (bwam3y89z) which I killed before restarting. Exit code 143 = SIGTERM, expected. The current app is running as bu43npq07 and
+  is healthy (HTTP 200 confirmed).
+
+❯ The tour is looking great! Plot of Scores and Table of Species are both empty for All USA (default). [Image #7] [Image #8] But working for a selected cell or 
+   Program area.                                                                                                                                                
+  ⎿  [Image #7]
+  ⎿  [Image #8]
+
+⏺ Both empty. Let me run the queries manually against the v6 db to see what's actually in the subregion zones.
+
+⏺ Bash(Rscript -e '
+      suppressPackageStartupMessages({…)
+  ⎿  --- subregion zones ---
+     # A tibble: 4 × 5
+       zone_seq tbl                    fld           value date_created
+     … +17 lines (ctrl+o to expand)
+
+⏺ Two findings:
+  1. zone_metric has 0 rows for the USA subregion zone — subregion-level metrics simply weren't computed in v6
+  2. zone_taxon has 9,226 rows for USA, but the species table shows 0 because the existing subregion branch filters by zone_value == sr_key and sr_key == "FULL"
+   doesn't exist
+
+  Let me check whether any subregion has zone_metric rows, and how many cells are in the USA subregion zone (so I know how feasible on-the-fly aggregation is).
+
+⏺ Bash(Rscript -e '
+      suppressPackageStartupMessages({library(DBI); library(duckdb); library(dplyr)})…)
+  ⎿  --- zone_metric rows per subregion zone ---
+     Error in `group_by()`:
+     ℹ In argument: `value`
+     … +17 lines (ctrl+o to expand)
+
+⏺ Bash(Rscript -e '
+      suppressPackageStartupMessages({library(DBI); library(duckdb); library(dplyr)})…)
+  ⎿  --- zone_metric rows per subregion zone ---
+     # A tibble: 0 × 2
+     # Groups:   sr_value [0]
+     … +21 lines (ctrl+o to expand)
+
+⏺ Found it. Two separate fixes needed:
+
+  1. Subregion zone_metric is empty — v6 simply doesn't have aggregated metrics for the four subregion zones (only program-area zones). I need to compute the
+  default flower plot on the fly from cell_metric × zone_cell.
+  2. Species table default branch filters by zone_value == sr_key which is "FULL" (not a real value). Need a FULL → USA fallback.
+
+  Let me fix both. First the flower plot default branch:
+
+⏺ Update(~/Github/MarineSensitivity/apps/mapgl/app.R)
+  ⎿  Added 17 lines, removed 7 lines
+      1681      }
+      1682  
+      1683      # ** subregion default ----
+      1684 -    # nothing clicked / drawn: show pre-computed zone_metric for the 
+      1685 -    # current subregion (FULL falls back to the USA subregion zone)
+      1684 +    # nothing clicked / drawn: aggregate cell_metric across all cells in 
+      1685 +    # the current subregion zone (FULL falls back to USA). v6 doesn't 
+      1686 +    # populate zone_metric for subregion zones, so we compute on the fly 
+      1687 +    # via the same weighted-mean SQL used for zone_metric in calc_scores. 
+      1688      if (is.null(rx$drawn_polygon) &&
+      1689          is.null(rx$clicked_cell)  &&
+      1690          is.null(rx$clicked_pra)) {
+     ...
+      1701        if (length(z_seq) > 0) {
+      1702          d_fl <- tbl(con_sdm, "metric") |>
+      1703            filter(str_detect(metric_key, ".*_ecoregion_rescaled$")) |>
+      1702 -          left_join(tbl(con_sdm, "zone_metric"), by = "metric_seq") |>
+      1703 -          filter(zone_seq == !!z_seq) |> 
+      1704 -          select(metric_key, score = value) |> 
+      1704 +          inner_join(tbl(con_sdm, "cell_metric"), by = "metric_seq") |>
+      1705 +          inner_join(
+      1706 +            tbl(con_sdm, "zone_cell") |>
+      1707 +              filter(zone_seq == !!z_seq) |>
+      1708 +              select(cell_id, pct_covered),
+      1709 +            by = "cell_id") |>
+      1710 +          group_by(metric_key) |>
+      1711 +          summarize(
+      1712 +            score = sum(value * pct_covered, na.rm = TRUE) /
+      1713 +                    sum(pct_covered, na.rm = TRUE),
+      1714 +            .groups = "drop") |>
+      1715 +          collect() |>
+      1716            mutate(
+      1717              component = metric_key |>
+      1718                str_replace("extrisk_", "") |>
+      1719                str_replace("_ecoregion_rescaled", "") |>
+      1720                str_replace("_", " "),
+      1721              even = 1) |>
+      1711 -          filter(component != "all") |>
+      1712 -          collect() 
+      1722 +          filter(component != "all")
+      1723          if (nrow(d_fl) > 0) {
+      1724            return(
+      1725              d_fl |>
+  ⎿  Interrupted · What should Claude do instead?
+
+Let's fix by ensuring subregion gets properly included in zone_metric (probably in `@calc_scores.qmd`), so runs faster. We should also cache the default view 
+   results so it loads fast
+
+⏺ I have the picture. The chunk cell_metrics_to_programarea_metrics at line 1834 only processes program-area zones. The aggregation SQL itself works on any zone
+   — I just need to add subregion zones to z_seqs. Let me do both: fix the QMD for future regeneration, AND add app-side caching that computes on the fly the   
+  first time (so it works immediately without re-running the pipeline).                                                                                         
+                                                                                                                                                                
+  Step 1: Fix calc_scores.qmd to include subregions in zone_metric.
+
+⏺ Now run that single chunk against the existing v6 db so subregion zone_metric rows get populated immediately (without needing a full pipeline rerun). Let me
+  first verify this is safe to do — read what do_metrics is set to and confirm the chunk's logic doesn't have side effects beyond inserting subregion rows.
+
+⏺ All four subregions (USA, AK, GA, PA) now have 8 ecoregion-rescaled metrics in zone_metric. The default flower-plot query in the app should now work fast
+  against the existing zone_metric table without on-the-fly aggregation.                                                                                        
+                                                                                                                                                                
+  Step 2: Revert the on-the-fly aggregation in the app to the simple zone_metric query (now that the data exists), and add app-side caching for both the flower 
+  data and the species table.                                                                                                                                   
+                                                                                                                                                                
+  Let me cache both: per-subregion flower data + per-subregion species table data, computed once at app startup and stored in memory. I'll add the cache build  
+  right after the existing r_outside_pra cache.
+
+⏺ Now fix the species table default branch — it currently filters by zone_value == sr_key where sr_key == "FULL" (no rows). Apply the same FULL→USA fallback.
+
+⏺ Cache file built with all 4 subregions × 8 components. Reload http://127.0.0.1:7575 in your browser.                                                          
+                                                                                                                                                                
+  Summary of changes                                                                                                                                            
+                                                                     
+  1. calc_scores.qmd fix (workflows/calc_scores.qmd:1831–1932)                                                                                                  
+  - Renamed chunk cell_metrics_to_programarea_metrics → cell_metrics_to_zone_metrics
+  - z_seqs now includes both program-area and subregion zones via tbl %in% c(!!tbl_pra, !!tbl_sr) so the same weighted-mean SQL populates zone_metric for both  
+  - Verification block now groups by zone_tbl so you can see the per-zone-type stats                                                                          
+  - The next chunk (apply_pctarea_to_programarea_components) is unchanged — pct_area weighting still only applies to program areas; subregion entries get the   
+  raw weighted mean                                                                                                                                             
+                                                                                                                                                                
+  2. One-shot DB update — ran the same SQL against the existing v6 db so the 4 subregion zones now have 8 ecoregion-rescaled metrics each (32 new rows in       
+  zone_metric). No need to re-run the full pipeline.                                                                                                            
+                                                                     
+  3. App cache (apps/mapgl/app.R)                                                                                                                               
+  - New disk cache mapgl/cache/flower_default_subregions.csv (2 KB, 32 rows) holding the per-subregion flower data, built once at startup from zone_metric (or
+  rebuilt automatically if you delete it)                                                                                                                       
+  - Default flower-plot branch in output$plot_flower now reads from this in-memory tibble instead of querying the db
+  - Species-table default branch fixed to apply FULL → USA fallback so you actually get the 9,226 USA species rows instead of 0                                 
+                                                                                                                                                                
+  The Plot of Scores tab should now show the All USA flower plot instantly on first load, and the Table of Species tab should show the 9,226 USA species.       
+  Picking AK / GA / PA from the Study Area dropdown will swap to that subregion's pre-computed data (still instant from the cache + zone_taxon). 
 
 ## 2026-04-09 final-report_2025 edits
 
