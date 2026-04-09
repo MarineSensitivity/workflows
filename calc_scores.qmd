@@ -1828,19 +1828,30 @@ tbl(con_sdm, "metric") |>
   summary()
 ```
 
-### Calculate ProgramArea metrics contributing to score based on cell metrics
+### Calculate ProgramArea + Subregion metrics contributing to score based on cell metrics
+
+The same weighted-mean SQL works for any zone (program area, subregion,
+ecoregion) because it joins through `zone_cell`. We aggregate to both
+program-area and subregion zones in one pass so the app can render a
+default flower plot for "All USA" / Alaska / Pacific / Gulf of America
+without computing on the fly. Note: the `pct_area` weighting in the
+next chunk only applies to program-area zones; subregion zones get the
+raw weighted mean.
 
 ```{r}
-#| label: cell_metrics_to_programarea_metrics
+#| label: cell_metrics_to_zone_metrics
 #| eval: !expr do_metrics
 
-# get zone_seqs for program areas
+# get zone_seqs for program areas + subregions
 z_seqs <- tbl(con_sdm, "zone") |>
-  filter(tbl == !!tbl_pra) |>
+  filter(tbl %in% c(!!tbl_pra, !!tbl_sr)) |>
   pull(zone_seq)
 
-message(glue("Calculating metrics for {length(z_seqs)} program areas..."))
-# Calculating metrics for 20 program areas...
+n_pra <- tbl(con_sdm, "zone") |> filter(tbl == !!tbl_pra) |> tally() |> pull(n)
+n_sr  <- tbl(con_sdm, "zone") |> filter(tbl == !!tbl_sr ) |> tally() |> pull(n)
+message(glue(
+  "Calculating metrics for {length(z_seqs)} zones ",
+  "({n_pra} program areas + {n_sr} subregions)..."))
 
 metrics <- c(
   glue("extrisk_{sp_cats}"),
@@ -1906,7 +1917,7 @@ for (m_key in metrics) {
   message(glue("  Calculated {m_key}"))
 }
 
-# verify
+# verify (program areas + subregions)
 d_ck <- tbl(con_sdm, "metric") |>
   select(metric_seq, metric_key) |>
   filter(metric_key %in% metrics) |>
@@ -1916,17 +1927,22 @@ d_ck <- tbl(con_sdm, "metric") |>
   ) |>
   left_join(
     tbl(con_sdm, "zone") |>
-      filter(tbl == !!tbl_pra) |>
-      select(zone_seq, pra_key = value),
+      filter(tbl %in% c(!!tbl_pra, !!tbl_sr)) |>
+      select(zone_seq, zone_tbl = tbl, zone_value = value),
     by = "zone_seq"
   ) |>
-  filter(!is.na(pra_key)) |>
+  filter(!is.na(zone_value)) |>
   collect()
 
 d_ck |>
   filter(str_detect(metric_key, "_ecoregion_rescaled")) |>
-  pull(value) |>
-  summary()
+  group_by(zone_tbl) |>
+  summarize(
+    n        = n(),
+    min      = min(value, na.rm = TRUE),
+    median   = median(value, na.rm = TRUE),
+    max      = max(value, na.rm = TRUE),
+    .groups  = "drop")
 #  Min. 1st Qu.  Median    Mean 3rd Qu.    Max.
 # 1.195  11.186  21.902  27.317  41.150  91.748
 ```
