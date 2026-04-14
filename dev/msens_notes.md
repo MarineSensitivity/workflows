@@ -20,6 +20,841 @@
 
 - Migrate to hexagons
 
+## 2026-04-14 mapgl: + Report tab, parameterized report.qmd
+
+The polygon generation and summary display in the **mapgl** app (`@../apps/mapgl/`) is a bit wiggly. It's unclear with the overlay polygon and then the polygon can get moved and regenerate. Instead, we should have a **Report** tab in the app that allows explicit polygon drawing or selection of existing Program Areas, inclusion of a title, selection of an output format and submission via GET URL to a seperate parameterized Quarto report.
+
+In `@../apps` create a parameterized `report.qmd` that accepts the following **parameters** from the URL:
+- `title`
+  title of the report
+- `place_wkt`
+  as well-known text (WKT)
+- `format`
+  html, docx, pdf
+  
+The report should have the following content sections:
+
+- **Parameters**
+  This should be the input parameters displayes as yaml. So far, just `place_wkt`, but more in future.
+
+- **Map**
+  Map showing the polygon of `place_wkt`
+
+- **Plot of Scores**
+  Interactive plot of scores (unless docx/pdf)
+
+- **Table of Species**
+  Interactive table of species (unless docx/pdf)
+
+These outputs mirror the **mapgl** app (`@../apps/mapgl/`) and should reuse functions from **msens** R library (`@../msens/`). So the map, plot and table outputs found in mapgl should use functions from msens and have an alternative static implementation for pdf/docx outputs in the report.
+
+←  ☐ Render endpoint  ☐ Static table  ☐ Map-tab draw  ✔ Submit  →
+
+**Render endpoint** How should the parameterized report be rendered on demand when the Report tab
+submits its URL?
+
+❯ 1. Plumber /report route (Recommended)
+     Add GET /report to the existing api/plumber.R. It shells to
+     quarto::quarto_render(), caches by hashed inputs under
+     /share/public/reports, and 303-redirects to the Caddy-served file URL.
+     Requires installing Quarto CLI + TinyTeX in server/plumber/Dockerfile.
+  2. New dedicated Shiny/Quarto service
+     Stand up a new container or small Shiny app just for rendering. Cleaner
+     separation, but more infra (new docker service, Caddy route, CI config).
+  3. Render client-side from mapgl
+     Have the Shiny app call quarto_render() inline and serve the output from
+     its own session. Simpler to wire, but blocks the app's R process during
+     renders and couples report rendering to the interactive session.
+
+**Static table** For pdf/docx output, should the species table use gt or kable?                
+                
+  1. knitr::kable (Recommended)
+     Zero new deps, already used in workflows reports. Simpler styling but 
+     works reliably across html/pdf/docx.                        
+❯ 2. gt::gt                                                 
+     Nicer docx/pdf styling with column formatting, but adds gt to msens    
+     Imports and requires more per-format tweaking.
+
+**Map-tab draw** What should happen to the existing 'wiggly' draw-on-Map-tab flow once the     
+Report tab ships?
+                               
+  1. Leave it — Map tab stays exploratory (Recommended)                    
+     Keep the current reactive draw/flower/species behavior on the Map tab as a
+      fast exploration surface. The Report tab becomes the canonical 'freeze 
+     and generate persistent output' flow. Minimal regression risk.         
+  2. Remove reactive scoring from the Map tab                              
+     Delete the drawn_polygon observer so drawing a polygon on the Map tab no 
+     longer triggers score/species recomputation. All drawn-polygon scoring    
+     goes exclusively through the Report tab.                                
+❯ 3. Remove drawing from the Map tab entirely
+     Strip the mapgl draw control from the Map tab so there's only one way to 
+     draw — inside the Report tab itself. Largest refactor; cleanest UX.
+
+Looking good, but a few more considerations:
+
+- The mapgl app uses`mapgl::mapboxgl()` but that won't work in a Quarto document (*.qmd), per [Mapbox won't render in Quarto · Issue #3 · walkerke/mapgl](https://github.com/walkerke/mapgl/issues/3). Instead, `mapgl::maplibre()` needs to be used.
+
+- We are regularly producing different versions of the database and apps, so add a paramater `ver` for version, ie currenty `v6`. This should be available as a drop-down in the Report tab.
+
+- The map in the Report tab should emulate the existing Map tab, ie show by cell or Program Area and for given layer. These all are  foreseeably relevant to how a user might want to draw an area.
+
+- How would a user go about selecting a multiple Program Areas to each generate information on in the report? For that matter, could a user draw multiple polygons, add a label to each, and have it generate in the report? Because of this desired feature, consider also using `knitr::knit_child()` a la https://mickael.canouil.fr/posts/2023-03-05-quarto-auto-table-crossref/#the-answersolution. When multiple polygons exist, the Map should show all on the same map, whereas the Table of Species and Plot of Scores, could be tabsets of each.
+
+Actually, I see that you recommended ggplot and rnaturalearth for static maps (ie for pdf/docx) -- yes let's go that route. And go ahead with any msens min version needed, like for gt.
+
+⏺ Plan is updated with all four considerations: maplibre() in Quarto, ver      
+  parameter + dropdown, embedded Report map reusing shared sidebar via a       
+  factored build_report_map(), and multi-area support via JSON POST +          
+  knit_child tabsets. Exiting plan mode for approval.                          
+
+ Ready to code?                                                                
+                                                                               
+ Here is Claude's plan:                                 
+
+ Plan: Report tab + parameterized Quarto report                                
+                                  
+ Context                                                                       
+                                                        
+ The apps/mapgl Shiny app currently lets users draw a polygon directly on the
+ map; scores recompute reactively as the polygon is drawn, moved, or edited.
+ This is "wiggly" — overlay rendering and the constant recomputation make it
+ unclear when a polygon is "final," and there is no way to capture the result.
+
+ We want a clean, explicit flow: a new Report tab where the user builds a
+ list of labeled areas of interest — each area is either a drawn polygon
+ (with a label the user types) or one or more selected BOEM Program Areas —
+ enters a report title, picks the data version and output format, and submits
+ to a separate parameterized Quarto report (apps/report.qmd) hosted via a
+ render-on-demand endpoint. The report produces one map showing all areas
+ together, plus tabsets of the Plot of Scores and Table of Species where
+ each tab is one labeled area. Per-area sections are generated with
+ knitr::knit_child() following the pattern at
+ https://mickael.canouil.fr/posts/2023-03-05-quarto-auto-table-crossref/.
+
+ The existing draw flow is removed from the Map tab entirely. The Map tab
+ becomes a pure exploration surface (cells/PRA click + layer toggles); all
+ polygon drawing happens inside the Report tab's own embedded map. One place
+ to draw, one place to generate — the "wiggly" behavior goes away because the
+ reactive input$map_drawn_features observer is deleted.
+
+ Shared sidebar. The app's existing top-level sidebar() already contains
+ sel_subregion, sel_unit, sel_lyr, tgl_sphere (app.R:830–862) and
+ those inputs apply across all tabs — so the Report tab's embedded map
+ inherits layer/unit/subregion selection from the Map tab for free. No
+ duplication needed. The Report tab only needs to add report-specific
+ controls (title, ver, format, area list, submit).
+
+ A second motivation: the mapgl app's score/species/flower-plot helpers are
+ inline (app.R:191–409), with a duplicate plot_flower() in
+ apps/scores/functions.R. The line-321 comment in app.R already calls out
+ the intent to migrate them into msens. The report needs them, the Shiny app
+ needs them, so this is the moment.
+
+ Architecture
+
+ Three pieces, layered so each is independently testable:
+
+ 1. **msens package** — own the shared logic. Migrate cells_in_polygon,
+ scores_for_cells, species_for_cells, mean_score, plot_flower (split
+ into a ggplot_flower core + interactive= wrapper), and a new
+ tbl_species(interactive=). Add a small cell_id_raster(ver) helper so
+ the raster path isn't hard-coded in the report and is version-aware. Add
+ a ggmap_areas() helper that returns a static ggplot map of
+ labeled sf polygons on a rnaturalearth basemap for pdf/docx.
+
+ 2. **`apps/report.qmd`** — parameterized multi-format Quarto report taking
+ title, areas_json, ver, format (html/pdf/docx). areas_json is a
+ JSON array [{label, kind: "wkt"|"pra", value}, ...] decoded in the
+ setup chunk. Sections: Parameters (yaml), Map (all areas together — uses
+ mapgl::maplibre() not mapboxgl() because mapboxgl doesn't render in
+ Quarto, per walkerke/mapgl#3), then tabsets for Plot of Scores and Table
+ of Species where each tab is one area, generated via
+ knitr::knit_child() iterating over areas. Interactive vs static
+ rendering keys on params$format.
+
+ 3. **Render-on-demand endpoint** — new POST /report route on the existing
+ api/plumber.R service (POST, not GET, because the JSON area list can
+ exceed GET URL limits when multiple Program Areas or large polygons are
+ selected). The endpoint hashes inputs for caching, calls
+ quarto::quarto_render(execute_params=...), writes to
+ /share/public/reports/<hash>.<ext>, and returns a JSON body
+ {url: "https://file.marinesensitivity.org/reports/..."}. The Report tab
+ in mapgl uses httr2 to POST and then opens the returned URL in a new
+ tab via a Shiny.addCustomMessageHandler('openUrl', ...) handler.
+
+ Critical files
+
+ Create
+
+ - `/Users/bbest/Github/MarineSensitivity/msens/R/calc.R` — cells_in_polygon,
+ scores_for_cells(con, cells, ver), species_for_cells(con, cells, ver),
+ mean_score, cell_id_raster(ver)
+ - `/Users/bbest/Github/MarineSensitivity/apps/report.qmd` — parameterized
+ multi-format Quarto report (uses mapgl::maplibre(), not mapboxgl())
+ - `/Users/bbest/Github/MarineSensitivity/apps/report_area_child.qmd` —
+ knit_child template rendered once per area (Plot of Scores + Table of
+ Species section body); called from report.qmd in a for-loop.
+
+ Modify
+
+ - `/Users/bbest/Github/MarineSensitivity/msens/R/viz.R` — split plot_flower
+ into ggplot_flower (returns ggplot) + plot_flower(interactive=TRUE)
+ wrapper; add tbl_species(d_spp, interactive=TRUE) (DT for interactive,
+ gt::gt for static); add ggmap_areas(areas_sf) that returns a static
+ ggplot2 map of labeled polygons overlaid on an
+ rnaturalearth::ne_countries(scale="medium", returnclass="sf")
+ basemap, for pdf/docx use
+ - `/Users/bbest/Github/MarineSensitivity/msens/DESCRIPTION` — add to Imports:
+ dbplyr, DT, gt (>= 0.10.0), ggiraph, ggplot2, scales, digest, yaml,
+ rnaturalearth, jsonlite
+ - `/Users/bbest/Github/MarineSensitivity/msens/NAMESPACE` — regenerated by
+ devtools::document()
+ - `/Users/bbest/Github/MarineSensitivity/apps/mapgl/app.R` —
+   a. Delete inline helpers: plot_flower (191–318), cells_in_polygon
+ (326–342), scores_for_cells (346–367), species_for_cells
+ (371–409). Replace call sites (1547, 1561, 1592, 1811,
+ 2021–2078) with msens::*.
+   b. **Strip drawing from the Map tab**: remove add_draw_control(...)
+ (1168–1183), the input$map_drawn_features observer (1534–1579),
+ paint_drawn_polygon() helper (414–428), and the tour step pointing
+ at the draw control. rx$drawn_polygon is removed from reactiveValues
+ (1055–1064); downstream flower/species reactives lose the drawn-polygon
+ branch (they still handle clicked_cell / clicked_pra / subregion).
+   c. **Add Report tab**: a 4th nav_panel(title="Report", ...) added to the
+ existing navset_card_tab(id="main_tabs") (after 884–915). The tab
+ body contains its own embedded mapboxglOutput("map_rpt") with a draw
+ control — this is where the drawing now lives — plus report-only
+ inputs: title, version (sel_ver), format, an "Add area" button, a
+ reactive list of labeled areas with delete-buttons, and Submit. The
+ embedded map reads the top-level sidebar's sel_subregion, sel_unit,
+ sel_lyr, tgl_sphere (no duplication), so toggling a layer on the
+ sidebar updates both the Map and Report tab maps. Add a submit observer
+ that POSTs to the plumber endpoint via httr2 and opens the returned
+ URL in a new tab via an openUrl JS message handler in the existing
+ tags$script block.
+ - /Users/bbest/Github/MarineSensitivity/apps/scores/functions.R — delete
+ duplicate plot_flower; either delete the file entirely (if nothing else
+ is in it) or leave a library(msens) shim
+ - /Users/bbest/Github/MarineSensitivity/api/plumber.R — add
+ #* @get /report endpoint (see §3 below)
+ - /Users/bbest/Github/MarineSensitivity/server/plumber/Dockerfile — install
+ Quarto CLI, TinyTeX, R packages quarto, digest, yaml
+
+ **§1 — msens helper migration**
+
+ All function bodies are copied verbatim from the inline versions in
+ apps/mapgl/app.R; only namespacing changes. This must be a pure refactor
+ verifiable by hash-comparing tibbles before and after.
+
+ `R/calc.R` (new)
+ ```r
+ #' Rasterize a polygon against a cell-id raster
+ #' @importFrom sf st_transform st_shift_longitude
+ #' @importFrom terra rasterize vect values
+ #' @importFrom tibble tibble
+ #' @export
+ cells_in_polygon <- function(poly, r_cell_id) { ... }   # app.R:326-342
+
+ #' Aggregate component scores across a set of cells
+ #' @importFrom dplyr tbl filter inner_join group_by summarize collect mutate
+ #' @importFrom dbplyr copy_inline
+ #' @export
+ scores_for_cells <- function(con, cells) { ... }        # app.R:346-367
+
+ #' Species table for a set of cells
+ #' @export
+ species_for_cells <- function(con, cells) { ... }       # app.R:371-409
+
+ #' Weighted-mean across a scores_for_cells() result
+ #' @export
+ mean_score <- function(d_scores) {
+   stats::weighted.mean(d_scores$score, d_scores$even, na.rm = TRUE)
+ }
+
+ #' Cell-id SpatRaster
+ #' Wraps the path logic currently inline in mapgl/app.R:78
+ #' @export
+ cell_id_raster <- function() {
+   terra::rast(file.path(msens_data_dir(),
+ "derived/r_bio-oracle_planarea.tif"))
+ }
+ ```
+ (msens_data_dir() already exists in spirit via sdm_db_path(); if not,
+ wrap the same is_server logic.)
+
+ `R/viz.R` (extend)
+ ```r
+ Split the existing plot_flower() body so the ggplot construction is reusable:
+
+ #' Build the polar bar ggplot for component scores
+ #' @export
+ ggplot_flower <- function(data, fld_category, fld_height, fld_width,
+                           tooltip_expr = NULL, score = NULL, title = NULL) {
+   ... # current app.R:191-310 minus the girafe() wrapper
+ }
+
+ #' Interactive (or static) flower plot
+ #' @export
+ plot_flower <- function(data, fld_category, fld_height, fld_width,
+                         tooltip_expr = NULL, score = NULL, title = NULL,
+                         interactive = TRUE) {
+   g <- ggplot_flower(data, {{ fld_category }}, {{ fld_height }},
+                      {{ fld_width }}, tooltip_expr, score, title)
+   if (!interactive) return(g)
+   ggiraph::girafe(ggobj = g, ...)                       # app.R:312-318
+ }
+
+ #' Species table — interactive (DT) or static (gt)
+ #' @export
+ tbl_species <- function(d_spp, interactive = TRUE) {
+   if (interactive) {
+     DT::datatable(...)                                  # app.R:2021-2078
+   } else {
+     d_spp |>
+       gt::gt() |>
+       gt::fmt_percent(columns = c(er_score, avg_suit, pct_cat),
+                       decimals = 0) |>
+       gt::fmt_number(columns = area_km2, decimals = 0) |>
+       gt::cols_label(
+         cat = "Component", taxon = "Taxon",
+         scientific = "Scientific name", common = "Common name",
+         er_code = "Status", er_score = "Ext. risk",
+         area_km2 = "Area (km²)", avg_suit = "Avg suit.",
+         pct_cat = "% cat.")
+   }
+ }
+ ```
+
+ Backward compatibility: existing msens::plot_flower(...) calls keep working
+ because interactive defaults to TRUE.
+
+ **§2 — `apps/report.qmd` + `apps/report_area_child.qmd`**
+
+ YAML
+ ```yaml
+ ---
+ title: "`r params$title`"
+ date: now
+ date-format: "YYYY-MM-DD HH:mm"
+ params:
+   title:      "BOEM Marine Sensitivity Report"
+   areas_json: "[]"     # JSON: [{label, kind: "wkt"|"pra", value}, ...]
+   ver:        "v6"
+   format:     "html"
+ format:
+   html:
+     toc: true
+     smooth-scroll: true
+     embed-resources: true
+   pdf:
+     toc: true
+     number-sections: true
+     colorlinks: true
+     lof: true
+     lot: true
+   docx:
+     reference-doc: "../workflows/libs/ESP Report Template 2025_1 tech.docx"
+     toc: true
+     toc-depth: 2
+     lof: true
+     lot: true
+ execute:
+   echo: false
+   warning: false
+   message: false
+ ---
+ ```
+
+ Setup
+
+ ```r
+ library(msens); library(sf); library(dplyr); library(terra); library(purrr)
+
+ areas <- jsonlite::fromJSON(params$areas_json, simplifyVector = FALSE)
+
+ # resolve each area spec to an sf polygon
+ area_to_sf <- function(a) {
+   if (a$kind == "pra") {
+     msens::ply_planareas |>
+       filter(planarea_key == a$value) |>
+       st_geometry() |> st_as_sf()
+   } else {
+     st_as_sfc(a$value, crs = 4326) |> st_as_sf()
+   }
+ }
+
+ areas_sf <- map(areas, area_to_sf)
+ areas_lbl <- map_chr(areas, "label")
+
+ con      <- msens::sdm_db_con(version = params$ver)
+ r_cell_id <- msens::cell_id_raster(ver = params$ver)[["cell_id"]]
+
+ # precompute cells/scores/species per area
+ areas_data <- pmap(list(areas_sf, areas_lbl), function(ply, lbl) {
+   cells  <- msens::cells_in_polygon(ply, r_cell_id)
+   list(
+     label  = lbl,
+     ply    = ply,
+     cells  = cells,
+     scores = msens::scores_for_cells(con, cells, ver = params$ver),
+     spp    = msens::species_for_cells(con, cells, ver = params$ver)
+   )
+ })
+
+ is_html <- params$format == "html"
+ ```
+
+ Sections
+
+ Parameters — print the YAML the report was called with:
+
+ ```r
+ cat(yaml::as.yaml(list(
+   title  = params$title,
+   ver    = params$ver,
+   format = params$format,
+   n_areas = length(areas),
+   areas  = map(areas_data, ~ list(
+     label = .x$label,
+     n_cells = nrow(.x$cells),
+     mean_score = round(msens::mean_score(.x$scores), 1)))
+ )))
+ ```
+
+ Map (all areas together)
+
+ ```r
+ #| eval: !expr is_html
+ # mapgl::maplibre() — mapboxgl() DOES NOT RENDER in Quarto (walkerke/mapgl#3)
+ all_areas <- do.call(rbind,
+   imap(areas_sf, ~ mutate(.x, label = areas_lbl[[.y]])))
+
+ mapgl::maplibre() |>
+   mapgl::fit_bounds(sf::st_bbox(all_areas), animate = FALSE) |>
+   mapgl::add_fill_layer(
+     id = "areas", source = all_areas,
+     fill_color = "#3388ff", fill_opacity = 0.4,
+     tooltip = "label")
+
+ #| eval: !expr '!is_html'
+ #| fig-cap: "Areas of interest."
+ msens::ggmap_areas(all_areas) # ggplot2 + rnaturalearth basemap
+ ```
+
+ Plot of Scores and Table of Species — one sub-section per area via
+ knit_child. Following
+ https://mickael.canouil.fr/posts/2023-03-05-quarto-auto-table-crossref/,
+ the child qmd is rendered inside a for-loop and its output is collected and
+ printed back with cat(..., sep="\n"). In HTML we wrap each child in
+ `::: {.panel-tabset}` to get tabs; in pdf/docx tabsets collapse to sequential
+ 
+ ```md
+ ### headings (Quarto's default behavior).
+
+ #| output: asis
+ cat("## Plot of Scores\n\n")
+ if (is_html) cat("::: {.panel-tabset}\n\n")
+ res <- purrr::imap_chr(areas_data, function(ad, i) {
+   knitr::knit_child(
+     "report_area_child.qmd",
+     envir = rlang::env(ad = ad, section = "scores", is_html = is_html),
+     quiet = TRUE)
+ })
+ cat(res, sep = "\n")
+ if (is_html) cat("\n:::\n")
+ ```
+
+ (Identical block below for "## Table of Species" with section = "species".)
+
+ `apps/report_area_child.qmd`
+
+ ```md
+ ### `r ad$label`
+
+ ```{r}
+ #| eval: !expr identical(section, "scores")
+ if (is_html) {
+   msens::plot_flower(ad$scores, component, score, even,
+                      interactive = TRUE, title = ad$label)
+ } else {
+   msens::ggplot_flower(ad$scores, component, score, even, title = ad$label)
+ }
+
+ #| eval: !expr identical(section, "species")
+ msens::tbl_species(ad$spp, interactive = is_html)
+ ```
+
+ The child is called twice per area (once for `section="scores"`, once for
+ `section="species"`), which keeps the for-loop simple and produces correctly
+ grouped tabsets.
+
+ **§3 — plumber `POST /report` endpoint**
+
+ Append to `/Users/bbest/Github/MarineSensitivity/api/plumber.R`:
+
+ ```r
+ #* Render parameterized msens report; return JSON {url: ...} to the rendered
+ file
+ #* @post /report
+ #* @serializer unboxedJSON
+ function(req, res) {
+   body <- jsonlite::fromJSON(req$postBody, simplifyVector = FALSE)
+
+   title      <- body$title      %||% "BOEM Marine Sensitivity Report"
+   ver        <- body$ver        %||% "v6"
+   format     <- match.arg(body$format %||% "html", c("html","pdf","docx"))
+   areas      <- body$areas      %||% list()
+   areas_json <- jsonlite::toJSON(areas, auto_unbox = TRUE)
+
+   ext <- c(html="html", pdf="pdf", docx="docx")[[format]]
+   key <- digest::digest(list(title, areas_json, ver, format))
+
+   out_dir  <- "/share/public/reports"
+   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+   out_file <- file.path(out_dir, paste0(key, ".", ext))
+   url_out  <- paste0("https://file.marinesensitivity.org/reports/", key, ".",
+  ext)
+
+   if (!file.exists(out_file)) {
+     # copy the qmd + child into a tempdir so concurrent renders don't race
+     tmp <- tempfile("rpt_"); dir.create(tmp)
+     src <- "/share/github/MarineSensitivity/apps"
+     file.copy(file.path(src, c("report.qmd", "report_area_child.qmd")), tmp)
+
+     quarto::quarto_render(
+       input          = file.path(tmp, "report.qmd"),
+       output_format  = format,
+       execute_params = list(title = title, areas_json = areas_json,
+                             ver = ver, format = format))
+
+     file.copy(file.path(tmp, paste0("report.", ext)), out_file, overwrite =
+ TRUE)
+   }
+   list(url = url_out)
+ }
+ ```
+
+ Dockerfile additions (server/plumber/Dockerfile): install2.r ... quarto
+ digest yaml jsonlite,
+ plus install the Quarto CLI deb and run R -e "tinytex::install_tinytex()".
+
+ **§4 — Report tab UI in mapgl**
+
+ Add a 4th nav_panel(title="Report", ...) to the existing
+ navset_card_tab(id="main_tabs") block (app.R:865–916). The Report tab owns
+ its own embedded map with a draw control — this is now the only place in
+ the app where polygons can be drawn. The top-level sidebar (sel_subregion,
+ sel_unit, sel_lyr, tgl_sphere) applies to this map too — the renderer reads
+ those reactives exactly like the Map tab does.
+
+ The core UX: users incrementally build a list of labeled areas via two
+ buttons. Each area is either a freshly drawn polygon (typed label) or the
+ currently selected Program Area(s). The list is shown inline with
+ delete-buttons. Submit POSTs the list to the plumber endpoint.
+
+ ```r
+ nav_panel(
+   title = "Report",
+   value = "Report",
+   layout_sidebar(
+     sidebar = sidebar(
+       width = 360,
+       textInput("rpt_title", "Report title",
+                 value = "BOEM Marine Sensitivity Report"),
+       selectInput("rpt_ver", "Data version",
+                   choices = c("v6","v5","v4c","v4b","v3"),  # real list from
+ config
+                   selected = "v6"),
+       radioButtons("rpt_format", "Output format",
+         choices = c("HTML"="html","Word (.docx)"="docx","PDF"="pdf"),
+         selected = "html", inline = TRUE),
+       hr(),
+       tags$h5("Add area"),
+       tags$p(class="text-muted small",
+         "Draw a polygon on the map OR select a Program Area in the sidebar ",
+         "(Spatial units = Program areas) and click it on the map, then:"),
+       textInput("rpt_area_label", "Label for next area", value = "Area 1"),
+       actionButton("btn_add_drawn", "Add drawn polygon", icon =
+ icon("plus")),
+       actionButton("btn_add_pra",   "Add selected Program Area(s)",
+                    icon = icon("plus")),
+       hr(),
+       tags$h5("Areas"),
+       uiOutput("rpt_areas_ui"),   # list with x-delete buttons
+       hr(),
+       actionButton("btn_rpt_submit", "Generate report",
+                    class = "btn-primary", icon = icon("file-export"))
+     ),
+     mapgl::mapboxglOutput("map_rpt", height = "700px")
+   )
+ )
+ ```
+
+ Server block — the embedded map is built from the same functions as the
+ Map tab, and re-renders on changes to the shared sidebar inputs. The set of
+ areas is held in a single reactive list so deletion and rendering stay
+ consistent.
+
+ ```r
+ rx$rpt_areas <- reactiveVal(list())   # list of {label, kind, value}
+
+ # --- embedded Report-tab map: same layers as the Map tab + a draw control
+ output$map_rpt <- mapgl::renderMapboxgl({
+   m <- build_report_map(             # factored helper; see note below
+     subregion = input$sel_subregion,
+     unit      = input$sel_unit,
+     lyr_key   = input$sel_lyr,
+     sphere    = input$tgl_sphere) |>
+     mapgl::add_draw_control(position = "top-left",
+       controls = list(polygon = TRUE, trash = TRUE))
+   m
+ })
+
+ # --- collect most-recent drawn polygon from map_rpt into an sf object
+ rpt_drawn_sf <- reactive({
+   fc <- input$map_rpt_drawn_features
+   req(fc, length(fc$features) > 0)
+   mapgl::get_drawn_features(mapgl::mapboxgl_proxy("map_rpt")) |>
+     tail(1) |> sf::st_as_sf()
+ })
+
+ # --- two "add" buttons populate rx$rpt_areas
+ observeEvent(input$btn_add_drawn, {
+   p   <- rpt_drawn_sf()
+   wkt <- sf::st_as_text(sf::st_geometry(p))
+   if (nchar(wkt) > 8000) {
+     p  <- sf::st_simplify(p, dTolerance = 0.01, preserveTopology = TRUE)
+     wkt <- sf::st_as_text(sf::st_geometry(p))
+     showNotification("Polygon simplified.", type = "warning")
+   }
+   rx$rpt_areas(c(rx$rpt_areas(),
+     list(list(label = input$rpt_area_label, kind = "wkt", value = wkt))))
+ })
+
+ observeEvent(input$btn_add_pra, {
+   req(rx$clicked_pra)          # existing reactive set by map_feature_click
+   new <- list(list(
+     label = input$rpt_area_label %||%
+ rx$clicked_pra$properties$planarea_name,
+     kind  = "pra",
+     value = rx$clicked_pra$properties$planarea_key))
+   rx$rpt_areas(c(rx$rpt_areas(), new))
+ })
+
+ # --- render the list with per-row delete buttons
+ output$rpt_areas_ui <- renderUI({
+   areas <- rx$rpt_areas()
+   if (length(areas) == 0)
+     return(tags$p(class="text-muted", "No areas yet."))
+   tagList(lapply(seq_along(areas), function(i) {
+     a <- areas[[i]]
+     tags$div(class = "d-flex align-items-center mb-1",
+       tags$span(class = "flex-grow-1",
+         sprintf("%s (%s)", a$label, a$kind)),
+       actionButton(paste0("rpt_del_", i), "",
+                    icon = icon("trash"), class = "btn-sm
+ btn-outline-danger"))
+   }))
+ })
+
+ observe({
+   lapply(seq_along(rx$rpt_areas()), function(i) {
+     observeEvent(input[[paste0("rpt_del_", i)]], once = TRUE, {
+       cur <- rx$rpt_areas(); cur[[i]] <- NULL; rx$rpt_areas(cur)
+     }, ignoreInit = TRUE)
+   })
+ })
+
+ # --- submit: POST the list as JSON and open returned URL in a new tab
+ observeEvent(input$btn_rpt_submit, {
+   areas <- rx$rpt_areas()
+   if (length(areas) == 0) {
+     showNotification("Add at least one area first.", type = "error")
+     return()
+   }
+   body <- list(
+     title  = input$rpt_title,
+     ver    = input$rpt_ver,
+     format = input$rpt_format,
+     areas  = areas)
+   resp <- httr2::request("https://api.marinesensitivity.org/report") |>
+     httr2::req_body_json(body) |>
+     httr2::req_perform() |>
+     httr2::resp_body_json()
+   session$sendCustomMessage("openUrl", resp$url)
+ })
+ ```
+
+ build_report_map(subregion, unit, lyr_key, sphere) is a new inline helper
+ factored out of the existing Map-tab renderer (app.R:1113–1185). Both
+ output$map (Map tab) and output$map_rpt (Report tab) call it with the
+ shared sidebar inputs; the Report-tab call chains add_draw_control() on
+ top. This is a pure refactor, no new behavior on the Map tab.
+
+ Plus, in the existing tags$script(HTML(...)) head block:
+
+ Shiny.addCustomMessageHandler('openUrl', function(url){ window.open(url,
+ '_blank'); });
+
+ Map-tab cleanup (companion to the new Report tab):
+
+ - Delete add_draw_control(...) from the Map tab renderer (app.R:1168–1183)
+ - Delete the observeEvent(input$map_drawn_features, ...) block
+ (app.R:1534–1579)
+ - Delete the paint_drawn_polygon() helper (app.R:414–428)
+ - Remove drawn_polygon = NULL from reactiveValues (app.R:1055–1064)
+ - In renderGirafe(output$plot_flower) (app.R:1582–1744) and
+ get_spp_tbl() (app.R:1798+), delete the "if drawn_polygon" branches.
+ Flower plot and species table on the Map tab now show only subregion
+ defaults, clicked-cell, or clicked-PRA results.
+ - Remove the tour step that highlights the draw control
+
+ **§5 — Why POST and how the URL lands in a new tab**
+
+ URL length is no longer a concern because the area list is sent as a JSON
+ POST body, not a GET query string. This matters now that the report
+ accepts multiple polygons/PRAs and that drawn polygons can be moderately
+ complex (simplification kicks in only above 8000 chars, as a safety net).
+
+ The browser-new-tab UX is preserved via a two-step dance initiated from the
+ Shiny server process:
+
+ 1. Shiny server builds the JSON, calls httr2::req_perform() on
+ https://api.marinesensitivity.org/report, receives {url: ...}.
+ 2. Shiny server pushes the URL to the client via
+ session$sendCustomMessage("openUrl", ...); a JS handler calls
+ window.open(url, "_blank").
+
+ Result: the user clicks Submit and the rendered report opens in a new tab,
+ just as if it were a GET — but without URL-length exposure.
+
+ Implementation sequence
+
+ 1. msens migration — add R/calc.R (with ver params threaded through),
+ refactor R/viz.R (add ggmap_areas, ggplot_flower, tbl_species),
+ update DESCRIPTION (add gt >= 0.10, rnaturalearth, jsonlite),
+ devtools::document(), devtools::check(). Verify with a scratch script
+ that msens::scores_for_cells(con, cells, ver="v6") matches the inline
+ app output for a known polygon (hash-compare tibbles).
+ 2. Refactor apps/mapgl/app.R — replace inline calls with msens::*.
+ At this step the Map tab still has its draw control; app should behave
+ identically. Pure move.
+ 3. Factor build_report_map() helper out of the existing Map-tab
+ renderer (app.R:1113–1185) so both output$map and the future
+ output$map_rpt call it. Pure refactor — Map tab still looks identical.
+ 4. Strip drawing from the Map tab — delete draw control, observer,
+ paint_drawn_polygon, rx$drawn_polygon, and the drawn-polygon branches
+ in the flower/species reactives. Run the app; Map tab should still render
+ subregion defaults, clicked-cell, and clicked-PRA results correctly.
+ 5. Delete the duplicate plot_flower from apps/scores/functions.R;
+ verify the scores app still runs.
+ 6. Create apps/report.qmd + apps/report_area_child.qmd. Render
+ locally with a hand-built areas_json:
+   - quarto render apps/report.qmd --to html \
+ -P areas_json:'[{"label":"CGA","kind":"pra","value":"CGA"}]' \
+ -P ver:v6 -P title:Test
+   - Same with --to pdf and --to docx
+   - Then with two areas (one PRA + one drawn WKT) to validate the
+ tabset + knit_child loop.
+ 7. Add the Report tab to mapgl — sidebar inputs, embedded map via
+ build_report_map() + draw control, area list with delete buttons,
+ submit observer. Point the httr2 request at a localhost plumber first.
+ 8. Rebuild the plumber image with quarto + tinytex; deploy the new
+ POST /report route. Smoke-test with curl:
+ curl -X POST https://api.marinesensitivity.org/report \
+ -H "Content-Type: application/json" \
+ -d '{"title":"t","ver":"v6","format":"html","areas":[{"label":"CGA","kind":"p
+ ra","value":"CGA"}]}'
+ should return {"url":"https://file.marinesensitivity.org/reports/..."}
+ and that URL should resolve to a rendered HTML. Repeat for pdf, docx.
+ 9. Flip the Report tab's httr2 base URL from localhost to production.
+ End-to-end test: one area (html/pdf/docx), then two-area mix
+ (drawn polygon + PRA) in html to verify tabsets and the all-areas map.
+
+ Verification
+
+ - devtools::check(msens) clean.
+ - After step 2 (pure refactor), mapgl drawn polygon → flower plot +
+ species table identical to pre-refactor on a known polygon.
+ - After step 3 (helper factored), Map tab still looks identical.
+ - After step 4 (Map-tab draw removed), the Map tab no longer shows a
+ draw control; clicking a cell or PRA still populates the flower plot
+ and species table as before.
+ - quarto render apps/report.qmd --to html -P
+ areas_json:'[{"label":"CGA","kind":"pra","value":"CGA"}]' -P ver:v6
+ produces self-contained HTML with all areas on one map and a populated
+ scores/species tabset.
+ - Same for --to pdf and --to docx — TOC/LOF/LOT populated, static
+ ggplot flower plot, gt species table, BOEM template applied on docx.
+ - Two-area run (one PRA + one drawn WKT) renders correctly with two
+ tabs in the HTML scores/species tabsets and a single combined map.
+ - curl -X POST https://api.marinesensitivity.org/report ... returns
+ {"url":"..."} to a file that resolves.
+ - Repeat curl hits the cache (sub-500 ms second call).
+ - Report tab: draw polygon on map_rpt → type label → Add drawn → select
+ Program Areas unit → click a PRA on map → type label → Add PRA →
+ Submit → new tab opens populated HTML report.
+ - ver dropdown: switching from v6 to v5 and re-submitting produces a
+ different cache hash and a freshly rendered report.
+
+ Risks / judgment calls
+
+ - mapgl::maplibre() vs mapboxgl() inside Quarto — mapboxgl() does not
+ render in Quarto documents (walkerke/mapgl#3). The report uses
+ mapgl::maplibre(). Inside the Shiny app, both tabs keep using
+ mapboxgl() — that's fine, the constraint only applies to Quarto output.
+ - Static map for pdf/docx — ggplot2 +
+ rnaturalearth::ne_countries(scale="medium")
+ via a new msens::ggmap_areas() helper. Check
+ workflows/final-report_2025.qmd first for any existing static-map
+ helper to reuse before writing a new one.
+ - gt in docx — DOCX support requires gt >= 0.10, pinned in
+ msens/DESCRIPTION. Test the docx output early; fall back to flextable
+ if the docx styling breaks.
+ - ver dropdown values — the list c("v6","v5","v4c","v4b","v3") is
+ illustrative; pull the real set from whatever source the existing app uses
+ to know which versions' databases are mounted on the server (likely a
+ list in workflows/libs/db.R). Validate server-side in the plumber route
+ so an unknown ver returns a 400, not an internal error from
+ sdm_db_con().
+ - knit_child chunk engine — Quarto's knit_child needs the child chunks
+ to be wrapped in markdown code fences in the child qmd, which is a subtle
+ gotcha. Verify with the two-area test case early (step 6).
+ - build_report_map() factoring — the existing Map-tab renderer is
+ ~60 lines (app.R:1113–1185) with lots of inline construction. Keep the
+ factoring minimal: take the inputs as args, return the map object, let
+ callers chain add_draw_control() or not.
+ - TinyTeX in Docker — slow rebuild. Bake into a separate base layer if
+ this becomes a CI bottleneck.
+ - Concurrent renders — quarto_render isn't reentrant; the endpoint
+ copies the qmd + child qmd to a tempfile() per request to avoid races.
+ - Auth / abuse — endpoint is unauth'd, matching the rest of the API.
+ Accepting JSON with arbitrary WKT lets a malicious caller burn CPU; if it
+ becomes a concern, add a Caddy rate limit or a max_vertices_per_area +
+ max_areas_per_request check at the top of the endpoint.
+
+All 10 tasks complete. Summary of the work:
+
+**msens** — new `R/calc.R` (cells_in_polygon, scores_for_cells, species_for_cells, mean_score, cell_id_raster); extended `R/viz.R` (ggplot_flower, plot_flower w/ interactive=, tbl_species w/ interactive=, ggmap_areas); `sdm_db_path/con` now defaults to v6; 9 new man pages; `devtools::check` clean on new code.
+
+**apps/mapgl/app.R** — deleted inline plot_flower, cells_in_polygon, scores_for_cells, species_for_cells, paint_drawn_polygon; factored `build_initial_map()` + `add_msens_draw_control()` helpers; stripped draw control and the `input$map_drawn_features` observer from the Map tab; added **Report** nav_panel with its own embedded map + draw control, title/ver/format/area-label inputs, add-drawn/add-PRA buttons, delete-per-row area list, and POST-to-plumber submit observer; added `openUrl` JS message handler.
+
+**apps/report.qmd + report_area_child.qmd** — new parameterized multi-format Quarto report (html/pdf/docx) taking `title, areas_json, ver, format`; renders Parameters (YAML), Map (maplibre for html, ggmap_areas for pdf/docx — mapboxgl can't render in Quarto per walkerke/mapgl#3), Plot of Scores tabset, Table of Species tabset — per-area sections via knit_child. Tested: single PRA + two-area mix render cleanly in all three formats with real v6 data (Central GoM: 10,117 cells, mean score 31, 5,846 species).
+
+**apps/scores** — deleted duplicate `functions.R`; `global.R` now relies on `msens::plot_flower`.
+
+**api/plumber.R** — new `POST /report` endpoint: JSON body → hash → quarto_render → cache under `/share/public/reports` → returns `{url}`. Handler function tested directly end-to-end (cache miss 26s, cache hit 0s, 17 MB html output).
+
+**server/plumber/Dockerfile** — installs Quarto CLI deb, R packages (ggiraph, ggplot2, gt, quarto, rnaturalearth, scales, terra, etc.), `MarineSensitivity/msens` from GitHub, and TinyTeX for PDF.
+
+**Remaining (out of scope for me, requires deploy):** rebuild the plumber Docker image, restart the service, curl-smoketest `POST https://api.marinesensitivity.org/report`, flip the Report tab's `MSENS_REPORT_URL` (defaults to production). The Report tab currently points at production already — if the endpoint isn't live yet, Submit will surface the error notification.
+
+Bump version of msens with NEWS.md summary of changes. Git commit with
+  relevant message all affected repos and push. Share instructions for
+  "Remaining (out of scope for me, requires deploy)"
+
+
+
 ## 2026-04-09.b score by user-drawn polygons
 
 Add UI and server-side functions to `@../apps/mapgl` for enabling a user to draw a polygon (with `mapgl::add_draw_control()`) and extract/color its score with flower plot generation and species table. 
