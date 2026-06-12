@@ -44,6 +44,10 @@ dbExecute(con_sdm, "
          AND worms_taxonomic_status NOT IN ('accepted','alternative representation') THEN FALSE
     WHEN taxon_authority = 'worms' AND sp_cat = 'reptile' THEN FALSE
     ELSE TRUE END")
+# require an actual mapped distribution (drop stale mdl_seq with no model_cell rows)
+dbExecute(con_sdm,
+  "UPDATE taxon SET is_ok = FALSE
+    WHERE is_ok AND mdl_seq NOT IN (SELECT DISTINCT mdl_seq FROM model_cell WHERE mdl_seq IS NOT NULL)")
 n_ok <- dbGetQuery(con_sdm, "SELECT count(*) n FROM taxon WHERE is_ok")$n
 message(glue("is_ok recomputed: {n_ok}"))
 

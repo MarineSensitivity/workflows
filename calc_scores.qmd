@@ -430,6 +430,34 @@ if (!"cell" %in% dbListTables(con_sdm)) {
 }
 ```
 
+```{r}
+#| label: backfill_cell
+#| eval: !expr do_metrics
+
+# backfill `cell` with modeled-but-missing cells. Range-map presence cells in areas
+# without Bio-Oracle environmental data were excluded from `cell` during ingest, yet
+# they carry model_cell values. Because zone_taxon inner-joins `cell` for area_km2,
+# those species would be dropped from per-zone species tables. Add the cells with their
+# geometric area (env columns left NULL) so every modeled cell is represented.
+missing_cells <- dbGetQuery(
+  con_sdm,
+  "SELECT DISTINCT cell_id FROM model_cell WHERE cell_id NOT IN (SELECT cell_id FROM cell)")
+if (nrow(missing_cells) > 0) {
+  if (!exists("r_cell")) r_cell <- rast(cell_tif)
+  area_all <- terra::values(terra::cellSize(r_cell[[1]], unit = "km", mask = FALSE))[, 1]
+  d_add <- tibble(
+    cell_id  = as.integer(missing_cells$cell_id),
+    area_km2 = as.numeric(area_all[missing_cells$cell_id]))
+  stopifnot(!any(is.na(d_add$area_km2)))
+  duckdb_register(con_sdm, "tmp_add_cell", d_add)
+  dbExecute(
+    con_sdm,
+    "INSERT INTO cell (cell_id, area_km2) SELECT cell_id, area_km2 FROM tmp_add_cell")
+  duckdb_unregister(con_sdm, "tmp_add_cell")
+  message(glue("backfilled {nrow(d_add)} modeled-but-missing cells into `cell`"))
+}
+```
+
 
 ### Add Program Areas to SDM zones
 
@@ -2481,6 +2509,43 @@ dbExecute(
   WHERE metric.metric_key = t.metric_key"
 )
 duckdb_unregister(con_sdm, "tmp_labels")
+```
+
+## Add "Full study area" zone
+
+A subregion-level zone (`subregion_key = 'FULL'`) covering **every** cell, so the apps'
+default study-area-wide species table and flower plot reflect all valid species — not only
+those within Program Areas (the "USA" subregion). Created before `zone_taxon` so it is picked
+up alongside the other subregions; its `zone_metric` is the coverage-weighted mean over all
+cells. (Folds in the former `dev/add_full_zone.R`.)
+
+```{r}
+#| label: add_full_studyarea_zone
+#| eval: !expr do_metrics
+
+full_seq <- tbl(con_sdm, "zone") |>
+  filter(tbl == !!tbl_sr, fld == "subregion_key", value == "FULL") |>
+  pull(zone_seq)
+if (length(full_seq) == 0) {
+  dbExecute(con_sdm, glue(
+    "INSERT INTO zone (tbl, fld, value) VALUES ('{tbl_sr}','subregion_key','FULL')"))
+  full_seq <- tbl(con_sdm, "zone") |>
+    filter(tbl == !!tbl_sr, fld == "subregion_key", value == "FULL") |>
+    pull(zone_seq)
+}
+# zone_cell = every cell
+dbExecute(con_sdm, glue("DELETE FROM zone_cell WHERE zone_seq = {full_seq}"))
+dbExecute(con_sdm, glue(
+  "INSERT INTO zone_cell (zone_seq, cell_id, pct_covered) SELECT {full_seq}, cell_id, 100 FROM cell"))
+# zone_metric = coverage-weighted mean of every metric over all cells
+dbExecute(con_sdm, glue("DELETE FROM zone_metric WHERE zone_seq = {full_seq}"))
+dbExecute(con_sdm, glue("
+  INSERT INTO zone_metric (zone_seq, metric_seq, value)
+  SELECT zc.zone_seq, cm.metric_seq, SUM(cm.value * zc.pct_covered) / SUM(zc.pct_covered)
+  FROM zone_cell zc JOIN cell_metric cm ON zc.cell_id = cm.cell_id
+  WHERE zc.zone_seq = {full_seq} AND cm.value IS NOT NULL
+  GROUP BY zc.zone_seq, cm.metric_seq"))
+message(glue("FULL study-area zone ready (zone_seq = {full_seq})"))
 ```
 
 ## Add/update `zone_taxon`
