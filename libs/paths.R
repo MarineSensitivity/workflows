@@ -1,8 +1,8 @@
 # shared version and path configuration ----
 # sourced by all workflow notebooks and apps
 
-ver <- "v6" # version string; change on branches (e.g., "v3b")
-ver_prev <- "v5" # previous version (for copying inputs to new version)
+ver <- "v7" # version string; change on branches (e.g., "v3b")
+ver_prev <- "v6" # previous version (for copying inputs to new version)
 
 is_server <- Sys.info()[["sysname"]] == "Linux"
 dir_data <- ifelse(is_server, "/share/data", "~/My Drive/projects/msens/data")
