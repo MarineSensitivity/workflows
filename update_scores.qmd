@@ -292,7 +292,24 @@ n_botw <- dbExecute(
 message(glue("listing join by botw_id: {n_botw} taxa matched"))
 # listing join by botw_id: 2 taxa matched
 
-# IUCN fallback for unmatched taxa
+# ESA fallback: taxa with a US ESA designation (esa_code from NMFS/FWS critical
+# habitat) that the listing join missed — e.g. subspecies whose worms_id differs
+# from the listed species (Pusa hispida hispida). Derive the proper authority:code
+# from esa_source so they don't fall through to the IUCN fallback as a bogus code.
+n_esa <- dbExecute(
+  con_sdm,
+  "
+  UPDATE taxon SET
+    extrisk_code = CASE WHEN esa_source = 'ch_nmfs' THEN 'NMFS:' ELSE 'FWS:' END || esa_code,
+    er_score     = CASE esa_code WHEN 'EN' THEN 100 WHEN 'TN' THEN 50 ELSE 1 END
+  WHERE extrisk_code IS NULL AND esa_code IN ('EN', 'TN')"
+)
+message(glue("ESA fallback (esa_code): {n_esa} taxa"))
+
+# IUCN fallback for unmatched taxa. Only build an IUCN code when redlist_code is a
+# valid IUCN Red List category — guards against ESA codes (e.g. 'TN', 'EN') that
+# leak into redlist_code from the NMFS/FWS critical-habitat ingests, which would
+# otherwise produce an invalid 'IUCN:TN'. ('TN' is an ESA status; IUCN uses 'NT'.)
 n_iucn <- dbExecute(
   con_sdm,
   "
@@ -304,7 +321,8 @@ n_iucn <- dbExecute(
       WHEN 'VU' THEN 5
       WHEN 'NT' THEN 2
       ELSE 1 END
-  WHERE extrisk_code IS NULL AND redlist_code IS NOT NULL"
+  WHERE extrisk_code IS NULL
+    AND redlist_code IN ('CR', 'EN', 'VU', 'NT', 'LC', 'DD')"
 )
 message(glue("IUCN fallback: {n_iucn} taxa"))
 # IUCN fallback: 6640 taxa
