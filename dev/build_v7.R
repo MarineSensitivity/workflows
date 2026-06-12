@@ -95,8 +95,8 @@ q_pra <- "SELECT z.value programarea_key, zm.value score FROM zone z
 d6 <- dbGetQuery(con6, q_pra); dbDisconnect(con6, shutdown = TRUE)
 d7 <- dbGetQuery(con_sdm, q_pra)
 delta <- d6 |> rename(score_v6 = score) |> inner_join(d7 |> rename(score_v7 = score), by = "programarea_key") |>
-  mutate(delta = round(score_v7 - score_v6, 3)) |> arrange(desc(abs(delta)))
-print(delta, n = Inf)
+  mutate(delta = round(score_v7 - score_v6, 3)) |> arrange(desc(abs(delta))) |> tibble::as_tibble()
+print(as.data.frame(delta))
 message(glue("PRA score delta: mean|d|={round(mean(abs(delta$delta)),3)}, max|d|={round(max(abs(delta$delta)),3)}"))
 write_csv(delta, file.path(dir_v, "v7_vs_v6_pra_score_delta.csv"))
 message("build_v7.R complete.")
