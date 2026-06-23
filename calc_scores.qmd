@@ -150,6 +150,7 @@ do_parquet <- T # no, but produces smaller faster duckdb
 do_pmtiles <- F # generate PMTiles archives for mapgl/mapsp apps
 do_pra_primprod <- F # NO, unless zones or primary prod ∆; zonal primary productivity for program areas
 do_deploy <- T # sync derived data + app code to server
+do_stac <- T # generate static STAC catalog (sdm extension) from the sdm db
 
 stopifnot(!do_pmtiles || (do_pmtiles && do_downloads)) # pmtiles should be generated from downloads
 
@@ -4951,6 +4952,39 @@ stopifnot(
 message(glue(
   "sdm.duckdb exists: {file_exists(sdm_db)}  size: {file_size(sdm_db)}"
 ))
+```
+
+## Generate STAC catalog
+
+Emit a static [STAC](https://stacspec.org/) catalog (using the [sdm extension](https://github.com/MarineSensitivity/stac-sdm)) describing this version's SDM products plus the live DuckDB-SQL TiTiler endpoint. The tree is written to `{dir_derived}/stac` (shared across versions) and synced to the server by the deploy chunk, where it is served at `https://file.marinesensitivity.org/stac/`.
+
+```{r}
+#| label: stac_catalog
+#| eval: !expr do_stac
+
+# generators live in the msens package (msens/R/stac.R); source the sibling repo
+# until the package is reinstalled with them
+librarian::shelf(jsonlite, base64enc, quiet = T)
+suppressWarnings(try(library(msens), silent = TRUE))
+if (!exists("stac_build")) {
+  source(here("../msens/R/stac.R"))
+}
+
+stac_dir <- glue("{dir_derived}/stac") # shared (not version-specific); served at /stac
+nc_csv <- here("data/nc_models.csv") # NCCOS seasonal source (not in the duckdb)
+
+# the db was shut down after import_parquet — open a fresh read-only connection
+con_stac <- dbConnect(duckdb(dbdir = sdm_db, read_only = TRUE))
+stac_build(
+  version = ver,
+  dir_out = stac_dir,
+  nc_csv  = if (file_exists(nc_csv)) nc_csv else NULL,
+  con     = con_stac)
+dbDisconnect(con_stac, shutdown = TRUE)
+
+message(glue(
+  "STAC catalog: {stac_dir}/catalog.json  ->  ",
+  "https://file.marinesensitivity.org/stac/catalog.json"))
 ```
 
 ## Deploy to server

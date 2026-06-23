@@ -86,6 +86,22 @@ if [[ "$MODE" == "all" || "$MODE" == "data" ]]; then
     "$HOME/My Drive/projects/msens/data/derived/pmtiles/" \
     "$SSH_HOST:$REMOTE_DERIVED/pmtiles/"
 
+  echo "=== syncing stac catalog (shared) ==="
+  rsync -avz --progress \
+    -e "ssh -i \"$SSH_KEY\"" \
+    "$HOME/My Drive/projects/msens/data/derived/stac/" \
+    "$SSH_HOST:$REMOTE_DERIVED/stac/"
+
+  # optional: publish the GeoParquet exports referenced by STAC `data` assets
+  # (large; off by default). enable with SYNC_PARQUET=1 ./libs/deploy_to_server.sh <ver>
+  if [[ "${SYNC_PARQUET:-0}" == "1" ]]; then
+    echo "=== syncing sdm_parquet (large) ==="
+    rsync -avz --progress \
+      -e "ssh -i \"$SSH_KEY\"" \
+      "$HOME/_big/msens/derived/${VER}/sdm_parquet/" \
+      "$SSH_HOST:$REMOTE_DERIVED/${VER}/sdm_parquet/"
+  fi
+
   # 2. fix permissions ----
   echo "=== fixing permissions ==="
   ssh -i "$SSH_KEY" "$SSH_HOST" bash -s <<DEPLOY
