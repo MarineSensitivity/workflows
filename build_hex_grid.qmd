@@ -1,0 +1,91 @@
+---
+title: "Build H3 hex grid (v8 sampling unit)"
+subtitle: "Global res-7 ocean hexagons with env covariates + US study-area / Program-Area membership"
+msens:
+  target_name: build_hex_grid
+  workflow_type: grid
+  dependency: []
+  output: data/manifests/build_hex_grid.json
+format: html
+editor_options:
+  chunk_output_type: console
+---
+
+The v8 spatial sampling unit is the **H3 resolution-7 hexagon** (~5.16 km²),
+replacing the 0.05° raster cell. This notebook builds the canonical `hex` table:
+every ocean hexagon globally, each carrying the 12 Bio-Oracle environmental
+covariates (inherited from the 0.05° pixel that contains the hex center), its
+`area_km2`, and boolean `in_usa` / `in_pra` membership flags.
+
+H3 res-7 ids are 64-bit and exceed R's exact-double range, so all indexing,
+area, and membership run inside DuckDB via the `h3` (+ `spatial`) extension — the
+same extension the OBIS `h3t` tile service uses, so hex ids align exactly for the
+OBIS overlay. See `msens::hex_grid_from_raster()` / `msens::hex_add_membership()`.
+
+```{r setup}
+librarian::shelf(DBI, dplyr, duckdb, glue, here, jsonlite, terra, quiet = TRUE)
+devtools::load_all(here("../msens"), quiet = TRUE)  # hex + grid helpers
+source(here("libs/paths.R"))                        # ver, sdm_db, bio_oracle_tif
+
+# study-area (to-shore US EEZ) + Program-Area polygons for membership
+ply_usa <- glue("{dir_derived}/v1/ply_boem-usa.gpkg")                    # shared
+ply_pra <- glue("{dir_derived}/{ver_prev}/ply_programareas_2026_{ver_prev}.gpkg")
+stopifnot(file.exists(bio_oracle_tif), file.exists(ply_usa), file.exists(ply_pra))
+
+# optional bbox restriction for prototype runs: HEX_BBOX="xmin,xmax,ymin,ymax"
+# (unset => full global build). DB path can be overridden with HEX_DB.
+hex_bbox <- Sys.getenv("HEX_BBOX", "")
+hex_db   <- Sys.getenv("HEX_DB", sdm_db)
+dir.create(dirname(hex_db), recursive = TRUE, showWarnings = FALSE)
+dir.create(here("data/manifests"), recursive = TRUE, showWarnings = FALSE)
+```
+
+## Read Bio-Oracle + build hex grid
+
+```{r build_grid}
+r <- rast(bio_oracle_tif)
+if (nzchar(hex_bbox)) {
+  bb <- as.numeric(strsplit(hex_bbox, ",")[[1]])
+  r  <- crop(r, ext(bb[1], bb[2], bb[3], bb[4]))
+  message(glue("restricted to bbox [{hex_bbox}] ({ncell(r)} pixels)"))
+}
+
+con <- dbConnect(duckdb(hex_db))
+# explode each ocean (depth_mean non-NA) pixel into its child res-7 hexes,
+# inheriting the pixel's 12 env layers + area_km2
+hex_grid_from_raster(r, con, res = hex_res, mask_layer = "depth_mean",
+                     out_tbl = "hex")
+```
+
+## Membership: US study area + Program Areas
+
+```{r membership}
+hex_add_membership(con, "hex", ply_usa, "in_usa")
+hex_add_membership(con, "hex", ply_pra, "in_pra")
+
+# primary key + index for fast joins downstream
+dbExecute(con, "ALTER TABLE hex ADD PRIMARY KEY (hex_id)")
+```
+
+## Summary + manifest
+
+```{r summary}
+smry <- dbGetQuery(con, "
+  SELECT count(*) AS n_hex,
+         count(*) FILTER (WHERE in_usa) AS n_usa,
+         count(*) FILTER (WHERE in_pra) AS n_pra,
+         round(min(area_km2), 3) AS area_min_km2,
+         round(max(area_km2), 3) AS area_max_km2,
+         count(*) FILTER (WHERE depth_mean IS NULL) AS n_null_depth
+  FROM hex")
+knitr::kable(smry)
+
+manifest <- c(as.list(smry), list(
+  version = ver, hex_res = hex_res, bbox = hex_bbox,
+  db = hex_db, source = basename(bio_oracle_tif)))
+write_json(manifest, here("data/manifests/build_hex_grid.json"),
+           auto_unbox = TRUE, pretty = TRUE)
+
+dbDisconnect(con, shutdown = TRUE)
+message(glue("hex grid: {smry$n_hex} hexes ({smry$n_usa} in US, {smry$n_pra} in PRAs) -> {hex_db}"))
+```

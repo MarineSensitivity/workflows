@@ -1,8 +1,11 @@
 # shared version and path configuration ----
 # sourced by all workflow notebooks and apps
 
-ver <- "v7" # version string; change on branches (e.g., "v3b")
-ver_prev <- "v6" # previous version (for copying inputs to new version)
+ver <- "v8" # version string; change on branches (e.g., "v3b")
+ver_prev <- "v7" # previous version (for copying inputs to new version)
+
+# v8 spatial sampling unit: H3 hexagon resolution 7 (~5.16 km^2). See msens::HEX_RES.
+hex_res <- 7L
 
 is_server <- Sys.info()[["sysname"]] == "Linux"
 dir_data <- ifelse(is_server, "/share/data", "~/My Drive/projects/msens/data")
@@ -18,6 +21,16 @@ dir_big_v <- ifelse(is_server, dir_v, glue::glue("{dir_big}/{ver}"))
 # databases
 spp_db <- glue::glue("{dir_big}/spp.duckdb")
 sdm_db <- glue::glue("{dir_big_v}/sdm.duckdb")
+
+# v8 release target: partitioned Parquet "marine atlas" on S3 (replaces the
+# single-duckdb release). DuckDB stays the working engine and attaches these
+# via httpfs (see msens::attach_atlas()).
+s3_atlas <- "s3://oceanmetrics.io-public/marine-atlas"
+dir_atlas_v <- glue::glue("{s3_atlas}/{ver}")
+
+# Bio-Oracle v3 global environmental raster (0.05 deg, 12 layers) — the source
+# of hex env covariates and the ocean mask for the hex grid
+bio_oracle_tif <- glue::glue("{dir_raw}/bio-oracle.org/bio-oracle_v3.tif")
 
 # zone table names
 tbl_er <- glue::glue("ply_ecoregions_2025")
