@@ -52,10 +52,19 @@ if (nzchar(hex_bbox)) {
 
 # bigint="integer64" so BIGINT hex_id round-trips to R exactly (not a lossy double)
 con <- dbConnect(duckdb(hex_db), bigint = "integer64")
-# explode each ocean (depth_mean non-NA) pixel into its child res-7 hexes,
-# inheriting the pixel's 12 env layers + area_km2 (hex_id stored as BIGINT)
-hex_grid_from_raster(r, con, res = hex_res, mask_layer = "depth_mean",
-                     out_tbl = "hex")
+
+# 1) enumerate the ocean hex tiling (geometry only: hex_id + area_km2)
+hex_ocean(r, con, res = hex_res, mask_layer = "depth_mean", out_tbl = "hex")
+
+# 2) interpolate the 12 Bio-Oracle env layers onto the hex CENTROIDS by inverse-
+#    distance weighting from the (ocean) pixel centroids. This is real
+#    interpolation — NOT inheriting the value of the pixel that contains the hex
+#    centre. Using ocean-only source points also means coastal hexes draw from the
+#    nearest ocean pixels rather than going NA. (See msens R/hex.R note.)
+pix <- as.data.frame(r, xy = TRUE, na.rm = FALSE)
+pix <- pix[!is.na(pix$depth_mean), ]
+names(pix)[match(c("x", "y"), names(pix))] <- c("lon", "lat")
+hex_interp_idw(con, pix, "hex", val_cols = names(r), k = 8, power = 2)
 ```
 
 ## Membership: US study area + Program Areas
