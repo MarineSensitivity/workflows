@@ -50,9 +50,10 @@ if (nzchar(hex_bbox)) {
   message(glue("restricted to bbox [{hex_bbox}] ({ncell(r)} pixels)"))
 }
 
-con <- dbConnect(duckdb(hex_db))
+# bigint="integer64" so BIGINT hex_id round-trips to R exactly (not a lossy double)
+con <- dbConnect(duckdb(hex_db), bigint = "integer64")
 # explode each ocean (depth_mean non-NA) pixel into its child res-7 hexes,
-# inheriting the pixel's 12 env layers + area_km2
+# inheriting the pixel's 12 env layers + area_km2 (hex_id stored as BIGINT)
 hex_grid_from_raster(r, con, res = hex_res, mask_layer = "depth_mean",
                      out_tbl = "hex")
 ```
@@ -60,10 +61,29 @@ hex_grid_from_raster(r, con, res = hex_res, mask_layer = "depth_mean",
 ## Membership: US study area + Program Areas
 
 ```{r membership}
-hex_add_membership(con, "hex", ply_usa, "in_usa")
-hex_add_membership(con, "hex", ply_pra, "in_pra")
+# polyfill each polygon at res-7 to enumerate in-polygon hexes (scale-independent)
+hex_add_membership(con, "hex", ply_usa, "in_usa", res = hex_res)
+hex_add_membership(con, "hex", ply_pra, "in_pra", res = hex_res)
+```
 
-# primary key + index for fast joins downstream
+## Partition columns + spatial clustering
+
+Add coarse H3 parent ids (`h3_p0` res-0, `h3_p2` res-2) as partition keys and
+rewrite the table **ordered by `hex_id`** so row groups (and the marine-atlas
+Parquet release) get tight, spatially-local hex ranges — enabling partition
+pruning and row-group skipping for bbox/tile queries.
+
+```{r partition_order}
+dbExecute(con, glue("
+  CREATE TABLE hex_ordered AS
+  SELECT hex_id,
+         CAST(h3_cell_to_parent(hex_id, 0) AS BIGINT) AS h3_p0,
+         CAST(h3_cell_to_parent(hex_id, 2) AS BIGINT) AS h3_p2,
+         * EXCLUDE (hex_id)
+  FROM hex
+  ORDER BY hex_id"))
+dbExecute(con, "DROP TABLE hex")
+dbExecute(con, "ALTER TABLE hex_ordered RENAME TO hex")
 dbExecute(con, "ALTER TABLE hex ADD PRIMARY KEY (hex_id)")
 ```
 
@@ -74,6 +94,8 @@ smry <- dbGetQuery(con, "
   SELECT count(*) AS n_hex,
          count(*) FILTER (WHERE in_usa) AS n_usa,
          count(*) FILTER (WHERE in_pra) AS n_pra,
+         count(DISTINCT h3_p0) AS n_part_p0,
+         count(DISTINCT h3_p2) AS n_part_p2,
          round(min(area_km2), 3) AS area_min_km2,
          round(max(area_km2), 3) AS area_max_km2,
          count(*) FILTER (WHERE depth_mean IS NULL) AS n_null_depth
