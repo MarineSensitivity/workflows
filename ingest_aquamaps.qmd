@@ -299,13 +299,15 @@ onto the **global 0.05° cell grid** ([-180,180], the `build_cell_grid.qmd` grid
 and write **one Parquet per species** to the marine-atlas release, keyed by
 `mdl_key = "am|{sp_key}"`.
 
-Method (the proven v7 `resample_smooth` fade): take the native 0.5° raster
-(`get_species_raster()`, 1-100, absent = NA, from `am.duckdb` or the cached tif),
-**extend it by a 1° margin and zero-fill** (so absent cells surround the range),
-**bilinear-resample onto the 0.05° grid**, mask to ocean, drop values `< threshold`.
-`cell_id` is the global raster index (`terra::cellFromXY` on Bio-Oracle) — the same
-`cell_id` as the `cell` table. No projection (Bio-Oracle/AquaMaps/AquaX share the
-0.05° topology). Global (no US clip).
+Method (**identical to the v7** `iterate`/`resample_smooth` conversion, verified
+cor > 0.999): take the native 0.5° raster (`get_species_raster()`, 1-100,
+absent = NA, from `am.duckdb` or the cached tif), **zero-fill absent cells within
+its extent**, **bilinear-resample onto the 0.05° grid**, mask to ocean, drop values
+`< threshold`. No outward margin (bilinear does not extrapolate past the source
+extent). `cell_id` is the global raster index (`terra::cellFromXY` on Bio-Oracle) —
+the same `cell_id` as the `cell` table. No projection (Bio-Oracle/AquaMaps/AquaX
+share the 0.05° topology). The only intended v8 differences from v7 are **global**
+extent (no US clip) and the **Parquet** output (vs per-species COG).
 
 **Parallelized with `furrr`** — one worker per species; each opens its own
 read-only `am.duckdb` connection and reads rasters from files (terra objects are
@@ -328,7 +330,6 @@ dir_am    <- glue("{dir_data}/derived/aquamaps/am.duckdb")            # AquaMaps
 dir_spp   <- glue("{dir_data}/raw/aquamaps.org/spp_cells")            # cached 0.5° species tifs
 dir_dist  <- glue("{dir_big_v}/marine-atlas/dist/dataset={ds_key}")   # local stage; sync to S3 after
 threshold <- 1L                                                       # drop suitability < 1
-margin    <- 1                                                        # deg zero-surround margin
 n_workers <- max(1, parallel::detectCores() - 2)
 dir_create(dir_dist)
 
@@ -357,10 +358,12 @@ interp_sp <- function(sp_key) {
   }
   r_bo <- terra::rast(bio_oracle_tif, lyrs = "depth_mean")       # 0.05° ocean template + cell geometry
 
-  # zero-surround: extend by margin, fill NA with 0, bilinear -> 0.05°, mask ocean
-  bb     <- terra::ext(r_sp) + margin
-  r_sp_z <- terra::extend(r_sp, bb); r_sp_z[is.na(r_sp_z)] <- 0
-  tmpl   <- terra::crop(r_bo, bb)
+  # v7-identical fade: zero-fill absent cells WITHIN the (trimmed) range extent,
+  # bilinear-resample onto the 0.05° grid, mask to ocean. No outward margin —
+  # bilinear does not extrapolate past the source extent, so this reproduces the
+  # v7 iterate/resample_smooth result (verified ~identical, cor > 0.999).
+  r_sp_z <- r_sp; r_sp_z[is.na(r_sp_z)] <- 0
+  tmpl   <- terra::crop(r_bo, terra::ext(r_sp))
   r05    <- terra::mask(terra::resample(r_sp_z, tmpl, method = "bilinear"), tmpl)
 
   d <- terra::as.data.frame(r05, xy = TRUE, na.rm = TRUE)
