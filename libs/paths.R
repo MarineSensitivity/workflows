@@ -37,6 +37,11 @@ bio_oracle_tif <- glue::glue("{dir_raw}/bio-oracle.org/bio-oracle_v3.tif")
 # cell_id by position. Shared across versions.
 cellid_tif <- glue::glue("{dir_derived}/r_cellid_global.tif")
 
+# AquaMaps source db + precomputed bilinear weight table (HCAF 0.5 deg -> 0.05 deg
+# cells; built once by ingest_aquamaps.qmd, shared across versions on this grid)
+am_db  <- glue::glue("{dir_derived}/aquamaps/am.duckdb")
+w05_db <- glue::glue("{dir_derived}/aquamaps/am_w05.duckdb")
+
 # study-area (to-shore US EEZ) + Program-Area polygons for in_usa / in_pra membership
 ply_usa_gpkg <- glue::glue("{dir_derived}/v1/ply_boem-usa.gpkg")            # shared
 ply_pra_gpkg <- glue::glue("{dir_derived}/{ver_prev}/ply_programareas_2026_{ver_prev}.gpkg")
