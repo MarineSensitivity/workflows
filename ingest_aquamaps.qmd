@@ -332,8 +332,13 @@ dir_am    <- glue("{dir_data}/derived/aquamaps/am.duckdb")            # AquaMaps
 dir_spp   <- glue("{dir_data}/raw/aquamaps.org/spp_cells")            # cached 0.5° species tifs
 dir_dist  <- glue("{dir_big_v}/marine-atlas/dist/dataset={ds_key}")   # local stage; sync to S3 after
 threshold <- 1L                                                       # drop suitability < 1
-n_workers <- max(1, parallel::detectCores() - 2)
+n_workers <- max(1, parallel::detectCores())                          # use all cores
 dir_create(dir_dist)
+
+# cell-id COG (single band; cell_id where ocean, NA on land) — the fast ocean
+# template + it hands cell_id back directly (no cellFromXY on millions of points).
+# Build it first with build_cell_grid.qmd.
+stopifnot("run build_cell_grid.qmd first (need cellid_tif)" = file.exists(cellid_tif))
 
 # species list + dataset/model tables (mdl_key = am|{sp_key}); no crosswalk at raw ingest
 con_dd  <- dbConnect(duckdb(dir_am, read_only = TRUE))
@@ -358,24 +363,26 @@ interp_sp <- function(sp_key) {
     on.exit(DBI::dbDisconnect(cdd, shutdown = TRUE), add = TRUE)
     get_species_raster(sp_key, cdd, get_hcaf_raster(cdd, dir_cache = dir_spp), dir_cache = dir_spp)
   }
-  r_bo <- terra::rast(bio_oracle_tif, lyrs = "depth_mean")       # 0.05° ocean template + cell geometry
+  # single-band cell-id raster over the range: cell_id where ocean, NA on land
+  r_cell <- terra::crop(terra::rast(cellid_tif), terra::ext(r_sp))
 
   # v7-identical fade: zero-fill absent cells WITHIN the (trimmed) range extent,
-  # bilinear-resample onto the 0.05° grid, mask to ocean. No outward margin —
-  # bilinear does not extrapolate past the source extent, so this reproduces the
-  # v7 iterate/resample_smooth result (verified ~identical, cor > 0.999).
+  # bilinear-resample onto the 0.05° grid. No outward margin — bilinear does not
+  # extrapolate past the source extent, so this reproduces the v7 iterate/
+  # resample_smooth result (verified cor > 0.999). Drop sub-threshold BEFORE
+  # extracting so as.data.frame only touches kept cells (a sparse wide-extent
+  # species is otherwise ~all zeros — the real slowdown).
   r_sp_z <- r_sp; r_sp_z[is.na(r_sp_z)] <- 0
-  tmpl   <- terra::crop(r_bo, terra::ext(r_sp))
-  r05    <- terra::mask(terra::resample(r_sp_z, tmpl, method = "bilinear"), tmpl)
+  r05    <- terra::resample(r_sp_z, r_cell, method = "bilinear")
+  r05[r05 < threshold] <- NA
 
-  d <- terra::as.data.frame(r05, xy = TRUE, na.rm = TRUE)
-  names(d) <- c("lon", "lat", "value")
-  d <- d[d$value >= threshold, , drop = FALSE]
+  s <- c(r05, r_cell); names(s) <- c("value", "cell_id")
+  d <- terra::as.data.frame(s, na.rm = TRUE)                     # ocean & value>=thr only; cell_id free
   if (nrow(d) == 0) return("empty")
 
   arrow::write_parquet(tibble(
     mdl_key = glue("{ds_key}|{sp_key}"),
-    cell_id = as.integer(terra::cellFromXY(r_bo, cbind(d$lon, d$lat))),
+    cell_id = as.integer(d$cell_id),
     value   = round(d$value, 2)), out_pq)
   "done"
 }
