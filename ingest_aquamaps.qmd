@@ -309,18 +309,20 @@ the same `cell_id` as the `cell` table. No projection (Bio-Oracle/AquaMaps/AquaX
 share the 0.05° topology). The only intended v8 differences from v7 are **global**
 extent (no US clip) and the **Parquet** output (vs per-species COG).
 
-**Parallelized with `furrr`** — one worker per species; each opens its own
-read-only `am.duckdb` connection and reads rasters from files (terra objects are
-not shared across workers), and writes its own Parquet file (no shared writes). The
-run is **resumable** — a species whose Parquet exists is skipped — so it can run
-over hours/days on the server and restart after interruption.
+**Parallelized with `parallel::mclapply`** (fork-based; ideal on the Linux server)
+— forked workers inherit the sourced `get_species_raster()` + attached packages;
+each opens its own read-only `am.duckdb` connection, reads rasters from files, and
+writes its own Parquet file (no shared writes). **Resumable** — a species whose
+Parquet exists is skipped — so it can run over hours on the server and restart
+after interruption. (On macOS/Windows, set `n_workers <- 1`; forking + terra is
+only reliable on Linux.)
 
 ```{r}
 #| label: v8_cell_ingest
 #| eval: false
 
-librarian::shelf(arrow, DBI, dplyr, duckdb, fs, furrr, future, glue, logger,
-                 purrr, readr, terra, tibble, quiet = T)
+librarian::shelf(arrow, DBI, dplyr, duckdb, fs, glue, here, logger,
+                 readr, terra, tibble, quiet = T)
 source(here("libs/am_functions.R"))   # get_species_raster(), get_hcaf_raster()
 source(here("libs/paths.R"))          # ver, sdm_db, dir_big_v, dir_data, bio_oracle_tif, s3_atlas
 
@@ -378,12 +380,12 @@ interp_sp <- function(sp_key) {
   "done"
 }
 
-# run in parallel, resumable
-plan(multisession, workers = n_workers)
-log_info("interpolating {format(nrow(sp_all), big.mark=',')} AquaMaps species on {n_workers} workers ...")
-res <- future_map_chr(sp_all$sp_key, purrr::possibly(interp_sp, otherwise = "error"),
-                      .options = furrr_options(seed = TRUE), .progress = TRUE)
-plan(sequential)
+# run in parallel (fork), resumable. mc.preschedule=FALSE => one fork per species
+# (dynamic load-balancing + isolates any single-species crash).
+log_info("interpolating {format(nrow(sp_all), big.mark=',')} AquaMaps species on {n_workers} cores (fork) ...")
+run1 <- function(k) tryCatch(interp_sp(k), error = function(e) paste0("error: ", conditionMessage(e)))
+res <- unlist(parallel::mclapply(sp_all$sp_key, run1,
+                                 mc.cores = n_workers, mc.preschedule = FALSE))
 print(table(res))
 
 # then sync the release to S3:
