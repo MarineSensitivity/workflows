@@ -20,3 +20,7 @@ redo_cell_grid <- .flag("REDO_CELL_GRID")  # rebuild cell table + cellid COG
 # ingest_aquamaps.qmd
 redo_am_w05    <- .flag("REDO_AM_W05")     # rebuild the AquaMaps bilinear weight table (w05)
 redo_am_ingest <- .flag("REDO_AM_INGEST")  # re-interpolate ALL species (else resume: keep existing Parquet)
+
+# generic for the other ingest_*.qmd (vector ranges, raster SDMs): re-do this
+# dataset's models (delete + rebuild) instead of resuming from existing Parquet
+redo_ingest    <- .flag("REDO_INGEST")
