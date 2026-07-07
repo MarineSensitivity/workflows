@@ -147,6 +147,12 @@ d_spp_pa <- read_csv(spp_pa_csv)  # 17,550 x 2
 
 ```{r}
 #| label: iterate_species_in_planareas
+#| eval: false
+
+# SUPERSEDED in v8 by the "Interpolate to H3 hex grid" section below
+# (label: v8_hex_ingest). This v7 step bilinear-resampled each species to a
+# 0.05-degree COG; v8 interpolates each species' native 0.5-degree suitability
+# onto the H3 res-7 hex grid by zero-surround IDW and writes partitioned Parquet.
 
 if (!all(sapply(c("r_hcaf", "r_bo", "r_land"), exists))){
   r_hcaf <- get_hcaf_raster()
@@ -284,6 +290,95 @@ for (i in 1:n){  # i = 1
 # sp_key = "W-Ant-103323"
 # sp_ds_tif <- glue("{dir_ds_spp}/{sp_key}.tif")
 # rast(sp_ds_tif) |> datatype() # "INT1U"
+```
+
+## Interpolate to H3 hex grid → partitioned Parquet (v8)
+
+Replace the v7 0.05° resample with the v8 write-target: interpolate each species'
+native 0.5° AquaMaps suitability onto the **H3 res-7 hex grid** by zero-surround
+inverse-distance weighting, and write one partitioned Parquet file per species
+(`dist/dataset=am/mdl_seq=N/`) for the marine-atlas release.
+
+The hex←HCAF IDW weights are identical for every species (all share the HCAF 0.5°
+grid), so they are precomputed **once** (`msens::hex_grid_weights()`, full 0.5°
+source grid + ~1-cell `radius_km` so distributions fade cleanly to 0 at their
+edges — see `msens` `R/interp.R` "ZERO-SURROUND") and applied per species with
+`msens::model_hex_from_weights()`. The loop is **resumable** — it skips any
+species whose Parquet partition already exists — so it can be run over days on the
+server and restarted after interruption.
+
+```{r}
+#| label: v8_hex_ingest
+#| eval: false
+
+librarian::shelf(arrow, DBI, dplyr, duckdb, fs, glue, logger, terra,
+                 MarineSensitivity/msens, quiet = T)
+source(here("libs/am_functions.R"))   # get_species_raster(), get_hcaf_raster()
+source(here("libs/paths.R"))          # ver="v8", sdm_db, dir_big_v, hex_res, dir_data
+
+# --- config -----------------------------------------------------------------
+ds_key    <- "am"
+dir_am    <- glue("{dir_data}/derived/aquamaps/am.duckdb")             # AquaMaps source db
+dir_spp   <- glue("{dir_data}/raw/aquamaps.org/spp_cells")             # cached 0.5° species tifs
+dir_dist  <- glue("{dir_big_v}/marine-atlas/dist/dataset={ds_key}")    # local stage; sync to s3 after
+hex_where <- NULL          # NULL = all hexes (global species app); "in_usa" = US-only first pass
+k         <- 12L; power <- 2; radius_km <- 60; threshold <- 1          # zero-surround IDW params
+dir_create(dir_dist)
+
+con    <- dbConnect(duckdb(sdm_db), bigint = "integer64")   # has the global `hex` table
+con_dd <- dbConnect(duckdb(dir_am, read_only = TRUE))       # AquaMaps source
+r_hcaf <- get_hcaf_raster(con_dd, dir_cache = dir_spp)
+
+# 1) hex←HCAF IDW weights (full 0.5° grid + radius = zero-surround). Build once.
+if (!("hex_src_w" %in% dbListTables(con))) {
+  log_info("building hex_src_w (IDW weights over {ifelse(is.null(hex_where),'all','US')} hexes) ...")
+  g   <- expand.grid(lon = seq(-179.75, 179.75, 0.5), lat = seq(-89.75, 89.75, 0.5))
+  src <- data.frame(src_i = cell_i_grid(g$lon, g$lat), lon = g$lon, lat = g$lat)
+  hex_grid_weights(con, "hex", src, k = k, power = power, radius_km = radius_km,
+                   where = hex_where, out_tbl = "hex_src_w")
+}
+
+# 2) species list + mdl_seq; record dataset + model tables
+sp_keys <- tbl(con_dd, "spp_cells") |> distinct(sp_key) |> pull(sp_key) |> sort()
+d_model <- tibble(ds_key = ds_key, mdl_seq = seq_along(sp_keys),
+                  taxa = sp_keys, time_period = "static", mdl_type = "suitability")
+dbExecute(con, glue("CREATE OR REPLACE TABLE dataset_{ds_key} AS
+  SELECT '{ds_key}' AS ds_key, 'AquaMaps' AS source_authority,
+         'suitability' AS response_type, 'static' AS temporal_interval"))
+dbWriteTable(con, glue("model_{ds_key}"), d_model, overwrite = TRUE)
+
+# 3) resumable loop: interpolate each species onto hexes → Parquet partition
+n <- nrow(d_model)
+log_info("interpolating {format(n, big.mark=',')} AquaMaps species → hexes ...")
+for (i in seq_len(n)) {
+  sp_key  <- d_model$taxa[i]; mdl_seq <- d_model$mdl_seq[i]
+  out_pq  <- glue("{dir_dist}/mdl_seq={mdl_seq}/part-0.parquet")
+  if (file_exists(out_pq)) next                                  # resumable
+
+  r <- tryCatch(get_species_raster(sp_key, con_dd, r_hcaf, dir_cache = dir_spp),
+                error = function(e) NULL)
+  if (is.null(r)) { log_warn("{i}/{n}: {sp_key} — no source raster"); next }
+  d <- as.data.frame(r, xy = TRUE, na.rm = TRUE)                 # native 0.5°, suitability 1-100
+  names(d) <- c("lon", "lat", "value")
+  d$src_i <- cell_i_grid(d$lon, d$lat)
+
+  mh <- model_hex_from_weights(con, d[, c("src_i", "value")], mdl_seq = mdl_seq,
+                               threshold = threshold, w_tbl = "hex_src_w")
+  if (nrow(mh) == 0) next
+  dir_create(dirname(out_pq))
+  duckdb::duckdb_register(con, "mh_out", mh)
+  dbExecute(con, glue(                                           # hex_id + value; mdl_seq is in the path
+    "COPY (SELECT hex_id, value FROM mh_out ORDER BY hex_id)
+       TO '{out_pq}' (FORMAT parquet, COMPRESSION zstd)"))
+  duckdb::duckdb_unregister(con, "mh_out")
+  if (i %% 100 == 0) log_info("{format(i, big.mark=',')}/{format(n, big.mark=',')}: {sp_key} → {nrow(mh)} hexes")
+}
+dbDisconnect(con_dd, shutdown = TRUE)
+dbDisconnect(con, shutdown = TRUE)
+
+# then sync the release to S3:
+#   aws s3 sync {dir_big_v}/marine-atlas s3://oceanmetrics.io-public/marine-atlas/v8
+message(glue("done → {dir_dist}  (then: aws s3 sync {dir_big_v}/marine-atlas {s3_atlas}/{ver})"))
 ```
 
 ```{r}
