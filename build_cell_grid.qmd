@@ -1,122 +1,99 @@
 ---
-title: "Build H3 hex grid (v8 sampling unit)"
-subtitle: "Global res-7 ocean hexagons with env covariates + US study-area / Program-Area membership"
+title: "Build global 0.05° cell grid (v8 sampling unit)"
+subtitle: "Global ocean 0.05° raster cells in [-180,180] with env covariates + US study-area / Program-Area membership"
 msens:
-  target_name: build_hex_grid
+  target_name: build_cell_grid
   workflow_type: grid
   dependency: []
-  output: data/manifests/build_hex_grid.json
+  output: data/manifests/build_cell_grid.json
 format: html
 editor_options:
   chunk_output_type: console
 ---
 
-The v8 spatial sampling unit is the **H3 resolution-7 hexagon** (~5.16 km²),
-replacing the 0.05° raster cell. This notebook builds the canonical `hex` table:
-every ocean hexagon globally, each carrying the 12 Bio-Oracle environmental
-covariates (inherited from the 0.05° pixel that contains the hex center), its
-`area_km2`, and boolean `in_usa` / `in_pra` membership flags.
+The v8 spatial sampling unit is the **global 0.05° raster cell** in **[-180,180]**
+(rolled back from H3 hex). The grid is anchored to the shared 0.05°, 3600×7200,
+EPSG:4326 topology of **Bio-Oracle v3 AND the AquaX SDM TIFs** — so `cell_id` is
+the raster cell index (`1:ncell`), and any SDM raster on this grid (Bio-Oracle,
+AquaX, resampled AquaMaps) maps to `cell_id` by position with **no projection**.
 
-H3 res-7 ids are 64-bit and exceed R's exact-double range, so all indexing,
-area, and membership run inside DuckDB via the `h3` (+ `spatial`) extension — the
-same extension the OBIS `h3t` tile service uses, so hex ids align exactly for the
-OBIS overlay. See `msens::hex_grid_from_raster()` / `msens::hex_add_membership()`.
+This notebook builds the canonical `cell` table (ocean cells only) — `cell_id`,
+the 12 Bio-Oracle env covariates, `area_km2`, and boolean `in_usa` / `in_pra`
+membership — plus the global cell-id COG that titiler paints.
 
 ```{r setup}
-librarian::shelf(DBI, dplyr, duckdb, glue, here, jsonlite, terra, quiet = TRUE)
-devtools::load_all(here("../msens"), quiet = TRUE)  # hex + grid helpers
-source(here("libs/paths.R"))                        # ver, sdm_db, bio_oracle_tif
+librarian::shelf(DBI, dplyr, duckdb, glue, here, jsonlite, sf, terra, quiet = TRUE)
+source(here("libs/paths.R"))   # ver, sdm_db, bio_oracle_tif, cellid_tif, ply_usa_gpkg, ply_pra_gpkg
+stopifnot(file.exists(bio_oracle_tif), file.exists(ply_usa_gpkg), file.exists(ply_pra_gpkg))
 
-# study-area (to-shore US EEZ) + Program-Area polygons for membership
-ply_usa <- glue("{dir_derived}/v1/ply_boem-usa.gpkg")                    # shared
-ply_pra <- glue("{dir_derived}/{ver_prev}/ply_programareas_2026_{ver_prev}.gpkg")
-stopifnot(file.exists(bio_oracle_tif), file.exists(ply_usa), file.exists(ply_pra))
-
-# optional bbox restriction for prototype runs: HEX_BBOX="xmin,xmax,ymin,ymax"
-# (unset => full global build). DB path can be overridden with HEX_DB.
-hex_bbox <- Sys.getenv("HEX_BBOX", "")
-hex_db   <- Sys.getenv("HEX_DB", sdm_db)
-dir.create(dirname(hex_db), recursive = TRUE, showWarnings = FALSE)
+# optional bbox restriction for prototype runs: CELL_BBOX="xmin,xmax,ymin,ymax"
+cell_bbox <- Sys.getenv("CELL_BBOX", "")
+cell_db   <- Sys.getenv("CELL_DB", sdm_db)
+dir.create(dirname(cell_db), recursive = TRUE, showWarnings = FALSE)
 dir.create(here("data/manifests"), recursive = TRUE, showWarnings = FALSE)
 ```
 
-## Read Bio-Oracle + build hex grid
+## Read Bio-Oracle, assign global cell_id, membership + area
 
 ```{r build_grid}
-r <- rast(bio_oracle_tif)
-if (nzchar(hex_bbox)) {
-  bb <- as.numeric(strsplit(hex_bbox, ",")[[1]])
+r <- rast(bio_oracle_tif)   # global [-180,180], 3600 x 7200, 12 env layers
+r$cell_id  <- 1:ncell(r)    # global raster-position id (shared with AquaX/AquaMaps grids)
+r$area_km2 <- cellSize(r$depth_mean, unit = "km")
+
+# membership: rasterize the study-area + Program-Area polygons onto the same grid
+r$in_usa <- rasterize(vect(st_read(ply_usa_gpkg, quiet = TRUE)), r$depth_mean, field = 1, background = 0)
+r$in_pra <- rasterize(vect(st_read(ply_pra_gpkg, quiet = TRUE)), r$depth_mean, field = 1, background = 0)
+
+if (nzchar(cell_bbox)) {
+  bb <- as.numeric(strsplit(cell_bbox, ",")[[1]])
   r  <- crop(r, ext(bb[1], bb[2], bb[3], bb[4]))
-  message(glue("restricted to bbox [{hex_bbox}] ({ncell(r)} pixels)"))
+  message(glue("restricted to bbox [{cell_bbox}]"))
 }
-
-# bigint="integer64" so BIGINT hex_id round-trips to R exactly (not a lossy double)
-con <- dbConnect(duckdb(hex_db), bigint = "integer64")
-
-# 1) enumerate the ocean hex tiling (geometry only: hex_id + area_km2)
-hex_ocean(r, con, res = hex_res, mask_layer = "depth_mean", out_tbl = "hex")
-
-# 2) interpolate the 12 Bio-Oracle env layers onto the hex CENTROIDS by inverse-
-#    distance weighting from the (ocean) pixel centroids. This is real
-#    interpolation — NOT inheriting the value of the pixel that contains the hex
-#    centre. Using ocean-only source points also means coastal hexes draw from the
-#    nearest ocean pixels rather than going NA. (See msens R/hex.R note.)
-pix <- as.data.frame(r, xy = TRUE, na.rm = FALSE)
-pix <- pix[!is.na(pix$depth_mean), ]
-names(pix)[match(c("x", "y"), names(pix))] <- c("lon", "lat")
-hex_interp_idw(con, pix, "hex", val_cols = names(r), k = 8, power = 2)
 ```
 
-## Membership: US study area + Program Areas
+## Write cell table (ocean cells) + global cell-id COG
 
-```{r membership}
-# polyfill each polygon at res-7 to enumerate in-polygon hexes (scale-independent)
-hex_add_membership(con, "hex", ply_usa, "in_usa", res = hex_res)
-hex_add_membership(con, "hex", ply_pra, "in_pra", res = hex_res)
-```
+```{r write_cell}
+# ocean cells only (depth_mean non-NA); cell_id stays the global raster index
+d_cell <- as.data.frame(r, xy = TRUE, na.rm = FALSE) |>
+  filter(!is.na(depth_mean)) |>
+  transmute(
+    cell_id = as.integer(cell_id),
+    lon = x, lat = y,
+    across(c(depth_mean, depth_min, depth_max, oxy_b_mean, oxy_mean, prim_prod_mean,
+             ice_con_ann, salinity_b_mean, salinity_mean, sbt_an_mean, sst_an_mean, fao_area_m)),
+    area_km2,
+    in_usa = in_usa == 1,
+    in_pra = in_pra == 1)
 
-## Partition columns + spatial clustering
+con <- dbConnect(duckdb(cell_db))
+dbWriteTable(con, "cell", d_cell, overwrite = TRUE)
+dbExecute(con, "ALTER TABLE cell ADD PRIMARY KEY (cell_id)")
 
-Add coarse H3 parent ids (`h3_p0` res-0, `h3_p2` res-2) as partition keys and
-rewrite the table **ordered by `hex_id`** so row groups (and the marine-atlas
-Parquet release) get tight, spatially-local hex ranges — enabling partition
-pruning and row-group skipping for bbox/tile queries.
-
-```{r partition_order}
-dbExecute(con, glue("
-  CREATE TABLE hex_ordered AS
-  SELECT hex_id,
-         CAST(h3_cell_to_parent(hex_id, 0) AS BIGINT) AS h3_p0,
-         CAST(h3_cell_to_parent(hex_id, 2) AS BIGINT) AS h3_p2,
-         * EXCLUDE (hex_id)
-  FROM hex
-  ORDER BY hex_id"))
-dbExecute(con, "DROP TABLE hex")
-dbExecute(con, "ALTER TABLE hex_ordered RENAME TO hex")
-dbExecute(con, "ALTER TABLE hex ADD PRIMARY KEY (hex_id)")
+# global cell-id COG in [-180,180] for titiler (uint32; no overviews to keep ids intact)
+writeRaster(r$cell_id, cellid_tif, filetype = "COG", datatype = "INT4U", overwrite = TRUE,
+            gdal = c("COMPRESS=LZW", "OVERVIEWS=NONE"))
 ```
 
 ## Summary + manifest
 
 ```{r summary}
 smry <- dbGetQuery(con, "
-  SELECT count(*) AS n_hex,
+  SELECT count(*) AS n_cell,
          count(*) FILTER (WHERE in_usa) AS n_usa,
          count(*) FILTER (WHERE in_pra) AS n_pra,
-         count(DISTINCT h3_p0) AS n_part_p0,
-         count(DISTINCT h3_p2) AS n_part_p2,
          round(min(area_km2), 3) AS area_min_km2,
          round(max(area_km2), 3) AS area_max_km2,
+         round(min(lon),1) AS lon_min, round(max(lon),1) AS lon_max,
          count(*) FILTER (WHERE depth_mean IS NULL) AS n_null_depth
-  FROM hex")
+  FROM cell")
 knitr::kable(smry)
 
 manifest <- c(as.list(smry), list(
-  version = ver, hex_res = hex_res, bbox = hex_bbox,
-  db = hex_db, source = basename(bio_oracle_tif)))
-write_json(manifest, here("data/manifests/build_hex_grid.json"),
-           auto_unbox = TRUE, pretty = TRUE)
+  version = ver, bbox = cell_bbox, db = cell_db,
+  cellid_tif = cellid_tif, source = basename(bio_oracle_tif)))
+write_json(manifest, here("data/manifests/build_cell_grid.json"), auto_unbox = TRUE, pretty = TRUE)
 
 dbDisconnect(con, shutdown = TRUE)
-message(glue("hex grid: {smry$n_hex} hexes ({smry$n_usa} in US, {smry$n_pra} in PRAs) -> {hex_db}"))
+message(glue("cell grid: {smry$n_cell} cells ({smry$n_usa} in US, {smry$n_pra} in PRAs) -> {cell_db}"))
 ```

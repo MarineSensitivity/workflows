@@ -4,8 +4,8 @@
 ver <- "v8" # version string; change on branches (e.g., "v3b")
 ver_prev <- "v7" # previous version (for copying inputs to new version)
 
-# v8 spatial sampling unit: H3 hexagon resolution 7 (~5.16 km^2). See msens::HEX_RES.
-hex_res <- 7L
+# v8 spatial sampling unit: GLOBAL 0.05 degree raster cell in [-180,180]
+# (rolled back from H3 hex; grid aligned to Bio-Oracle v3 + AquaX topology)
 
 is_server <- Sys.info()[["sysname"]] == "Linux"
 dir_data <- ifelse(is_server, "/share/data", "~/My Drive/projects/msens/data")
@@ -29,8 +29,17 @@ s3_atlas <- "s3://oceanmetrics.io-public/marine-atlas"
 dir_atlas_v <- glue::glue("{s3_atlas}/{ver}")
 
 # Bio-Oracle v3 global environmental raster (0.05 deg, 12 layers) — the source
-# of hex env covariates and the ocean mask for the hex grid
+# of cell env covariates and the ocean mask for the global cell grid
 bio_oracle_tif <- glue::glue("{dir_raw}/bio-oracle.org/bio-oracle_v3.tif")
+
+# global 0.05 deg cell-id COG in [-180,180] (built by build_cell_grid.qmd);
+# any SDM raster on this topology (Bio-Oracle, AquaX, resampled AquaMaps) maps to
+# cell_id by position. Shared across versions.
+cellid_tif <- glue::glue("{dir_derived}/r_cellid_global.tif")
+
+# study-area (to-shore US EEZ) + Program-Area polygons for in_usa / in_pra membership
+ply_usa_gpkg <- glue::glue("{dir_derived}/v1/ply_boem-usa.gpkg")            # shared
+ply_pra_gpkg <- glue::glue("{dir_derived}/{ver_prev}/ply_programareas_2026_{ver_prev}.gpkg")
 
 # zone table names
 tbl_er <- glue::glue("ply_ecoregions_2025")
