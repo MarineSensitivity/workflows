@@ -1,0 +1,107 @@
+---
+title: "Merge taxon metrics — validity flags + range / rarity / endemism / pct_marine"
+msens:
+  target_name: merge_taxon
+  workflow_type: merge
+  dependency: [merge_models, build_cell_grid]
+  output: data/manifests/merge_taxon.json
+editor_options:
+  chunk_output_type: console
+---
+
+Per-taxon attributes on the merged `model_cell`, joined to the `cell` table (ocean
+cells with `area_km2` / `in_usa` / `in_pra`):
+
+- **3 nested validity flags** (`is_valid_global ⊇ is_valid_usa ⊇ is_valid_pra`):
+  a taxon is *valid_global* if it has a mapped distribution reaching the ocean, isn't
+  extinct, and isn't flagged non-marine (`worms_is_marine`); *valid_usa* / *valid_pra*
+  add "has cells in the US study area / Program Areas".
+- **range / rarity / endemism / pct_marine**: `range_km2` = Σ `area_km2` over the
+  taxon's ocean cells (v7-comparable marine range); `pct_marine` = ocean-cell share of
+  the whole (land+ocean) range; `us_endemism` = US share of the marine range; rarity
+  class from the marine `range_km2` distribution.
+
+## Setup + compute
+
+```{r}
+#| label: compute
+
+librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, quiet = T)
+source(here("libs/paths.R"))
+source(here("libs/vars.R"))
+
+dir_atlas <- glue("{dir_big_v}/marine-atlas")
+merged    <- glue("{dir_atlas}/dist_merged/dataset=ms_merge")
+merge_db  <- glue("{dir_atlas}/merge.duckdb")
+manifest  <- here("data/manifests/merge_taxon.json")
+dir_create(path_dir(manifest))
+stopifnot("run merge_models first"    = dir_exists(merged),
+          "run build_cell_grid first" = file_exists(sdm_db))
+
+con <- dbConnect(duckdb(merge_db))
+dbExecute(con, glue("ATTACH '{sdm_db}' AS grid (READ_ONLY)"))
+
+# per-taxon cell tallies against the ocean cell table
+dbExecute(con, glue("CREATE OR REPLACE TABLE taxon_cell AS
+  WITH mc AS (SELECT mdl_key, cell_id FROM read_parquet('{merged}/**/*.parquet')),
+  j AS (SELECT mc.mdl_key, c.area_km2, c.in_usa, c.in_pra,
+               (c.cell_id IS NOT NULL) AS is_ocean
+        FROM mc LEFT JOIN grid.cell c USING (cell_id))
+  SELECT mdl_key,
+    count(*)                              AS n_cells,
+    count(*) FILTER (WHERE is_ocean)      AS n_ocean,
+    count(*) FILTER (WHERE in_usa)        AS n_usa,
+    count(*) FILTER (WHERE in_pra)        AS n_pra,
+    round(sum(area_km2) FILTER (WHERE is_ocean), 1) AS range_km2,
+    round(sum(area_km2) FILTER (WHERE in_usa),   1) AS range_usa_km2
+  FROM j GROUP BY mdl_key"))
+```
+
+## Flags + range/rarity/endemism → taxon
+
+```{r}
+#| label: flags
+
+# rarity thresholds on the marine range (km2); tune vs v7
+dbExecute(con, "CREATE OR REPLACE TABLE taxon AS
+  WITH t AS (
+    SELECT x.*, tc.n_cells, tc.n_ocean, tc.n_usa, tc.n_pra, tc.range_km2, tc.range_usa_km2
+    FROM taxon x LEFT JOIN taxon_cell tc ON x.ms_merge_key = tc.mdl_key)
+  SELECT *,
+    -- 3 nested validity flags (global superset of usa superset of pra)
+    (n_ocean > 0 AND coalesce(worms_is_extinct, FALSE) = FALSE
+       AND coalesce(worms_is_marine, TRUE) = TRUE)        AS is_valid_global,
+    (n_usa > 0)                                            AS is_valid_usa,
+    (n_pra > 0)                                            AS is_valid_pra,
+    round(100.0 * n_ocean / nullif(n_cells, 0), 1)         AS pct_marine,
+    round(100.0 * n_usa   / nullif(n_ocean, 0), 1)         AS us_endemism,
+    CASE
+      WHEN range_km2 IS NULL       THEN NULL
+      WHEN range_km2 <     10000   THEN 'very_rare'
+      WHEN range_km2 <    100000   THEN 'rare'
+      WHEN range_km2 <   1000000   THEN 'uncommon'
+      WHEN range_km2 <  10000000   THEN 'common'
+      ELSE                              'widespread' END   AS rarity
+  FROM t")
+
+smry <- dbGetQuery(con, "SELECT
+  count(*) n_taxa,
+  count(*) FILTER (WHERE is_valid_global) valid_global,
+  count(*) FILTER (WHERE is_valid_usa)    valid_usa,
+  count(*) FILTER (WHERE is_valid_pra)    valid_pra,
+  round(median(pct_marine),1) med_pct_marine FROM taxon")
+knitr::kable(smry)
+dbDisconnect(con, shutdown = TRUE)
+```
+
+## Manifest
+
+```{r}
+#| label: manifest
+
+write_json(
+  list(target = "merge_taxon", ver = ver, n_taxa = smry$n_taxa,
+       valid_global = smry$valid_global, valid_usa = smry$valid_usa,
+       valid_pra = smry$valid_pra, built = as.character(Sys.time())),
+  manifest, auto_unbox = TRUE, pretty = TRUE)
+```
