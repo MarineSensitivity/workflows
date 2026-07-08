@@ -33,14 +33,18 @@ Parquet exists). `REDO_INGEST=1` rebuilds all.
 #| label: setup
 
 librarian::shelf(
-  arrow, DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, readr, sf, terra,
-  tibble, MarineSensitivity/msens, quiet = T)
+  arrow, DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, readr, RSQLite, sf,
+  terra, tibble, MarineSensitivity/msens, quiet = T)
 source(here("libs/paths.R"))   # dir_raw, dir_big_v, cellid_tif, ver
 source(here("libs/vars.R"))    # redo_ingest
 options(readr.show_col_types = F)
 
 ds_key    <- "bl"
-botw_gpkg <- glue("{dir_raw}/birdlife.org/BOTW_GPKG_2024_2/BOTW_2024_2.gpkg")
+# prefer a fast LOCAL copy off Google Drive — per-species queries throttle badly on Drive
+botw_gpkg <- {
+  f_local <- path.expand("~/_big/msens/raw/BOTW_2024_2.gpkg")
+  if (file.exists(f_local)) f_local else glue("{dir_raw}/birdlife.org/BOTW_GPKG_2024_2/BOTW_2024_2.gpkg")
+}
 dir_dist  <- glue("{dir_big_v}/marine-atlas/dist/dataset={ds_key}")
 manifest  <- here("data/manifests/ingest_birdlife_botw.json")
 n_workers <- max(1L, parallel::detectCores())
@@ -49,6 +53,15 @@ dir_create(c(dir_dist, path_dir(manifest)))
 stopifnot(
   "run build_cell_grid.qmd first (need cellid_tif)" = file_exists(cellid_tif),
   "BOTW gpkg not found"                             = file_exists(botw_gpkg))
+
+# ensure sisid is indexed so the ~11k per-species queries are fast (0.03s vs a 10.9s
+# full scan of the 17,379-row all_species table — 300x)
+if (file.access(botw_gpkg, mode = 2) == 0) {  # writable copy
+  con_gpkg <- dbConnect(RSQLite::SQLite(), botw_gpkg)
+  try(dbExecute(con_gpkg, "CREATE INDEX IF NOT EXISTS idx_all_species_sisid ON all_species(sisid)"),
+      silent = TRUE)
+  dbDisconnect(con_gpkg)
+}
 ```
 
 ## Species list + model crosswalk
