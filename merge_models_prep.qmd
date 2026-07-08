@@ -59,9 +59,14 @@ lookup <- dir_ls(dir_dist, glob = "*model_*.csv") |>
       sisid           = if ("sisid" %in% names(m)) as.character(m$sisid) else NA_character_) }) |>
   bind_rows() |> distinct(mdl_key, .keep_all = TRUE)
 
+# read ingested mdl_keys per dataset so a mid-transfer / corrupt dataset (e.g. am
+# actively rsyncing, with a truncated "no magic bytes" parquet) is skipped with a
+# warning rather than crashing the whole glob — its taxa resolve on the next run.
 con0     <- dbConnect(duckdb())
-ingested <- dbGetQuery(con0, glue(
-  "SELECT DISTINCT mdl_key FROM read_parquet('{dir_dist}/*/*.parquet')"))$mdl_key
+ds_dirs  <- dir_ls(dir_dist, type = "directory", regexp = "dataset=")
+ingested <- unlist(lapply(ds_dirs, \(d) tryCatch(
+  dbGetQuery(con0, glue("SELECT DISTINCT mdl_key FROM read_parquet('{d}/*.parquet')"))$mdl_key,
+  error = \(e) { log_warn("skip {path_file(d)}: {conditionMessage(e)}"); character(0) })))
 dbDisconnect(con0, shutdown = TRUE)
 models <- lookup |> filter(mdl_key %in% ingested)
 count(models, ds_key)
