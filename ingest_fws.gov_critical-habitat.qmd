@@ -1,748 +1,83 @@
 ---
-title: "Ingest FWS ESA Critical Habitat Geodatabase"
+title: "Ingest USFWS ESA Critical Habitat → global 0.05° cells"
 msens:
   target_name: ingest_ch_fws
   workflow_type: ingest
-  dependency: [ingest_taxon, build_cell_grid]
+  dependency: [build_cell_grid]
   output: data/manifests/ingest_ch_fws.json
   dataset: {ds_key: ch_fws, response_type: range, source_authority: USFWS, temporal_interval: static, native_format: vector}
 editor_options:
   chunk_output_type: console
 ---
 
-## Read FWS ESA Critical Habitat Geodatabase
-
-- [ECOS: USFWS Threatened & Endangered Species Active Critical Habitat Report](https://ecos.fws.gov/ecp/report/table/critical-habitat.html)
-  - A zip file containing two shapefiles, one for lines, one for polygons, which aggregate all critical habitat shapes for all species. Updated: May 5, 2025
-  - [Map Viewer](https://fws.maps.arcgis.com/apps/mapviewer/index.html?webmap=9d8de5e265ad4fe09893cf75b8dbfb77)
-  
-  - [Integrated Taxonomic Information System (ITIS)](https://www.gbif.org/dataset/9ca92552-f23a-41a8-a140-01abaa31c931)
+USFWS **ESA critical-habitat** polygons onto the **global 0.05° cell grid**. Like
+FWS ranges, critical habitat is designated for many terrestrial species (840
+total), so we **match v7's marine-relevant subset (29 species)** for comparability
+(`data/v7_ch_fws_spcodes.csv`). Value = `msens::compute_er_score("FWS:{code}")` from
+the ESA `listing_st` (Endangered→EN=100, Threatened→TN=50), never hard-coded. Whole
+range via `cells_from_ranges`. `mdl_key = "ch_fws|{spcode}"`.
 
 ```{r}
-#| label: setup
+#| label: ingest
+
 librarian::shelf(
-  DBI, dplyr, DT, duckdb, fs, glue, here, knitr, janitor, leaflet, 
-  leaflet.extras2, logger, mapview, purrr, readr, readxl, sf, stringr, terra, 
-  tibble,
-  quiet = T)
-
+  arrow, DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, readr, sf, terra,
+  tibble, MarineSensitivity/msens, quiet = T)
+source(here("libs/paths.R"))   # dir_raw, dir_big_v, cellid_tif, ver
+source(here("libs/vars.R"))    # redo_ingest
 options(readr.show_col_types = F)
-mapviewOptions(
-  basemaps       = "Esri.OceanBasemap",
-  vector.palette = \(n) grDevices::hcl.colors(n, palette = "Spectral") )
-sf_use_s2(T)
+sf_use_s2(FALSE)
 
-is_server    <- Sys.info()[["sysname"]] == "Linux"
-dir_private  <- ifelse(is_server, "/share/private", "~/My Drive/private")
-dir_data     <- ifelse(is_server, "/share/data"   , "~/My Drive/projects/msens/data")
-spp_db       <- glue("{dir_data}/derived/spp.duckdb")
-sdm_db       <- glue("{dir_data}/derived/sdm.duckdb")
-cell_tif     <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
-dir_fws      <- glue("{dir_data}/raw/fws.gov")
-ply_shp      <- glue("{dir_fws}/crithab_all_layers/crithab_poly.shp")
-lns_shp      <- glue("{dir_fws}/crithab_all_layers/CRITHAB_LINE.shp")
-species_csv  <- glue("{dir_fws}/species.csv")
-ch_spp_csv   <- glue("{dir_fws}/crithab_spp.csv")
-ch_taxon_csv <- glue("{dir_fws}/crithab_spp_taxon.csv")
-dir_rast     <- glue("{dir_fws}/crithab_rast")
-ds_key       <- "ch_fws"
+ds_key   <- "ch_fws"
+poly_shp <- glue("{dir_raw}/fws.gov/crithab_all_layers/crithab_poly.shp")
+dir_dist <- glue("{dir_big_v}/marine-atlas/dist/dataset={ds_key}")
+manifest <- here("data/manifests/ingest_ch_fws.json")
+dir_create(c(dir_dist, path_dir(manifest)))
+stopifnot("run build_cell_grid.qmd first" = file_exists(cellid_tif), file_exists(poly_shp))
+v7_spcodes <- read_csv(here("data/v7_ch_fws_spcodes.csv"))$spcode   # 29 v7 ch_fws species
 
-dir.create(dir_rast, showWarnings = F)
-```
+ply <- st_read(poly_shp, quiet = TRUE)
+sp <- ply |> st_drop_geometry() |>
+  filter(spcode %in% v7_spcodes) |>
+  group_by(spcode, sciname, comname) |>
+  summarise(status = if_else(any(grepl("Endangered", listing_st)), "EN", "TN"), .groups = "drop") |>
+  mutate(er_code  = paste0("FWS:", status),
+         er_score = compute_er_score(er_code),
+         mdl_key  = mdl_key_raw(ds_key, spcode)) |>
+  arrange(sciname)
+write_csv(sp, glue("{dir_dist}/../model_{ds_key}.csv"))
 
-## TODO: Lines
-
-## Polygons
-
-```{r}
-#| label: polygons
-ply <- read_sf(ply_shp) |> 
-  clean_names() |> 
-  st_make_valid()
-
-d_spp <- ply |> 
-  st_drop_geometry()
-
-# table(d_ply$singlmulti, useNA = "ifany")
-# SINGLE 
-#    851 
-# table(d_ply$listing_st)
-# Endangered Proposed Endangered Proposed Threatened          Threatened 
-#        645                  18                   9                 179
-# glimpse(d_ply)
-# Rows: 851
-# Columns: 22
-# $ singlmulti <chr> "SINGLE", "SINGLE", "SINGLE", "SINGLE", "SINGLE", "SINGLE", "SINGLE"…
-# $ comname    <chr> "Kentucky creekshell", "Pecos pupfish", "Penasco least chipmunk", "F…
-# $ sciname    <chr> "Villosa ortmanni", "Cyprinodon pecosensis", "Tamias minimus atristr…
-# $ spcode     <chr> "F008", "E046", "A08G", "D02G", "D02G", "D02G", "D02G", "F05D", "K06…
-# $ vipcode    <chr> "I01", "V01", "V01", "V02", "V03", "V04", "V05", "I01", "I01", "V01"…
-# $ entity_id  <dbl> 6827, 5921, 4228, 11683, 11684, 11685, 11686, 11676, 10757, 215, 972…
-# $ unit       <chr> "Please check current species specific shapefile", "Please check cur…
-# $ subunit    <chr> "Please check current species specific shapefile", "Please check cur…
-# $ unitname   <chr> "Please check current species specific shapefile", "Please check cur…
-# $ subunitnam <chr> "Please check current species specific shapefile", "Please check cur…
-# $ status     <chr> "Proposed", "Proposed", "Final", "Proposed", "Proposed", "Proposed",…
-# $ leadoffice <dbl> 42431, 0, 22420, 11420, 11440, 11420, 11420, 21450, 40120, 65115, 11…
-# $ coopoffice <chr> "Please check current species specific shapefile", "Please check cur…
-# $ coopofmore <chr> "Please check current species specific shapefile", "Please check cur…
-# $ fedreg     <chr> "89FR76196 76233", "89FR92744 92785", "89FR99656 99687", "90FR3412 3…
-# $ pubdate    <chr> "20240917", "20241122", "20241210", "20250114", "20250114", "2025011…
-# $ effectdate <chr> "Please check current species specific shapefile", "Please check cur…
-# $ vacatedate <chr> "Please check current species specific shapefile", "Please check cur…
-# $ accuracy   <chr> "Please check current species specific shapefile", "Please check cur…
-# $ source_id  <dbl> 2106, 2107, 2112, 2108, 2109, 2110, 2111, 2092, 1999, 6, 910, 890, 1…
-# $ objectid   <dbl> 868, 869, 874, 870, 871, 872, 873, 811, 717, 1, 74, 73, 3, 455, 302,…
-# $ listing_st <chr> "Proposed Endangered", "Proposed Threatened", "Endangered", "Threate…
-
-```
-
-```{r}
-#| label: init_dbs
-con_spp <- dbConnect(duckdb(dbdir = spp_db, read_only = T))
-# dbListTables(con_spp)
-# [1] "gbif"             "gbif_vernacular"  "itis"             "itis_vernacular" 
-# [5] "iucn_redlist"     "iucn_vernacular"  "worms"            "worms_vernacular"
-con_sdm <- dbConnect(duckdb(dbdir = sdm_db, read_only = F))
-
-# *DEBUG* ----
-# tbl(con_sdm, "model") |>
-#   group_by(ds_key) |>
-#   summarize(n = n())
-#   ds_key      n
-#   <chr>   <dbl>
-# 1 ch_nmfs    34
-# 2 am_0.05 17550
-# 3 bl        573
-```
-
-### Add `dataset`
-
-```{r}
-#| label: insert_dataset_row
-row_dataset <- tibble(
-  ds_key          = !!ds_key,
-  name_short      = "FWS Critical Habitat for USA, 2025-05-05",
-  name_original   = "USFWS Threatened & Endangered Species Active Critical Habitat Report",
-  description     = "This page contains the spatial data for active proposed and final critical habitat for FWS only and Joint FWS/NMFS threatened and endangered species. ECOS is a FWS-sponsored platform for FWS data. The ECOS critical habitat on-line mapper includes (some, not all of the) proposed and final critical habitat for species listed as Threatened and Endangered by the FWS, or that are jointly managed by FWS/NMFS. The on-line mapper does not include species which are under the sole jurisdiction of NMFS.",
-  citation        = "",
-  source_broad    = "NMFS",
-  source_detail   = "https://ecos.fws.gov/ecp/",
-  regions         = "USA",
-  response_type   = "binary",
-  taxa_groups     = "all taxa",
-  year_pub        = 2025,
-  date_obs_beg    = NA,
-  date_obs_end    = NA,
-  date_env_beg    = NA,
-  date_env_end    = NA,
-  link_info       = "https://ecos.fws.gov/ecp/report/table/critical-habitat.html",
-  link_download   = "https://ecos.fws.gov/docs/crithab/crithab_all/crithab_all_layers.zip",
-  link_metadata   = "https://ecos.fws.gov/ecp/report/table/critical-habitat.html",
-  links_other     = "http://fws.maps.arcgis.com/home/webmap/viewer.html?webmap=9d8de5e265ad4fe09893cf75b8dbfb77",
-  spatial_res_deg = 0.05,
-  temporal_res    = "static")
-
-if (dbExistsTable(con_sdm, "dataset"))
-  dbExecute(con_sdm, glue("DELETE FROM dataset WHERE ds_key = '{ds_key}'"))
-
-dbWriteTable(con_sdm, "dataset", row_dataset, append = TRUE)
-# tbl(con_sdm, "dataset")
-```
-
-### Iterate rows: distribution to raster
-
-TODO: 
-
-- [ ] sort different liststatus per species, e.g. Rice's whale has both "prop." and "fin." status
-
-```{r}
-#| label: setup_iterate
-# sum(
-
-# d_ply |>
-#   arrange(sciname) |>
-#   filter(str_starts(sciname, "Sterna")) |> 
-#   View()
-
-# spp_dupe <- d_ply |> 
-#   filter(duplicated(sciname)) |> 
-#   pull(sciname) |>
-#   unique()
-# d_ply_dupe <- d_ply |> 
-#   filter(sciname %in% spp_dupe) |> 
-#   arrange(sciname)
-# View(d_ply_dupe)
-# Ambystoma californiense # California tiger Salamander
-# Charadrius melodus      # Piping Plover
-
-ply <- read_sf(ply_shp) |> 
-  clean_names() |> 
-  st_make_valid() |> 
-  mutate(
-    esa_code = case_match( # er: extinction risk
-      listing_st,
-      c("Threatened",
-        "Proposed Threatened") ~ "TN",     # "TN" = 0.6
-      c("Endangered",
-        "Proposed Endangered") ~ "EN") |>  # "EN" = 0.8
-      factor(c("TN", "EN"), ordered = T),
-    value = case_match(
-      esa_code,
-      "TN" ~ 70L,    # assign 70% presence to Threatened habitat
-      "EN" ~ 90L ))  # assign 90% presence to Endangered habitat
-
-# table(ply$listing_st, useNA = "ifany")
-# Endangered Proposed Endangered Proposed Threatened          Threatened 
-#        645                  18                   9                 179
-# table(ply$esa_code, useNA = "ifany")
-#  TN  EN 
-# 188 663
-
-d_spp <- ply |> 
-  st_drop_geometry() |> 
-  group_by(spcode, sciname, comname) |> 
-  summarize(
-    esa_code_max = max(esa_code),  # Get max esa_code to use for species weight. Precautionary principle
-    n_esa_tn     = sum(esa_code == "TN"),
-    n_esa_en     = sum(esa_code == "EN"),
-    .groups = "drop") |> 
-  rowid_to_column() # 840 x 7
-write_csv(d_spp, ch_spp_csv)
-
-# d_spp |>
-#   filter(n_esa_tn > 0 & n_esa_en > 0)
-#   rowid spcode sciname                 comname                     esa_code_max n_esa_tn n_esa_en
-#   <int> <chr>  <chr>                   <chr>                       <ord>           <int>    <int>
-# 1    50 B079   Charadrius melodus      Piping Plover               EN                  1        1
-# 2    69 C00S   Chelonia mydas          Green sea turtle            EN                  3        2
-# 3   101 D01T   Ambystoma californiense California tiger Salamander EN                  1        2
-# 4   106 D02G   Rana boylii             Foothill yellow-legged frog EN                  2        2
-
-r_cell   <- rast(cell_tif, lyrs = "cell_id") # [   0, 360]
-r_cell_r <- rotate(r_cell)                   # [-180, 180]
-ext(r_cell_r) <- round(ext(r_cell_r), 3)
-```
-
-```{r}
-#| label: iterate_sp_to_rast
-log_txt <- glue("{dir_rast}/_log {Sys.time()}.txt")
-log_appender(appender_file(log_txt))
-
-for (i in d_spp$rowid){  # i = 69 # C00S _Chelonia mydas_ Green sea turtle
-  # sp = "Charadrius melodus" # Piping Plover: no intersection with er1
-  # sp = "Ursus maritimus"    # Polar Bear: 
-  
-  # rast('/Users/bbest/Library/CloudStorage/GoogleDrive-ben@ecoquants.com/My Drive/projects/msens/data/raw/fws.gov/crithab_rast/Chelonia_mydas.tif')
-  # min value   :             70 
-  # max value   :             90 
-  
-  d_sp    <- filter(d_spp, rowid == i)
-  sp_sci  <- d_sp$sciname
-  sp_code <- d_sp$spcode
-  sp_key  <- glue("{ds_key}:{sp_code}")
-  p_sp    <- filter(ply, spcode == sp_code)
-  # mapView(p_sp, zcol = "esa_code")
-  
-  r_tif <- glue("{dir_rast}/{str_replace_all(sp_sci, ' ', '_')}.tif")
-  if (file.exists(r_tif)){
-    log_info("| SKIP | {sp_sci} | tif already exists")
-    next()
-  }
-
-  r_sp <- try(
-    rasterize(
-      p_sp,
-      r_cell_r,
-      field   = "value",
-      fun     = "max",
-      touches = T) |>
-      rotate() |> 
-      crop(r_cell) |> 
-      mask(r_cell),
-    silent = T)
-  # mapView(as.factor(trim(r_sp))) + mapView(p_sp, zcol = "esa_code")
-  if (inherits(r_sp, "try-error")){
-    log_info("| SKIP | {sp_sci} | error in rasterize(),...: {r_sp}")
-    next()
-  }
-  n_cells <- length(values(r_sp, na.rm = T))
-  if (n_cells == 0){
-    log_info("| SKIP | {sp_sci} | rast has no intersecting values")
-    next()
-  }
-  names(r_sp) <- sp_sci
-  round(ext(r_sp), 3)
-  
-  log_info("| WRITE | {sp_sci} | {format(n_cells, big.mark=',')} cells")
-  writeRaster(
-    r_sp, 
-    filename = r_tif,
-    overwrite = T)
-
-  # TODO: delete, append... ----
+if (redo_ingest && dir_exists(dir_dist)) { dir_delete(dir_dist); dir_create(dir_dist) }
+done <- path_ext_remove(path_file(dir_ls(dir_dist, glob = "*.parquet")))
+todo <- sp |> filter(!spcode %in% done)
+log_info("{ds_key}: {length(done)} done; rasterizing {nrow(todo)} of {nrow(sp)} (v7-matched) ...")
+for (i in seq_len(nrow(todo))) {
+  r      <- todo[i, ]
+  ply_sp <- ply |> filter(spcode == r$spcode) |> summarise(.groups = "drop")
+  d <- cells_from_ranges(ply_sp, cellid_tif, value = r$er_score)
+  if (nrow(d) == 0) { log_warn("  {r$spcode}: no cells"); next }
+  write_parquet(tibble(mdl_key = r$mdl_key, cell_id = d$cell_id, value = d$value),
+                fs::path(dir_dist, r$spcode, ext = "parquet"))
 }
+log_info("{ds_key}: done")
 ```
+
+## Verify + manifest
 
 ```{r}
-#| label: sp_cat
+#| label: verify
 
-# *.tif, join spp data ----
-d_spp <- read_csv(ch_spp_csv) |> 
-  rename(
-    sp_code         = spcode) |>
-  select(-rowid)
-d_species <- read_csv(species_csv) |> 
-  clean_names()
-# names(d_species)
+pq  <- dir_ls(dir_dist, glob = "*.parquet")
+con <- dbConnect(duckdb())
+smry <- dbGetQuery(con, glue(
+  "SELECT count(DISTINCT mdl_key) n_models, count(*) n_cells, min(value) v_min, max(value) v_max
+     FROM read_parquet('{dir_dist}/*.parquet')"))
+dbDisconnect(con, shutdown = TRUE)
+knitr::kable(smry)
 
-d_rast <- tibble(
-  tif = dir_ls(dir_rast, glob = "*.tif")) |> 
-  mutate(
-    sciname = path_file(tif) |> 
-      path_ext_remove() |> 
-      str_replace_all("_", " ")) |> 
-  left_join(
-    d_spp,
-    by = "sciname") |>
-  left_join(
-    d_species,
-    by = "sp_code") |>
-  arrange(sciname) |> 
-# stopifnot(nrow(d_rast |> filter(sciname != scientific_name)) == 0)
-# stopifnot(nrow(d_rast |> filter(comname != common_name    )) == 0)
-  select(-sciname, -comname)
-
-# table(d_rast$species_group, useNA = "ifany")
-# Amphibians        Arachnids            Birds      Crustaceans Ferns and Allies 
-#          5                1               21                1               13 
-#     Fishes Flowering Plants          Insects          Mammals         Reptiles 
-#          7              239               11               13               34 
-#     Snails 
-#          1
-
-# + scientific_name_clean ----
-# Remove all parentheses containing = followed by any characters, e.g.,
-#   "Acipenser oxyrinchus (=oxyrhynchus) desotoi"  
-#   "Asplenium (=Diellia) dielfalcatum (=falcata)"
-d_rast <- d_rast |> 
-  mutate(
-    scientific_name_clean = scientific_name |> 
-      str_remove_all("\\(=[^)]+\\)") |> 
-      str_squish()) |>  # Replace multiple spaces with single space
-  mutate(
-    common_name = na_if(common_name, "No common name")) |> 
-  rename(
-    fws_url                 = scientific_name_url,
-    scientific_name_dataset = scientific_name,
-    common_name_dataset     = common_name)
-
-# + worms_id, scientific_name_worms ----
-d_rast_taxon <- d_rast |> 
-  left_join(
-    tbl(con_spp, "worms") |>
-      filter(scientificName %in% d_rast$scientific_name_clean) |> 
-      select(
-        scientificName, 
-        worms_id              = acceptedNameUsageID,
-        scientific_name_worms = acceptedNameUsage,
-        taxonomicStatus,
-        worms_is_marine       = isMarine, 
-        worms_is_extinct      = isExtinct) |>
-    collect(),
-    by = join_by(scientific_name_clean == scientificName)) |> 
-  mutate(
-    taxonomic_status = factor(
-      taxonomicStatus,
-      levels = c(
-        "accepted", "unassessed", "interim unpublished", "temporary name",
-        "uncertain", "taxon inquirendum", "nomen dubium",
-        "alternative representation", "misapplication",
-        "misspelling - incorrect original spelling",
-        "misspelling - incorrect subsequent spelling",
-        "unjustified emendation",
-        "incorrect grammatical agreement of specific epithet",
-        "junior subjective synonym", "junior objective synonym",
-        "junior homonym", "unreplaced junior homonym",
-        "superseded combination", "superseded rank",
-        "nomen nudum", "nomen oblitum",
-        "unavailable name", "unaccepted"), 
-      ordered = T )) |>
-  slice_min(
-    by        = scientific_name_clean,
-    order_by  = taxonomic_status, 
-    with_ties = F)
-# d_rast_taxon$worms_id |> is.na() |> table()
-# FALSE  TRUE 
-#    44   269
-
-# ∆ itis_id to latest accepted ----
-d_rast_taxon <- d_rast_taxon |> 
-  left_join(
-    tbl(con_spp, "itis") |>
-      filter(
-        taxonID %in% d_rast_taxon$taxonomic_serial_number,
-        taxonID != acceptedNameUsageID) |> 
-      select(taxonID, acceptedNameUsageID) |> 
-      collect(),
-    by = c("taxonomic_serial_number" = "taxonID")) |> 
-  mutate(
-    itis_id = coalesce(acceptedNameUsageID, taxonomic_serial_number),
-    itis_id = ifelse(itis_id < 0, NA, itis_id)) |> 
-  select(-acceptedNameUsageID, -taxonomic_serial_number, -taxonomic_serial_number_url)
-# table(is.na(d_rast_taxon$itis_id))
-# FALSE  TRUE 
-#   311     2
-
-# + scientific_name_itis ----
-d_rast_taxon <- d_rast_taxon |> 
-  left_join(
-    tbl(con_spp, "itis") |>
-      filter(
-        taxonID %in% d_rast_taxon$itis_id) |> 
-      select(
-        taxonID, 
-        scientific_name_itis = scientificName) |>
-      collect(),
-    by = join_by(itis_id == taxonID))
-
-# + common_name_worms ----
-d_rast_taxon <- d_rast_taxon |> 
-  left_join(
-    tbl(con_spp, "worms_vernacular") |>
-      filter(
-        taxonID %in% d_rast_taxon$worms_id,
-        language == "ENG") |> 
-      select(
-        taxonID,
-        common_name_worms = vernacularName,
-        isPreferredName) |>
-      collect(),
-    by = join_by(worms_id == taxonID)) |> 
-  slice_max(
-    by        = scientific_name_clean,
-    order_by  = isPreferredName, 
-    with_ties = F)
-
-# + common_name_itis ----
-d_rast_taxon <- d_rast_taxon |> 
-  left_join(
-    tbl(con_spp, "itis_vernacular") |>
-      filter(
-        taxonID %in% d_rast_taxon$itis_id,
-        language == "English") |> 
-      group_by(taxonID) |> 
-      summarize(
-        common_name_itis = first(vernacularName), # get one common name per taxonID
-        .groups = "drop") |>
-      collect(),
-    by = join_by(itis_id == taxonID))
-
-# cleanup  ----
-d_rast_taxon <- d_rast_taxon |> 
-  # select(starts_with("common_name_")) |> names() |> paste(collapse = ", ")
-  mutate(
-    scientific_name_accepted = coalesce(
-      scientific_name_worms, scientific_name_itis, scientific_name_clean),
-    common_name_accepted = coalesce(
-      common_name_worms, common_name_itis, common_name_dataset)) |>
-  select(
-    -taxonomicStatus, -taxonomic_status, -scientific_name_clean)
-
-# d_rast_taxon |>
-#   mutate(has_worms_id = !is.na(worms_id)) |>
-#   select(species_group, has_worms_id) |>
-#   table()
-#                   has_worms_id
-# species_group      FALSE TRUE
-#   Amphibians           1    1
-#   Arachnids            1    0
-#   Birds               14    4
-#   Crustaceans          0    1
-#   Ferns and Allies    13    0
-#   Fishes               0    4
-#   Flowering Plants   215   24
-#   Insects              9    1
-#   Mammals              6    3
-#   Reptiles            10    5
-#   Snails               0    1
-# d_rast_taxon |>
-#   mutate(has_worms_id = !is.na(worms_id)) |>
-#   filter(has_worms_id) |> 
-#   select(species_group, worms_is_marine) |>
-#   table()
-#                   worms_is_marine
-# species_group      FALSE TRUE
-#   Amphibians           1    0
-#   Birds                0    4
-#   Crustaceans          1    0
-#   Fishes               1    3
-#   Flowering Plants    21    0
-#   Insects              0    0
-#   Mammals              0    3
-#   Reptiles             0    5
-#   Snails               1    0
-# d_rast_taxon |>
-#   filter(species_group == "Birds") |>
-#   arrange(common_name_dataset) |> 
-#   select(common_name_dataset, species_name_dataset, esa_code_max)
-#              esa_code_max
-# species_group EN TN
-#         Birds 10  8
-
-
-# Western Snowy Plover: missing in WoRMS, old taxonomy in ITIS ----
-# _Charadrius nivosus nivosus_ 
-# d_rast_taxon |>
-#   filter(common_name_dataset == "Western Snowy Plover") |> 
-#   glimpse()
-# https://en.wikipedia.org/wiki/Western_snowy_plover
-# https://explorer.natureserve.org/Taxon/ELEMENT_GLOBAL.2.874425/Anarhynchus_nivosus
-# TODO: look for NatureServe web services
-
-# Gulf sturgeon: ch_nmfs + ch_fws ----
-# both NMFS and FWS defined Critical Habitat for Gulf sturgeon
-# https://en.wikipedia.org/wiki/Gulf_sturgeon
-# scientific_name_dataset: "Acipenser oxyrinchus (=oxyrhynchus) desotoi"
-# scientific_name_worms: "Acipenser desotoi"
-# d_rast_taxon |>
-#   filter(common_name_dataset == "Gulf sturgeon") |>
-#   glimpse()
-
-write_csv(d_rast_taxon, ch_taxon_csv)
-```
-
-```{r}
-#| label: iterate_rast_to_db
-d_rast4db <- read_csv(ch_taxon_csv) # 313 × 20
-
-# table(d_rast4db$species_group, useNA = "ifany")
-#       Amphibians        Arachnids            Birds      Crustaceans 
-#                2                1               18                1 
-# Ferns and Allies           Fishes Flowering Plants          Insects 
-#               13                4              239               10 
-#          Mammals         Reptiles           Snails 
-#                9               15                1 
-
-d_birds <- d_rast4db |> 
-  filter(species_group == "Birds") |>  # 18 rows
-  mutate(
-    sp_cat = "bird")
-d_notbirds <- d_rast4db |> 
-  filter(
-    species_group != "Birds",
-    !is.na(worms_is_marine),
-    worms_is_marine == T) |> 
-  mutate(
-    sp_cat = case_match(
-      species_group,
-      "Fishes"   ~ "fish",
-      "Mammals"  ~ "mammal",
-      "Reptiles" ~ "turtle"))       # 11 rows
-d_rast4db <- bind_rows(d_birds, d_notbirds) |> 
-  arrange(scientific_name_dataset)  # 313 -> 29 rows
-
-# table(d_rast4db$sp_cat, useNA = "ifany")
-# bird   fish mammal turtle 
-#   18      3      3      5
-
-# ext(r_cell) <- round(ext(r_cell), 3)
-
-for (i in 1:nrow(d_rast4db)){  # i = 1
-
-  r_sp   <- rast(d_rast4db$tif[i])
-  ext(r_sp) <- round(ext(r_sp), 3)
-  
-  d_sp   <- d_rast4db |> slice(i)
-  # d_sp |> glimpse()
-  # $ tif                      <chr> "/Users/bbest/My Drive/projects/msens/data…
-  # $ sp_code                  <chr> "E04W"
-  # $ esa_code_max             <chr> "TN"
-  # $ n_esa_tn                 <dbl> 1
-  # $ n_esa_en                 <dbl> 0
-  # $ common_name_dataset      <chr> "Gulf sturgeon"
-  # $ scientific_name_dataset  <chr> "Acipenser oxyrinchus (=oxyrhynchus) desot…
-  # $ fws_url                  <chr> "https://ecos.fws.gov/ecp/species/651"
-  # $ species_group            <chr> "Fishes"
-  # $ worms_id                 <dbl> 1805509
-  # $ scientific_name_worms    <chr> "Acipenser desotoi"
-  # $ worms_is_marine          <lgl> TRUE
-  # $ worms_is_extinct         <lgl> NA
-  # $ itis_id                  <dbl> 624005
-  # $ scientific_name_itis     <chr> "Acipenser oxyrinchus desotoi"
-  # $ common_name_worms        <chr> NA
-  # $ isPreferredName          <dbl> NA
-  # $ common_name_itis         <chr> "Gulf sturgeon"
-  # $ scientific_name_accepted <chr> "Acipenser desotoi"
-  # $ common_name_accepted     <chr> "Gulf sturgeon"
-  # $ sp_cat                   <chr> "fish"
-  sp     <- d_sp$scientific_name_dataset
-  sp_key <- glue("{ds_key}:{d_sp$sp_code}")
-  
-  n_cells <- length(values(r_sp, na.rm = T))
-  if (n_cells == 0){
-    message(glue("No cells for {sp} ({i}/{nrow(ply_ch)})"))
-    next()
-  }
-
-  # delete: existing ----
-  mdl_seqs <- tbl(con_sdm, "model") |> 
-    filter(ds_key == !!ds_key, taxa == !!sp_key) |> 
-    pull(mdl_seq)
-  if (length(mdl_seqs) > 0) {
-    dbExecute(con_sdm, glue("DELETE FROM model WHERE ds_key = '{ds_key}' AND taxa = '{sp_key}'"))
-    dbExecute(con_sdm, glue("DELETE FROM species WHERE ds_key = '{ds_key}' AND taxa = '{sp_key}'"))
-    dbExecute(con_sdm, glue("DELETE FROM model_cell WHERE mdl_seq IN ({paste(mdl_seqs, collapse = ',')})"))
-  }
-  
-  # append: model ----
-  d_model <- tibble(
-    ds_key      = ds_key,
-    taxa        = sp_key,
-    time_period = "2025",
-    region      = "Global",
-    mdl_type    = "binary",
-    description = glue(
-      "FWS critical habitat for {sp}, interpolated to 0.05° resolution") )
-  dbWriteTable(con_sdm, "model", d_model, append = TRUE)
-  # tbl(con_sdm, "model") |> collect() |> tail()
-  
-  # get the mdl_seq that was just created
-  mdl_seq <- dbGetQuery(con_sdm, glue("
-    SELECT mdl_seq FROM model 
-    WHERE
-      ds_key = '{ds_key}' AND 
-      taxa   = '{sp_key}'
-    ORDER BY mdl_seq DESC LIMIT 1 "))$mdl_seq
-  
-  # d_sp |> glimpse()
-  # Rows: 1
-  # Columns: 4
-  # $ sp_cat   <chr> "coral"
-  # $ sciename <chr> "Acropora cervicornis"
-  # $ comname  <chr> "Coral, staghorn"
-  # $ esa_code <ord> TN
-  
-  # append: species ----
-  d_species <- tibble(
-    ds_key                   = ds_key,
-    taxa                     = sp_key,
-    sp_key                   = sp_key,
-    worms_id                 = d_sp$worms_id,
-    gbif_id                  = NA_integer_,  # TODO: lookup from GBIF
-    itis_id                  = d_sp$itis_id,
-    iucn_id                  = NA_integer_,  # TODO: lookup from IUCN
-    scientific_name_dataset  = sp,
-    common_name_dataset      = d_sp$common_name_dataset,
-    # TODO: do lookup from WoRMS
-    scientific_name_accepted = d_sp$scientific_name_accepted,
-    common_name_accepted     = d_sp$common_name_accepted,
-    redlist_code             = d_sp$esa_code_max,
-    redlist_year             = NA_integer_,
-    sp_cat                   = d_sp$sp_cat)
-  # glimpse(d_species)
-  stopifnot(length(setdiff(names(d_species), dbListFields(con_sdm, "species"))) == 0)
-  stopifnot(setdiff(dbListFields(con_sdm, "species"), names(d_species)) == "sp_seq")
-  dbWriteTable(con_sdm, "species", d_species, append = T)
-  # tbl(con_sdm, "species") |> collect() |> tail()
-  # tbl(con_sdm, "model")   |> collect() |> tail()
-  stopifnot(tbl(con_sdm, "species") |> filter(is.na(sp_seq)) |> collect() |> nrow() == 0)
-
-  # append: model_cell ----
-  d_mdl_cell <- as.data.frame(r_sp, cells = T, na.rm = T) |>
-    tibble() |>
-    select(cell_id = cell, value = 2) |> 
-    mutate(
-      mdl_seq = mdl_seq) |> 
-    arrange(cell_id)
-  dbWriteTable(con_sdm, "model_cell", d_mdl_cell, append = T)
-}
-```
-
-## Prompt for Claude on WoRMS taxonID duplicate parsing
-
-Create parsimonious R code (not elaborate functions) that reasonably chooses the best possible record where multiple possibilities might exist for a WoRMS `taxonID` (aka AphiaID) based on the `taxonomicStatus`, which could be assigned as an ordered factor (ie "accepted" most preferred and "unaccepted" least with "unassessed" in between), so the best possible option is chosen.
-
-
-```
-> # get WoRMS taxon IDs for species with rasters ----
-> d_rast_taxon <- d_rast |> 
-+   left_join(
-+     tbl(con_spp, "worms") |>
-+       filter(scientificName %in% d_rast$scientific_name_clean) |> 
-+       select(
-+         scientific_name = scientificName, 
-+         worms_id        = taxonID,
-+         isMarine, 
-+         isExtinct) |>
-+     collect(),
-+     by = "scientific_name")
->                    
-> # check for duplicates
-> sp_dupes <- d_rast_taxon |> 
-+   filter(duplicated(scientific_name_clean)) |> 
-+   pull(scientific_name_clean)
-> tbl(con_spp, "worms") |>
-+   filter(scientificName %in% sp_dupes) |> 
-+   select(
-+     taxonID, acceptedNameUsageID, parentNameUsageID,
-+     scientificName, taxonomicStatus) |>
-+   collect()
-# A tibble: 2 × 5
-  taxonID acceptedNameUsageID parentNameUsageID scientificName     taxonomicStatus
-    <int>               <int>             <int> <chr>              <chr>          
-1 1137205             1137205           1075810 Lipochaeta fauriei unassessed     
-2 1210962             1106700           1075810 Lipochaeta fauriei unaccepted     
-> 
-> # show all possible values for taxonomicStatus
-> tbl(con_spp, "worms") |>
-+   pull(taxonomicStatus) |> 
-+   table()
-
-                                           accepted 
-                                             673086 
-                         alternative representation 
-                                              30178 
-incorrect grammatical agreement of specific epithet 
-                                               1425 
-                                interim unpublished 
-                                                136 
-                                     junior homonym 
-                                               3847 
-                           junior objective synonym 
-                                               2619 
-                          junior subjective synonym 
-                                              46318 
-                                     misapplication 
-                                                388 
-          misspelling - incorrect original spelling 
-                                                957 
-        misspelling - incorrect subsequent spelling 
-                                               7781 
-                                       nomen dubium 
-                                               6531 
-                                        nomen nudum 
-                                               5333 
-                                      nomen oblitum 
-                                                144 
-                             superseded combination 
-                                              94155 
-                                    superseded rank 
-                                               5071 
-                                  taxon inquirendum 
-                                              19339 
-                                     temporary name 
-                                                676 
-                                         unaccepted 
-                                             450403 
-                                         unassessed 
-                                             127867 
-                                   unavailable name 
-                                               2117 
-                                          uncertain 
-                                               2870 
-                             unjustified emendation 
-                                                445 
-                          unreplaced junior homonym 
-                                               2672
+write_json(
+  list(target = "ingest_ch_fws", ds_key = ds_key, ver = ver,
+       n_models = nrow(sp), n_parquet = length(pq), dir_dist = dir_dist,
+       built = as.character(Sys.time())),
+  manifest, auto_unbox = TRUE, pretty = TRUE)
 ```
