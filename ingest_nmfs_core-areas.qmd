@@ -11,10 +11,10 @@ editor_options:
 ---
 
 NMFS **Core Distribution Areas** onto the **global 0.05° cell grid**. Currently one:
-**Rice's whale** (*Balaenoptera ricei*), whose designated core area gets maximum
-weighting (`value = 100`). `mdl_key = "ca_nmfs|{sp_id}"`. Same vector→cells pattern
-(`msens::cells_from_ranges()`) as the other range datasets; add rows to `areas` for
-future core areas.
+**Rice's whale** (*Balaenoptera ricei*), ESA-Endangered, so `value =
+msens::compute_er_score("NMFS:EN")` = 100 (extinction-risk score, never hard-coded).
+`mdl_key = "ca_nmfs|{sp_id}"`. Same vector→cells pattern (`msens::cells_from_ranges()`)
+as the other range datasets; add rows to `areas` (with `er_code`) for future core areas.
 
 ## Setup + rasterize
 
@@ -35,20 +35,22 @@ manifest <- here("data/manifests/ingest_ca_nmfs.json")
 dir_create(c(dir_dist, path_dir(manifest)))
 stopifnot("run build_cell_grid.qmd first" = file_exists(cellid_tif))
 
-# core-area shapefile(s) -> species; extend this table as NMFS adds core areas
+# core-area shapefile(s) -> species; extend this table as NMFS adds core areas.
+# er_code drives the value via msens::compute_er_score() (never hard-code the value):
+# Rice's whale is ESA-Endangered (NMFS) -> compute_er_score("NMFS:EN") = 100.
 areas <- tribble(
-  ~sp_id,               ~sci_name,             ~shp,
-  "Balaenoptera_ricei", "Balaenoptera ricei",
+  ~sp_id,               ~sci_name,            ~er_code,   ~shp,
+  "Balaenoptera_ricei", "Balaenoptera ricei", "NMFS:EN",
     "shapefile_Rices_whale_core_distribution_area_Jun19_SERO/shapefile_Rices_whale_core_distribution_area_Jun19_SERO.shp") |>
   mutate(mdl_key = mdl_key_raw(ds_key, sp_id))
-write_csv(areas |> select(mdl_key, sp_id, sci_name), glue("{dir_dist}/../model_{ds_key}.csv"))
+write_csv(areas |> select(mdl_key, sp_id, sci_name, er_code), glue("{dir_dist}/../model_{ds_key}.csv"))
 
 if (redo_ingest && dir_exists(dir_dist)) { dir_delete(dir_dist); dir_create(dir_dist) }
 for (i in seq_len(nrow(areas))) {
   a <- areas[i, ]; out_pq <- fs::path(dir_dist, a$sp_id, ext = "parquet")
   if (file_exists(out_pq)) { log_info("{a$sp_id}: skip"); next }
   ply <- st_read(glue("{dir_ca}/{a$shp}"), quiet = TRUE)
-  d   <- cells_from_ranges(ply, cellid_tif, value = 100)     # core area = max weight
+  d   <- cells_from_ranges(ply, cellid_tif, value = compute_er_score(a$er_code))
   if (nrow(d) == 0) { log_warn("{a$sp_id}: no cells"); next }
   write_parquet(tibble(mdl_key = a$mdl_key, cell_id = d$cell_id, value = d$value), out_pq)
   log_info("{a$sp_id}: {nrow(d)} cells")

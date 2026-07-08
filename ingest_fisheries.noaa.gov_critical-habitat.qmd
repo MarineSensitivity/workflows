@@ -15,12 +15,13 @@ Rasterize each species' **NMFS ESA critical-habitat** polygon(s) onto the **glob
 keyed by `mdl_key = "ch_nmfs|{sp_id}"` (`sp_id` = a slug of the scientific name —
 NMFS critical habitat has no numeric species id).
 
-**Method.** A range is presence, so `msens::cells_from_ranges()` (exactextractr)
-marks every cell the (unioned) polygon overlaps with `value = 100`, capturing the
-whole footprint with no land mask — here that's ocean cells anyway, since critical
-habitat is marine. Pass `cover = TRUE` for coverage-weighted edges. This is the
-shared **vector → cells** pattern reused by every range dataset (BOTW, FWS, NMFS
-core areas, turtles).
+**Method.** `msens::cells_from_ranges()` (exactextractr) marks every cell the
+(unioned) polygon overlaps, capturing the whole footprint with no land mask (here
+ocean anyway, critical habitat being marine). The **value is the species'
+extinction-risk score** via `msens::compute_er_score()` — never hard-coded — from
+its most-protective ESA status (`NMFS:EN` = 100, `NMFS:TN` = 50). This is the shared
+**vector → cells** pattern reused by every range dataset (BOTW, FWS, NMFS core
+areas, turtles).
 
 Source `ply.gpkg` is derived from the NMFS ESA Critical Habitat geodatabase (see
 `old/ingest_fisheries.noaa.gov_critical-habitat_v7.qmd` for that one-time
@@ -62,11 +63,16 @@ ply <- st_read(ply_geo, quiet = TRUE)
 sp  <- ply |>
   st_drop_geometry() |>
   group_by(SCIENAME) |>                       # one model per species (polygons unioned below)
-  summarise(TAXON = first(TAXON), COMNAME = first(COMNAME), .groups = "drop") |>
+  summarise(
+    TAXON = first(TAXON), COMNAME = first(COMNAME),
+    # most-protective ESA status among the species' critical-habitat features
+    status = if_else(any(grepl("Endangered", LISTSTATUS)), "EN", "TN"), .groups = "drop") |>
   arrange(SCIENAME) |>
   mutate(
-    sp_id   = gsub("^_|_$", "", gsub("[^A-Za-z0-9]+", "_", SCIENAME)),
-    mdl_key = mdl_key_raw(ds_key, sp_id))
+    sp_id    = gsub("^_|_$", "", gsub("[^A-Za-z0-9]+", "_", SCIENAME)),
+    mdl_key  = mdl_key_raw(ds_key, sp_id),
+    er_code  = paste0("NMFS:", status),
+    er_score = compute_er_score(er_code))     # value via compute_er_score(), never hard-coded
 stopifnot(!any(duplicated(sp$sp_id)))
 write_csv(sp, glue("{dir_dist}/../model_{ds_key}.csv"))
 nrow(sp)
@@ -85,7 +91,7 @@ log_info("{ds_key}: {length(done)} done; rasterizing {nrow(todo)} of {nrow(sp)} 
 for (i in seq_len(nrow(todo))) {
   row    <- todo[i, ]
   ply_sp <- ply |> filter(SCIENAME == row$SCIENAME) |> summarise(.groups = "drop")
-  d <- cells_from_ranges(ply_sp, cellid_tif)          # binary presence = 100 (v7-consistent)
+  d <- cells_from_ranges(ply_sp, cellid_tif, value = row$er_score)   # ER score, not hard-coded
   if (nrow(d) == 0) { log_warn("  {row$sp_id}: no ocean cells covered"); next }
   write_parquet(
     tibble(mdl_key = row$mdl_key, cell_id = d$cell_id, value = d$value),

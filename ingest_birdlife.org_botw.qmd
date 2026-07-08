@@ -17,10 +17,12 @@ grid** and write one Parquet per species, keyed by `mdl_key = "bl|{sisid}"`.
 so v8 captures the **entire** distribution (land + ocean) — a departure from prior
 versions that masked to the ocean. `msens::cells_from_ranges()` (exactextractr) is
 fast and tolerant of BOTW's messy geometry (self-touching / MULTISURFACE loops),
-using extant polygons (`presence ∈ {1,2,3}`), value = 100 = presence. How marine a
-range is (`pct_marine`) is a derived metric computed at **merge**, where the `cell`
-table's `is_ocean` joins cleanly for every dataset — not a filter here. (The
-redlist-category weighting of the presence value also happens at merge.)
+using extant polygons (`presence ∈ {1,2,3}`). The **value is the IUCN
+extinction-risk score** via `msens::compute_er_score("IUCN:{code}")` (never
+hard-coded; CR=50, EN=25, VU=5, NT=2, LC/DD=1) — the Red List category normalized
+to that vocabulary. How marine a range is (`pct_marine`) is a derived metric
+computed at **merge**, where the `cell` table's `is_ocean` joins cleanly for every
+dataset — not a filter here.
 
 Parallelized with `parallel::mclapply` (fork); resumable (skip species whose
 Parquet exists). `REDO_INGEST=1` rebuilds all.
@@ -63,11 +65,23 @@ chk <- st_read(botw_gpkg, quiet = TRUE,
   query = "SELECT ScientificName AS sci_name, IUCN_RedList_Category_2024 AS iucn
              FROM main_BL_HBW_Checklist_V9") |> st_drop_geometry()
 
+# normalize the IUCN Red List category to compute_er_score()'s vocabulary
+# (CR/EN/VU/NT/LC/DD): "CR (PE)"/"CR (PEW)" -> CR; drop extinct (EX/EW); blank -> LC.
+# Value = the IUCN extinction-risk score (never hard-coded); merge may add MBTA etc.
 sp <- a_attr |> st_drop_geometry() |>
   left_join(chk, by = "sci_name") |>
-  filter(is.na(iucn) | iucn != "EX") |>
-  arrange(sci_name) |>
-  mutate(mdl_key = mdl_key_raw(ds_key, sisid))
+  mutate(iucn = toupper(trimws(iucn))) |>
+  filter(is.na(iucn) | !iucn %in% c("EX", "EW")) |>
+  mutate(
+    code = case_when(
+      is.na(iucn) | iucn == ""            ~ "LC",
+      grepl("^CR", iucn)                  ~ "CR",
+      iucn %in% c("EN","VU","NT","LC","DD") ~ iucn,
+      TRUE                                ~ "LC"),
+    er_code  = paste0("IUCN:", code),
+    er_score = compute_er_score(er_code),
+    mdl_key  = mdl_key_raw(ds_key, sisid)) |>
+  arrange(sci_name)
 stopifnot(!any(duplicated(sp$sisid)))
 write_csv(sp, glue("{dir_dist}/../model_{ds_key}.csv"))
 nrow(sp)
@@ -90,7 +104,8 @@ one <- function(i) {
     "SELECT sisid, geom FROM all_species WHERE sisid = %d AND presence IN (1,2,3)", sisid)),
     error = function(e) NULL)
   if (is.null(p) || nrow(p) == 0) return("empty")
-  d <- tryCatch(cells_from_ranges(p, cellid_tif), error = function(e) NULL)
+  d <- tryCatch(cells_from_ranges(p, cellid_tif, value = todo$er_score[i]),
+                error = function(e) NULL)
   if (is.null(d) || nrow(d) == 0) return("empty")
   arrow::write_parquet(
     tibble::tibble(mdl_key = todo$mdl_key[i], cell_id = d$cell_id, value = d$value), out_pq)

@@ -14,13 +14,14 @@ Refined sea-turtle ranges onto the **global 0.05° cell grid**, replacing the ov
 broad AquaMaps/IUCN turtle ranges. Range polygons come from **SWOT** global
 distributions; **NMFS DPS** boundaries mark the Endangered sub-populations.
 
-**Value = extinction-risk within the range.** For the three species with DPS data
-(Loggerhead CC, Green CM, Olive Ridley LO): cells inside an **Endangered DPS →
-100**, the rest of the range (Threatened) **→ 50**. The three pure-Endangered
-species (Leatherback DC, Hawksbill EI, Kemp's Ridley LK): **100** throughout. The
-EN/TN split is done at the **cell level** (rasterize both, combine) — no fragile
-geometry intersection. Whole range, no land mask (turtles are marine, so these are
-ocean cells). `mdl_key = "rng_turtle_swot_dps|{code}"`.
+**Value = extinction-risk score** via `msens::compute_er_score()` (never hard-coded).
+For the three species with DPS data (Loggerhead CC, Green CM, Olive Ridley LO):
+cells inside an **Endangered DPS → `compute_er_score("NMFS:EN")` = 100**, the rest
+of the range (Threatened) **→ `compute_er_score("NMFS:TN")` = 50**. The three
+pure-Endangered species (Leatherback DC, Hawksbill EI, Kemp's Ridley LK): 100
+throughout. The EN/TN split is done at the **cell level** (rasterize both, combine)
+— no fragile geometry intersection. Whole range, no land mask (turtles are marine,
+so these are ocean cells). `mdl_key = "rng_turtle_swot_dps|{code}"`.
 
 ## Setup
 
@@ -41,6 +42,11 @@ dir_dist <- glue("{dir_big_v}/marine-atlas/dist/dataset={ds_key}")
 manifest <- here("data/manifests/ingest_turtles_swot_dps.json")
 dir_create(c(dir_dist, path_dir(manifest)))
 stopifnot("run build_cell_grid.qmd first" = file_exists(cellid_tif), dir_exists(dir_swot))
+
+# range value = extinction-risk score via msens::compute_er_score() (NEVER hard-code).
+# Sea turtles are ESA-listed marine species (NMFS authority): EN=100, TN=50.
+er_en <- compute_er_score("NMFS:EN")   # 100
+er_tn <- compute_er_score("NMFS:TN")   # 50
 
 swot_spp <- tribble(
   ~code, ~sci_name,                ~common_name,    ~has_dps, ~esa_pure,
@@ -69,11 +75,11 @@ for (i in seq_len(nrow(swot_spp))) {
   swot <- st_read(glue("{dir_swot}/Global_Distribution_{s$code}.shp"), quiet = TRUE)
   if (s$has_dps) {
     dps     <- st_read(glue("{dir_dps}/{tolower(s$code)}_endangered.gpkg"), quiet = TRUE)
-    d_range <- cells_from_ranges(swot, cellid_tif, value = 50)   # whole range = Threatened
-    d_en    <- cells_from_ranges(dps,  cellid_tif, value = 100)  # Endangered DPS areas
-    d <- d_range |> mutate(value = if_else(cell_id %in% d_en$cell_id, 100, 50))
+    d_range <- cells_from_ranges(swot, cellid_tif, value = er_tn)  # whole range = Threatened
+    d_en    <- cells_from_ranges(dps,  cellid_tif, value = er_en)  # Endangered DPS areas
+    d <- d_range |> mutate(value = if_else(cell_id %in% d_en$cell_id, er_en, er_tn))
   } else {
-    d <- cells_from_ranges(swot, cellid_tif, value = 100)        # pure Endangered
+    d <- cells_from_ranges(swot, cellid_tif, value = er_en)        # pure Endangered
   }
   if (nrow(d) == 0) { log_warn("{s$code}: no cells"); next }
   write_parquet(tibble(mdl_key = s$mdl_key, cell_id = d$cell_id, value = d$value), out_pq)
