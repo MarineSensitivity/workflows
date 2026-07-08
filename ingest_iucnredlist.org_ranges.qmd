@@ -1,0 +1,115 @@
+---
+title: "Ingest IUCN Red List expert ranges → global 0.05° cells"
+msens:
+  target_name: ingest_rng_iucn
+  workflow_type: ingest
+  dependency: [build_cell_grid]
+  output: data/manifests/ingest_rng_iucn.json
+  dataset: {ds_key: rng_iucn, response_type: range, source_authority: IUCN, temporal_interval: static, native_format: vector}
+editor_options:
+  chunk_output_type: console
+---
+
+IUCN Red List **expert ranges** for marine taxa onto the **global 0.05° cell grid**
+— the non-bird complement to AquaMaps/BOTW. Source: the 24 marine taxonomic-group
+downloads under `raw/iucnredlist.org/` (corals, fish, sharks, marine mammals,
+turtles, seagrasses, mangroves…).
+
+Per species (`id_no`): union its **extant** polygons (`presence ∈ {1,2,3}`),
+capture the **whole range** (no land mask), value = `msens::compute_er_score(
+"IUCN:{category}")` (never hard-coded; CR=50/EN=25/VU=5/NT=2/LC,DD=1). `mdl_key =
+"rng_iucn|{id_no}"`. Species are filtered to IUCN's own **`marine = true`** flag —
+authoritative for non-birds (e.g. it drops freshwater turtles from the TURTLES
+group) — so the plain-`MAMMALS` terrestrial species are excluded too.
+
+Parallel (mclapply, per group in memory), resumable; `REDO_INGEST=1` rebuilds all.
+
+## Setup
+
+```{r}
+#| label: setup
+
+librarian::shelf(
+  arrow, DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, readr, sf, terra,
+  tibble, MarineSensitivity/msens, quiet = T)
+source(here("libs/paths.R"))   # dir_raw, dir_big_v, cellid_tif, ver
+source(here("libs/vars.R"))    # redo_ingest
+options(readr.show_col_types = F)
+sf_use_s2(FALSE)
+
+ds_key    <- "rng_iucn"
+dir_iucn  <- glue("{dir_raw}/iucnredlist.org")
+dir_dist  <- glue("{dir_big_v}/marine-atlas/dist/dataset={ds_key}")
+manifest  <- here("data/manifests/ingest_rng_iucn.json")
+n_workers <- max(1L, parallel::detectCores())
+dir_create(c(dir_dist, path_dir(manifest)))
+stopifnot("run build_cell_grid.qmd first" = file_exists(cellid_tif), dir_exists(dir_iucn))
+
+# valid IUCN Red List categories for compute_er_score (drop EX/EW/blank)
+iucn_ok <- c("CR", "EN", "VU", "NT", "LC", "DD")
+if (redo_ingest && dir_exists(dir_dist)) { dir_delete(dir_dist); dir_create(dir_dist) }
+```
+
+## Iterate taxonomic groups → species → cells
+
+```{r}
+#| label: interpolate
+
+groups <- dir_ls(dir_iucn, type = "directory")
+sp_all <- list()
+
+for (grp in groups) {
+  shps <- dir_ls(grp, glob = "*.shp", recurse = TRUE)
+  if (length(shps) == 0) next
+  g <- suppressWarnings(bind_rows(lapply(shps, st_read, quiet = TRUE))) |>
+    rlang::set_names(tolower) |>
+    filter(presence %in% 1:3, tolower(marine) == "true", category %in% iucn_ok)
+  if (nrow(g) == 0) next
+
+  sp <- g |> st_drop_geometry() |>
+    group_by(id_no, sci_name, class, category) |> summarise(.groups = "drop") |>
+    mutate(er_score = compute_er_score(paste0("IUCN:", category)),
+           mdl_key  = mdl_key_raw(ds_key, id_no), group = path_file(grp))
+  sp_all[[path_file(grp)]] <- sp
+  done <- as.integer(path_ext_remove(path_file(dir_ls(dir_dist, glob = "*.parquet"))))
+  todo <- sp |> filter(!id_no %in% done)
+  log_info("{path_file(grp)}: {nrow(sp)} marine species, {nrow(todo)} to do")
+
+  one <- function(i) {
+    r      <- todo[i, ]
+    ply_sp <- g |> filter(id_no == r$id_no) |> summarise(.groups = "drop")
+    d <- tryCatch(cells_from_ranges(ply_sp, cellid_tif, value = r$er_score),
+                  error = function(e) NULL)
+    if (is.null(d) || nrow(d) == 0) return("empty")
+    arrow::write_parquet(
+      tibble::tibble(mdl_key = r$mdl_key, cell_id = d$cell_id, value = d$value),
+      fs::path(dir_dist, r$id_no, ext = "parquet")); "done"
+  }
+  invisible(parallel::mclapply(seq_len(nrow(todo)),
+    function(i) tryCatch(one(i), error = function(e) "error"),
+    mc.cores = n_workers, mc.preschedule = FALSE))
+}
+sp_all <- bind_rows(sp_all)
+write_csv(sp_all, glue("{dir_dist}/../model_{ds_key}.csv"))
+glue("{nrow(sp_all)} IUCN marine species across {length(unique(sp_all$group))} groups")
+```
+
+## Verify + manifest
+
+```{r}
+#| label: verify
+
+pq  <- dir_ls(dir_dist, glob = "*.parquet")
+con <- dbConnect(duckdb())
+smry <- dbGetQuery(con, glue(
+  "SELECT count(DISTINCT mdl_key) n_models, count(*) n_cells, min(value) v_min, max(value) v_max
+     FROM read_parquet('{dir_dist}/*.parquet')"))
+dbDisconnect(con, shutdown = TRUE)
+knitr::kable(smry)
+
+write_json(
+  list(target = "ingest_rng_iucn", ds_key = ds_key, ver = ver,
+       n_species = nrow(sp_all), n_parquet = length(pq),
+       dir_dist = dir_dist, built = as.character(Sys.time())),
+  manifest, auto_unbox = TRUE, pretty = TRUE)
+```
