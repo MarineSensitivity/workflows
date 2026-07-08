@@ -26,7 +26,8 @@ cells with `area_km2` / `in_usa` / `in_pra`):
 ```{r}
 #| label: compute
 
-librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, quiet = T)
+librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, stringr,
+                 tibble, MarineSensitivity/msens, quiet = T)
 source(here("libs/paths.R"))
 source(here("libs/vars.R"))
 
@@ -91,6 +92,49 @@ smry <- dbGetQuery(con, "SELECT
   count(*) FILTER (WHERE is_valid_pra)    valid_pra,
   round(median(pct_marine),1) med_pct_marine FROM taxon")
 knitr::kable(smry)
+dbDisconnect(con, shutdown = TRUE)
+```
+
+## Taxon extinction-risk (`extrisk_code` + `er_score`)
+
+Governing code by precedence: **US listing** (ESA status / MMPA / MBTA from
+`ingest_listings`) if present, else the **IUCN** category; `er_score` via
+`msens::compute_er_score()` with the MMPA/MBTA floors.
+
+```{r}
+#| label: extrisk
+
+con <- dbConnect(duckdb(merge_db))
+tx  <- dbGetQuery(con, "SELECT ms_merge_key, scientific_name, iucn_code FROM taxon") |>
+  mutate(sci = clean_sci_name(scientific_name))
+if ("listing" %in% dbListTables(con)) {
+  tx <- tx |> left_join(
+    dbGetQuery(con, "SELECT sci, nmfs_esa, fws_esa, is_mmpa, is_mbta, is_bcc FROM listing"),
+    by = "sci")
+} else {
+  log_warn("no listing table — run ingest_listings; er_score falls back to IUCN only")
+  tx <- tx |> mutate(nmfs_esa = NA, fws_esa = NA, is_mmpa = FALSE, is_mbta = FALSE, is_bcc = FALSE)
+}
+esa_rank <- function(x) match(coalesce(x, "LC"), c("LC", "TN", "EN"))
+tx <- tx |> mutate(
+  across(c(is_mmpa, is_mbta, is_bcc), \(v) coalesce(v, FALSE)),
+  us_code = c("LC", "TN", "EN")[pmax(esa_rank(nmfs_esa), esa_rank(fws_esa))],
+  is_us   = us_code != "LC" | is_mmpa | is_mbta,
+  extrisk_code = case_when(
+    is_us &  is_mmpa ~ paste0("NMFS:", us_code),
+    is_us            ~ paste0("FWS:",  us_code),
+    iucn_code %in% c("CR","EN","VU","NT","LC","DD") ~ paste0("IUCN:", iucn_code),
+    TRUE ~ NA_character_))
+tx$er_score <- 1L
+ok <- !is.na(tx$extrisk_code)
+tx$er_score[ok] <- compute_er_score(tx$extrisk_code[ok], is_mmpa = tx$is_mmpa[ok], is_mbta = tx$is_mbta[ok])
+
+dbWriteTable(con, "taxon_er",
+  tx |> select(ms_merge_key, extrisk_code, er_score, is_mmpa, is_mbta, is_bcc), overwrite = TRUE)
+dbExecute(con, "CREATE OR REPLACE TABLE taxon AS
+  SELECT t.*, e.extrisk_code, e.er_score, e.is_mmpa, e.is_mbta, e.is_bcc
+  FROM taxon t LEFT JOIN taxon_er e USING (ms_merge_key)")
+log_info("extrisk: {sum(tx$is_us)} US-listed ({sum(tx$is_mmpa)} MMPA, {sum(tx$is_mbta)} MBTA) of {nrow(tx)} taxa")
 dbDisconnect(con, shutdown = TRUE)
 ```
 
