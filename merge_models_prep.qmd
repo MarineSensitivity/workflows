@@ -162,18 +162,26 @@ the same model. Needs the `listing` table (`ingest_listings`).
 #| label: er_score
 
 con <- dbConnect(duckdb(glue("{dir_atlas}/merge.duckdb")))
-tx  <- dbGetQuery(con, "SELECT ms_merge_key, scientific_name, iucn_code FROM taxon") |>
+tx  <- dbGetQuery(con, "SELECT ms_merge_key, taxon_authority, taxon_id, scientific_name, iucn_code FROM taxon") |>
   mutate(sci = clean_sci_name(scientific_name))
+# US ESA status stays species-specific (from the listing); is_bcc too
 if ("listing" %in% dbListTables(con)) {
-  tx <- tx |> left_join(
-    dbGetQuery(con, "SELECT sci, nmfs_esa, fws_esa, is_mmpa, is_mbta, is_bcc FROM listing"), by = "sci")
+  tx <- tx |> left_join(dbGetQuery(con, "SELECT sci, nmfs_esa, fws_esa, is_bcc FROM listing"), by = "sci")
 } else {
-  log_warn("no listing table — run ingest_listings; er_score falls back to IUCN only")
-  tx <- tx |> mutate(nmfs_esa = NA, fws_esa = NA, is_mmpa = FALSE, is_mbta = FALSE, is_bcc = FALSE)
+  log_warn("no listing table — run ingest_listings; ESA falls back to IUCN only")
+  tx <- tx |> mutate(nmfs_esa = NA, fws_esa = NA, is_bcc = FALSE)
 }
+# TAXONOMY-BASED floors: the MMPA (marine mammals) and MBTA (birds) are TAXA-based laws,
+# so assign the floor by taxonomy — NOT by an imperfect species list that mis/under-matches.
+# MMPA -> all WoRMS class Mammalia (matched by AphiaID = taxon_id); MBTA -> all Aves (= BOTW).
+con_spp  <- dbConnect(duckdb(spp_db, read_only = TRUE))
+mammalia <- dbGetQuery(con_spp, "SELECT DISTINCT CAST(scientificNameID AS VARCHAR) aphia FROM worms WHERE class='Mammalia'")$aphia
+dbDisconnect(con_spp, shutdown = TRUE)
 esa_rank <- function(x) match(coalesce(x, "LC"), c("LC", "TN", "EN"))
 tx <- tx |> mutate(
-  across(c(is_mmpa, is_mbta, is_bcc), \(v) coalesce(v, FALSE)),
+  is_bcc  = coalesce(is_bcc, FALSE),
+  is_mmpa = taxon_authority == "worms" & taxon_id %in% mammalia,   # class Mammalia
+  is_mbta = taxon_authority == "botw",                             # class Aves
   us_code = c("LC", "TN", "EN")[pmax(esa_rank(nmfs_esa), esa_rank(fws_esa))],
   is_us   = us_code != "LC" | is_mmpa | is_mbta,
   extrisk_code = case_when(
@@ -189,7 +197,7 @@ dbWriteTable(con, "taxon_er",
 dbExecute(con, "CREATE OR REPLACE TABLE taxon AS
   SELECT t.*, e.extrisk_code, e.er_score, e.is_mmpa, e.is_mbta, e.is_bcc
   FROM taxon t LEFT JOIN taxon_er e USING (ms_merge_key)")
-log_info("governing er_score: {sum(tx$is_us)} US-listed ({sum(tx$is_mmpa)} MMPA, {sum(tx$is_mbta)} MBTA) of {nrow(tx)} taxa")
+log_info("taxonomy floors: {sum(tx$is_mmpa)} Mammalia (MMPA), {sum(tx$is_mbta)} Aves (MBTA); {sum(tx$is_us)} US-listed of {nrow(tx)}")
 dbDisconnect(con, shutdown = TRUE)
 ```
 
