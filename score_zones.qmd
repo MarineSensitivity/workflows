@@ -1,0 +1,118 @@
+---
+title: "Score setup — zones (program areas + ecoregions) + taxon prep"
+msens:
+  target_name: score_zones
+  workflow_type: score
+  dependency: [merge_taxon, build_cell_grid]
+  output: data/manifests/score_zones.json
+editor_options:
+  chunk_output_type: console
+---
+
+Foundation for `calc_scores` (v8): assemble the scoring DuckDB from the merged
+`model_cell` + `taxon` + `cell`, prep the taxon for scoring (`sp_cat`,
+`is_er_spatial`), and build `zone` + `zone_cell` — cells ↔ program areas / ecoregions
+with `pct_covered` (0–100) via exactextractr coverage of each zone polygon over the
+cell-id grid. Scoring formulas need `zone_cell.pct_covered` at every step.
+
+## Setup — assemble the scoring DB
+
+```{r}
+#| label: setup
+
+librarian::shelf(DBI, dplyr, duckdb, exactextractr, fs, glue, here, jsonlite, logger,
+                 sf, terra, tibble, MarineSensitivity/msens, quiet = T)
+source(here("libs/paths.R"))
+source(here("libs/vars.R"))
+sf_use_s2(FALSE)
+
+dir_atlas <- glue("{dir_big_v}/marine-atlas")
+merged    <- glue("{dir_atlas}/dist_merged/dataset=ms_merge")
+merge_db  <- glue("{dir_atlas}/merge.duckdb")
+pa_gpkg   <- glue("{dir_data}/derived/{ver_prev}/ply_programareas_2026_{ver_prev}.gpkg")
+er_gpkg   <- glue("{dir_data}/derived/{ver_prev}/ply_ecoregions_2025.gpkg")
+manifest  <- here("data/manifests/score_zones.json")
+dir_create(path_dir(manifest))
+stopifnot(all(file_exists(c(sdm_db, merge_db, cellid_tif, pa_gpkg, er_gpkg))),
+          dir_exists(merged))
+
+con <- dbConnect(duckdb(sdm_db))                    # sdm_db already has `cell` (build_cell_grid)
+dbExecute(con, glue("ATTACH '{merge_db}' AS m (READ_ONLY)"))
+
+# model_cell = merged US model (mdl_key, cell_id, value); materialize for scoring joins
+dbExecute(con, glue("CREATE OR REPLACE TABLE model_cell AS
+  SELECT mdl_key, cell_id, value FROM read_parquet('{merged}/**/*.parquet')"))
+dbExecute(con, "CREATE INDEX IF NOT EXISTS mc_cell ON model_cell(cell_id)")
+```
+
+## Taxon prep — sp_cat + is_er_spatial
+
+```{r}
+#| label: taxon
+
+# reuse v7 sp_cat (bird/coral/fish/invertebrate/mammal/other/turtle) by worms_id/sisid.
+# v7 taxon_id is DOUBLE, v8 is VARCHAR -> cast via BIGINT in SQL (R as.character gives
+# scientific notation for large ids and won't match). New v8 taxa default to 'other'.
+# is_er_spatial = turtles (SWOT+DPS ER baked into the merged cell value -> er_score=100
+# at scoring so it isn't double-counted).
+dbExecute(con, glue("ATTACH '{dir_big}/{ver_prev}/sdm.duckdb' AS v7 (READ_ONLY)"))
+dbExecute(con, "CREATE OR REPLACE TABLE v7_cat AS
+  SELECT taxon_authority, CAST(CAST(taxon_id AS BIGINT) AS VARCHAR) AS taxon_id, any_value(sp_cat) AS sp_cat
+  FROM v7.taxon WHERE taxon_id IS NOT NULL GROUP BY 1, 2")
+dbExecute(con, "CREATE OR REPLACE TABLE taxon AS
+  SELECT t.*,
+    coalesce(c.sp_cat, 'other')                              AS sp_cat,
+    (t.ms_merge_key IN (
+       SELECT DISTINCT ms_merge_key FROM m.taxon_model WHERE mdl_key LIKE 'rng_turtle_swot_dps|%'
+     ))                                                      AS is_er_spatial
+  FROM m.taxon t
+  LEFT JOIN v7_cat c ON t.taxon_authority = c.taxon_authority AND t.taxon_id = c.taxon_id")
+dbExecute(con, "DETACH v7")
+knitr::kable(dbGetQuery(con, "SELECT sp_cat, count(*) n FROM taxon WHERE is_valid_usa GROUP BY 1 ORDER BY 2 DESC"))
+```
+
+## Zones + zone_cell (program areas + ecoregions)
+
+```{r}
+#| label: zones
+
+zone_specs <- list(
+  list(tbl = glue("ply_programareas_2026_{ver}"), fld = "programarea_key", gpkg = pa_gpkg),
+  list(tbl = "ply_ecoregions_2025",               fld = "ecoregion_key",   gpkg = er_gpkg))
+
+r_cell <- rast(cellid_tif)
+zone_rows <- list(); zc_rows <- list(); zseq <- 0L
+for (zs in zone_specs) {
+  ply <- st_read(zs$gpkg, quiet = TRUE) |> st_make_valid() |>
+    st_transform(4326) |> select(all_of(zs$fld))
+  for (i in seq_len(nrow(ply))) {
+    zseq <- zseq + 1L
+    zval <- ply[[zs$fld]][i]
+    zone_rows[[length(zone_rows) + 1]] <- tibble(
+      zone_seq = zseq, tbl = zs$tbl, fld = zs$fld, value = as.character(zval))
+    # coverage fraction of this zone polygon over each cell -> pct_covered (0-100)
+    df <- exact_extract(r_cell, ply[i, ], progress = FALSE)[[1]]
+    df <- df[!is.na(df$value) & df$coverage_fraction > 0, , drop = FALSE]
+    if (nrow(df) > 0) zc_rows[[length(zc_rows) + 1]] <- tibble(
+      zone_seq = zseq, cell_id = as.integer(df$value),
+      pct_covered = as.integer(round(df$coverage_fraction * 100)))
+  }
+  log_info("{zs$fld}: {nrow(ply)} zones")
+}
+dbWriteTable(con, "zone",      bind_rows(zone_rows), overwrite = TRUE)
+dbWriteTable(con, "zone_cell", bind_rows(zc_rows) |> filter(pct_covered > 0), overwrite = TRUE)
+
+smry <- dbGetQuery(con, "SELECT z.fld, count(DISTINCT z.zone_seq) zones, count(*) zone_cells
+  FROM zone z JOIN zone_cell zc USING(zone_seq) GROUP BY 1")
+knitr::kable(smry)
+dbDisconnect(con, shutdown = TRUE)
+```
+
+## Manifest
+
+```{r}
+#| label: manifest
+
+write_json(list(target = "score_zones", ver = ver, built = as.character(Sys.time())),
+  manifest, auto_unbox = TRUE, pretty = TRUE)
+```
