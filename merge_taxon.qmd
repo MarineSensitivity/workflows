@@ -20,19 +20,22 @@ cells with `area_km2` / `in_usa` / `in_pra`):
   taxon's ocean cells (v7-comparable marine range); `pct_marine` = ocean-cell share of
   the whole (land+ocean) range; `us_endemism` = US share of the marine range; rarity
   class from the marine `range_km2` distribution.
+- **`is_marine`** (marine-relevance filter): keeps genuinely marine/coastal **birds** in the
+  score and culls terrestrial ones (v8 captures each bird's whole, largely-terrestrial range).
 
 ## Setup + compute
 
 ```{r}
 #| label: compute
 
-librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, stringr,
+librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, readr, stringr,
                  tibble, MarineSensitivity/msens, quiet = T)
 source(here("libs/paths.R"))
 source(here("libs/vars.R"))
 
 dir_atlas <- glue("{dir_big_v}/marine-atlas")
 merged    <- glue("{dir_atlas}/dist_merged/dataset=ms_merge")
+dir_dist  <- glue("{dir_atlas}/dist")   # raw per-dataset (global) ranges, for bird pct_marine
 merge_db  <- glue("{dir_atlas}/merge.duckdb")
 manifest  <- here("data/manifests/merge_taxon.json")
 dir_create(path_dir(manifest))
@@ -63,6 +66,12 @@ dbExecute(con, glue("CREATE OR REPLACE TABLE taxon_cell AS
 ```{r}
 #| label: flags
 
+# idempotent: drop any derived columns a prior run added so `x.*` stays base taxon (+ er)
+for (col in c("n_cells","n_ocean","n_usa","n_pra","range_km2","range_usa_km2",
+              "is_valid_global","is_valid_usa","is_valid_pra","pct_marine","us_endemism",
+              "rarity","is_marine","pct_marine_bl"))
+  try(dbExecute(con, glue("ALTER TABLE taxon DROP COLUMN IF EXISTS {col}")), silent = TRUE)
+
 # rarity thresholds on the marine range (km2); tune vs v7
 dbExecute(con, "CREATE OR REPLACE TABLE taxon AS
   WITH t AS (
@@ -92,6 +101,65 @@ smry <- dbGetQuery(con, "SELECT
   count(*) FILTER (WHERE is_valid_pra)    valid_pra,
   round(median(pct_marine),1) med_pct_marine FROM taxon")
 knitr::kable(smry)
+```
+
+## Marine relevance (birds) — `is_marine`
+
+A bird's whole global range is largely terrestrial (v8 keeps the entire range, no land
+mask), so only genuinely **marine/coastal** birds should drive the marine-sensitivity
+score. `is_marine` (bird) = member of a marine/coastal **family**
+(`data/marine_bird_families.csv`) **and** whole-range `pct_marine ≥ 5%`, **or** on the
+curated **include** list — minus the curated **exclude** list
+(`data/marine_birds_curation.csv`); both are GitHub-tracked + reviewable. The share is
+computed from the **raw global** `bl` ranges (the merged `model_cell` is US-scoped, so its
+`pct_marine` is ~100% and unusable here). Non-bird taxa are marine by dataset → `TRUE`.
+
+```{r}
+#| label: marine_relevance
+
+marine_fam <- read_csv(here("data/marine_bird_families.csv"), show_col_types = FALSE)$family
+cur     <- read_csv(here("data/marine_birds_curation.csv"), show_col_types = FALSE)
+inc_sci <- clean_sci_name(cur$scientific_name[cur$action == "include"])
+exc_sci <- clean_sci_name(cur$scientific_name[cur$action == "exclude"])
+
+# whole-range ocean share per bird from the RAW global bl ranges ∩ ocean cell table
+bl_pm <- dbGetQuery(con, glue("
+  WITH b AS (SELECT mc.mdl_key, (c.cell_id IS NOT NULL) AS is_ocean
+    FROM read_parquet('{dir_dist}/dataset=bl/*.parquet') mc
+    LEFT JOIN grid.cell c USING (cell_id))
+  SELECT mdl_key, round(100.0 * count(*) FILTER (WHERE is_ocean) / count(*), 1) AS pct_marine_bl
+  FROM b GROUP BY mdl_key"))
+
+# family + cleaned name per bl model; map to the merged taxon via taxon_model
+bl_mod <- read_csv(glue("{dir_dist}/model_bl.csv"), show_col_types = FALSE) |>
+  transmute(mdl_key, family, sci = clean_sci_name(sci_name))
+tmod <- dbGetQuery(con, "SELECT ms_merge_key, mdl_key FROM taxon_model WHERE mdl_key LIKE 'bl|%'")
+
+bird <- bl_pm |>
+  left_join(bl_mod, by = "mdl_key") |>
+  left_join(tmod,   by = "mdl_key") |>
+  mutate(is_marine_bird =
+    ((family %in% marine_fam & pct_marine_bl >= 5) | sci %in% inc_sci) & !sci %in% exc_sci) |>
+  group_by(ms_merge_key) |>
+  summarise(pct_marine_bl  = max(pct_marine_bl),
+            is_marine_bird = any(is_marine_bird), .groups = "drop")
+
+duckdb_register(con, "tmp_bird_marine", bird)
+dbExecute(con, "CREATE OR REPLACE TABLE taxon AS
+  SELECT t.*,
+    CASE WHEN t.taxon_authority = 'botw'
+         THEN coalesce(b.is_marine_bird, FALSE) ELSE TRUE END AS is_marine,
+    b.pct_marine_bl
+  FROM taxon t LEFT JOIN tmp_bird_marine b USING (ms_merge_key)")
+duckdb_unregister(con, "tmp_bird_marine")
+
+mr <- dbGetQuery(con, "SELECT
+  count(*) FILTER (WHERE taxon_authority='botw')                            n_birds,
+  count(*) FILTER (WHERE taxon_authority='botw' AND is_marine)              n_marine,
+  count(*) FILTER (WHERE taxon_authority='botw' AND is_valid_usa AND is_marine) n_marine_usa
+  FROM taxon")
+log_info("marine birds: {mr$n_marine} of {mr$n_birds} ({mr$n_marine_usa} valid_usa)")
+knitr::kable(mr)
 dbDisconnect(con, shutdown = TRUE)
 ```
 
