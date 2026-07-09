@@ -3,7 +3,7 @@ title: "Merge prep — taxon crosswalk (each model → WORMS / BOTW taxon)"
 msens:
   target_name: merge_models_prep
   workflow_type: merge
-  dependency: [ingest_aquamaps, ingest_rng_iucn, ingest_birdlife_botw, ingest_rng_fws, ingest_ch_nmfs, ingest_ch_fws, ingest_turtles_swot_dps, ingest_ca_nmfs]
+  dependency: [ingest_aquamaps, ingest_rng_iucn, ingest_birdlife_botw, ingest_rng_fws, ingest_ch_nmfs, ingest_ch_fws, ingest_turtles_swot_dps, ingest_ca_nmfs, ingest_listings]
   output: data/manifests/merge_models_prep.json
 editor_options:
   chunk_output_type: console
@@ -143,6 +143,54 @@ dbDisconnect(con, shutdown = TRUE)
 
 glue("{nrow(taxon)} taxa ({sum(taxon$taxon_authority=='worms')} WORMS + ",
      "{sum(taxon$taxon_authority=='botw')} BOTW) from {nrow(taxon_model)} models")
+```
+
+## Governing extinction-risk score (`er_score`)
+
+Each **ingest** layer holds the ER *as its own dataset knew it* — IUCN category for
+`rng_iucn`/BOTW, FWS status for `rng_fws`/`ch_fws`, NMFS for SWOT/critical-habitat —
+each via `msens::compute_er_score()`. Those source values can be **out of date** (an
+older IUCN category) or **out of context** (a US national NMFS/FWS listing, or an
+MMPA/MBTA floor, that should override the IUCN international score). So here we compute
+each taxon's **governing** `er_score`: the most-protective across its datasets, US
+national overriding IUCN, with MMPA/MBTA floors — again via `compute_er_score()`.
+`merge_models` applies this to the **range-cell values** (the fitting point where a
+species' presence should carry its governing ER, not the raw source code); v7 followed
+the same model. Needs the `listing` table (`ingest_listings`).
+
+```{r}
+#| label: er_score
+
+con <- dbConnect(duckdb(glue("{dir_atlas}/merge.duckdb")))
+tx  <- dbGetQuery(con, "SELECT ms_merge_key, scientific_name, iucn_code FROM taxon") |>
+  mutate(sci = clean_sci_name(scientific_name))
+if ("listing" %in% dbListTables(con)) {
+  tx <- tx |> left_join(
+    dbGetQuery(con, "SELECT sci, nmfs_esa, fws_esa, is_mmpa, is_mbta, is_bcc FROM listing"), by = "sci")
+} else {
+  log_warn("no listing table — run ingest_listings; er_score falls back to IUCN only")
+  tx <- tx |> mutate(nmfs_esa = NA, fws_esa = NA, is_mmpa = FALSE, is_mbta = FALSE, is_bcc = FALSE)
+}
+esa_rank <- function(x) match(coalesce(x, "LC"), c("LC", "TN", "EN"))
+tx <- tx |> mutate(
+  across(c(is_mmpa, is_mbta, is_bcc), \(v) coalesce(v, FALSE)),
+  us_code = c("LC", "TN", "EN")[pmax(esa_rank(nmfs_esa), esa_rank(fws_esa))],
+  is_us   = us_code != "LC" | is_mmpa | is_mbta,
+  extrisk_code = case_when(
+    is_us &  is_mmpa ~ paste0("NMFS:", us_code),   # US national + MMPA overrides IUCN
+    is_us            ~ paste0("FWS:",  us_code),
+    iucn_code %in% c("CR","EN","VU","NT","LC","DD") ~ paste0("IUCN:", iucn_code),
+    TRUE ~ NA_character_))
+tx$er_score <- 1L
+ok <- !is.na(tx$extrisk_code)
+tx$er_score[ok] <- compute_er_score(tx$extrisk_code[ok], is_mmpa = tx$is_mmpa[ok], is_mbta = tx$is_mbta[ok])
+dbWriteTable(con, "taxon_er",
+  tx |> select(ms_merge_key, extrisk_code, er_score, is_mmpa, is_mbta, is_bcc), overwrite = TRUE)
+dbExecute(con, "CREATE OR REPLACE TABLE taxon AS
+  SELECT t.*, e.extrisk_code, e.er_score, e.is_mmpa, e.is_mbta, e.is_bcc
+  FROM taxon t LEFT JOIN taxon_er e USING (ms_merge_key)")
+log_info("governing er_score: {sum(tx$is_us)} US-listed ({sum(tx$is_mmpa)} MMPA, {sum(tx$is_mbta)} MBTA) of {nrow(tx)} taxa")
+dbDisconnect(con, shutdown = TRUE)
 ```
 
 ## Manifest

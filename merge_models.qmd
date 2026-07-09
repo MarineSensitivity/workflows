@@ -61,8 +61,9 @@ dbExecute(con, "CREATE OR REPLACE TABLE us_cells AS SELECT cell_id FROM grid.cel
 n_us <- dbGetQuery(con, "SELECT count(*) n FROM us_cells")$n
 # MATERIALIZE the US-filtered model cells once (a streamed scan+join, no aggregate) so
 # the parts below don't each re-scan the 66G am parquet.
-dbExecute(con, "DROP VIEW IF EXISTS model_cell_all")     # a prior run may have left a view
-dbExecute(con, "DROP TABLE IF EXISTS model_cell_all")
+# model_cell_all may persist as a view OR a table from a prior run; drop whichever it is
+try(dbExecute(con, "DROP TABLE IF EXISTS model_cell_all"), silent = TRUE)
+try(dbExecute(con, "DROP VIEW IF EXISTS model_cell_all"),  silent = TRUE)
 dbExecute(con, glue("CREATE OR REPLACE TABLE model_cell_all AS
   SELECT tm.ms_merge_key, split_part(mc.mdl_key,'|',1) AS ds_key, mc.cell_id, mc.value
   FROM read_parquet('{dir_dist}/*/*.parquet') mc
@@ -131,20 +132,25 @@ dbExecute(con, glue("COPY (
     WHERE mc.ms_merge_key IN (SELECT ms_merge_key FROM taxon_flags WHERE has_am AND NOT has_range)
   ) TO '{dir_merged}/p_amonly' (FORMAT parquet, PER_THREAD_OUTPUT true, COMPRESSION zstd)"))
 
-# Part 2: range-only taxa -> max over their (sparse) range cells
+# ER RECONCILIATION (the "fitting point"): a range presence cell carries the taxon's
+# GOVERNING er_score (US-national/floored, from merge_models_prep) — NOT the raw
+# per-dataset source ER the ingest layer held. So Part 2/3 value the range footprint
+# by taxon.er_score, matching v7. (Turtles keep their spatially-varying DPS ER surface.)
+
+# Part 2: range-only taxa -> governing er_score over their range footprint
 dbExecute(con, glue("CREATE OR REPLACE TABLE mc_rangeonly AS
-    SELECT mc.ms_merge_key AS mdl_key, mc.cell_id, max(mc.value)::DOUBLE AS \"value\" FROM model_cell_all mc
+    SELECT DISTINCT mc.ms_merge_key AS mdl_key, mc.cell_id, t.er_score::DOUBLE AS \"value\"
+    FROM model_cell_all mc JOIN taxon t ON mc.ms_merge_key = t.ms_merge_key
     WHERE mc.ms_merge_key IN (SELECT ms_merge_key FROM taxon_flags WHERE has_range AND NOT has_am)
-      AND mc.ms_merge_key NOT IN ({tkeys_sql})
-    GROUP BY mc.ms_merge_key, mc.cell_id"))
+      AND mc.ms_merge_key NOT IN ({tkeys_sql})"))
 
 # Part 3: both taxa -> range footprint (er), then am AT those cells via a join that
 # builds the small range set and probes am (never a dense-am group-by)
 dbExecute(con, glue("CREATE OR REPLACE TABLE both_range AS
-    SELECT mc.ms_merge_key, mc.cell_id, max(mc.value) er FROM model_cell_all mc
+    SELECT DISTINCT mc.ms_merge_key, mc.cell_id, t.er_score AS er
+    FROM model_cell_all mc JOIN taxon t ON mc.ms_merge_key = t.ms_merge_key
     WHERE mc.ms_merge_key IN (SELECT ms_merge_key FROM taxon_flags WHERE has_am AND has_range)
-      AND mc.ds_key <> 'am' AND mc.ms_merge_key NOT IN ({tkeys_sql})
-    GROUP BY mc.ms_merge_key, mc.cell_id"))
+      AND mc.ds_key <> 'am' AND mc.ms_merge_key NOT IN ({tkeys_sql})"))
 dbExecute(con, "CREATE OR REPLACE TABLE both_am AS
     SELECT am.ms_merge_key, am.cell_id, max(am.value) am_value
     FROM model_cell_all am JOIN both_range br USING (ms_merge_key, cell_id)
