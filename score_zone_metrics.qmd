@@ -1,0 +1,106 @@
+---
+title: "Score zone metrics — program-area composite + v7 equivalence gate"
+msens:
+  target_name: score_zone_metrics
+  workflow_type: score
+  dependency: [score_cell_metrics]
+  output: data/manifests/score_zone_metrics.json
+editor_options:
+  chunk_output_type: console
+---
+
+Aggregate the composite components to zones and compute the **program-area score**
+(v7's distinct path, not a roll-up of the cell composite):
+
+1. component → zone = `SUM(cm.value × pct_covered) / SUM(pct_covered)`
+2. PA pct_area down-weight: `value × (data_coverage / total_coverage)` (backs up `_prepctareaweighting`)
+3. PA score = `SUM(value)/COUNT(value)` (plain mean) of the pct_area-weighted components
+
+Then the **`pra_score_delta` gate**: compare the v8 PA composite to v7's per program area.
+
+## Setup
+
+```{r}
+#| label: setup
+
+librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, sf, quiet = T)
+source(here("libs/paths.R")); source(here("libs/vars.R"))
+manifest <- here("data/manifests/score_zone_metrics.json"); dir_create(path_dir(manifest))
+pa_gpkg  <- glue("{dir_data}/derived/{ver_prev}/ply_programareas_2026_{ver_prev}.gpkg")
+stopifnot(file_exists(sdm_db), file_exists(pa_gpkg))
+
+con <- dbConnect(duckdb(sdm_db))
+mseq_of <- function(k) dbGetQuery(con, glue("SELECT metric_seq FROM metric WHERE metric_key='{k}'"))$metric_seq[1]
+mseq_new <- function(k, desc="") { ex<-dbGetQuery(con,glue("SELECT metric_seq FROM metric WHERE metric_key='{k}'"))
+  s <- if(nrow(ex)) ex$metric_seq[1] else { s0<-dbGetQuery(con,"SELECT coalesce(max(metric_seq),0)+1 s FROM metric")$s
+    dbExecute(con,glue("INSERT INTO metric VALUES ({s0},'{k}','{desc}')")); s0 }
+  dbExecute(con, glue("DELETE FROM zone_metric WHERE metric_seq={s} AND zone_seq IN (SELECT zone_seq FROM zone WHERE fld='programarea_key')")); s }
+
+sp_cats   <- c("bird","coral","fish","invertebrate","mammal","other","turtle")
+comp_keys <- c(glue("extrisk_{sp_cats}_ecoregion_rescaled"), "primprod_ecoregion_rescaled")
+comp_seqs <- sapply(comp_keys, mseq_of)
+```
+
+## Component → program-area (coverage-weighted mean) + pct_area down-weight
+
+```{r}
+#| label: zone_agg
+
+for (k in comp_keys) {
+  bs <- mseq_of(k)
+  bk <- mseq_new(glue("{k}_prepctareaweighting"), glue("pre-pct_area backup of {k}"))
+  # 2a coverage-weighted mean over PA cells, into zone_metric (this metric_seq, PA zones)
+  dbExecute(con, glue("DELETE FROM zone_metric WHERE metric_seq={bs} AND zone_seq IN (SELECT zone_seq FROM zone WHERE fld='programarea_key')"))
+  dbExecute(con, glue("INSERT INTO zone_metric (zone_seq, metric_seq, value)
+    SELECT zc.zone_seq, {bs}, SUM(cm.value*zc.pct_covered)/SUM(zc.pct_covered)
+    FROM zone_cell zc JOIN zone z USING(zone_seq) JOIN cell_metric cm ON zc.cell_id=cm.cell_id
+    WHERE z.fld='programarea_key' AND cm.metric_seq={bs} AND cm.value IS NOT NULL
+    GROUP BY zc.zone_seq"))
+  # backup pre-weight value
+  dbExecute(con, glue("INSERT INTO zone_metric (zone_seq, metric_seq, value)
+    SELECT zone_seq, {bk}, value FROM zone_metric WHERE metric_seq={bs}
+      AND zone_seq IN (SELECT zone_seq FROM zone WHERE fld='programarea_key')"))
+  # 2b pct_area = (coverage of cells with data for this metric) / (coverage of all cells in zone); value *= pct_area
+  dbExecute(con, glue("UPDATE zone_metric zm SET value = value * (
+      SELECT SUM(zc.pct_covered) FILTER (WHERE cm.value IS NOT NULL) * 1.0 / SUM(zc.pct_covered)
+      FROM zone_cell zc LEFT JOIN cell_metric cm ON zc.cell_id=cm.cell_id AND cm.metric_seq={bs}
+      WHERE zc.zone_seq = zm.zone_seq)
+    WHERE zm.metric_seq={bs} AND zm.zone_seq IN (SELECT zone_seq FROM zone WHERE fld='programarea_key')"))
+}
+log_info("zone components + pct_area done for {length(comp_keys)} metrics")
+```
+
+## Program-area composite score
+
+```{r}
+#| label: pa_score
+
+sc <- mseq_new("score_extriskspcat_primprod_ecoregionrescaled_equalweights", "Equal-weight composite (PA)")
+seqs_sql <- paste(comp_seqs, collapse=",")
+dbExecute(con, glue("INSERT INTO zone_metric (zone_seq, metric_seq, value)
+  SELECT zone_seq, {sc}, SUM(value)/COUNT(value)
+  FROM zone_metric
+  WHERE metric_seq IN ({seqs_sql}) AND value IS NOT NULL
+    AND zone_seq IN (SELECT zone_seq FROM zone WHERE fld='programarea_key')
+  GROUP BY zone_seq"))
+v8_pa <- dbGetQuery(con, glue("SELECT z.value AS programarea_key, round(zm.value,2) AS score_v8
+  FROM zone z JOIN zone_metric zm USING(zone_seq) WHERE zm.metric_seq={sc} ORDER BY 1"))
+dbDisconnect(con, shutdown=TRUE)
+```
+
+## v7 equivalence gate (pra_score_delta)
+
+```{r}
+#| label: validate
+
+v7_pa <- st_read(pa_gpkg, quiet=TRUE) |> st_drop_geometry() |>
+  transmute(programarea_key, score_v7 = round(score_extriskspcat_primprod_ecoregionrescaled_equalweights, 2))
+cmp <- v8_pa |> inner_join(v7_pa, by="programarea_key") |>
+  mutate(delta = round(score_v8 - score_v7, 2)) |> arrange(desc(abs(delta)))
+knitr::kable(cmp)
+gate <- with(cmp, list(n=nrow(cmp), mean_abs=round(mean(abs(delta)),2), max_abs=round(max(abs(delta)),2),
+  rmse=round(sqrt(mean(delta^2)),2), cor=round(cor(score_v8, score_v7),3)))
+str(gate)
+write_json(c(list(target="score_zone_metrics", ver=ver), gate, list(built=as.character(Sys.time()))),
+  manifest, auto_unbox=TRUE, pretty=TRUE)
+```
