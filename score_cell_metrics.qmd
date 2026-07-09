@@ -11,7 +11,7 @@ editor_options:
 
 Per-cell scoring (replicates v7 `calc_scores.qmd` exactly):
 
-1. **`extrisk_{spcat}`** = `SUM(er_score × value / 100)` over valid species in the category
+1. **`extrisk_{spcat}`** = `SUM(er_score × val / 100)` over valid species in the category
    (`is_er_spatial`/turtles → er_score = 100; MMPA floor already baked into `er_score`).
 2. **ecoregion min/max** of that metric per ecoregion; **`_ecoregion_rescaled`** per cell =
    `(x − eco_min)/(eco_max − eco_min) × 100`, coverage-normalized across ecoregions.
@@ -32,9 +32,11 @@ vgpm_tif <- glue("{dir_data}/raw/oregonstate.edu/vgpm.r2022.v.chl.v.sst.2160x432
 stopifnot(all(file_exists(c(sdm_db, cellid_tif, vgpm_tif))))
 
 con <- dbConnect(duckdb(sdm_db))
-dbExecute(con, "CREATE TABLE IF NOT EXISTS metric (metric_seq INTEGER PRIMARY KEY, metric_key VARCHAR, description VARCHAR)")
-dbExecute(con, "CREATE TABLE IF NOT EXISTS cell_metric (cell_id INTEGER, metric_seq INTEGER, value DOUBLE)")
-dbExecute(con, "CREATE TABLE IF NOT EXISTS zone_metric (zone_seq INTEGER, metric_seq INTEGER, value DOUBLE)")
+# fresh recreate (a prior run may have left these with a `value` column, not `val`)
+for (t in c("cell_metric", "zone_metric", "metric")) dbExecute(con, paste("DROP TABLE IF EXISTS", t))
+dbExecute(con, "CREATE TABLE metric (metric_seq INTEGER PRIMARY KEY, metric_key VARCHAR, description VARCHAR)")
+dbExecute(con, "CREATE TABLE cell_metric (cell_id INTEGER, metric_seq INTEGER, val DOUBLE)")
+dbExecute(con, "CREATE TABLE zone_metric (zone_seq INTEGER, metric_seq INTEGER, val DOUBLE)")
 
 # idempotent metric_seq: fetch or insert, wiping any prior values for a clean rebuild
 mseq <- function(key, desc = "") {
@@ -64,9 +66,9 @@ log_info("scoring taxa filter: {taxa_where}")
 
 for (cat in sp_cats) {
   s <- mseq(glue("extrisk_{cat}"), glue("Extinction-risk-weighted suitability, {cat}"))
-  dbExecute(con, glue("INSERT INTO cell_metric (cell_id, metric_seq, value)
+  dbExecute(con, glue("INSERT INTO cell_metric (cell_id, metric_seq, val)
     SELECT mc.cell_id, {s}, ROUND(SUM(
-        (CASE WHEN t.is_er_spatial THEN 100 ELSE t.er_score END) * mc.value) / 100.0, 2) AS value
+        (CASE WHEN t.is_er_spatial THEN 100 ELSE t.er_score END) * mc.val) / 100.0, 2) AS val
     FROM model_cell mc JOIN taxon t ON mc.mdl_key = t.ms_merge_key
     WHERE {taxa_where}
       AND (CASE WHEN t.sp_cat = 'reptile' THEN 'other' ELSE t.sp_cat END) = '{cat}'
@@ -86,20 +88,20 @@ rescale_ecoregion <- function(base_key) {
   smin <- mseq(glue("{base_key}_ecoregion_min")); smax <- mseq(glue("{base_key}_ecoregion_max"))
   srs  <- mseq(glue("{base_key}_ecoregion_rescaled"))
   for (fx in list(c(smin,"min"), c(smax,"max")))
-    dbExecute(con, glue("INSERT INTO zone_metric (zone_seq, metric_seq, value)
-      SELECT z.zone_seq, {fx[1]}, {fx[2]}(cm.value)
+    dbExecute(con, glue("INSERT INTO zone_metric (zone_seq, metric_seq, val)
+      SELECT z.zone_seq, {fx[1]}, {fx[2]}(cm.val)
       FROM zone z JOIN zone_cell zc USING(zone_seq) JOIN cell_metric cm ON zc.cell_id=cm.cell_id
       WHERE z.fld='ecoregion_key' AND cm.metric_seq={bs} GROUP BY z.zone_seq"))
-  dbExecute(con, glue("INSERT INTO cell_metric (cell_id, metric_seq, value)
+  dbExecute(con, glue("INSERT INTO cell_metric (cell_id, metric_seq, val)
     WITH cell_ecoregion AS (
       SELECT zc.cell_id, zc.zone_seq,
              zc.pct_covered * 100.0 / SUM(zc.pct_covered) OVER (PARTITION BY zc.cell_id) AS norm_pct
       FROM zone_cell zc JOIN zone z USING(zone_seq) WHERE z.fld='ecoregion_key'),
-    mm AS (SELECT mn.zone_seq, mn.value min_v, mx.value max_v
-           FROM (SELECT zone_seq,value FROM zone_metric WHERE metric_seq={smin}) mn
-           JOIN (SELECT zone_seq,value FROM zone_metric WHERE metric_seq={smax}) mx USING(zone_seq))
+    mm AS (SELECT mn.zone_seq, mn.val min_v, mx.val max_v
+           FROM (SELECT zone_seq,val FROM zone_metric WHERE metric_seq={smin}) mn
+           JOIN (SELECT zone_seq,val FROM zone_metric WHERE metric_seq={smax}) mx USING(zone_seq))
     SELECT cm.cell_id, {srs},
-      SUM((cm.value - mm.min_v)/(mm.max_v - mm.min_v) * (ce.norm_pct/100.0)) * 100 AS value
+      SUM((cm.val - mm.min_v)/(mm.max_v - mm.min_v) * (ce.norm_pct/100.0)) * 100 AS val
     FROM cell_metric cm JOIN cell_ecoregion ce ON cm.cell_id=ce.cell_id JOIN mm ON ce.zone_seq=mm.zone_seq
     WHERE cm.metric_seq={bs} AND mm.min_v < mm.max_v
     GROUP BY cm.cell_id"))
@@ -111,8 +113,8 @@ sp <- mseq("primprod", "Primary productivity VGPM/VIIRS npp_avg (mg C/m2/day)")
 pp <- cells_from_raster(subset(rast(vgpm_tif), "npp_avg"), cellid_tif,
                         method = "bilinear", min_value = 0, zero_fill = FALSE)
 duckdb_register(con, "tmp_pp_df", pp)
-dbExecute(con, glue("INSERT INTO cell_metric (cell_id, metric_seq, value)
-  SELECT p.cell_id, {sp}, p.value FROM tmp_pp_df p JOIN cell c ON p.cell_id = c.cell_id WHERE c.in_usa"))
+dbExecute(con, glue("INSERT INTO cell_metric (cell_id, metric_seq, val)
+  SELECT p.cell_id, {sp}, p.val FROM tmp_pp_df p JOIN cell c ON p.cell_id = c.cell_id WHERE c.in_usa"))
 duckdb_unregister(con, "tmp_pp_df")
 rescale_ecoregion("primprod")
 log_info("stage 1b/1c + primprod done")
@@ -126,13 +128,13 @@ log_info("stage 1b/1c + primprod done")
 comp_keys <- c(glue("extrisk_{sp_cats}_ecoregion_rescaled"), "primprod_ecoregion_rescaled")
 sc <- mseq("score_extriskspcat_primprod_ecoregionrescaled_equalweights", "Equal-weight composite")
 in_list <- paste(sprintf("'%s'", comp_keys), collapse=",")
-dbExecute(con, glue("INSERT INTO cell_metric (cell_id, metric_seq, value)
-  SELECT cm.cell_id, {sc}, ROUND(AVG(cm.value))
+dbExecute(con, glue("INSERT INTO cell_metric (cell_id, metric_seq, val)
+  SELECT cm.cell_id, {sc}, ROUND(AVG(cm.val))
   FROM cell_metric cm JOIN metric m USING(metric_seq)
   WHERE m.metric_key IN ({in_list}) GROUP BY cm.cell_id"))
 
-smry <- dbGetQuery(con, glue("SELECT count(*) n_cells, round(min(value),1) v_min, round(max(value),1) v_max,
-  round(avg(value),1) v_avg FROM cell_metric WHERE metric_seq={sc}"))
+smry <- dbGetQuery(con, glue("SELECT count(*) n_cells, round(min(val),1) v_min, round(max(val),1) v_max,
+  round(avg(val),1) v_avg FROM cell_metric WHERE metric_seq={sc}"))
 knitr::kable(smry)
 dbDisconnect(con, shutdown=TRUE)
 ```

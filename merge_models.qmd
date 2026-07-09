@@ -15,9 +15,9 @@ scale (~13B am cell-rows), so it must stream + spill rather than materialize:
 
 - **Default = max-merge, masked to the range footprint.** A taxon's merged cells are
   its **range** cells if it has any (`rng_*`/`ch_*`/`ca_*`/`bl`), else its full `am`
-  footprint; at each kept cell `value = max` across the taxon's models. Streamed
+  footprint; at each kept cell `val = max` across the taxon's models. Streamed
   straight to Parquet via a single `COPY` (one grouped scan), so no 13B-row table.
-- **Turtles = multiplicative.** `value = pmax(1, round(er × suit / 100))` with
+- **Turtles = multiplicative.** `val = pmax(1, round(er × suit / 100))` with
   critical-habitat max-override — computed from **only the 6 turtle taxa's files**
   (never a full am scan, which is what OOM'd the naive version).
 
@@ -65,7 +65,7 @@ n_us <- dbGetQuery(con, "SELECT count(*) n FROM us_cells")$n
 try(dbExecute(con, "DROP TABLE IF EXISTS model_cell_all"), silent = TRUE)
 try(dbExecute(con, "DROP VIEW IF EXISTS model_cell_all"),  silent = TRUE)
 dbExecute(con, glue("CREATE OR REPLACE TABLE model_cell_all AS
-  SELECT tm.ms_merge_key, split_part(mc.mdl_key,'|',1) AS ds_key, mc.cell_id, mc.value
+  SELECT tm.ms_merge_key, split_part(mc.mdl_key,'|',1) AS ds_key, mc.cell_id, mc.val
   FROM read_parquet('{dir_dist}/*/*.parquet') mc
   JOIN taxon_model tm USING (mdl_key)
   JOIN us_cells u ON mc.cell_id = u.cell_id"))
@@ -83,27 +83,19 @@ turtle_keys <- dbGetQuery(con, glue(
 tkeys_sql   <- paste(sprintf("'%s'", turtle_keys), collapse = ",")
 log_info("{length(turtle_keys)} turtle taxa (multiplicative merge)")
 
-# read ONLY the turtle taxa's model files (a handful) — never scan all am
-turtle_mdls <- dbGetQuery(con, glue(
-  "SELECT DISTINCT mdl_key FROM taxon_model WHERE ms_merge_key IN ({tkeys_sql})"))$mdl_key
-tfiles <- vapply(strsplit(turtle_mdls, "|", fixed = TRUE),
-                 \(p) glue("{dir_dist}/dataset={p[1]}/{p[2]}.parquet"), character(1))
-tfiles <- tfiles[file_exists(tfiles)]
-tfiles_sql <- paste(sprintf("'%s'", tfiles), collapse = ",")
-
+# turtle taxa's US cells from the materialized model_cell_all (indexed on ms_merge_key,
+# already US-scoped) — the dist parquets are consolidated so per-model files aren't addressable
 dbExecute(con, glue("CREATE OR REPLACE TABLE mc_turtle AS
   WITH t AS (
-    SELECT tm.ms_merge_key, split_part(mc.mdl_key,'|',1) ds_key, mc.cell_id, mc.value
-    FROM read_parquet([{tfiles_sql}]) mc JOIN taxon_model tm USING (mdl_key)
-    JOIN us_cells u ON mc.cell_id = u.cell_id),
-  er   AS (SELECT ms_merge_key, cell_id, max(value) er_value   FROM t WHERE ds_key='{turtle_ds}' GROUP BY 1,2),
-  suit AS (SELECT ms_merge_key, cell_id, max(value) suit_value FROM t WHERE ds_key='{suit_ds}'   GROUP BY 1,2),
-  ch   AS (SELECT ms_merge_key, cell_id, max(value) ch_value   FROM t WHERE ds_key IN ({ch_sql})  GROUP BY 1,2),
+    SELECT ms_merge_key, ds_key, cell_id, val FROM model_cell_all WHERE ms_merge_key IN ({tkeys_sql})),
+  er   AS (SELECT ms_merge_key, cell_id, max(val) er_value   FROM t WHERE ds_key='{turtle_ds}' GROUP BY 1,2),
+  suit AS (SELECT ms_merge_key, cell_id, max(val) suit_value FROM t WHERE ds_key='{suit_ds}'   GROUP BY 1,2),
+  ch   AS (SELECT ms_merge_key, cell_id, max(val) ch_value   FROM t WHERE ds_key IN ({ch_sql})  GROUP BY 1,2),
   mult AS (SELECT er.ms_merge_key, er.cell_id,
-             greatest(1, CAST(round(er.er_value * coalesce(suit.suit_value,1) / 100.0) AS INTEGER)) AS value
+             greatest(1, CAST(round(er.er_value * coalesce(suit.suit_value,1) / 100.0) AS INTEGER)) AS val
            FROM er LEFT JOIN suit USING (ms_merge_key, cell_id))
   SELECT m.ms_merge_key AS mdl_key, m.cell_id,
-         CAST(greatest(m.value, coalesce(ch.ch_value, 0)) AS DOUBLE) AS value
+         CAST(greatest(m.val, coalesce(ch.ch_value, 0)) AS DOUBLE) AS val
   FROM mult m LEFT JOIN ch USING (ms_merge_key, cell_id)"))
 log_info("mc_turtle: {dbGetQuery(con, 'SELECT count(*) n FROM mc_turtle')$n} cells")
 ```
@@ -128,18 +120,18 @@ dir_create(dir_merged)
 
 # Part 1: am-only taxa -> stream US am cells directly (no aggregate)
 dbExecute(con, glue("COPY (
-    SELECT mc.ms_merge_key AS mdl_key, mc.cell_id, mc.value FROM model_cell_all mc
+    SELECT mc.ms_merge_key AS mdl_key, mc.cell_id, mc.val FROM model_cell_all mc
     WHERE mc.ms_merge_key IN (SELECT ms_merge_key FROM taxon_flags WHERE has_am AND NOT has_range)
   ) TO '{dir_merged}/p_amonly' (FORMAT parquet, PER_THREAD_OUTPUT true, COMPRESSION zstd)"))
 
 # ER RECONCILIATION (the "fitting point"): a range presence cell carries the taxon's
 # GOVERNING er_score (US-national/floored, from merge_models_prep) — NOT the raw
-# per-dataset source ER the ingest layer held. So Part 2/3 value the range footprint
+# per-dataset source ER the ingest layer held. So Part 2/3 val the range footprint
 # by taxon.er_score, matching v7. (Turtles keep their spatially-varying DPS ER surface.)
 
 # Part 2: range-only taxa -> governing er_score over their range footprint
 dbExecute(con, glue("CREATE OR REPLACE TABLE mc_rangeonly AS
-    SELECT DISTINCT mc.ms_merge_key AS mdl_key, mc.cell_id, t.er_score::DOUBLE AS \"value\"
+    SELECT DISTINCT mc.ms_merge_key AS mdl_key, mc.cell_id, t.er_score::DOUBLE AS \"val\"
     FROM model_cell_all mc JOIN taxon t ON mc.ms_merge_key = t.ms_merge_key
     WHERE mc.ms_merge_key IN (SELECT ms_merge_key FROM taxon_flags WHERE has_range AND NOT has_am)
       AND mc.ms_merge_key NOT IN ({tkeys_sql})"))
@@ -152,24 +144,24 @@ dbExecute(con, glue("CREATE OR REPLACE TABLE both_range AS
     WHERE mc.ms_merge_key IN (SELECT ms_merge_key FROM taxon_flags WHERE has_am AND has_range)
       AND mc.ds_key <> 'am' AND mc.ms_merge_key NOT IN ({tkeys_sql})"))
 dbExecute(con, "CREATE OR REPLACE TABLE both_am AS
-    SELECT am.ms_merge_key, am.cell_id, max(am.value) am_value
+    SELECT am.ms_merge_key, am.cell_id, max(am.val) am_value
     FROM model_cell_all am JOIN both_range br USING (ms_merge_key, cell_id)
     WHERE am.ds_key='am' GROUP BY am.ms_merge_key, am.cell_id")
 dbExecute(con, "CREATE OR REPLACE TABLE mc_both AS
     SELECT br.ms_merge_key AS mdl_key, br.cell_id,
-           greatest(br.er, coalesce(ba.am_value, 0))::DOUBLE AS \"value\"
+           greatest(br.er, coalesce(ba.am_value, 0))::DOUBLE AS \"val\"
     FROM both_range br LEFT JOIN both_am ba USING (ms_merge_key, cell_id)")
 log_info("range-only {dbGetQuery(con,'SELECT count(*) n FROM mc_rangeonly')$n}, both {dbGetQuery(con,'SELECT count(*) n FROM mc_both')$n} cells")
 
 # write parts 2+3+turtles alongside the streamed part 1
 dbExecute(con, glue("COPY (
-    SELECT mdl_key, cell_id, value FROM mc_rangeonly
-    UNION ALL SELECT mdl_key, cell_id, value FROM mc_both
-    UNION ALL SELECT mdl_key, cell_id, value FROM mc_turtle
+    SELECT mdl_key, cell_id, val FROM mc_rangeonly
+    UNION ALL SELECT mdl_key, cell_id, val FROM mc_both
+    UNION ALL SELECT mdl_key, cell_id, val FROM mc_turtle
   ) TO '{dir_merged}/p_agg' (FORMAT parquet, PER_THREAD_OUTPUT true, COMPRESSION zstd)"))
 
 smry <- dbGetQuery(con, glue("SELECT count(DISTINCT mdl_key) n_taxa, count(*) n_cells,
-  min(value) v_min, max(value) v_max FROM read_parquet('{dir_merged}/**/*.parquet')"))
+  min(val) v_min, max(val) v_max FROM read_parquet('{dir_merged}/**/*.parquet')"))
 knitr::kable(smry)
 dbDisconnect(con, shutdown = TRUE)
 ```
