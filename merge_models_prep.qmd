@@ -158,30 +158,45 @@ national overriding IUCN, with MMPA/MBTA floors — again via `compute_er_score(
 species' presence should carry its governing ER, not the raw source code); v7 followed
 the same model. Needs the `listing` table (`ingest_listings`).
 
+The two statutory floors differ in how they are assigned:
+
+- **MMPA (`is_mmpa`, +20 floor)** — the Marine Mammal Protection Act protects *all*
+  marine mammals, so we assign it by **taxonomy**: every WoRMS class **Mammalia** taxon
+  (matched by AphiaID = `taxon_id`), not the incomplete NMFS directory (which lists only
+  ~70 managed stocks vs 137 marine-mammal taxa here).
+- **MBTA (`is_mbta`, +10 floor)** — the Migratory Bird Treaty Act protects only
+  **migratory birds native to the US / US territories**, an explicit species list, so we
+  assign it from the authoritative **FWS CFR 50 §10.13** list (`ingest_listings`, matched
+  by `clean_sci_name`). It is **not** all Aves — a bird absent from 10.13 (e.g. a
+  non-US / non-migratory species) gets **no** MBTA floor. Most 10.13 birds are terrestrial;
+  the marine-relevance filter (`score_zones`) is what keeps terrestrial birds out of the
+  score, while this floor only sets the *value* of those that remain.
+
 ```{r}
 #| label: er_score
 
 con <- dbConnect(duckdb(glue("{dir_atlas}/merge.duckdb")))
 tx  <- dbGetQuery(con, "SELECT ms_merge_key, taxon_authority, taxon_id, scientific_name, iucn_code FROM taxon") |>
   mutate(sci = clean_sci_name(scientific_name))
-# US ESA status stays species-specific (from the listing); is_bcc too
+# US ESA + MBTA + BCC stay species-specific from the listing. is_mbta is the FWS CFR
+# 50 §10.13 list (migratory birds native to the US) — an explicit species list, NOT all
+# Aves; a bird absent from 10.13 gets no MBTA floor.
 if ("listing" %in% dbListTables(con)) {
-  tx <- tx |> left_join(dbGetQuery(con, "SELECT sci, nmfs_esa, fws_esa, is_bcc FROM listing"), by = "sci")
+  tx <- tx |> left_join(dbGetQuery(con, "SELECT sci, nmfs_esa, fws_esa, is_mbta, is_bcc FROM listing"), by = "sci")
 } else {
-  log_warn("no listing table — run ingest_listings; ESA falls back to IUCN only")
-  tx <- tx |> mutate(nmfs_esa = NA, fws_esa = NA, is_bcc = FALSE)
+  log_warn("no listing table — run ingest_listings; ESA/MBTA fall back to IUCN only")
+  tx <- tx |> mutate(nmfs_esa = NA, fws_esa = NA, is_mbta = FALSE, is_bcc = FALSE)
 }
-# TAXONOMY-BASED floors: the MMPA (marine mammals) and MBTA (birds) are TAXA-based laws,
-# so assign the floor by taxonomy — NOT by an imperfect species list that mis/under-matches.
-# MMPA -> all WoRMS class Mammalia (matched by AphiaID = taxon_id); MBTA -> all Aves (= BOTW).
+# MMPA is assigned by TAXONOMY (all marine mammals are protected): every WoRMS class
+# Mammalia taxon (AphiaID = taxon_id), more complete than the ~70-stock NMFS directory.
 con_spp  <- dbConnect(duckdb(spp_db, read_only = TRUE))
 mammalia <- dbGetQuery(con_spp, "SELECT DISTINCT CAST(scientificNameID AS VARCHAR) aphia FROM worms WHERE class='Mammalia'")$aphia
 dbDisconnect(con_spp, shutdown = TRUE)
 esa_rank <- function(x) match(coalesce(x, "LC"), c("LC", "TN", "EN"))
 tx <- tx |> mutate(
   is_bcc  = coalesce(is_bcc, FALSE),
-  is_mmpa = taxon_authority == "worms" & taxon_id %in% mammalia,   # class Mammalia
-  is_mbta = taxon_authority == "botw",                             # class Aves
+  is_mmpa = taxon_authority == "worms" & taxon_id %in% mammalia,   # MMPA: all marine mammals
+  is_mbta = coalesce(is_mbta, FALSE) & taxon_authority == "botw",  # MBTA: CFR 10.13, birds only
   us_code = c("LC", "TN", "EN")[pmax(esa_rank(nmfs_esa), esa_rank(fws_esa))],
   is_us   = us_code != "LC" | is_mmpa | is_mbta,
   extrisk_code = case_when(
