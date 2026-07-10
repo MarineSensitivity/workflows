@@ -1,0 +1,150 @@
+---
+title: "Ingest WoRMS — (re)build the spp.duckdb `worms` table from the monthly marinespecies.org DwC-A"
+msens:
+  target_name: ingest_worms
+  workflow_type: ingest
+  dependency: []
+  output: data/manifests/ingest_worms.json
+editor_options:
+  chunk_output_type: console
+---
+
+Rebuild the `worms` taxonomy table in **`spp.duckdb`** from the monthly **World Register
+of Marine Species** Darwin Core Archive downloaded from
+[marinespecies.org/download](https://www.marinespecies.org/download/). Run this whenever a
+newer download is dropped in `{dir_raw}/marinespecies.org/WoRMS_download_<YYYY-MM-DD>/`; it
+is **version-tracked** (a `worms_meta` row records the loaded download date) and idempotent
+— it rebuilds only when the latest download on disk is newer than what is loaded (or
+`REDO_WORMS=1`).
+
+**Why this source (not checklistbank / GBIF):** the marinespecies.org DwC-A is the
+authoritative WoRMS export and carries the `isMarine`/`isBrackish`/… habitat flags. It is
+updated monthly. **AlgaeBase-sourced taxa (macroalgae/seagrass) are license-excluded** from
+this (and every redistributable) WoRMS download, so ~hundreds of algae used by our SDM
+datasets are absent here — `merge_taxon.qmd` fills those on demand from the **WoRMS REST
+API** (`worrms::wm_record`) and caches them in `data/worms_taxonomy_supplement.csv`.
+
+## Setup + locate the latest download
+
+```{r}
+#| label: setup
+
+librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, readr, stringr, quiet = T)
+source(here("libs/paths.R"))   # spp_db, dir_raw
+manifest <- here("data/manifests/ingest_worms.json"); dir_create(path_dir(manifest))
+redo     <- nzchar(Sys.getenv("REDO_WORMS"))
+
+# newest WoRMS_download_<date> folder holding the DwC-A core + speciesprofile
+dl_root <- glue("{dir_raw}/marinespecies.org")
+dls <- dir_ls(dl_root, type = "directory", regexp = "WoRMS_download_\\d{4}-\\d{2}-\\d{2}$")
+stopifnot("no WoRMS_download_<date> folder found" = length(dls) > 0)
+dl_dir   <- dls[order(path_file(dls))] |> tail(1)                    # latest by name (date)
+worms_ver <- str_extract(path_file(dl_dir), "\\d{4}-\\d{2}-\\d{2}")
+taxon_txt <- glue("{dl_dir}/taxon.txt")
+sprof_txt <- glue("{dl_dir}/speciesprofile.txt")
+stopifnot(all(file_exists(c(taxon_txt, sprof_txt))))
+log_info("latest WoRMS download: {path_file(dl_dir)} (version {worms_ver})")
+```
+
+## Fetch a fresh monthly download (procedure)
+
+The [WoRMS download](https://www.marinespecies.org/download/) is **login-gated and
+request-based** (there is no stable "latest" URL): sign in, request a full Darwin Core
+Archive, and download the generated zip. It cannot be reliably scripted end-to-end, so the
+monthly refresh is: **download → unzip into `WoRMS_download_<YYYY-MM-DD>/` → run this
+notebook** (it auto-detects the newest folder).
+
+Credentials live outside git in `{dir_private}/…marinespecies.org_<user>.txt` (password
+only; username is `ben@ecoquants.com`). The chunk below is a **best-effort** helper (kept
+`eval: false`) — if WoRMS changes to expose a direct authenticated archive URL, wire it here.
+
+```{r}
+#| label: download
+#| eval: false
+
+# username + password (password file is the plain secret; never commit it)
+dir_private <- ifelse(Sys.info()[["sysname"]] == "Linux", "/share/private", "~/My Drive/private")
+pw_txt <- Sys.glob(path.expand(glue("{dir_private}/*marinespecies.org_*.txt")))[1]
+worms_user <- "ben@ecoquants.com"
+worms_pass <- readr::read_file(pw_txt) |> trimws()
+# NOTE: marinespecies.org serves the DwC-A via a login + request flow, not a static URL.
+# Do the request in the browser, then unzip into
+#   {dir_raw}/marinespecies.org/WoRMS_download_<YYYY-MM-DD>/
+# and re-run this notebook. (Placeholder for a future authenticated-URL fetch.)
+```
+
+## (Re)build the `worms` table
+
+```{r}
+#| label: build
+
+con <- dbConnect(duckdb(spp_db))
+loaded <- tryCatch(
+  dbGetQuery(con, "SELECT worms_ver FROM worms_meta ORDER BY built DESC LIMIT 1")$worms_ver,
+  error = function(e) NA_character_)
+
+if (!redo && isTRUE(loaded == worms_ver) && "worms" %in% dbListTables(con)) {
+  log_info("worms table already at version {worms_ver}; skipping (REDO_WORMS=1 to force)")
+} else {
+  strip <- function(col) glue(
+    "TRY_CAST(regexp_replace({col}, 'urn:lsid:marinespecies.org:taxname:', '') AS BIGINT)")
+  dbExecute(con, glue("
+    CREATE OR REPLACE TABLE worms AS
+    WITH sp AS (
+      SELECT {strip('taxonID')} AS taxonID, isMarine, isFreshwater, isTerrestrial,
+             isExtinct, isBrackish
+      FROM read_csv('{sprof_txt}', delim='\t', header=true, quote='\"', ignore_errors=true,
+                    types={{'taxonID':'VARCHAR'}}))
+    SELECT
+      {strip('t.taxonID')}             AS taxonID,
+      {strip('t.scientificNameID')}    AS scientificNameID,
+      {strip('t.acceptedNameUsageID')} AS acceptedNameUsageID,
+      {strip('t.parentNameUsageID')}   AS parentNameUsageID,
+      t.scientificName, t.acceptedNameUsage, t.parentNameUsage,
+      t.kingdom, t.phylum, t.\"class\", t.\"order\", t.family, t.genus, t.subgenus,
+      t.specificEpithet, t.infraspecificEpithet, t.taxonRank, t.scientificNameAuthorship,
+      t.nomenclaturalCode, t.taxonomicStatus, t.nomenclaturalStatus,
+      sp.isMarine, sp.isFreshwater, sp.isTerrestrial, sp.isExtinct, sp.isBrackish
+    FROM read_csv('{taxon_txt}', delim='\t', header=true, quote='\"', ignore_errors=true,
+                  types={{'taxonID':'VARCHAR','scientificNameID':'VARCHAR',
+                          'acceptedNameUsageID':'VARCHAR','parentNameUsageID':'VARCHAR'}}) t
+    LEFT JOIN sp ON {strip('t.taxonID')} = sp.taxonID"))
+
+  for (ix in c("taxonID", "scientificNameID", "acceptedNameUsageID", "scientificName"))
+    try(dbExecute(con, glue("CREATE INDEX worms_{ix}_idx ON worms ({ix})")), silent = TRUE)
+
+  n <- dbGetQuery(con, "SELECT count(*) n FROM worms")$n
+  dbExecute(con, "CREATE TABLE IF NOT EXISTS worms_meta (worms_ver VARCHAR, n_rows BIGINT, source VARCHAR, built TIMESTAMP)")
+  dbExecute(con, glue("INSERT INTO worms_meta VALUES ('{worms_ver}', {n}, '{path_file(dl_dir)}', now())"))
+  log_info("rebuilt worms: {n} rows from {path_file(dl_dir)}")
+}
+```
+
+## Verify
+
+```{r}
+#| label: verify
+
+smry <- dbGetQuery(con, "SELECT count(*) n_rows,
+  count(*) FILTER (WHERE scientificNameID IS NOT NULL) n_aphia,
+  count(*) FILTER (WHERE isMarine) n_marine,
+  count(DISTINCT kingdom) n_kingdoms FROM worms")
+knitr::kable(smry)
+knitr::kable(dbGetQuery(con, "SELECT kingdom, count(*) n FROM worms GROUP BY 1 ORDER BY n DESC LIMIT 8"))
+# AlgaeBase check: these should be ABSENT here (filled by the WoRMS API in merge_taxon)
+alg <- dbGetQuery(con, "SELECT count(*) n FROM worms WHERE scientificName IN ('Caulerpa sertularioides','Ulva intestinalis')")$n
+log_info("AlgaeBase spot-check (expect 0, filled via API): {alg}")
+dbDisconnect(con, shutdown = TRUE)
+```
+
+## Manifest
+
+```{r}
+#| label: manifest
+
+write_json(
+  list(target = "ingest_worms", worms_ver = worms_ver, source = path_file(dl_dir),
+       n_rows = smry$n_rows, n_marine = smry$n_marine, built = as.character(Sys.time())),
+  manifest, auto_unbox = TRUE, pretty = TRUE)
+manifest
+```

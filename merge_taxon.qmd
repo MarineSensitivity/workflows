@@ -29,7 +29,7 @@ cells with `area_km2` / `in_usa` / `in_pra`):
 #| label: compute
 
 librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, readr, stringr,
-                 tibble, MarineSensitivity/msens, quiet = T)
+                 tibble, ropensci/worrms, MarineSensitivity/msens, quiet = T)
 source(here("libs/paths.R"))
 source(here("libs/vars.R"))
 
@@ -111,14 +111,46 @@ crosswalk — so new taxa land in the right class instead of a catch-all `other`
 v7's six scored classes (bird, mammal, turtle, fish, coral, invertebrate) **plus
 `primary_producer`** (marine plants/algae/diatoms — distinct from the carbon `primprod`
 metric). **Reptiles/amphibians are categorized but EXCLUDED from scoring** (sea turtles stay
-`turtle`; `score_cell_metrics` scores only the seven classes). AphiaIDs missing from the
-local WoRMS snapshot (mostly algae/seagrass) fall back to `data/worms_taxonomy_supplement.csv`.
+`turtle`; `score_cell_metrics` scores only the seven classes). **AlgaeBase-sourced taxa
+(macroalgae/seagrass) are license-excluded from the downloadable WoRMS DwC-A**, so
+worms-authority AphiaIDs absent from the local snapshot are fetched from the **WoRMS API**
+(`worrms::wm_record`) and cached in `data/worms_taxonomy_supplement.csv` — self-maintaining
+(only new ids are fetched; offline runs use the cache).
 
 ```{r}
 #| label: sp_cat
 
-supp <- read_csv(here("data/worms_taxonomy_supplement.csv"), show_col_types = FALSE) |>
-  transmute(taxon_id = as.character(taxon_id), s_kingdom = kingdom, s_phylum = phylum, s_class = class)
+# Self-maintaining WoRMS supplement: AlgaeBase-sourced taxa (macroalgae/seagrass) are
+# excluded from the downloadable WoRMS DwC-A by license, so any worms-authority taxon used
+# here but absent from the local snapshot is fetched from the WoRMS API and cached. Only
+# *new* unmatched AphiaIDs are fetched; offline runs fall back to the existing cache.
+supp_csv <- here("data/worms_taxonomy_supplement.csv")
+supp <- if (file_exists(supp_csv))
+  read_csv(supp_csv, show_col_types = FALSE, col_types = cols(taxon_id = "c")) else
+  tibble(taxon_id = character(), scientificName = character(),
+         kingdom = character(), phylum = character(), class = character(), order = character())
+need <- setdiff(dbGetQuery(con, "
+  SELECT DISTINCT t.taxon_id FROM taxon t
+  LEFT JOIN spp.worms w ON t.taxon_authority='worms' AND CAST(w.scientificNameID AS VARCHAR)=t.taxon_id
+  WHERE t.taxon_authority='worms' AND w.scientificNameID IS NULL")$taxon_id, supp$taxon_id)
+if (length(need)) {
+  log_info("WoRMS API: fetching {length(need)} AphiaIDs missing from the snapshot (AlgaeBase-excluded etc.)")
+  fetched <- tryCatch({
+    ids <- as.integer(need); ids <- ids[!is.na(ids)]
+    bind_rows(lapply(split(ids, ceiling(seq_along(ids) / 50)), \(b) tryCatch({
+      r <- worrms::wm_record(b)
+      tibble(taxon_id = as.character(r$AphiaID), scientificName = r$scientificname,
+             kingdom = r$kingdom, phylum = r$phylum, class = r$class, order = r$order)
+    }, error = \(e) NULL)))
+  }, error = \(e) { log_warn("WoRMS API fetch failed ({conditionMessage(e)}); using cached supplement"); NULL })
+  if (!is.null(fetched) && nrow(fetched)) {
+    supp <- bind_rows(supp, fetched) |> distinct(taxon_id, .keep_all = TRUE)
+    write_csv(supp, supp_csv)
+    log_info("supplement now {nrow(supp)} taxa ({nrow(fetched)} newly fetched + cached)")
+  }
+}
+supp <- supp |> transmute(taxon_id = as.character(taxon_id),
+                          s_kingdom = kingdom, s_phylum = phylum, s_class = class)
 turtle_keys <- dbGetQuery(con,
   "SELECT DISTINCT ms_merge_key FROM taxon_model WHERE mdl_key LIKE 'rng_turtle_swot_dps|%'")$ms_merge_key
 
