@@ -44,6 +44,7 @@ stopifnot("run merge_models first"    = dir_exists(merged),
 
 con <- dbConnect(duckdb(merge_db))
 dbExecute(con, glue("ATTACH '{sdm_db}' AS grid (READ_ONLY)"))
+dbExecute(con, glue("ATTACH '{spp_db}' AS spp (READ_ONLY)"))   # WoRMS class/phylum for sp_cat
 
 # per-taxon cell tallies against the ocean cell table
 dbExecute(con, glue("CREATE OR REPLACE TABLE taxon_cell AS
@@ -69,7 +70,7 @@ dbExecute(con, glue("CREATE OR REPLACE TABLE taxon_cell AS
 # idempotent: drop any derived columns a prior run added so `x.*` stays base taxon (+ er)
 for (col in c("n_cells","n_ocean","n_usa","n_pra","range_km2","range_usa_km2",
               "is_valid_global","is_valid_usa","is_valid_pra","pct_marine","us_endemism",
-              "rarity","is_marine","pct_marine_bl"))
+              "rarity","is_marine","pct_marine_bl","sp_cat"))
   try(dbExecute(con, glue("ALTER TABLE taxon DROP COLUMN IF EXISTS {col}")), silent = TRUE)
 
 # rarity thresholds on the marine range (km2); tune vs v7
@@ -101,6 +102,56 @@ smry <- dbGetQuery(con, "SELECT
   count(*) FILTER (WHERE is_valid_pra)    valid_pra,
   round(median(pct_marine),1) med_pct_marine FROM taxon")
 knitr::kable(smry)
+```
+
+## Species category (`sp_cat`) by taxonomy
+
+`sp_cat` is assigned by **taxonomy** (WoRMS class/phylum/kingdom + BirdLife→bird), not a v7
+crosswalk — so new taxa land in the right class instead of a catch-all `other` (eliminated).
+v7's six scored classes (bird, mammal, turtle, fish, coral, invertebrate) **plus
+`primary_producer`** (marine plants/algae/diatoms — distinct from the carbon `primprod`
+metric). **Reptiles/amphibians are categorized but EXCLUDED from scoring** (sea turtles stay
+`turtle`; `score_cell_metrics` scores only the seven classes). AphiaIDs missing from the
+local WoRMS snapshot (mostly algae/seagrass) fall back to `data/worms_taxonomy_supplement.csv`.
+
+```{r}
+#| label: sp_cat
+
+supp <- read_csv(here("data/worms_taxonomy_supplement.csv"), show_col_types = FALSE) |>
+  transmute(taxon_id = as.character(taxon_id), s_kingdom = kingdom, s_phylum = phylum, s_class = class)
+turtle_keys <- dbGetQuery(con,
+  "SELECT DISTINCT ms_merge_key FROM taxon_model WHERE mdl_key LIKE 'rng_turtle_swot_dps|%'")$ms_merge_key
+
+tx <- dbGetQuery(con, "
+  SELECT t.ms_merge_key, t.taxon_authority AS auth, t.taxon_id,
+         w.kingdom, w.phylum, w.\"class\" AS cls
+  FROM taxon t
+  LEFT JOIN spp.worms w ON t.taxon_authority='worms' AND CAST(w.scientificNameID AS VARCHAR)=t.taxon_id") |>
+  left_join(supp, by = "taxon_id") |>
+  mutate(kingdom = coalesce(kingdom, s_kingdom),
+         phylum  = coalesce(phylum,  s_phylum),
+         cls     = coalesce(cls,     s_class))
+
+fish_cls    <- c("Teleostei","Elasmobranchii","Holocephali","Myxini","Chondrostei","Petromyzonti",
+                 "Actinopteri","Actinopterygii","Chondrichthyes","Coelacanthi","Dipneusti","Cladistia","Sarcopterygii")
+reptile_cls <- c("Reptilia","Crocodylia","Squamata","Testudines","Lepidosauria","Sauropsida","Archosauria")
+tx <- tx |> mutate(sp_cat = case_when(
+  ms_merge_key %in% turtle_keys                    ~ "turtle",
+  auth == "botw" | cls == "Aves"                   ~ "bird",
+  cls == "Mammalia"                                ~ "mammal",
+  cls %in% reptile_cls                             ~ "reptile",        # excluded from scoring
+  cls == "Amphibia"                                ~ "amphibian",      # excluded from scoring
+  cls %in% fish_cls                                ~ "fish",
+  cls %in% c("Hexacorallia","Octocorallia")        ~ "coral",
+  kingdom %in% c("Plantae","Chromista","Bacteria") ~ "primary_producer",
+  TRUE                                             ~ "invertebrate"))
+
+duckdb_register(con, "tmp_spcat", tx |> select(ms_merge_key, sp_cat))
+dbExecute(con, "CREATE OR REPLACE TABLE taxon AS
+  SELECT t.*, s.sp_cat FROM taxon t LEFT JOIN tmp_spcat s USING (ms_merge_key)")
+duckdb_unregister(con, "tmp_spcat")
+knitr::kable(dbGetQuery(con, "SELECT sp_cat, count(*) n, count(*) FILTER(WHERE is_valid_usa) valid_usa
+  FROM taxon GROUP BY 1 ORDER BY n DESC"))
 ```
 
 ## Marine relevance (birds) — `is_marine`
