@@ -275,12 +275,14 @@ pmt_model_rows <- if (nrow(pmt_reg)) {
 asset_info <- bind_rows(am_reg, pmt_model_rows) |>
   mutate(across(everything(), ~ if (is.factor(.)) as.character(.) else .))
 
-# per-am-model geographic bbox (from cell_id row/col arithmetic on the global grid) so the
-# app can fit to an input's actual (often global) extent. pmtiles rows get NULL -> world fit.
-# bbox by mid over the compact partitioned parquet, then map mid -> mdl_key via am_map.
+# per-model geographic bbox (cell_id row/col arithmetic on the global grid) so the app fits
+# to each input's actual extent — NOT the whole world (lands on the globe antipode). am from
+# the compact _am_parts (mid->mdl_key); vector ranges from their small dist partitions.
+bbox_cols <- c("xmin","xmax","ymin","ymax")
+bb_am <- tibble()
 if (nrow(am_reg) && exists("am_parts") && dir_exists(am_parts)) {
   con <- dbConnect(duckdb(), config = list(threads = "6"))
-  bb <- dbGetQuery(con, glue("
+  bb_am <- dbGetQuery(con, glue("
     WITH rc AS (SELECT mid, (cell_id-1) % 7200 AS col, (cell_id-1) // 7200 AS row
                 FROM read_parquet('{am_parts}/**/*.parquet', hive_partitioning=true))
     SELECT mid,
@@ -289,8 +291,24 @@ if (nrow(am_reg) && exists("am_parts") && dir_exists(am_parts)) {
     FROM rc GROUP BY mid")) |>
     dplyr::left_join(am_map, by = "mid") |> dplyr::select(-mid)
   dbDisconnect(con, shutdown = TRUE)
-  asset_info <- asset_info |> left_join(bb, by = "mdl_key")
 }
+bb_vec <- tibble()
+vec_ds <- unique(pmt_model_rows$ds_key)                          # the pmtiles datasets
+if (length(vec_ds)) {
+  con   <- dbConnect(duckdb(), config = list(threads = "6"))
+  globs <- paste0("'", dir_atlas, "/dist/dataset=", vec_ds, "/*.parquet'", collapse = ", ")
+  dbWriteTable(con, "vk", tibble(mdl_key = unique(pmt_model_rows$mdl_key)), overwrite = TRUE)
+  bb_vec <- dbGetQuery(con, glue("
+    WITH rc AS (SELECT p.mdl_key, (p.cell_id-1) % 7200 AS col, (p.cell_id-1) // 7200 AS row
+                FROM read_parquet([{globs}]) p SEMI JOIN vk USING(mdl_key))
+    SELECT mdl_key,
+      -180 + min(col)*0.05       AS xmin, -180 + (max(col)+1)*0.05 AS xmax,
+       90 - (max(row)+1)*0.05    AS ymin,   90 - min(row)*0.05     AS ymax
+    FROM rc GROUP BY mdl_key"))
+  dbDisconnect(con, shutdown = TRUE)
+}
+bb_all <- bind_rows(bb_am, bb_vec)
+if (nrow(bb_all)) asset_info <- asset_info |> left_join(bb_all, by = "mdl_key")
 
 # attach ms_merge_key (the merged taxon key) so the species app can join a taxon
 # directly to its input surfaces. A raw model may feed >1 merged taxon -> one row each.
