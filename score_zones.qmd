@@ -20,7 +20,7 @@ cell-id grid. Scoring formulas need `zone_cell.pct_covered` at every step.
 ```{r}
 #| label: setup
 
-librarian::shelf(DBI, dplyr, duckdb, exactextractr, fs, glue, here, jsonlite, logger,
+librarian::shelf(DBI, dplyr, duckdb, exactextractr, fs, glue, here, jsonlite, logger, readr,
                  sf, terra, tibble, MarineSensitivity/msens, quiet = T)
 source(here("libs/paths.R"))
 source(here("libs/vars.R"))
@@ -100,6 +100,25 @@ for (zs in zone_specs) {
   }
   log_info("{zs$fld}: {nrow(ply)} zones")
 }
+
+# subregion zones (USA / AK / GA / PA) = unions of their member Program Areas (the v7 grouping,
+# `{ver_prev}/subregion_programareas.csv`). No polygon source — build from the PA zones' cells so
+# the apps' "Study area" filter (subregion_key) works.
+sr_map   <- read_csv(glue("{dir_data}/derived/{ver_prev}/subregion_programareas.csv"), show_col_types = FALSE)
+zone_df  <- bind_rows(zone_rows); zc_df <- bind_rows(zc_rows)
+pa_zones <- zone_df |> filter(fld == "programarea_key") |> select(pa_seq = zone_seq, programarea_key = val)
+for (sr in sort(unique(sr_map$subregion_key))) {
+  zseq <- zseq + 1L
+  member_seqs <- pa_zones$pa_seq[pa_zones$programarea_key %in% sr_map$programarea_key[sr_map$subregion_key == sr]]
+  sr_cells <- zc_df |> filter(zone_seq %in% member_seqs) |>
+    group_by(cell_id) |> summarise(pct_covered = max(pct_covered), .groups = "drop")
+  zone_rows[[length(zone_rows) + 1]] <- tibble(
+    zone_seq = zseq, tbl = glue("ply_subregions_2026_{ver}"), fld = "subregion_key", val = sr)
+  if (nrow(sr_cells)) zc_rows[[length(zc_rows) + 1]] <- tibble(
+    zone_seq = zseq, cell_id = sr_cells$cell_id, pct_covered = sr_cells$pct_covered)
+}
+log_info("subregion_key: {n_distinct(sr_map$subregion_key)} zones")
+
 dbWriteTable(con, "zone",      bind_rows(zone_rows), overwrite = TRUE)
 dbWriteTable(con, "zone_cell", bind_rows(zc_rows) |> filter(pct_covered > 0), overwrite = TRUE)
 
