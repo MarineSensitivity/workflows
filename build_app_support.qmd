@@ -1,0 +1,111 @@
+---
+title: "Build app support files — zone gpkgs, layers registry, metrics raster"
+msens:
+  target_name: build_app_support
+  workflow_type: release
+  dependency: [score_cell_metrics, score_zones]
+  output: data/manifests/build_app_support.json
+editor_options:
+  chunk_output_type: console
+---
+
+Reproducibly generate the per-version files the Shiny apps (`scores`, `species`) load at
+startup — which the v8 scoring pipeline doesn't otherwise emit:
+
+- **`ply_ecoregions_2025.gpkg` / `ply_programareas_2026_{ver}.gpkg`** — the zone polygons
+  (shared with `ver_prev`; copied to the version dir the apps expect).
+- **`layers_{ver}.csv`** — the app's layer registry (order/category/label/key); adapted from
+  the prior version for the v8 `sp_cat` set (`other` → `primary_producer`).
+- **`r_metrics_{ver}.tif`** — a raster stack of the per-cell metrics + `ecoregion_key`/
+  `programarea_key`, rasterized from `cell_metric` onto the **global cell-id COG** using the
+  COG-value = `cell_id` lookup (NOT `r[cell_id]<-` pixel-index, which is a v7-grid assumption).
+
+## Setup
+
+```{r}
+#| label: setup
+
+librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, readr, sf, terra, quiet = T)
+source(here("libs/paths.R"))
+dir_v    <- glue("{dir_derived}/{ver}"); dir_create(dir_v)
+manifest <- here("data/manifests/build_app_support.json"); dir_create(path_dir(manifest))
+stopifnot(all(file_exists(c(sdm_db, cellid_tif))))
+```
+
+## Zone polygons → version dir
+
+```{r}
+#| label: gpkgs
+
+er_src <- glue("{dir_derived}/{ver_prev}/ply_ecoregions_2025.gpkg")
+pa_src <- glue("{dir_derived}/{ver_prev}/ply_programareas_2026_{ver_prev}.gpkg")
+stopifnot(all(file_exists(c(er_src, pa_src))))
+file_copy(er_src, glue("{dir_v}/ply_ecoregions_2025.gpkg"),          overwrite = TRUE)
+file_copy(pa_src, glue("{dir_v}/ply_programareas_2026_{ver}.gpkg"),  overwrite = TRUE)
+log_info("copied ecoregion + programarea gpkgs to {dir_v}")
+```
+
+## Layer registry (`layers_{ver}.csv`)
+
+```{r}
+#| label: layers
+
+lyrs <- read_csv(glue("{dir_derived}/{ver_prev}/layers_{ver_prev}.csv"), show_col_types = FALSE) |>
+  mutate(
+    lyr   = gsub("_other", "_primary_producer", lyr),          # extrisk_other_* -> extrisk_primary_producer_*
+    layer = gsub("^other:", "primary producer:", layer))       # relabel
+write_csv(lyrs, glue("{dir_v}/layers_{ver}.csv"))
+log_info("layers_{ver}.csv: {nrow(lyrs)} layers")
+```
+
+## Metrics raster (`r_metrics_{ver}.tif`)
+
+```{r}
+#| label: r_metrics
+
+con    <- dbConnect(duckdb(sdm_db, read_only = TRUE))
+r_cell <- rast(cellid_tif)                                       # pixel value = cell_id
+# crop to the programarea polygons' extent (US study area) so it isn't a full global grid
+pa      <- st_read(glue("{dir_v}/ply_programareas_2026_{ver}.gpkg"), quiet = TRUE)
+r_cell  <- crop(r_cell, ext(project(vect(pa), r_cell)))
+cidx    <- values(r_cell, mat = FALSE)                          # cell_id per pixel (NA on land)
+maxid   <- max(cidx, na.rm = TRUE)
+mk_lut  <- function(cell_id, v) { lut <- rep(NA_real_, maxid); lut[cell_id] <- v; lut }
+
+# one band per app layer, plus the raw composite key already in lyrs$lyr
+lst <- list()
+for (k in unique(lyrs$lyr)) {
+  d <- dbGetQuery(con, glue("SELECT cm.cell_id, cm.val FROM cell_metric cm
+    JOIN metric m USING(metric_seq) WHERE m.metric_key = '{k}'"))
+  if (!nrow(d)) { log_warn("no cells for layer {k}"); next }
+  r <- setValues(rast(r_cell), mk_lut(d$cell_id, d$val)[cidx]); names(r) <- k
+  lst[[k]] <- r
+}
+# categorical zone keys from zone_cell
+for (zf in c("ecoregion_key", "programarea_key")) {
+  d    <- dbGetQuery(con, glue("SELECT zc.cell_id, z.val AS key FROM zone_cell zc
+    JOIN zone z USING(zone_seq) WHERE z.fld = '{zf}'"))
+  lvls <- sort(unique(d$key)); d$id <- match(d$key, lvls)
+  r    <- setValues(rast(r_cell), mk_lut(d$cell_id, d$id)[cidx]); names(r) <- zf
+  levels(r) <- data.frame(id = seq_along(lvls), key = lvls)
+  lst[[zf]] <- r
+}
+r_metrics <- rast(lst)
+if ("primprod" %in% names(r_metrics))
+  r_metrics[["primprod_log"]] <- log(r_metrics[["primprod"]])
+writeRaster(r_metrics, glue("{dir_v}/r_metrics_{ver}.tif"), overwrite = TRUE,
+            gdal = c("COMPRESS=ZSTD", "TILED=YES"))
+n_lyr <- nlyr(r_metrics)
+dbDisconnect(con, shutdown = TRUE)
+log_info("r_metrics_{ver}.tif: {n_lyr} bands")
+```
+
+## Manifest
+
+```{r}
+#| label: manifest
+
+write_json(list(target = "build_app_support", ver = ver, dir = dir_v,
+  layers = nrow(lyrs), r_metrics_bands = n_lyr, built = as.character(Sys.time())),
+  manifest, auto_unbox = TRUE, pretty = TRUE)
+```
