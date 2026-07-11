@@ -177,33 +177,37 @@ if (nrow(pmt_reg)) knitr::kable(pmt_reg |> transmute(ds_key, mb = round(as.numer
 
 ## AquaMaps → per-model COGs
 
-Consolidate the served `am` cells into one mdl_key-sorted Parquet (row-group pruning lets
-each per-model read fetch only its groups), then paint each model onto the global grid,
-cropped to its bbox, as a COG with overviews. Parallel + resumable (skip existing COGs).
+Consolidate the served `am` cells by **integer** key (`mid`) via `PARTITION_BY` — one small
+Parquet dir per model (`_am_parts/mid={mid}/`, columns `cell_id,val` only). This drops the
+40-byte `mdl_key` string from the ~12B-row intermediate and needs no global sort (a plain
+ORDER BY would spill ~500GB), so each per-model read is a direct partition scan. Then paint
+each model onto the global grid, cropped to its bbox, as a COG with overviews. Parallel +
+resumable (skip existing COGs).
 
 ```{r}
-#| label: am-sort
+#| label: am-partition
 
-# test mode uses a separate sorted file + only the test subset, so it never poisons a full run
-am_keys   <- if (length(served_by_ds[["am"]])) sort(served_by_ds[["am"]]) else character(0)
-am_sort_keys <- if (test_n > 0) head(am_keys, test_n) else am_keys
-am_sorted <- glue("{dir_native}/_am_sorted{if (test_n > 0) '_test' else ''}.parquet")
-if (!skip_am && length(am_sort_keys)) {
-  if (!file_exists(am_sorted) || redo) {
-    log_info("sorting {length(am_sort_keys)} served am models by mdl_key -> {path_file(am_sorted)} …")
-    con <- dbConnect(duckdb(), config = list(threads = "6", memory_limit = "12GB"))
+# test mode uses a separate parts dir + only the test subset, so it never poisons a full run
+am_keys <- if (length(served_by_ds[["am"]])) sort(served_by_ds[["am"]]) else character(0)
+am_take <- if (test_n > 0) head(am_keys, test_n) else am_keys
+am_map  <- tibble(mdl_key = am_take, mid = seq_along(am_take))       # stable int key per model
+am_parts<- glue("{dir_native}/_am_parts{if (test_n > 0) '_test' else ''}")
+if (!skip_am && length(am_take)) {
+  if (!dir_exists(am_parts) || redo) {
+    if (dir_exists(am_parts)) dir_delete(am_parts)
+    log_info("partitioning {length(am_take)} served am models by mid -> _am_parts …")
+    con <- dbConnect(duckdb(), config = list(threads = "6", memory_limit = "10GB"))
     dbExecute(con, glue("SET temp_directory='{dir_atlas}/duckdb_tmp'"))
-    dbExecute(con, "CREATE TEMP TABLE k(mdl_key VARCHAR)")
-    dbAppendTable(con, "k", tibble(mdl_key = am_sort_keys))
+    dbExecute(con, "SET partitioned_write_max_open_files=400")
+    dbWriteTable(con, "am_map", am_map, overwrite = TRUE)
     dbExecute(con, glue("COPY (
-      SELECT p.mdl_key, p.cell_id, p.val
+      SELECT map.mid, p.cell_id, p.val
       FROM read_parquet('{dir_atlas}/dist/dataset=am/*.parquet') p
-      SEMI JOIN k USING(mdl_key)
-      ORDER BY p.mdl_key
-    ) TO '{am_sorted}' (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 100000)"))
+      JOIN am_map map ON p.mdl_key = map.mdl_key
+    ) TO '{am_parts}' (FORMAT parquet, COMPRESSION zstd, PARTITION_BY (mid), OVERWRITE_OR_IGNORE)"))
     dbDisconnect(con, shutdown = TRUE)
-    log_info("am_sorted.parquet: {round(as.numeric(file_size(am_sorted))/1e9,1)} GB")
-  } else log_info("_am_sorted.parquet exists — skip re-sort (REDO_NATIVE=1 to force)")
+    log_info("_am_parts: {length(dir_ls(am_parts))} partitions, {round(sum(file_size(dir_ls(am_parts, recurse=TRUE, type='file')))/1e9,1)} GB")
+  } else log_info("_am_parts exists — skip repartition (REDO_NATIVE=1 to force)")
 }
 ```
 
@@ -211,45 +215,40 @@ if (!skip_am && length(am_sort_keys)) {
 #| label: am-cogs
 
 am_reg <- tibble()
-if (!skip_am && length(am_keys) && file_exists(am_sorted)) {
-  keys <- am_sort_keys
-  todo <- keys[!file_exists(glue("{dir_cog}/{safe_key(keys)}.tif"))]
-  log_info("am COGs: {length(keys)} target, {length(todo)} to build ({length(keys)-length(todo)} exist)")
+if (!skip_am && length(am_take) && dir_exists(am_parts)) {
+  todo <- am_map[!file_exists(glue("{dir_cog}/{safe_key(am_map$mdl_key)}.tif")), ]
+  log_info("am COGs: {nrow(am_map)} target, {nrow(todo)} to build ({nrow(am_map)-nrow(todo)} exist)")
 
   grid <- grid_spec(rast(cellid_tif))
-  build_batch <- function(batch_keys) {
+  build_batch <- function(rows) {
     suppressMessages({library(DBI); library(duckdb); library(terra)})
-    con <- dbConnect(duckdb(), read_only = FALSE)
+    con <- dbConnect(duckdb())
     on.exit(dbDisconnect(con, shutdown = TRUE))
-    st <- dbSendQuery(con, sprintf(
-      "SELECT cell_id, val FROM read_parquet('%s') WHERE mdl_key = ?", am_sorted))
-    out <- character(0)
-    for (k in batch_keys) {
-      f <- sprintf("%s/%s.tif", dir_cog, safe_key(k))
-      if (file.exists(f)) { out <- c(out, f); next }
-      duckdb::dbBind(st, list(k)); d <- dbFetch(st)
-      if (!nrow(d)) next
-      msens::publish_cog(d$cell_id, d$val, f, grid)
-      out <- c(out, f)
+    for (i in seq_len(nrow(rows))) {
+      k <- rows$mdl_key[i]; f <- sprintf("%s/%s.tif", dir_cog, safe_key(k))
+      if (file.exists(f)) next
+      pf <- sprintf("%s/mid=%d", am_parts, rows$mid[i])
+      if (!dir.exists(pf)) next
+      d <- dbGetQuery(con, sprintf("SELECT cell_id, val FROM read_parquet('%s/*.parquet')", pf))
+      if (nrow(d)) msens::publish_cog(d$cell_id, d$val, f, grid)
     }
-    dbClearResult(st)
-    out
+    nrow(rows)
   }
 
-  if (length(todo)) {
+  if (nrow(todo)) {
     plan(multisession, workers = n_workers)
-    batches <- split(todo, (seq_along(todo) - 1) %% n_workers)
-    res <- future_map(batches, build_batch,
-                      .options = furrr_options(globals = c("am_sorted","dir_cog","grid","safe_key"),
-                                               packages = c("msens"), seed = TRUE))
+    batches <- split(todo, (seq_len(nrow(todo)) - 1) %% n_workers)
+    future_map(batches, build_batch,
+               .options = furrr_options(globals = c("am_parts","dir_cog","grid","safe_key"),
+                                        packages = c("msens"), seed = TRUE))
     plan(sequential)
   }
-  built <- glue("{dir_cog}/{safe_key(keys)}.tif")
+  built <- glue("{dir_cog}/{safe_key(am_map$mdl_key)}.tif")
   am_reg <- tibble(
-    mdl_key = keys, ds_key = "am", asset_type = "cog",
-    asset_url = glue("{s3_http}/native/am/{safe_key(keys)}.tif"),
+    mdl_key = am_map$mdl_key, ds_key = "am", asset_type = "cog",
+    asset_url = glue("{s3_http}/native/am/{safe_key(am_map$mdl_key)}.tif"),
     rescale_min = 1L, rescale_max = 100L, colormap = "spectral_r")[file_exists(built), ]
-  log_info("am COGs on disk: {nrow(am_reg)} / {length(keys)}")
+  log_info("am COGs on disk: {nrow(am_reg)} / {nrow(am_map)}")
 }
 ```
 
@@ -273,15 +272,17 @@ asset_info <- bind_rows(am_reg, pmt_model_rows) |>
 
 # per-am-model geographic bbox (from cell_id row/col arithmetic on the global grid) so the
 # app can fit to an input's actual (often global) extent. pmtiles rows get NULL -> world fit.
-if (nrow(am_reg) && file_exists(am_sorted)) {
+# bbox by mid over the compact partitioned parquet, then map mid -> mdl_key via am_map.
+if (nrow(am_reg) && exists("am_parts") && dir_exists(am_parts)) {
   con <- dbConnect(duckdb(), config = list(threads = "6"))
   bb <- dbGetQuery(con, glue("
-    WITH rc AS (SELECT mdl_key, (cell_id-1) % 7200 AS col, (cell_id-1) // 7200 AS row
-                FROM read_parquet('{am_sorted}'))
-    SELECT mdl_key,
+    WITH rc AS (SELECT mid, (cell_id-1) % 7200 AS col, (cell_id-1) // 7200 AS row
+                FROM read_parquet('{am_parts}/**/*.parquet', hive_partitioning=true))
+    SELECT mid,
       -180 + min(col)*0.05       AS xmin, -180 + (max(col)+1)*0.05 AS xmax,
        90 - (max(row)+1)*0.05    AS ymin,   90 - min(row)*0.05     AS ymax
-    FROM rc GROUP BY mdl_key"))
+    FROM rc GROUP BY mid")) |>
+    dplyr::left_join(am_map, by = "mid") |> dplyr::select(-mid)
   dbDisconnect(con, shutdown = TRUE)
   asset_info <- asset_info |> left_join(bb, by = "mdl_key")
 }
