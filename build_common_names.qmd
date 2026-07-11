@@ -1,0 +1,153 @@
+---
+title: "Build taxon common names — NMFS > FWS > BirdLife > WoRMS (English)"
+msens:
+  target_name: build_common_names
+  workflow_type: merge
+  dependency: [merge_taxon]
+  output: data/manifests/build_common_names.json
+editor_options:
+  chunk_output_type: console
+---
+
+Resolve one English **common name** per taxon by a preference order — US federal names win
+(they're the authoritative/managed names), then BirdLife for birds, then WoRMS:
+
+1. **NOAA NMFS** species directory (`common_name`) — highest preference.
+2. **USFWS** species explorer (`Common Name`).
+3. **BirdLife** checklist (`common`, from `model_bl.csv`) — authoritative for birds (WoRMS
+   covers birds poorly).
+4. **WoRMS** vernacular (`vernacularname.txt`, `language == "ENG"`, `isPreferredName` first) —
+   for the rest. WoRMS can list several English candidates, so we take the *preferred* one.
+
+Taxa still uncovered (not in NMFS/FWS/BirdLife and with no English WoRMS vernacular) are logged
+as **Wikipedia candidates** (`COMMON_WIKI=1` fetches + caches best-fit names — a gated follow-up,
+since it's a large network job). Writes `common_name` to `merge.duckdb` + `sdm.duckdb` `taxon`.
+
+## Setup + sources
+
+```{r}
+#| label: setup
+
+librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, janitor, jsonlite, logger, readr,
+                 stringr, tibble, MarineSensitivity/msens, quiet = T)
+source(here("libs/paths.R"))
+options(readr.show_col_types = F)
+
+merge_db  <- glue("{dir_big_v}/marine-atlas/merge.duckdb")
+model_bl  <- glue("{dir_big_v}/marine-atlas/dist/model_bl.csv")
+nmfs_csv  <- here("data/nmfs_species-directory.csv")
+fws_csv   <- glue("{dir_raw}/fws.gov/species/FWS_Species_Data_Explorer.csv")
+vern_txt  <- glue("{dir_raw}/marinespecies.org/checklistbank.org_dataset-2011_v2026-07-02/vernacularname.txt")
+manifest  <- here("data/manifests/build_common_names.json"); dir_create(path_dir(manifest))
+stopifnot(all(file_exists(c(merge_db, nmfs_csv, fws_csv, vern_txt))))
+
+first_common <- function(d) d |> filter(!is.na(common), common != "") |>
+  group_by(sci) |> summarise(common = first(common), .groups = "drop")
+
+nmfs <- read_csv(nmfs_csv) |> transmute(sci = clean_sci_name(scientific_name), common = common_name) |> first_common()
+fws  <- read_csv(fws_csv)  |> clean_names() |>
+  transmute(sci = clean_sci_name(scientific_name), common = common_name) |> first_common()
+
+# WoRMS English vernacular, preferred first, one per AphiaID
+vern <- read_tsv(vern_txt) |>
+  filter(language == "ENG") |>
+  mutate(aphia = str_remove(taxonID, "urn:lsid:marinespecies.org:taxname:"),
+         pref  = as.integer(isPreferredName %in% c("1", "true", "preferred", "TRUE"))) |>
+  arrange(desc(pref)) |>
+  group_by(aphia) |> summarise(common = first(vernacularName), .groups = "drop")
+
+# BirdLife common by sisid (taxon_id for botw)
+bl <- read_csv(model_bl) |> transmute(sisid = as.character(sisid), common) |>
+  filter(!is.na(common)) |> distinct(sisid, .keep_all = TRUE)
+```
+
+## Resolve per taxon
+
+```{r}
+#| label: resolve
+
+con <- dbConnect(duckdb(merge_db))
+tx  <- dbGetQuery(con, "SELECT ms_merge_key, taxon_authority, taxon_id, scientific_name FROM taxon") |>
+  mutate(sci = clean_sci_name(scientific_name))
+
+tx <- tx |>
+  left_join(nmfs |> rename(cn_nmfs = common), by = "sci") |>
+  left_join(fws  |> rename(cn_fws  = common), by = "sci") |>
+  left_join(bl   |> rename(cn_bl   = common), by = c("taxon_id" = "sisid")) |>
+  left_join(vern |> rename(cn_worms = common), by = c("taxon_id" = "aphia")) |>
+  mutate(
+    common_name = coalesce(cn_nmfs, cn_fws, cn_bl, cn_worms),
+    common_src  = case_when(!is.na(cn_nmfs) ~ "NMFS", !is.na(cn_fws) ~ "FWS",
+                            !is.na(cn_bl) ~ "BirdLife", !is.na(cn_worms) ~ "WoRMS", TRUE ~ NA))
+
+src_tbl <- tx |> count(common_src)
+knitr::kable(src_tbl)
+log_info("common names resolved for {sum(!is.na(tx$common_name))} of {nrow(tx)} taxa")
+```
+
+## Wikipedia fallback (gated: `COMMON_WIKI=1`)
+
+```{r}
+#| label: wikipedia
+
+wiki_csv <- here("data/common_names_wikipedia.csv")
+need <- tx |> filter(is.na(common_name)) |> distinct(scientific_name)
+log_info("{nrow(need)} taxa lack a common name (Wikipedia candidates)")
+if (nzchar(Sys.getenv("COMMON_WIKI")) && nrow(need)) {
+  librarian::shelf(httr2, quiet = T)
+  cache <- if (file_exists(wiki_csv)) read_csv(wiki_csv) else tibble(scientific_name = character(), common = character())
+  todo  <- setdiff(need$scientific_name, cache$scientific_name)
+  wiki_common <- function(sci) tryCatch({
+    r <- httr2::request("https://en.wikipedia.org/api/rest_v1/page/summary/") |>
+      httr2::req_url_path_append(utils::URLencode(sci, reserved = TRUE)) |>
+      httr2::req_user_agent("marinesensitivity.org common-name resolver") |>
+      httr2::req_error(is_error = \(x) FALSE) |> httr2::req_perform() |> httr2::resp_body_json()
+    ti <- r$title
+    if (is.null(ti) || grepl("Not found", r$type %||% "")) NA_character_ else ti
+  }, error = \(e) NA_character_)
+  fetched <- tibble(scientific_name = todo, common = vapply(todo, wiki_common, character(1)))
+  cache   <- bind_rows(cache, fetched) |> distinct(scientific_name, .keep_all = TRUE)
+  write_csv(cache, wiki_csv)
+  tx <- tx |> left_join(cache |> rename(cn_wiki = common), by = "scientific_name") |>
+    mutate(common_name = coalesce(common_name, cn_wiki),
+           common_src  = ifelse(is.na(common_src) & !is.na(cn_wiki), "Wikipedia", common_src))
+  log_info("Wikipedia filled {sum(!is.na(tx$cn_wiki))} of {length(todo)} fetched")
+} else if (file_exists(wiki_csv)) {
+  tx <- tx |> left_join(read_csv(wiki_csv) |> rename(cn_wiki = common), by = "scientific_name") |>
+    mutate(common_name = coalesce(common_name, cn_wiki),
+           common_src  = ifelse(is.na(common_src) & !is.na(cn_wiki), "Wikipedia", common_src))
+}
+```
+
+## Write `common_name` → taxon (merge + sdm)
+
+```{r}
+#| label: write
+
+duckdb_register(con, "tmp_cn", tx |> select(ms_merge_key, common_name))
+dbExecute(con, "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS common_name VARCHAR")
+dbExecute(con, "UPDATE taxon SET common_name = tmp_cn.common_name FROM tmp_cn WHERE taxon.ms_merge_key = tmp_cn.ms_merge_key")
+dbDisconnect(con, shutdown = TRUE)
+
+con2 <- dbConnect(duckdb(sdm_db))
+if ("taxon" %in% dbListTables(con2)) {
+  duckdb_register(con2, "tmp_cn", tx |> select(ms_merge_key, common_name))
+  dbExecute(con2, "ALTER TABLE taxon ADD COLUMN IF NOT EXISTS common_name VARCHAR")
+  dbExecute(con2, "UPDATE taxon SET common_name = tmp_cn.common_name FROM tmp_cn WHERE taxon.ms_merge_key = tmp_cn.ms_merge_key")
+  n_sdm <- dbGetQuery(con2, "SELECT count(common_name) n FROM taxon")$n
+} else n_sdm <- 0
+dbDisconnect(con2, shutdown = TRUE)
+log_info("wrote common_name to merge.duckdb + sdm.duckdb ({n_sdm} in sdm taxon)")
+```
+
+## Manifest
+
+```{r}
+#| label: manifest
+
+write_json(list(target = "build_common_names", ver = ver,
+  n_taxa = nrow(tx), n_common = sum(!is.na(tx$common_name)),
+  by_source = as.list(setNames(src_tbl$n, src_tbl$common_src)),
+  n_uncovered = sum(is.na(tx$common_name)), built = as.character(Sys.time())),
+  manifest, auto_unbox = TRUE, pretty = TRUE)
+```
