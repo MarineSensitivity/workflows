@@ -1,0 +1,160 @@
+---
+title: "Build the model + dataset registry (`dataset` + `model` tables)"
+msens:
+  target_name: build_registry
+  workflow_type: schema
+  dependency: [auto]
+  output: data/manifests/build_registry.json
+editor_options:
+  chunk_output_type: console
+---
+
+Assemble the **`dataset`** and **`model`** registry tables that the v8 ingests define
+*implicitly* — dataset properties in each `ingest_*.qmd` `msens:` frontmatter block, model
+properties in each `{dist}/model_{ds}.csv`. v7 wrote these tables inline in every ingest
+(`INSERT INTO dataset/model`); the v8 Parquet rewrite dropped those inserts, so the registry
+was never consolidated. Building it **once here** (rather than per-ingest) makes it a
+first-class target that **fails loudly if an ingested dataset is missing its metadata** — the
+single source of truth for STAC, the marine-atlas release, apps and the API.
+
+Written to `sdm.duckdb` (`dataset`, `model`) and staged as Parquet for the release.
+
+## Setup
+
+```{r}
+#| label: setup
+
+librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, purrr, readr,
+                 stringr, tibble, yaml, quiet = T)
+source(here("libs/paths.R"))
+options(readr.show_col_types = F)
+if (!exists("%||%")) `%||%` <- function(a, b) if (is.null(a)) b else a
+dir_atlas <- glue("{dir_big_v}/marine-atlas")
+dir_dist  <- glue("{dir_atlas}/dist")
+merge_db  <- glue("{dir_atlas}/merge.duckdb")
+manifest  <- here("data/manifests/build_registry.json"); dir_create(path_dir(manifest))
+stopifnot("run ingests first" = dir_exists(dir_dist), "run build_cell_grid first" = file_exists(sdm_db))
+
+# canonical dataset order (merged first, then contributing datasets)
+ds_order <- c("ms_merge","am","ca_nmfs","ch_nmfs","ch_fws","rng_fws","bl","rng_iucn",
+              "rng_turtle_swot_dps","gm","nc")
+```
+
+## `dataset` — from the `msens:` frontmatter (+ v7 metadata where keys match)
+
+```{r}
+#| label: dataset
+
+# one row per ingest that declares a `msens: dataset:` block (the authoritative v8 props)
+fm_dataset <- function(f) {
+  txt <- readLines(f, warn = FALSE)
+  d   <- which(txt == "---")
+  if (length(d) < 2) return(NULL)
+  m <- tryCatch(yaml.load(paste(txt[(d[1] + 1):(d[2] - 1)], collapse = "\n")), error = \(e) NULL)
+  ds <- m$msens$dataset
+  if (is.null(ds$ds_key)) return(NULL)
+  tibble(ds_key = ds$ds_key, response_type = ds$response_type %||% NA,
+         source_broad = ds$source_authority %||% NA, temporal_res = ds$temporal_interval %||% "static",
+         native_format = ds$native_format %||% NA, qmd = path_file(f))
+}
+ds_fm <- map_dfr(dir_ls(".", glob = "ingest_*.qmd"), fm_dataset)
+
+# the merged product is its own "dataset"
+ds_fm <- bind_rows(ds_fm, tibble(
+  ds_key = "ms_merge", response_type = "mixed", source_broad = "MarineSensitivity",
+  temporal_res = "static", native_format = "parquet", qmd = "merge_models.qmd"))
+
+# inherit rich metadata (name_short/description/citation/links/env dates) from v7 for
+# matching keys; v8 frontmatter props override. am was `am_0.05` in v7.
+v7 <- dbConnect(duckdb(glue("{dir_big}/{ver_prev}/sdm.duckdb"), read_only = TRUE))
+d_v7 <- dbGetQuery(v7, "SELECT * FROM dataset") |>
+  mutate(ds_key = if_else(ds_key == "am_0.05", "am", ds_key))
+dbDisconnect(v7, shutdown = TRUE)
+
+dataset <- ds_fm |>
+  left_join(d_v7 |> select(-response_type, -source_broad, -temporal_res, -sort_order), by = "ds_key") |>
+  mutate(
+    name_short  = coalesce(name_short, glue("{source_broad} ({response_type})")),
+    description = coalesce(description, name_short),
+    spatial_res_deg = 0.05,
+    sort_order  = match(ds_key, ds_order)) |>
+  arrange(sort_order) |>
+  relocate(ds_key, name_short, response_type, source_broad, temporal_res, native_format, sort_order)
+
+# datasets that were actually ingested (have a dist partition) MUST have a dataset row
+ingested <- dir_ls(dir_dist, type = "directory", glob = "*dataset=*") |> path_file() |> str_remove("dataset=")
+missing_meta <- setdiff(ingested, dataset$ds_key)
+if (length(missing_meta))
+  stop("ingested datasets missing a `msens: dataset:` block: ", paste(missing_meta, collapse = ", "))
+not_ingested <- setdiff(setdiff(dataset$ds_key, "ms_merge"), ingested)
+if (length(not_ingested))
+  log_warn("dataset(s) declared but NOT ingested (no dist partition): {paste(not_ingested, collapse=', ')}")
+
+knitr::kable(dataset |> select(ds_key, name_short, response_type, source_broad, temporal_res, native_format, sort_order))
+```
+
+## `model` — union of every `model_{ds}.csv` (+ merged `ms_merge` models)
+
+```{r}
+#| label: model
+
+# each ingest writes model_{ds}.csv with dataset-native columns; map to a common schema
+# keyed by the stable mdl_key.
+read_model_csv <- function(f) {
+  ds <- str_match(path_file(f), "^model_(.+)\\.csv$")[, 2]
+  d  <- read_csv(f) |> rename_with(tolower)
+  pick <- function(cands) { hit <- intersect(tolower(cands), names(d)); if (length(hit)) d[[hit[1]]] else NA }
+  tibble(
+    mdl_key     = d$mdl_key,
+    ds_key      = ds,
+    sp_id       = as.character(pick(c("sp_key","sisid","sp_id","spcode","id_no","code"))),
+    sci_name    = as.character(pick(c("taxa","sci_name","sciname","sciename","scientific_name"))),
+    common_name = as.character(pick(c("common","comname","common_name"))),
+    er_score    = suppressWarnings(as.numeric(pick(c("er_score")))))
+}
+model_raw <- map_dfr(dir_ls(dir_dist, glob = "*/model_*.csv") |> c(dir_ls(dir_dist, glob = "model_*.csv")),
+                     read_model_csv) |> distinct(mdl_key, .keep_all = TRUE)
+
+# merged per-taxon models (mdl_key = ms_merge_key) from the merge taxon
+con <- dbConnect(duckdb(merge_db, read_only = TRUE))
+model_merged <- dbGetQuery(con, "SELECT ms_merge_key AS mdl_key, scientific_name AS sci_name,
+  er_score, sp_cat FROM taxon") |>
+  transmute(mdl_key, ds_key = "ms_merge", sp_id = mdl_key, sci_name, common_name = NA_character_, er_score, sp_cat)
+dbDisconnect(con, shutdown = TRUE)
+
+model <- bind_rows(model_raw |> mutate(sp_cat = NA_character_), model_merged) |>
+  mutate(ds_key = factor(ds_key, levels = ds_order)) |> arrange(ds_key, mdl_key) |>
+  mutate(ds_key = as.character(ds_key))
+log_info("model registry: {nrow(model)} models ({n_distinct(model_raw$ds_key)} raw datasets + ms_merge)")
+knitr::kable(model |> count(ds_key, name = "n_models"))
+```
+
+## Write registry → `sdm.duckdb` + release Parquet
+
+```{r}
+#| label: write
+
+con <- dbConnect(duckdb(sdm_db))
+dbWriteTable(con, "dataset", dataset, overwrite = TRUE)
+dbWriteTable(con, "model",   model,   overwrite = TRUE)
+# stage as Parquet alongside the other release tables
+reg_dir <- glue("{dir_atlas}/registry"); dir_create(reg_dir)
+dbExecute(con, glue("COPY dataset TO '{reg_dir}/dataset.parquet' (FORMAT parquet)"))
+dbExecute(con, glue("COPY model   TO '{reg_dir}/model.parquet'   (FORMAT parquet)"))
+smry <- dbGetQuery(con, "SELECT (SELECT count(*) FROM dataset) n_datasets, (SELECT count(*) FROM model) n_models")
+dbDisconnect(con, shutdown = TRUE)
+knitr::kable(smry)
+```
+
+## Manifest
+
+```{r}
+#| label: manifest
+
+write_json(
+  list(target = "build_registry", ver = ver, n_datasets = smry$n_datasets, n_models = smry$n_models,
+       ingested = ingested, not_ingested = if (length(not_ingested)) not_ingested else NULL,
+       built = as.character(Sys.time())),
+  manifest, auto_unbox = TRUE, pretty = TRUE)
+manifest
+```
