@@ -1,5 +1,5 @@
 ---
-title: "Release marine-atlas — versioned Parquet → S3"
+title: "Release marine-atlas — versioned Parquet → S3, view-DB serving, STAC"
 msens:
   target_name: release_marine-atlas
   workflow_type: release
@@ -9,20 +9,22 @@ editor_options:
   chunk_output_type: console
 ---
 
-Publish the **v8 marine-atlas** as partitioned Parquet to
-`s3://oceanmetrics.io-public/marine-atlas/{ver}/` — a self-describing, versioned release
-consumable directly over `httpfs` (DuckDB) or any Parquet reader:
+Publish the **v8 marine-atlas** and stand up its serving, reproducibly:
 
-- **`tables/`** — the derived scoring tables: `cell` (0.05° ocean grid + env + `in_usa`/
-  `in_pra`), `taxon` (sp_cat, er_score, validity flags, `is_marine`, rarity), `dataset` +
-  `model` (registry), `cell_metric` (per-cell scores), `zone`/`zone_cell`/`zone_metric`,
-  `metric`.
-- **`dist_merged/`** — the merged per-taxon model surfaces (`ms_merge|…`).
-- **`registry/`** — `dataset.parquet` + `model.parquet` (also in `tables/`).
-- **`dist/`** — the raw per-dataset per-species surfaces (~74G, AquaMaps-heavy) — **opt-in**
-  (`RELEASE_RAW=1`); AquaMaps originals are already public.
-
-The STAC catalog is emitted separately (needs the v8 `stac.R` pass).
+1. **Data → S3** `s3://oceanmetrics.io-public/marine-atlas/{ver}/`:
+   - `tables/` — derived scoring tables (`cell`, `taxon`, `dataset`, `model`,
+     `cell_metric`, `zone*`, `metric`).
+   - `dist_merged/` — merged per-taxon surfaces (`ms_merge|…`).
+   - `serve/model_cell.parquet` — the **serving-optimized** surface: one file, globally
+     **sorted by `mdl_key`** (row-group zone-map pruning) so a titiler tile does an
+     HTTP-range point read; single file ⇒ anonymous GET (no S3 LIST/creds).
+   - `registry/` — `dataset`/`model` Parquet.
+   - `dist/` — raw per-dataset surfaces (~74G) — opt-in (`RELEASE_RAW=1`).
+2. **View DB** — a **tiny** `serve.duckdb` whose tables are *views* over the S3 Parquet
+   (path-style HTTPS URLs). Titiler reads this; the big data never rsyncs to the server.
+3. **STAC** — `stac_build(version)` → deploy the catalog to the file host `/stac`.
+4. **Deploy** (`RELEASE_DEPLOY=1`) — rsync the KB view DB + STAC to `msens1`, (re)build the
+   parallel `titiler-v8` service, restart caddy. v7 serving is untouched (A/B).
 
 ## Setup
 
@@ -32,58 +34,129 @@ The STAC catalog is emitted separately (needs the v8 `stac.R` pass).
 librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, quiet = T)
 source(here("libs/paths.R"))
 dir_atlas <- glue("{dir_big_v}/marine-atlas")
-tbl_dir   <- glue("{dir_atlas}/tables"); dir_create(tbl_dir)
+tbl_dir   <- glue("{dir_atlas}/tables");  dir_create(tbl_dir)
+serve_dir <- glue("{dir_atlas}/serve");   dir_create(serve_dir)
 manifest  <- here("data/manifests/release_marine-atlas.json"); dir_create(path_dir(manifest))
-s3_ver    <- glue("{s3_atlas}/{ver}")           # s3://oceanmetrics.io-public/marine-atlas/v8
+s3_ver    <- glue("{s3_atlas}/{ver}")                      # s3://…/marine-atlas/v8
+s3_http   <- glue("https://s3.us-east-1.amazonaws.com/{sub('^s3://', '', s3_ver)}")  # path-style
 do_s3     <- !nzchar(Sys.getenv("RELEASE_NO_S3"))
-do_raw    <- nzchar(Sys.getenv("RELEASE_RAW"))
+do_raw    <-  nzchar(Sys.getenv("RELEASE_RAW"))
+do_deploy <-  nzchar(Sys.getenv("RELEASE_DEPLOY"))
+# server targets (parallel titiler-v8)
+srv_repo  <- "/share/github/MarineSensitivity/server"
+srv_viewdb<- glue("/share/data/big/{ver}/serve.duckdb")
+srv_stac  <- glue("/share/data/derived/stac/{ver}")
+titiler_v8<- glue("https://titiler-{ver}.marinesensitivity.org/msens")
 stopifnot("run build_registry first" = {
   con0 <- dbConnect(duckdb(sdm_db, read_only = TRUE)); on.exit(dbDisconnect(con0, shutdown = TRUE))
-  all(c("dataset", "model") %in% dbListTables(con0)) })
+  all(c("dataset", "model", "model_cell") %in% dbListTables(con0)) })
 ```
 
-## Stage derived tables → Parquet
+## Stage derived tables + serving surface → Parquet
 
 ```{r}
 #| label: stage
 
 con <- dbConnect(duckdb(sdm_db, read_only = TRUE))
-# small/derived scoring tables (model_cell is released as dist_merged, not re-exported)
+dbExecute(con, "PRAGMA memory_limit='12GB'"); dbExecute(con, "PRAGMA threads=6")
+dbExecute(con, glue("PRAGMA temp_directory='{dir_atlas}/duckdb_tmp'"))
+
+# small/derived scoring tables (model_cell is released as dist_merged + serve/, not here)
 rel_tables <- c("cell", "taxon", "dataset", "model", "metric",
                 "cell_metric", "zone", "zone_cell", "zone_metric")
-for (t in rel_tables) {
-  out <- glue("{tbl_dir}/{t}.parquet")
-  dbExecute(con, glue("COPY (SELECT * FROM {t}) TO '{out}' (FORMAT parquet, COMPRESSION zstd)"))
-}
-sizes <- tibble(table = rel_tables,
-                mb = round(file_size(glue("{tbl_dir}/{rel_tables}.parquet")) / 1e6, 1))
+for (t in rel_tables)
+  dbExecute(con, glue("COPY (SELECT * FROM {t}) TO '{tbl_dir}/{t}.parquet' (FORMAT parquet, COMPRESSION zstd)"))
+
+# serving surface: ONE file, globally sorted by mdl_key -> row-group min/max stats let a
+# titiler point query (WHERE mdl_key='…') fetch only the matching row groups over HTTP range.
+dbExecute(con, glue("COPY (SELECT mdl_key, cell_id, val FROM model_cell ORDER BY mdl_key)
+  TO '{serve_dir}/model_cell.parquet' (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 100000)"))
 dbDisconnect(con, shutdown = TRUE)
-knitr::kable(sizes)
+knitr::kable(tibble(
+  file = c(glue("tables/{rel_tables}.parquet"), "serve/model_cell.parquet"),
+  mb   = round(file_size(c(glue("{tbl_dir}/{rel_tables}.parquet"),
+                           glue("{serve_dir}/model_cell.parquet"))) / 1e6, 1)))
 ```
 
-## Sync to S3
+## Sync data → S3
 
 ```{r}
 #| label: s3
 
-# each release component -> its prefix under s3://…/marine-atlas/{ver}/
 sync <- function(local, prefix) {
   if (!dir_exists(local)) { log_warn("skip (missing): {local}"); return(invisible()) }
-  args <- c("s3", "sync", local, glue("{s3_ver}/{prefix}"), "--only-show-errors", "--no-progress")
-  log_info("aws s3 sync {path_file(local)} -> {s3_ver}/{prefix}")
-  st <- system2("aws", args, stdout = TRUE, stderr = TRUE)
+  st <- system2("aws", c("s3", "sync", local, glue("{s3_ver}/{prefix}"),
+                         "--only-show-errors", "--no-progress"), stdout = TRUE, stderr = TRUE)
   if (!is.null(attr(st, "status")) && attr(st, "status") != 0) stop(paste(st, collapse = "\n"))
+  log_info("synced {path_file(local)} -> {s3_ver}/{prefix}")
 }
 if (do_s3) {
-  sync(tbl_dir,                     "tables")
+  sync(tbl_dir,                         "tables")
+  sync(serve_dir,                       "serve")
   sync(glue("{dir_atlas}/dist_merged"), "dist_merged")
   sync(glue("{dir_atlas}/registry"),    "registry")
   if (do_raw) sync(glue("{dir_atlas}/dist"), "dist")
-  # top-level listing
-  ls_s3 <- system2("aws", c("s3", "ls", glue("{s3_ver}/"), "--recursive", "--summarize"),
-                   stdout = TRUE, stderr = TRUE)
-  log_info("released to {s3_ver}/ ({tail(ls_s3, 2)[1]})")
-} else log_info("RELEASE_NO_S3 set — staged locally only ({tbl_dir})")
+} else log_info("RELEASE_NO_S3 set — staged locally only")
+```
+
+## Build the tiny view DB (views over the S3 Parquet)
+
+```{r}
+#| label: viewdb
+
+viewdb <- glue("{serve_dir}/serve.duckdb")
+if (file_exists(viewdb)) file_delete(viewdb)
+cv <- dbConnect(duckdb(viewdb))
+dbExecute(cv, "INSTALL httpfs; LOAD httpfs;")
+# explicit path-style HTTPS single-file URLs -> anonymous GET + HTTP range (the dotted bucket
+# breaks virtual-hosted TLS, so never use s3://… here). model_cell = the sorted serve file.
+dbExecute(cv, glue("CREATE VIEW model_cell AS SELECT * FROM read_parquet('{s3_http}/serve/model_cell.parquet')"))
+for (t in rel_tables)
+  dbExecute(cv, glue("CREATE VIEW {t} AS SELECT * FROM read_parquet('{s3_http}/tables/{t}.parquet')"))
+dbDisconnect(cv, shutdown = TRUE)
+log_info("view DB {viewdb} ({round(file_size(viewdb)/1e3,1)} KB) — views over {s3_http}")
+```
+
+## Emit STAC catalog (tile links → titiler-{ver})
+
+```{r}
+#| label: stac
+
+suppressWarnings(try(library(msens), silent = TRUE))
+source(here("../msens/R/stac.R"))   # override any stale install with the current (v8) generators
+stac_dir <- glue("{dir_atlas}/stac")
+cfg <- stac_cfg(ver); cfg$titiler_base <- titiler_v8
+con <- dbConnect(duckdb(sdm_db, read_only = TRUE))
+stac_build(version = ver, dir_out = stac_dir, cfg = cfg, con = con)
+dbDisconnect(con, shutdown = TRUE)
+log_info("STAC catalog: {stac_dir}/{ver}/collection.json")
+```
+
+## Deploy to msens1 (parallel titiler-{ver})
+
+```{r}
+#| label: deploy
+
+if (!do_deploy) {
+  log_info("RELEASE_DEPLOY unset — skipping server deploy (S3 data + local view DB/STAC ready)")
+} else {
+# 1. the KB view DB + the STAC version subtree (data stays on S3 — no big rsync)
+system2("ssh", c("msens", glue("mkdir -p {path_dir(srv_viewdb)} {srv_stac}")))
+system2("rsync", c("-aq", viewdb, glue("msens:{srv_viewdb}")))
+system2("rsync", c("-aq", glue("{stac_dir}/{ver}/"), glue("msens:{srv_stac}/")))
+# add this version as a child of the STAC root (keep other versions)
+system2("ssh", c("msens", shQuote(glue(
+  "python3 - <<'PY'\nimport json\np='/share/data/derived/stac/catalog.json'\nc=json.load(open(p))\nh=[l['href'] for l in c['links'] if l.get('rel')=='child']\nif './{ver}/collection.json' not in h:\n c['links'].append({{'rel':'child','href':'./{ver}/collection.json'}}); json.dump(c,open(p,'w'),indent=2)\nPY"))))
+# 2. (re)build + start the parallel titiler-{ver}; restart caddy for its route
+system2("ssh", c("msens", glue(
+  "cd {srv_repo} && git pull --quiet && docker compose up -d --build titiler-{ver} && docker compose restart caddy")))
+# 3. smoke test
+sql <- glue("SELECT cell_id, val AS value FROM model_cell WHERE mdl_key='{dbGetQuery(dbConnect(duckdb(sdm_db,read_only=TRUE)),\"SELECT mdl_key FROM model WHERE ds_key='ms_merge' LIMIT 1\")$mdl_key}'")
+b64 <- sdm_sql_b64(sql)
+code <- system2("curl", c("-s","-o","/dev/null","-w","%{http_code}",
+  glue("{titiler_v8}/statistics?sql={b64}")), stdout = TRUE)
+log_info("titiler-{ver} /statistics smoke test: HTTP {code}")
+}
 ```
 
 ## Manifest
@@ -93,8 +166,10 @@ if (do_s3) {
 
 write_json(
   list(target = "release_marine-atlas", ver = ver, s3 = s3_ver,
-       tables = rel_tables, table_mb = sizes$mb, raw_included = do_raw,
-       pushed_s3 = do_s3, built = as.character(Sys.time())),
+       tables = rel_tables, serve = "serve/model_cell.parquet (sorted by mdl_key)",
+       view_db = "serve.duckdb (views over S3)", stac = glue("{s3_http} + file host /stac/{ver}"),
+       titiler = titiler_v8, raw_included = do_raw, pushed_s3 = do_s3, deployed = do_deploy,
+       built = as.character(Sys.time())),
   manifest, auto_unbox = TRUE, pretty = TRUE)
 manifest
 ```
