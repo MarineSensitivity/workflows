@@ -1,0 +1,345 @@
+---
+title: "Publish native-format input surfaces — range PMTiles + AquaMaps COGs"
+msens:
+  target_name: publish_native
+  workflow_type: release
+  dependency: [merge_taxon]
+  output: data/manifests/publish_native.json
+editor_options:
+  chunk_output_type: console
+---
+
+Phase 4b: publish each **raw input** model in a cloud-native, pyramided format so the
+species app can overlay the whole (often global) range a source contributes — surfaces
+far too large (up to ~19M cells) for the dense per-cell SQL tiler:
+
+- **vector ranges** (`rng_iucn`, `rng_fws`, `ca_nmfs`, `ch_fws`, `ch_nmfs`, `bl`,
+  `rng_turtle_swot_dps`) → **one PMTiles per dataset**, features tagged with `mdl_key`
+  (client filters by it), served from the file host `/pmtiles`.
+- **AquaMaps** (`am`, raster) → **one COG per model** (bbox-cropped, overviews), served
+  from S3 by titiler-v8 `/cog`.
+
+Both drive a `native_asset` registry (`mdl_key → asset_type + url`) that STAC + the app read.
+We only publish inputs that feed a **served taxon** (`is_valid_usa & is_marine`, non
+reptile/amphibian) — the set the species app actually lists.
+
+**Flags:** `REDO_NATIVE=1` (rebuild PMTiles + re-sort am), `NATIVE_SKIP_AM` / `NATIVE_SKIP_PMTILES`,
+`NATIVE_TEST_N=<n>` (only first n am COGs, smoke test), `NATIVE_NO_S3` (stage locally, skip upload),
+`NATIVE_WORKERS=<n>`.
+
+## Setup
+
+```{r}
+#| label: setup
+
+librarian::shelf(DBI, dplyr, duckdb, fs, furrr, glue, here, jsonlite, logger, purrr,
+                 readr, sf, stringr, terra, MarineSensitivity/msens, quiet = T)
+source(here("libs/paths.R"))
+source(here("../msens/R/publish.R"))   # override any stale install
+
+dir_atlas  <- glue("{dir_big_v}/marine-atlas")
+merge_db   <- glue("{dir_atlas}/merge.duckdb")
+dir_native <- glue("{dir_atlas}/native"); dir_create(dir_native)
+dir_cog    <- glue("{dir_native}/am");     dir_create(dir_cog)
+dir_pmt    <- glue("{dir_native}/pmtiles"); dir_create(dir_pmt)
+manifest   <- here("data/manifests/publish_native.json"); dir_create(path_dir(manifest))
+stopifnot(all(file_exists(c(sdm_db, merge_db, cellid_tif))))
+
+redo        <- nzchar(Sys.getenv("REDO_NATIVE"))
+do_s3       <- !nzchar(Sys.getenv("NATIVE_NO_S3"))
+skip_am     <- nzchar(Sys.getenv("NATIVE_SKIP_AM"))
+skip_pmt    <- nzchar(Sys.getenv("NATIVE_SKIP_PMTILES"))
+test_n      <- as.integer(Sys.getenv("NATIVE_TEST_N", "0"))
+n_workers   <- as.integer(Sys.getenv("NATIVE_WORKERS", "6"))
+s3_ver      <- glue("{s3_atlas}/{ver}")
+s3_http     <- glue("https://s3.us-east-1.amazonaws.com/{sub('^s3://', '', s3_ver)}")
+pmt_base    <- glue("https://file.marinesensitivity.org/pmtiles/{ver}")
+
+safe_key <- function(k) gsub("[^A-Za-z0-9._-]", "_", k)   # mdl_key -> filesystem/URL-safe
+```
+
+## Served raw mdl_keys (the set the app lists)
+
+```{r}
+#| label: served
+
+con <- dbConnect(duckdb(), config = list(threads = "6", memory_limit = "10GB"))
+dbExecute(con, glue("SET temp_directory='{dir_atlas}/duckdb_tmp'"))
+dbExecute(con, glue("ATTACH '{merge_db}' AS m (READ_ONLY)"))
+served <- dbGetQuery(con, "
+  SELECT DISTINCT tm.mdl_key, split_part(tm.mdl_key,'|',1) AS ds_key
+  FROM m.taxon_model tm
+  JOIN m.taxon t USING(ms_merge_key)
+  WHERE t.is_valid_usa AND t.is_marine AND t.sp_cat NOT IN ('reptile','amphibian')")
+dbDisconnect(con, shutdown = TRUE)
+served_by_ds <- split(served$mdl_key, served$ds_key)
+knitr::kable(served |> count(ds_key, name = "n_mdl") |> arrange(desc(n_mdl)))
+```
+
+## Vector ranges → PMTiles (one per dataset, tagged by mdl_key)
+
+Each dataset's source polygons are read, `mdl_key` derived from the documented source id,
+then **inner-joined to the served set** — which implicitly reproduces each ingest's
+presence/marine/category filtering (only ingested-and-served models survive the join). One
+`{ds}.pmtiles` per dataset, `mdl_key` (+ `ds_key`) as feature properties.
+
+```{r}
+#| label: pmtiles-specs
+
+# reader per dataset: returns an sf with a `mdl_key` column (unfiltered — the served
+# inner-join happens after). paths mirror the ingest notebooks (see Explore recon).
+Sys.setenv(OGR_STROKE_CURVE = "TRUE")   # linearize BOTW MULTISURFACE curves
+slug <- function(x) gsub("^_|_$", "", gsub("[^A-Za-z0-9]+", "_", x))
+
+read_iucn <- function() {
+  shps <- dir_ls(glue("{dir_raw}/iucnredlist.org"), glob = "*.shp", recurse = TRUE)
+  map_dfr(shps, function(s) {
+    x <- tryCatch(st_read(s, quiet = TRUE), error = function(e) NULL)
+    if (is.null(x) || !"id_no" %in% tolower(names(x))) return(NULL)
+    names(x) <- tolower(names(x))
+    x |> transmute(mdl_key = glue("rng_iucn|{id_no}")) |> st_zm(drop = TRUE)
+  })
+}
+read_fws_rng <- function() {
+  shps <- glue("{dir_raw}/fws.gov/usfws_complete_species_current_range/usfws_complete_species_current_range_{1:2}.shp")
+  map_dfr(shps[file_exists(shps)], function(s) {
+    x <- st_read(s, quiet = TRUE); names(x) <- tolower(names(x))
+    x |> transmute(mdl_key = glue("rng_fws|{spcode}"))          # source is NAD83 -> publish_pmtiles reprojects
+  })
+}
+read_ca_nmfs <- function() {
+  s <- glue("{dir_raw}/fisheries.noaa.gov/core-areas/shapefile_Rices_whale_core_distribution_area_Jun19_SERO/shapefile_Rices_whale_core_distribution_area_Jun19_SERO.shp")
+  st_read(s, quiet = TRUE) |> transmute(mdl_key = "ca_nmfs|Balaenoptera_ricei")
+}
+read_ch_fws <- function() {
+  x <- st_read(glue("{dir_raw}/fws.gov/crithab_all_layers/crithab_poly.shp"), quiet = TRUE)
+  names(x) <- tolower(names(x)); x |> transmute(mdl_key = glue("ch_fws|{spcode}"))
+}
+read_ch_nmfs <- function() {
+  x <- st_read(glue("{dir_raw}/fisheries.noaa.gov/ply.gpkg"), layer = "ply", quiet = TRUE)
+  x |> transmute(mdl_key = glue("ch_nmfs|{slug(SCIENAME)}"))
+}
+read_turtle <- function() {
+  codes <- c("CC","CM","DC","EI","LK","LO")
+  map_dfr(codes, function(cd) {
+    s <- glue("{dir_raw}/swot_seamap.env.duke.edu/swot_distribution/Global_Distribution_{cd}.shp")
+    if (!file_exists(s)) return(NULL)
+    st_read(s, quiet = TRUE) |> transmute(mdl_key = glue("rng_turtle_swot_dps|{cd}")) |> st_zm(drop = TRUE)
+  })
+}
+read_bl <- function(sisids) {
+  gpkg <- c(glue("{dir_big}/../raw/BOTW_2024_2.gpkg"),
+            glue("{dir_raw}/birdlife.org/BOTW_GPKG_2024_2/BOTW_2024_2.gpkg"))
+  gpkg <- gpkg[file_exists(gpkg)][1]; stopifnot(!is.na(gpkg))
+  ids  <- paste(unique(sub("^bl\\|", "", sisids)), collapse = ",")
+  q    <- glue("SELECT sisid, geom FROM all_species WHERE sisid IN ({ids}) AND presence IN (1,2,3)")
+  st_read(gpkg, query = q, quiet = TRUE) |> transmute(mdl_key = glue("bl|{sisid}"))
+}
+
+pmt_specs <- list(
+  rng_iucn            = read_iucn,
+  rng_fws             = read_fws_rng,
+  ca_nmfs             = read_ca_nmfs,
+  ch_fws              = read_ch_fws,
+  ch_nmfs             = read_ch_nmfs,
+  rng_turtle_swot_dps = read_turtle,
+  bl                  = function() read_bl(served_by_ds[["bl"]]))
+```
+
+```{r}
+#| label: pmtiles-build
+
+pmt_only <- Sys.getenv("NATIVE_PMT_DS")                    # optional comma-list to restrict (partial reruns/tests)
+pmt_ds   <- if (nzchar(pmt_only)) intersect(names(pmt_specs), strsplit(pmt_only, ",")[[1]]) else names(pmt_specs)
+pmt_rows <- list()
+if (!skip_pmt) for (ds in pmt_ds) {
+  keys <- served_by_ds[[ds]]
+  if (is.null(keys)) { log_warn("no served keys for {ds} — skip PMTiles"); next }
+  out <- glue("{dir_pmt}/{ds}.pmtiles")
+  if (file_exists(out) && !redo) { log_info("{ds}.pmtiles exists — skip (REDO_NATIVE=1 to force)") }
+  else {
+    log_info("reading source polygons for {ds} ({length(keys)} served models) …")
+    x <- pmt_specs[[ds]]()
+    x <- x |> mutate(mdl_key = as.character(mdl_key)) |>
+      filter(mdl_key %in% keys) |> mutate(ds_key = ds)
+    x <- x[!st_is_empty(x), ]
+    if (!nrow(x)) { log_warn("{ds}: 0 features after served-join — skip"); next }
+    log_info("{ds}: {nrow(x)} features, {n_distinct(x$mdl_key)} models -> tippecanoe")
+    publish_pmtiles(x, out, layer = ds, minzoom = 0, maxzoom = 7)
+  }
+  if (file_exists(out)) pmt_rows[[ds]] <- tibble(
+    ds_key = ds, asset_type = "pmtiles",
+    asset_url = glue("{pmt_base}/{ds}.pmtiles"), source_layer = ds)
+}
+pmt_reg <- bind_rows(pmt_rows)
+if (nrow(pmt_reg)) knitr::kable(pmt_reg |> transmute(ds_key, mb = round(as.numeric(file_size(glue("{dir_pmt}/{ds_key}.pmtiles")))/1e6,1), asset_url))
+```
+
+## AquaMaps → per-model COGs
+
+Consolidate the served `am` cells into one mdl_key-sorted Parquet (row-group pruning lets
+each per-model read fetch only its groups), then paint each model onto the global grid,
+cropped to its bbox, as a COG with overviews. Parallel + resumable (skip existing COGs).
+
+```{r}
+#| label: am-sort
+
+# test mode uses a separate sorted file + only the test subset, so it never poisons a full run
+am_keys   <- if (length(served_by_ds[["am"]])) sort(served_by_ds[["am"]]) else character(0)
+am_sort_keys <- if (test_n > 0) head(am_keys, test_n) else am_keys
+am_sorted <- glue("{dir_native}/_am_sorted{if (test_n > 0) '_test' else ''}.parquet")
+if (!skip_am && length(am_sort_keys)) {
+  if (!file_exists(am_sorted) || redo) {
+    log_info("sorting {length(am_sort_keys)} served am models by mdl_key -> {path_file(am_sorted)} …")
+    con <- dbConnect(duckdb(), config = list(threads = "6", memory_limit = "12GB"))
+    dbExecute(con, glue("SET temp_directory='{dir_atlas}/duckdb_tmp'"))
+    dbExecute(con, "CREATE TEMP TABLE k(mdl_key VARCHAR)")
+    dbAppendTable(con, "k", tibble(mdl_key = am_sort_keys))
+    dbExecute(con, glue("COPY (
+      SELECT p.mdl_key, p.cell_id, p.val
+      FROM read_parquet('{dir_atlas}/dist/dataset=am/*.parquet') p
+      SEMI JOIN k USING(mdl_key)
+      ORDER BY p.mdl_key
+    ) TO '{am_sorted}' (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 100000)"))
+    dbDisconnect(con, shutdown = TRUE)
+    log_info("am_sorted.parquet: {round(as.numeric(file_size(am_sorted))/1e9,1)} GB")
+  } else log_info("_am_sorted.parquet exists — skip re-sort (REDO_NATIVE=1 to force)")
+}
+```
+
+```{r}
+#| label: am-cogs
+
+am_reg <- tibble()
+if (!skip_am && length(am_keys) && file_exists(am_sorted)) {
+  keys <- am_sort_keys
+  todo <- keys[!file_exists(glue("{dir_cog}/{safe_key(keys)}.tif"))]
+  log_info("am COGs: {length(keys)} target, {length(todo)} to build ({length(keys)-length(todo)} exist)")
+
+  grid <- grid_spec(rast(cellid_tif))
+  build_batch <- function(batch_keys) {
+    suppressMessages({library(DBI); library(duckdb); library(terra)})
+    con <- dbConnect(duckdb(), read_only = FALSE)
+    on.exit(dbDisconnect(con, shutdown = TRUE))
+    st <- dbSendQuery(con, sprintf(
+      "SELECT cell_id, val FROM read_parquet('%s') WHERE mdl_key = ?", am_sorted))
+    out <- character(0)
+    for (k in batch_keys) {
+      f <- sprintf("%s/%s.tif", dir_cog, safe_key(k))
+      if (file.exists(f)) { out <- c(out, f); next }
+      duckdb::dbBind(st, list(k)); d <- dbFetch(st)
+      if (!nrow(d)) next
+      msens::publish_cog(d$cell_id, d$val, f, grid)
+      out <- c(out, f)
+    }
+    dbClearResult(st)
+    out
+  }
+
+  if (length(todo)) {
+    plan(multisession, workers = n_workers)
+    batches <- split(todo, (seq_along(todo) - 1) %% n_workers)
+    res <- future_map(batches, build_batch,
+                      .options = furrr_options(globals = c("am_sorted","dir_cog","grid","safe_key"),
+                                               packages = c("msens"), seed = TRUE))
+    plan(sequential)
+  }
+  built <- glue("{dir_cog}/{safe_key(keys)}.tif")
+  am_reg <- tibble(
+    mdl_key = keys, ds_key = "am", asset_type = "cog",
+    asset_url = glue("{s3_http}/native/am/{safe_key(keys)}.tif"),
+    rescale_min = 1L, rescale_max = 100L, colormap = "spectral_r")[file_exists(built), ]
+  log_info("am COGs on disk: {nrow(am_reg)} / {length(keys)}")
+}
+```
+
+## native_asset registry → sdm.duckdb
+
+```{r}
+#| label: registry
+
+# per-input-model asset rows: am COGs are per-model; vector PMTiles apply to every served
+# mdl_key of that dataset (client filters the one PMTiles by mdl_key).
+pmt_model_rows <- if (nrow(pmt_reg)) {
+  map_dfr(seq_len(nrow(pmt_reg)), function(i) {
+    ds <- pmt_reg$ds_key[i]
+    tibble(mdl_key = served_by_ds[[ds]], ds_key = ds, asset_type = "pmtiles",
+           asset_url = pmt_reg$asset_url[i], source_layer = pmt_reg$source_layer[i])
+  })
+} else tibble()
+
+asset_info <- bind_rows(am_reg, pmt_model_rows) |>
+  mutate(across(everything(), ~ if (is.factor(.)) as.character(.) else .))
+
+# per-am-model geographic bbox (from cell_id row/col arithmetic on the global grid) so the
+# app can fit to an input's actual (often global) extent. pmtiles rows get NULL -> world fit.
+if (nrow(am_reg) && file_exists(am_sorted)) {
+  con <- dbConnect(duckdb(), config = list(threads = "6"))
+  bb <- dbGetQuery(con, glue("
+    WITH rc AS (SELECT mdl_key, (cell_id-1) % 7200 AS col, (cell_id-1) // 7200 AS row
+                FROM read_parquet('{am_sorted}'))
+    SELECT mdl_key,
+      -180 + min(col)*0.05       AS xmin, -180 + (max(col)+1)*0.05 AS xmax,
+       90 - (max(row)+1)*0.05    AS ymin,   90 - min(row)*0.05     AS ymax
+    FROM rc GROUP BY mdl_key"))
+  dbDisconnect(con, shutdown = TRUE)
+  asset_info <- asset_info |> left_join(bb, by = "mdl_key")
+}
+
+# attach ms_merge_key (the merged taxon key) so the species app can join a taxon
+# directly to its input surfaces. A raw model may feed >1 merged taxon -> one row each.
+con <- dbConnect(duckdb(sdm_db))
+dbExecute(con, glue("ATTACH '{merge_db}' AS m (READ_ONLY)"))
+tm <- dbGetQuery(con, "SELECT DISTINCT tm.mdl_key, tm.ms_merge_key
+  FROM m.taxon_model tm JOIN m.taxon t USING(ms_merge_key)
+  WHERE t.is_valid_usa AND t.is_marine AND t.sp_cat NOT IN ('reptile','amphibian')")
+dbExecute(con, "DETACH m")
+
+native_asset <- asset_info |>
+  inner_join(tm, by = "mdl_key", relationship = "many-to-many") |>
+  relocate(ms_merge_key)
+
+dbWriteTable(con, "native_asset", native_asset, overwrite = TRUE)
+smry <- dbGetQuery(con, "SELECT asset_type, count(*) n_rows, count(DISTINCT mdl_key) n_models,
+  count(DISTINCT ms_merge_key) n_taxa, count(DISTINCT ds_key) n_ds FROM native_asset GROUP BY 1")
+dbDisconnect(con, shutdown = TRUE)
+knitr::kable(smry)
+```
+
+## Sync → S3 (COGs) + file host (PMTiles)
+
+```{r}
+#| label: sync
+
+if (do_s3) {
+  if (nrow(am_reg)) {
+    st <- system2("aws", c("s3","sync", dir_cog, glue("{s3_ver}/native/am"),
+                           "--only-show-errors","--no-progress"), stdout=TRUE, stderr=TRUE)
+    if (!is.null(attr(st,"status")) && attr(st,"status")!=0) stop(paste(st, collapse="\n"))
+    log_info("synced am COGs -> {s3_ver}/native/am")
+  }
+  # PMTiles -> server file host (/share/data/derived/pmtiles/{ver}); also keep on S3
+  if (nrow(pmt_reg)) {
+    system2("ssh", c("msens", glue("mkdir -p /share/data/derived/pmtiles/{ver}")))
+    system2("rsync", c("-aq", glue("{dir_pmt}/"), glue("msens:/share/data/derived/pmtiles/{ver}/")))
+    st <- system2("aws", c("s3","sync", dir_pmt, glue("{s3_ver}/native/pmtiles"),
+                           "--only-show-errors","--no-progress"), stdout=TRUE, stderr=TRUE)
+    log_info("synced PMTiles -> file host /pmtiles/{ver} + {s3_ver}/native/pmtiles")
+  }
+} else log_info("NATIVE_NO_S3 set — staged locally only ({dir_native})")
+```
+
+## Manifest
+
+```{r}
+#| label: manifest
+
+write_json(list(
+  target = "publish_native", ver = ver,
+  pmtiles_datasets = if (nrow(pmt_reg)) pmt_reg$ds_key else character(0),
+  am_cogs = nrow(am_reg),
+  native_assets = nrow(native_asset), pushed_s3 = do_s3,
+  built = as.character(Sys.time())),
+  manifest, auto_unbox = TRUE, pretty = TRUE)
+manifest
+```
