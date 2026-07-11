@@ -137,9 +137,26 @@ out_yaml <- file.path(data_dir, "workflows.yml")
 # targets DAG as Mermaid (needs the targets/msens env). When that env is absent
 # (e.g. CI installs only rmarkdown/yaml/jsonlite), preserve the DAG already
 # committed in workflows.yml so a card-only refresh never drops it.
+type_col <- vapply(categories, function(c) c$color, "")   # workflow_type -> color
+
+# recolor each mermaid node by its workflow_type (tar_mermaid tags all nodes ':::outdated';
+# we map target_name -> type and append matching classDefs, so release/registry/etc. are
+# visually distinct instead of a uniform-grey hairball of deps:[auto] edges).
+color_dag <- function(dag) {
+  if (!nzchar(dag) || !grepl(":::", dag)) return(dag)
+  n2t <- setNames(vapply(recs, function(r) r$category, ""),
+                  vapply(recs, function(r) r$target,   ""))
+  for (nm in names(n2t))
+    dag <- gsub(sprintf('(\\(\\["%s"\\]\\)):::[A-Za-z]+', nm),
+                sprintf('\\1:::%s', n2t[[nm]]), dag, perl = TRUE)
+  defs <- paste(sprintf("  classDef %s fill:%s,stroke:#00000066,color:#10161c;",
+                        names(type_col), type_col), collapse = "\n")
+  paste0(dag, "\n", defs, "\n  classDef outdated fill:#8b98a5,color:#10161c;")
+}
+
 dag <- tryCatch({
   librarian::shelf(targets, quiet = TRUE)
-  paste(targets::tar_mermaid(targets_only = TRUE, legend = FALSE), collapse = "\n")
+  color_dag(paste(targets::tar_mermaid(targets_only = TRUE, legend = FALSE), collapse = "\n"))
 }, error = function(e) {
   message("tar_mermaid unavailable (", conditionMessage(e), ") — preserving committed DAG")
   tryCatch(yaml::read_yaml(out_yaml)$dag_mermaid %||% "", error = function(e2) "")
