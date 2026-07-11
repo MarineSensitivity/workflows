@@ -1,0 +1,100 @@
+---
+title: "Release marine-atlas — versioned Parquet → S3"
+msens:
+  target_name: release_marine-atlas
+  workflow_type: release
+  dependency: [auto]
+  output: data/manifests/release_marine-atlas.json
+editor_options:
+  chunk_output_type: console
+---
+
+Publish the **v8 marine-atlas** as partitioned Parquet to
+`s3://oceanmetrics.io-public/marine-atlas/{ver}/` — a self-describing, versioned release
+consumable directly over `httpfs` (DuckDB) or any Parquet reader:
+
+- **`tables/`** — the derived scoring tables: `cell` (0.05° ocean grid + env + `in_usa`/
+  `in_pra`), `taxon` (sp_cat, er_score, validity flags, `is_marine`, rarity), `dataset` +
+  `model` (registry), `cell_metric` (per-cell scores), `zone`/`zone_cell`/`zone_metric`,
+  `metric`.
+- **`dist_merged/`** — the merged per-taxon model surfaces (`ms_merge|…`).
+- **`registry/`** — `dataset.parquet` + `model.parquet` (also in `tables/`).
+- **`dist/`** — the raw per-dataset per-species surfaces (~74G, AquaMaps-heavy) — **opt-in**
+  (`RELEASE_RAW=1`); AquaMaps originals are already public.
+
+The STAC catalog is emitted separately (needs the v8 `stac.R` pass).
+
+## Setup
+
+```{r}
+#| label: setup
+
+librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, quiet = T)
+source(here("libs/paths.R"))
+dir_atlas <- glue("{dir_big_v}/marine-atlas")
+tbl_dir   <- glue("{dir_atlas}/tables"); dir_create(tbl_dir)
+manifest  <- here("data/manifests/release_marine-atlas.json"); dir_create(path_dir(manifest))
+s3_ver    <- glue("{s3_atlas}/{ver}")           # s3://oceanmetrics.io-public/marine-atlas/v8
+do_s3     <- !nzchar(Sys.getenv("RELEASE_NO_S3"))
+do_raw    <- nzchar(Sys.getenv("RELEASE_RAW"))
+stopifnot("run build_registry first" = {
+  con0 <- dbConnect(duckdb(sdm_db, read_only = TRUE)); on.exit(dbDisconnect(con0, shutdown = TRUE))
+  all(c("dataset", "model") %in% dbListTables(con0)) })
+```
+
+## Stage derived tables → Parquet
+
+```{r}
+#| label: stage
+
+con <- dbConnect(duckdb(sdm_db, read_only = TRUE))
+# small/derived scoring tables (model_cell is released as dist_merged, not re-exported)
+rel_tables <- c("cell", "taxon", "dataset", "model", "metric",
+                "cell_metric", "zone", "zone_cell", "zone_metric")
+for (t in rel_tables) {
+  out <- glue("{tbl_dir}/{t}.parquet")
+  dbExecute(con, glue("COPY (SELECT * FROM {t}) TO '{out}' (FORMAT parquet, COMPRESSION zstd)"))
+}
+sizes <- tibble(table = rel_tables,
+                mb = round(file_size(glue("{tbl_dir}/{rel_tables}.parquet")) / 1e6, 1))
+dbDisconnect(con, shutdown = TRUE)
+knitr::kable(sizes)
+```
+
+## Sync to S3
+
+```{r}
+#| label: s3
+
+# each release component -> its prefix under s3://…/marine-atlas/{ver}/
+sync <- function(local, prefix) {
+  if (!dir_exists(local)) { log_warn("skip (missing): {local}"); return(invisible()) }
+  args <- c("s3", "sync", local, glue("{s3_ver}/{prefix}"), "--only-show-errors", "--no-progress")
+  log_info("aws s3 sync {path_file(local)} -> {s3_ver}/{prefix}")
+  st <- system2("aws", args, stdout = TRUE, stderr = TRUE)
+  if (!is.null(attr(st, "status")) && attr(st, "status") != 0) stop(paste(st, collapse = "\n"))
+}
+if (do_s3) {
+  sync(tbl_dir,                     "tables")
+  sync(glue("{dir_atlas}/dist_merged"), "dist_merged")
+  sync(glue("{dir_atlas}/registry"),    "registry")
+  if (do_raw) sync(glue("{dir_atlas}/dist"), "dist")
+  # top-level listing
+  ls_s3 <- system2("aws", c("s3", "ls", glue("{s3_ver}/"), "--recursive", "--summarize"),
+                   stdout = TRUE, stderr = TRUE)
+  log_info("released to {s3_ver}/ ({tail(ls_s3, 2)[1]})")
+} else log_info("RELEASE_NO_S3 set — staged locally only ({tbl_dir})")
+```
+
+## Manifest
+
+```{r}
+#| label: manifest
+
+write_json(
+  list(target = "release_marine-atlas", ver = ver, s3 = s3_ver,
+       tables = rel_tables, table_mb = sizes$mb, raw_included = do_raw,
+       pushed_s3 = do_s3, built = as.character(Sys.time())),
+  manifest, auto_unbox = TRUE, pretty = TRUE)
+manifest
+```
