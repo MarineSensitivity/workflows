@@ -76,12 +76,20 @@ served_by_ds <- split(served$mdl_key, served$ds_key)
 knitr::kable(served |> count(ds_key, name = "n_mdl") |> arrange(desc(n_mdl)))
 ```
 
-## Vector ranges → PMTiles (one per dataset, tagged by mdl_key)
+## Vector ranges → per-model PMTiles
 
 Each dataset's source polygons are read, `mdl_key` derived from the documented source id,
-then **inner-joined to the served set** — which implicitly reproduces each ingest's
-presence/marine/category filtering (only ingested-and-served models survive the join). One
-`{ds}.pmtiles` per dataset, `mdl_key` (+ `ds_key`) as feature properties.
+then **inner-joined to the served set** (reproducing each ingest's presence/marine/category
+filter — only ingested-and-served models survive the join) and split into **one PMTiles per
+model** at `{ds}/{sp_id}.pmtiles`. A per-model file — like the per-model AquaMaps COGs — needs
+no client-side filter and its low-zoom tiles stay a few KB. Packing thousands of overlapping
+global ranges into one per-dataset archive overflowed the z0–z2 world tiles past maplibre's
+per-tile budget, so a selected range silently failed to draw at global zoom.
+
+IUCN's thousands of ranges are read from a **v8 indexed GeoPackage** (`native/src/rng_iucn.gpkg`,
+built once from the source shapefiles with the ingest's presence/marine/category filter,
+dissolved per `id_no`, indexed) — the derived per-group gpkgs are stale v7 artifacts (410 served
+species short).
 
 ```{r}
 #| label: pmtiles-specs
@@ -92,13 +100,11 @@ Sys.setenv(OGR_STROKE_CURVE = "TRUE")   # linearize BOTW MULTISURFACE curves
 slug <- function(x) gsub("^_|_$", "", gsub("[^A-Za-z0-9]+", "_", x))
 
 read_iucn <- function() {
-  shps <- dir_ls(glue("{dir_raw}/iucnredlist.org"), glob = "*.shp", recurse = TRUE)
-  map_dfr(shps, function(s) {
-    x <- tryCatch(st_read(s, quiet = TRUE), error = function(e) NULL)
-    if (is.null(x) || !"id_no" %in% tolower(names(x))) return(NULL)
-    names(x) <- tolower(names(x))
-    x |> transmute(mdl_key = glue("rng_iucn|{id_no}")) |> st_zm(drop = TRUE)
-  })
+  # read the v8 indexed ranges gpkg (one dissolved feature per served id_no), built by the
+  # `iucn-src` chunk below — fast + off-Drive vs. crawling thousands of source shapefiles.
+  gpkg <- glue("{dir_native}/src/rng_iucn.gpkg")
+  stopifnot("run the iucn-src chunk first" = file_exists(gpkg))
+  st_read(gpkg, quiet = TRUE) |> transmute(mdl_key = as.character(mdl_key)) |> st_zm(drop = TRUE)
 }
 read_fws_rng <- function() {
   shps <- glue("{dir_raw}/fws.gov/usfws_complete_species_current_range/usfws_complete_species_current_range_{1:2}.shp")
@@ -148,6 +154,40 @@ pmt_specs <- list(
   rng_iucn            = read_iucn)
 ```
 
+### IUCN v8 indexed ranges GeoPackage
+
+Built once from the source shapefiles with the ingest's presence/marine/category filter,
+dissolved to one feature per served `id_no`, indexed on `id_no`. `read_iucn()` then reads it
+in one fast, off-Drive query (the derived per-group gpkgs are stale v7 and miss 410 species).
+
+```{r}
+#| label: iucn-src
+
+iucn_gpkg <- glue("{dir_native}/src/rng_iucn.gpkg"); dir_create(path_dir(iucn_gpkg))
+if (!file_exists(iucn_gpkg) || redo) {
+  iucn_ok <- c("CR","EN","VU","NT","LC","DD")
+  ids_srv <- as.integer(sub("^rng_iucn\\|", "", served_by_ds[["rng_iucn"]]))
+  log_info("building {path_file(iucn_gpkg)} for {length(ids_srv)} served ids (source shapefiles) …")
+  shps <- dir_ls(glue("{dir_raw}/iucnredlist.org"), glob = "*.shp", recurse = TRUE)
+  gi <- map_dfr(shps, function(s) {
+    y <- tryCatch(st_read(s, quiet = TRUE), error = function(e) NULL)
+    if (is.null(y)) return(NULL); names(y) <- tolower(names(y))
+    if (!all(c("id_no","presence","marine","category") %in% names(y))) return(NULL)
+    y |> filter(presence %in% 1:3, tolower(marine) == "true", category %in% iucn_ok,
+                id_no %in% ids_srv) |>
+      transmute(id_no = as.integer(id_no)) |> st_zm(drop = TRUE)
+  })
+  # keep each presence polygon as its own feature (same mdl_key) — publish_pmtiles_models
+  # groups a model's features into one file; dissolving would trip s2 on invalid rings.
+  gi <- gi |> mutate(mdl_key = as.character(glue("rng_iucn|{id_no}")), ds_key = "rng_iucn")
+  gi <- gi[!st_is_empty(gi), ]
+  st_write(gi, iucn_gpkg, layer = "rng_iucn", quiet = TRUE, delete_dsn = TRUE)
+  system2("ogrinfo", c(shQuote(iucn_gpkg), "-sql",
+                       shQuote("CREATE INDEX idx_idno ON rng_iucn(id_no)")))
+  log_info("wrote {path_file(iucn_gpkg)}: {nrow(gi)} species")
+} else log_info("{path_file(iucn_gpkg)} exists — skip (REDO_NATIVE=1 to rebuild)")
+```
+
 ```{r}
 #| label: pmtiles-build
 
@@ -157,30 +197,36 @@ pmt_rows <- list()
 if (!skip_pmt) for (ds in pmt_ds) {
   keys <- served_by_ds[[ds]]
   if (is.null(keys)) { log_warn("no served keys for {ds} — skip PMTiles"); next }
-  out <- glue("{dir_pmt}/{ds}.pmtiles")
-  if (file_exists(out) && !redo) { log_info("{ds}.pmtiles exists — skip (REDO_NATIVE=1 to force)") }
-  else {
+  dir_ds <- glue("{dir_pmt}/{ds}"); dir_create(dir_ds)
+  # one PMTiles per model (resumable — skips existing unless REDO_NATIVE). z6 is plenty for
+  # coarse range overlays; a single range tiles to a few KB so no per-dataset density blowup.
+  if (ds == "rng_iucn") {
+    # IUCN's full-res source is ~7 GB — read each model on demand from the indexed gpkg
+    # (never load it all into memory), one index hit per species.
+    log_info("{ds}: {length(keys)} models -> per-model PMTiles from indexed gpkg ({n_workers} workers)")
+    built <- publish_pmtiles_from_gpkg(iucn_gpkg, "rng_iucn", keys, dir_ds,
+                                       workers = n_workers, redo = redo, minzoom = 0, maxzoom = 6)
+  } else {
     log_info("reading source polygons for {ds} ({length(keys)} served models) …")
     x <- pmt_specs[[ds]]()
     x <- x |> mutate(mdl_key = as.character(mdl_key)) |>
       filter(mdl_key %in% keys) |> mutate(ds_key = ds)
     x <- x[!st_is_empty(x), ]
     if (!nrow(x)) { log_warn("{ds}: 0 features after served-join — skip"); next }
-    log_info("{ds}: {nrow(x)} features, {n_distinct(x$mdl_key)} models -> tippecanoe")
-    # z5 is plenty for coarse expert-range overlays; z6 on thousands of huge global
-    # IUCN polygons runs ~30 min. maxzoom is per-dataset so a slow one can go lower.
-    mz <- if (ds == "rng_iucn") 5L else 6L
-    publish_pmtiles(x, out, layer = ds, minzoom = 0, maxzoom = mz)
+    log_info("{ds}: {nrow(x)} features, {n_distinct(x$mdl_key)} models -> per-model PMTiles ({n_workers} workers)")
+    built <- publish_pmtiles_models(x, dir_ds, layer = ds, workers = n_workers,
+                                    redo = redo, minzoom = 0, maxzoom = 6)
   }
-  if (file_exists(out)) pmt_rows[[ds]] <- tibble(
-    ds_key = ds, asset_type = "pmtiles",
-    # ?v={mtime} busts the browser/PMTiles-protocol cache on every rebuild (same filename,
-    # new content otherwise serves stale tiles); Caddy ignores the query and serves the file.
-    asset_url = glue("{pmt_base}/{ds}.pmtiles?v={as.integer(file_info(out)$modification_time)}"),
+  if (is.null(built) || !nrow(built)) { log_warn("{ds}: no PMTiles built"); next }
+  pmt_rows[[ds]] <- built |> transmute(
+    mdl_key, ds_key = ds, asset_type = "pmtiles",
+    # per-model URL; ?v={mtime} busts the browser/PMTiles-protocol cache on rebuild
+    # (Caddy ignores the query and serves the file).
+    asset_url = glue("{pmt_base}/{ds}/{path_file(file)}?v={as.integer(file_info(file)$modification_time)}"),
     source_layer = ds)
 }
-pmt_reg <- bind_rows(pmt_rows)
-if (nrow(pmt_reg)) knitr::kable(pmt_reg |> transmute(ds_key, mb = round(as.numeric(file_size(glue("{dir_pmt}/{ds_key}.pmtiles")))/1e6,1), asset_url))
+pmt_reg <- bind_rows(pmt_rows)   # now ONE ROW PER MODEL (mdl_key, asset_url)
+if (nrow(pmt_reg)) knitr::kable(pmt_reg |> count(ds_key, name = "n_models"))
 ```
 
 ## AquaMaps → per-model COGs
@@ -265,15 +311,9 @@ if (!skip_am && length(am_take) && dir_exists(am_parts)) {
 ```{r}
 #| label: registry
 
-# per-input-model asset rows: am COGs are per-model; vector PMTiles apply to every served
-# mdl_key of that dataset (client filters the one PMTiles by mdl_key).
-pmt_model_rows <- if (nrow(pmt_reg)) {
-  map_dfr(seq_len(nrow(pmt_reg)), function(i) {
-    ds <- pmt_reg$ds_key[i]
-    tibble(mdl_key = served_by_ds[[ds]], ds_key = ds, asset_type = "pmtiles",
-           asset_url = pmt_reg$asset_url[i], source_layer = pmt_reg$source_layer[i])
-  })
-} else tibble()
+# per-input-model asset rows: am COGs AND vector PMTiles are now both per-model — pmt_reg
+# already carries one (mdl_key, asset_url) row per model (its own PMTiles file).
+pmt_model_rows <- if (nrow(pmt_reg)) pmt_reg else tibble()
 
 asset_info <- bind_rows(am_reg, pmt_model_rows) |>
   mutate(across(everything(), ~ if (is.factor(.)) as.character(.) else .))
