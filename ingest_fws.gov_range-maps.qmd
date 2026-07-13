@@ -27,6 +27,20 @@ coastal/marine species belong in a marine-sensitivity model. Handled in two phas
 hard-coded): `EN` = 100, `TN` = 50, `LC` = 1, from the species' most-protective
 (precautionary) ESA status. Whole range, no land mask (`pct_marine` is the metric).
 
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "USFWS ranges: ingest the v7-matched species; report pct_marine candidates v7 may have missed"
+flowchart LR
+  src["usfws current-range shp<br/>(2,205 spp)"] --> er["val = compute_er_score('FWS:code')<br/>EN100 TN50 LC1 (most-protective)"]
+  er --> v7["Phase 1: ingest v7 subset<br/>(106 spcodes)"]
+  src --> pm["Phase 2: pct_marine<br/>(exact_extract ocean mask) → review"]
+  v7 --> ee["cells_from_ranges() vs 0.05° cellid COG"]
+  ee --> pq[("dist/dataset=rng_fws/{spcode}.parquet<br/>(mdl_key, cell_id, val) · V2/zstd")]
+  pq --> mf["hash_parquet → content-addressed manifest"]
+```
+
 ## Setup
 
 ```{r}
@@ -133,7 +147,7 @@ for (i in seq_len(nrow(todo))) {
   ply_sp <- rng |> filter(spcode == r$spcode) |> summarise(.groups = "drop")
   d <- cells_from_ranges(ply_sp, cellid_tif, value = r$er_score)   # whole range, ER-scored
   if (nrow(d) == 0) { log_warn("  {r$spcode} ({r$sciname}): no cells"); next }
-  write_parquet(tibble(mdl_key = r$mdl_key, cell_id = d$cell_id, val = d$val),
+  msens::write_atlas_parquet(tibble(mdl_key = r$mdl_key, cell_id = d$cell_id, val = d$val),
                 fs::path(dir_dist, r$spcode, ext = "parquet"))
 }
 log_info("{ds_key}: done")
@@ -149,12 +163,17 @@ con <- dbConnect(duckdb())
 smry <- dbGetQuery(con, glue(
   "SELECT count(DISTINCT mdl_key) n_models, count(*) n_cells, min(val) v_min, max(val) v_max
      FROM read_parquet('{dir_dist}/*.parquet')"))
+# order-independent content fingerprint of the on-disk surface (not the ingest run)
+h <- msens::hash_parquet(glue("{dir_dist}/*.parquet"), con)
 dbDisconnect(con, shutdown = TRUE)
-knitr::kable(smry)
+msens::report_table(smry, caption = "rng_fws model_cell surface")
 
-write_json(
-  list(target = "ingest_rng_fws", ds_key = ds_key, ver = ver,
-       n_species_all = nrow(sp), n_v7 = sum(sp$is_v7), n_parquet = length(pq),
-       dir_dist = dir_dist, built = as.character(Sys.time())),
-  manifest, auto_unbox = TRUE, pretty = TRUE)
+# content-addressed manifest: deterministic, no wall-clock, no machine paths ->
+# downstream targets re-run only when this surface's content actually changes
+msens::write_manifest(
+  manifest, target = "ingest_rng_fws", content_hash = h,
+  stats = list(ds_key = ds_key, ver = ver, n_species_all = nrow(sp),
+               n_v7 = sum(sp$is_v7), n_cells = smry$n_cells,
+               v_min = smry$v_min, v_max = smry$v_max, n_parquet = length(pq)),
+  force = msens::force_target("ingest_rng_fws"))
 ```

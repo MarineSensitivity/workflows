@@ -17,6 +17,21 @@ total), so we **match v7's marine-relevant subset (29 species)** for comparabili
 the ESA `listing_st` (Endangered→EN=100, Threatened→TN=50), never hard-coded. Whole
 range via `cells_from_ranges`. `mdl_key = "ch_fws|{spcode}"`.
 
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "USFWS critical habitat (v7-matched subset) → extinction-risk value on the global 0.05° grid"
+flowchart LR
+  src["crithab_poly.shp<br/>(840 spp)"] --> filt["filter to v7 marine subset<br/>(29 spcodes)"]
+  filt --> er["val = compute_er_score('FWS:code')<br/>EN100 TN50"]
+  er --> ee["cells_from_ranges()<br/>exact_extract vs 0.05° cellid COG"]
+  ee --> pq[("dist/dataset=ch_fws/{spcode}.parquet<br/>(mdl_key, cell_id, val) · V2/zstd")]
+  pq --> mf["hash_parquet → content-addressed manifest"]
+```
+
+## Ingest
+
 ```{r}
 #| label: ingest
 
@@ -56,7 +71,7 @@ for (i in seq_len(nrow(todo))) {
   ply_sp <- ply |> filter(spcode == r$spcode) |> summarise(.groups = "drop")
   d <- cells_from_ranges(ply_sp, cellid_tif, value = r$er_score)
   if (nrow(d) == 0) { log_warn("  {r$spcode}: no cells"); next }
-  write_parquet(tibble(mdl_key = r$mdl_key, cell_id = d$cell_id, val = d$val),
+  msens::write_atlas_parquet(tibble(mdl_key = r$mdl_key, cell_id = d$cell_id, val = d$val),
                 fs::path(dir_dist, r$spcode, ext = "parquet"))
 }
 log_info("{ds_key}: done")
@@ -72,12 +87,17 @@ con <- dbConnect(duckdb())
 smry <- dbGetQuery(con, glue(
   "SELECT count(DISTINCT mdl_key) n_models, count(*) n_cells, min(val) v_min, max(val) v_max
      FROM read_parquet('{dir_dist}/*.parquet')"))
+# order-independent content fingerprint of the on-disk surface (not the ingest run)
+h <- msens::hash_parquet(glue("{dir_dist}/*.parquet"), con)
 dbDisconnect(con, shutdown = TRUE)
-knitr::kable(smry)
+msens::report_table(smry, caption = "ch_fws model_cell surface")
 
-write_json(
-  list(target = "ingest_ch_fws", ds_key = ds_key, ver = ver,
-       n_models = nrow(sp), n_parquet = length(pq), dir_dist = dir_dist,
-       built = as.character(Sys.time())),
-  manifest, auto_unbox = TRUE, pretty = TRUE)
+# content-addressed manifest: deterministic, no wall-clock, no machine paths ->
+# downstream targets re-run only when this surface's content actually changes
+msens::write_manifest(
+  manifest, target = "ingest_ch_fws", content_hash = h,
+  stats = list(ds_key = ds_key, ver = ver, n_models = nrow(sp),
+               n_cells = smry$n_cells, v_min = smry$v_min, v_max = smry$v_max,
+               n_parquet = length(pq)),
+  force = msens::force_target("ingest_ch_fws"))
 ```

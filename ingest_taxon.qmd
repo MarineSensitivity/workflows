@@ -25,6 +25,21 @@ and types for ingesting.
   >AlgaeBase has a very clear license and only shares the full dataset with WoRMs. Only genus level is added in the WoRMs checklist to GBIF, not species level.
 
 
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "Taxonomic authority DwC-A + BirdLife BOTW + IUCN Red List → spp.duckdb taxonomy tables, content-addressed manifest"
+flowchart LR
+  dwc["DwC-A downloads<br/>GBIF · ITIS · WoRMS · IUCN"] --> auth["load taxonomy +<br/>vernacular tables"]
+  botwsrc["BirdLife BOTW gpkg"] --> botw["botw species table<br/>(+ botw.csv)"]
+  rl["IUCN Red List API"] --> rlt["iucn_redlist assessments"]
+  auth --> db[("spp.duckdb")]
+  botw --> db
+  rlt --> db
+  db --> mf["hash_query(botw)<br/>→ content-addressed manifest"]
+```
+
 ## Setup
 
 ```{r}
@@ -762,6 +777,30 @@ dbDisconnect(con_spp, shutdown = T)
 #   - [taxizedb](https://docs.ropensci.org/taxizedb/articles/taxizedb.html)
 # - use colors for extinction risk categories:
 #   [IUCN Red List color scales — scale_color_iucn • rredlist](https://docs.ropensci.org/rredlist/reference/scale_iucn.html)
+```
+
+## Outputs + manifest
+
+```{r}
+#| label: outputs
+
+# the notebook's core species table is `botw` (Birds of the World), written to
+# spp.duckdb alongside botw_csv; fingerprint it read-only (con_spp already closed)
+con_m <- dbConnect(duckdb(dbdir = spp_db, read_only = TRUE))
+smry  <- dbGetQuery(con_m, "SELECT
+  (SELECT count(*) FROM botw)            AS n_species,
+  (SELECT count(*) FROM botw_vernacular) AS n_vernacular")
+h <- msens::hash_query(con_m, "botw")
+dbDisconnect(con_m, shutdown = TRUE)
+msens::report_table(smry, caption = "ingest_taxon botw species table")
+
+# content-addressed manifest: deterministic (no wall-clock, no machine paths) ->
+# downstream targets re-run only when this table's content actually changes
+manifest <- here("data/manifests/ingest_taxon.json"); dir_create(path_dir(manifest))
+msens::write_manifest(
+  manifest, target = "ingest_taxon", content_hash = h,
+  stats = list(n_species = smry$n_species, n_vernacular = smry$n_vernacular),
+  force = msens::force_target("ingest_taxon"))
 ```
 
 ## Match sdm to spp

@@ -27,6 +27,19 @@ dataset — not a filter here.
 Parallelized with `parallel::mclapply` (fork); resumable (skip species whose
 Parquet exists). `REDO_INGEST=1` rebuilds all.
 
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "BirdLife BOTW ranges → whole-range extinction-risk value on the global 0.05° grid"
+flowchart LR
+  src["BOTW gpkg<br/>all_species (presence∈1:3)"] --> chk["join BL/HBW checklist<br/>→ IUCN Red List category"]
+  chk --> er["val = compute_er_score('IUCN:code')<br/>CR50 EN25 VU5 NT2 LC/DD1"]
+  er --> ee["cells_from_ranges()<br/>exact_extract vs 0.05° cellid COG"]
+  ee --> pq[("dist/dataset=bl/{sisid}.parquet<br/>(mdl_key, cell_id, val) · V2/zstd")]
+  pq --> mf["hash_parquet → content-addressed manifest"]
+```
+
 ## Setup
 
 ```{r}
@@ -125,7 +138,7 @@ one <- function(i) {
   d <- tryCatch(cells_from_ranges(p, cellid_tif, value = todo$er_score[i]),
                 error = function(e) NULL)
   if (is.null(d) || nrow(d) == 0) return("empty")
-  arrow::write_parquet(
+  msens::write_atlas_parquet(
     tibble::tibble(mdl_key = todo$mdl_key[i], cell_id = d$cell_id, val = d$val), out_pq)
   "done"
 }
@@ -145,8 +158,10 @@ con  <- dbConnect(duckdb())
 smry <- dbGetQuery(con, glue(
   "SELECT count(DISTINCT mdl_key) n_models, count(*) n_cells, max(val) v_max
      FROM read_parquet('{dir_dist}/*.parquet')"))
+# order-independent content fingerprint of the on-disk surface (not the ingest run)
+h <- msens::hash_parquet(glue("{dir_dist}/*.parquet"), con)
 dbDisconnect(con, shutdown = TRUE)
-knitr::kable(smry)
+msens::report_table(smry, caption = "bl model_cell surface")
 ```
 
 ## Manifest (target output)
@@ -154,10 +169,13 @@ knitr::kable(smry)
 ```{r}
 #| label: manifest
 
-write_json(
-  list(target = "ingest_birdlife_botw", ds_key = ds_key, ver = ver,
-       n_species = nrow(sp), n_parquet = length(pq),
-       dir_dist = dir_dist, source = path_file(botw_gpkg), built = as.character(Sys.time())),
-  manifest, auto_unbox = TRUE, pretty = TRUE)
-manifest
+# content-addressed manifest: deterministic, no wall-clock, no machine paths ->
+# downstream targets re-run only when this surface's content actually changes
+msens::write_manifest(
+  manifest, target = "ingest_birdlife_botw", content_hash = h,
+  stats = list(ds_key = ds_key, ver = ver, n_species = nrow(sp),
+               n_models = smry$n_models, n_cells = smry$n_cells,
+               v_max = smry$v_max, n_parquet = length(pq),
+               source = path_file(botw_gpkg)),
+  force = msens::force_target("ingest_birdlife_botw"))
 ```

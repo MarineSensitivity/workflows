@@ -19,6 +19,21 @@ Per-cell scoring (replicates v7 `calc_scores.qmd` exactly):
 4. **composite** `score_extriskspcat_primprod_ecoregionrescaled_equalweights` =
    `ROUND(AVG(present rescaled components))` (7 extrisk + primprod, equal weight).
 
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "Per-cell scoring: extrisk_{spcat} → ecoregion rescale, + primprod → equal-weight composite"
+flowchart LR
+  mt["model_cell × taxon<br/>(er_score, sp_cat, is_marine)"] --> ex["extrisk_{spcat}<br/>Σ er·val/100"]
+  ex --> rs["ecoregion min/max<br/>→ _ecoregion_rescaled"]
+  vg["VGPM npp_avg → cells"] --> pp["primprod → rescaled"]
+  rs --> cm[("cell_metric<br/>sdm.duckdb")]
+  pp --> cm
+  cm --> co["equal-weight composite"] --> cm
+  cm --> mf["hash_query(cell_metric)<br/>→ content-addressed manifest"]
+```
+
 ## Setup + metric registry
 
 ```{r}
@@ -137,7 +152,9 @@ dbExecute(con, glue("INSERT INTO cell_metric (cell_id, metric_seq, val)
 
 smry <- dbGetQuery(con, glue("SELECT count(*) n_cells, round(min(val),1) v_min, round(max(val),1) v_max,
   round(avg(val),1) v_avg FROM cell_metric WHERE metric_seq={sc}"))
-knitr::kable(smry)
+msens::report_table(smry, caption = "composite score per cell")
+# content fingerprint of the full cell_metric output table (before disconnect)
+cm_hash <- msens::hash_query(con, "cell_metric")
 dbDisconnect(con, shutdown=TRUE)
 ```
 
@@ -146,7 +163,10 @@ dbDisconnect(con, shutdown=TRUE)
 ```{r}
 #| label: manifest
 
-write_json(list(target="score_cell_metrics", ver=ver, composite_cells=smry$n_cells,
-  v_min=smry$v_min, v_max=smry$v_max, built=as.character(Sys.time())),
-  manifest, auto_unbox=TRUE, pretty=TRUE)
+# content-addressed: fingerprint of the cell_metric output table (no wall-clock)
+msens::write_manifest(
+  manifest, target = "score_cell_metrics", content_hash = cm_hash,
+  stats = list(ver = ver, composite_cells = smry$n_cells,
+               v_min = smry$v_min, v_max = smry$v_max),
+  force = msens::force_target("score_cell_metrics"))
 ```

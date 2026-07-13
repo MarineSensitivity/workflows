@@ -19,6 +19,20 @@ single source of truth for STAC, the marine-atlas release, apps and the API.
 
 Written to `sdm.duckdb` (`dataset`, `model`) and staged as Parquet for the release.
 
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "Registry consolidation: dataset props from front-matter, model props from per-ingest CSVs + merged taxa"
+flowchart LR
+  fm["ingest_*.qmd<br/>msens: dataset: blocks"] --> ds["dataset table"]
+  csv["dist/model_{ds}.csv<br/>(per-ingest)"] --> mdl["model table"]
+  tax["merge.duckdb taxon<br/>(ms_merge models)"] --> mdl
+  ds --> db[("sdm.duckdb + registry/*.parquet<br/>V2/zstd")]
+  mdl --> db
+  db --> mf["hash_query(dataset)+hash_query(model)<br/>→ content-addressed manifest"]
+```
+
 ## Setup
 
 ```{r}
@@ -125,6 +139,11 @@ dbDisconnect(con, shutdown = TRUE)
 model <- bind_rows(model_raw |> mutate(sp_cat = NA_character_), model_merged) |>
   mutate(ds_key = factor(ds_key, levels = ds_order)) |> arrange(ds_key, mdl_key) |>
   mutate(ds_key = as.character(ds_key))
+# stable integer id per mdl_key: the compact partition key for the serving surface
+# (serve/model_cell/mdl_id=*, so a titiler tile is a partition-pruned point read) and
+# the mdl_key->mdl_id map the app/tile-URL builder joins on. dense_rank over the unique
+# sorted mdl_key makes it a deterministic function of the model set (1..N).
+model <- model |> mutate(mdl_id = dense_rank(mdl_key)) |> relocate(mdl_id, .after = mdl_key)
 log_info("model registry: {nrow(model)} models ({n_distinct(model_raw$ds_key)} raw datasets + ms_merge)")
 knitr::kable(model |> count(ds_key, name = "n_models"))
 ```
@@ -137,13 +156,15 @@ knitr::kable(model |> count(ds_key, name = "n_models"))
 con <- dbConnect(duckdb(sdm_db))
 dbWriteTable(con, "dataset", dataset, overwrite = TRUE)
 dbWriteTable(con, "model",   model,   overwrite = TRUE)
-# stage as Parquet alongside the other release tables
+# stage as Parquet (V2/zstd/80MB row groups) alongside the other release tables
 reg_dir <- glue("{dir_atlas}/registry"); dir_create(reg_dir)
-dbExecute(con, glue("COPY dataset TO '{reg_dir}/dataset.parquet' (FORMAT parquet)"))
-dbExecute(con, glue("COPY model   TO '{reg_dir}/model.parquet'   (FORMAT parquet)"))
+msens::copy_atlas_parquet(con, "dataset", glue("{reg_dir}/dataset.parquet"))
+msens::copy_atlas_parquet(con, "model",   glue("{reg_dir}/model.parquet"))
 smry <- dbGetQuery(con, "SELECT (SELECT count(*) FROM dataset) n_datasets, (SELECT count(*) FROM model) n_models")
+# content fingerprints of both registry tables (fold into one manifest hash)
+reg_hash <- paste0(msens::hash_query(con, "dataset"), msens::hash_query(con, "model"))
 dbDisconnect(con, shutdown = TRUE)
-knitr::kable(smry)
+msens::report_table(smry, caption = "registry counts")
 ```
 
 ## Manifest
@@ -151,10 +172,11 @@ knitr::kable(smry)
 ```{r}
 #| label: manifest
 
-write_json(
-  list(target = "build_registry", ver = ver, n_datasets = smry$n_datasets, n_models = smry$n_models,
-       ingested = ingested, not_ingested = if (length(not_ingested)) not_ingested else NULL,
-       built = as.character(Sys.time())),
-  manifest, auto_unbox = TRUE, pretty = TRUE)
-manifest
+# content-addressed: fingerprint of dataset+model tables (sorted lists for determinism)
+msens::write_manifest(
+  manifest, target = "build_registry", content_hash = reg_hash,
+  stats = list(ver = ver, n_datasets = smry$n_datasets, n_models = smry$n_models,
+               ingested = paste(sort(ingested), collapse = ","),
+               not_ingested = if (length(not_ingested)) paste(sort(not_ingested), collapse = ",") else ""),
+  force = msens::force_target("build_registry"))
 ```

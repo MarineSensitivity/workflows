@@ -20,6 +20,19 @@ startup — which the v8 scoring pipeline doesn't otherwise emit:
   `programarea_key`, rasterized from `cell_metric` onto the **global cell-id COG** using the
   COG-value = `cell_id` lookup (NOT `r[cell_id]<-` pixel-index, which is a v7-grid assumption).
 
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "Per-version Shiny app-support files: zone gpkgs, layer registry, and the cell-metrics raster"
+flowchart LR
+  prev["ver_prev files<br/>(gpkgs, layers, subregions)"] --> copy["copy + adapt<br/>(other → primary_producer)"]
+  db["sdm.duckdb<br/>cell_metric + zone_cell"] --> rast["rasterize onto cell-id COG"]
+  copy --> out[("{ver}/ dir<br/>gpkgs · layers.csv · r_metrics.tif")]
+  rast --> out
+  out --> mf["hash_query(r_metrics) → content-addressed manifest"]
+```
+
 ## Setup
 
 ```{r}
@@ -121,12 +134,24 @@ dbDisconnect(con, shutdown = TRUE)
 log_info("r_metrics_{ver}.tif: {n_lyr} bands")
 ```
 
-## Manifest
+## Outputs + manifest
 
 ```{r}
 #| label: manifest
 
-write_json(list(target = "build_app_support", ver = ver, dir = dir_v,
-  layers = nrow(lyrs), r_metrics_bands = n_lyr, built = as.character(Sys.time())),
-  manifest, auto_unbox = TRUE, pretty = TRUE)
+# content fingerprint of the notebook's authoritative output (the metrics raster):
+# reduce its non-NA cell values order-independently via DuckDB — deterministic, so no
+# wall-clock and no machine paths leak into the tracked manifest.
+con <- dbConnect(duckdb())
+duckdb::duckdb_register(con, "r_metrics_df", as.data.frame(r_metrics, cells = TRUE, na.rm = TRUE))
+h   <- msens::hash_query(con, "r_metrics_df")
+dbDisconnect(con, shutdown = TRUE)
+
+smry <- tibble::tibble(output = c("layers", "r_metrics_bands"), n = c(nrow(lyrs), n_lyr))
+msens::report_table(smry, caption = "app-support outputs")
+
+msens::write_manifest(
+  manifest, target = "build_app_support", content_hash = h,
+  stats = list(ver = ver, layers = nrow(lyrs), r_metrics_bands = n_lyr),
+  force = msens::force_target("build_app_support"))
 ```

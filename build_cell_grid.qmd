@@ -27,6 +27,19 @@ COG) is **skipped when the cell-id COG already exists** (resume); force it with
 `REDO_CELL_GRID=1` (`libs/vars.R`). A bbox prototype run (`CELL_BBOX=...`) always
 rebuilds into its own `CELL_DB`.
 
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "Bio-Oracle raster → global 0.05° cell grid: cell table + cell-id COG, content-addressed manifest"
+flowchart LR
+  bo["Bio-Oracle v3<br/>0.05° 12-layer raster"] --> id["assign cell_id=1:ncell,<br/>area_km2, in_usa/in_pra"]
+  id --> ocn["keep ocean cells<br/>(depth_mean non-NA)"]
+  ocn --> cell[("cell table<br/>sdm.duckdb")]
+  ocn --> cog["r_cellid_global.tif COG<br/>(titiler paints)"]
+  cell --> mf["hash_query(cell)<br/>→ content-addressed manifest"]
+```
+
 ```{r setup}
 librarian::shelf(DBI, dplyr, duckdb, glue, here, jsonlite, sf, terra, quiet = TRUE)
 source(here("libs/paths.R"))   # ver, sdm_db, bio_oracle_tif, cellid_tif, ply_usa_gpkg, ply_pra_gpkg
@@ -106,12 +119,17 @@ smry <- dbGetQuery(con, "
          round(min(lon),1) AS lon_min, round(max(lon),1) AS lon_max,
          count(*) FILTER (WHERE depth_mean IS NULL) AS n_null_depth
   FROM cell")
+# content fingerprint of the cell table (before disconnect)
+h <- msens::hash_query(con, "cell")
 dbDisconnect(con, shutdown = TRUE)
-knitr::kable(smry)
+msens::report_table(smry, caption = "global 0.05° cell grid summary")
 
-manifest <- c(as.list(smry), list(
-  version = ver, bbox = cell_bbox, db = cell_db,
-  cellid_tif = cellid_tif, source = basename(bio_oracle_tif)))
-write_json(manifest, here("data/manifests/build_cell_grid.json"), auto_unbox = TRUE, pretty = TRUE)
+# content-addressed manifest: deterministic (no wall-clock, no machine paths) ->
+# downstream targets re-run only when the cell table's content actually changes
+msens::write_manifest(
+  here("data/manifests/build_cell_grid.json"), target = "build_cell_grid", content_hash = h,
+  stats = c(as.list(smry), list(version = ver, bbox = cell_bbox,
+            source = basename(bio_oracle_tif))),
+  force = msens::force_target("build_cell_grid"))
 message(glue("cell grid: {smry$n_cell} cells ({smry$n_usa} in US, {smry$n_pra} in PRAs) -> {cell_db}"))
 ```

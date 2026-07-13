@@ -24,6 +24,18 @@ this (and every redistributable) WoRMS download, so ~hundreds of algae used by o
 datasets are absent here — `merge_taxon.qmd` fills those on demand from the **WoRMS REST
 API** (`worrms::wm_record`) and caches them in `data/worms_taxonomy_supplement.csv`.
 
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "Latest WoRMS DwC-A → rebuilt `worms` taxonomy table with habitat flags, content-addressed manifest"
+flowchart LR
+  dwc["WoRMS DwC-A<br/>taxon.txt + speciesprofile.txt"] --> pick["pick latest<br/>WoRMS_download_&lt;date&gt;"]
+  pick --> bld["CREATE TABLE worms<br/>(strip LSID, join isMarine/…)"]
+  bld --> tbl[("worms table<br/>spp.duckdb")]
+  tbl --> mf["hash_query(worms)<br/>→ content-addressed manifest"]
+```
+
 ## Setup + locate the latest download
 
 ```{r}
@@ -129,11 +141,13 @@ smry <- dbGetQuery(con, "SELECT count(*) n_rows,
   count(*) FILTER (WHERE scientificNameID IS NOT NULL) n_aphia,
   count(*) FILTER (WHERE isMarine) n_marine,
   count(DISTINCT kingdom) n_kingdoms FROM worms")
-knitr::kable(smry)
+msens::report_table(smry, caption = "worms taxonomy table summary")
 knitr::kable(dbGetQuery(con, "SELECT kingdom, count(*) n FROM worms GROUP BY 1 ORDER BY n DESC LIMIT 8"))
 # AlgaeBase check: these should be ABSENT here (filled by the WoRMS API in merge_taxon)
 alg <- dbGetQuery(con, "SELECT count(*) n FROM worms WHERE scientificName IN ('Caulerpa sertularioides','Ulva intestinalis')")$n
 log_info("AlgaeBase spot-check (expect 0, filled via API): {alg}")
+# content fingerprint of the worms table (before disconnect)
+h <- msens::hash_query(con, "worms")
 dbDisconnect(con, shutdown = TRUE)
 ```
 
@@ -142,9 +156,12 @@ dbDisconnect(con, shutdown = TRUE)
 ```{r}
 #| label: manifest
 
-write_json(
-  list(target = "ingest_worms", worms_ver = worms_ver, source = path_file(dl_dir),
-       n_rows = smry$n_rows, n_marine = smry$n_marine, built = as.character(Sys.time())),
-  manifest, auto_unbox = TRUE, pretty = TRUE)
+# content-addressed manifest: deterministic (no wall-clock) -> downstream targets
+# re-run only when the worms table's content actually changes
+msens::write_manifest(
+  manifest, target = "ingest_worms", content_hash = h,
+  stats = list(worms_ver = worms_ver, source = path_file(dl_dir),
+               n_rows = smry$n_rows, n_marine = smry$n_marine),
+  force = msens::force_target("ingest_worms"))
 manifest
 ```

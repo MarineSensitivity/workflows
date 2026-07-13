@@ -32,6 +32,18 @@ Re-run control (`libs/vars.R`, override via env): `REDO_AM_W05=1` rebuilds the
 weight table; `REDO_AM_INGEST=1` re-interpolates every species (otherwise the loop
 resumes, skipping species whose Parquet already exists).
 
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "AquaMaps HCAF 0.5° suitability bilinearly interpolated onto the global 0.05° grid via a precomputed weight join"
+flowchart LR
+  am["am.duckdb<br/>HCAF 0.5° spp_cells"] --> w05["w05 weight table<br/>(cell_id → 4 loiczid, bilinear w)"]
+  w05 --> interp["per-species DuckDB join<br/>Σ w×prob×100, ≥ threshold"]
+  interp --> pq[("dist/dataset=am/{sp_key}.parquet<br/>(mdl_key, cell_id, val) · V2/zstd")]
+  pq --> mf["hash_parquet → content-addressed manifest"]
+```
+
 ## Setup
 
 ```{r}
@@ -129,16 +141,15 @@ dbExecute(con, glue("SET threads = {max(1L, parallel::detectCores())}"))
 t0 <- Sys.time()
 for (i in seq_along(todo)) {
   k <- todo[i]
-  dbExecute(con, glue("
-    COPY (
-      SELECT 'am|{k}' AS mdl_key, w.cell_id, round(SUM(w.w * sc.prob), 2) AS \"val\"
-      FROM w05 w
-      JOIN (SELECT c.loiczid, s.probability*100 AS prob
-              FROM am.spp_cells s JOIN am.cells c USING (cell_id)
-             WHERE s.sp_key = '{k}') sc  ON w.loiczid = sc.loiczid
-      GROUP BY w.cell_id
-      HAVING SUM(w.w * sc.prob) >= {threshold}
-    ) TO '{fs::path(dir_dist, k, ext = \"parquet\")}' (FORMAT parquet, COMPRESSION zstd)"))
+  msens::copy_atlas_parquet(con, glue("
+    SELECT 'am|{k}' AS mdl_key, w.cell_id, round(SUM(w.w * sc.prob), 2) AS \"val\"
+    FROM w05 w
+    JOIN (SELECT c.loiczid, s.probability*100 AS prob
+            FROM am.spp_cells s JOIN am.cells c USING (cell_id)
+           WHERE s.sp_key = '{k}') sc  ON w.loiczid = sc.loiczid
+    GROUP BY w.cell_id
+    HAVING SUM(w.w * sc.prob) >= {threshold}"),
+    fs::path(dir_dist, k, ext = "parquet"))
   if (i %% 1000 == 0)
     log_info("  {i}/{length(todo)} ({round(as.numeric(Sys.time()-t0, units='mins'),1)} min)")
 }
@@ -161,17 +172,29 @@ glue("{n_pq} species Parquet written; sample {sp_all$sp_key[1]}: ",
      "{smp$n_cells} cells, val {smp$v_min}-{smp$v_max}")
 ```
 
-## Manifest (target output)
+## Outputs + manifest
 
 ```{r}
 #| label: manifest
 
-write_json(
-  list(target = "ingest_aquamaps", ds_key = ds_key, ver = ver,
-       n_species = nrow(sp_all), n_parquet = n_pq,
-       dir_dist = dir_dist, w05_db = w05_db, built = as.character(Sys.time())),
-  manifest, auto_unbox = TRUE, pretty = TRUE)
-manifest
+pq   <- dir_ls(dir_dist, glob = "*.parquet")
+con  <- dbConnect(duckdb())
+smry <- dbGetQuery(con, glue(
+  "SELECT count(DISTINCT mdl_key) n_models, count(*) n_cells, min(val) v_min, max(val) v_max
+     FROM read_parquet('{dir_dist}/*.parquet')"))
+# order-independent content fingerprint of the on-disk surface (not the ingest run)
+h <- msens::hash_parquet(glue("{dir_dist}/*.parquet"), con)
+dbDisconnect(con, shutdown = TRUE)
+msens::report_table(smry, caption = "am model_cell surface")
+
+# content-addressed manifest: deterministic, no wall-clock, no machine paths ->
+# downstream targets re-run only when this surface's content actually changes
+msens::write_manifest(
+  manifest, target = "ingest_aquamaps", content_hash = h,
+  stats = list(ds_key = ds_key, ver = ver, n_species = nrow(sp_all),
+               n_models = smry$n_models, n_cells = smry$n_cells,
+               v_min = smry$v_min, v_max = smry$v_max, n_parquet = length(pq)),
+  force = msens::force_target("ingest_aquamaps"))
 ```
 
 ## Publish to S3

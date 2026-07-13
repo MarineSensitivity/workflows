@@ -23,6 +23,17 @@ Taxa still uncovered (not in NMFS/FWS/BirdLife and with no English WoRMS vernacu
 as **Wikipedia candidates** (`COMMON_WIKI=1` fetches + caches best-fit names — a gated follow-up,
 since it's a large network job). Writes `common_name` to `merge.duckdb` + `sdm.duckdb` `taxon`.
 
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "One English common name per taxon by preference: NMFS > FWS > BirdLife > WoRMS (Wikipedia gated)"
+flowchart LR
+  src["NMFS · FWS · BirdLife · WoRMS vern<br/>(+ gated Wikipedia)"] --> res["coalesce by preference<br/>per clean_sci_name / sisid / aphia"]
+  res --> tx[("common_name → taxon<br/>merge.duckdb + sdm.duckdb")]
+  tx --> mf["hash_query(taxon)<br/>→ content-addressed manifest"]
+```
+
 ## Setup + sources
 
 ```{r}
@@ -140,14 +151,23 @@ dbDisconnect(con2, shutdown = TRUE)
 log_info("wrote common_name to merge.duckdb + sdm.duckdb ({n_sdm} in sdm taxon)")
 ```
 
-## Manifest
+## Outputs + manifest
 
 ```{r}
 #| label: manifest
 
-write_json(list(target = "build_common_names", ver = ver,
-  n_taxa = nrow(tx), n_common = sum(!is.na(tx$common_name)),
-  by_source = as.list(setNames(src_tbl$n, src_tbl$common_src)),
-  n_uncovered = sum(is.na(tx$common_name)), built = as.character(Sys.time())),
-  manifest, auto_unbox = TRUE, pretty = TRUE)
+# content-addressed: fingerprint of the taxon table (now carrying common_name);
+# reopen read-only since the write chunks already disconnected
+con <- dbConnect(duckdb(merge_db, read_only = TRUE))
+h   <- msens::hash_query(con, "taxon")
+dbDisconnect(con, shutdown = TRUE)
+
+msens::report_table(src_tbl, caption = "common-name source counts")
+
+msens::write_manifest(
+  manifest, target = "build_common_names", content_hash = h,
+  stats = list(ver = ver, n_taxa = nrow(tx), n_common = sum(!is.na(tx$common_name)),
+               by_source = as.list(setNames(src_tbl$n, src_tbl$common_src)),
+               n_uncovered = sum(is.na(tx$common_name))),
+  force = msens::force_target("build_common_names"))
 ```

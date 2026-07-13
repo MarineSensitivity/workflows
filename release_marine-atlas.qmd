@@ -67,23 +67,34 @@ rel_tables <- c("cell", "taxon", "dataset", "model", "metric",
                 "cell_metric", "zone", "zone_cell", "zone_metric", "native_asset")
 rel_tables <- intersect(rel_tables, dbListTables(con))
 for (t in rel_tables)
-  dbExecute(con, glue("COPY (SELECT * FROM {t}) TO '{tbl_dir}/{t}.parquet' (FORMAT parquet, COMPRESSION zstd)"))
+  msens::copy_atlas_parquet(con, glue("SELECT * FROM {t}"), glue("{tbl_dir}/{t}.parquet"))
 
-# serving surface: ONE file, globally sorted by mdl_key -> row-group min/max stats let a
-# titiler point query (WHERE mdl_key='…') fetch only the matching row groups over HTTP range.
-# skip the ~3GB re-sort if it already exists (model_cell rarely changes); RELEASE_REDO_SERVE=1 forces.
-serve_pq <- glue("{serve_dir}/model_cell.parquet")
-if (!file_exists(serve_pq) || nzchar(Sys.getenv("RELEASE_REDO_SERVE"))) {
-  dbExecute(con, glue("COPY (SELECT mdl_key, cell_id, val FROM model_cell ORDER BY mdl_key)
-    TO '{serve_pq}' (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 100000)"))
+# serving surface: Hive-PARTITIONED by the integer mdl_id (from the model registry), which REPLACES
+# the 40-byte mdl_key string in the stored rows (compact: rows are just cell_id,val; mdl_id lives in
+# the path). A titiler tile reads exactly ONE partition (serve/model_cell/mdl_id={id}/data_0.parquet)
+# by exact path -> anonymous GET, no S3 LIST, no global ORDER BY (avoids the ~500GB sort spill). The
+# STABLE public identifier stays mdl_key: titiler resolves mdl_key->mdl_id from the model registry,
+# so mdl_id (which renumbers as models are added) never appears in a URL.
+# skip the rebuild if it exists (model_cell rarely changes); RELEASE_REDO_SERVE=1 forces.
+serve_mc <- glue("{serve_dir}/model_cell")
+if (!dir_exists(serve_mc) || nzchar(Sys.getenv("RELEASE_REDO_SERVE"))) {
+  if (dir_exists(serve_mc)) dir_delete(serve_mc)
+  dbExecute(con, "SET partitioned_write_max_open_files=1024")   # ~one partition per merged model
+  msens::copy_atlas_parquet(
+    con, "SELECT m.mdl_id, c.cell_id, c.val FROM model_cell c JOIN model m USING (mdl_key)",
+    serve_mc, partition_by = "mdl_id")
 } else {
-  log_info("serve/model_cell.parquet exists — skipping re-sort (RELEASE_REDO_SERVE=1 to force)")
+  log_info("serve/model_cell/ exists — skipping repartition (RELEASE_REDO_SERVE=1 to force)")
 }
+# content fingerprint of the served surface (source table = deterministic, cheaper than scanning parts)
+serve_hash <- msens::hash_query(con, "SELECT mdl_key, cell_id, val FROM model_cell")
+n_parts    <- length(dir_ls(serve_mc, type = "directory"))
 dbDisconnect(con, shutdown = TRUE)
-knitr::kable(tibble(
-  file = c(glue("tables/{rel_tables}.parquet"), "serve/model_cell.parquet"),
-  mb   = round(file_size(c(glue("{tbl_dir}/{rel_tables}.parquet"),
-                           glue("{serve_dir}/model_cell.parquet"))) / 1e6, 1)))
+msens::report_table(tibble(
+  file = c(glue("tables/{rel_tables}.parquet"), glue("serve/model_cell/ ({n_parts} mdl_id partitions)")),
+  mb   = round(c(file_size(glue("{tbl_dir}/{rel_tables}.parquet")),
+                 sum(file_size(dir_ls(serve_mc, recurse = TRUE, glob = "*.parquet")))) / 1e6, 1)),
+  caption = "released Parquet (V2/zstd/80MB)")
 ```
 
 ## Sync data → S3
@@ -116,13 +127,24 @@ viewdb <- glue("{serve_dir}/serve.duckdb")
 if (file_exists(viewdb)) file_delete(viewdb)
 cv <- dbConnect(duckdb(viewdb))
 dbExecute(cv, "INSTALL httpfs; LOAD httpfs;")
-# explicit path-style HTTPS single-file URLs -> anonymous GET + HTTP range (the dotted bucket
-# breaks virtual-hosted TLS, so never use s3://… here). model_cell = the sorted serve file.
-dbExecute(cv, glue("CREATE VIEW model_cell AS SELECT * FROM read_parquet('{s3_http}/serve/model_cell.parquet')"))
+# tables: single files via explicit path-style HTTPS -> anonymous GET + HTTP range (the dotted
+# bucket breaks virtual-hosted TLS, so never use s3://… for these).
 for (t in rel_tables)
   dbExecute(cv, glue("CREATE VIEW {t} AS SELECT * FROM read_parquet('{s3_http}/tables/{t}.parquet')"))
+# model_cell is Hive-partitioned by the integer mdl_id (stored rows are cell_id,val). The HOT tile
+# path reads one partition by EXACT path in titiler (factory mdl_key->mdl_id fast-path, anonymous
+# GET, no LIST). This glob VIEW is for ad-hoc/statistics queries; it needs S3 LIST -> the aws
+# extension + credential chain (the server has creds; only place s3:// is needed). It joins the
+# `model` view back to the STABLE mdl_key so ad-hoc queries can select by mdl_key, not the internal id.
+dbExecute(cv, "INSTALL aws; LOAD aws; SET s3_url_style='path';")
+dbExecute(cv, "CREATE OR REPLACE SECRET atlas_s3 (TYPE s3, PROVIDER credential_chain, REGION 'us-east-1');")
+s3_uri <- glue("s3://{sub('^s3://', '', s3_ver)}")
+dbExecute(cv, glue("CREATE VIEW model_cell AS
+  SELECT m.mdl_key, mc.mdl_id, mc.cell_id, mc.val
+  FROM read_parquet('{s3_uri}/serve/model_cell/*/*.parquet', hive_partitioning = true) mc
+  JOIN model m USING (mdl_id)"))
 dbDisconnect(cv, shutdown = TRUE)
-log_info("view DB {viewdb} ({round(file_size(viewdb)/1e3,1)} KB) — views over {s3_http}")
+log_info("view DB {viewdb} ({round(file_size(viewdb)/1e3,1)} KB) — tables over {s3_http}, model_cell partitioned by mdl_id (public key = mdl_key)")
 ```
 
 ## Emit STAC catalog (tile links → titiler-{ver})
@@ -158,12 +180,13 @@ system2("ssh", c("msens", shQuote(glue(
 # 2. (re)build + start the parallel titiler-{ver}; restart caddy for its route
 system2("ssh", c("msens", glue(
   "cd {srv_repo} && git pull --quiet && docker compose up -d --build titiler-{ver} && docker compose restart caddy")))
-# 3. smoke test
-sql <- glue("SELECT cell_id, val AS value FROM model_cell WHERE mdl_key='{dbGetQuery(dbConnect(duckdb(sdm_db,read_only=TRUE)),\"SELECT mdl_key FROM model WHERE ds_key='ms_merge' LIMIT 1\")$mdl_key}'")
-b64 <- sdm_sql_b64(sql)
+# 3. smoke test — the stable-mdl_key fast-path (titiler resolves ->mdl_id, reads one partition)
+c0 <- dbConnect(duckdb(sdm_db, read_only = TRUE))
+mk <- dbGetQuery(c0, "SELECT mdl_key FROM model WHERE ds_key='ms_merge' ORDER BY mdl_id LIMIT 1")$mdl_key
+dbDisconnect(c0, shutdown = TRUE)
 code <- system2("curl", c("-s","-o","/dev/null","-w","%{http_code}",
-  glue("{titiler_v8}/statistics?sql={b64}")), stdout = TRUE)
-log_info("titiler-{ver} /statistics smoke test: HTTP {code}")
+  glue("{titiler_v8}/statistics?mdl_key={URLencode(mk, reserved = TRUE)}")), stdout = TRUE)
+log_info("titiler-{ver} /statistics?mdl_key={mk} smoke test: HTTP {code}")
 }
 ```
 
@@ -172,12 +195,13 @@ log_info("titiler-{ver} /statistics smoke test: HTTP {code}")
 ```{r}
 #| label: manifest
 
-write_json(
-  list(target = "release_marine-atlas", ver = ver, s3 = s3_ver,
-       tables = rel_tables, serve = "serve/model_cell.parquet (sorted by mdl_key)",
-       view_db = "serve.duckdb (views over S3)", stac = glue("{s3_http} + file host /stac/{ver}"),
-       titiler = titiler_v8, raw_included = do_raw, pushed_s3 = do_s3, deployed = do_deploy,
-       built = as.character(Sys.time())),
-  manifest, auto_unbox = TRUE, pretty = TRUE)
-manifest
+# content-addressed: fingerprint of the served model_cell surface (run-mode flags like
+# pushed_s3/deployed are side effects, not content, so they're excluded).
+msens::write_manifest(
+  manifest, target = "release_marine_atlas", content_hash = serve_hash,
+  stats = list(ver = ver, s3 = s3_ver, n_tables = length(rel_tables),
+               tables = paste(sort(rel_tables), collapse = ","),
+               serve = "serve/model_cell/ (partitioned by mdl_id)", n_partitions = n_parts,
+               titiler = titiler_v8),
+  force = msens::force_target("release_marine_atlas"))
 ```

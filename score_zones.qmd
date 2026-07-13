@@ -15,6 +15,20 @@ Foundation for `calc_scores` (v8): assemble the scoring DuckDB from the merged
 with `pct_covered` (0–100) via exactextractr coverage of each zone polygon over the
 cell-id grid. Scoring formulas need `zone_cell.pct_covered` at every step.
 
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "Assemble the scoring DB: merged model_cell + scoring taxon + zone/zone_cell coverage"
+flowchart LR
+  mrg["dist_merged model_cell"] --> mc["model_cell (sdm.duckdb)"]
+  mtx["merge.duckdb taxon<br/>+ v7 in_v7/is_er_spatial"] --> tx["taxon (scoring)"]
+  ply["program-area + ecoregion polys<br/>→ exact_extract vs cellid grid"] --> zc["zone + zone_cell<br/>(pct_covered 0-100)"]
+  mc --> mf["hash_query(model_cell,taxon,zone,zone_cell)<br/>→ content-addressed manifest"]
+  tx --> mf
+  zc --> mf
+```
+
 ## Setup — assemble the scoring DB
 
 ```{r}
@@ -124,7 +138,14 @@ dbWriteTable(con, "zone_cell", bind_rows(zc_rows) |> filter(pct_covered > 0), ov
 
 smry <- dbGetQuery(con, "SELECT z.fld, count(DISTINCT z.zone_seq) zones, count(*) zone_cells
   FROM zone z JOIN zone_cell zc USING(zone_seq) GROUP BY 1")
-knitr::kable(smry)
+msens::report_table(smry, caption = "zones + zone_cells by field")
+
+# content fingerprint of everything this notebook produces for downstream scoring:
+# model_cell + scoring taxon + zone + zone_cell (fold; before disconnect)
+zones_hash   <- paste0(msens::hash_query(con, "model_cell"), msens::hash_query(con, "taxon"),
+                       msens::hash_query(con, "zone"),       msens::hash_query(con, "zone_cell"))
+n_zones      <- dbGetQuery(con, "SELECT count(*) n FROM zone")$n
+n_zone_cells <- dbGetQuery(con, "SELECT count(*) n FROM zone_cell")$n
 dbDisconnect(con, shutdown = TRUE)
 ```
 
@@ -133,6 +154,9 @@ dbDisconnect(con, shutdown = TRUE)
 ```{r}
 #| label: manifest
 
-write_json(list(target = "score_zones", ver = ver, built = as.character(Sys.time())),
-  manifest, auto_unbox = TRUE, pretty = TRUE)
+# content-addressed: fingerprint of model_cell + taxon + zone + zone_cell (no wall-clock)
+msens::write_manifest(
+  manifest, target = "score_zones", content_hash = zones_hash,
+  stats = list(ver = ver, n_zones = n_zones, n_zone_cells = n_zone_cells),
+  force = msens::force_target("score_zones"))
 ```

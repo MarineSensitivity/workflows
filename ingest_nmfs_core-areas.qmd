@@ -16,6 +16,18 @@ msens::compute_er_score("NMFS:EN")` = 100 (extinction-risk score, never hard-cod
 `mdl_key = "ca_nmfs|{sp_id}"`. Same vector→cells pattern (`msens::cells_from_ranges()`)
 as the other range datasets; add rows to `areas` (with `er_code`) for future core areas.
 
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "NMFS Core Distribution Areas → extinction-risk value on the global 0.05° grid"
+flowchart LR
+  src["core-area shapefile(s)<br/>(Rice's whale)"] --> er["val = compute_er_score('NMFS:EN')<br/>= 100"]
+  er --> ee["cells_from_ranges()<br/>exact_extract vs 0.05° cellid COG"]
+  ee --> pq[("dist/dataset=ca_nmfs/{sp_id}.parquet<br/>(mdl_key, cell_id, val) · V2/zstd")]
+  pq --> mf["hash_parquet → content-addressed manifest"]
+```
+
 ## Setup + rasterize
 
 ```{r}
@@ -52,7 +64,7 @@ for (i in seq_len(nrow(areas))) {
   ply <- st_read(glue("{dir_ca}/{a$shp}"), quiet = TRUE)
   d   <- cells_from_ranges(ply, cellid_tif, value = compute_er_score(a$er_code))
   if (nrow(d) == 0) { log_warn("{a$sp_id}: no cells"); next }
-  write_parquet(tibble(mdl_key = a$mdl_key, cell_id = d$cell_id, val = d$val), out_pq)
+  msens::write_atlas_parquet(tibble(mdl_key = a$mdl_key, cell_id = d$cell_id, val = d$val), out_pq)
   log_info("{a$sp_id}: {nrow(d)} cells")
 }
 ```
@@ -67,12 +79,16 @@ con <- dbConnect(duckdb())
 smry <- dbGetQuery(con, glue(
   "SELECT count(DISTINCT mdl_key) n_models, count(*) n_cells, max(val) v_max
      FROM read_parquet('{dir_dist}/*.parquet')"))
+# order-independent content fingerprint of the on-disk surface (not the ingest run)
+h <- msens::hash_parquet(glue("{dir_dist}/*.parquet"), con)
 dbDisconnect(con, shutdown = TRUE)
-knitr::kable(smry)
+msens::report_table(smry, caption = "ca_nmfs model_cell surface")
 
-write_json(
-  list(target = "ingest_ca_nmfs", ds_key = ds_key, ver = ver,
-       n_models = nrow(areas), n_parquet = length(pq),
-       dir_dist = dir_dist, built = as.character(Sys.time())),
-  manifest, auto_unbox = TRUE, pretty = TRUE)
+# content-addressed manifest: deterministic, no wall-clock, no machine paths ->
+# downstream targets re-run only when this surface's content actually changes
+msens::write_manifest(
+  manifest, target = "ingest_ca_nmfs", content_hash = h,
+  stats = list(ds_key = ds_key, ver = ver, n_models = nrow(areas),
+               n_cells = smry$n_cells, v_max = smry$v_max, n_parquet = length(pq)),
+  force = msens::force_target("ingest_ca_nmfs"))
 ```

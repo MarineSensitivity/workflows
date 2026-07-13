@@ -17,6 +17,19 @@ that v8 ingests **all** birds, not v7's 571), and **`is_bcc`** (Birds of
 Conservation Concern). Keyed by `clean_sci_name()` so the merge crosswalk joins it
 to each taxon; the US-vs-IUCN precedence + `compute_er_score` happen in `merge_taxon`.
 
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "US federal lists → per-taxon MMPA/MBTA/ESA/BCC attributes joined on clean scientific name"
+flowchart LR
+  nmfs["NMFS directory<br/>(ESA + is_mmpa)"] --> comb["full_join by<br/>clean_sci_name()"]
+  fws["FWS Explorer<br/>(ESA + is_bcc)"] --> comb
+  mbta["CFR 50 §10.13<br/>(is_mbta)"] --> comb
+  comb --> tbl[("listing table<br/>merge.duckdb")]
+  tbl --> mf["hash_query(listing)<br/>→ content-addressed manifest"]
+```
+
 ## Setup + read the three lists
 
 ```{r}
@@ -82,8 +95,10 @@ con <- dbConnect(duckdb(merge_db))
 dbWriteTable(con, "listing", listing, overwrite = TRUE)
 smry <- dbGetQuery(con, "SELECT count(*) n, sum(is_mmpa::int) mmpa, sum(is_mbta::int) mbta,
   sum(is_bcc::int) bcc, count(*) FILTER(WHERE nmfs_esa<>'LC' OR fws_esa<>'LC') esa_listed FROM listing")
+# content fingerprint of the listing table (before disconnect)
+h <- msens::hash_query(con, "listing")
 dbDisconnect(con, shutdown = TRUE)
-knitr::kable(smry)
+msens::report_table(smry, caption = "US federal listing table summary")
 ```
 
 ## Manifest
@@ -91,8 +106,11 @@ knitr::kable(smry)
 ```{r}
 #| label: manifest
 
-write_json(
-  list(target = "ingest_listings", ver = ver, n = smry$n, n_mmpa = smry$mmpa,
-       n_mbta = smry$mbta, n_bcc = smry$bcc, built = as.character(Sys.time())),
-  manifest, auto_unbox = TRUE, pretty = TRUE)
+# content-addressed manifest: deterministic (no wall-clock) -> downstream targets
+# re-run only when the listing table's content actually changes
+msens::write_manifest(
+  manifest, target = "ingest_listings", content_hash = h,
+  stats = list(ver = ver, n = smry$n, n_mmpa = smry$mmpa,
+               n_mbta = smry$mbta, n_bcc = smry$bcc),
+  force = msens::force_target("ingest_listings"))
 ```

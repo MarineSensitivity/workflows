@@ -18,6 +18,20 @@ Aggregate the composite components to zones and compute the **program-area score
 
 Then the **`pra_score_delta` gate**: compare the v8 PA composite to v7's per program area.
 
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "Aggregate components to program areas (coverage-weighted, pct_area down-weight) → PA composite + v7 gate"
+flowchart LR
+  cm["cell_metric components"] --> za["component → PA<br/>Σ(val·cov)/Σcov"]
+  za --> pw["pct_area down-weight"]
+  pw --> sc["PA composite score"]
+  sc --> zm[("zone_metric (PA rows)<br/>sdm.duckdb")]
+  zm --> gate["pra_score_delta<br/>v8 vs v7 gate"]
+  zm --> mf["hash_query(zone_metric)<br/>→ content-addressed manifest"]
+```
+
 ## Setup
 
 ```{r}
@@ -85,6 +99,8 @@ dbExecute(con, glue("INSERT INTO zone_metric (zone_seq, metric_seq, val)
   GROUP BY zone_seq"))
 v8_pa <- dbGetQuery(con, glue("SELECT z.val AS programarea_key, round(zm.val,2) AS score_v8
   FROM zone z JOIN zone_metric zm USING(zone_seq) WHERE zm.metric_seq={sc} ORDER BY 1"))
+# content fingerprint of the zone_metric output table (before disconnect)
+zm_hash <- msens::hash_query(con, "zone_metric")
 dbDisconnect(con, shutdown=TRUE)
 ```
 
@@ -97,10 +113,13 @@ v7_pa <- st_read(pa_gpkg, quiet=TRUE) |> st_drop_geometry() |>
   transmute(programarea_key, score_v7 = round(score_extriskspcat_primprod_ecoregionrescaled_equalweights, 2))
 cmp <- v8_pa |> inner_join(v7_pa, by="programarea_key") |>
   mutate(delta = round(score_v8 - score_v7, 2)) |> arrange(desc(abs(delta)))
-knitr::kable(cmp)
+msens::report_table(cmp, caption = "program-area score: v8 vs v7")
 gate <- with(cmp, list(n=nrow(cmp), mean_abs=round(mean(abs(delta)),2), max_abs=round(max(abs(delta)),2),
   rmse=round(sqrt(mean(delta^2)),2), cor=round(cor(score_v8, score_v7),3)))
 str(gate)
-write_json(c(list(target="score_zone_metrics", ver=ver), gate, list(built=as.character(Sys.time()))),
-  manifest, auto_unbox=TRUE, pretty=TRUE)
+# content-addressed: fingerprint of the zone_metric output table + deterministic gate stats
+msens::write_manifest(
+  manifest, target = "score_zone_metrics", content_hash = zm_hash,
+  stats = c(list(ver = ver), gate),
+  force = msens::force_target("score_zone_metrics"))
 ```

@@ -23,6 +23,22 @@ cells with `area_km2` / `in_usa` / `in_pra`):
 - **`is_marine`** (marine-relevance filter): keeps genuinely marine/coastal **birds** in the
   score and culls terrestrial ones (v8 captures each bird's whole, largely-terrestrial range).
 
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "Per-taxon attributes on the merged model_cell: validity flags, range/rarity, sp_cat, is_marine"
+flowchart LR
+  mc["dist_merged model_cell<br/>∩ cell (area/in_usa/in_pra)"] --> tc["taxon_cell tallies<br/>n_cells/n_ocean/range_km2"]
+  tc --> flg["validity flags +<br/>rarity + pct_marine"]
+  wrm["WoRMS class/phylum<br/>(+ API supplement)"] --> cat["sp_cat by taxonomy"]
+  bl["raw bl ranges +<br/>marine families / curation"] --> mar["is_marine (birds)"]
+  flg --> tx[("taxon<br/>merge.duckdb")]
+  cat --> tx
+  mar --> tx
+  tx --> mf["hash_query(taxon)<br/>→ content-addressed manifest"]
+```
+
 ## Setup + compute
 
 ```{r}
@@ -243,6 +259,8 @@ mr <- dbGetQuery(con, "SELECT
   FROM taxon")
 log_info("marine birds: {mr$n_marine} of {mr$n_birds} ({mr$n_marine_usa} valid_usa)")
 knitr::kable(mr)
+# content fingerprint of the taxon output table (before disconnect)
+taxon_hash <- msens::hash_query(con, "taxon")
 dbDisconnect(con, shutdown = TRUE)
 ```
 
@@ -253,14 +271,18 @@ The governing `extrisk_code` / `er_score` (US-national/floored, via
 `merge_models` can apply them to the range-cell values — and carried through here on the
 `taxon` table (via `x.*` in the flags chunk above). No recompute needed.
 
-## Manifest
+## Outputs + manifest
 
 ```{r}
 #| label: manifest
 
-write_json(
-  list(target = "merge_taxon", ver = ver, n_taxa = smry$n_taxa,
-       valid_global = smry$valid_global, valid_usa = smry$valid_usa,
-       valid_pra = smry$valid_pra, built = as.character(Sys.time())),
-  manifest, auto_unbox = TRUE, pretty = TRUE)
+msens::report_table(smry, caption = "merge_taxon: validity flags")
+
+# content-addressed: fingerprint of the taxon output table (no wall-clock)
+msens::write_manifest(
+  manifest, target = "merge_taxon", content_hash = taxon_hash,
+  stats = list(ver = ver, n_taxa = smry$n_taxa,
+               valid_global = smry$valid_global, valid_usa = smry$valid_usa,
+               valid_pra = smry$valid_pra),
+  force = msens::force_target("merge_taxon"))
 ```

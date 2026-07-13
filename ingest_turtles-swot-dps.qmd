@@ -23,6 +23,20 @@ throughout. The EN/TN split is done at the **cell level** (rasterize both, combi
 — no fragile geometry intersection. Whole range, no land mask (turtles are marine,
 so these are ocean cells). `mdl_key = "rng_turtle_swot_dps|{code}"`.
 
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "SWOT ranges + NMFS DPS boundaries → cell-level EN/TN turtle ranges on the global 0.05° grid"
+flowchart LR
+  swot["SWOT global distribution<br/>(6 species)"] --> rng["cells_from_ranges(val=TN=50)"]
+  dps["NMFS DPS boundaries<br/>(Endangered sub-pops)"] --> en["cells_from_ranges(val=EN=100)"]
+  rng --> comb["cell-level combine<br/>EN inside DPS, else TN"]
+  en --> comb
+  comb --> pq[("dist/dataset=rng_turtle_swot_dps/{code}.parquet<br/>(mdl_key, cell_id, val) · V2/zstd")]
+  pq --> mf["hash_parquet → content-addressed manifest"]
+```
+
 ## Setup
 
 ```{r}
@@ -77,12 +91,12 @@ for (i in seq_len(nrow(swot_spp))) {
     dps     <- st_read(glue("{dir_dps}/{tolower(s$code)}_endangered.gpkg"), quiet = TRUE)
     d_range <- cells_from_ranges(swot, cellid_tif, value = er_tn)  # whole range = Threatened
     d_en    <- cells_from_ranges(dps,  cellid_tif, value = er_en)  # Endangered DPS areas
-    d <- d_range |> mutate(value = if_else(cell_id %in% d_en$cell_id, er_en, er_tn))
+    d <- d_range |> mutate(val = if_else(cell_id %in% d_en$cell_id, er_en, er_tn))
   } else {
     d <- cells_from_ranges(swot, cellid_tif, value = er_en)        # pure Endangered
   }
   if (nrow(d) == 0) { log_warn("{s$code}: no cells"); next }
-  write_parquet(tibble(mdl_key = s$mdl_key, cell_id = d$cell_id, val = d$val), out_pq)
+  msens::write_atlas_parquet(tibble(mdl_key = s$mdl_key, cell_id = d$cell_id, val = d$val), out_pq)
   log_info("{s$code} ({s$common_name}): {nrow(d)} cells")
 }
 ```
@@ -96,10 +110,12 @@ pq   <- dir_ls(dir_dist, glob = "*.parquet")
 con  <- dbConnect(duckdb())
 smry <- dbGetQuery(con, glue(
   "SELECT replace(mdl_key,'rng_turtle_swot_dps|','') code, count(*) n_cells,
-          count(*) FILTER (WHERE value = 100) n_en, count(*) FILTER (WHERE value = 50) n_tn
+          count(*) FILTER (WHERE val = 100) n_en, count(*) FILTER (WHERE val = 50) n_tn
      FROM read_parquet('{dir_dist}/*.parquet') GROUP BY mdl_key ORDER BY code"))
+# order-independent content fingerprint of the on-disk surface (not the ingest run)
+h <- msens::hash_parquet(glue("{dir_dist}/*.parquet"), con)
 dbDisconnect(con, shutdown = TRUE)
-knitr::kable(smry)
+msens::report_table(smry, caption = "rng_turtle_swot_dps model_cell surface")
 ```
 
 ## Manifest (target output)
@@ -107,10 +123,11 @@ knitr::kable(smry)
 ```{r}
 #| label: manifest
 
-write_json(
-  list(target = "ingest_turtles_swot_dps", ds_key = ds_key, ver = ver,
-       n_species = nrow(swot_spp), n_parquet = length(pq),
-       dir_dist = dir_dist, built = as.character(Sys.time())),
-  manifest, auto_unbox = TRUE, pretty = TRUE)
-manifest
+# content-addressed manifest: deterministic, no wall-clock, no machine paths ->
+# downstream targets re-run only when this surface's content actually changes
+msens::write_manifest(
+  manifest, target = "ingest_turtles_swot_dps", content_hash = h,
+  stats = list(ds_key = ds_key, ver = ver, n_species = nrow(swot_spp),
+               n_parquet = length(pq)),
+  force = msens::force_target("ingest_turtles_swot_dps"))
 ```

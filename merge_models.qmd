@@ -21,6 +21,20 @@ scale (~13B am cell-rows), so it must stream + spill rather than materialize:
   critical-habitat max-override — computed from **only the 6 turtle taxa's files**
   (never a full am scan, which is what OOM'd the naive version).
 
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "US-scoped per-taxon merge: max-merge over range footprint (governing er) + multiplicative turtles → streamed Parquet"
+flowchart LR
+  raw["dist/*/*.parquet<br/>(raw model_cell)"] --> mca["model_cell_all<br/>US-scoped, by ms_merge_key"]
+  mca --> mx["max-merge over range<br/>(er_score at range cells)"]
+  mca --> tt["turtles ×<br/>pmax(1, er·suit/100)"]
+  mx --> pq[("dist_merged/dataset=ms_merge/**<br/>V2/zstd via copy_atlas_parquet")]
+  tt --> pq
+  pq --> mf["hash_parquet → content-addressed manifest"]
+```
+
 ## Setup
 
 ```{r}
@@ -119,10 +133,10 @@ if (dir_exists(dir_merged)) dir_delete(dir_merged)
 dir_create(dir_merged)
 
 # Part 1: am-only taxa -> stream US am cells directly (no aggregate)
-dbExecute(con, glue("COPY (
-    SELECT mc.ms_merge_key AS mdl_key, mc.cell_id, mc.val FROM model_cell_all mc
-    WHERE mc.ms_merge_key IN (SELECT ms_merge_key FROM taxon_flags WHERE has_am AND NOT has_range)
-  ) TO '{dir_merged}/p_amonly' (FORMAT parquet, PER_THREAD_OUTPUT true, COMPRESSION zstd)"))
+msens::copy_atlas_parquet(con,
+  "SELECT mc.ms_merge_key AS mdl_key, mc.cell_id, mc.val FROM model_cell_all mc
+    WHERE mc.ms_merge_key IN (SELECT ms_merge_key FROM taxon_flags WHERE has_am AND NOT has_range)",
+  glue("{dir_merged}/p_amonly"), per_thread = TRUE)
 
 # ER RECONCILIATION (the "fitting point"): a range presence cell carries the taxon's
 # GOVERNING er_score (US-national/floored, from merge_models_prep) — NOT the raw
@@ -154,15 +168,17 @@ dbExecute(con, "CREATE OR REPLACE TABLE mc_both AS
 log_info("range-only {dbGetQuery(con,'SELECT count(*) n FROM mc_rangeonly')$n}, both {dbGetQuery(con,'SELECT count(*) n FROM mc_both')$n} cells")
 
 # write parts 2+3+turtles alongside the streamed part 1
-dbExecute(con, glue("COPY (
-    SELECT mdl_key, cell_id, val FROM mc_rangeonly
+msens::copy_atlas_parquet(con,
+  "SELECT mdl_key, cell_id, val FROM mc_rangeonly
     UNION ALL SELECT mdl_key, cell_id, val FROM mc_both
-    UNION ALL SELECT mdl_key, cell_id, val FROM mc_turtle
-  ) TO '{dir_merged}/p_agg' (FORMAT parquet, PER_THREAD_OUTPUT true, COMPRESSION zstd)"))
+    UNION ALL SELECT mdl_key, cell_id, val FROM mc_turtle",
+  glue("{dir_merged}/p_agg"), per_thread = TRUE)
 
 smry <- dbGetQuery(con, glue("SELECT count(DISTINCT mdl_key) n_taxa, count(*) n_cells,
   min(val) v_min, max(val) v_max FROM read_parquet('{dir_merged}/**/*.parquet')"))
-knitr::kable(smry)
+# order-independent fingerprint of the merged surface (before disconnect)
+h <- msens::hash_parquet(glue("{dir_merged}/**/*.parquet"), con)
+msens::report_table(smry, caption = "merged model_cell surface (ms_merge)")
 dbDisconnect(con, shutdown = TRUE)
 ```
 
@@ -171,8 +187,10 @@ dbDisconnect(con, shutdown = TRUE)
 ```{r}
 #| label: manifest
 
-write_json(
-  list(target = "merge_models", ver = ver, n_taxa = smry$n_taxa, n_cells = smry$n_cells,
-       dir_merged = dir_merged, built = as.character(Sys.time())),
-  manifest, auto_unbox = TRUE, pretty = TRUE)
+# content-addressed: fingerprint of the merged Parquet surface (no wall-clock, no path)
+msens::write_manifest(
+  manifest, target = "merge_models", content_hash = h,
+  stats = list(ver = ver, n_taxa = smry$n_taxa, n_cells = smry$n_cells,
+               v_min = smry$v_min, v_max = smry$v_max),
+  force = msens::force_target("merge_models"))
 ```

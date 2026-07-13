@@ -67,10 +67,12 @@ recs <- lapply(qmds, function(q) {
   wt   <- m$workflow_type %||% ""
   if (is.null(m) || !nzchar(wt) || !wt %in% cat_order) return(NULL)   # only pipeline notebooks
   ds   <- m$dataset                                                   # ingests only
-  # last-ran: the manifest `built` timestamp (falls back to qmd mtime)
+  # last-ran: the manifest file's mtime. manifests are now content-addressed and
+  # only rewritten when the output content changes (msens::write_manifest skips an
+  # unchanged write, preserving mtime), so this reads as "last time output changed".
   manf <- if (!is.null(m$output)) file.path(wd, m$output) else NA_character_
   built <- if (!is.na(manf) && file.exists(manf))
-    tryCatch(jsonlite::fromJSON(manf)$built, error = function(e) NULL) else NULL
+    tryCatch(format(file.info(manf)$mtime, "%Y-%m-%d %H:%M"), error = function(e) NULL) else NULL
   html <- if (file.exists(file.path(out_dir, paste0(base, ".html")))) paste0(base, ".html") else ""
 
   list(

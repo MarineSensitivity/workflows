@@ -23,6 +23,19 @@ Emits `taxon` (one row per taxon: id, authority, name, `worms_is_marine`…) and
 `taxon_model` (`mdl_key ↔ taxon_id`), keyed for merge by
 `mdl_key_merged(authority, taxon_id)` → `ms_merge|WORMS:…` / `ms_merge|BOTW:…`.
 
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "Crosswalk each model → common taxon (BOTW birds / WORMS rest) + governing extinction-risk floors"
+flowchart LR
+  csv["dist/model_{ds}.csv<br/>∩ ingested mdl_keys"] --> res["resolve taxon:<br/>bird→BOTW:sisid, else WORMS:id<br/>(reuse v7 + match_taxa)"]
+  res --> tm[("taxon_model + taxon<br/>merge.duckdb")]
+  lst["listing + WoRMS Mammalia<br/>(MMPA/MBTA floors)"] --> er["governing er_score<br/>compute_er_score()"]
+  er --> tm
+  tm --> mf["hash_query(taxon)+hash_query(taxon_model)<br/>→ content-addressed manifest"]
+```
+
 ## Setup + read all model crosswalks
 
 ```{r}
@@ -216,16 +229,25 @@ log_info("taxonomy floors: {sum(tx$is_mmpa)} Mammalia (MMPA), {sum(tx$is_mbta)} 
 dbDisconnect(con, shutdown = TRUE)
 ```
 
-## Manifest
+## Outputs + manifest
 
 ```{r}
 #| label: manifest
 
-write_json(
-  list(target = "merge_models_prep", ver = ver,
-       n_models = nrow(taxon_model), n_taxa = nrow(taxon),
-       n_worms = sum(taxon$taxon_authority == "worms"),
-       n_botw  = sum(taxon$taxon_authority == "botw"),
-       built = as.character(Sys.time())),
-  manifest, auto_unbox = TRUE, pretty = TRUE)
+# content-addressed: fingerprint of the taxon + taxon_model output tables (reopen
+# read-only since the er_score chunk already disconnected)
+con <- dbConnect(duckdb(glue("{dir_atlas}/merge.duckdb"), read_only = TRUE))
+h   <- paste0(msens::hash_query(con, "taxon"), msens::hash_query(con, "taxon_model"))
+dbDisconnect(con, shutdown = TRUE)
+
+smry <- tibble(n_taxa = nrow(taxon), n_models = nrow(taxon_model),
+               n_worms = sum(taxon$taxon_authority == "worms"),
+               n_botw  = sum(taxon$taxon_authority == "botw"))
+msens::report_table(smry, caption = "merge_models_prep: taxa + models")
+
+msens::write_manifest(
+  manifest, target = "merge_models_prep", content_hash = h,
+  stats = list(ver = ver, n_models = smry$n_models, n_taxa = smry$n_taxa,
+               n_worms = smry$n_worms, n_botw = smry$n_botw),
+  force = msens::force_target("merge_models_prep"))
 ```

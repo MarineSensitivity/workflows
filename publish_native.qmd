@@ -27,6 +27,25 @@ reptile/amphibian) — the set the species app actually lists.
 `NATIVE_TEST_N=<n>` (only first n am COGs, smoke test), `NATIVE_NO_S3` (stage locally, skip upload),
 `NATIVE_WORKERS=<n>`.
 
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "Per-model native inputs: vector ranges → PMTiles, AquaMaps cells → COGs, unified in a native_asset registry"
+flowchart LR
+  srv["merge.duckdb<br/>served taxa"] --> vec["vector ranges"]
+  srv --> am["AquaMaps"]
+  vec --> vn["PMTiles polygons<br/>representation=native"]
+  vec --> vm["0.05° gridded COG (opt-in)<br/>representation=model"]
+  am --> an["0.5° HCAF COG<br/>representation=native"]
+  am --> amm["0.05° resampled COG<br/>representation=model"]
+  vn --> reg[("native_asset<br/>mdl_key × representation → url, bbox")]
+  vm --> reg
+  an --> reg
+  amm --> reg
+  reg --> mf["hash_query → content-addressed manifest"]
+```
+
 ## Setup
 
 ```{r}
@@ -219,7 +238,7 @@ if (!skip_pmt) for (ds in pmt_ds) {
   }
   if (is.null(built) || !nrow(built)) { log_warn("{ds}: no PMTiles built"); next }
   pmt_rows[[ds]] <- built |> transmute(
-    mdl_key, ds_key = ds, asset_type = "pmtiles",
+    mdl_key, ds_key = ds, asset_type = "pmtiles", representation = "native",   # source polygons = original
     # per-model URL; ?v={mtime} busts the browser/PMTiles-protocol cache on rebuild
     # (Caddy ignores the query and serves the file).
     asset_url = glue("{pmt_base}/{ds}/{path_file(file)}?v={as.integer(file_info(file)$modification_time)}"),
@@ -254,11 +273,11 @@ if (!skip_am && length(am_take)) {
     dbExecute(con, glue("SET temp_directory='{dir_atlas}/duckdb_tmp'"))
     dbExecute(con, "SET partitioned_write_max_open_files=400")
     dbWriteTable(con, "am_map", am_map, overwrite = TRUE)
-    dbExecute(con, glue("COPY (
+    msens::copy_atlas_parquet(con, glue("
       SELECT map.mid, p.cell_id, p.val
       FROM read_parquet('{dir_atlas}/dist/dataset=am/*.parquet') p
-      JOIN am_map map ON p.mdl_key = map.mdl_key
-    ) TO '{am_parts}' (FORMAT parquet, COMPRESSION zstd, PARTITION_BY (mid), OVERWRITE_OR_IGNORE)"))
+      JOIN am_map map ON p.mdl_key = map.mdl_key"),
+      am_parts, partition_by = "mid")
     dbDisconnect(con, shutdown = TRUE)
     log_info("_am_parts: {length(dir_ls(am_parts))} partitions, {round(sum(file_size(dir_ls(am_parts, recurse=TRUE, type='file')))/1e9,1)} GB")
   } else log_info("_am_parts exists — skip repartition (REDO_NATIVE=1 to force)")
@@ -298,11 +317,110 @@ if (!skip_am && length(am_take) && dir_exists(am_parts)) {
     plan(sequential)
   }
   built <- glue("{dir_cog}/{safe_key(am_map$mdl_key)}.tif")
+  # representation = "model": these COGs are painted from dist/dataset=am (the 0.05° bilinear-
+  # RESAMPLED suitability actually used in scoring) — NOT AquaMaps' native 0.5° cells. The native
+  # surface is published separately below (representation = "native").
   am_reg <- tibble(
-    mdl_key = am_map$mdl_key, ds_key = "am", asset_type = "cog",
+    mdl_key = am_map$mdl_key, ds_key = "am", asset_type = "cog", representation = "model",
     asset_url = glue("{s3_http}/native/am/{safe_key(am_map$mdl_key)}.tif"),
     rescale_min = 1L, rescale_max = 100L, colormap = "spectral_r")[file_exists(built), ]
-  log_info("am COGs on disk: {nrow(am_reg)} / {nrow(am_map)}")
+  log_info("am model COGs (0.05° resampled) on disk: {nrow(am_reg)} / {nrow(am_map)}")
+}
+```
+
+## AquaMaps native 0.5° COGs (the *original* surface)
+
+Publish each served AquaMaps model at its **true native 0.5°** resolution — the HCAF `probability`
+painted by `loiczid` onto the 720×360 half-degree grid (`publish_cog` is grid-agnostic; `loiczid`
+is its row-major top-left index, verified against the ingest). This is the **original**
+representation, distinct from the 0.05°-resampled model COGs above; `probability×100` shares the
+[0,100] rescale. Parallel + resumable.
+
+```{r}
+#| label: am-native-cogs
+
+dir_cog_native <- glue("{dir_native}/am_native"); dir_create(dir_cog_native)
+am_native_reg  <- tibble()
+if (!skip_am && length(am_take) && file_exists(am_db)) {
+  native_grid <- grid_spec(rast(nrows = 360, ncols = 720, xmin = -180, xmax = 180,
+                                ymin = -90, ymax = 90, crs = "EPSG:4326"))
+  todo_n <- am_map[!file_exists(glue("{dir_cog_native}/{safe_key(am_map$mdl_key)}.tif")), ]
+  log_info("am native 0.5° COGs: {nrow(am_map)} target, {nrow(todo_n)} to build")
+
+  build_native <- function(rows) {
+    suppressMessages({library(DBI); library(duckdb); library(terra)})
+    con <- dbConnect(duckdb(am_db, read_only = TRUE)); on.exit(dbDisconnect(con, shutdown = TRUE))
+    for (i in seq_len(nrow(rows))) {
+      k <- rows$mdl_key[i]; sp <- sub("^am\\|", "", k)
+      f <- sprintf("%s/%s.tif", dir_cog_native, safe_key(k))
+      if (file.exists(f)) next
+      d <- dbGetQuery(con, sprintf(
+        "SELECT c.loiczid AS cell_id, s.probability*100 AS val
+           FROM spp_cells s JOIN cells c USING (cell_id) WHERE s.sp_key = '%s'", sp))
+      if (nrow(d)) msens::publish_cog(d$cell_id, d$val, f, native_grid)
+    }
+    nrow(rows)
+  }
+  if (nrow(todo_n)) {
+    plan(multisession, workers = n_workers)
+    batches <- split(todo_n, (seq_len(nrow(todo_n)) - 1) %% n_workers)
+    future_map(batches, build_native,
+               .options = furrr_options(globals = c("am_db","dir_cog_native","native_grid","safe_key"),
+                                        packages = c("msens"), seed = TRUE))
+    plan(sequential)
+  }
+  built_n <- glue("{dir_cog_native}/{safe_key(am_map$mdl_key)}.tif")
+  am_native_reg <- tibble(
+    mdl_key = am_map$mdl_key, ds_key = "am", asset_type = "cog", representation = "native",
+    asset_url = glue("{s3_http}/native/am_native/{safe_key(am_map$mdl_key)}.tif"),
+    rescale_min = 1L, rescale_max = 100L, colormap = "spectral_r")[file_exists(built_n), ]
+  log_info("am native 0.5° COGs on disk: {nrow(am_native_reg)} / {nrow(am_map)}")
+}
+```
+
+## Vector inputs → 0.05° gridded COGs (the *interpolated* surface, opt-in)
+
+Each vector input's dist surface (`(cell_id, val)` on the 0.05° grid) painted as a COG — the
+**model/interpolated** representation of a vector range, complementing its native PMTiles polygons
+(so both representations exist per `mdl_key`). Opt-in (`NATIVE_VEC_COG=1`) since there are
+thousands; iterates each dist file once (each holds one model) and `publish_cog`s the served ones.
+
+```{r}
+#| label: vec-grid-cogs
+
+do_vec_cog  <- nzchar(Sys.getenv("NATIVE_VEC_COG"))
+vec_cog_reg <- tibble()
+if (do_vec_cog && nrow(pmt_reg)) {
+  dir_vcog <- glue("{dir_native}/vec_grid"); dir_create(dir_vcog)
+  keys_by_ds <- split(pmt_reg$mdl_key, pmt_reg$ds_key)          # served vector models per dataset
+  grid <- grid_spec(rast(cellid_tif))
+
+  build_ds <- function(ds, keys) {
+    suppressMessages({library(DBI); library(duckdb); library(terra); library(arrow)})
+    files <- fs::dir_ls(glue("{dir_atlas}/dist/dataset={ds}"), glob = "*.parquet")
+    con <- dbConnect(duckdb()); on.exit(dbDisconnect(con, shutdown = TRUE))
+    for (fp in files) {
+      k <- dbGetQuery(con, sprintf("SELECT DISTINCT mdl_key FROM read_parquet('%s') LIMIT 1", fp))$mdl_key
+      if (length(k) != 1 || !k %in% keys) next
+      f <- sprintf("%s/%s.tif", dir_vcog, safe_key(k))
+      if (file.exists(f)) next
+      d <- dbGetQuery(con, sprintf("SELECT cell_id, val FROM read_parquet('%s')", fp))
+      if (nrow(d)) msens::publish_cog(d$cell_id, d$val, f, grid)
+    }
+    length(files)
+  }
+  plan(multisession, workers = n_workers)
+  future_map2(names(keys_by_ds), keys_by_ds, build_ds,
+              .options = furrr_options(globals = c("dir_vcog","dir_atlas","grid","safe_key"),
+                                       packages = c("msens"), seed = TRUE))
+  plan(sequential)
+
+  vec_cog_reg <- pmt_reg |> distinct(mdl_key, ds_key) |> mutate(
+    asset_type = "cog", representation = "model",
+    asset_url = glue("{s3_http}/native/vec_grid/{safe_key(mdl_key)}.tif"),
+    rescale_min = 1L, rescale_max = 100L, colormap = "spectral_r")
+  vec_cog_reg <- vec_cog_reg[file_exists(glue("{dir_vcog}/{safe_key(vec_cog_reg$mdl_key)}.tif")), ]
+  log_info("vector grid COGs on disk: {nrow(vec_cog_reg)}")
 }
 ```
 
@@ -311,11 +429,14 @@ if (!skip_am && length(am_take) && dir_exists(am_parts)) {
 ```{r}
 #| label: registry
 
-# per-input-model asset rows: am COGs AND vector PMTiles are now both per-model — pmt_reg
-# already carries one (mdl_key, asset_url) row per model (its own PMTiles file).
+# per-input-model asset rows across BOTH representations:
+#   original/native  = vector PMTiles (source polygons) + am native 0.5° COGs
+#   model/interpolated = am 0.05° resampled COGs (+ vector 0.05° gridded COGs if enabled)
+# each keyed on the STABLE mdl_key; the `representation` column distinguishes them.
 pmt_model_rows <- if (nrow(pmt_reg)) pmt_reg else tibble()
+vec_cog_rows   <- if (exists("vec_cog_reg") && nrow(vec_cog_reg)) vec_cog_reg else tibble()
 
-asset_info <- bind_rows(am_reg, pmt_model_rows) |>
+asset_info <- bind_rows(am_reg, am_native_reg, pmt_model_rows, vec_cog_rows) |>
   mutate(across(everything(), ~ if (is.factor(.)) as.character(.) else .))
 
 # per-model geographic bbox (cell_id row/col arithmetic on the global grid) so the app fits
@@ -367,10 +488,11 @@ native_asset <- asset_info |>
   relocate(ms_merge_key)
 
 dbWriteTable(con, "native_asset", native_asset, overwrite = TRUE)
-smry <- dbGetQuery(con, "SELECT asset_type, count(*) n_rows, count(DISTINCT mdl_key) n_models,
-  count(DISTINCT ms_merge_key) n_taxa, count(DISTINCT ds_key) n_ds FROM native_asset GROUP BY 1")
+smry <- dbGetQuery(con, "SELECT representation, asset_type, count(*) n_rows,
+  count(DISTINCT mdl_key) n_models, count(DISTINCT ms_merge_key) n_taxa, count(DISTINCT ds_key) n_ds
+  FROM native_asset GROUP BY 1, 2 ORDER BY 1, 2")
 dbDisconnect(con, shutdown = TRUE)
-knitr::kable(smry)
+msens::report_table(smry, caption = "native_asset registry by representation × asset type")
 ```
 
 ## Sync → S3 (COGs) + file host (PMTiles)
@@ -378,13 +500,17 @@ knitr::kable(smry)
 ```{r}
 #| label: sync
 
+aws_sync <- function(local, prefix) {
+  st <- system2("aws", c("s3","sync", local, glue("{s3_ver}/{prefix}"),
+                         "--only-show-errors","--no-progress"), stdout=TRUE, stderr=TRUE)
+  if (!is.null(attr(st,"status")) && attr(st,"status")!=0) stop(paste(st, collapse="\n"))
+  log_info("synced {path_file(local)} -> {s3_ver}/{prefix}")
+}
 if (do_s3) {
-  if (nrow(am_reg)) {
-    st <- system2("aws", c("s3","sync", dir_cog, glue("{s3_ver}/native/am"),
-                           "--only-show-errors","--no-progress"), stdout=TRUE, stderr=TRUE)
-    if (!is.null(attr(st,"status")) && attr(st,"status")!=0) stop(paste(st, collapse="\n"))
-    log_info("synced am COGs -> {s3_ver}/native/am")
-  }
+  if (nrow(am_reg))        aws_sync(dir_cog,        "native/am")         # model (0.05° resampled)
+  if (nrow(am_native_reg)) aws_sync(dir_cog_native, "native/am_native") # original (0.5° native)
+  if (exists("vec_cog_reg") && nrow(vec_cog_reg))
+                           aws_sync(glue("{dir_native}/vec_grid"), "native/vec_grid")  # vector model grid
   # PMTiles -> server file host (/share/data/derived/pmtiles/{ver}); also keep on S3
   if (nrow(pmt_reg)) {
     system2("ssh", c("msens", glue("mkdir -p /share/data/derived/pmtiles/{ver}")))
@@ -401,12 +527,22 @@ if (do_s3) {
 ```{r}
 #| label: manifest
 
-write_json(list(
-  target = "publish_native", ver = ver,
-  pmtiles_datasets = if (nrow(pmt_reg)) pmt_reg$ds_key else character(0),
-  am_cogs = nrow(am_reg),
-  native_assets = nrow(native_asset), pushed_s3 = do_s3,
-  built = as.character(Sys.time())),
-  manifest, auto_unbox = TRUE, pretty = TRUE)
-manifest
+# content-addressed: fingerprint the native_asset registry table (reopen sdm.duckdb
+# read-only — the registry chunk already disconnected). Deterministic: no wall-clock,
+# no machine paths, no run-mode flags.
+con <- dbConnect(duckdb(sdm_db, read_only = TRUE))
+h   <- msens::hash_query(con, "native_asset")
+dbDisconnect(con, shutdown = TRUE)
+
+msens::write_manifest(
+  manifest, target = "publish_native", content_hash = h,
+  stats = list(
+    ver = ver,
+    pmtiles_datasets = if (nrow(pmt_reg)) paste(sort(unique(pmt_reg$ds_key)), collapse = ",") else "",
+    n_pmtiles_native = nrow(pmt_reg),                                    # vector original polygons
+    am_cogs_model    = nrow(am_reg),                                     # am 0.05° resampled
+    am_cogs_native   = if (exists("am_native_reg")) nrow(am_native_reg) else 0L,  # am 0.5° original
+    vec_cogs_model   = if (exists("vec_cog_reg")) nrow(vec_cog_reg) else 0L,      # vector 0.05° gridded
+    native_assets    = nrow(native_asset)),
+  force = msens::force_target("publish_native"))
 ```

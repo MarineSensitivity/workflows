@@ -28,6 +28,19 @@ Source `ply.gpkg` is derived from the NMFS ESA Critical Habitat geodatabase (see
 extraction + QA maps). Re-run control: `REDO_INGEST=1` rebuilds all models (else
 the loop resumes, skipping species whose Parquet exists).
 
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "NMFS ESA critical habitat → extinction-risk value on the global 0.05° grid"
+flowchart LR
+  src["ply.gpkg<br/>per-species CH polygons"] --> mdl["one model per SCIENAME<br/>most-protective ESA status"]
+  mdl --> er["val = compute_er_score('NMFS:code')<br/>EN100 TN50"]
+  er --> ee["cells_from_ranges()<br/>exact_extract vs 0.05° cellid COG"]
+  ee --> pq[("dist/dataset=ch_nmfs/{sp_id}.parquet<br/>(mdl_key, cell_id, val) · V2/zstd")]
+  pq --> mf["hash_parquet → content-addressed manifest"]
+```
+
 ## Setup
 
 ```{r}
@@ -93,7 +106,7 @@ for (i in seq_len(nrow(todo))) {
   ply_sp <- ply |> filter(SCIENAME == row$SCIENAME) |> summarise(.groups = "drop")
   d <- cells_from_ranges(ply_sp, cellid_tif, value = row$er_score)   # ER score, not hard-coded
   if (nrow(d) == 0) { log_warn("  {row$sp_id}: no ocean cells covered"); next }
-  write_parquet(
+  msens::write_atlas_parquet(
     tibble(mdl_key = row$mdl_key, cell_id = d$cell_id, val = d$val),
     path(dir_dist, row$sp_id, ext = "parquet"))
 }
@@ -111,8 +124,10 @@ smry <- dbGetQuery(con, glue(
   "SELECT count(DISTINCT mdl_key) n_models, count(*) n_cells,
           min(val) v_min, max(val) v_max
      FROM read_parquet('{dir_dist}/*.parquet')"))
+# order-independent content fingerprint of the on-disk surface (not the ingest run)
+h <- msens::hash_parquet(glue("{dir_dist}/*.parquet"), con)
 dbDisconnect(con, shutdown = TRUE)
-knitr::kable(smry)
+msens::report_table(smry, caption = "ch_nmfs model_cell surface")
 ```
 
 ## Manifest (target output)
@@ -120,10 +135,12 @@ knitr::kable(smry)
 ```{r}
 #| label: manifest
 
-write_json(
-  list(target = "ingest_ch_nmfs", ds_key = ds_key, ver = ver,
-       n_models = nrow(sp), n_parquet = length(pq),
-       dir_dist = dir_dist, source = path_file(ply_geo), built = as.character(Sys.time())),
-  manifest, auto_unbox = TRUE, pretty = TRUE)
-manifest
+# content-addressed manifest: deterministic, no wall-clock, no machine paths ->
+# downstream targets re-run only when this surface's content actually changes
+msens::write_manifest(
+  manifest, target = "ingest_ch_nmfs", content_hash = h,
+  stats = list(ds_key = ds_key, ver = ver, n_models = nrow(sp),
+               n_cells = smry$n_cells, v_min = smry$v_min, v_max = smry$v_max,
+               n_parquet = length(pq), source = path_file(ply_geo)),
+  force = msens::force_target("ingest_ch_nmfs"))
 ```

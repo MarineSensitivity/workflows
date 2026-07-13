@@ -34,6 +34,47 @@
   Let's write a manuscript (with a plan first to discuss) on forwarding the vision of this project to the next iteration (plan )
   '/Users/bbest/Library/CloudStorage/GoogleDrive-ben@ecoquants.com/.shortcut-targets-by-id/1sppUmlMtZ-sXaBm72M1-8PnjVudXO91v/US MBON Public Folder/Working Groups/BioIndicators/manuscripts/atlas/atlas _ BioIndicators manuscript.md'
 
+## 2026-07-13 parquet 2.0
+
+We made lots of progress with `v8`. Let's improve upon it in several ways:
+
+1. Parquet and DuckDB. From DuckDB, the default parquet version is very old and much improved with `V2`. Also `zstd` compression is preferred over snappy and 80MB row groups get the most general performance. There was also a major improvement with DuckDB `1.5+` introducing native `GEOMETRY` type, so let's make that the minimimum R package version with msens and backward compatability with duckdb and parquet files.
+ 
+2. Workflows with target hashes and rendered QMDs to HTML. The whole pipeline of QMDs was executed, but not rendered to HTML. Now that we're updating the parquet format and need to re-run, let's also render the QMDs to HTML. There is also not an output target specified yet in these notebooks that allows the generation of a checksum hash and therefore properly triggers downstream notebooks on changes. The trick is that it seems timestamps, metadata or contents might change even if content is identical in a parquet file. This might not be the case if sort order is explicitly identified, but requires some testing and should be part of this revamp.
+
+Also evaluate `@./dev/plans/2026-07-13 v8 next steps — parquet+workflow, gm+nc density, Phase 11 cutover.md` for next steps. Let's fix some of the parquet publishing gotchas along the way, then resume with gm + nc.
+
+Also implement flags that allow recreation of parquet/json files even if already exist, and default to skip if exists without changes (in content, NOT timestamp alone) since last time. Creation in all cases should be idempotent. And we want some basic reporting in all the QMDs with tables summarizing outputs and possibly mermaid diagrams (always rendered as PNGs with lightbox) explaining architecture and design choices
+
+Planning: /Users/bbest/.claude/plans/we-made-lots-of-starry-bird.md
+──────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☒ GEOMETRY scope  ☐ Content hash  ☐ Serve re-sort  ✔ Submit  →
+
+**GEOMETRY scope** For the DuckDB 1.5+ / native GEOMETRY part — persist geometry now, or just enable it?
+
+  1. Enable only (pin + standardize) ✔
+     Pin duckdb>=1.5 in msens, standardize the writer (V2/zstd/80MB), keep everything as (mdl_key,cell_id,val). GEOMETRY becomes available but no geometry columns are written yet. Smallest, safest; matches the core 'improve parquet format' ask. Design leaves room to add a GEOMETRY cell column later without rework.
+  2. Also make cell.parquet GeoParquet
+     Additionally add a native GEOMETRY column (cell centroid point, or 0.05° polygon) to tables/cell.parquet so it's real GeoParquet — GIS/STAC-consumable. Modest extra work; cell table grows; consumers must tolerate the geometry column.
+  3. Full: cell + native ranges GeoParquet
+     Geometry on the cell table AND publish native range surfaces as GeoParquet alongside PMTiles. Largest scope; touches publish_native and the native_asset registry.
+❯ 4. Enable only for now. Another important large-scale redo aspect of this revamp this reminds me of: the AquaMaps STAC published is for the 0.05 degree resampled version of AquaMaps, not its native cells of 0.5. A big motivating force behind going global with the ingest of `v8` is the ability to show BOTH: a) the original native SDM, so for AquaMaps that is in 0.5 degree cells; and b) the resampled (and for future density surface models, rescaled 0-100) version used in the modeling. We skipped a) and are showing b) as if its the original, which is NOT true. We need to faithfully do this for BOTH raster AND vector. Right now, we are using PMTiles to show original vector, but not showing the raster interpolated version yet.
+
+**Content hash** How should the content fingerprint / change-detection work? (You flagged parquet timestamps/sort-order as needing testing.)
+
+❯ 1. Order-independent DuckDB hash ✔
+     Fingerprint = count(*) + bit_xor(hash(row)) + sum(hash(row)) over the on-disk parquet — commutative, so robust to row order, row-group boundaries, compression, and parquet metadata timestamps. No need to force deterministic bytes. Stored in a deterministic manifest (drop wall-clock 'built'); downstream re-runs only when the fingerprint changes. Recommended.
+  1. Deterministic bytes + file hash
+     Force every parquet to write byte-identical for identical data (fixed ORDER BY, stripped metadata) then hash the file bytes. Simpler concept but fragile — parquet embeds stats/timestamps and DuckDB/arrow don't guarantee reproducible bytes; likely to false-trigger.
+
+**Serve re-sort** The serve/model_cell.parquet re-sort is a known gotcha (~3GB global ORDER BY, risks the ~500GB spill). Change it now or defer?
+
+❯ 1. Keep ORDER BY, just upgrade format
+     This pass only upgrades serve/model_cell.parquet to V2/zstd/80MB row groups, keeping the current ORDER BY mdl_key layout (better zone-map pruning for titiler). Lowest risk to the live titiler-v8 read path. Defer the PARTITION_BY change to a separate, measured step.
+  1. Switch to PARTITION_BY(mid) now ✔
+     Repartition the serving surface by an integer model id (the AquaMaps-COG trick) to avoid the global ORDER BY spill and let titiler do partition-pruning. Faster/cheaper to build, but changes the titiler read path and needs a point-read benchmark before it's trusted.
+
+
 ## 2026-07-07 revert to AquaX raster 0.05
 
 In the face of ~4 days conversion to hex and the realization that our biggest SDM provider, AquaX, for the next round, is already in a 0.05° raster (see >10K TIFs in `@/_big/msens/AquaX_2026-04/SDM/MBON_USA_BOEM_masked_emmean_matched_species_TIF_TIF/`), the best course of action is to keep v8 at the same raster resolution and not resolve to this H3 hexagon spatial unit route. We do want to still go global on species ingest and use a global grid [-180,180] (not [0,360]) and keep the workflow pipeline improvements, but need to roll back the hexagon stuff (at least from the pipeline, fine to keep helper functions for future TBD use).
@@ -897,6 +938,450 @@ This touches the ER architecture (the memory note "range value = compute_er_scor
 ----
 
 Great! This ingestion of range distributions (vs suitability) is slightly problematic b/c values could be out of date (eg newer IUCN score) or out of context (eg NOAA/FWS national score overrides IUCN international, or floor gets set b/c MMPA or MBTA). The er score most closely associated with the input dataset (eg outdated IUCN ER or locally available FWS/SWOT, using `msens::compute_er_score()`) should be applied for the ingested dataset species layer. Then values should be updated for the merged model at a fitting point. This aspect needs to be documented and the dependencies should reflect sequencing to arrive at values matching `v7` (which I believe followed this model).
+
+### bird culling, MBTA not for all birds
+
+What global whole-range pct_marine threshold should mark a bird as "marine-relevant" (kept in scoring)? Culling by whole-range ocean fraction is imperfect: wide-ranging coastal birds (Ring-billed Gull, Great Cormorant, some sandpipers) score low because most of their range is inland, while a few island endemics leak in high.
+
+❯ 1. ≥5% ocean                    ┌────────────────────────────────────────────────────────────┐
+  2. ≥3% ocean                    │ thr   marine kept   total birds kept                       │
+  3. ≥10% ocean                   │ ≥1%    212/215      5063  (barely culls)                   │
+                                  │ ≥3%    204/215      3391                                   │
+                                  │ ≥5%    199/215      2568  ← this                           │
+                                  │ ≥10%   190/215      1903  (culls coastal gulls/cormorants) │
+                                  │ ≥25%   173/215      1141                                   │
+                                  └────────────────────────────────────────────────────────────┘
+
+Notes: Let's go with ≥5% and be able to add or exclude from that list. Thoroughly review the list and draft species to include and exclude for marine birds to systematically update (so in Github) and reproducibly include in the pipeline.
+
+Looking again at [MBTA](https://www.fws.gov/law/migratory-bird-treaty-act-1918), "applies only to migratory bird species that are native to the United States or U.S. territories". And there is a list of species for inclusion: `@~/My Drive/projects/msens/data/raw/fws.gov/birds_mbta/CFR50-Part10.13-2023.xlsx`. This means that there may be birds without the MBTA floor, which is different than what we've assumed and documented. This needs to be baked in too.
+
+----
+
+Both refinements ("1 then 2") are done, committed, and the full pipeline rebuilt + validated. Here's where it landed.
+
+**1 — Statutory floors** (corrected per your MBTA note)
+
+┌────────┬──────────────────────────────────┬────────────────┬────────────────────────────────┐
+│ Floor  │              Basis               │     Count      │             Change             │
+├────────┼──────────────────────────────────┼────────────────┼────────────────────────────────┤
+│ MMPA   │ taxonomy — all WoRMS class       │ 137            │ was 70 (NMFS directory)        │
+│ +20    │ Mammalia                         │                │                                │
+├────────┼──────────────────────────────────┼────────────────┼────────────────────────────────┤
+│ MBTA   │ **FWS CFR 50 §10.13** list       │ 1,018 of       │ not all Aves — a bird off      │
+│ +10    │ (native US migratory birds)      │ 10,995 birds   │ 10.13 gets no floor            │
+└────────┴──────────────────────────────────┴────────────────┴────────────────────────────────┘
+
+I'd briefly assumed "all Aves" — your correction reverted that. MBTA is now driven by the authoritative 10.13 list (already parsed in ingest_nmfs-fws-listings.qmd), matched by clean_sci_name. MMPA stays taxonomy-based since marine mammals are protected as a class.
+
+**2 — Marine-bird cull (`is_marine`)**
+
+`is_marine` (bird) = in a marine/coastal family and whole-range pct_marine ≥ 5%, or curated-include, minus curated-exclude → 460 marine birds of 10,995 (226 valid_usa). Two GitHub-tracked, reviewable files in workflows/data/:
+- `marine_bird_families.csv` (24 families) — this is what kills the sub-pixel-island confound: kiwis (13.5% ocean), white-eyes (10.5%), megapodes, island monarchs/fantails all score high pct_marine but aren't marine families, so they drop wholesale.
+- `marine_birds_curation.csv` — include coastal birds diluted by big inland ranges (Double-crested/Great/Neotropical/Brandt's/Pelagic Cormorant, Eurasian Oystercatcher, Caspian/Gull-billed Tern, Black Skimmer, Ring-billed Gull, Clark's Grebe); exclude island-endemic snipes/woodcocks. The 3 grebes you flagged (Red-necked/Horned/Western) already pass at ≥5%.
+
+`pct_marine` is computed from the **raw global `bl` ranges** ∩ ocean cells (the US-scoped merged `model_cell` is ~100% and unusable). `SCORE_ALLBIRDS=1` disables the filter for diagnostics.
+
+**Effect — v8 vs v7, per component across 20 PRAs**
+
+     comp          v8_rng           v7_rng   mean_d  cor
+     bird  4.4-74.7(mu46)  0.9-99.0(mu54)   -7.68  0.547   <- cull's intended effect
+    coral  1.6-53.4(mu13)  1.5-47.8(mu13)   -0.12  0.991   unchanged
+     fish  1.8-72.4(mu24)  2.5-70.0(mu22)    1.44  0.848
+ inverteb  1.2-67.5(mu21)  1.2-68.2(mu21)   -0.14  0.999   unchanged
+   mammal 14.6-90.2(mu51)  4.2-83.8(mu53)   -1.93  0.808
+    other  4.7-66.0(mu35)  4.8-41.2(mu18)   16.93  0.210   <- see below
+   turtle  0.8-70.2(mu34)  0.9-70.4(mu39)   -5.26  0.885
+ primprod  1.4-26.8(mu8.6) 1.5-27.3(mu8.6)  -0.02  0.995   unchanged
+COMPOSITE  8.1-51.5(mu29)  7.5-52.7(mu28)    0.84  0.925
+
+Bird moved most (cor 0.547) — exactly the cull. Coral/invert/primprod are untouched (cor ≥ 0.99), confirming the changes are surgical to birds/mammals.
+
+**One thing to flag (not a bug)**
+
+The other jump (cor 0.21) is the expanded v8 species set: of 1,902 scored other taxa, 778 are new v8 species (+26 reptiles) that default to sp_cat='other' because they have no v7 crosswalk. The natural fix mirrors the MMPA insight — assign sp_cat by taxonomy (WoRMS class/phylum) for new species instead of defaulting to other. That's the main remaining v8↔v7 divergence driver.
+
+Want me to (a) do the taxonomy-based sp_cat next, (b) pause for you to review the two curation CSVs, or (c) both?
+
+----
+
+PROMPT: We decided with more recent versions including v7 to exclude reptiles, except sea turtles. Let's review the 778 (-26 reptiles) new v8 species since I don't understand where they came from -- we did not ingest any new datasets. Let's also review all the sp_cat='other' since there is surely a better name and or divisions
+
+----
+
+Now I can answer all three clearly.
+
+**Q2 — where the "778 new" species came from (no new datasets)**
+
+They come from the same sources, ingested more completely in v8:
+
+┌──────────────┬────────────┬──────────────────────────────────────────────────────────────────┐
+│   dataset    │    new     │                               note                               │
+│              │  species   │                                                                  │
+├──────────────┼────────────┼──────────────────────────────────────────────────────────────────┤
+│ am           │ 446        │ v8 reingested AquaMaps globally (~23,700 spp); v7 scored a       │
+│ (AquaMaps)   │            │ narrower US subset                                               │
+├──────────────┼────────────┼──────────────────────────────────────────────────────────────────┤
+│ rng_iucn     │ 332        │ IUCN range polygons                                              │
+├──────────────┼────────────┼──────────────────────────────────────────────────────────────────┤
+│ bl           │ 266        │ these are birds mislabeled other (see Q3)                        │
+│ (BirdLife)   │            │                                                                  │
+├──────────────┼────────────┼──────────────────────────────────────────────────────────────────┤
+│ rng_fws      │ 38         │                                                                  │
+└──────────────┴────────────┴──────────────────────────────────────────────────────────────────┘
+
+Two v8 changes surface species v7's pipeline dropped: (1) whole-range / no US land-mask — a species only has to touch US waters once to be valid_usa; (2) the global AquaMaps reingest. Most (v7_exists=0) weren't in v7's taxon table at all. is_valid_usa requires ≥1 cell in the US study area, so these are genuinely US-present — not interpolation artifacts.
+
+**Q3 — `other` is a mislabel bucket, not a real category**
+
+`sp_cat` is currently inherited from a v7 crosswalk by taxon-id; any taxon v7 didn't have defaults to `other`. It's the same flaw as the MMPA floor. By WoRMS taxonomy, the current 1,902 other redistribute:
+
+other(1902) ->  invertebrate 1274   (Annelida, Mollusca, Echinodermata, Arthropoda, sponges, bryozoans…)
+                bird          305    (BirdLife -> should be 'bird')
+                fish          170    (incl. chimaeras/hagfish/lampreys — v7 already counts these as fish)
+                coral          80    (Hexa/Octocorallia -> 'coral')
+                algae/protist  47
+                plant          18    (seagrasses, Tracheophyta)
+                residual      265    (259 WoRMS ids missing from my worms snapshot + 3 Crocodylia + 1 Amphibia)
+
+A taxonomy-based `sp_cat` (WoRMS class/phylum + BirdLife→bird) dissolves other entirely and also fixes the mislabeled birds/fish/coral. Full `valid_usa` redistribution: invertebrate 9493, fish 6836, bird 907, coral 855, mammal 90, algae/protist 47, plant 18, turtle 6, + reptile→exclude.
+
+Q1 — reptiles: confirmed exclude (except sea turtles)
+
+Crocodylia/Amphibia/other Reptilia → excluded from scoring; sea turtles stay as turtle.
+
+Two design calls are yours before I implement:
+
+←  ☒ Category scheme  ☒ Plants/algae  ✔ Submit  →
+
+**Category scheme**. How granular should the taxonomy-based sp_cat categories be? (This replaces the v7-crosswalk sp_cat with WoRMS class/phylum + BirdLife→bird, eliminating the 'other' bucket.)
+
+❯ 1. Keep v7's 6 classes ✔        ┌────────────────────────────────────────────────────────────┐
+  2. Finer invertebrate splits    │ moves 305 birds -> bird                                    │
+  3. Fix mislabels only           │ moves 170 -> fish                                          │
+                                  │ moves 80 -> coral                                          │
+                                  │ rest stays in 'other' (rename to                           │
+                                  │ 'invertebrate_other'?)  ~1350                              │
+                                  └────────────────────────────────────────────────────────────┘
+
+❯ 1. Keep v7's 6 classes          ┌────────────────────────────────────────────────────────────┐
+  2. Finer invertebrate splits    │ bird          907                                          │
+  3. Fix mislabels only ✔         │ mammal         90                                          │
+                                  │ turtle          6                                          │
+                                  │ fish         6836                                          │
+                                  │ coral         855                                          │
+                                  │ invertebrate 9493   (everything non-vertebrate, non-coral) │
+                                  │                                                            │
+                                  │ reptile      EXCLUDE                                       │
+                                  │ plant/algae  -> see next question                          │
+                                  └────────────────────────────────────────────────────────────┘
+
+Notes: Yes, let's fix birds, fish and coral that got lumped into **`other`** and fold the rest into **`invertebrates`** (assuming they are all in fact invertebrates, except coral). So we don't want invertebrates + invertebrates_other, just invertebrates.
+
+←  ☒ Category scheme  ☒ Plants/algae  ✔ Submit  →
+
+**Plants/algae**. How should non-faunal taxa (marine plants/seagrasses ~18, algae/protists ~47) be handled? These aren't animals and weren't a distinct v7 category.
+
+❯ 1. Own category 'primary_producer'    │ plant_algae / primary_producer  ~65                        │
+ 1. Exclude from scoring                │ appears as its own scored component                        │
+  2. Fold into invertebrate
+
+Notes: Yes, let's add **`primary_producers`**, which is different from the component **`primary_production`** (Carbon, not species distributions)
+
+----
+
+All 259 fetched — 257 are primary producers (Plantae/Chromista/Bacteria), and 2 are actually animals (a bryozoan + cnidarian) that a blind default would have misfiled. Now I have authoritative taxonomy for everything. Let me commit the supplement and read the score_zones taxon chunk to wire it all up:
+
+### + `ingest_worms.qmd`: monthly WoRMS spp.duckdb refresh ✓
+
+Good to use worrms to get the unmatched WoRMS ids. The residuals without WoRMS identifiers are due
+  to "data originating from [AlgaeBase](http://www.algaebase.org/) is excluded, since the license
+  does not allow redistribution". Be sure to bake this extra fetching / matching into the pipeline.
+  Ideally we also figure out a way to regularly fetch the WoRMS download (updated monthly). I put
+  the latest here: `@~/My Drive/projects/msens/data/raw/marinespecies.org/WoRMS_download_2026-07-01`. The [download](https://www.marinespecies.org/download/) page where I got the zip is password protected: 
+  username: "ben@ecoquants.com"
+  password: contents of `@~/My Drive/private/2026-07-10_marinespecies.org_ben@ecoquants.com.txt`
+  Can you also implement a notebook that regularly updates the spp duckdb db or fold that into the existing notebook?
+
+---
+
+1. worrms fetching baked into the pipeline ✓
+
+merge_taxon.qmd now self-maintains the WoRMS supplement: any worms-authority AphiaID used by our datasets but absent from the local snapshot is fetched from the WoRMS REST API (worrms::wm_record), appended to data/worms_taxonomy_supplement.csv, and reused. Only new ids are fetched; offline runs fall back to the cache. Your AlgaeBase insight is exactly why it's needed — those taxa are license-excluded from every redistributable WoRMS download, so the API is the only source.
+
+Proven live: swapping the worms source left 404 gaps, it auto-fetched the 145 new algae and cached them (supplement 259→404), and sp_cat came out byte-identical — so scores didn't move.
+
+2. `ingest_worms.qmd` — monthly spp.duckdb refresh ✓
+
+New notebook rebuilds the worms table from the marinespecies.org DwC-A:
+- Auto-detects the newest WoRMS_download_<YYYY-MM-DD>/, loads taxon.txt + speciesprofile.txt (LSID→AphiaID, isMarine/… flags), version-tracked in a worms_meta row (idempotent — only rebuilds on a newer download; REDO_WORMS=1 forces).
+- Ran it: 596,103 rows @ 2026-07-01, replacing the older checklistbank export. Coverage of our taxa 98.5% (the 404 gaps = AlgaeBase algae, filled by #1).
+
+This replaces the checklistbank source; the old folder remains as a fallback.
+
+3. Regular download automation — documented, not fully scriptable
+
+The WoRMS download (https://www.marinespecies.org/download/) is login + request-gated (you sign in, request a DwC-A, download the generated zip) — there's no stable "latest" URL to wget. So the notebook documents the monthly procedure (download → unzip into a dated folder → run) and reads the password from your private file (kept out of git); the auto-detect + version-tracking make the ingest side one-command. I left a labeled eval:false hook to wire in an authenticated URL if WoRMS ever exposes one.
+
+The honest gap is the fetch step itself. Options if you want it more hands-off:
+- I can set up a monthly reminder (cron/calendar) to do the manual download + run the notebook.
+- Or investigate whether the approved user-request flow yields a reusable token URL I could script.
+
+Want either of those, or is the documented manual refresh fine?
+
+### now S3 push
+
+ ☐ Next stream
+
+The pipeline (ingest→merge→score) is complete and validated (v7↔v8 cor 0.971). The remaining plan phases are distinct streams with different effort/dependencies. Which should I tackle first?
+
+❯ 1. Release → S3 + STAC          ┌────────────────────────────────────────────────┐
+  2. Docs + skills                │ release_marine-atlas.qmd:                      │
+  3. Serving + apps               │   s3://oceanmetrics.io-public/marine-atlas/v8/ │
+                                  │     dist/  dist_merged/  cell  taxon  model    │
+                                  │     dataset  cell_metric  zone*  metric        │
+                                  │ - STAC catalog (stac_build) keyed on mdl_key   │
+                                  │ stage local -> verify -> push (needs creds)    │
+                                  └────────────────────────────────────────────────┘
+
+Notes: See reference_aws_credentials.md and indexed in MEMORY.md:  AWS CLI is configured now so S3 push has my creds
+
+----
+
+Two blockers surface: v8 sdm.duckdb has no dataset/model tables (STAC needs dataset), and dist/ is 74G (raw AquaMaps) vs dist_merged/ 2.8G. Let me see how the msens: metadata is structured (to assemble the dataset registry) and confirm the model CSVs:
+
+
+I have the dataset metadata (10 datasets + ms_merge) and model CSVs. Let me check v7's dataset/model table schemas to mirror them, and the STAC cfg's expected columns:
+
+----
+
+PROMPT: Wait, the dataset and model tables should've been built upon model ingest. This absence is a REAL PROBLEM as all subsequent model ingests would also probably miss this absolutely fundamental step. This was in here before with all the ingest notebooks, so how did it get lost?!!
+
+----
+
+Traced it. Here's exactly what happened — and it's a real gap, but not data loss.
+
+How it got lost
+
+v7 wired the registry into each ingest. create_sdm-tables.qmd created the dataset + model tables, and every v7 ingest (e.g. ingest_aquamaps_to_sdm_duckdb.qmd) did an INSERT INTO dataset / INSERT INTO model alongside writing model_cell.
+
+The v8 rewrite changed the output contract and dropped the registry writes. The v8 ingests were rebuilt to emit partitioned Parquet (marine-atlas/dist/dataset={ds_key}/… keyed by mdl_key) plus a per-dataset model_{ds}.csv — and the dataset/model table inserts were never reimplemented. create_sdm-tables.qmd is a v7 artifact that isn't in the v8 targets DAG; schema.qmd is now just stale documentation (it still describes the old mdl_seq schema).
+
+Why nobody noticed: merge_models_prep reads the model_{ds}.csv + Parquet directly to build taxon/taxon_model, so the whole ingest→merge→score pipeline runs fine without dataset/model tables. They're only needed for STAC / release / apps / API — which is Phase 7, exactly where we just arrived. So the gap was latent until now.
+
+The reassuring part: nothing is lost
+
+The registry is fully recoverable — the information was never dropped, just never consolidated:
+- dataset props live in the msens: frontmatter of each ingest (all 10: ds_key, response_type, source_authority, temporal_interval, native_format).
+- model props live in model_{ds}.csv (per-dataset mdl_key, taxa, er_score, …).
+
+Two things worth flagging
+
+1. gm + nc were never ingested in v8 — there's no model_gm.csv/model_nc.csv and no dataset=gm/dataset=nc partitions (8 of 10 datasets are ingested). Separate from this bug, but it means the current merge/scores exclude the NOAA density models.
+2. The fix should not be per-ingest INSERTs again — that's precisely the thing that got silently dropped.
+
+The fix
+
+A single `build_registry` target that assembles dataset (from the msens: frontmatter — one source of truth, every ingest uniformly) and model (union of the model_{ds}.csv), writes them to sdm.duckdb + the marine-atlas release, and fails loudly if a dataset is missing. It becomes a dependency of release. Let me build it:
+
+----
+
+Registry gap fixed and recorded. To close the loop on your question:
+
+**How it got lost**: the v8 ingest rewrite swapped the output contract (Parquet + model_{ds}.csv) but didn't carry over v7's per-ingest INSERT INTO dataset/model. It stayed invisible because merge reads the CSVs/Parquet directly — only release/STAC/apps need the tables. No data was lost (all recoverable from frontmatter + CSVs), and it's now consolidated into one build_registry target that can't be silently dropped per-ingest and errors if any ingested dataset lacks metadata.
+
+That investigation also surfaced a bigger, separate gap: gm and nc were never ingested in v8 — the NOAA density models (SEFSC monthly cetaceans, NCCOS seasonal) have no dist partition, so they're absent from the current merge and scores. This isn't the registry bug; it's missing data that affects the release's scientific completeness (density models carry a lot of the marine-mammal signal).
+
+That's a scope decision for the release:
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ gm/nc scope
+
+gm (NOAA SEFSC monthly cetacean density) and nc (NOAA NCCOS seasonal) were never ingested in v8 — they're in the dataset registry but absent from merge/scores. How should the release handle them?
+
+ 1. Release v8 now, add gm/nc later                          │ release now: am, bl, rng_iucn, rng_fws,        │
+  2. Ingest gm + nc first         │   ch_fws, ch_nmfs, ca_nmfs, turtles + ms_merge │
+  3. Check first, then decide     │ gm/nc -> tracked follow-on (re-ingest ->       │
+                                  │   re-merge -> re-score -> re-release)          │
+                                  └────────────────────────────────────────────────┘
+
+Notes: The gm/nc datasets will need conversion from a density
+        scale (# individuals/km^2) to a suitability score [0,100],
+        so let's handle that later (but part of this session)
+
+----
+
+I've mapped Phase 8's serving contract. Here's the checkpoint and what's ahead.
+
+Where we are
+
+Two solid deliverables this stretch, both verified:
+- **Registry gap fixed** — `build_registry.qmd` rebuilds the `dataset`/`model` tables the v8 ingest rewrite dropped; can't be silently missed again (errors if an ingested dataset lacks metadata).
+- **v8 marine-atlas** released — live at `s3://oceanmetrics.io-public/marine-atlas/v8/` (3.59 GB), round-trips via the new `msens::attach_atlas()`.
+
+**Phase 8 (serving + STAC)** — scope, and it touches the live server
+
+The v7 titiler factory (server/titiler/factory.py) already serves SQL-driven cell tiles from a fixed cell-id COG. The v8 pass is a coherent cross-repo change:
+- `factory.py`: point COG_PATH at the v8 global cell-id COG (r_cellid_global.tif, [-180,180]) and accept the val column; the client bakes SELECT cell_id, val FROM …dist_merged… WHERE mdl_key = '…'.
+- `msens/R/stac.R`: the v8 pass (mdl_seq→mdl_key, value→val, am_0.05→am, atlas paths) + emit the catalog.
+- `msens/R/viz.R` client helpers (cell_tile_url/cell_stats): value→val, mdl_seq→mdl_key.
+- Deploy to the titiler host (titiler.marinesensitivity.org) — the outward-facing step.
+
+That's a multi-file change ending in a server deploy, so before I start editing across server/, msens/, and redeploying, I want your steer on sequencing — these three next units diverge and one is a self-contained win:
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Next unit
+
+Release is done. Which unit next? (Phase 8 serving ends in a live titiler redeploy; the others don't touch the server.)
+
+❯ 1. Phase 8: serving + STAC      ┌───────────────────────────────────────────┐
+  2. gm/nc density ingest         │ server/titiler/factory.py (COG swap, val) │
+  3. Phase 10: docs + skills      │ msens/R/stac.R  (mdl_key/val/am/paths)    │
+                                  │ msens/R/viz.R   (client tile URLs)        │
+                                  │ -> deploy titiler.marinesensitivity.org   │
+                                  └───────────────────────────────────────────┘
+
+----
+
+
+I've de-risked Phase 8 by scoping it fully — and the key finding is that it's mostly deploy, not code. Let me checkpoint with what I found and the exact plan, since the deploy is a careful operational sequence best done as its own focused step rather than rushed at the tail of a long stretch.
+
+Phase 8 scoping — findings
+
+- The titiler factory needs no code change. It's env-driven (MSENS_CELLID_COG, MSENS_DUCKDB) and its SQL validator blocks read_parquet/httpfs, which fixes the v8 serving contract: the client sends SELECT cell_id, val AS value FROM model_cell WHERE mdl_key='…' against a server-side DuckDB table, rendered on the cell-id COG.
+- cell_tile_url/cell_stats need no change — they're SQL-agnostic; the app composes the SQL.
+- Real code changes are small: stac.R (v8 SQL template + mdl_seq→mdl_key, value→val, am_0.05→am, atlas paths, mdl_key example plumbing in stac_build) and viz.R (3 lines: the mapsp popup link mdl_seq→mdl_key).
+- The substance is the deploy — and one gotcha: v8 model_cell is indexed on cell_id, not mdl_key. Serving filters by mdl_key, so the serving DuckDB needs a mdl_key index or every tile full-scans 587M rows.
+- Global cell-id COG (r_cellid_global.tif, 73 MB) is present locally.
+
+Deploy plan (the operational sequence)
+
+1. Build a lean serving DuckDB (model_cell mdl_key/cell_id/val + index on mdl_key, + cell/taxon/dataset/model for popups) — smaller + faster than shipping full sdm.duckdb.
+2. rsync it + r_cellid_global.tif to msens1:/share/data/....
+3. Set MSENS_CELLID_COG + MSENS_DUCKDB in the titiler docker-compose, docker compose up -d titiler.
+4. stac.R v8 pass → stac_build(version="v8", con=...) → deploy catalog to /stac.
+5. Verify a live tile + /statistics for a known mdl_key.
+
+Since this is the outward-facing server step you flagged — and it's cleaner as one careful sequence than squeezed in here — I'll execute it fresh next. Want me to (a) proceed straight into the deploy sequence above, or (b) do the stac.R + viz.R code edits first and commit those, then deploy?
+
+----
+
+Clean — the exact command runs without error (titiler-v8 Running, caddy restarted). The earlier no configuration file was a transient artifact of the R subprocess stderr capture on the first build, not a real failure; the verbatim command and the live service are both fine.
+
+This unit is complete. Everything is now reproducible and committed:
+
+Reproducibility fold-in — done
+
+release_marine-atlas.qmd now regenerates the entire v8 release + serving from one notebook (the ad-hoc scripts are gone):
+1. Stage tables + the serving surface (serve/model_cell.parquet, sorted by mdl_key) → S3
+2. Build the tiny view DB (views over S3)
+3. Emit the STAC catalog (tile links → titiler-v8)
+4. Gated deploy (RELEASE_DEPLOY=1) — rsync the KB view DB + STAC to msens1, rebuild titiler-v8, restart caddy, smoke-test
+
+Flags RELEASE_NO_S3 / RELEASE_RAW / RELEASE_DEPLOY keep a plain build side-effect-free. Validated: the build path runs clean end-to-end, and the deploy chunk was proven against the live server (titiler-v8 /statistics → HTTP 200). It sources the current msens/R/stac.R so a stale install can't shadow the v8 generators.
+
+I also saved your "reproducible by default" directive to memory so it carries forward.
+
+v8 status board
+
+┌───────────────────────────────┬───────────────────────────┐
+│                               │                           │
+├───────────────────────────────┼───────────────────────────┤
+│ Pipeline (ingest→merge→score) │ ✅ validated (cor 0.971)  │
+├───────────────────────────────┼───────────────────────────┤
+│ Registry (dataset/model)      │ ✅ fixed (build_registry) │
+├───────────────────────────────┼───────────────────────────┤
+│ Release → S3                  │ ✅ live + round-trips     │
+├───────────────────────────────┼───────────────────────────┤
+│ Serving (titiler-v8 + STAC)   │ ✅ live, reproducible     │
+└───────────────────────────────┴───────────────────────────┘
+
+Remaining: Phase 9 (apps → titiler-v8 + mdl_key), Phase 10 (docs + skills), the gm/nc density→[0,100] ingest you queued, Phase 4b (native PMTiles/COG). Where next?
+
+----
+
+Both v8 apps are working and Chrome-verified. 🎉
+
+What landed this push
+
+scores_v8 — composite sensitivity scores render across every US Program Area via titiler-v8 (verified earlier).
+
+species_v8 — the harder port, now working: rewrote the map from in-R terra rasters → mapbox image source to the titiler-v8 XYZ pattern (cell_tile_url("… WHERE mdl_key='…'") + add_cell_tiles, same as scores). Migrated the data-prep to v8 taxon schema (is_valid_usa & is_marine, ms_merge_key as the served mdl_key), dropped the per-dataset taxon_model pivot (only the merged surface is served — per-dataset "original" layers are Phase 4b), removed the 0–360 st_shift_longitude assumption, and fixed fit_bounds from the model's cell lon/lat. Verified in Chrome: the leatherback turtle's distribution (413k cells) renders across US waters, legend 1–100.
+
+Reproducible support files — build_app_support.qmd generates the gpkgs, layers_v8.csv, and r_metrics_v8.tif (via the correct COG-value = cell_id lookup).
+
+Both committed to main. (The Chrome host-permission hiccup on the second port resolved with a fresh tab — no action needed from you.)
+
+Remaining polish (noted in memory)
+
+- Exclude reptile/amphibian from the species picker (they're valid_usa but not scored).
+- Per-species common names (v8 taxon has none — join a vernacular source).
+- Proper subregion zones (currently a USA→all-PRAs stub).
+- Server deploy: publish /scores_v8 + /species_v8 (a main/apps_v8 checkout + symlinks; v7 stays live as default).
+
+Want me to knock out the picker/common-name polish next, or go straight to deploying scores_v8/species_v8 to the server so they're live?
+
+----
+
+Work on the picker/common-name polish next. I just downloaded WoRMS `~/My Drive/projects/msens/data/raw/ marinespecies.org/checklistbank.org_dataset-2011_v2026-07-02/vernacularname.txt` (see other files there), an older version of which was already ingested with @ingest_taxon.qmd. We've had issues in the past with having to specify preferred names. The NOAA/NMFS species list should have preference over FWS, both of which are preferred over WoRMS. The problem with WoRMS is that there may be several English candidates without knowing which is most sensible. Might need to enlist Wikipedia or other for the best fit for those not covered by NOAA or FWS.
+
+----
+
+Picker/common-name polish is done and verified.
+
+What landed
+
+build_common_names.qmd — a reproducible resolver that picks one English common name per taxon by your preference order:
+NMFS → FWS → BirdLife → WoRMS (US federal names win as authoritative; BirdLife is authoritative for birds since WoRMS covers them poorly; WoRMS vernacular filtered to language=ENG with isPreferredName first, so the several English candidates collapse to the preferred one). Writes common_name to both taxon tables.
+
+Coverage of the scored set: bird/mammal/turtle 100%, fish 48%, coral 53%, invertebrate 20%, primary_producer 2% (many inverts/algae genuinely have no common name). The 18,561 uncovered taxa are logged as Wikipedia candidates — COMMON_WIKI=1 fetches + caches best-fit names, gated because it's a large network job (the follow-up for the gaps).
+
+species app — now labels "{sp_cat}: {scientific_name} ({common_name})" and excludes reptile/amphibian (valid_usa but not scored). Chrome-verified: the picker and title show "turtle: Dermochelys coriacea (Leatherback Turtle)".
+
+Remaining
+
+- Wikipedia gap-fill (COMMON_WIKI=1) — fill the ~18.5k inverts/algae/fish without a federal/BirdLife/WoRMS common name (worth it mostly for fish; many inverts are genuinely nameless).
+- Subregion zones (currently a USA→all-PRAs stub).
+- Server deploy of /scores_v8 + /species_v8.
+
+Want me to run the Wikipedia gap-fill (I'd scope it to the taxa where a common name actually exists, e.g. fish, to avoid thousands of empty lookups), tackle subregion zones, or deploy the apps to the server?
+
+----
+
+PROMPT: Move onto server deploy
+
+---
+
+### TODO: workflows index: QMD not rendered to HTML; deps: auto
+
+1. Why so many QMDs lack rendered HTML
+
+The pipeline was executed, not rendered. I ran the v8 notebooks via the fast dev-loop from CLAUDE.md:
+purl("merge_taxon.qmd", "/tmp/x.R", documentation=0); source("/tmp/x.R")
+purl() extracts just the R code chunks and source() runs them — this produces all the data (DuckDB tables, Parquet, S3 uploads) but never renders the .qmd to HTML. Rendering is a separate step. So "the model completed" (data exists) ≠ "HTML exists."
+
+The two ways to get HTML are quarto render <nb>.qmd or targets::tar_make() (which does render each .qmd — per CLAUDE.md "prefer targets… renders the .qmd"). I built v8 largely via purl+source (fastest to iterate, and tar_make re-runs the whole expensive pipeline), so no HTML was produced for most. The index's "notebook ↗" link only appears when _output/{base}.html exists.
+
+Caveat if you want them all rendered: quarto render re-executes each notebook, i.e. re-runs the pipeline (hours, and some steps hit S3/the DB). The clean fix is Quarto freeze: auto (render from cached execution) or wiring the render through tar_make(). Happy to set that up — want me to render the pipeline notebooks (with freeze so they don't re-execute)?
+
+2. The DAG — release_marine-atlas & build_registry, and deps: auto
+
+They were never missing — both are in the DAG. The problem was cosmetic: tar_mermaid() paints every node the same grey, and these two sit in a dense web where every ingest edge converges into them, so they were impossible to pick out. I just color-coded the DAG nodes by workflow_type using the same palette as the section headers (grid=purple, ingest=blue, merge=teal, score=amber, schema=orange, release=pink). Now build_registry is a clear orange node and release_marine_atlas a pink one on the right (pushed; live page updates after the Pages build).
+
+dependency: [auto] is front-matter shorthand for "depend on every upstream grid + ingest target" — so you don't hand-list all 14 ingests. build_registry uses it because it consolidates every ingested dataset's registry; release_marine_atlas uses it because the release bundles the whole atlas. That's exactly why those two nodes have an incoming edge from every ingest (the converging fan). Targets with specific inputs list them explicitly instead (e.g. merge_taxon → deps: [merge_models, build_cell_grid]).
+
+Want me to proceed with the freeze-based HTML rendering, or leave the notebooks as source-only (with the .qmd links they already have)?
+
+### TODO: humpback whale (LC, but EN?) = 100!
+
+The humpback is not a bug — it's the intended (v7-matching) design, though I understand why it looks off. The ER scale (from `compute_er_score`) is: US ESA listings — EN=100, TN=50 (+MMPA 20, MBTA 10); IUCN — CR=50, EN=25, VU=5, NT=2. Humpback is globally IUCN LC, but NMFS lists Endangered DPSs, so the v8 governing ER (most-protective, US-national overrides IUCN) = NMFS:EN → 100. The merge then values the range footprint at `er_score` (the "fitting point") and `GREATEST(er_score, am_suitability)` → 100 everywhere the range covers (er_score dominates the am gradient).
+
+Three design nuances you may want to revisit (all choices, not code bugs — and changing them shifts scores + the v7-equivalence gate, so I won't touch them unilaterally):
+- US EN=100 ≫ IUCN CR=50/EN=25 — US listings are weighted much heavier, so any US-Endangered species floors at 100 across its whole range.
+- Species-level ER on the whole range — the humpback's Endangered DPSs generalize to the entire species range (DPS granularity is lost).
+- `GREATEST(er, suitability)` flattens the AquaMaps gradient for high-ER species.
+
+
 
 ## 2026-07-06.b  h3-db: + schema
 
