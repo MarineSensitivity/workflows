@@ -14,7 +14,7 @@ is_server <- Sys.info()[["sysname"]] == "Linux"
 dir_data <- ifelse(is_server, "/share/data", "~/_big/msens")
 dir_derived <- glue::glue("{dir_data}/derived")
 dir_raw <- glue::glue("{dir_data}/raw")
-dir_private <- ifelse(is_server, "/share/private", "~/My Drive/private")
+dir_private <- ifelse(is_server, "/share/private", "~/_big/msens/private")
 dir_big <- ifelse(is_server, "/share/data/big", "~/_big/msens/derived")
 
 # versioned directories
