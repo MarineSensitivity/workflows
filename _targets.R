@@ -26,7 +26,11 @@ if (requireNamespace("pkgload", quietly = TRUE) &&
   library(msens)
 }
 
-# build the target list from the `msens:` blocks in ./*.qmd
+# build the target list from the `msens:` blocks in ./*.qmd.
+# gm/nc are not yet ingested (Phase D): their notebooks would fail and — via the
+# `[auto]` dependency — block build_registry/release/publish_native. Exclude them
+# until ready. Override with TARGETS_EXCLUDE="a,b" (or TARGETS_EXCLUDE="" for all).
 msens::build_targets_list(
   workflows_dir = getwd(),
-  exclude       = NULL)
+  exclude = { e <- Sys.getenv("TARGETS_EXCLUDE", unset = "ingest_sdm_gm,ingest_sdm_nc")
+              if (nzchar(e)) trimws(strsplit(e, ",")[[1]]) else NULL })
