@@ -8,7 +8,10 @@ ver_prev <- "v7" # previous version (for copying inputs to new version)
 # (rolled back from H3 hex; grid aligned to Bio-Oracle v3 + AquaX topology)
 
 is_server <- Sys.info()[["sysname"]] == "Linux"
-dir_data <- ifelse(is_server, "/share/data", "~/My Drive/projects/msens/data")
+# laptop: sources live under ~/_big (fast local disk), NOT Google Drive — Drive streaming is
+# unreliable and slow for the big rasters/shapefiles. Inputs are hydrated into ~/_big/msens/
+# {derived,raw} (see dev notes); dir_derived == dir_big here. Server uses the /share mount.
+dir_data <- ifelse(is_server, "/share/data", "~/_big/msens")
 dir_derived <- glue::glue("{dir_data}/derived")
 dir_raw <- glue::glue("{dir_data}/raw")
 dir_private <- ifelse(is_server, "/share/private", "~/My Drive/private")
