@@ -125,18 +125,40 @@ log_info("non-bird taxa resolved: {sum(!is.na(resolved$worms_id))} of {nrow(reso
 ```{r}
 #| label: taxon
 
-# non-bird models -> worms taxon
-tm_worms <- models |> filter(ds_key != "bl") |>
-  left_join(resolved |> select(scientific_name, worms_id), by = "scientific_name") |>
-  filter(!is.na(worms_id)) |>
-  transmute(mdl_key, taxon_authority = "worms", taxon_id = as.character(worms_id))
+# BOTW-sisid <-> WoRMS-aphia crosswalk (birds): BirdLife is the bird authority, so BOTW:{sisid}
+# is a bird's canonical taxon. Map cleaned scientific_name -> sisid so a bird's NON-bl datasets
+# (FWS ranges / critical habitat, AquaMaps — which resolve to WORMS by name) merge into that SAME
+# BOTW model instead of splitting the species across BOTW + WORMS (the duplicate-picker bug). Match
+# on the cleaned name, with a binomial fallback for authorship/subspecies differences.
+bird_xw <- models |> filter(ds_key == "bl", !is.na(sisid)) |>
+  transmute(sci_clean = clean_sci_name(scientific_name),
+            sci_binom = clean_sci_name(scientific_name, binomial = TRUE),
+            sisid     = as.character(sisid))
+# distinct maps (s_cln/s_bin names avoid colliding with models' own all-NA `sisid` column)
+sisid_by_clean <- bird_xw |> distinct(sci_clean, .keep_all = TRUE) |> transmute(sci_clean, s_cln = sisid)
+sisid_by_binom <- bird_xw |> distinct(sci_binom, .keep_all = TRUE) |> transmute(sci_binom, s_bin = sisid)
 
-# bird models -> botw taxon (native sisid)
+# non-bl models: resolve to worms by name, THEN override to the bird's BOTW:{sisid} when the
+# species is a BirdLife bird (so all of a bird's datasets land on one BOTW model).
+tm_nonbl <- models |> filter(ds_key != "bl") |>
+  mutate(sci_clean = clean_sci_name(scientific_name),
+         sci_binom = clean_sci_name(scientific_name, binomial = TRUE)) |>
+  left_join(resolved |> select(scientific_name, worms_id), by = "scientific_name") |>
+  left_join(sisid_by_clean, by = "sci_clean") |>
+  left_join(sisid_by_binom, by = "sci_binom") |>
+  mutate(bird_sisid = coalesce(s_cln, s_bin),                  # bird? (clean match, else binomial)
+         taxon_authority = if_else(!is.na(bird_sisid), "botw", "worms"),
+         taxon_id        = if_else(!is.na(bird_sisid), bird_sisid, as.character(worms_id))) |>
+  filter(!is.na(taxon_id)) |>
+  transmute(mdl_key, taxon_authority, taxon_id)
+
+# bl models -> botw taxon (native sisid)
 tm_botw <- models |> filter(ds_key == "bl", !is.na(sisid)) |>
   transmute(mdl_key, taxon_authority = "botw", taxon_id = as.character(sisid))
 
-taxon_model <- bind_rows(tm_worms, tm_botw) |>
+taxon_model <- bind_rows(tm_nonbl, tm_botw) |>
   mutate(ms_merge_key = mdl_key_merged(taxon_authority, taxon_id))
+log_info("bird crosswalk: {sum(tm_nonbl$taxon_authority=='botw')} non-bl models re-keyed BOTW (would split otherwise)")
 
 taxon <- taxon_model |>
   left_join(models |> select(mdl_key, scientific_name, iucn_code), by = "mdl_key") |>
