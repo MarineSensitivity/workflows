@@ -205,16 +205,25 @@ system2("rsync", c("-aq", glue("{stac_dir}/{ver}/"), glue("msens:{srv_stac}/")))
 # add this version as a child of the STAC root (keep other versions)
 system2("ssh", c("msens", shQuote(glue(
   "python3 - <<'PY'\nimport json\np='/share/data/derived/stac/catalog.json'\nc=json.load(open(p))\nh=[l['href'] for l in c['links'] if l.get('rel')=='child']\nif './{ver}/collection.json' not in h:\n c['links'].append({{'rel':'child','href':'./{ver}/collection.json'}}); json.dump(c,open(p,'w'),indent=2)\nPY"))))
-# 2. (re)build + start the parallel titiler-{ver}; restart caddy for its route
-system2("ssh", c("msens", glue(
-  "cd {srv_repo} && git pull --quiet && docker compose up -d --build titiler-{ver} && docker compose restart caddy")))
-# 3. smoke test — the stable-mdl_key fast-path (titiler resolves ->mdl_id, reads one partition)
+# 2. update the server repo + REBUILD & FORCE-RECREATE titiler-{ver} (so a new factory always
+# takes effect even if compose sees no config change), restart caddy. Explicit fetch + ff-only
+# with `set -e` so a stale/failed pull FAILS LOUDLY instead of silently serving the old factory
+# (a silent `git pull --quiet` once left the mdl_key factory undeployed for days).
+deploy_out <- system2("ssh", c("msens", shQuote(glue(
+  "set -e; cd {srv_repo} && git fetch --quiet origin && git merge --ff-only origin/main && ",
+  "docker compose up -d --build --force-recreate titiler-{ver} && docker compose restart caddy && ",
+  "echo DEPLOY_OK $(git rev-parse --short HEAD)"))), stdout = TRUE, stderr = TRUE)
+log_info("titiler-{ver} deploy: {paste(tail(deploy_out, 2), collapse=' | ')}")
+if (!any(grepl("DEPLOY_OK", deploy_out))) stop(paste(tail(deploy_out, 15), collapse = "\n"))
+# 3. smoke test — the stable-mdl_key fast-path (factory resolves mdl_key->mdl_id, reads one
+# partition). Hit tilejson.json (not /statistics, which requires a geometry) → expect 200.
 c0 <- dbConnect(duckdb(sdm_db, read_only = TRUE))
 mk <- dbGetQuery(c0, "SELECT mdl_key FROM model WHERE ds_key='ms_merge' ORDER BY mdl_id LIMIT 1")$mdl_key
 dbDisconnect(c0, shutdown = TRUE)
-code <- system2("curl", c("-s","-o","/dev/null","-w","%{http_code}",
-  glue("{titiler_v8}/statistics?mdl_key={URLencode(mk, reserved = TRUE)}")), stdout = TRUE)
-log_info("titiler-{ver} /statistics?mdl_key={mk} smoke test: HTTP {code}")
+code <- system2("curl", c("-s","-o","/dev/null","-w","%{http_code}","--retry","3",
+  glue("{titiler_v8}/tilejson.json?mdl_key={URLencode(mk, reserved = TRUE)}")), stdout = TRUE)
+log_info("titiler-{ver} /tilejson.json?mdl_key={mk} smoke test: HTTP {code} (expect 200)")
+if (!identical(code, "200")) log_warn("titiler-{ver} merged-surface smoke test != 200 — check the factory")
 }
 ```
 
