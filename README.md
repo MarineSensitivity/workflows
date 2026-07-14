@@ -38,6 +38,14 @@ The **global 0.05° raster cell** in `[-180,180]` (Bio-Oracle v3 / AquaX topolog
   `REDO_AM_INGEST=1`, `REDO_CELL_GRID=1`) gate expensive cached steps so
   `quarto render` / `tar_make` is cheap once the heavy artifacts exist.
 
+- **Every process is baked into a committed QMD and executed by RENDERING to HTML.**
+  Ingest, merge, score, publish, **S3 sync, and server + Shiny-app deploy** are all chunks
+  in the owning notebook, gated behind env flags (`RELEASE_DEPLOY`, `DEPLOY_APPS`,
+  `RELEASE_S3_TABLES`, …) — never ad-hoc `ssh`/`aws`/scratch scripts. Run real work via
+  `targets::tar_make()` or `quarto render` so the tracked `_output/*.html` (Design mermaid +
+  summary tables, the workflows-page links) is produced; `purl + source` is diagnostics-only
+  (it skips the HTML + content-hash checkpoint).
+
 ## Ingest → `model_cell` (cell_id, value) by native format
 
 - vector ranges → `msens::cells_from_ranges()` (exactextractr; whole range)

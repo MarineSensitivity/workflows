@@ -5,20 +5,24 @@ description: Release the MarineSensitivity marine-atlas to S3 and stand up its s
 
 # Publish + serve the marine-atlas
 
-Everything is reproducible via **`release_marine-atlas.qmd`** — do NOT hand-run ad-hoc scripts
-(see feedback_reproducible_by_default). It stages tables + the serving surface, syncs to S3,
-builds the view DB, emits STAC, and (gated) deploys.
+**Every process is baked into `release_marine-atlas.qmd` and run by RENDERING to HTML** — never
+ad-hoc `ssh`/`aws`/scratch scripts, and never `purl + source` (which executes chunks but SKIPS the
+tracked `_output/*.html` + content-hash checkpoint; diagnostics only). See
+feedback_reproducible_by_default. The notebook stages tables + the serving surface, syncs to S3,
+builds the view DB, emits STAC, and (gated) deploys the server + the v8 Shiny apps.
 
 ## Release (data → S3)
 
 ```r
-Rscript -e 'library(knitr); purl("release_marine-atlas.qmd","/tmp/x.R",quiet=T,documentation=0); source("/tmp/x.R")'
+quarto render release_marine-atlas.qmd            # or: Rscript -e 'targets::tar_make(release_marine_atlas)'
 ```
-Produces `s3://oceanmetrics.io-public/marine-atlas/{ver}/`: `tables/` (cell, taxon, dataset,
-model, cell_metric, zone*, metric), `dist_merged/`, `registry/`, and **`serve/model_cell.parquet`**
-— ONE file **sorted by mdl_key** (`COPY (… ORDER BY mdl_key)`, ROW_GROUP_SIZE 100000) so a titiler
-tile is an HTTP-range point read; single file ⇒ anonymous GET (no LIST/creds). Flags: `RELEASE_NO_S3=1`
-(stage only), `RELEASE_RAW=1` (also push the ~74G raw `dist/`).
+Produces `s3://oceanmetrics.io-public/marine-atlas/{ver}/`: `tables/` (cell, taxon, dataset, model,
+cell_metric, zone*, metric, native_asset), `dist_merged/`, `registry/`, and **`serve/model_cell/`** —
+Hive-**partitioned by the integer `mdl_id`** (dense_rank over mdl_key; stored rows are cell_id,val) so a
+titiler tile is an exact-partition point read. The STABLE public key stays **`mdl_key`** (the factory
+resolves mdl_key→mdl_id). Flags: `RELEASE_NO_S3=1` (stage only), `RELEASE_S3_TABLES=1` (push `tables/`
+incl `native_asset` WITHOUT the serve cutover), `RELEASE_REDO_SERVE=1` (re-partition when the model set
+changed — e.g. after a merge/crosswalk change renumbers mdl_id), `RELEASE_RAW=1` (also push raw `dist/`).
 
 ## Read it back (any consumer)
 
@@ -35,14 +39,16 @@ single-file URLs (never `s3://`, which trips the vhost-TLS bug). Adding a datase
 rsyncs the big data — only the S3 Parquet changes. Intra-region (EC2+bucket us-east-1): ~0.13s warm
 SQL, ~0.07s tile; if cold reads ever exceed 1–2s, fall back to a local `/share` Parquet copy.
 
-## Deploy (gated: `RELEASE_DEPLOY=1`)
+## Deploy (gated — all in-notebook chunks, no ad-hoc ssh)
 
-The notebook rsyncs the KB view DB + STAC subtree to `msens1`, (re)builds the **parallel** `titiler-{ver}`
-service, restarts caddy, smoke-tests. Manual equivalent:
-```
-ssh msens; cd /share/github/MarineSensitivity/server; git pull
-docker compose up -d --build titiler-v8; docker compose restart caddy   # caddy restart needed for new routes
-```
+- **`RELEASE_DEPLOY=1`** — the notebook rsyncs the KB view DB + STAC subtree to `msens1`, `git pull`s
+  the server repo and (re)builds the **parallel** `titiler-{ver}` service (picks up the mdl_key→mdl_id
+  factory), restarts caddy, smoke-tests.
+- **`DEPLOY_APPS=1`** (also implied by `RELEASE_DEPLOY`) — the `deploy-apps` chunk pulls the `apps_v8`
+  checkout (`MarineSensitivity/apps@main`, symlinked `/share/shiny_apps/{species,scores}_v8`) and reloads
+  ONLY the v8 apps via Shiny Server `restart.txt`. The v7 apps are a separate checkout in the same
+  container and are **not** restarted — no container bounce, v7 uninterrupted.
+
 titiler-v8 (`titiler-v8.marinesensitivity.org`, port 8001) runs parallel to v7 (A/B). The factory
 (`../server/titiler/factory.py`) is env-driven (`MSENS_DUCKDB`=view DB, `MSENS_CELLID_COG`=global COG)
 and its SQL validator **blocks `read_parquet` in client SQL** — the view expands server-side, so

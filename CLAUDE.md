@@ -26,13 +26,30 @@ Rscript -e 'targets::tar_make()'                    # full pipeline
 Rscript -e 'targets::tar_visnetwork()'              # dependency DAG
 Rscript -e 'targets::tar_make("merge_taxon")'       # one target
 
-# run a single notebook headless (bypasses targets) — the common dev loop:
+# render a single notebook to HTML (real runs — produces the tracked _output/*.html):
+quarto render score_cell_metrics.qmd
+# purl+source is ONLY for quick diagnostics — it executes chunks but SKIPS the HTML artifact:
 Rscript -e 'suppressMessages(library(knitr)); purl("merge_taxon.qmd","/tmp/x.R",quiet=TRUE,documentation=0); source("/tmp/x.R")'
-quarto render score_cell_metrics.qmd                # or via quarto
 
 # after editing the msens package, reinstall so library(msens) isn't stale
 Rscript -e 'devtools::install("../msens")'          # or source the file directly in a pinch
 ```
+
+### Reproducibility (non-negotiable — do not regress)
+
+**Every process must be baked into a committed QMD and executed by RENDERING to HTML.** Two
+requirements, both mandatory:
+
+1. **Baked into the QMD** — every step (ingest, merge, score, publish, **S3 sync, server + Shiny-app
+   deploy**) is a chunk in the owning notebook, gated behind an env flag (default off), **never** an
+   ad-hoc `ssh`/`aws`/scratch script. Deploys live in `release_marine-atlas.qmd`: `RELEASE_DEPLOY`
+   (serve.duckdb + titiler-v8 + STAC), `DEPLOY_APPS` (pull `apps_v8` + reload only the v8 apps via
+   `restart.txt`; v7 untouched), `RELEASE_S3_TABLES` (push `tables/` incl `native_asset` without the
+   full serve cutover).
+2. **Rendered to HTML** — run via `targets::tar_make()` or `quarto render`, which produce the tracked
+   `_output/*.html` (Design mermaid + summary tables) that the workflows landing page links.
+   `purl(...) + source()` is for quick diagnostics ONLY — it skips the HTML and the content-hash
+   checkpoint, so it is not a substitute for a real run.
 
 **Env flags** (gate expensive/side-effecting steps): `REDO_INGEST=1` (rebuild an ingest),
 `REDO_WORMS=1` (rebuild the worms table), `SCORE_V7COMMON=1` (score only v7's species, for
