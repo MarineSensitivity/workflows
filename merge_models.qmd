@@ -93,13 +93,16 @@ dbExecute(con, "CREATE OR REPLACE TABLE mkey_map AS
   SELECT ms_merge_key, CAST(dense_rank() OVER (ORDER BY ms_merge_key) AS INTEGER) AS mkey_id
   FROM (SELECT DISTINCT ms_merge_key FROM taxon_model)")
 dir_parts <- glue("{dir_atlas}/mc_parts")
-if (dir_exists(dir_parts)) dir_delete(dir_parts)
-dbExecute(con, "SET partitioned_write_max_open_files=512")
-msens::copy_atlas_parquet(con, glue(
-  "SELECT mm.mkey_id, tm.ms_merge_key, split_part(mc.mdl_key,'|',1) AS ds_key, mc.cell_id, mc.val
-   FROM read_parquet('{dir_dist}/*/*.parquet') mc JOIN taxon_model tm USING (mdl_key)
-   JOIN mkey_map mm USING (ms_merge_key)"),
-  dir_parts, partition_by = "mkey_id")
+# the partition write is the ~40-min step; skip it if the input already exists (REDO_MC_PARTS=1 forces)
+if (!dir_exists(dir_parts) || nzchar(Sys.getenv("REDO_MC_PARTS"))) {
+  if (dir_exists(dir_parts)) dir_delete(dir_parts)
+  dbExecute(con, "SET partitioned_write_max_open_files=512")
+  msens::copy_atlas_parquet(con, glue(
+    "SELECT mm.mkey_id, tm.ms_merge_key, split_part(mc.mdl_key,'|',1) AS ds_key, mc.cell_id, mc.val
+     FROM read_parquet('{dir_dist}/*/*.parquet') mc JOIN taxon_model tm USING (mdl_key)
+     JOIN mkey_map mm USING (ms_merge_key)"),
+    dir_parts, partition_by = "mkey_id")
+} else log_info("mc_parts exists — skipping repartition (REDO_MC_PARTS=1 to force)")
 # VIEW over the partitioned input — EVERY query below filters mkey_id (integer) so reads are pruned
 dbExecute(con, glue("CREATE OR REPLACE VIEW mc_parts AS
   SELECT mkey_id, ms_merge_key, ds_key, cell_id, val
@@ -163,9 +166,14 @@ msens::copy_atlas_parquet(con,
 # suitability AT those range cells) — am OUTSIDE the range is masked out (range-only → am NULL).
 # am-only taxa have no range footprint → omitted from the GLOBAL surface (reuse am COGs), but their
 # US am cells go into the scoring surface.
+# Batch by CELL COUNT, not taxa count: a few taxa have global ranges (10-25M cells each), so a
+# fixed 150-taxa batch OOMs. Pack taxa until ~40M cells/batch (a single taxon maxes at the 25.9M
+# grid, so it always fits one batch). Counts come from parquet metadata (fast, no data scan).
 nonturtle <- setdiff(all_ids, turtle_ids)
-batches   <- split(nonturtle, ceiling(seq_along(nonturtle) / 150))
-log_info("merging {length(nonturtle)} non-turtle taxa in {length(batches)} pruned batches")
+cnt <- dbGetQuery(con, "SELECT mkey_id, count(*) AS n FROM mc_parts GROUP BY mkey_id")
+cnt <- cnt[cnt$mkey_id %in% nonturtle, ]; cnt <- cnt[order(cnt$mkey_id), ]
+batches <- unname(split(cnt$mkey_id, cumsum(as.numeric(cnt$n)) %/% 40e6))
+log_info("merging {length(nonturtle)} non-turtle taxa in {length(batches)} cell-bounded batches (~40M cells each)")
 glob_sql <- "SELECT br.ms_merge_key AS mdl_key, br.cell_id,
                greatest(br.er, coalesce(ba.am_val, 0))::DOUBLE AS val
              FROM b_range br LEFT JOIN b_am ba USING (ms_merge_key, cell_id)"
