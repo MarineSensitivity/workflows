@@ -129,25 +129,33 @@ if (do_s3) {
 viewdb <- glue("{serve_dir}/serve.duckdb")
 if (file_exists(viewdb)) file_delete(viewdb)
 cv <- dbConnect(duckdb(viewdb))
-dbExecute(cv, "INSTALL httpfs; LOAD httpfs;")
-# tables: single files via explicit path-style HTTPS -> anonymous GET + HTTP range (the dotted
-# bucket breaks virtual-hosted TLS, so never use s3://… for these).
+# view sources: the released S3 Parquet (production) OR the local staged Parquet when
+# RELEASE_NO_S3 (a local dry-run — nothing was pushed, so an S3 view would point at nothing).
+if (do_s3) {
+  dbExecute(cv, "INSTALL httpfs; LOAD httpfs;")
+  # tables: single files via explicit path-style HTTPS -> anonymous GET + HTTP range (the dotted
+  # bucket breaks virtual-hosted TLS, so never use s3://… for these).
+  tbl_src <- glue("{s3_http}/tables")
+  # model_cell glob needs S3 LIST -> the aws extension + credential chain (server has creds).
+  dbExecute(cv, "INSTALL aws; LOAD aws; SET s3_url_style='path';")
+  dbExecute(cv, "CREATE OR REPLACE SECRET atlas_s3 (TYPE s3, PROVIDER credential_chain, REGION 'us-east-1');")
+  mc_glob <- glue("s3://{sub('^s3://', '', s3_ver)}/serve/model_cell/*/*.parquet")
+} else {
+  tbl_src <- tbl_dir                                 # local staged tables
+  mc_glob <- glue("{serve_mc}/*/*.parquet")          # local partitioned serve
+}
 for (t in rel_tables)
-  dbExecute(cv, glue("CREATE VIEW {t} AS SELECT * FROM read_parquet('{s3_http}/tables/{t}.parquet')"))
+  dbExecute(cv, glue("CREATE VIEW {t} AS SELECT * FROM read_parquet('{tbl_src}/{t}.parquet')"))
 # model_cell is Hive-partitioned by the integer mdl_id (stored rows are cell_id,val). The HOT tile
 # path reads one partition by EXACT path in titiler (factory mdl_key->mdl_id fast-path, anonymous
-# GET, no LIST). This glob VIEW is for ad-hoc/statistics queries; it needs S3 LIST -> the aws
-# extension + credential chain (the server has creds; only place s3:// is needed). It joins the
-# `model` view back to the STABLE mdl_key so ad-hoc queries can select by mdl_key, not the internal id.
-dbExecute(cv, "INSTALL aws; LOAD aws; SET s3_url_style='path';")
-dbExecute(cv, "CREATE OR REPLACE SECRET atlas_s3 (TYPE s3, PROVIDER credential_chain, REGION 'us-east-1');")
-s3_uri <- glue("s3://{sub('^s3://', '', s3_ver)}")
+# GET, no LIST). This glob VIEW is for ad-hoc/statistics queries; it joins the `model` view back to
+# the STABLE mdl_key so ad-hoc queries can select by mdl_key, not the internal id.
 dbExecute(cv, glue("CREATE VIEW model_cell AS
   SELECT m.mdl_key, mc.mdl_id, mc.cell_id, mc.val
-  FROM read_parquet('{s3_uri}/serve/model_cell/*/*.parquet', hive_partitioning = true) mc
+  FROM read_parquet('{mc_glob}', hive_partitioning = true) mc
   JOIN model m USING (mdl_id)"))
 dbDisconnect(cv, shutdown = TRUE)
-log_info("view DB {viewdb} ({round(file_size(viewdb)/1e3,1)} KB) — tables over {s3_http}, model_cell partitioned by mdl_id (public key = mdl_key)")
+log_info("view DB {viewdb} ({round(file_size(viewdb)/1e3,1)} KB) — {if (do_s3) 'S3' else 'LOCAL'} sources, model_cell partitioned by mdl_id (public key = mdl_key)")
 ```
 
 ## Emit STAC catalog (tile links → titiler-{ver})
