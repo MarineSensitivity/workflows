@@ -44,11 +44,14 @@ librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, quiet = T
 source(here("libs/paths.R"))
 source(here("libs/vars.R"))
 
-dir_atlas  <- glue("{dir_big_v}/marine-atlas")
-dir_dist   <- glue("{dir_atlas}/dist")
-merge_db   <- glue("{dir_atlas}/merge.duckdb")
-dir_merged <- glue("{dir_atlas}/dist_merged/dataset=ms_merge")
-manifest   <- here("data/manifests/merge_models.json")
+dir_atlas   <- glue("{dir_big_v}/marine-atlas")
+dir_dist    <- glue("{dir_atlas}/dist")
+merge_db    <- glue("{dir_atlas}/merge.duckdb")
+# MERGE_WHOLE_RANGE=1 emits the GLOBAL whole-range merged surface (for presentation COGs) to a
+# SEPARATE dir; the default US-scoped surface (which scoring reads) is untouched.
+whole_range <- nzchar(Sys.getenv("MERGE_WHOLE_RANGE"))
+dir_merged  <- glue("{dir_atlas}/{if (whole_range) 'dist_merged_global' else 'dist_merged'}/dataset=ms_merge")
+manifest    <- here("data/manifests/merge_models.json")
 dir_create(path_dir(manifest))
 stopifnot("run merge_models_prep first" = file_exists(merge_db),
           "run build_cell_grid first"   = file_exists(sdm_db))
@@ -67,24 +70,35 @@ dbExecute(con, glue("PRAGMA memory_limit='{mem_gb}GB'"))
 dbExecute(con, glue("PRAGMA temp_directory='{dir_atlas}/duckdb_tmp'"))
 dbExecute(con, glue("PRAGMA threads={max(1L, parallel::detectCores() - 1L)}"))
 
-# US-SCOPE: restrict the merge to in_usa cells (the global whole-range merge is a
-# separate bigger-RAM run; a global GROUP BY over 13B near-unique (taxon,cell) rows
-# won't fit here). Taxon range/pct_marine metrics are computed globally in merge_taxon.
+# MERGE_WHOLE_RANGE=1 → the GLOBAL whole-range merge (land+ocean, no US restriction) that feeds
+# the per-taxon presentation COGs. Its output is a SEPARATE surface (dist_merged_global) and does
+# NOT touch the US-scoped model_cell that scoring reads. am-only taxa are excluded (their merged
+# surface IS the AquaMaps surface — reuse the existing am model COGs), so we never group dense am;
+# only the ~3B range-based rows (bl/iucn/fws/turtles) + am probed at range cells run here.
 dbExecute(con, glue("ATTACH '{sdm_db}' AS grid (READ_ONLY)"))
-dbExecute(con, "CREATE OR REPLACE TABLE us_cells AS SELECT cell_id FROM grid.cell WHERE in_usa")
-n_us <- dbGetQuery(con, "SELECT count(*) n FROM us_cells")$n
-# MATERIALIZE the US-filtered model cells once (a streamed scan+join, no aggregate) so
-# the parts below don't each re-scan the 66G am parquet.
-# model_cell_all may persist as a view OR a table from a prior run; drop whichever it is
 try(dbExecute(con, "DROP TABLE IF EXISTS model_cell_all"), silent = TRUE)
 try(dbExecute(con, "DROP VIEW IF EXISTS model_cell_all"),  silent = TRUE)
-dbExecute(con, glue("CREATE OR REPLACE TABLE model_cell_all AS
-  SELECT tm.ms_merge_key, split_part(mc.mdl_key,'|',1) AS ds_key, mc.cell_id, mc.val
-  FROM read_parquet('{dir_dist}/*/*.parquet') mc
-  JOIN taxon_model tm USING (mdl_key)
-  JOIN us_cells u ON mc.cell_id = u.cell_id"))
-dbExecute(con, "CREATE INDEX mca_key ON model_cell_all(ms_merge_key)")
-log_info("US-scoped merge: {n_us} in_usa cells, {dbGetQuery(con,'SELECT count(*) n FROM model_cell_all')$n} model-cells; memory_limit={mem_gb}GB")
+if (whole_range) {
+  # global, ALL cells; a VIEW (never materialize 13B rows). am is read from dist directly where
+  # needed (Part 3 both_am, turtles), at the sparse range cells only.
+  dbExecute(con, glue("CREATE VIEW model_cell_all AS
+    SELECT tm.ms_merge_key, split_part(mc.mdl_key,'|',1) AS ds_key, mc.cell_id, mc.val
+    FROM read_parquet('{dir_dist}/*/*.parquet') mc
+    JOIN taxon_model tm USING (mdl_key)"))
+  log_info("WHOLE-RANGE (global) merge: model_cell_all is a global VIEW; am-only taxa reuse am COGs")
+} else {
+  dbExecute(con, "CREATE OR REPLACE TABLE us_cells AS SELECT cell_id FROM grid.cell WHERE in_usa")
+  n_us <- dbGetQuery(con, "SELECT count(*) n FROM us_cells")$n
+  # MATERIALIZE the US-filtered model cells once (a streamed scan+join, no aggregate) so
+  # the parts below don't each re-scan the 66G am parquet.
+  dbExecute(con, glue("CREATE OR REPLACE TABLE model_cell_all AS
+    SELECT tm.ms_merge_key, split_part(mc.mdl_key,'|',1) AS ds_key, mc.cell_id, mc.val
+    FROM read_parquet('{dir_dist}/*/*.parquet') mc
+    JOIN taxon_model tm USING (mdl_key)
+    JOIN us_cells u ON mc.cell_id = u.cell_id"))
+  dbExecute(con, "CREATE INDEX mca_key ON model_cell_all(ms_merge_key)")
+  log_info("US-scoped merge: {n_us} in_usa cells, {dbGetQuery(con,'SELECT count(*) n FROM model_cell_all')$n} model-cells; memory_limit={mem_gb}GB")
+}
 ```
 
 ## Turtle taxa (multiplicative, from only their files)
@@ -132,11 +146,15 @@ dbExecute(con, "CREATE OR REPLACE TABLE taxon_flags AS
 if (dir_exists(dir_merged)) dir_delete(dir_merged)
 dir_create(dir_merged)
 
-# Part 1: am-only taxa -> stream US am cells directly (no aggregate)
-msens::copy_atlas_parquet(con,
-  "SELECT mc.ms_merge_key AS mdl_key, mc.cell_id, mc.val FROM model_cell_all mc
-    WHERE mc.ms_merge_key IN (SELECT ms_merge_key FROM taxon_flags WHERE has_am AND NOT has_range)",
-  glue("{dir_merged}/p_amonly"), per_thread = TRUE)
+# Part 1: am-only taxa -> stream am cells directly (no aggregate). SKIPPED for the whole-range
+# build — am-only taxa's merged surface IS the AquaMaps surface, so they reuse the existing am
+# model COGs; streaming ~13B global am rows here would be pointless (and huge).
+if (!whole_range) {
+  msens::copy_atlas_parquet(con,
+    "SELECT mc.ms_merge_key AS mdl_key, mc.cell_id, mc.val FROM model_cell_all mc
+      WHERE mc.ms_merge_key IN (SELECT ms_merge_key FROM taxon_flags WHERE has_am AND NOT has_range)",
+    glue("{dir_merged}/p_amonly"), per_thread = TRUE)
+}
 
 # ER RECONCILIATION (the "fitting point"): a range presence cell carries the taxon's
 # GOVERNING er_score (US-national/floored, from merge_models_prep) — NOT the raw
@@ -187,10 +205,14 @@ dbDisconnect(con, shutdown = TRUE)
 ```{r}
 #| label: manifest
 
-# content-addressed: fingerprint of the merged Parquet surface (no wall-clock, no path)
-msens::write_manifest(
-  manifest, target = "merge_models", content_hash = h,
-  stats = list(ver = ver, n_taxa = smry$n_taxa, n_cells = smry$n_cells,
-               v_min = smry$v_min, v_max = smry$v_max),
-  force = msens::force_target("merge_models"))
+# content-addressed: fingerprint of the merged Parquet surface (no wall-clock, no path).
+# The whole-range build is a SIDE output (dist_merged_global for COGs) — do NOT overwrite the
+# tracked US merge_models manifest.
+if (!whole_range) {
+  msens::write_manifest(
+    manifest, target = "merge_models", content_hash = h,
+    stats = list(ver = ver, n_taxa = smry$n_taxa, n_cells = smry$n_cells,
+                 v_min = smry$v_min, v_max = smry$v_max),
+    force = msens::force_target("merge_models"))
+} else log_info("whole-range global merge → {dir_merged} ({smry$n_taxa} taxa, {smry$n_cells} cells); manifest untouched")
 ```
