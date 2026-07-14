@@ -248,12 +248,21 @@ container; they are **not** restarted, so v7 serving is uninterrupted. Gated by
 if (!do_apps) {
   log_info("RELEASE_DEPLOY/DEPLOY_APPS unset — skipping Shiny app deploy")
 } else {
-  apps_co <- "/share/github/MarineSensitivity/apps_v8"   # main branch; symlinked as *_v8
-  v8_apps <- c("species", "scores")
-  cmd <- glue("cd {apps_co} && git pull --quiet && ",
-              "for a in {paste(v8_apps, collapse=' ')}; do touch {apps_co}/$a/restart.txt; done")
-  status <- system2("ssh", c("msens", shQuote(cmd)), stdout = TRUE, stderr = TRUE)
-  log_info("deployed v8 apps [{paste(v8_apps, collapse=', ')}] from apps_v8@main; v7 apps untouched")
+  apps_co  <- "/share/github/MarineSensitivity/apps_v8"   # main branch; symlinked as *_v8
+  msens_co <- "/share/github/MarineSensitivity/msens"
+  v8_apps  <- c("species", "scores")
+  touches  <- paste(sprintf("touch %s/%s/restart.txt", apps_co, v8_apps), collapse = "; ")
+  # `set -e` + explicit ff-only fetch (a silent `git pull --quiet` once left the app + msens
+  # stale for hours). ALSO reinstall msens into the shiny/rstudio container: a stale container
+  # msens lacked `cell_tile_url(mdl_key=)` and crashed the merged surface. Reload only the v8 apps.
+  cmd <- glue("set -e; ",
+              "cd {apps_co}  && git fetch --quiet origin && git merge --ff-only origin/main; ",
+              "cd {msens_co} && git fetch --quiet origin && git merge --ff-only origin/main && ",
+              "docker exec rstudio R CMD INSTALL --no-multiarch {msens_co} >/dev/null 2>&1; ",
+              "{touches}; echo APPS_OK $(git -C {apps_co} rev-parse --short HEAD)")
+  out <- system2("ssh", c("msens", shQuote(cmd)), stdout = TRUE, stderr = TRUE)
+  if (!any(grepl("APPS_OK", out))) stop(paste(tail(out, 15), collapse = "\n"))
+  log_info("deployed v8 apps [{paste(v8_apps, collapse=', ')}] + reinstalled msens; v7 apps untouched: {tail(out,1)}")
 }
 ```
 
