@@ -86,20 +86,26 @@ n_us <- dbGetQuery(con, "SELECT count(*) n FROM us_cells")$n
 # no OOM (a bulk join over the ~3B `both` range cells otherwise blows the memory limit).
 try(dbExecute(con, "DROP TABLE IF EXISTS model_cell_all"), silent = TRUE)
 try(dbExecute(con, "DROP TABLE IF EXISTS mc_range"),       silent = TRUE)
+# ms_merge_key holds '|' and ':' which break hive partition PATHS (…/mc_parts/ms_merge_key=ms_merge|…
+# can't be parsed back). Partition on an INTEGER surrogate mkey_id — exactly what the serve surface
+# does with mdl_id. ms_merge_key stays a stored column.
+dbExecute(con, "CREATE OR REPLACE TABLE mkey_map AS
+  SELECT ms_merge_key, CAST(dense_rank() OVER (ORDER BY ms_merge_key) AS INTEGER) AS mkey_id
+  FROM (SELECT DISTINCT ms_merge_key FROM taxon_model)")
 dir_parts <- glue("{dir_atlas}/mc_parts")
 if (dir_exists(dir_parts)) dir_delete(dir_parts)
 dbExecute(con, "SET partitioned_write_max_open_files=512")
 msens::copy_atlas_parquet(con, glue(
-  "SELECT tm.ms_merge_key, split_part(mc.mdl_key,'|',1) AS ds_key, mc.cell_id, mc.val
-   FROM read_parquet('{dir_dist}/*/*.parquet') mc JOIN taxon_model tm USING (mdl_key)"),
-  dir_parts, partition_by = "ms_merge_key")
-# VIEW over the partitioned input — EVERY query below filters ms_merge_key so reads are pruned
+  "SELECT mm.mkey_id, tm.ms_merge_key, split_part(mc.mdl_key,'|',1) AS ds_key, mc.cell_id, mc.val
+   FROM read_parquet('{dir_dist}/*/*.parquet') mc JOIN taxon_model tm USING (mdl_key)
+   JOIN mkey_map mm USING (ms_merge_key)"),
+  dir_parts, partition_by = "mkey_id")
+# VIEW over the partitioned input — EVERY query below filters mkey_id (integer) so reads are pruned
 dbExecute(con, glue("CREATE OR REPLACE VIEW mc_parts AS
-  SELECT ms_merge_key, ds_key, cell_id, val
+  SELECT mkey_id, ms_merge_key, ds_key, cell_id, val
   FROM read_parquet('{dir_parts}/**/*.parquet', hive_partitioning = true)"))
-all_keys <- dbGetQuery(con, glue("SELECT DISTINCT ms_merge_key
-  FROM read_parquet('{dir_parts}/**/*.parquet', hive_partitioning = true)"))$ms_merge_key
-log_info("partitioned merge input: {length(all_keys)} taxa by ms_merge_key; US trim {n_us} in_usa cells; memory_limit={mem_gb}GB")
+all_ids <- dbGetQuery(con, "SELECT mkey_id FROM mkey_map ORDER BY mkey_id")$mkey_id
+log_info("partitioned merge input: {length(all_ids)} taxa by mkey_id; US trim {n_us} in_usa cells; memory_limit={mem_gb}GB")
 ```
 
 ## Turtle taxa (multiplicative, from only their files)
@@ -110,12 +116,14 @@ log_info("partitioned merge input: {length(all_keys)} taxa by ms_merge_key; US t
 turtle_keys <- dbGetQuery(con, glue(
   "SELECT DISTINCT ms_merge_key FROM taxon_model WHERE mdl_key LIKE '{turtle_ds}|%'"))$ms_merge_key
 tkeys_sql   <- paste(sprintf("'%s'", turtle_keys), collapse = ",")
+turtle_ids  <- dbGetQuery(con, glue("SELECT mkey_id FROM mkey_map WHERE ms_merge_key IN ({tkeys_sql})"))$mkey_id
+tids_sql    <- paste(turtle_ids, collapse = ",")
 log_info("{length(turtle_keys)} turtle taxa (multiplicative merge)")
 
-# whole-range (global) multiplicative turtle merge, reading ONLY the 6 turtle taxa's partitions
-# (ms_merge_key IN (...) → partition-pruned, tiny). er/ch/suit all come from the one pruned slice.
+# whole-range (global) multiplicative turtle merge, reading ONLY the turtle taxa's partitions
+# (mkey_id IN (...) → partition-pruned, tiny). er/ch/suit all come from the one pruned slice.
 dbExecute(con, glue("CREATE OR REPLACE TABLE mc_turtle AS
-  WITH t AS (SELECT ms_merge_key, ds_key, cell_id, val FROM mc_parts WHERE ms_merge_key IN ({tkeys_sql})),
+  WITH t AS (SELECT ms_merge_key, ds_key, cell_id, val FROM mc_parts WHERE mkey_id IN ({tids_sql})),
        er   AS (SELECT ms_merge_key, cell_id, max(val) er_value   FROM t WHERE ds_key='{turtle_ds}' GROUP BY 1,2),
        suit AS (SELECT ms_merge_key, cell_id, max(val) suit_value FROM t WHERE ds_key='{suit_ds}'   GROUP BY 1,2),
        ch   AS (SELECT ms_merge_key, cell_id, max(val) ch_value   FROM t WHERE ds_key IN ({ch_sql})  GROUP BY 1,2),
@@ -155,16 +163,16 @@ msens::copy_atlas_parquet(con,
 # suitability AT those range cells) — am OUTSIDE the range is masked out (range-only → am NULL).
 # am-only taxa have no range footprint → omitted from the GLOBAL surface (reuse am COGs), but their
 # US am cells go into the scoring surface.
-nonturtle <- setdiff(all_keys, turtle_keys)
+nonturtle <- setdiff(all_ids, turtle_ids)
 batches   <- split(nonturtle, ceiling(seq_along(nonturtle) / 150))
 log_info("merging {length(nonturtle)} non-turtle taxa in {length(batches)} pruned batches")
 glob_sql <- "SELECT br.ms_merge_key AS mdl_key, br.cell_id,
                greatest(br.er, coalesce(ba.am_val, 0))::DOUBLE AS val
              FROM b_range br LEFT JOIN b_am ba USING (ms_merge_key, cell_id)"
 for (i in seq_along(batches)) {
-  bk <- paste(sprintf("'%s'", batches[[i]]), collapse = ",")
+  bk <- paste(batches[[i]], collapse = ",")   # integer mkey_ids → partition-pruned
   dbExecute(con, glue("CREATE OR REPLACE TABLE b AS
-    SELECT ms_merge_key, ds_key, cell_id, val FROM mc_parts WHERE ms_merge_key IN ({bk})"))
+    SELECT ms_merge_key, ds_key, cell_id, val FROM mc_parts WHERE mkey_id IN ({bk})"))
   # range footprint (non-am) valued by the taxon's governing er_score
   dbExecute(con, "CREATE OR REPLACE TABLE b_range AS
     SELECT DISTINCT b.ms_merge_key, b.cell_id, t.er_score::DOUBLE AS er
