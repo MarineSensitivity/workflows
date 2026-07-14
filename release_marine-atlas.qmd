@@ -45,6 +45,8 @@ s3_http   <- glue("https://s3.us-east-1.amazonaws.com/{sub('^s3://', '', s3_ver)
 do_s3     <- !nzchar(Sys.getenv("RELEASE_NO_S3"))
 do_raw    <-  nzchar(Sys.getenv("RELEASE_RAW"))
 do_deploy <-  nzchar(Sys.getenv("RELEASE_DEPLOY"))
+do_apps   <-  do_deploy || nzchar(Sys.getenv("DEPLOY_APPS"))        # (re)deploy the v8 Shiny apps
+do_s3_tbl <-  do_s3     || nzchar(Sys.getenv("RELEASE_S3_TABLES"))  # push derived tables (native_asset) without the full serve cutover
 # server targets (parallel titiler-v8)
 srv_repo  <- "/share/github/MarineSensitivity/server"
 srv_viewdb<- glue("/share/data/big/{ver}/serve.duckdb")
@@ -112,12 +114,16 @@ sync <- function(local, prefix) {
   if (!is.null(attr(st, "status")) && attr(st, "status") != 0) stop(paste(st, collapse = "\n"))
   log_info("synced {path_file(local)} -> {s3_ver}/{prefix}")
 }
+# derived tables (incl native_asset, which the species-app native/model toggle reads) can be
+# pushed on their own via RELEASE_S3_TABLES, without the multi-GB serve/dist_merged cutover.
+if (do_s3_tbl) sync(tbl_dir, "tables")
 if (do_s3) {
-  sync(tbl_dir,                         "tables")
   sync(serve_dir,                       "serve")
   sync(glue("{dir_atlas}/dist_merged"), "dist_merged")
   sync(glue("{dir_atlas}/registry"),    "registry")
   if (do_raw) sync(glue("{dir_atlas}/dist"), "dist")
+} else if (do_s3_tbl) {
+  log_info("RELEASE_S3_TABLES: synced tables/ only (serve/dist_merged/registry NOT pushed)")
 } else log_info("RELEASE_NO_S3 set — staged locally only")
 ```
 
@@ -198,6 +204,30 @@ dbDisconnect(c0, shutdown = TRUE)
 code <- system2("curl", c("-s","-o","/dev/null","-w","%{http_code}",
   glue("{titiler_v8}/statistics?mdl_key={URLencode(mk, reserved = TRUE)}")), stdout = TRUE)
 log_info("titiler-{ver} /statistics?mdl_key={mk} smoke test: HTTP {code}")
+}
+```
+
+## Deploy the v8 Shiny apps (reload only apps_v8; v7 untouched)
+
+Reproducible app deploy — no ad-hoc ssh. Pull the **apps_v8** checkout
+(`MarineSensitivity/apps@main`, symlinked as `/share/shiny_apps/{species,scores}_v8`) and
+reload **only** the v8 apps via Shiny Server's per-app `restart.txt`. The v7 apps are a
+separate checkout (`/share/shiny_apps/{species,scores}` → `mapsp`/`mapgl`) sharing the same
+container; they are **not** restarted, so v7 serving is uninterrupted. Gated by
+`RELEASE_DEPLOY` (full release) or the granular `DEPLOY_APPS=1`.
+
+```{r}
+#| label: deploy-apps
+
+if (!do_apps) {
+  log_info("RELEASE_DEPLOY/DEPLOY_APPS unset — skipping Shiny app deploy")
+} else {
+  apps_co <- "/share/github/MarineSensitivity/apps_v8"   # main branch; symlinked as *_v8
+  v8_apps <- c("species", "scores")
+  cmd <- glue("cd {apps_co} && git pull --quiet && ",
+              "for a in {paste(v8_apps, collapse=' ')}; do touch {apps_co}/$a/restart.txt; done")
+  status <- system2("ssh", c("msens", shQuote(cmd)), stdout = TRUE, stderr = TRUE)
+  log_info("deployed v8 apps [{paste(v8_apps, collapse=', ')}] from apps_v8@main; v7 apps untouched")
 }
 ```
 
