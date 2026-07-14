@@ -107,18 +107,21 @@ msens::report_table(tibble(
 ```{r}
 #| label: s3
 
-sync <- function(local, prefix) {
+sync <- function(local, prefix, del = FALSE) {
   if (!dir_exists(local)) { log_warn("skip (missing): {local}"); return(invisible()) }
-  st <- system2("aws", c("s3", "sync", local, glue("{s3_ver}/{prefix}"),
-                         "--only-show-errors", "--no-progress"), stdout = TRUE, stderr = TRUE)
+  args <- c("s3", "sync", local, glue("{s3_ver}/{prefix}"), "--only-show-errors", "--no-progress")
+  if (del) args <- c(args, "--delete")   # prune stale S3 keys not present locally
+  st <- system2("aws", args, stdout = TRUE, stderr = TRUE)
   if (!is.null(attr(st, "status")) && attr(st, "status") != 0) stop(paste(st, collapse = "\n"))
-  log_info("synced {path_file(local)} -> {s3_ver}/{prefix}")
+  log_info("synced {path_file(local)} -> {s3_ver}/{prefix}{if (del) ' (--delete)' else ''}")
 }
 # derived tables (incl native_asset, which the species-app native/model toggle reads) can be
 # pushed on their own via RELEASE_S3_TABLES, without the multi-GB serve/dist_merged cutover.
 if (do_s3_tbl) sync(tbl_dir, "tables")
 if (do_s3) {
-  sync(serve_dir,                       "serve")
+  # serve is Hive-partitioned by mdl_id, which RENUMBERS when the model set changes (e.g. the
+  # bird crosswalk merged 25 taxa) -> --delete prunes stale partitions + the legacy single file.
+  sync(serve_dir,                       "serve", del = TRUE)
   sync(glue("{dir_atlas}/dist_merged"), "dist_merged")
   sync(glue("{dir_atlas}/registry"),    "registry")
   if (do_raw) sync(glue("{dir_atlas}/dist"), "dist")
