@@ -138,6 +138,26 @@ if (do_s3) {
 } else log_info("RELEASE_NO_S3 set — staged locally only")
 ```
 
+## Public-read CORS for browser DuckDB-WASM (`query.html`)
+
+The workflows [`query.html`](query.html) page runs DuckDB-WASM **in the browser** and range-reads the
+public `tables/*.parquet` directly. That needs the bucket's CORS to allow the `Range` request header:
+a bare `AllowedMethods:[GET]` rule returns **403** on the preflight (`Access-Control-Request-Headers:
+range`). One-time + idempotent; gated behind `RELEASE_CORS=1` so a normal release leaves CORS
+untouched. The policy is a committed file (`data/s3/cors_public.json`) — public-read only, no ACL
+change. Roll back with the 2-line `{AllowedMethods:[GET], AllowedOrigins:[*]}` prior config.
+
+```{r}
+#| label: s3-cors
+cors_file <- here("data/s3/cors_public.json")
+if (nzchar(Sys.getenv("RELEASE_CORS")) && file_exists(cors_file)) {
+  bucket <- sub("^s3://([^/]+)/.*$", "\\1", s3_ver)                    # oceanmetrics.io-public
+  system2("aws", c("s3api", "put-bucket-cors", "--bucket", bucket,
+                   "--cors-configuration", glue("file://{cors_file}")))
+  log_info("applied public-read CORS (GET/HEAD + Range header) to s3://{bucket} for browser DuckDB-WASM")
+} else log_info("s3 CORS unchanged (set RELEASE_CORS=1 to (re)apply data/s3/cors_public.json)")
+```
+
 ## Build the tiny view DB (views over the S3 Parquet)
 
 ```{r}
