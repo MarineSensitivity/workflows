@@ -53,10 +53,22 @@ stopifnot(all(file_exists(c(sdm_db, merge_db, cellid_tif, pa_gpkg, er_gpkg))),
 con <- dbConnect(duckdb(sdm_db))                    # sdm_db already has `cell` (build_cell_grid)
 dbExecute(con, glue("ATTACH '{merge_db}' AS m (READ_ONLY)"))
 
-# model_cell = merged US model (mdl_key, cell_id, val); materialize for scoring joins
-dbExecute(con, glue("CREATE OR REPLACE TABLE model_cell AS
-  SELECT mdl_key, cell_id, val FROM read_parquet('{merged}/**/*.parquet')"))
-dbExecute(con, "CREATE INDEX IF NOT EXISTS mc_cell ON model_cell(cell_id)")
+# model_cell = merged US model (mdl_key, cell_id, val); materialize for scoring joins.
+# rebuilding this ~580M-row table + its index is the slow part of score_zones (~30 min), so skip it
+# when already materialized AND row-count-identical to the merged parquet — i.e. an idempotent re-run
+# to refresh downstream taxon flags only, with the merged surface unchanged. A changed merge (row
+# count differs) forces the rebuild; REDO_SCORE_ZONES=1 forces it unconditionally.
+redo_mc <- nzchar(Sys.getenv("REDO_SCORE_ZONES"))
+n_mc <- if ("model_cell" %in% dbListTables(con))
+  dbGetQuery(con, "SELECT count(*) n FROM model_cell")$n else 0
+n_pq <- dbGetQuery(con, glue("SELECT count(*) n FROM read_parquet('{merged}/**/*.parquet')"))$n
+if (redo_mc || n_mc != n_pq) {
+  dbExecute(con, glue("CREATE OR REPLACE TABLE model_cell AS
+    SELECT mdl_key, cell_id, val FROM read_parquet('{merged}/**/*.parquet')"))
+  dbExecute(con, "CREATE INDEX IF NOT EXISTS mc_cell ON model_cell(cell_id)")
+  log_info("model_cell (re)built: {n_pq} rows")
+} else log_info(
+  "model_cell up-to-date ({n_mc} rows == merged parquet) — skipping ~30-min rebuild (REDO_SCORE_ZONES=1 to force)")
 ```
 
 ## Taxon prep — sp_cat + is_er_spatial

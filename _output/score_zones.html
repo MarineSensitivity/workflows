@@ -108,7 +108,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
     <div>
     <div class="quarto-title-meta-heading">Published</div>
     <div class="quarto-title-meta-contents">
-      <p class="date">2026-07-15 11:09:45</p>
+      <p class="date">2026-07-15 17:54:42</p>
     </div>
   </div>
   
@@ -174,20 +174,23 @@ Figure&nbsp;1: Assemble the scoring DB: merged model_cell + scoring taxon + zone
 </div>
 <details class="code-fold">
 <summary>Code</summary>
-<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb5"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># model_cell = merged US model (mdl_key, cell_id, val); materialize for scoring joins</span></span>
-<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="fu">glue</span>(<span class="st">"CREATE OR REPLACE TABLE model_cell AS</span></span>
-<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="st">  SELECT mdl_key, cell_id, val FROM read_parquet('{merged}/**/*.parquet')"</span>))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb5"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># model_cell = merged US model (mdl_key, cell_id, val); materialize for scoring joins.</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="co"># rebuilding this ~580M-row table + its index is the slow part of score_zones (~30 min), so skip it</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="co"># when already materialized AND row-count-identical to the merged parquet — i.e. an idempotent re-run</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="co"># to refresh downstream taxon flags only, with the merged surface unchanged. A changed merge (row</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="co"># count differs) forces the rebuild; REDO_SCORE_ZONES=1 forces it unconditionally.</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>redo_mc <span class="ot">&lt;-</span> <span class="fu">nzchar</span>(<span class="fu">Sys.getenv</span>(<span class="st">"REDO_SCORE_ZONES"</span>))</span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>n_mc <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="st">"model_cell"</span> <span class="sc">%in%</span> <span class="fu">dbListTables</span>(con))</span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>  <span class="fu">dbGetQuery</span>(con, <span class="st">"SELECT count(*) n FROM model_cell"</span>)<span class="sc">$</span>n <span class="cf">else</span> <span class="dv">0</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>n_pq <span class="ot">&lt;-</span> <span class="fu">dbGetQuery</span>(con, <span class="fu">glue</span>(<span class="st">"SELECT count(*) n FROM read_parquet('{merged}/**/*.parquet')"</span>))<span class="sc">$</span>n</span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (redo_mc <span class="sc">||</span> n_mc <span class="sc">!=</span> n_pq) {</span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>  <span class="fu">dbExecute</span>(con, <span class="fu">glue</span>(<span class="st">"CREATE OR REPLACE TABLE model_cell AS</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="st">    SELECT mdl_key, cell_id, val FROM read_parquet('{merged}/**/*.parquet')"</span>))</span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>  <span class="fu">dbExecute</span>(con, <span class="st">"CREATE INDEX IF NOT EXISTS mc_cell ON model_cell(cell_id)"</span>)</span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"model_cell (re)built: {n_pq} rows"</span>)</span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>} <span class="cf">else</span> <span class="fu">log_info</span>(</span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>  <span class="st">"model_cell up-to-date ({n_mc} rows == merged parquet) — skipping ~30-min rebuild (REDO_SCORE_ZONES=1 to force)"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </details>
-<div class="cell-output cell-output-stdout">
-<pre><code>[1] 580568326</code></pre>
-</div>
-<details class="code-fold">
-<summary>Code</summary>
-<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb7"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="st">"CREATE INDEX IF NOT EXISTS mc_cell ON model_cell(cell_id)"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
-</details>
-<div class="cell-output cell-output-stdout">
-<pre><code>[1] 0</code></pre>
-</div>
 </div>
 </section>
 <section id="taxon-prep-sp_cat-is_er_spatial" class="level2" data-number="3">
@@ -195,50 +198,50 @@ Figure&nbsp;1: Assemble the scoring DB: merged model_cell + scoring taxon + zone
 <div class="cell">
 <details class="code-fold">
 <summary>Code</summary>
-<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb9"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co"># sp_cat is assigned by TAXONOMY in merge_taxon (WoRMS class/phylum + BirdLife-&gt;bird) and</span></span>
-<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="co"># rides along on m.taxon; here we only add in_v7 (v7's scored set, for the same-species</span></span>
-<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="co"># compare) and is_er_spatial (turtles: SWOT+DPS ER baked into the merged cell val -&gt;</span></span>
-<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="co"># er_score=100 at scoring so it isn't double-counted). v7 taxon_id is DOUBLE, v8 VARCHAR</span></span>
-<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="co"># -&gt; cast via BIGINT (R as.character gives scientific notation for large ids, won't match).</span></span>
-<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="fu">glue</span>(<span class="st">"ATTACH '{dir_big}/{ver_prev}/sdm.duckdb' AS v7 (READ_ONLY)"</span>))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb6"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># sp_cat is assigned by TAXONOMY in merge_taxon (WoRMS class/phylum + BirdLife-&gt;bird) and</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="co"># rides along on m.taxon; here we only add in_v7 (v7's scored set, for the same-species</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="co"># compare) and is_er_spatial (turtles: SWOT+DPS ER baked into the merged cell val -&gt;</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="co"># er_score=100 at scoring so it isn't double-counted). v7 taxon_id is DOUBLE, v8 VARCHAR</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="co"># -&gt; cast via BIGINT (R as.character gives scientific notation for large ids, won't match).</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="fu">glue</span>(<span class="st">"ATTACH '{dir_big}/{ver_prev}/sdm.duckdb' AS v7 (READ_ONLY)"</span>))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </details>
 <div class="cell-output cell-output-stdout">
 <pre><code>[1] 0</code></pre>
 </div>
 <details class="code-fold">
 <summary>Code</summary>
-<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb11"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="st">"CREATE OR REPLACE TABLE v7_cat AS</span></span>
-<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="st">  SELECT taxon_authority, CAST(CAST(taxon_id AS BIGINT) AS VARCHAR) AS taxon_id,</span></span>
-<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="st">         bool_or(is_ok) AS is_ok</span></span>
-<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="st">  FROM v7.taxon WHERE taxon_id IS NOT NULL GROUP BY 1, 2"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb8"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="st">"CREATE OR REPLACE TABLE v7_cat AS</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="st">  SELECT taxon_authority, CAST(CAST(taxon_id AS BIGINT) AS VARCHAR) AS taxon_id,</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="st">         bool_or(is_ok) AS is_ok</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="st">  FROM v7.taxon WHERE taxon_id IS NOT NULL GROUP BY 1, 2"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </details>
 <div class="cell-output cell-output-stdout">
 <pre><code>[1] 17561</code></pre>
 </div>
 <details class="code-fold">
 <summary>Code</summary>
-<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb13"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="st">"CREATE OR REPLACE TABLE taxon AS</span></span>
-<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="st">  SELECT t.*,</span></span>
-<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="st">    coalesce(c.is_ok, FALSE)                                 AS in_v7,   -- in v7's scored set (same-species compare)</span></span>
-<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="st">    (t.ms_merge_key IN (</span></span>
-<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a><span class="st">       SELECT DISTINCT ms_merge_key FROM m.taxon_model WHERE mdl_key LIKE 'rng_turtle_swot_dps|%'</span></span>
-<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a><span class="st">     ))                                                      AS is_er_spatial</span></span>
-<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a><span class="st">  FROM m.taxon t</span></span>
-<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a><span class="st">  LEFT JOIN v7_cat c ON t.taxon_authority = c.taxon_authority AND t.taxon_id = c.taxon_id"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb10"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="st">"CREATE OR REPLACE TABLE taxon AS</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="st">  SELECT t.*,</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="st">    coalesce(c.is_ok, FALSE)                                 AS in_v7,   -- in v7's scored set (same-species compare)</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="st">    (t.ms_merge_key IN (</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="st">       SELECT DISTINCT ms_merge_key FROM m.taxon_model WHERE mdl_key LIKE 'rng_turtle_swot_dps|%'</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="st">     ))                                                      AS is_er_spatial</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a><span class="st">  FROM m.taxon t</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a><span class="st">  LEFT JOIN v7_cat c ON t.taxon_authority = c.taxon_authority AND t.taxon_id = c.taxon_id"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </details>
 <div class="cell-output cell-output-stdout">
 <pre><code>[1] 37051</code></pre>
 </div>
 <details class="code-fold">
 <summary>Code</summary>
-<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb15"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="st">"DETACH v7"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb12"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="st">"DETACH v7"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </details>
 <div class="cell-output cell-output-stdout">
 <pre><code>[1] 0</code></pre>
 </div>
 <details class="code-fold">
 <summary>Code</summary>
-<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb17"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a>knitr<span class="sc">::</span><span class="fu">kable</span>(<span class="fu">dbGetQuery</span>(con, <span class="st">"SELECT sp_cat, count(*) n FROM taxon WHERE is_valid_usa GROUP BY 1 ORDER BY 2 DESC"</span>))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb14"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a>knitr<span class="sc">::</span><span class="fu">kable</span>(<span class="fu">dbGetQuery</span>(con, <span class="st">"SELECT sp_cat, count(*) n FROM taxon WHERE is_valid_usa GROUP BY 1 ORDER BY 2 DESC"</span>))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </details>
 <div class="cell-output-display">
 <table class="caption-top table table-sm table-striped small">
@@ -295,54 +298,54 @@ Figure&nbsp;1: Assemble the scoring DB: merged model_cell + scoring taxon + zone
 <div class="cell">
 <details class="code-fold">
 <summary>Code</summary>
-<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb18"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a>zone_specs <span class="ot">&lt;-</span> <span class="fu">list</span>(</span>
-<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a>  <span class="fu">list</span>(<span class="at">tbl =</span> <span class="fu">glue</span>(<span class="st">"ply_programareas_2026_{ver}"</span>), <span class="at">fld =</span> <span class="st">"programarea_key"</span>, <span class="at">gpkg =</span> pa_gpkg),</span>
-<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a>  <span class="fu">list</span>(<span class="at">tbl =</span> <span class="st">"ply_ecoregions_2025"</span>,               <span class="at">fld =</span> <span class="st">"ecoregion_key"</span>,   <span class="at">gpkg =</span> er_gpkg))</span>
-<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a>r_cell <span class="ot">&lt;-</span> <span class="fu">rast</span>(cellid_tif)</span>
-<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a>zone_rows <span class="ot">&lt;-</span> <span class="fu">list</span>(); zc_rows <span class="ot">&lt;-</span> <span class="fu">list</span>(); zseq <span class="ot">&lt;-</span> <span class="dv">0</span>L</span>
-<span id="cb18-7"><a href="#cb18-7" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> (zs <span class="cf">in</span> zone_specs) {</span>
-<span id="cb18-8"><a href="#cb18-8" aria-hidden="true" tabindex="-1"></a>  ply <span class="ot">&lt;-</span> <span class="fu">st_read</span>(zs<span class="sc">$</span>gpkg, <span class="at">quiet =</span> <span class="cn">TRUE</span>) <span class="sc">|&gt;</span> <span class="fu">st_make_valid</span>() <span class="sc">|&gt;</span></span>
-<span id="cb18-9"><a href="#cb18-9" aria-hidden="true" tabindex="-1"></a>    <span class="fu">st_transform</span>(<span class="dv">4326</span>) <span class="sc">|&gt;</span> <span class="fu">select</span>(<span class="fu">all_of</span>(zs<span class="sc">$</span>fld))</span>
-<span id="cb18-10"><a href="#cb18-10" aria-hidden="true" tabindex="-1"></a>  <span class="cf">for</span> (i <span class="cf">in</span> <span class="fu">seq_len</span>(<span class="fu">nrow</span>(ply))) {</span>
-<span id="cb18-11"><a href="#cb18-11" aria-hidden="true" tabindex="-1"></a>    zseq <span class="ot">&lt;-</span> zseq <span class="sc">+</span> <span class="dv">1</span>L</span>
-<span id="cb18-12"><a href="#cb18-12" aria-hidden="true" tabindex="-1"></a>    zval <span class="ot">&lt;-</span> ply[[zs<span class="sc">$</span>fld]][i]</span>
-<span id="cb18-13"><a href="#cb18-13" aria-hidden="true" tabindex="-1"></a>    zone_rows[[<span class="fu">length</span>(zone_rows) <span class="sc">+</span> <span class="dv">1</span>]] <span class="ot">&lt;-</span> <span class="fu">tibble</span>(</span>
-<span id="cb18-14"><a href="#cb18-14" aria-hidden="true" tabindex="-1"></a>      <span class="at">zone_seq =</span> zseq, <span class="at">tbl =</span> zs<span class="sc">$</span>tbl, <span class="at">fld =</span> zs<span class="sc">$</span>fld, <span class="at">val =</span> <span class="fu">as.character</span>(zval))</span>
-<span id="cb18-15"><a href="#cb18-15" aria-hidden="true" tabindex="-1"></a>    <span class="co"># coverage fraction of this zone polygon over each cell -&gt; pct_covered (0-100)</span></span>
-<span id="cb18-16"><a href="#cb18-16" aria-hidden="true" tabindex="-1"></a>    df <span class="ot">&lt;-</span> <span class="fu">exact_extract</span>(r_cell, ply[i, ], <span class="at">progress =</span> <span class="cn">FALSE</span>)[[<span class="dv">1</span>]]   <span class="co"># exactextractr's own `value` col</span></span>
-<span id="cb18-17"><a href="#cb18-17" aria-hidden="true" tabindex="-1"></a>    df <span class="ot">&lt;-</span> df[<span class="sc">!</span><span class="fu">is.na</span>(df<span class="sc">$</span>value) <span class="sc">&amp;</span> df<span class="sc">$</span>coverage_fraction <span class="sc">&gt;</span> <span class="dv">0</span>, , drop <span class="ot">=</span> <span class="cn">FALSE</span>]</span>
-<span id="cb18-18"><a href="#cb18-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="fu">nrow</span>(df) <span class="sc">&gt;</span> <span class="dv">0</span>) zc_rows[[<span class="fu">length</span>(zc_rows) <span class="sc">+</span> <span class="dv">1</span>]] <span class="ot">&lt;-</span> <span class="fu">tibble</span>(</span>
-<span id="cb18-19"><a href="#cb18-19" aria-hidden="true" tabindex="-1"></a>      <span class="at">zone_seq =</span> zseq, <span class="at">cell_id =</span> <span class="fu">as.integer</span>(df<span class="sc">$</span>value),</span>
-<span id="cb18-20"><a href="#cb18-20" aria-hidden="true" tabindex="-1"></a>      <span class="at">pct_covered =</span> <span class="fu">as.integer</span>(<span class="fu">round</span>(df<span class="sc">$</span>coverage_fraction <span class="sc">*</span> <span class="dv">100</span>)))</span>
-<span id="cb18-21"><a href="#cb18-21" aria-hidden="true" tabindex="-1"></a>  }</span>
-<span id="cb18-22"><a href="#cb18-22" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"{zs$fld}: {nrow(ply)} zones"</span>)</span>
-<span id="cb18-23"><a href="#cb18-23" aria-hidden="true" tabindex="-1"></a>}</span>
-<span id="cb18-24"><a href="#cb18-24" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb18-25"><a href="#cb18-25" aria-hidden="true" tabindex="-1"></a><span class="co"># subregion zones (USA / AK / GA / PA) = unions of their member Program Areas (the v7 grouping,</span></span>
-<span id="cb18-26"><a href="#cb18-26" aria-hidden="true" tabindex="-1"></a><span class="co"># `{ver_prev}/subregion_programareas.csv`). No polygon source — build from the PA zones' cells so</span></span>
-<span id="cb18-27"><a href="#cb18-27" aria-hidden="true" tabindex="-1"></a><span class="co"># the apps' "Study area" filter (subregion_key) works.</span></span>
-<span id="cb18-28"><a href="#cb18-28" aria-hidden="true" tabindex="-1"></a>sr_map   <span class="ot">&lt;-</span> <span class="fu">read_csv</span>(<span class="fu">glue</span>(<span class="st">"{dir_data}/derived/{ver_prev}/subregion_programareas.csv"</span>), <span class="at">show_col_types =</span> <span class="cn">FALSE</span>)</span>
-<span id="cb18-29"><a href="#cb18-29" aria-hidden="true" tabindex="-1"></a>zone_df  <span class="ot">&lt;-</span> <span class="fu">bind_rows</span>(zone_rows); zc_df <span class="ot">&lt;-</span> <span class="fu">bind_rows</span>(zc_rows)</span>
-<span id="cb18-30"><a href="#cb18-30" aria-hidden="true" tabindex="-1"></a>pa_zones <span class="ot">&lt;-</span> zone_df <span class="sc">|&gt;</span> <span class="fu">filter</span>(fld <span class="sc">==</span> <span class="st">"programarea_key"</span>) <span class="sc">|&gt;</span> <span class="fu">select</span>(<span class="at">pa_seq =</span> zone_seq, <span class="at">programarea_key =</span> val)</span>
-<span id="cb18-31"><a href="#cb18-31" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> (sr <span class="cf">in</span> <span class="fu">sort</span>(<span class="fu">unique</span>(sr_map<span class="sc">$</span>subregion_key))) {</span>
-<span id="cb18-32"><a href="#cb18-32" aria-hidden="true" tabindex="-1"></a>  zseq <span class="ot">&lt;-</span> zseq <span class="sc">+</span> <span class="dv">1</span>L</span>
-<span id="cb18-33"><a href="#cb18-33" aria-hidden="true" tabindex="-1"></a>  member_seqs <span class="ot">&lt;-</span> pa_zones<span class="sc">$</span>pa_seq[pa_zones<span class="sc">$</span>programarea_key <span class="sc">%in%</span> sr_map<span class="sc">$</span>programarea_key[sr_map<span class="sc">$</span>subregion_key <span class="sc">==</span> sr]]</span>
-<span id="cb18-34"><a href="#cb18-34" aria-hidden="true" tabindex="-1"></a>  sr_cells <span class="ot">&lt;-</span> zc_df <span class="sc">|&gt;</span> <span class="fu">filter</span>(zone_seq <span class="sc">%in%</span> member_seqs) <span class="sc">|&gt;</span></span>
-<span id="cb18-35"><a href="#cb18-35" aria-hidden="true" tabindex="-1"></a>    <span class="fu">group_by</span>(cell_id) <span class="sc">|&gt;</span> <span class="fu">summarise</span>(<span class="at">pct_covered =</span> <span class="fu">max</span>(pct_covered), <span class="at">.groups =</span> <span class="st">"drop"</span>)</span>
-<span id="cb18-36"><a href="#cb18-36" aria-hidden="true" tabindex="-1"></a>  zone_rows[[<span class="fu">length</span>(zone_rows) <span class="sc">+</span> <span class="dv">1</span>]] <span class="ot">&lt;-</span> <span class="fu">tibble</span>(</span>
-<span id="cb18-37"><a href="#cb18-37" aria-hidden="true" tabindex="-1"></a>    <span class="at">zone_seq =</span> zseq, <span class="at">tbl =</span> <span class="fu">glue</span>(<span class="st">"ply_subregions_2026_{ver}"</span>), <span class="at">fld =</span> <span class="st">"subregion_key"</span>, <span class="at">val =</span> sr)</span>
-<span id="cb18-38"><a href="#cb18-38" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="fu">nrow</span>(sr_cells)) zc_rows[[<span class="fu">length</span>(zc_rows) <span class="sc">+</span> <span class="dv">1</span>]] <span class="ot">&lt;-</span> <span class="fu">tibble</span>(</span>
-<span id="cb18-39"><a href="#cb18-39" aria-hidden="true" tabindex="-1"></a>    <span class="at">zone_seq =</span> zseq, <span class="at">cell_id =</span> sr_cells<span class="sc">$</span>cell_id, <span class="at">pct_covered =</span> sr_cells<span class="sc">$</span>pct_covered)</span>
-<span id="cb18-40"><a href="#cb18-40" aria-hidden="true" tabindex="-1"></a>}</span>
-<span id="cb18-41"><a href="#cb18-41" aria-hidden="true" tabindex="-1"></a><span class="fu">log_info</span>(<span class="st">"subregion_key: {n_distinct(sr_map$subregion_key)} zones"</span>)</span>
-<span id="cb18-42"><a href="#cb18-42" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb18-43"><a href="#cb18-43" aria-hidden="true" tabindex="-1"></a><span class="fu">dbWriteTable</span>(con, <span class="st">"zone"</span>,      <span class="fu">bind_rows</span>(zone_rows), <span class="at">overwrite =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb18-44"><a href="#cb18-44" aria-hidden="true" tabindex="-1"></a><span class="fu">dbWriteTable</span>(con, <span class="st">"zone_cell"</span>, <span class="fu">bind_rows</span>(zc_rows) <span class="sc">|&gt;</span> <span class="fu">filter</span>(pct_covered <span class="sc">&gt;</span> <span class="dv">0</span>), <span class="at">overwrite =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb18-45"><a href="#cb18-45" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb18-46"><a href="#cb18-46" aria-hidden="true" tabindex="-1"></a>smry <span class="ot">&lt;-</span> <span class="fu">dbGetQuery</span>(con, <span class="st">"SELECT z.fld, count(DISTINCT z.zone_seq) zones, count(*) zone_cells</span></span>
-<span id="cb18-47"><a href="#cb18-47" aria-hidden="true" tabindex="-1"></a><span class="st">  FROM zone z JOIN zone_cell zc USING(zone_seq) GROUP BY 1"</span>)</span>
-<span id="cb18-48"><a href="#cb18-48" aria-hidden="true" tabindex="-1"></a>msens<span class="sc">::</span><span class="fu">report_table</span>(smry, <span class="at">caption =</span> <span class="st">"zones + zone_cells by field"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb15"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a>zone_specs <span class="ot">&lt;-</span> <span class="fu">list</span>(</span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a>  <span class="fu">list</span>(<span class="at">tbl =</span> <span class="fu">glue</span>(<span class="st">"ply_programareas_2026_{ver}"</span>), <span class="at">fld =</span> <span class="st">"programarea_key"</span>, <span class="at">gpkg =</span> pa_gpkg),</span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a>  <span class="fu">list</span>(<span class="at">tbl =</span> <span class="st">"ply_ecoregions_2025"</span>,               <span class="at">fld =</span> <span class="st">"ecoregion_key"</span>,   <span class="at">gpkg =</span> er_gpkg))</span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a>r_cell <span class="ot">&lt;-</span> <span class="fu">rast</span>(cellid_tif)</span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a>zone_rows <span class="ot">&lt;-</span> <span class="fu">list</span>(); zc_rows <span class="ot">&lt;-</span> <span class="fu">list</span>(); zseq <span class="ot">&lt;-</span> <span class="dv">0</span>L</span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> (zs <span class="cf">in</span> zone_specs) {</span>
+<span id="cb15-8"><a href="#cb15-8" aria-hidden="true" tabindex="-1"></a>  ply <span class="ot">&lt;-</span> <span class="fu">st_read</span>(zs<span class="sc">$</span>gpkg, <span class="at">quiet =</span> <span class="cn">TRUE</span>) <span class="sc">|&gt;</span> <span class="fu">st_make_valid</span>() <span class="sc">|&gt;</span></span>
+<span id="cb15-9"><a href="#cb15-9" aria-hidden="true" tabindex="-1"></a>    <span class="fu">st_transform</span>(<span class="dv">4326</span>) <span class="sc">|&gt;</span> <span class="fu">select</span>(<span class="fu">all_of</span>(zs<span class="sc">$</span>fld))</span>
+<span id="cb15-10"><a href="#cb15-10" aria-hidden="true" tabindex="-1"></a>  <span class="cf">for</span> (i <span class="cf">in</span> <span class="fu">seq_len</span>(<span class="fu">nrow</span>(ply))) {</span>
+<span id="cb15-11"><a href="#cb15-11" aria-hidden="true" tabindex="-1"></a>    zseq <span class="ot">&lt;-</span> zseq <span class="sc">+</span> <span class="dv">1</span>L</span>
+<span id="cb15-12"><a href="#cb15-12" aria-hidden="true" tabindex="-1"></a>    zval <span class="ot">&lt;-</span> ply[[zs<span class="sc">$</span>fld]][i]</span>
+<span id="cb15-13"><a href="#cb15-13" aria-hidden="true" tabindex="-1"></a>    zone_rows[[<span class="fu">length</span>(zone_rows) <span class="sc">+</span> <span class="dv">1</span>]] <span class="ot">&lt;-</span> <span class="fu">tibble</span>(</span>
+<span id="cb15-14"><a href="#cb15-14" aria-hidden="true" tabindex="-1"></a>      <span class="at">zone_seq =</span> zseq, <span class="at">tbl =</span> zs<span class="sc">$</span>tbl, <span class="at">fld =</span> zs<span class="sc">$</span>fld, <span class="at">val =</span> <span class="fu">as.character</span>(zval))</span>
+<span id="cb15-15"><a href="#cb15-15" aria-hidden="true" tabindex="-1"></a>    <span class="co"># coverage fraction of this zone polygon over each cell -&gt; pct_covered (0-100)</span></span>
+<span id="cb15-16"><a href="#cb15-16" aria-hidden="true" tabindex="-1"></a>    df <span class="ot">&lt;-</span> <span class="fu">exact_extract</span>(r_cell, ply[i, ], <span class="at">progress =</span> <span class="cn">FALSE</span>)[[<span class="dv">1</span>]]   <span class="co"># exactextractr's own `value` col</span></span>
+<span id="cb15-17"><a href="#cb15-17" aria-hidden="true" tabindex="-1"></a>    df <span class="ot">&lt;-</span> df[<span class="sc">!</span><span class="fu">is.na</span>(df<span class="sc">$</span>value) <span class="sc">&amp;</span> df<span class="sc">$</span>coverage_fraction <span class="sc">&gt;</span> <span class="dv">0</span>, , drop <span class="ot">=</span> <span class="cn">FALSE</span>]</span>
+<span id="cb15-18"><a href="#cb15-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="fu">nrow</span>(df) <span class="sc">&gt;</span> <span class="dv">0</span>) zc_rows[[<span class="fu">length</span>(zc_rows) <span class="sc">+</span> <span class="dv">1</span>]] <span class="ot">&lt;-</span> <span class="fu">tibble</span>(</span>
+<span id="cb15-19"><a href="#cb15-19" aria-hidden="true" tabindex="-1"></a>      <span class="at">zone_seq =</span> zseq, <span class="at">cell_id =</span> <span class="fu">as.integer</span>(df<span class="sc">$</span>value),</span>
+<span id="cb15-20"><a href="#cb15-20" aria-hidden="true" tabindex="-1"></a>      <span class="at">pct_covered =</span> <span class="fu">as.integer</span>(<span class="fu">round</span>(df<span class="sc">$</span>coverage_fraction <span class="sc">*</span> <span class="dv">100</span>)))</span>
+<span id="cb15-21"><a href="#cb15-21" aria-hidden="true" tabindex="-1"></a>  }</span>
+<span id="cb15-22"><a href="#cb15-22" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"{zs$fld}: {nrow(ply)} zones"</span>)</span>
+<span id="cb15-23"><a href="#cb15-23" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb15-24"><a href="#cb15-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-25"><a href="#cb15-25" aria-hidden="true" tabindex="-1"></a><span class="co"># subregion zones (USA / AK / GA / PA) = unions of their member Program Areas (the v7 grouping,</span></span>
+<span id="cb15-26"><a href="#cb15-26" aria-hidden="true" tabindex="-1"></a><span class="co"># `{ver_prev}/subregion_programareas.csv`). No polygon source — build from the PA zones' cells so</span></span>
+<span id="cb15-27"><a href="#cb15-27" aria-hidden="true" tabindex="-1"></a><span class="co"># the apps' "Study area" filter (subregion_key) works.</span></span>
+<span id="cb15-28"><a href="#cb15-28" aria-hidden="true" tabindex="-1"></a>sr_map   <span class="ot">&lt;-</span> <span class="fu">read_csv</span>(<span class="fu">glue</span>(<span class="st">"{dir_data}/derived/{ver_prev}/subregion_programareas.csv"</span>), <span class="at">show_col_types =</span> <span class="cn">FALSE</span>)</span>
+<span id="cb15-29"><a href="#cb15-29" aria-hidden="true" tabindex="-1"></a>zone_df  <span class="ot">&lt;-</span> <span class="fu">bind_rows</span>(zone_rows); zc_df <span class="ot">&lt;-</span> <span class="fu">bind_rows</span>(zc_rows)</span>
+<span id="cb15-30"><a href="#cb15-30" aria-hidden="true" tabindex="-1"></a>pa_zones <span class="ot">&lt;-</span> zone_df <span class="sc">|&gt;</span> <span class="fu">filter</span>(fld <span class="sc">==</span> <span class="st">"programarea_key"</span>) <span class="sc">|&gt;</span> <span class="fu">select</span>(<span class="at">pa_seq =</span> zone_seq, <span class="at">programarea_key =</span> val)</span>
+<span id="cb15-31"><a href="#cb15-31" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> (sr <span class="cf">in</span> <span class="fu">sort</span>(<span class="fu">unique</span>(sr_map<span class="sc">$</span>subregion_key))) {</span>
+<span id="cb15-32"><a href="#cb15-32" aria-hidden="true" tabindex="-1"></a>  zseq <span class="ot">&lt;-</span> zseq <span class="sc">+</span> <span class="dv">1</span>L</span>
+<span id="cb15-33"><a href="#cb15-33" aria-hidden="true" tabindex="-1"></a>  member_seqs <span class="ot">&lt;-</span> pa_zones<span class="sc">$</span>pa_seq[pa_zones<span class="sc">$</span>programarea_key <span class="sc">%in%</span> sr_map<span class="sc">$</span>programarea_key[sr_map<span class="sc">$</span>subregion_key <span class="sc">==</span> sr]]</span>
+<span id="cb15-34"><a href="#cb15-34" aria-hidden="true" tabindex="-1"></a>  sr_cells <span class="ot">&lt;-</span> zc_df <span class="sc">|&gt;</span> <span class="fu">filter</span>(zone_seq <span class="sc">%in%</span> member_seqs) <span class="sc">|&gt;</span></span>
+<span id="cb15-35"><a href="#cb15-35" aria-hidden="true" tabindex="-1"></a>    <span class="fu">group_by</span>(cell_id) <span class="sc">|&gt;</span> <span class="fu">summarise</span>(<span class="at">pct_covered =</span> <span class="fu">max</span>(pct_covered), <span class="at">.groups =</span> <span class="st">"drop"</span>)</span>
+<span id="cb15-36"><a href="#cb15-36" aria-hidden="true" tabindex="-1"></a>  zone_rows[[<span class="fu">length</span>(zone_rows) <span class="sc">+</span> <span class="dv">1</span>]] <span class="ot">&lt;-</span> <span class="fu">tibble</span>(</span>
+<span id="cb15-37"><a href="#cb15-37" aria-hidden="true" tabindex="-1"></a>    <span class="at">zone_seq =</span> zseq, <span class="at">tbl =</span> <span class="fu">glue</span>(<span class="st">"ply_subregions_2026_{ver}"</span>), <span class="at">fld =</span> <span class="st">"subregion_key"</span>, <span class="at">val =</span> sr)</span>
+<span id="cb15-38"><a href="#cb15-38" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="fu">nrow</span>(sr_cells)) zc_rows[[<span class="fu">length</span>(zc_rows) <span class="sc">+</span> <span class="dv">1</span>]] <span class="ot">&lt;-</span> <span class="fu">tibble</span>(</span>
+<span id="cb15-39"><a href="#cb15-39" aria-hidden="true" tabindex="-1"></a>    <span class="at">zone_seq =</span> zseq, <span class="at">cell_id =</span> sr_cells<span class="sc">$</span>cell_id, <span class="at">pct_covered =</span> sr_cells<span class="sc">$</span>pct_covered)</span>
+<span id="cb15-40"><a href="#cb15-40" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb15-41"><a href="#cb15-41" aria-hidden="true" tabindex="-1"></a><span class="fu">log_info</span>(<span class="st">"subregion_key: {n_distinct(sr_map$subregion_key)} zones"</span>)</span>
+<span id="cb15-42"><a href="#cb15-42" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-43"><a href="#cb15-43" aria-hidden="true" tabindex="-1"></a><span class="fu">dbWriteTable</span>(con, <span class="st">"zone"</span>,      <span class="fu">bind_rows</span>(zone_rows), <span class="at">overwrite =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb15-44"><a href="#cb15-44" aria-hidden="true" tabindex="-1"></a><span class="fu">dbWriteTable</span>(con, <span class="st">"zone_cell"</span>, <span class="fu">bind_rows</span>(zc_rows) <span class="sc">|&gt;</span> <span class="fu">filter</span>(pct_covered <span class="sc">&gt;</span> <span class="dv">0</span>), <span class="at">overwrite =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb15-45"><a href="#cb15-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-46"><a href="#cb15-46" aria-hidden="true" tabindex="-1"></a>smry <span class="ot">&lt;-</span> <span class="fu">dbGetQuery</span>(con, <span class="st">"SELECT z.fld, count(DISTINCT z.zone_seq) zones, count(*) zone_cells</span></span>
+<span id="cb15-47"><a href="#cb15-47" aria-hidden="true" tabindex="-1"></a><span class="st">  FROM zone z JOIN zone_cell zc USING(zone_seq) GROUP BY 1"</span>)</span>
+<span id="cb15-48"><a href="#cb15-48" aria-hidden="true" tabindex="-1"></a>msens<span class="sc">::</span><span class="fu">report_table</span>(smry, <span class="at">caption =</span> <span class="st">"zones + zone_cells by field"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </details>
 <div class="cell-output-display">
 <table class="caption-top table table-sm table-striped small">
@@ -361,27 +364,27 @@ Figure&nbsp;1: Assemble the scoring DB: merged model_cell + scoring taxon + zone
 <td style="text-align: right;">630944</td>
 </tr>
 <tr class="even">
-<td style="text-align: left;">subregion_key</td>
-<td style="text-align: right;">4</td>
-<td style="text-align: right;">697280</td>
-</tr>
-<tr class="odd">
 <td style="text-align: left;">programarea_key</td>
 <td style="text-align: right;">20</td>
 <td style="text-align: right;">350938</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">subregion_key</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">697280</td>
 </tr>
 </tbody>
 </table>
 </div>
 <details class="code-fold">
 <summary>Code</summary>
-<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb19"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="co"># content fingerprint of everything this notebook produces for downstream scoring:</span></span>
-<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a><span class="co"># model_cell + scoring taxon + zone + zone_cell (fold; before disconnect)</span></span>
-<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a>zones_hash   <span class="ot">&lt;-</span> <span class="fu">paste0</span>(msens<span class="sc">::</span><span class="fu">hash_query</span>(con, <span class="st">"model_cell"</span>), msens<span class="sc">::</span><span class="fu">hash_query</span>(con, <span class="st">"taxon"</span>),</span>
-<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a>                       msens<span class="sc">::</span><span class="fu">hash_query</span>(con, <span class="st">"zone"</span>),       msens<span class="sc">::</span><span class="fu">hash_query</span>(con, <span class="st">"zone_cell"</span>))</span>
-<span id="cb19-5"><a href="#cb19-5" aria-hidden="true" tabindex="-1"></a>n_zones      <span class="ot">&lt;-</span> <span class="fu">dbGetQuery</span>(con, <span class="st">"SELECT count(*) n FROM zone"</span>)<span class="sc">$</span>n</span>
-<span id="cb19-6"><a href="#cb19-6" aria-hidden="true" tabindex="-1"></a>n_zone_cells <span class="ot">&lt;-</span> <span class="fu">dbGetQuery</span>(con, <span class="st">"SELECT count(*) n FROM zone_cell"</span>)<span class="sc">$</span>n</span>
-<span id="cb19-7"><a href="#cb19-7" aria-hidden="true" tabindex="-1"></a><span class="fu">dbDisconnect</span>(con, <span class="at">shutdown =</span> <span class="cn">TRUE</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb16"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="co"># content fingerprint of everything this notebook produces for downstream scoring:</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="co"># model_cell + scoring taxon + zone + zone_cell (fold; before disconnect)</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a>zones_hash   <span class="ot">&lt;-</span> <span class="fu">paste0</span>(msens<span class="sc">::</span><span class="fu">hash_query</span>(con, <span class="st">"model_cell"</span>), msens<span class="sc">::</span><span class="fu">hash_query</span>(con, <span class="st">"taxon"</span>),</span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a>                       msens<span class="sc">::</span><span class="fu">hash_query</span>(con, <span class="st">"zone"</span>),       msens<span class="sc">::</span><span class="fu">hash_query</span>(con, <span class="st">"zone_cell"</span>))</span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a>n_zones      <span class="ot">&lt;-</span> <span class="fu">dbGetQuery</span>(con, <span class="st">"SELECT count(*) n FROM zone"</span>)<span class="sc">$</span>n</span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a>n_zone_cells <span class="ot">&lt;-</span> <span class="fu">dbGetQuery</span>(con, <span class="st">"SELECT count(*) n FROM zone_cell"</span>)<span class="sc">$</span>n</span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a><span class="fu">dbDisconnect</span>(con, <span class="at">shutdown =</span> <span class="cn">TRUE</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </details>
 </div>
 </section>
@@ -390,11 +393,11 @@ Figure&nbsp;1: Assemble the scoring DB: merged model_cell + scoring taxon + zone
 <div class="cell">
 <details class="code-fold">
 <summary>Code</summary>
-<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb20"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="co"># content-addressed: fingerprint of model_cell + taxon + zone + zone_cell (no wall-clock)</span></span>
-<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a>msens<span class="sc">::</span><span class="fu">write_manifest</span>(</span>
-<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a>  manifest, <span class="at">target =</span> <span class="st">"score_zones"</span>, <span class="at">content_hash =</span> zones_hash,</span>
-<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">stats =</span> <span class="fu">list</span>(<span class="at">ver =</span> ver, <span class="at">n_zones =</span> n_zones, <span class="at">n_zone_cells =</span> n_zone_cells),</span>
-<span id="cb20-5"><a href="#cb20-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">force =</span> msens<span class="sc">::</span><span class="fu">force_target</span>(<span class="st">"score_zones"</span>))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb17"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="co"># content-addressed: fingerprint of model_cell + taxon + zone + zone_cell (no wall-clock)</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a>msens<span class="sc">::</span><span class="fu">write_manifest</span>(</span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a>  manifest, <span class="at">target =</span> <span class="st">"score_zones"</span>, <span class="at">content_hash =</span> zones_hash,</span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">stats =</span> <span class="fu">list</span>(<span class="at">ver =</span> ver, <span class="at">n_zones =</span> n_zones, <span class="at">n_zone_cells =</span> n_zone_cells),</span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">force =</span> msens<span class="sc">::</span><span class="fu">force_target</span>(<span class="st">"score_zones"</span>))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </details>
 </div>
 <!-- -->
@@ -854,168 +857,180 @@ Figure&nbsp;1: Assemble the scoring DB: merged model_cell + scoring taxon + zone
     }
   });
   </script><div class="modal fade" id="quarto-embedded-source-code-modal" tabindex="-1" aria-labelledby="quarto-embedded-source-code-modal-label" aria-hidden="true"><div class="modal-dialog modal-dialog-scrollable"><div class="modal-content"><div class="modal-header"><h5 class="modal-title" id="quarto-embedded-source-code-modal-label">Source Code</h5><button class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><div class="">
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb21" data-shortcodes="false"><pre class="sourceCode markdown code-with-copy"><code class="sourceCode markdown"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
-<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a><span class="an">title:</span><span class="co"> "Score setup — zones (program areas + ecoregions) + taxon prep"</span></span>
-<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a><span class="an">msens:</span></span>
-<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a><span class="co">  target_name: score_zones</span></span>
-<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a><span class="co">  workflow_type: score</span></span>
-<span id="cb21-6"><a href="#cb21-6" aria-hidden="true" tabindex="-1"></a><span class="co">  dependency: [merge_taxon, build_cell_grid]</span></span>
-<span id="cb21-7"><a href="#cb21-7" aria-hidden="true" tabindex="-1"></a><span class="co">  output: data/manifests/score_zones.json</span></span>
-<span id="cb21-8"><a href="#cb21-8" aria-hidden="true" tabindex="-1"></a><span class="an">editor_options:</span></span>
-<span id="cb21-9"><a href="#cb21-9" aria-hidden="true" tabindex="-1"></a><span class="co">  chunk_output_type: console</span></span>
-<span id="cb21-10"><a href="#cb21-10" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
-<span id="cb21-11"><a href="#cb21-11" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb21-12"><a href="#cb21-12" aria-hidden="true" tabindex="-1"></a>Foundation for <span class="in">`calc_scores`</span> (v8): assemble the scoring DuckDB from the merged</span>
-<span id="cb21-13"><a href="#cb21-13" aria-hidden="true" tabindex="-1"></a><span class="in">`model_cell`</span> + <span class="in">`taxon`</span> + <span class="in">`cell`</span>, prep the taxon for scoring (<span class="in">`sp_cat`</span>,</span>
-<span id="cb21-14"><a href="#cb21-14" aria-hidden="true" tabindex="-1"></a><span class="in">`is_er_spatial`</span>), and build <span class="in">`zone`</span> + <span class="in">`zone_cell`</span> — cells ↔ program areas / ecoregions</span>
-<span id="cb21-15"><a href="#cb21-15" aria-hidden="true" tabindex="-1"></a>with <span class="in">`pct_covered`</span> (0–100) via exactextractr coverage of each zone polygon over the</span>
-<span id="cb21-16"><a href="#cb21-16" aria-hidden="true" tabindex="-1"></a>cell-id grid. Scoring formulas need <span class="in">`zone_cell.pct_covered`</span> at every step.</span>
-<span id="cb21-17"><a href="#cb21-17" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb21-18"><a href="#cb21-18" aria-hidden="true" tabindex="-1"></a><span class="fu">## Design</span></span>
-<span id="cb21-19"><a href="#cb21-19" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb21-22"><a href="#cb21-22" aria-hidden="true" tabindex="-1"></a><span class="in">```{mermaid}</span></span>
-<span id="cb21-23"><a href="#cb21-23" aria-hidden="true" tabindex="-1"></a>%%| label: fig-design</span>
-<span id="cb21-24"><a href="#cb21-24" aria-hidden="true" tabindex="-1"></a>%%| fig-cap: <span class="ot">"</span><span class="st">Assemble the scoring DB: merged model_cell + scoring taxon + zone/zone_cell coverage</span><span class="ot">"</span></span>
-<span id="cb21-25"><a href="#cb21-25" aria-hidden="true" tabindex="-1"></a>flowchart LR</span>
-<span id="cb21-26"><a href="#cb21-26" aria-hidden="true" tabindex="-1"></a>  mrg[<span class="ot">"</span><span class="st">dist_merged model_cell</span><span class="ot">"</span>] --&gt; mc[<span class="ot">"</span><span class="st">model_cell (sdm.duckdb)</span><span class="ot">"</span>]</span>
-<span id="cb21-27"><a href="#cb21-27" aria-hidden="true" tabindex="-1"></a>  mtx[<span class="ot">"</span><span class="st">merge.duckdb taxon&lt;br/&gt;+ v7 in_v7/is_er_spatial</span><span class="ot">"</span>] --&gt; tx[<span class="ot">"</span><span class="st">taxon (scoring)</span><span class="ot">"</span>]</span>
-<span id="cb21-28"><a href="#cb21-28" aria-hidden="true" tabindex="-1"></a>  ply[<span class="ot">"</span><span class="st">program-area + ecoregion polys&lt;br/&gt;→ exact_extract vs cellid grid</span><span class="ot">"</span>] --&gt; zc[<span class="ot">"</span><span class="st">zone + zone_cell&lt;br/&gt;(pct_covered 0-100)</span><span class="ot">"</span>]</span>
-<span id="cb21-29"><a href="#cb21-29" aria-hidden="true" tabindex="-1"></a>  mc --&gt; mf[<span class="ot">"</span><span class="st">hash_query(model_cell,taxon,zone,zone_cell)&lt;br/&gt;→ content-addressed manifest</span><span class="ot">"</span>]</span>
-<span id="cb21-30"><a href="#cb21-30" aria-hidden="true" tabindex="-1"></a>  tx --&gt; mf</span>
-<span id="cb21-31"><a href="#cb21-31" aria-hidden="true" tabindex="-1"></a>  zc --&gt; mf</span>
-<span id="cb21-32"><a href="#cb21-32" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb21-33"><a href="#cb21-33" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb21-34"><a href="#cb21-34" aria-hidden="true" tabindex="-1"></a><span class="fu">## Setup — assemble the scoring DB</span></span>
-<span id="cb21-35"><a href="#cb21-35" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb21-38"><a href="#cb21-38" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb21-39"><a href="#cb21-39" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: setup</span></span>
-<span id="cb21-40"><a href="#cb21-40" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb21-41"><a href="#cb21-41" aria-hidden="true" tabindex="-1"></a>librarian<span class="sc">::</span><span class="fu">shelf</span>(DBI, dplyr, duckdb, exactextractr, fs, glue, here, jsonlite, logger, readr,</span>
-<span id="cb21-42"><a href="#cb21-42" aria-hidden="true" tabindex="-1"></a>                 sf, terra, tibble, MarineSensitivity<span class="sc">/</span>msens, <span class="at">quiet =</span> T)</span>
-<span id="cb21-43"><a href="#cb21-43" aria-hidden="true" tabindex="-1"></a><span class="fu">source</span>(<span class="fu">here</span>(<span class="st">"libs/paths.R"</span>))</span>
-<span id="cb21-44"><a href="#cb21-44" aria-hidden="true" tabindex="-1"></a><span class="fu">source</span>(<span class="fu">here</span>(<span class="st">"libs/vars.R"</span>))</span>
-<span id="cb21-45"><a href="#cb21-45" aria-hidden="true" tabindex="-1"></a><span class="fu">sf_use_s2</span>(<span class="cn">FALSE</span>)</span>
-<span id="cb21-46"><a href="#cb21-46" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb21-47"><a href="#cb21-47" aria-hidden="true" tabindex="-1"></a>dir_atlas <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{dir_big_v}/marine-atlas"</span>)</span>
-<span id="cb21-48"><a href="#cb21-48" aria-hidden="true" tabindex="-1"></a>merged    <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{dir_atlas}/dist_merged/dataset=ms_merge"</span>)</span>
-<span id="cb21-49"><a href="#cb21-49" aria-hidden="true" tabindex="-1"></a>merge_db  <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{dir_atlas}/merge.duckdb"</span>)</span>
-<span id="cb21-50"><a href="#cb21-50" aria-hidden="true" tabindex="-1"></a>pa_gpkg   <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{dir_data}/derived/{ver_prev}/ply_programareas_2026_{ver_prev}.gpkg"</span>)</span>
-<span id="cb21-51"><a href="#cb21-51" aria-hidden="true" tabindex="-1"></a>er_gpkg   <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{dir_data}/derived/{ver_prev}/ply_ecoregions_2025.gpkg"</span>)</span>
-<span id="cb21-52"><a href="#cb21-52" aria-hidden="true" tabindex="-1"></a>manifest  <span class="ot">&lt;-</span> <span class="fu">here</span>(<span class="st">"data/manifests/score_zones.json"</span>)</span>
-<span id="cb21-53"><a href="#cb21-53" aria-hidden="true" tabindex="-1"></a><span class="fu">dir_create</span>(<span class="fu">path_dir</span>(manifest))</span>
-<span id="cb21-54"><a href="#cb21-54" aria-hidden="true" tabindex="-1"></a><span class="fu">stopifnot</span>(<span class="fu">all</span>(<span class="fu">file_exists</span>(<span class="fu">c</span>(sdm_db, merge_db, cellid_tif, pa_gpkg, er_gpkg))),</span>
-<span id="cb21-55"><a href="#cb21-55" aria-hidden="true" tabindex="-1"></a>          <span class="fu">dir_exists</span>(merged))</span>
-<span id="cb21-56"><a href="#cb21-56" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb21-57"><a href="#cb21-57" aria-hidden="true" tabindex="-1"></a>con <span class="ot">&lt;-</span> <span class="fu">dbConnect</span>(<span class="fu">duckdb</span>(sdm_db))                    <span class="co"># sdm_db already has `cell` (build_cell_grid)</span></span>
-<span id="cb21-58"><a href="#cb21-58" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="fu">glue</span>(<span class="st">"ATTACH '{merge_db}' AS m (READ_ONLY)"</span>))</span>
-<span id="cb21-59"><a href="#cb21-59" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb21-60"><a href="#cb21-60" aria-hidden="true" tabindex="-1"></a><span class="co"># model_cell = merged US model (mdl_key, cell_id, val); materialize for scoring joins</span></span>
-<span id="cb21-61"><a href="#cb21-61" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="fu">glue</span>(<span class="st">"CREATE OR REPLACE TABLE model_cell AS</span></span>
-<span id="cb21-62"><a href="#cb21-62" aria-hidden="true" tabindex="-1"></a><span class="st">  SELECT mdl_key, cell_id, val FROM read_parquet('{merged}/**/*.parquet')"</span>))</span>
-<span id="cb21-63"><a href="#cb21-63" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="st">"CREATE INDEX IF NOT EXISTS mc_cell ON model_cell(cell_id)"</span>)</span>
-<span id="cb21-64"><a href="#cb21-64" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb21-65"><a href="#cb21-65" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb21-66"><a href="#cb21-66" aria-hidden="true" tabindex="-1"></a><span class="fu">## Taxon prep — sp_cat + is_er_spatial</span></span>
-<span id="cb21-67"><a href="#cb21-67" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb21-70"><a href="#cb21-70" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb21-71"><a href="#cb21-71" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: taxon</span></span>
-<span id="cb21-72"><a href="#cb21-72" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb21-73"><a href="#cb21-73" aria-hidden="true" tabindex="-1"></a><span class="co"># sp_cat is assigned by TAXONOMY in merge_taxon (WoRMS class/phylum + BirdLife-&gt;bird) and</span></span>
-<span id="cb21-74"><a href="#cb21-74" aria-hidden="true" tabindex="-1"></a><span class="co"># rides along on m.taxon; here we only add in_v7 (v7's scored set, for the same-species</span></span>
-<span id="cb21-75"><a href="#cb21-75" aria-hidden="true" tabindex="-1"></a><span class="co"># compare) and is_er_spatial (turtles: SWOT+DPS ER baked into the merged cell val -&gt;</span></span>
-<span id="cb21-76"><a href="#cb21-76" aria-hidden="true" tabindex="-1"></a><span class="co"># er_score=100 at scoring so it isn't double-counted). v7 taxon_id is DOUBLE, v8 VARCHAR</span></span>
-<span id="cb21-77"><a href="#cb21-77" aria-hidden="true" tabindex="-1"></a><span class="co"># -&gt; cast via BIGINT (R as.character gives scientific notation for large ids, won't match).</span></span>
-<span id="cb21-78"><a href="#cb21-78" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="fu">glue</span>(<span class="st">"ATTACH '{dir_big}/{ver_prev}/sdm.duckdb' AS v7 (READ_ONLY)"</span>))</span>
-<span id="cb21-79"><a href="#cb21-79" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="st">"CREATE OR REPLACE TABLE v7_cat AS</span></span>
-<span id="cb21-80"><a href="#cb21-80" aria-hidden="true" tabindex="-1"></a><span class="st">  SELECT taxon_authority, CAST(CAST(taxon_id AS BIGINT) AS VARCHAR) AS taxon_id,</span></span>
-<span id="cb21-81"><a href="#cb21-81" aria-hidden="true" tabindex="-1"></a><span class="st">         bool_or(is_ok) AS is_ok</span></span>
-<span id="cb21-82"><a href="#cb21-82" aria-hidden="true" tabindex="-1"></a><span class="st">  FROM v7.taxon WHERE taxon_id IS NOT NULL GROUP BY 1, 2"</span>)</span>
-<span id="cb21-83"><a href="#cb21-83" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="st">"CREATE OR REPLACE TABLE taxon AS</span></span>
-<span id="cb21-84"><a href="#cb21-84" aria-hidden="true" tabindex="-1"></a><span class="st">  SELECT t.*,</span></span>
-<span id="cb21-85"><a href="#cb21-85" aria-hidden="true" tabindex="-1"></a><span class="st">    coalesce(c.is_ok, FALSE)                                 AS in_v7,   -- in v7's scored set (same-species compare)</span></span>
-<span id="cb21-86"><a href="#cb21-86" aria-hidden="true" tabindex="-1"></a><span class="st">    (t.ms_merge_key IN (</span></span>
-<span id="cb21-87"><a href="#cb21-87" aria-hidden="true" tabindex="-1"></a><span class="st">       SELECT DISTINCT ms_merge_key FROM m.taxon_model WHERE mdl_key LIKE 'rng_turtle_swot_dps|%'</span></span>
-<span id="cb21-88"><a href="#cb21-88" aria-hidden="true" tabindex="-1"></a><span class="st">     ))                                                      AS is_er_spatial</span></span>
-<span id="cb21-89"><a href="#cb21-89" aria-hidden="true" tabindex="-1"></a><span class="st">  FROM m.taxon t</span></span>
-<span id="cb21-90"><a href="#cb21-90" aria-hidden="true" tabindex="-1"></a><span class="st">  LEFT JOIN v7_cat c ON t.taxon_authority = c.taxon_authority AND t.taxon_id = c.taxon_id"</span>)</span>
-<span id="cb21-91"><a href="#cb21-91" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="st">"DETACH v7"</span>)</span>
-<span id="cb21-92"><a href="#cb21-92" aria-hidden="true" tabindex="-1"></a>knitr<span class="sc">::</span><span class="fu">kable</span>(<span class="fu">dbGetQuery</span>(con, <span class="st">"SELECT sp_cat, count(*) n FROM taxon WHERE is_valid_usa GROUP BY 1 ORDER BY 2 DESC"</span>))</span>
-<span id="cb21-93"><a href="#cb21-93" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb21-94"><a href="#cb21-94" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb21-95"><a href="#cb21-95" aria-hidden="true" tabindex="-1"></a><span class="fu">## Zones + zone_cell (program areas + ecoregions)</span></span>
-<span id="cb21-96"><a href="#cb21-96" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb21-99"><a href="#cb21-99" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb21-100"><a href="#cb21-100" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: zones</span></span>
-<span id="cb21-101"><a href="#cb21-101" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb21-102"><a href="#cb21-102" aria-hidden="true" tabindex="-1"></a>zone_specs <span class="ot">&lt;-</span> <span class="fu">list</span>(</span>
-<span id="cb21-103"><a href="#cb21-103" aria-hidden="true" tabindex="-1"></a>  <span class="fu">list</span>(<span class="at">tbl =</span> <span class="fu">glue</span>(<span class="st">"ply_programareas_2026_{ver}"</span>), <span class="at">fld =</span> <span class="st">"programarea_key"</span>, <span class="at">gpkg =</span> pa_gpkg),</span>
-<span id="cb21-104"><a href="#cb21-104" aria-hidden="true" tabindex="-1"></a>  <span class="fu">list</span>(<span class="at">tbl =</span> <span class="st">"ply_ecoregions_2025"</span>,               <span class="at">fld =</span> <span class="st">"ecoregion_key"</span>,   <span class="at">gpkg =</span> er_gpkg))</span>
-<span id="cb21-105"><a href="#cb21-105" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb21-106"><a href="#cb21-106" aria-hidden="true" tabindex="-1"></a>r_cell <span class="ot">&lt;-</span> <span class="fu">rast</span>(cellid_tif)</span>
-<span id="cb21-107"><a href="#cb21-107" aria-hidden="true" tabindex="-1"></a>zone_rows <span class="ot">&lt;-</span> <span class="fu">list</span>(); zc_rows <span class="ot">&lt;-</span> <span class="fu">list</span>(); zseq <span class="ot">&lt;-</span> <span class="dv">0</span>L</span>
-<span id="cb21-108"><a href="#cb21-108" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> (zs <span class="cf">in</span> zone_specs) {</span>
-<span id="cb21-109"><a href="#cb21-109" aria-hidden="true" tabindex="-1"></a>  ply <span class="ot">&lt;-</span> <span class="fu">st_read</span>(zs<span class="sc">$</span>gpkg, <span class="at">quiet =</span> <span class="cn">TRUE</span>) <span class="sc">|&gt;</span> <span class="fu">st_make_valid</span>() <span class="sc">|&gt;</span></span>
-<span id="cb21-110"><a href="#cb21-110" aria-hidden="true" tabindex="-1"></a>    <span class="fu">st_transform</span>(<span class="dv">4326</span>) <span class="sc">|&gt;</span> <span class="fu">select</span>(<span class="fu">all_of</span>(zs<span class="sc">$</span>fld))</span>
-<span id="cb21-111"><a href="#cb21-111" aria-hidden="true" tabindex="-1"></a>  <span class="cf">for</span> (i <span class="cf">in</span> <span class="fu">seq_len</span>(<span class="fu">nrow</span>(ply))) {</span>
-<span id="cb21-112"><a href="#cb21-112" aria-hidden="true" tabindex="-1"></a>    zseq <span class="ot">&lt;-</span> zseq <span class="sc">+</span> <span class="dv">1</span>L</span>
-<span id="cb21-113"><a href="#cb21-113" aria-hidden="true" tabindex="-1"></a>    zval <span class="ot">&lt;-</span> ply[[zs<span class="sc">$</span>fld]][i]</span>
-<span id="cb21-114"><a href="#cb21-114" aria-hidden="true" tabindex="-1"></a>    zone_rows[[<span class="fu">length</span>(zone_rows) <span class="sc">+</span> <span class="dv">1</span>]] <span class="ot">&lt;-</span> <span class="fu">tibble</span>(</span>
-<span id="cb21-115"><a href="#cb21-115" aria-hidden="true" tabindex="-1"></a>      <span class="at">zone_seq =</span> zseq, <span class="at">tbl =</span> zs<span class="sc">$</span>tbl, <span class="at">fld =</span> zs<span class="sc">$</span>fld, <span class="at">val =</span> <span class="fu">as.character</span>(zval))</span>
-<span id="cb21-116"><a href="#cb21-116" aria-hidden="true" tabindex="-1"></a>    <span class="co"># coverage fraction of this zone polygon over each cell -&gt; pct_covered (0-100)</span></span>
-<span id="cb21-117"><a href="#cb21-117" aria-hidden="true" tabindex="-1"></a>    df <span class="ot">&lt;-</span> <span class="fu">exact_extract</span>(r_cell, ply[i, ], <span class="at">progress =</span> <span class="cn">FALSE</span>)[[<span class="dv">1</span>]]   <span class="co"># exactextractr's own `value` col</span></span>
-<span id="cb21-118"><a href="#cb21-118" aria-hidden="true" tabindex="-1"></a>    df <span class="ot">&lt;-</span> df[<span class="sc">!</span><span class="fu">is.na</span>(df<span class="sc">$</span>value) <span class="sc">&amp;</span> df<span class="sc">$</span>coverage_fraction <span class="sc">&gt;</span> <span class="dv">0</span>, , drop <span class="ot">=</span> <span class="cn">FALSE</span>]</span>
-<span id="cb21-119"><a href="#cb21-119" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="fu">nrow</span>(df) <span class="sc">&gt;</span> <span class="dv">0</span>) zc_rows[[<span class="fu">length</span>(zc_rows) <span class="sc">+</span> <span class="dv">1</span>]] <span class="ot">&lt;-</span> <span class="fu">tibble</span>(</span>
-<span id="cb21-120"><a href="#cb21-120" aria-hidden="true" tabindex="-1"></a>      <span class="at">zone_seq =</span> zseq, <span class="at">cell_id =</span> <span class="fu">as.integer</span>(df<span class="sc">$</span>value),</span>
-<span id="cb21-121"><a href="#cb21-121" aria-hidden="true" tabindex="-1"></a>      <span class="at">pct_covered =</span> <span class="fu">as.integer</span>(<span class="fu">round</span>(df<span class="sc">$</span>coverage_fraction <span class="sc">*</span> <span class="dv">100</span>)))</span>
-<span id="cb21-122"><a href="#cb21-122" aria-hidden="true" tabindex="-1"></a>  }</span>
-<span id="cb21-123"><a href="#cb21-123" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"{zs$fld}: {nrow(ply)} zones"</span>)</span>
-<span id="cb21-124"><a href="#cb21-124" aria-hidden="true" tabindex="-1"></a>}</span>
-<span id="cb21-125"><a href="#cb21-125" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb21-126"><a href="#cb21-126" aria-hidden="true" tabindex="-1"></a><span class="co"># subregion zones (USA / AK / GA / PA) = unions of their member Program Areas (the v7 grouping,</span></span>
-<span id="cb21-127"><a href="#cb21-127" aria-hidden="true" tabindex="-1"></a><span class="co"># `{ver_prev}/subregion_programareas.csv`). No polygon source — build from the PA zones' cells so</span></span>
-<span id="cb21-128"><a href="#cb21-128" aria-hidden="true" tabindex="-1"></a><span class="co"># the apps' "Study area" filter (subregion_key) works.</span></span>
-<span id="cb21-129"><a href="#cb21-129" aria-hidden="true" tabindex="-1"></a>sr_map   <span class="ot">&lt;-</span> <span class="fu">read_csv</span>(<span class="fu">glue</span>(<span class="st">"{dir_data}/derived/{ver_prev}/subregion_programareas.csv"</span>), <span class="at">show_col_types =</span> <span class="cn">FALSE</span>)</span>
-<span id="cb21-130"><a href="#cb21-130" aria-hidden="true" tabindex="-1"></a>zone_df  <span class="ot">&lt;-</span> <span class="fu">bind_rows</span>(zone_rows); zc_df <span class="ot">&lt;-</span> <span class="fu">bind_rows</span>(zc_rows)</span>
-<span id="cb21-131"><a href="#cb21-131" aria-hidden="true" tabindex="-1"></a>pa_zones <span class="ot">&lt;-</span> zone_df <span class="sc">|&gt;</span> <span class="fu">filter</span>(fld <span class="sc">==</span> <span class="st">"programarea_key"</span>) <span class="sc">|&gt;</span> <span class="fu">select</span>(<span class="at">pa_seq =</span> zone_seq, <span class="at">programarea_key =</span> val)</span>
-<span id="cb21-132"><a href="#cb21-132" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> (sr <span class="cf">in</span> <span class="fu">sort</span>(<span class="fu">unique</span>(sr_map<span class="sc">$</span>subregion_key))) {</span>
-<span id="cb21-133"><a href="#cb21-133" aria-hidden="true" tabindex="-1"></a>  zseq <span class="ot">&lt;-</span> zseq <span class="sc">+</span> <span class="dv">1</span>L</span>
-<span id="cb21-134"><a href="#cb21-134" aria-hidden="true" tabindex="-1"></a>  member_seqs <span class="ot">&lt;-</span> pa_zones<span class="sc">$</span>pa_seq[pa_zones<span class="sc">$</span>programarea_key <span class="sc">%in%</span> sr_map<span class="sc">$</span>programarea_key[sr_map<span class="sc">$</span>subregion_key <span class="sc">==</span> sr]]</span>
-<span id="cb21-135"><a href="#cb21-135" aria-hidden="true" tabindex="-1"></a>  sr_cells <span class="ot">&lt;-</span> zc_df <span class="sc">|&gt;</span> <span class="fu">filter</span>(zone_seq <span class="sc">%in%</span> member_seqs) <span class="sc">|&gt;</span></span>
-<span id="cb21-136"><a href="#cb21-136" aria-hidden="true" tabindex="-1"></a>    <span class="fu">group_by</span>(cell_id) <span class="sc">|&gt;</span> <span class="fu">summarise</span>(<span class="at">pct_covered =</span> <span class="fu">max</span>(pct_covered), <span class="at">.groups =</span> <span class="st">"drop"</span>)</span>
-<span id="cb21-137"><a href="#cb21-137" aria-hidden="true" tabindex="-1"></a>  zone_rows[[<span class="fu">length</span>(zone_rows) <span class="sc">+</span> <span class="dv">1</span>]] <span class="ot">&lt;-</span> <span class="fu">tibble</span>(</span>
-<span id="cb21-138"><a href="#cb21-138" aria-hidden="true" tabindex="-1"></a>    <span class="at">zone_seq =</span> zseq, <span class="at">tbl =</span> <span class="fu">glue</span>(<span class="st">"ply_subregions_2026_{ver}"</span>), <span class="at">fld =</span> <span class="st">"subregion_key"</span>, <span class="at">val =</span> sr)</span>
-<span id="cb21-139"><a href="#cb21-139" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="fu">nrow</span>(sr_cells)) zc_rows[[<span class="fu">length</span>(zc_rows) <span class="sc">+</span> <span class="dv">1</span>]] <span class="ot">&lt;-</span> <span class="fu">tibble</span>(</span>
-<span id="cb21-140"><a href="#cb21-140" aria-hidden="true" tabindex="-1"></a>    <span class="at">zone_seq =</span> zseq, <span class="at">cell_id =</span> sr_cells<span class="sc">$</span>cell_id, <span class="at">pct_covered =</span> sr_cells<span class="sc">$</span>pct_covered)</span>
-<span id="cb21-141"><a href="#cb21-141" aria-hidden="true" tabindex="-1"></a>}</span>
-<span id="cb21-142"><a href="#cb21-142" aria-hidden="true" tabindex="-1"></a><span class="fu">log_info</span>(<span class="st">"subregion_key: {n_distinct(sr_map$subregion_key)} zones"</span>)</span>
-<span id="cb21-143"><a href="#cb21-143" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb21-144"><a href="#cb21-144" aria-hidden="true" tabindex="-1"></a><span class="fu">dbWriteTable</span>(con, <span class="st">"zone"</span>,      <span class="fu">bind_rows</span>(zone_rows), <span class="at">overwrite =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb21-145"><a href="#cb21-145" aria-hidden="true" tabindex="-1"></a><span class="fu">dbWriteTable</span>(con, <span class="st">"zone_cell"</span>, <span class="fu">bind_rows</span>(zc_rows) <span class="sc">|&gt;</span> <span class="fu">filter</span>(pct_covered <span class="sc">&gt;</span> <span class="dv">0</span>), <span class="at">overwrite =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb21-146"><a href="#cb21-146" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb21-147"><a href="#cb21-147" aria-hidden="true" tabindex="-1"></a>smry <span class="ot">&lt;-</span> <span class="fu">dbGetQuery</span>(con, <span class="st">"SELECT z.fld, count(DISTINCT z.zone_seq) zones, count(*) zone_cells</span></span>
-<span id="cb21-148"><a href="#cb21-148" aria-hidden="true" tabindex="-1"></a><span class="st">  FROM zone z JOIN zone_cell zc USING(zone_seq) GROUP BY 1"</span>)</span>
-<span id="cb21-149"><a href="#cb21-149" aria-hidden="true" tabindex="-1"></a>msens<span class="sc">::</span><span class="fu">report_table</span>(smry, <span class="at">caption =</span> <span class="st">"zones + zone_cells by field"</span>)</span>
-<span id="cb21-150"><a href="#cb21-150" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb21-151"><a href="#cb21-151" aria-hidden="true" tabindex="-1"></a><span class="co"># content fingerprint of everything this notebook produces for downstream scoring:</span></span>
-<span id="cb21-152"><a href="#cb21-152" aria-hidden="true" tabindex="-1"></a><span class="co"># model_cell + scoring taxon + zone + zone_cell (fold; before disconnect)</span></span>
-<span id="cb21-153"><a href="#cb21-153" aria-hidden="true" tabindex="-1"></a>zones_hash   <span class="ot">&lt;-</span> <span class="fu">paste0</span>(msens<span class="sc">::</span><span class="fu">hash_query</span>(con, <span class="st">"model_cell"</span>), msens<span class="sc">::</span><span class="fu">hash_query</span>(con, <span class="st">"taxon"</span>),</span>
-<span id="cb21-154"><a href="#cb21-154" aria-hidden="true" tabindex="-1"></a>                       msens<span class="sc">::</span><span class="fu">hash_query</span>(con, <span class="st">"zone"</span>),       msens<span class="sc">::</span><span class="fu">hash_query</span>(con, <span class="st">"zone_cell"</span>))</span>
-<span id="cb21-155"><a href="#cb21-155" aria-hidden="true" tabindex="-1"></a>n_zones      <span class="ot">&lt;-</span> <span class="fu">dbGetQuery</span>(con, <span class="st">"SELECT count(*) n FROM zone"</span>)<span class="sc">$</span>n</span>
-<span id="cb21-156"><a href="#cb21-156" aria-hidden="true" tabindex="-1"></a>n_zone_cells <span class="ot">&lt;-</span> <span class="fu">dbGetQuery</span>(con, <span class="st">"SELECT count(*) n FROM zone_cell"</span>)<span class="sc">$</span>n</span>
-<span id="cb21-157"><a href="#cb21-157" aria-hidden="true" tabindex="-1"></a><span class="fu">dbDisconnect</span>(con, <span class="at">shutdown =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb21-158"><a href="#cb21-158" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb21-159"><a href="#cb21-159" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb21-160"><a href="#cb21-160" aria-hidden="true" tabindex="-1"></a><span class="fu">## Manifest</span></span>
-<span id="cb21-161"><a href="#cb21-161" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb21-164"><a href="#cb21-164" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb21-165"><a href="#cb21-165" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: manifest</span></span>
-<span id="cb21-166"><a href="#cb21-166" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb21-167"><a href="#cb21-167" aria-hidden="true" tabindex="-1"></a><span class="co"># content-addressed: fingerprint of model_cell + taxon + zone + zone_cell (no wall-clock)</span></span>
-<span id="cb21-168"><a href="#cb21-168" aria-hidden="true" tabindex="-1"></a>msens<span class="sc">::</span><span class="fu">write_manifest</span>(</span>
-<span id="cb21-169"><a href="#cb21-169" aria-hidden="true" tabindex="-1"></a>  manifest, <span class="at">target =</span> <span class="st">"score_zones"</span>, <span class="at">content_hash =</span> zones_hash,</span>
-<span id="cb21-170"><a href="#cb21-170" aria-hidden="true" tabindex="-1"></a>  <span class="at">stats =</span> <span class="fu">list</span>(<span class="at">ver =</span> ver, <span class="at">n_zones =</span> n_zones, <span class="at">n_zone_cells =</span> n_zone_cells),</span>
-<span id="cb21-171"><a href="#cb21-171" aria-hidden="true" tabindex="-1"></a>  <span class="at">force =</span> msens<span class="sc">::</span><span class="fu">force_target</span>(<span class="st">"score_zones"</span>))</span>
-<span id="cb21-172"><a href="#cb21-172" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb18" data-shortcodes="false"><pre class="sourceCode markdown code-with-copy"><code class="sourceCode markdown"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="an">title:</span><span class="co"> "Score setup — zones (program areas + ecoregions) + taxon prep"</span></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a><span class="an">msens:</span></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a><span class="co">  target_name: score_zones</span></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a><span class="co">  workflow_type: score</span></span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a><span class="co">  dependency: [merge_taxon, build_cell_grid]</span></span>
+<span id="cb18-7"><a href="#cb18-7" aria-hidden="true" tabindex="-1"></a><span class="co">  output: data/manifests/score_zones.json</span></span>
+<span id="cb18-8"><a href="#cb18-8" aria-hidden="true" tabindex="-1"></a><span class="an">editor_options:</span></span>
+<span id="cb18-9"><a href="#cb18-9" aria-hidden="true" tabindex="-1"></a><span class="co">  chunk_output_type: console</span></span>
+<span id="cb18-10"><a href="#cb18-10" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb18-11"><a href="#cb18-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-12"><a href="#cb18-12" aria-hidden="true" tabindex="-1"></a>Foundation for <span class="in">`calc_scores`</span> (v8): assemble the scoring DuckDB from the merged</span>
+<span id="cb18-13"><a href="#cb18-13" aria-hidden="true" tabindex="-1"></a><span class="in">`model_cell`</span> + <span class="in">`taxon`</span> + <span class="in">`cell`</span>, prep the taxon for scoring (<span class="in">`sp_cat`</span>,</span>
+<span id="cb18-14"><a href="#cb18-14" aria-hidden="true" tabindex="-1"></a><span class="in">`is_er_spatial`</span>), and build <span class="in">`zone`</span> + <span class="in">`zone_cell`</span> — cells ↔ program areas / ecoregions</span>
+<span id="cb18-15"><a href="#cb18-15" aria-hidden="true" tabindex="-1"></a>with <span class="in">`pct_covered`</span> (0–100) via exactextractr coverage of each zone polygon over the</span>
+<span id="cb18-16"><a href="#cb18-16" aria-hidden="true" tabindex="-1"></a>cell-id grid. Scoring formulas need <span class="in">`zone_cell.pct_covered`</span> at every step.</span>
+<span id="cb18-17"><a href="#cb18-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-18"><a href="#cb18-18" aria-hidden="true" tabindex="-1"></a><span class="fu">## Design</span></span>
+<span id="cb18-19"><a href="#cb18-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-22"><a href="#cb18-22" aria-hidden="true" tabindex="-1"></a><span class="in">```{mermaid}</span></span>
+<span id="cb18-23"><a href="#cb18-23" aria-hidden="true" tabindex="-1"></a>%%| label: fig-design</span>
+<span id="cb18-24"><a href="#cb18-24" aria-hidden="true" tabindex="-1"></a>%%| fig-cap: <span class="ot">"</span><span class="st">Assemble the scoring DB: merged model_cell + scoring taxon + zone/zone_cell coverage</span><span class="ot">"</span></span>
+<span id="cb18-25"><a href="#cb18-25" aria-hidden="true" tabindex="-1"></a>flowchart LR</span>
+<span id="cb18-26"><a href="#cb18-26" aria-hidden="true" tabindex="-1"></a>  mrg[<span class="ot">"</span><span class="st">dist_merged model_cell</span><span class="ot">"</span>] --&gt; mc[<span class="ot">"</span><span class="st">model_cell (sdm.duckdb)</span><span class="ot">"</span>]</span>
+<span id="cb18-27"><a href="#cb18-27" aria-hidden="true" tabindex="-1"></a>  mtx[<span class="ot">"</span><span class="st">merge.duckdb taxon&lt;br/&gt;+ v7 in_v7/is_er_spatial</span><span class="ot">"</span>] --&gt; tx[<span class="ot">"</span><span class="st">taxon (scoring)</span><span class="ot">"</span>]</span>
+<span id="cb18-28"><a href="#cb18-28" aria-hidden="true" tabindex="-1"></a>  ply[<span class="ot">"</span><span class="st">program-area + ecoregion polys&lt;br/&gt;→ exact_extract vs cellid grid</span><span class="ot">"</span>] --&gt; zc[<span class="ot">"</span><span class="st">zone + zone_cell&lt;br/&gt;(pct_covered 0-100)</span><span class="ot">"</span>]</span>
+<span id="cb18-29"><a href="#cb18-29" aria-hidden="true" tabindex="-1"></a>  mc --&gt; mf[<span class="ot">"</span><span class="st">hash_query(model_cell,taxon,zone,zone_cell)&lt;br/&gt;→ content-addressed manifest</span><span class="ot">"</span>]</span>
+<span id="cb18-30"><a href="#cb18-30" aria-hidden="true" tabindex="-1"></a>  tx --&gt; mf</span>
+<span id="cb18-31"><a href="#cb18-31" aria-hidden="true" tabindex="-1"></a>  zc --&gt; mf</span>
+<span id="cb18-32"><a href="#cb18-32" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb18-33"><a href="#cb18-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-34"><a href="#cb18-34" aria-hidden="true" tabindex="-1"></a><span class="fu">## Setup — assemble the scoring DB</span></span>
+<span id="cb18-35"><a href="#cb18-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-38"><a href="#cb18-38" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb18-39"><a href="#cb18-39" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: setup</span></span>
+<span id="cb18-40"><a href="#cb18-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-41"><a href="#cb18-41" aria-hidden="true" tabindex="-1"></a>librarian<span class="sc">::</span><span class="fu">shelf</span>(DBI, dplyr, duckdb, exactextractr, fs, glue, here, jsonlite, logger, readr,</span>
+<span id="cb18-42"><a href="#cb18-42" aria-hidden="true" tabindex="-1"></a>                 sf, terra, tibble, MarineSensitivity<span class="sc">/</span>msens, <span class="at">quiet =</span> T)</span>
+<span id="cb18-43"><a href="#cb18-43" aria-hidden="true" tabindex="-1"></a><span class="fu">source</span>(<span class="fu">here</span>(<span class="st">"libs/paths.R"</span>))</span>
+<span id="cb18-44"><a href="#cb18-44" aria-hidden="true" tabindex="-1"></a><span class="fu">source</span>(<span class="fu">here</span>(<span class="st">"libs/vars.R"</span>))</span>
+<span id="cb18-45"><a href="#cb18-45" aria-hidden="true" tabindex="-1"></a><span class="fu">sf_use_s2</span>(<span class="cn">FALSE</span>)</span>
+<span id="cb18-46"><a href="#cb18-46" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-47"><a href="#cb18-47" aria-hidden="true" tabindex="-1"></a>dir_atlas <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{dir_big_v}/marine-atlas"</span>)</span>
+<span id="cb18-48"><a href="#cb18-48" aria-hidden="true" tabindex="-1"></a>merged    <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{dir_atlas}/dist_merged/dataset=ms_merge"</span>)</span>
+<span id="cb18-49"><a href="#cb18-49" aria-hidden="true" tabindex="-1"></a>merge_db  <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{dir_atlas}/merge.duckdb"</span>)</span>
+<span id="cb18-50"><a href="#cb18-50" aria-hidden="true" tabindex="-1"></a>pa_gpkg   <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{dir_data}/derived/{ver_prev}/ply_programareas_2026_{ver_prev}.gpkg"</span>)</span>
+<span id="cb18-51"><a href="#cb18-51" aria-hidden="true" tabindex="-1"></a>er_gpkg   <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{dir_data}/derived/{ver_prev}/ply_ecoregions_2025.gpkg"</span>)</span>
+<span id="cb18-52"><a href="#cb18-52" aria-hidden="true" tabindex="-1"></a>manifest  <span class="ot">&lt;-</span> <span class="fu">here</span>(<span class="st">"data/manifests/score_zones.json"</span>)</span>
+<span id="cb18-53"><a href="#cb18-53" aria-hidden="true" tabindex="-1"></a><span class="fu">dir_create</span>(<span class="fu">path_dir</span>(manifest))</span>
+<span id="cb18-54"><a href="#cb18-54" aria-hidden="true" tabindex="-1"></a><span class="fu">stopifnot</span>(<span class="fu">all</span>(<span class="fu">file_exists</span>(<span class="fu">c</span>(sdm_db, merge_db, cellid_tif, pa_gpkg, er_gpkg))),</span>
+<span id="cb18-55"><a href="#cb18-55" aria-hidden="true" tabindex="-1"></a>          <span class="fu">dir_exists</span>(merged))</span>
+<span id="cb18-56"><a href="#cb18-56" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-57"><a href="#cb18-57" aria-hidden="true" tabindex="-1"></a>con <span class="ot">&lt;-</span> <span class="fu">dbConnect</span>(<span class="fu">duckdb</span>(sdm_db))                    <span class="co"># sdm_db already has `cell` (build_cell_grid)</span></span>
+<span id="cb18-58"><a href="#cb18-58" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="fu">glue</span>(<span class="st">"ATTACH '{merge_db}' AS m (READ_ONLY)"</span>))</span>
+<span id="cb18-59"><a href="#cb18-59" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-60"><a href="#cb18-60" aria-hidden="true" tabindex="-1"></a><span class="co"># model_cell = merged US model (mdl_key, cell_id, val); materialize for scoring joins.</span></span>
+<span id="cb18-61"><a href="#cb18-61" aria-hidden="true" tabindex="-1"></a><span class="co"># rebuilding this ~580M-row table + its index is the slow part of score_zones (~30 min), so skip it</span></span>
+<span id="cb18-62"><a href="#cb18-62" aria-hidden="true" tabindex="-1"></a><span class="co"># when already materialized AND row-count-identical to the merged parquet — i.e. an idempotent re-run</span></span>
+<span id="cb18-63"><a href="#cb18-63" aria-hidden="true" tabindex="-1"></a><span class="co"># to refresh downstream taxon flags only, with the merged surface unchanged. A changed merge (row</span></span>
+<span id="cb18-64"><a href="#cb18-64" aria-hidden="true" tabindex="-1"></a><span class="co"># count differs) forces the rebuild; REDO_SCORE_ZONES=1 forces it unconditionally.</span></span>
+<span id="cb18-65"><a href="#cb18-65" aria-hidden="true" tabindex="-1"></a>redo_mc <span class="ot">&lt;-</span> <span class="fu">nzchar</span>(<span class="fu">Sys.getenv</span>(<span class="st">"REDO_SCORE_ZONES"</span>))</span>
+<span id="cb18-66"><a href="#cb18-66" aria-hidden="true" tabindex="-1"></a>n_mc <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="st">"model_cell"</span> <span class="sc">%in%</span> <span class="fu">dbListTables</span>(con))</span>
+<span id="cb18-67"><a href="#cb18-67" aria-hidden="true" tabindex="-1"></a>  <span class="fu">dbGetQuery</span>(con, <span class="st">"SELECT count(*) n FROM model_cell"</span>)<span class="sc">$</span>n <span class="cf">else</span> <span class="dv">0</span></span>
+<span id="cb18-68"><a href="#cb18-68" aria-hidden="true" tabindex="-1"></a>n_pq <span class="ot">&lt;-</span> <span class="fu">dbGetQuery</span>(con, <span class="fu">glue</span>(<span class="st">"SELECT count(*) n FROM read_parquet('{merged}/**/*.parquet')"</span>))<span class="sc">$</span>n</span>
+<span id="cb18-69"><a href="#cb18-69" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (redo_mc <span class="sc">||</span> n_mc <span class="sc">!=</span> n_pq) {</span>
+<span id="cb18-70"><a href="#cb18-70" aria-hidden="true" tabindex="-1"></a>  <span class="fu">dbExecute</span>(con, <span class="fu">glue</span>(<span class="st">"CREATE OR REPLACE TABLE model_cell AS</span></span>
+<span id="cb18-71"><a href="#cb18-71" aria-hidden="true" tabindex="-1"></a><span class="st">    SELECT mdl_key, cell_id, val FROM read_parquet('{merged}/**/*.parquet')"</span>))</span>
+<span id="cb18-72"><a href="#cb18-72" aria-hidden="true" tabindex="-1"></a>  <span class="fu">dbExecute</span>(con, <span class="st">"CREATE INDEX IF NOT EXISTS mc_cell ON model_cell(cell_id)"</span>)</span>
+<span id="cb18-73"><a href="#cb18-73" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"model_cell (re)built: {n_pq} rows"</span>)</span>
+<span id="cb18-74"><a href="#cb18-74" aria-hidden="true" tabindex="-1"></a>} <span class="cf">else</span> <span class="fu">log_info</span>(</span>
+<span id="cb18-75"><a href="#cb18-75" aria-hidden="true" tabindex="-1"></a>  <span class="st">"model_cell up-to-date ({n_mc} rows == merged parquet) — skipping ~30-min rebuild (REDO_SCORE_ZONES=1 to force)"</span>)</span>
+<span id="cb18-76"><a href="#cb18-76" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb18-77"><a href="#cb18-77" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-78"><a href="#cb18-78" aria-hidden="true" tabindex="-1"></a><span class="fu">## Taxon prep — sp_cat + is_er_spatial</span></span>
+<span id="cb18-79"><a href="#cb18-79" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-82"><a href="#cb18-82" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb18-83"><a href="#cb18-83" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: taxon</span></span>
+<span id="cb18-84"><a href="#cb18-84" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-85"><a href="#cb18-85" aria-hidden="true" tabindex="-1"></a><span class="co"># sp_cat is assigned by TAXONOMY in merge_taxon (WoRMS class/phylum + BirdLife-&gt;bird) and</span></span>
+<span id="cb18-86"><a href="#cb18-86" aria-hidden="true" tabindex="-1"></a><span class="co"># rides along on m.taxon; here we only add in_v7 (v7's scored set, for the same-species</span></span>
+<span id="cb18-87"><a href="#cb18-87" aria-hidden="true" tabindex="-1"></a><span class="co"># compare) and is_er_spatial (turtles: SWOT+DPS ER baked into the merged cell val -&gt;</span></span>
+<span id="cb18-88"><a href="#cb18-88" aria-hidden="true" tabindex="-1"></a><span class="co"># er_score=100 at scoring so it isn't double-counted). v7 taxon_id is DOUBLE, v8 VARCHAR</span></span>
+<span id="cb18-89"><a href="#cb18-89" aria-hidden="true" tabindex="-1"></a><span class="co"># -&gt; cast via BIGINT (R as.character gives scientific notation for large ids, won't match).</span></span>
+<span id="cb18-90"><a href="#cb18-90" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="fu">glue</span>(<span class="st">"ATTACH '{dir_big}/{ver_prev}/sdm.duckdb' AS v7 (READ_ONLY)"</span>))</span>
+<span id="cb18-91"><a href="#cb18-91" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="st">"CREATE OR REPLACE TABLE v7_cat AS</span></span>
+<span id="cb18-92"><a href="#cb18-92" aria-hidden="true" tabindex="-1"></a><span class="st">  SELECT taxon_authority, CAST(CAST(taxon_id AS BIGINT) AS VARCHAR) AS taxon_id,</span></span>
+<span id="cb18-93"><a href="#cb18-93" aria-hidden="true" tabindex="-1"></a><span class="st">         bool_or(is_ok) AS is_ok</span></span>
+<span id="cb18-94"><a href="#cb18-94" aria-hidden="true" tabindex="-1"></a><span class="st">  FROM v7.taxon WHERE taxon_id IS NOT NULL GROUP BY 1, 2"</span>)</span>
+<span id="cb18-95"><a href="#cb18-95" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="st">"CREATE OR REPLACE TABLE taxon AS</span></span>
+<span id="cb18-96"><a href="#cb18-96" aria-hidden="true" tabindex="-1"></a><span class="st">  SELECT t.*,</span></span>
+<span id="cb18-97"><a href="#cb18-97" aria-hidden="true" tabindex="-1"></a><span class="st">    coalesce(c.is_ok, FALSE)                                 AS in_v7,   -- in v7's scored set (same-species compare)</span></span>
+<span id="cb18-98"><a href="#cb18-98" aria-hidden="true" tabindex="-1"></a><span class="st">    (t.ms_merge_key IN (</span></span>
+<span id="cb18-99"><a href="#cb18-99" aria-hidden="true" tabindex="-1"></a><span class="st">       SELECT DISTINCT ms_merge_key FROM m.taxon_model WHERE mdl_key LIKE 'rng_turtle_swot_dps|%'</span></span>
+<span id="cb18-100"><a href="#cb18-100" aria-hidden="true" tabindex="-1"></a><span class="st">     ))                                                      AS is_er_spatial</span></span>
+<span id="cb18-101"><a href="#cb18-101" aria-hidden="true" tabindex="-1"></a><span class="st">  FROM m.taxon t</span></span>
+<span id="cb18-102"><a href="#cb18-102" aria-hidden="true" tabindex="-1"></a><span class="st">  LEFT JOIN v7_cat c ON t.taxon_authority = c.taxon_authority AND t.taxon_id = c.taxon_id"</span>)</span>
+<span id="cb18-103"><a href="#cb18-103" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="st">"DETACH v7"</span>)</span>
+<span id="cb18-104"><a href="#cb18-104" aria-hidden="true" tabindex="-1"></a>knitr<span class="sc">::</span><span class="fu">kable</span>(<span class="fu">dbGetQuery</span>(con, <span class="st">"SELECT sp_cat, count(*) n FROM taxon WHERE is_valid_usa GROUP BY 1 ORDER BY 2 DESC"</span>))</span>
+<span id="cb18-105"><a href="#cb18-105" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb18-106"><a href="#cb18-106" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-107"><a href="#cb18-107" aria-hidden="true" tabindex="-1"></a><span class="fu">## Zones + zone_cell (program areas + ecoregions)</span></span>
+<span id="cb18-108"><a href="#cb18-108" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-111"><a href="#cb18-111" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb18-112"><a href="#cb18-112" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: zones</span></span>
+<span id="cb18-113"><a href="#cb18-113" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-114"><a href="#cb18-114" aria-hidden="true" tabindex="-1"></a>zone_specs <span class="ot">&lt;-</span> <span class="fu">list</span>(</span>
+<span id="cb18-115"><a href="#cb18-115" aria-hidden="true" tabindex="-1"></a>  <span class="fu">list</span>(<span class="at">tbl =</span> <span class="fu">glue</span>(<span class="st">"ply_programareas_2026_{ver}"</span>), <span class="at">fld =</span> <span class="st">"programarea_key"</span>, <span class="at">gpkg =</span> pa_gpkg),</span>
+<span id="cb18-116"><a href="#cb18-116" aria-hidden="true" tabindex="-1"></a>  <span class="fu">list</span>(<span class="at">tbl =</span> <span class="st">"ply_ecoregions_2025"</span>,               <span class="at">fld =</span> <span class="st">"ecoregion_key"</span>,   <span class="at">gpkg =</span> er_gpkg))</span>
+<span id="cb18-117"><a href="#cb18-117" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-118"><a href="#cb18-118" aria-hidden="true" tabindex="-1"></a>r_cell <span class="ot">&lt;-</span> <span class="fu">rast</span>(cellid_tif)</span>
+<span id="cb18-119"><a href="#cb18-119" aria-hidden="true" tabindex="-1"></a>zone_rows <span class="ot">&lt;-</span> <span class="fu">list</span>(); zc_rows <span class="ot">&lt;-</span> <span class="fu">list</span>(); zseq <span class="ot">&lt;-</span> <span class="dv">0</span>L</span>
+<span id="cb18-120"><a href="#cb18-120" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> (zs <span class="cf">in</span> zone_specs) {</span>
+<span id="cb18-121"><a href="#cb18-121" aria-hidden="true" tabindex="-1"></a>  ply <span class="ot">&lt;-</span> <span class="fu">st_read</span>(zs<span class="sc">$</span>gpkg, <span class="at">quiet =</span> <span class="cn">TRUE</span>) <span class="sc">|&gt;</span> <span class="fu">st_make_valid</span>() <span class="sc">|&gt;</span></span>
+<span id="cb18-122"><a href="#cb18-122" aria-hidden="true" tabindex="-1"></a>    <span class="fu">st_transform</span>(<span class="dv">4326</span>) <span class="sc">|&gt;</span> <span class="fu">select</span>(<span class="fu">all_of</span>(zs<span class="sc">$</span>fld))</span>
+<span id="cb18-123"><a href="#cb18-123" aria-hidden="true" tabindex="-1"></a>  <span class="cf">for</span> (i <span class="cf">in</span> <span class="fu">seq_len</span>(<span class="fu">nrow</span>(ply))) {</span>
+<span id="cb18-124"><a href="#cb18-124" aria-hidden="true" tabindex="-1"></a>    zseq <span class="ot">&lt;-</span> zseq <span class="sc">+</span> <span class="dv">1</span>L</span>
+<span id="cb18-125"><a href="#cb18-125" aria-hidden="true" tabindex="-1"></a>    zval <span class="ot">&lt;-</span> ply[[zs<span class="sc">$</span>fld]][i]</span>
+<span id="cb18-126"><a href="#cb18-126" aria-hidden="true" tabindex="-1"></a>    zone_rows[[<span class="fu">length</span>(zone_rows) <span class="sc">+</span> <span class="dv">1</span>]] <span class="ot">&lt;-</span> <span class="fu">tibble</span>(</span>
+<span id="cb18-127"><a href="#cb18-127" aria-hidden="true" tabindex="-1"></a>      <span class="at">zone_seq =</span> zseq, <span class="at">tbl =</span> zs<span class="sc">$</span>tbl, <span class="at">fld =</span> zs<span class="sc">$</span>fld, <span class="at">val =</span> <span class="fu">as.character</span>(zval))</span>
+<span id="cb18-128"><a href="#cb18-128" aria-hidden="true" tabindex="-1"></a>    <span class="co"># coverage fraction of this zone polygon over each cell -&gt; pct_covered (0-100)</span></span>
+<span id="cb18-129"><a href="#cb18-129" aria-hidden="true" tabindex="-1"></a>    df <span class="ot">&lt;-</span> <span class="fu">exact_extract</span>(r_cell, ply[i, ], <span class="at">progress =</span> <span class="cn">FALSE</span>)[[<span class="dv">1</span>]]   <span class="co"># exactextractr's own `value` col</span></span>
+<span id="cb18-130"><a href="#cb18-130" aria-hidden="true" tabindex="-1"></a>    df <span class="ot">&lt;-</span> df[<span class="sc">!</span><span class="fu">is.na</span>(df<span class="sc">$</span>value) <span class="sc">&amp;</span> df<span class="sc">$</span>coverage_fraction <span class="sc">&gt;</span> <span class="dv">0</span>, , drop <span class="ot">=</span> <span class="cn">FALSE</span>]</span>
+<span id="cb18-131"><a href="#cb18-131" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="fu">nrow</span>(df) <span class="sc">&gt;</span> <span class="dv">0</span>) zc_rows[[<span class="fu">length</span>(zc_rows) <span class="sc">+</span> <span class="dv">1</span>]] <span class="ot">&lt;-</span> <span class="fu">tibble</span>(</span>
+<span id="cb18-132"><a href="#cb18-132" aria-hidden="true" tabindex="-1"></a>      <span class="at">zone_seq =</span> zseq, <span class="at">cell_id =</span> <span class="fu">as.integer</span>(df<span class="sc">$</span>value),</span>
+<span id="cb18-133"><a href="#cb18-133" aria-hidden="true" tabindex="-1"></a>      <span class="at">pct_covered =</span> <span class="fu">as.integer</span>(<span class="fu">round</span>(df<span class="sc">$</span>coverage_fraction <span class="sc">*</span> <span class="dv">100</span>)))</span>
+<span id="cb18-134"><a href="#cb18-134" aria-hidden="true" tabindex="-1"></a>  }</span>
+<span id="cb18-135"><a href="#cb18-135" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"{zs$fld}: {nrow(ply)} zones"</span>)</span>
+<span id="cb18-136"><a href="#cb18-136" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb18-137"><a href="#cb18-137" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-138"><a href="#cb18-138" aria-hidden="true" tabindex="-1"></a><span class="co"># subregion zones (USA / AK / GA / PA) = unions of their member Program Areas (the v7 grouping,</span></span>
+<span id="cb18-139"><a href="#cb18-139" aria-hidden="true" tabindex="-1"></a><span class="co"># `{ver_prev}/subregion_programareas.csv`). No polygon source — build from the PA zones' cells so</span></span>
+<span id="cb18-140"><a href="#cb18-140" aria-hidden="true" tabindex="-1"></a><span class="co"># the apps' "Study area" filter (subregion_key) works.</span></span>
+<span id="cb18-141"><a href="#cb18-141" aria-hidden="true" tabindex="-1"></a>sr_map   <span class="ot">&lt;-</span> <span class="fu">read_csv</span>(<span class="fu">glue</span>(<span class="st">"{dir_data}/derived/{ver_prev}/subregion_programareas.csv"</span>), <span class="at">show_col_types =</span> <span class="cn">FALSE</span>)</span>
+<span id="cb18-142"><a href="#cb18-142" aria-hidden="true" tabindex="-1"></a>zone_df  <span class="ot">&lt;-</span> <span class="fu">bind_rows</span>(zone_rows); zc_df <span class="ot">&lt;-</span> <span class="fu">bind_rows</span>(zc_rows)</span>
+<span id="cb18-143"><a href="#cb18-143" aria-hidden="true" tabindex="-1"></a>pa_zones <span class="ot">&lt;-</span> zone_df <span class="sc">|&gt;</span> <span class="fu">filter</span>(fld <span class="sc">==</span> <span class="st">"programarea_key"</span>) <span class="sc">|&gt;</span> <span class="fu">select</span>(<span class="at">pa_seq =</span> zone_seq, <span class="at">programarea_key =</span> val)</span>
+<span id="cb18-144"><a href="#cb18-144" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> (sr <span class="cf">in</span> <span class="fu">sort</span>(<span class="fu">unique</span>(sr_map<span class="sc">$</span>subregion_key))) {</span>
+<span id="cb18-145"><a href="#cb18-145" aria-hidden="true" tabindex="-1"></a>  zseq <span class="ot">&lt;-</span> zseq <span class="sc">+</span> <span class="dv">1</span>L</span>
+<span id="cb18-146"><a href="#cb18-146" aria-hidden="true" tabindex="-1"></a>  member_seqs <span class="ot">&lt;-</span> pa_zones<span class="sc">$</span>pa_seq[pa_zones<span class="sc">$</span>programarea_key <span class="sc">%in%</span> sr_map<span class="sc">$</span>programarea_key[sr_map<span class="sc">$</span>subregion_key <span class="sc">==</span> sr]]</span>
+<span id="cb18-147"><a href="#cb18-147" aria-hidden="true" tabindex="-1"></a>  sr_cells <span class="ot">&lt;-</span> zc_df <span class="sc">|&gt;</span> <span class="fu">filter</span>(zone_seq <span class="sc">%in%</span> member_seqs) <span class="sc">|&gt;</span></span>
+<span id="cb18-148"><a href="#cb18-148" aria-hidden="true" tabindex="-1"></a>    <span class="fu">group_by</span>(cell_id) <span class="sc">|&gt;</span> <span class="fu">summarise</span>(<span class="at">pct_covered =</span> <span class="fu">max</span>(pct_covered), <span class="at">.groups =</span> <span class="st">"drop"</span>)</span>
+<span id="cb18-149"><a href="#cb18-149" aria-hidden="true" tabindex="-1"></a>  zone_rows[[<span class="fu">length</span>(zone_rows) <span class="sc">+</span> <span class="dv">1</span>]] <span class="ot">&lt;-</span> <span class="fu">tibble</span>(</span>
+<span id="cb18-150"><a href="#cb18-150" aria-hidden="true" tabindex="-1"></a>    <span class="at">zone_seq =</span> zseq, <span class="at">tbl =</span> <span class="fu">glue</span>(<span class="st">"ply_subregions_2026_{ver}"</span>), <span class="at">fld =</span> <span class="st">"subregion_key"</span>, <span class="at">val =</span> sr)</span>
+<span id="cb18-151"><a href="#cb18-151" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="fu">nrow</span>(sr_cells)) zc_rows[[<span class="fu">length</span>(zc_rows) <span class="sc">+</span> <span class="dv">1</span>]] <span class="ot">&lt;-</span> <span class="fu">tibble</span>(</span>
+<span id="cb18-152"><a href="#cb18-152" aria-hidden="true" tabindex="-1"></a>    <span class="at">zone_seq =</span> zseq, <span class="at">cell_id =</span> sr_cells<span class="sc">$</span>cell_id, <span class="at">pct_covered =</span> sr_cells<span class="sc">$</span>pct_covered)</span>
+<span id="cb18-153"><a href="#cb18-153" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb18-154"><a href="#cb18-154" aria-hidden="true" tabindex="-1"></a><span class="fu">log_info</span>(<span class="st">"subregion_key: {n_distinct(sr_map$subregion_key)} zones"</span>)</span>
+<span id="cb18-155"><a href="#cb18-155" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-156"><a href="#cb18-156" aria-hidden="true" tabindex="-1"></a><span class="fu">dbWriteTable</span>(con, <span class="st">"zone"</span>,      <span class="fu">bind_rows</span>(zone_rows), <span class="at">overwrite =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb18-157"><a href="#cb18-157" aria-hidden="true" tabindex="-1"></a><span class="fu">dbWriteTable</span>(con, <span class="st">"zone_cell"</span>, <span class="fu">bind_rows</span>(zc_rows) <span class="sc">|&gt;</span> <span class="fu">filter</span>(pct_covered <span class="sc">&gt;</span> <span class="dv">0</span>), <span class="at">overwrite =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb18-158"><a href="#cb18-158" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-159"><a href="#cb18-159" aria-hidden="true" tabindex="-1"></a>smry <span class="ot">&lt;-</span> <span class="fu">dbGetQuery</span>(con, <span class="st">"SELECT z.fld, count(DISTINCT z.zone_seq) zones, count(*) zone_cells</span></span>
+<span id="cb18-160"><a href="#cb18-160" aria-hidden="true" tabindex="-1"></a><span class="st">  FROM zone z JOIN zone_cell zc USING(zone_seq) GROUP BY 1"</span>)</span>
+<span id="cb18-161"><a href="#cb18-161" aria-hidden="true" tabindex="-1"></a>msens<span class="sc">::</span><span class="fu">report_table</span>(smry, <span class="at">caption =</span> <span class="st">"zones + zone_cells by field"</span>)</span>
+<span id="cb18-162"><a href="#cb18-162" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-163"><a href="#cb18-163" aria-hidden="true" tabindex="-1"></a><span class="co"># content fingerprint of everything this notebook produces for downstream scoring:</span></span>
+<span id="cb18-164"><a href="#cb18-164" aria-hidden="true" tabindex="-1"></a><span class="co"># model_cell + scoring taxon + zone + zone_cell (fold; before disconnect)</span></span>
+<span id="cb18-165"><a href="#cb18-165" aria-hidden="true" tabindex="-1"></a>zones_hash   <span class="ot">&lt;-</span> <span class="fu">paste0</span>(msens<span class="sc">::</span><span class="fu">hash_query</span>(con, <span class="st">"model_cell"</span>), msens<span class="sc">::</span><span class="fu">hash_query</span>(con, <span class="st">"taxon"</span>),</span>
+<span id="cb18-166"><a href="#cb18-166" aria-hidden="true" tabindex="-1"></a>                       msens<span class="sc">::</span><span class="fu">hash_query</span>(con, <span class="st">"zone"</span>),       msens<span class="sc">::</span><span class="fu">hash_query</span>(con, <span class="st">"zone_cell"</span>))</span>
+<span id="cb18-167"><a href="#cb18-167" aria-hidden="true" tabindex="-1"></a>n_zones      <span class="ot">&lt;-</span> <span class="fu">dbGetQuery</span>(con, <span class="st">"SELECT count(*) n FROM zone"</span>)<span class="sc">$</span>n</span>
+<span id="cb18-168"><a href="#cb18-168" aria-hidden="true" tabindex="-1"></a>n_zone_cells <span class="ot">&lt;-</span> <span class="fu">dbGetQuery</span>(con, <span class="st">"SELECT count(*) n FROM zone_cell"</span>)<span class="sc">$</span>n</span>
+<span id="cb18-169"><a href="#cb18-169" aria-hidden="true" tabindex="-1"></a><span class="fu">dbDisconnect</span>(con, <span class="at">shutdown =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb18-170"><a href="#cb18-170" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb18-171"><a href="#cb18-171" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-172"><a href="#cb18-172" aria-hidden="true" tabindex="-1"></a><span class="fu">## Manifest</span></span>
+<span id="cb18-173"><a href="#cb18-173" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-176"><a href="#cb18-176" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb18-177"><a href="#cb18-177" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: manifest</span></span>
+<span id="cb18-178"><a href="#cb18-178" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-179"><a href="#cb18-179" aria-hidden="true" tabindex="-1"></a><span class="co"># content-addressed: fingerprint of model_cell + taxon + zone + zone_cell (no wall-clock)</span></span>
+<span id="cb18-180"><a href="#cb18-180" aria-hidden="true" tabindex="-1"></a>msens<span class="sc">::</span><span class="fu">write_manifest</span>(</span>
+<span id="cb18-181"><a href="#cb18-181" aria-hidden="true" tabindex="-1"></a>  manifest, <span class="at">target =</span> <span class="st">"score_zones"</span>, <span class="at">content_hash =</span> zones_hash,</span>
+<span id="cb18-182"><a href="#cb18-182" aria-hidden="true" tabindex="-1"></a>  <span class="at">stats =</span> <span class="fu">list</span>(<span class="at">ver =</span> ver, <span class="at">n_zones =</span> n_zones, <span class="at">n_zone_cells =</span> n_zone_cells),</span>
+<span id="cb18-183"><a href="#cb18-183" aria-hidden="true" tabindex="-1"></a>  <span class="at">force =</span> msens<span class="sc">::</span><span class="fu">force_target</span>(<span class="st">"score_zones"</span>))</span>
+<span id="cb18-184"><a href="#cb18-184" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
 </code></pre></div><button title="Copy to Clipboard" class="code-copy-button" data-in-quarto-modal=""><i class="bi"></i></button></div>
 </div></div></div></div></div>
 </div> <!-- /content -->
