@@ -1,0 +1,239 @@
+---
+layout: default
+title: "Query the Marine Atlas"
+---
+
+<style>
+  #q-wrap { max-width: 1180px; }
+  .q-lede { margin: 0.25rem 0 1.25rem; max-width: 80ch; color: var(--fg); }
+  .q-lede code { color: var(--accent); }
+  .q-controls { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: flex-end; margin-bottom: 0.6rem; }
+  .q-field { display: flex; flex-direction: column; gap: 0.2rem; }
+  .q-field label { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); font-family: var(--mono); }
+  .q-controls select {
+    background: var(--panel); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 5px; padding: 0.35rem 0.5rem; font: inherit; min-width: 15rem; }
+  #q-sql {
+    width: 100%; min-height: 9.5rem; resize: vertical;
+    background: var(--panel); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 0.7rem 0.8rem;
+    font-family: var(--mono); font-size: 0.82rem; line-height: 1.5; tab-size: 2; }
+  .q-actions { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; margin: 0.6rem 0; }
+  .q-btn {
+    background: var(--accent); color: #06232b; border: none; cursor: pointer;
+    border-radius: 5px; padding: 0.4rem 0.95rem; font: inherit; font-weight: 700; }
+  .q-btn:hover { background: var(--accent-d); }
+  .q-btn.secondary { background: var(--panel-2); color: var(--fg); border: 1px solid var(--border); font-weight: 500; }
+  .q-btn:disabled { opacity: 0.5; cursor: default; }
+  #q-status { font-family: var(--mono); font-size: 0.8rem; color: var(--muted); }
+  #q-status.busy { color: var(--accent); }
+  #q-status.error { color: #ff8787; }
+  #q-status.ok { color: #69db7c; }
+  .q-hint { color: var(--muted); font-size: 0.78rem; margin: 0.15rem 0 0.7rem; }
+  #q-meta { font-family: var(--mono); font-size: 0.78rem; color: var(--muted); margin: 0.5rem 0 0.3rem; }
+  .q-tablewrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 6px; max-height: 60vh; }
+  table.q-table { border-collapse: collapse; font-size: 0.82rem; width: 100%; }
+  table.q-table th, table.q-table td { padding: 0.3rem 0.6rem; border-bottom: 1px solid var(--border); text-align: left; white-space: nowrap; }
+  table.q-table th { position: sticky; top: 0; background: var(--panel); font-family: var(--mono); font-size: 0.74rem; color: var(--muted); z-index: 1; }
+  table.q-table td.num, table.q-table th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  table.q-table tr:hover td { background: var(--panel); }
+</style>
+
+<div id="q-wrap">
+  <p class="q-lede">
+    A browser-only <a href="https://duckdb.org/docs/api/wasm/overview">DuckDB-WASM</a> playground
+    that queries the <b>v8 Marine Atlas</b> Parquet directly on S3 — no server, no download. Pick an
+    example or write your own SQL; it runs against the public
+    <code>read_parquet('…/marine-atlas/v8/tables/*.parquet')</code> tables documented on the
+    <a href="{{ '/schema.html' | relative_url }}">schema</a> page. First run cold-starts the WASM
+    engine (~5&nbsp;s), then it's fast (DuckDB range-reads only the bytes it needs).
+  </p>
+
+  <div class="q-controls">
+    <div class="q-field">
+      <label for="q-cat">category</label>
+      <select id="q-cat"></select>
+    </div>
+    <div class="q-field">
+      <label for="q-ex">example query</label>
+      <select id="q-ex"></select>
+    </div>
+  </div>
+  <p class="q-hint" id="q-desc"></p>
+
+  <textarea id="q-sql" spellcheck="false"></textarea>
+
+  <div class="q-actions">
+    <button class="q-btn" id="q-run">Run ▶</button>
+    <button class="q-btn secondary" id="q-csv" disabled>Download CSV</button>
+    <span id="q-status">idle</span>
+  </div>
+
+  <div id="q-meta"></div>
+  <div class="q-tablewrap" id="q-tablewrap" hidden><table class="q-table" id="q-table"></table></div>
+</div>
+
+<script type="module">
+const BASE = "https://s3.us-east-1.amazonaws.com/oceanmetrics.io-public/marine-atlas/v8";
+const T = (t) => `read_parquet('${BASE}/tables/${t}.parquet')`;
+
+// ── example queries by category (against the real v8 serve/tables schema) ──
+const CATS = {
+  "browse": {
+    "datasets": {
+      desc: "The 11 source datasets in the registry (build_registry).",
+      sql: `SELECT ds_key, name_short, response_type, native_format, taxa_groups\nFROM ${T('dataset')}\nORDER BY sort_order;` },
+    "sensitivity metrics": {
+      desc: "The scoring metrics computed per cell/zone.",
+      sql: `SELECT metric_seq, metric_key, description\nFROM ${T('metric')}\nORDER BY metric_seq;` },
+    "sample taxa (US)": {
+      desc: "100 merged taxa valid in US waters, with category + extinction-risk score.",
+      sql: `SELECT ms_merge_key, scientific_name, common_name, sp_cat, er_score, is_valid_usa, is_valid_global\nFROM ${T('taxon')}\nWHERE is_valid_usa\nLIMIT 100;` },
+  },
+  "taxa": {
+    "valid taxa by category (US vs global)": {
+      desc: "How many merged taxa are valid globally vs. specifically in US waters, per taxonomy-based scoring category.",
+      sql: `SELECT sp_cat,\n  count(*) FILTER (WHERE is_valid_global)                  AS valid_global,\n  count(*) FILTER (WHERE is_valid_global AND is_valid_usa) AS valid_us\nFROM ${T('taxon')}\nGROUP BY sp_cat\nORDER BY valid_global DESC;` },
+    "most-protective extinction risk (US)": {
+      desc: "US-water taxa with the highest governing extinction-risk score (MMPA/MBTA floors applied).",
+      sql: `SELECT scientific_name, common_name, sp_cat, extrisk_code, er_score, is_mmpa, is_mbta\nFROM ${T('taxon')}\nWHERE is_valid_usa AND er_score >= 80\nORDER BY er_score DESC, scientific_name\nLIMIT 200;` },
+    "rarity distribution (US)": {
+      desc: "Rarity classes (from merged range area) across US-water taxa.",
+      sql: `SELECT rarity, count(*) AS n, round(median(range_km2)) AS median_km2\nFROM ${T('taxon')}\nWHERE is_valid_usa\nGROUP BY rarity\nORDER BY median_km2;` },
+    "species outside the US": {
+      desc: "The taxa the species-app dropdown adds when 'Only species in US waters' is UNCHECKED — valid on their whole global range but with no US-water cells.",
+      sql: `SELECT scientific_name, common_name, sp_cat, er_score\nFROM ${T('taxon')}\nWHERE is_valid_global AND NOT coalesce(is_valid_usa, FALSE)\nORDER BY scientific_name\nLIMIT 200;` },
+  },
+  "models & assets": {
+    "models per dataset": {
+      desc: "Count of raw species models contributed by each source dataset.",
+      sql: `SELECT d.ds_key, d.name_short, count(*) AS n_models\nFROM ${T('model')} m\nJOIN ${T('dataset')} d USING (ds_key)\nGROUP BY 1, 2\nORDER BY n_models DESC;` },
+    "native assets by dataset + representation": {
+      desc: "Published COG/PMTiles assets per dataset — 'native' (original) vs 'model' (0.05° gridded).",
+      sql: `SELECT ds_key, representation, asset_type, count(*) AS n\nFROM ${T('native_asset')}\nGROUP BY 1, 2, 3\nORDER BY ds_key, representation;` },
+    "one taxon's inputs (Leatherback Turtle)": {
+      desc: "Every input model + published asset a merged taxon is built from — Dermochelys coriacea (ms_merge|WORMS:137209): AquaMaps, FWS/NMFS critical habitat, FWS/IUCN range, SWOT turtle range, each as native + model representations.",
+      sql: `SELECT mdl_key, ds_key, representation, asset_type, asset_url\nFROM ${T('native_asset')}\nWHERE ms_merge_key = 'ms_merge|WORMS:137209'\nORDER BY ds_key, representation;` },
+  },
+  "scores & zones": {
+    "scoring zones": {
+      desc: "The BOEM Program Areas + ecoregions that scores aggregate over. (zone_key is aliased — 'zone' is a DuckDB reserved word.)",
+      sql: `SELECT zone_seq, tbl, fld, val AS zone_key\nFROM ${T('zone')}\nORDER BY tbl, val\nLIMIT 200;` },
+    "top Program Areas by metric": {
+      desc: "Program-Area zone-metric values, joined to metric definitions, highest first. (metric_value is aliased — 'value' is a DuckDB reserved word.)",
+      sql: `SELECT z.val AS program_area, mt.metric_key, round(zm.val, 3) AS metric_value\nFROM ${T('zone_metric')} zm\nJOIN ${T('zone')}   z  USING (zone_seq)\nJOIN ${T('metric')} mt USING (metric_seq)\nWHERE z.tbl LIKE 'ply_programareas%'\nORDER BY metric_value DESC\nLIMIT 100;` },
+  },
+  "cells & environment": {
+    "sample grid cells": {
+      desc: "First 100 rows of the 0.05° cell grid with environmental covariates + US/Program-Area flags. (cell.parquet is large — kept to a LIMIT so the browser reads only the first row group.)",
+      sql: `SELECT cell_id, lon, lat, depth_mean, sst_an_mean, area_km2, in_usa, in_pra\nFROM ${T('cell')}\nLIMIT 100;` },
+  },
+  "SQL shell": {
+    "freeform": {
+      desc: "Write any DuckDB SQL. The tables/ Parquet are small (taxon 37k, model 80k, dataset 11 …) so joins are fast; cell.parquet (17M) and the partitioned serve/model_cell (580M) are large — filter or LIMIT them.",
+      sql: `-- any DuckDB SQL against the public marine-atlas Parquet\nSELECT sp_cat, count(*) AS n, round(avg(er_score), 1) AS avg_er\nFROM ${T('taxon')}\nWHERE is_valid_usa\nGROUP BY sp_cat\nORDER BY n DESC;` },
+  },
+};
+
+// ── DuckDB-WASM: lazy single shared connection (jsDelivr bundle + httpfs) ──
+const DUCKDB_VERSION = "1.29.0";
+let _conn = null, _init = null;
+async function getConn() {
+  if (_conn) return _conn;
+  if (_init) return _init;
+  _init = (async () => {
+    const duckdb = await import(`https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@${DUCKDB_VERSION}/+esm`);
+    const bundle = await duckdb.selectBundle(duckdb.getJsDelivrBundles());
+    const worker = await duckdb.createWorker(bundle.mainWorker);
+    const db = new duckdb.AsyncDuckDB(new duckdb.ConsoleLogger(), worker);
+    await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+    const conn = await db.connect();
+    await conn.query("INSTALL httpfs; LOAD httpfs;");
+    _conn = conn;
+    return conn;
+  })();
+  return _init;
+}
+
+// ── UI wiring ──
+const $ = (id) => document.getElementById(id);
+const catSel = $("q-cat"), exSel = $("q-ex"), sqlBox = $("q-sql"), desc = $("q-desc");
+const statusEl = $("q-status"), runBtn = $("q-run"), csvBtn = $("q-csv");
+let lastCols = [], lastRows = [];
+
+function setStatus(msg, cls) { statusEl.textContent = msg; statusEl.className = cls || ""; }
+const esc = (s) => String(s ?? "").replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+
+function fillCats() {
+  catSel.innerHTML = Object.keys(CATS).map((c) => `<option>${esc(c)}</option>`).join("");
+  fillExamples();
+}
+function fillExamples() {
+  const ex = CATS[catSel.value];
+  exSel.innerHTML = Object.keys(ex).map((k) => `<option>${esc(k)}</option>`).join("");
+  loadExample();
+}
+function loadExample() {
+  const q = CATS[catSel.value][exSel.value];
+  sqlBox.value = q.sql;
+  desc.textContent = q.desc;
+}
+catSel.addEventListener("change", fillExamples);
+exSel.addEventListener("change", loadExample);
+
+function isNum(v) { return typeof v === "bigint" || (typeof v === "number" && !Number.isNaN(v)); }
+function cellText(v) {
+  if (v == null) return "";
+  if (typeof v === "bigint") return v.toString();
+  return String(v);
+}
+function renderTable(cols, rows) {
+  const t = $("q-table");
+  const head = `<tr>${cols.map((c) => `<th>${esc(c)}</th>`).join("")}</tr>`;
+  const body = rows.slice(0, 2000).map((r) =>
+    `<tr>${cols.map((c) => { const v = r[c]; return `<td class="${isNum(v) ? "num" : ""}">${esc(cellText(v))}</td>`; }).join("")}</tr>`
+  ).join("");
+  t.innerHTML = head + body;
+  $("q-tablewrap").hidden = rows.length === 0;
+}
+function rowsToCSV(cols, rows) {
+  const q = (v) => { const s = cellText(v); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+  return [cols.join(","), ...rows.map((r) => cols.map((c) => q(r[c])).join(","))].join("\n");
+}
+
+async function run() {
+  const sql = sqlBox.value.trim();
+  if (!sql) return;
+  runBtn.disabled = true; csvBtn.disabled = true;
+  $("q-meta").textContent = "";
+  try {
+    setStatus(_conn ? "Running…" : "Starting DuckDB-WASM (~5 s cold start)…", "busy");
+    const conn = await getConn();
+    const t0 = performance.now();
+    const arrow = await conn.query(sql);
+    const cols = arrow.schema.fields.map((f) => f.name);
+    const rows = arrow.toArray().map((r) => r.toJSON());
+    const ms = Math.round(performance.now() - t0);
+    lastCols = cols; lastRows = rows;
+    renderTable(cols, rows);
+    $("q-meta").textContent = `${rows.length.toLocaleString()} row${rows.length === 1 ? "" : "s"} · ${cols.length} column${cols.length === 1 ? "" : "s"} · ${ms} ms${rows.length > 2000 ? " · showing first 2,000" : ""}`;
+    setStatus("done", "ok");
+    csvBtn.disabled = rows.length === 0;
+  } catch (err) {
+    setStatus(`✗ ${err.message}`, "error");
+    $("q-tablewrap").hidden = true;
+  } finally {
+    runBtn.disabled = false;
+  }
+}
+runBtn.addEventListener("click", run);
+sqlBox.addEventListener("keydown", (e) => { if ((e.ctrlKey || e.metaKey) && e.key === "Enter") run(); });
+csvBtn.addEventListener("click", () => {
+  const blob = new Blob([rowsToCSV(lastCols, lastRows)], { type: "text/csv" });
+  const a = Object.assign(document.createElement("a"), {
+    href: URL.createObjectURL(blob), download: `marine-atlas_query_${Date.now()}.csv` });
+  a.click(); URL.revokeObjectURL(a.href);
+});
+
+fillCats();
+</script>
