@@ -51,6 +51,7 @@ source(here("libs/vars.R"))
 
 dir_atlas <- glue("{dir_big_v}/marine-atlas")
 merged    <- glue("{dir_atlas}/dist_merged/dataset=ms_merge")
+merged_global <- glue("{dir_atlas}/dist_merged_global/dataset=ms_merge")   # whole-range → is_valid_global
 dir_dist  <- glue("{dir_atlas}/dist")   # raw per-dataset (global) ranges, for bird pct_marine
 merge_db  <- glue("{dir_atlas}/merge.duckdb")
 manifest  <- here("data/manifests/merge_taxon.json")
@@ -76,6 +77,17 @@ dbExecute(con, glue("CREATE OR REPLACE TABLE taxon_cell AS
     round(sum(area_km2) FILTER (WHERE is_ocean), 1) AS range_km2,
     round(sum(area_km2) FILTER (WHERE in_usa),   1) AS range_usa_km2
   FROM j GROUP BY mdl_key"))
+
+# whole-range (global) ocean-cell tally → is_valid_global, so a species valid OUTSIDE the US (e.g.
+# Sotalia guianensis, IUCN range wholly non-US) is still is_valid_global — it appears in the app's
+# "US waters"-UNCHECKED picker and renders via its merged whole-range COG. am-only taxa aren't in the
+# global surface (they reuse am COGs), so those fall back to the US n_ocean in is_valid_global below.
+if (dir_exists(merged_global)) {
+  dbExecute(con, glue("CREATE OR REPLACE TABLE taxon_cell_global AS
+    SELECT mc.mdl_key, count(*) FILTER (WHERE c.cell_id IS NOT NULL) AS n_global
+    FROM read_parquet('{merged_global}/**/*.parquet') mc LEFT JOIN grid.cell c USING (cell_id)
+    GROUP BY mc.mdl_key"))
+} else dbExecute(con, "CREATE OR REPLACE TABLE taxon_cell_global (mdl_key VARCHAR, n_global BIGINT)")
 ```
 
 ## Flags + range/rarity/endemism → taxon
@@ -84,7 +96,7 @@ dbExecute(con, glue("CREATE OR REPLACE TABLE taxon_cell AS
 #| label: flags
 
 # idempotent: drop any derived columns a prior run added so `x.*` stays base taxon (+ er)
-for (col in c("n_cells","n_ocean","n_usa","n_pra","range_km2","range_usa_km2",
+for (col in c("n_cells","n_ocean","n_global","n_usa","n_pra","range_km2","range_usa_km2",
               "is_valid_global","is_valid_usa","is_valid_pra","pct_marine","us_endemism",
               "rarity","is_marine","pct_marine_bl","sp_cat"))
   try(dbExecute(con, glue("ALTER TABLE taxon DROP COLUMN IF EXISTS {col}")), silent = TRUE)
@@ -92,11 +104,15 @@ for (col in c("n_cells","n_ocean","n_usa","n_pra","range_km2","range_usa_km2",
 # rarity thresholds on the marine range (km2); tune vs v7
 dbExecute(con, "CREATE OR REPLACE TABLE taxon AS
   WITH t AS (
-    SELECT x.*, tc.n_cells, tc.n_ocean, tc.n_usa, tc.n_pra, tc.range_km2, tc.range_usa_km2
-    FROM taxon x LEFT JOIN taxon_cell tc ON x.ms_merge_key = tc.mdl_key)
+    SELECT x.*, tc.n_cells, tc.n_ocean, tc.n_usa, tc.n_pra, tc.range_km2, tc.range_usa_km2,
+           tcg.n_global
+    FROM taxon x LEFT JOIN taxon_cell tc ON x.ms_merge_key = tc.mdl_key
+                 LEFT JOIN taxon_cell_global tcg ON x.ms_merge_key = tcg.mdl_key)
   SELECT *,
-    -- 3 nested validity flags (global superset of usa superset of pra)
-    (n_ocean > 0 AND coalesce(worms_is_extinct, FALSE) = FALSE
+    -- 3 nested validity flags (global superset of usa superset of pra); is_valid_global uses the
+    -- WHOLE-RANGE tally (n_global) so non-US species count, falling back to US n_ocean for am-only taxa
+    ((coalesce(n_global, 0) > 0 OR coalesce(n_ocean, 0) > 0)
+       AND coalesce(worms_is_extinct, FALSE) = FALSE
        AND coalesce(worms_is_marine, TRUE) = TRUE)        AS is_valid_global,
     (n_usa > 0)                                            AS is_valid_usa,
     (n_pra > 0)                                            AS is_valid_pra,
