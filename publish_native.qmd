@@ -424,15 +424,88 @@ if (do_vec_cog && nrow(pmt_reg)) {
 }
 ```
 
+## Merged taxon surface → per-taxon whole-range COGs
+
+Publish the **merged model itself** (`ds_key = "ms_merge"`, `representation = "model"`) as a
+whole-range COG per taxon, painted from `dist_merged_global` — so the species app renders the merged
+layer (and non-US species' global range) via titiler `/cog` (anonymous, clickable) instead of the
+creds-gated `model_cell` glob. Partition the global surface by an integer key (`mmid`) — no global
+sort — then paint each per-taxon slice. Opt-in (`PUBLISH_MERGED_COG=1`); parallel + resumable.
+
+```{r}
+#| label: merged-cogs
+
+do_merged_cog <- nzchar(Sys.getenv("PUBLISH_MERGED_COG"))
+merged_reg  <- tibble()
+merged_map  <- tibble()
+mparts      <- glue("{dir_native}/_merged_parts{if (test_n > 0) '_test' else ''}")
+dir_gmerged <- glue("{dir_atlas}/dist_merged_global/dataset=ms_merge")
+if (do_merged_cog && dir_exists(dir_gmerged)) {
+  dir_mcog <- glue("{dir_native}/merged"); dir_create(dir_mcog)
+  con <- dbConnect(duckdb(), config = list(threads = "6", memory_limit = "10GB"))
+  dbExecute(con, glue("SET temp_directory='{dir_atlas}/duckdb_tmp'"))
+  dbExecute(con, glue("ATTACH '{merge_db}' AS m (READ_ONLY)"))
+  # served merged taxa (the set the app lists) present in the global surface
+  mkeys <- dbGetQuery(con, glue("
+    SELECT DISTINCT g.mdl_key FROM read_parquet('{dir_gmerged}/**/*.parquet') g
+    SEMI JOIN (SELECT DISTINCT ms_merge_key AS mdl_key FROM m.taxon
+               WHERE is_marine AND ms_merge_key IS NOT NULL AND sp_cat NOT IN ('reptile','amphibian')) s
+      USING (mdl_key)"))$mdl_key
+  mkeys <- sort(mkeys); if (test_n > 0) mkeys <- head(mkeys, test_n)
+  merged_map <- tibble(mdl_key = mkeys, mmid = seq_along(mkeys))
+  if (length(mkeys) && (!dir_exists(mparts) || redo)) {
+    if (dir_exists(mparts)) dir_delete(mparts)
+    dbExecute(con, "SET partitioned_write_max_open_files=400")
+    dbWriteTable(con, "merged_map", merged_map, overwrite = TRUE)
+    msens::copy_atlas_parquet(con, glue("
+      SELECT mm.mmid, g.cell_id, g.val
+      FROM read_parquet('{dir_gmerged}/**/*.parquet') g JOIN merged_map mm ON g.mdl_key = mm.mdl_key"),
+      mparts, partition_by = "mmid")
+    log_info("_merged_parts: {length(dir_ls(mparts))} partitions")
+  }
+  dbDisconnect(con, shutdown = TRUE)
+
+  grid <- grid_spec(rast(cellid_tif))
+  todo <- merged_map[!file_exists(glue("{dir_mcog}/{safe_key(merged_map$mdl_key)}.tif")), ]
+  log_info("merged COGs: {nrow(merged_map)} target, {nrow(todo)} to build")
+  build_merged <- function(rows) {
+    suppressMessages({library(DBI); library(duckdb); library(terra)})
+    con <- dbConnect(duckdb()); on.exit(dbDisconnect(con, shutdown = TRUE))
+    for (i in seq_len(nrow(rows))) {
+      k <- rows$mdl_key[i]; f <- sprintf("%s/%s.tif", dir_mcog, safe_key(k))
+      if (file.exists(f)) next
+      pf <- sprintf("%s/mmid=%d", mparts, rows$mmid[i]); if (!dir.exists(pf)) next
+      d <- dbGetQuery(con, sprintf("SELECT cell_id, val FROM read_parquet('%s/*.parquet')", pf))
+      if (nrow(d)) msens::publish_cog(d$cell_id, d$val, f, grid)
+    }
+    nrow(rows)
+  }
+  if (nrow(todo)) {
+    plan(multisession, workers = n_workers)
+    future_map(split(todo, (seq_len(nrow(todo)) - 1) %% n_workers), build_merged,
+               .options = furrr_options(globals = c("mparts","dir_mcog","grid","safe_key"),
+                                        packages = c("msens"), seed = TRUE))
+    plan(sequential)
+  }
+  built <- glue("{dir_mcog}/{safe_key(merged_map$mdl_key)}.tif")
+  merged_reg <- tibble(
+    mdl_key = merged_map$mdl_key, ds_key = "ms_merge", asset_type = "cog", representation = "model",
+    asset_url = glue("{s3_http}/native/merged/{safe_key(merged_map$mdl_key)}.tif"),
+    rescale_min = 1L, rescale_max = 100L, colormap = "spectral_r")[file_exists(built), ]
+  log_info("merged model COGs on disk: {nrow(merged_reg)} / {nrow(merged_map)}")
+}
+```
+
 ## native_asset registry → sdm.duckdb
 
 ```{r}
 #| label: registry
 
-# per-input-model asset rows across BOTH representations:
+# per-model asset rows across representations:
 #   original/native  = vector PMTiles (source polygons) + am native 0.5° COGs
-#   model/interpolated = am 0.05° resampled COGs (+ vector 0.05° gridded COGs if enabled)
-# each keyed on the STABLE mdl_key; the `representation` column distinguishes them.
+#   model/interpolated = am 0.05° resampled COGs + vector 0.05° gridded COGs + merged whole-range COGs
+# each keyed on the STABLE mdl_key; the `representation` column distinguishes them. Merged rows carry
+# mdl_key == ms_merge_key, so they skip the input→taxon join and are bound in directly below.
 pmt_model_rows <- if (nrow(pmt_reg)) pmt_reg else tibble()
 vec_cog_rows   <- if (exists("vec_cog_reg") && nrow(vec_cog_reg)) vec_cog_reg else tibble()
 
@@ -486,6 +559,25 @@ dbExecute(con, "DETACH m")
 native_asset <- asset_info |>
   inner_join(tm, by = "mdl_key", relationship = "many-to-many") |>
   relocate(ms_merge_key)
+
+# merged whole-range COGs: mdl_key IS the taxon key -> skip the input->taxon join, bind directly
+# (built for ALL valid marine taxa incl non-US, so the app can show a non-US species' global range)
+if (exists("merged_reg") && nrow(merged_reg)) {
+  bb_merged <- tibble()
+  if (exists("mparts") && dir_exists(mparts)) {
+    conb <- dbConnect(duckdb(), config = list(threads = "6"))
+    bb_merged <- dbGetQuery(conb, glue("
+      WITH rc AS (SELECT mmid, (cell_id-1) % 7200 AS col, (cell_id-1) // 7200 AS row
+                  FROM read_parquet('{mparts}/**/*.parquet', hive_partitioning = true))
+      SELECT mmid, -180 + min(col)*0.05 AS xmin, -180 + (max(col)+1)*0.05 AS xmax,
+                    90 - (max(row)+1)*0.05 AS ymin, 90 - min(row)*0.05 AS ymax
+      FROM rc GROUP BY mmid")) |> left_join(merged_map, by = "mmid") |> select(-mmid)
+    dbDisconnect(conb, shutdown = TRUE)
+  }
+  merged_rows <- merged_reg |> mutate(ms_merge_key = mdl_key)
+  if (nrow(bb_merged)) merged_rows <- left_join(merged_rows, bb_merged, by = "mdl_key")
+  native_asset <- bind_rows(native_asset, relocate(merged_rows, ms_merge_key))
+}
 
 dbWriteTable(con, "native_asset", native_asset, overwrite = TRUE)
 smry <- dbGetQuery(con, "SELECT representation, asset_type, count(*) n_rows,
