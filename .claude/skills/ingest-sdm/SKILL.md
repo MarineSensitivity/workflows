@@ -72,3 +72,13 @@ islands confound it). See `feedback_marine_relevance`.
 - Range value == `compute_er_score(...)` (not a magic number).
 - Runs on the **laptop** (has all sources; the server has only `am.duckdb` — see
   `reference_server_msens1`). Reinstall msens on the server after changes.
+
+## Add a unit test for how the new model MERGES
+
+Ingesting is only half the job — the new dataset changes how a taxon's cells merge (does it constrain
+AquaMaps like a range? multiply like turtles? add a new suitability surface?). **Add a fixture to
+`../msens/tests/testthat/test-merge.R`** with a synthetic taxon exercising the new dataset's rule and
+assert its exact merged output (US + global), so the behavior can't silently break as more models are
+added. If the merge needs new logic, put it in `msens::merge_sql()`/`turtle_sql()` (the notebook calls
+them) rather than inline SQL. Run `devtools::test("../msens")` before rendering. See the `validate-sdm`
+skill for why rule-level tests catch what the aggregate `pra_score_delta` gate hides.

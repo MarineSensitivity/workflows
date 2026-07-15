@@ -1,13 +1,38 @@
 ---
 name: validate-sdm
-description: Validate a MarineSensitivity version bump — confirm Program-Area scores stay ~equivalent to the prior version on common inputs (the score-equivalence gate), and diagnose per-component drift. Use after changing the merge/scoring pipeline or bumping the version.
+description: Validate a MarineSensitivity change — the rule-level testthat unit tests in ../msens AND the aggregate Program-Area score-equivalence gate. Use after changing merge/scoring logic, adding a distribution model, or bumping the version.
 ---
 
-# Validate SDM scores (version-equivalence gate)
+# Validate SDM scores (unit tests + version-equivalence gate)
+
+Correctness has **two layers**, and you need both:
+
+1. **Rule-level unit tests** (`../msens/tests/testthat/`) assert each merge/scoring rule's exact
+   output on synthetic fixtures — the primary guard when you change logic or add a model.
+2. **Aggregate score-equivalence gate** (`msens::pra_score_delta`) confirms Program-Area scores stay
+   ~equivalent to the prior version on common inputs.
+
+The aggregate gate can **hide** rule-level breakage: the v8 rewrite silently dropped the
+`iucn_range_outside_us_eez` exclusion and re-introduced ~750 AquaMaps over-predictions (e.g. Sotalia
+guianensis, a river dolphin), yet their near-zero suitability made the PRA delta look fine. Only a
+rule-level assertion catches that. **Run the unit tests first**, then the aggregate gate.
+
+## Unit tests (rule-level guard)
+
+- Merge/scoring rules live in `msens` as the single source of truth (`merge_sql()`, `turtle_sql()`,
+  `compute_er_score()`, …); the notebooks *call* them, so notebook and tests cannot drift.
+- `test-merge.R` asserts one synthetic taxon per category: range-only, both-masked (am beyond range
+  dropped from US), `iucn_range_outside_us_eez`-excluded (no US presence but present in the global
+  viz surface), am-only single, am-only multi-model (RAW, duplicates preserved), turtle multiplicative.
+- **When you change a rule or add a dataset, add/update its fixture in the same change**, run
+  `Rscript -e 'devtools::test("../msens")'`, reinstall msens, and treat a red test as a hard stop.
+  Every fixed bug becomes a permanent named assertion.
+
+## The version-equivalence gate
 
 On any pipeline change or version bump, the guardrail is: **Program-Area (PRA) scores stay
 ~equivalent to the prior version on the *common* inputs.** Real divergence must be explained
-(more species, marine cull, taxonomy sp_cat), not accidental.
+(more species, marine cull, taxonomy sp_cat, an intended exclusion like no_eez), not accidental.
 
 ## The gate
 

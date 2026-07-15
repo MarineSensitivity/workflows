@@ -46,6 +46,16 @@ The **global 0.05° raster cell** in `[-180,180]` (Bio-Oracle v3 / AquaX topolog
   summary tables, the workflows-page links) is produced; `purl + source` is diagnostics-only
   (it skips the HTML + content-hash checkpoint).
 
+- **Model logic is `msens` functions, guarded by unit tests.** The scientific rules — how
+  per-dataset cells merge per taxon (`msens::merge_sql()` / `msens::turtle_sql()`), how ranges
+  constrain AquaMaps, how ER is scored — live in `../msens` as the single source of truth; the
+  notebooks *call* them. Every rule has a testthat fixture in `../msens/tests/testthat/` asserting
+  its exact output (one synthetic taxon per category: range-only, both-masked,
+  `iucn_range_outside_us_eez`-excluded, am-only single/multi-model, turtle). **Add or update the
+  test in the same change as the logic**, run `devtools::test("../msens")`, reinstall msens, and
+  never let a red test through. This catches rule-level breakage the aggregate `pra_score_delta`
+  gate can hide (the 750 no_eez over-predictions had near-zero score impact yet were wrong).
+
 ## Ingest → `model_cell` (cell_id, value) by native format
 
 - vector ranges → `msens::cells_from_ranges()` (exactextractr; whole range)

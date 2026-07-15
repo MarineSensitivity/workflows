@@ -56,8 +56,33 @@ requirements, both mandatory:
 apples-to-apples), `SCORE_ALLBIRDS=1` (disable the marine-bird cull), `RELEASE_NO_S3=1` /
 `RELEASE_RAW=1` / `RELEASE_DEPLOY=1` (release + serving).
 
-No test suite; correctness is enforced by `msens::pra_score_delta` (v7↔v8 gate) and the
-`stopifnot`/validation chunks in the notebooks.
+### Unit tests (non-negotiable — the model logic must stay guarded)
+
+The scientific rules of the model (how per-dataset cells merge into one surface per taxon, how
+extinction risk is scored, how ranges constrain AquaMaps) are **fragile**: a wrong join, a dropped
+`WHERE`, an added `GROUP BY`, or a US-vs-global scope slip silently corrupts results. Guard every
+such rule with a **testthat unit test** in `../msens/tests/testthat/`.
+
+- **Logic lives in `msens`, not in QMD strings.** Merge rules are `msens::merge_sql()` /
+  `msens::turtle_sql()` (single source of truth); the notebook *calls* them and
+  `test-merge.R` *asserts* them, so the notebook and the tests can never drift. Put new model logic
+  (a new dataset's constraint, a new scoring term) behind an `msens` function the same way.
+- **Every rule gets a fixture that asserts its exact output.** `test-merge.R` has one synthetic
+  taxon per category (range-only, both-masked, `iucn_range_outside_us_eez`-excluded, am-only single,
+  am-only multi-model no-dedup, turtle multiplicative) with the expected merged cells hard-asserted.
+  A category that isn't tested is a category that will silently break.
+- **Add/update tests in the SAME change as the logic.** When you add a distribution model or tweak a
+  merge/score rule, add or update its fixture + assertion *before* rendering. Treat a red test as a
+  hard stop. Run `Rscript -e 'devtools::test("../msens")'` (or `testthat::test_file(...)`); reinstall
+  msens after edits so the notebook picks up the new rule.
+- **Regression cases are permanent.** When a bug is found (e.g. the v8 rewrite dropping the
+  `iucn_range_outside_us_eez` exclusion, or deduping multi-AquaMaps-model am cells), encode the
+  fixed behavior as a named assertion so it can't regress.
+
+Whole-pipeline correctness is ALSO enforced by `msens::pra_score_delta` (version-equivalence gate)
+and the `stopifnot`/content-hash validation chunks — but those catch *aggregate* drift; the unit
+tests catch *rule-level* breakage the aggregates can hide (the 750 no_eez species had near-zero
+aggregate impact yet were scientifically wrong).
 
 ## Architecture
 
