@@ -25,14 +25,17 @@ scale (~13B am cell-rows), so it must stream + spill rather than materialize:
 
 ```{mermaid}
 %%| label: fig-design
-%%| fig-cap: "US-scoped per-taxon merge: max-merge over range footprint (governing er) + multiplicative turtles → streamed Parquet"
+%%| fig-cap: "ONE batched merge → TWO surfaces from the same data. GLOBAL viz = am ∪ range (FULL OUTER, whole-range merged model) → COGs. US scoring = v7-faithful US-boundary-aware rule (range∩US max(er,am-at-range) UNION am∩US for taxa with no US range) — NOT a trim of global. Turtles multiplicative."
 flowchart LR
-  raw["dist/*/*.parquet<br/>(raw model_cell)"] --> mca["model_cell_all<br/>US-scoped, by ms_merge_key"]
-  mca --> mx["max-merge over range<br/>(er_score at range cells)"]
-  mca --> tt["turtles ×<br/>pmax(1, er·suit/100)"]
-  mx --> pq[("dist_merged/dataset=ms_merge/**<br/>V2/zstd via copy_atlas_parquet")]
-  tt --> pq
-  pq --> mf["hash_parquet → content-addressed manifest"]
+  raw["dist/*/*.parquet<br/>(raw model_cell)"] --> mcp[("mc_parts<br/>partitioned by mkey_id (int)")]
+  mcp --> gm["GLOBAL: er over range<br/>∪ am over whole am footprint<br/>(FULL OUTER)"]
+  mcp --> um["US: range∩US max(er,am@range)<br/>∪ am∩US for taxa w/ no US range"]
+  mcp --> tt["turtles ×<br/>greatest(1, er·suit/100)"]
+  gm --> g[("dist_merged_global/**<br/>whole-range → viz COGs")]
+  tt --> g
+  um --> us[("dist_merged/**<br/>US model_cell → scoring")]
+  tt --> us
+  us --> mf["hash_parquet → 392cb9…<br/>content-addressed manifest"]
 ```
 
 ## Setup
@@ -124,18 +127,11 @@ tids_sql    <- paste(turtle_ids, collapse = ",")
 log_info("{length(turtle_keys)} turtle taxa (multiplicative merge)")
 
 # whole-range (global) multiplicative turtle merge, reading ONLY the turtle taxa's partitions
-# (mkey_id IN (...) → partition-pruned, tiny). er/ch/suit all come from the one pruned slice.
-dbExecute(con, glue("CREATE OR REPLACE TABLE mc_turtle AS
-  WITH t AS (SELECT ms_merge_key, ds_key, cell_id, val FROM mc_parts WHERE mkey_id IN ({tids_sql})),
-       er   AS (SELECT ms_merge_key, cell_id, max(val) er_value   FROM t WHERE ds_key='{turtle_ds}' GROUP BY 1,2),
-       suit AS (SELECT ms_merge_key, cell_id, max(val) suit_value FROM t WHERE ds_key='{suit_ds}'   GROUP BY 1,2),
-       ch   AS (SELECT ms_merge_key, cell_id, max(val) ch_value   FROM t WHERE ds_key IN ({ch_sql})  GROUP BY 1,2),
-       mult AS (SELECT er.ms_merge_key, er.cell_id,
-                  greatest(1, CAST(round(er.er_value * coalesce(suit.suit_value,1) / 100.0) AS INTEGER)) AS val
-                FROM er LEFT JOIN suit USING (ms_merge_key, cell_id))
-  SELECT m.ms_merge_key AS mdl_key, m.cell_id,
-         CAST(greatest(m.val, coalesce(ch.ch_value, 0)) AS DOUBLE) AS val
-  FROM mult m LEFT JOIN ch USING (ms_merge_key, cell_id)"))
+# (mkey_id IN (...) → partition-pruned, tiny). Rule = msens::turtle_sql() (unit-tested).
+dbExecute(con, glue("CREATE OR REPLACE TABLE turtle_src AS
+  SELECT ms_merge_key, ds_key, cell_id, val FROM mc_parts WHERE mkey_id IN ({tids_sql})"))
+dbExecute(con, paste("CREATE OR REPLACE TABLE mc_turtle AS",
+  msens::turtle_sql(turtle_ds, suit_ds, ch_ds, src = "turtle_src")))
 log_info("mc_turtle (whole-range): {dbGetQuery(con, 'SELECT count(*) n FROM mc_turtle')$n} cells")
 ```
 
@@ -161,11 +157,15 @@ msens::copy_atlas_parquet(con,
   "SELECT mt.mdl_key, mt.cell_id, mt.val FROM mc_turtle mt JOIN us_cells u ON mt.cell_id = u.cell_id",
   glue("{dir_merged}/turtle"), per_thread = TRUE)
 
-# BATCH the rest so each merge reads ONLY its taxa's pruned partitions (bounded memory). The
-# whole-range merge per cell = max(the taxon's GOVERNING er over its range footprint, AquaMaps
-# suitability AT those range cells) — am OUTSIDE the range is masked out (range-only → am NULL).
+# BATCH the rest so each merge reads ONLY its taxa's pruned partitions (bounded memory). Two surfaces
+# come off the same batch (see glob_global_sql / us_sql below): the GLOBAL viz surface = am ∪ range
+# (whole-range merged model, FULL OUTER); the US SCORING surface = v7-faithful US-boundary-aware rule
+# (range footprint ∩ US valued max(er, am-at-range), UNION am ∩ US for taxa with no range in the US).
+# The US rule keeps the 750 am-in-US taxa whose IUCN range lies wholly outside the US (silently
+# dropped before) yet still masks am to the range for taxa that DO have US range — so it reproduces
+# the prior US merge exactly and is NOT a plain trim of the global surface.
 # am-only taxa have no range footprint → omitted from the GLOBAL surface (reuse am COGs), but their
-# US am cells go into the scoring surface.
+# US am cells go into the scoring surface via the am-only UNION branch.
 # Batch by CELL COUNT, not taxa count: a few taxa have global ranges (10-25M cells each), so a
 # fixed 150-taxa batch OOMs. Pack taxa until ~40M cells/batch (a single taxon maxes at the 25.9M
 # grid, so it always fits one batch). Counts come from parquet metadata (fast, no data scan).
@@ -174,31 +174,29 @@ cnt <- dbGetQuery(con, "SELECT mkey_id, count(*) AS n FROM mc_parts GROUP BY mke
 cnt <- cnt[cnt$mkey_id %in% nonturtle, ]; cnt <- cnt[order(cnt$mkey_id), ]
 batches <- unname(split(cnt$mkey_id, cumsum(as.numeric(cnt$n)) %/% 40e6))
 log_info("merging {length(nonturtle)} non-turtle taxa in {length(batches)} cell-bounded batches (~40M cells each)")
-glob_sql <- "SELECT br.ms_merge_key AS mdl_key, br.cell_id,
-               greatest(br.er, coalesce(ba.am_val, 0))::DOUBLE AS val
-             FROM b_range br LEFT JOIN b_am ba USING (ms_merge_key, cell_id)"
+# The merge RULES are msens::merge_sql() — the SINGLE SOURCE OF TRUTH, unit-tested in
+# msens/tests/testthat/test-merge.R (every taxon category asserted). Two surfaces from the same batch:
+#  GLOBAL viz  ($global) = am ∪ range (FULL OUTER, whole-range merged model) → COGs.
+#  US scoring  ($us)     = v7-faithful, IUCN-CONSTRAINED: range∩US max(er, am-at-range) [am BEYOND the
+#    range is MASKED] UNION raw am∩US for TRUE am-only taxa (global has_range=FALSE). A species whose
+#    IUCN range lies WHOLLY outside the US gets NO US presence — the iucn_range_outside_us_eez
+#    exclusion (e.g. Sotalia guianensis). See ?msens::merge_sql for the full rationale.
+msq             <- msens::merge_sql()
+glob_global_sql <- msq$global
+us_sql          <- msq$us
 for (i in seq_along(batches)) {
   bk <- paste(batches[[i]], collapse = ",")   # integer mkey_ids → partition-pruned
   dbExecute(con, glue("CREATE OR REPLACE TABLE b AS
     SELECT ms_merge_key, ds_key, cell_id, val FROM mc_parts WHERE mkey_id IN ({bk})"))
-  # range footprint (non-am) valued by the taxon's governing er_score
-  dbExecute(con, "CREATE OR REPLACE TABLE b_range AS
-    SELECT DISTINCT b.ms_merge_key, b.cell_id, t.er_score::DOUBLE AS er
-    FROM b JOIN taxon t ON b.ms_merge_key = t.ms_merge_key WHERE b.ds_key <> 'am'")
-  # am AT those range cells (both taxa)
-  dbExecute(con, "CREATE OR REPLACE TABLE b_am AS
-    SELECT b.ms_merge_key, b.cell_id, max(b.val) am_val
-    FROM b JOIN b_range USING (ms_merge_key, cell_id) WHERE b.ds_key = 'am' GROUP BY 1, 2")
-  msens::copy_atlas_parquet(con, glob_sql, glue("{dir_global}/b{i}"), per_thread = TRUE)
-  msens::copy_atlas_parquet(con, glue(
-    "SELECT g.mdl_key, g.cell_id, g.val FROM ({glob_sql}) g JOIN us_cells u ON g.cell_id = u.cell_id
-     UNION ALL
-     SELECT b.ms_merge_key AS mdl_key, b.cell_id, b.val FROM b JOIN us_cells u ON b.cell_id = u.cell_id
-      WHERE b.ds_key='am' AND b.ms_merge_key IN (SELECT ms_merge_key FROM taxon_flags WHERE has_am AND NOT has_range)"),
-    glue("{dir_merged}/b{i}"), per_thread = TRUE)
+  dbExecute(con, msq$b_range)    # range footprint (non-am) valued by governing er_score
+  dbExecute(con, msq$b_am_all)   # (global) am over WHOLE am footprint of has_range taxa → am∪range
+  dbExecute(con, msq$b_am_rng)   # (US) am AT range cells only → range-footprint max(er, am-at-range)
+  msens::copy_atlas_parquet(con, glob_global_sql, glue("{dir_global}/b{i}"), per_thread = TRUE)
+  msens::copy_atlas_parquet(con, us_sql,          glue("{dir_merged}/b{i}"), per_thread = TRUE)
   if (i %% 10 == 0) log_info("  batch {i}/{length(batches)}")
 }
-dbExecute(con, "DROP TABLE IF EXISTS b; DROP TABLE IF EXISTS b_range; DROP TABLE IF EXISTS b_am")
+dbExecute(con, "DROP TABLE IF EXISTS b; DROP TABLE IF EXISTS b_range;
+  DROP TABLE IF EXISTS b_am_all; DROP TABLE IF EXISTS b_am_rng")
 
 # summaries: global (viz) + US (scoring); fingerprint the US scoring surface (the tracked output)
 smry_g <- dbGetQuery(con, glue("SELECT count(DISTINCT mdl_key) n_taxa, count(*) n_cells,
