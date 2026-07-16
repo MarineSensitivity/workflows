@@ -74,6 +74,79 @@ Planning: /Users/bbest/.claude/plans/we-made-lots-of-starry-bird.md
   1. Switch to PARTITION_BY(mid) now ✔
      Repartition the serving surface by an integer model id (the AquaMaps-COG trick) to avoid the global ORDER BY spill and let titiler do partition-pruning. Faster/cheaper to build, but changes the titiler read path and needs a point-read benchmark before it's trusted.
 
+----
+
+The exclude fix is committed and pushed. The render is running healthy in the background. Here's the status.
+
+What just happened
+
+The full render launched and cleared its first real blocker. It rendered build_cell_grid, ingest_worms, ingest_listings, and ingest_ca_nmfs (v1→v2 parquet confirmed), then hit a pre-existing problem: ingest_taxon.qmd is an old-style WIP notebook that hardcodes its own Drive paths and connects to an invalid Drive sdm.duckdb stub — nothing to do with the parquet revamp, and it emits only DuckDB taxonomy (no parquet), which already exists in spp.duckdb. I excluded it (like gm/nc), resumed, and it's now progressing cleanly through ingest_birdlife_botw. That exclude + the reason are committed and pushed.
+
+Current state
+
+- Committed + pushed: 8 commits across the four repos — Phase A/B/C, the mdl_key stability rework, the local-~/_big + DAG-exclude fixes.
+- Render running (detached, resumable via checkpoints). Order from here: remaining vector ingests → ingest_aquamaps (builds the w05 weight table, ~minutes; skips re-interpolation) → ingest_rng_iucn (the slow one — reads all IUCN shapefiles from Drive) → merge_models (the 13B-row merge, the real long pole) → score → registry → release → publish_native → build_app_support. Log: scratchpad/render.log; state via tar_progress().
+
+Two things to flag
+
+1. **`ingest_taxon` needs a paths cleanup (use `libs/paths.R` instead of hardcoded Drive paths)** — a separate small task from the revamp. It's excluded until then.
+2. It's a multi-hour run and detached, so I won't get an automatic completion ping. There's also a real chance it hits another old-style notebook further along (e.g. in merge/score) — I'd catch that in the log.
+
+Since it's long, I'll pause here rather than poll idly. Say the word and I'll check the render's progress, or once it's through release we pick up Phase D (nc ingest) — all in-repo and locally runnable. Want me to keep watching the render to the finish, or check back at a set interval?
+
+----
+
+Google Drive locally on the laptop seems to have stopped working, so I am dubious of any paths including IUCN shapefiles being properly read. We need to download any unhydrated necessary files into a reasonable path under `~/_big/`, update paths.R or similar, and process accordingly. There should also be a memory about big geopackages needing an index added for reading to speed things up.
+
+----
+
+
+At https://marinesensitivity.org/workflows/ I am expecting to see rendered HTML notebook links for all that was run in the DAG, yet I do not see the very first one for build_cell_grid.qmd. Was that only run lazily (ie R chunks extracted and ran outside of Quarto render)? Remember, the whole point is to render all notebooks, and ensure they are well explained and summarized with tabular summaries and mermaid diagrams. Please render as needed (if outputs already created, should check and default to not overwriting unless flag set, then run in an idempotent way with a checksum that kicks off downstream dependencies as needed). The git commit and push.
+
+----
+
+Done — build_cell_grid is fixed, the full pipeline re-ran cleanly, and every DAG node now has a rendered, committed, deployed HTML. Here's the complete picture:
+
+Your specific issue — build_cell_grid
+
+Not lazy execution — it was fully rendered (## Design mermaid PNG + summary table, 72K). It was just explicitly gitignored (a stale entry in the "build state" block), so its card linked to a missing page while every other notebook's HTML was deployed. Un-ignored, committed, pushed. The same latent problem (rendered-but-uncommitted) was also hiding iucn/worms/fws — all now fixed.
+
+The full render completed (fresh V2 + checkpoints + HTML)
+
+Every target ran, `tar_outdated` is now empty:
+- **merge_models**: 654M US model-cells rebuilt in 6m, zero errors (the "13B" was my overestimate)
+- **score_zones** → score_cell_metrics → score_zone_metrics, build_common_names, build_registry, publish_native (native COGs from local am.duckdb + per-model PMTiles), build_app_support
+- **release** completed (local serve.duckdb over the 18,528-partition serve + STAC + manifest)
+
+Two bugs found and fixed en route
+
+1. **DAG dependency** (the one that nearly pushed stale data to S3): release/build_registry used dependency: [auto], which resolves to grid+ingest only — so release was scheduled before merge/score. Fixed to depend on the score/registry/publish terminals; release is now gated last.
+2. **release viewdb under `RELEASE_NO_S3`**: the view-DB step assumed the S3 serve exists (object 's3_uri' not found). Fixed to build serve.duckdb over local staged Parquet on a local render; production S3 path unchanged.
+
+Deployed
+
+Three pushes (efc3ef83 DAG fix → 9de63833 grid+ingest HTML → 452fa777 merge/score/release HTML + viewdb fix). The jekyll-gh-pages action is rebuilding — in a minute or two, marinesensitivity.org/workflows/ will show working links for all 25 notebooks across all 6 categories (grid → ingest → merge → score → registry → release), each with its Design diagram + summary tables. I followed your idempotency rule throughout: build_cell_grid wasn't re-rendered (already current), and the content-checksum manifests drove what re-ran.
+
+Deferred deliberately (unchanged from plan): the S3 cutover (Phase 11 — needs the titiler factory deployed) and Phase D (gm/nc density ingest). Want me to move on to Phase D next?
+
+----
+
+PROMPT: Let's update the app to view the original and interpolated distributions. That probably also needs the newer titiler factory, but should not interrupt the v7 apps. I am also noticing repeat species drop-downs in https://app.marinesensitivity.org/species_v8/ eg [Image #1]
+
+### duplicate birds: Marbled Murrelet = ms_merge|BOTW:22694870, ms_merge|WORMS:254308 (n=2)
+
+The duplicate is a real data issue, not just UI: 13 bird species have two separate merged models — one BOTW-keyed (BirdLife range) and one WoRMS-keyed (IUCN/FWS ranges) — that never unified in the crosswalk (e.g., Marbled Murrelet = ms_merge|BOTW:22694870 n=1 and ms_merge|WORMS:254308 n=2). A naive app-level dedup would be lossy (dropping either hides half the species' range). Let me hold that thought and first understand the app's render/layer logic for the native/model toggle (the primary ask).
+
+----
+
+But I hit a real wall worth your call. The exact bulk whole-range merge is ~30 billion rows (16.2B global ranges + 13B AquaMaps) because IUCN/BirdLife species have global ranges — millions of cells each — vs. 634k US cells. That OOMs on the 26 GB laptop (and the server is worse at 15 GB). A single bulk aggregate at that scale won't fit here.
+
+It's still achievable, but the approach has to change from "one big merge → COG" to per-taxon (bounded memory). And there's a faster path that fixes your actual complaints without the full 30B compute. Your call:
+
+----
+
+PROMPT: Since `model_cell_all` is only used for this global per-species model parquet output in `merge_models.qmd`, it can stay stored as a deeply partitioned parquet, for instance by `mdl_key`. Then when constructing individual species models, `mdl_key` shall always be specified in the `WHERE` clause and only the relevant rows will be loaded into memory, avoiding any OOM issues.
+
 
 ## 2026-07-07 revert to AquaX raster 0.05
 
