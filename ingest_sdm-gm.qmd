@@ -1,584 +1,200 @@
 ---
-title: "Ingest SDMs: GoMex cetacean & sea turtle"
+title: "Ingest SDMs: NOAA SEFSC GoMex Cetacean & Sea-Turtle Densities"
+subtitle: "Monthly hexagon abundance (#/40 km²) → density → suitability [0,100] on the global 0.05° grid"
 msens:
   target_name: ingest_sdm_gm
   workflow_type: ingest
-  dependency: [ingest_taxon, build_cell_grid]
+  dependency: [build_cell_grid]
   output: data/manifests/ingest_sdm_gm.json
   dataset: {ds_key: gm, response_type: density, source_authority: NOAA SEFSC, temporal_interval: monthly, native_format: vector}
 editor_options:
   chunk_output_type: console
-format:
-  html:
-    code-fold: true
-    code-tools: true
 ---
 
-[Cetacean and sea turtle spatial density model outputs from visual observations using line-transect survey methods aboard NOAA vessel and aircraft platforms in the Gulf of Mexico from 2003-06-12 to 2019-07-31 (NCEI Accession 0256800)](https://www.ncei.noaa.gov/access/metadata/landing-page/bin/iso?id=gov.noaa.nodc:256800)
+NOAA SEFSC [Gulf-of-Mexico cetacean & sea-turtle spatial density models](https://www.ncei.noaa.gov/access/metadata/landing-page/bin/iso?id=gov.noaa.nodc:256800)
+(NCEI 0256800) — 19 hexagon shapefiles, one per species/population, each carrying monthly abundance
+`{Mon}_n` (individuals per 40 km² hexagon, `-9999` = no data). v8 mirrors the **nc** density ingest
+(`ingest_sdm-nc.qmd`): rasterize each (species × month) onto the global 0.05° grid, rescale the
+heavy-tailed density to a graded **suitability [0,100]** per species (so months share a scale), plus
+an **annual** mean surface. Two dolphins are modelled as split **Oceanic + Shelf** populations whose
+densities are **summed** per hexagon before rasterizing.
 
-- additional [metadata](https://www.fisheries.noaa.gov/inport/item/67830)
+- **`mdl_key`**: monthly `gm|{sp_id}|{01..12}` + annual `gm|{sp_id}`. `sp_id` = `WORMS:{aphia}` when
+  `taxa_sci` resolves to a single WoRMS AphiaID, else `GUILD:{taxa_shp}` for species groups.
+- **Density → [0,100] is a modeling choice** (v7 never scored gm): per-`sp_id` linear rescale to the
+  pooled **p99.5** of non-zero density, stored as `val_cap` in `model_gm.csv`. **NOT yet folded into
+  merge/scoring** (merge treats non-`am` datasets as binary ranges; a scoring change to validate with
+  `pra_score_delta`).
+
+> **Inputs are on Drive, not in-repo.** Set `GM_SHP_DIR` to the shapefile folder (or hydrate it to
+> `~/_big/msens/raw/sdm/gm`). This notebook was authored against the nc pattern but **must be run on
+> a host with the Drive inputs** (e.g. `msens1`); it is not executed in the in-repo CI render.
 
 ```{r}
-#| messages: FALSE
-#| warning: FALSE
+#| label: setup
 
-# packages
-librarian::shelf(
-  devtools, dplyr, DT, fs, glue, here, janitor, knitr, mapview, purrr, readr, 
-  readxl, sf, stringr, tibble, tidyr, units,
-  quiet = T)
-options(readr.show_col_types = F)
+librarian::shelf(dplyr, fs, glue, here, janitor, jsonlite, logger, purrr, readr, readxl,
+                 sf, stringr, terra, tibble, tidyr, worrms, MarineSensitivity/msens, quiet = T)
+source(here("libs/paths.R"))
+source(here("libs/vars.R"))
+sf_use_s2(FALSE)
+options(readr.show_col_types = FALSE)
 
-source(here("libs/db.R"))  # con, create_index()
+ds_key   <- "gm"
+dir_dist <- glue("{dir_big_v}/marine-atlas/dist/dataset={ds_key}"); dir_create(dir_dist)
+mdl_csv  <- glue("{dir_big_v}/marine-atlas/dist/model_{ds_key}.csv")
+manifest <- here("data/manifests/ingest_sdm_gm.json"); dir_create(path_dir(manifest))
+cog_base <- "https://file.marinesensitivity.org/cog/sdm/raw"
+p_cap    <- 0.995
+NA_VAL   <- -9999
+
+# Drive-hosted inputs (override with GM_SHP_DIR); default to a hydrated ~/_big copy if present.
+shp_dir  <- Sys.getenv("GM_SHP_DIR", unset = path.expand("~/_big/msens/raw/sdm/gm"))
+taxa_xls <- if (file_exists(glue("{shp_dir}/spp_gmx.xlsx"))) {
+  glue("{shp_dir}/spp_gmx.xlsx")
+} else glue("{shp_dir}/../spp_gmx.xlsx")
+stopifnot("run on a host with the Drive gm inputs (set GM_SHP_DIR)" = dir_exists(shp_dir),
+          file_exists(cellid_tif))
+
+if (redo_ingest && dir_exists(dir_dist)) { dir_delete(dir_dist); dir_create(dir_dist) }
+
+r_grid <- rast(cellid_tif)                               # global 0.05° template (values = cell_id)
+
+# write one model surface as (mdl_key, cell_id, val) parquet (V2/zstd). mm = NA -> annual.
+pq_path <- function(safe, mm) if (is.na(mm)) glue("{dir_dist}/{ds_key}_{safe}.parquet") else
+                                            glue("{dir_dist}/{ds_key}_{safe}_{mm}.parquet")
+write_surface <- function(d, sid, mm, safe) {
+  mk <- if (is.na(mm)) glue("{ds_key}|{sid}") else glue("{ds_key}|{sid}|{mm}")
+  msens::write_atlas_parquet(
+    tibble(mdl_key = as.character(mk), cell_id = as.integer(d$cell_id), val = d$val),
+    pq_path(safe, mm))
+}
 ```
 
-```{r}
-#| label: d_datasets
-schema <- "public"
-
-d_datasets <- tibble(
-  ds_key      = "gm", # TODO: "sw_gm_cets-turtles_dens",
-  # ds_key:     "{src}_{rgn}_{taxa}_{resp}"; see below for response_type, taxa_groups lookups
-  # name_short: "{source_broad} {regions} {taxa_groups} {response_type}"
-  name_short  = "NOAA GoMex Cetacean & Sea Turtle Densities",
-  name_full   = "Cetacean and sea turtle spatial density model outputs from visual observations using line-transect survey methods aboard NOAA vessel and aircraft platforms in the Gulf of Mexico from 2003-06-12 to 2019-07-31 (NCEI Accession 0256800)",
-  link        = "https://www.ncei.noaa.gov/access/metadata/landing-page/bin/iso?id=gov.noaa.nodc:256800",
-  citation    = "Litz, Jenny; Aichinger Dias, Laura; Rappucci, Gina; Martinez, Anthony; Soldevilla, Melissa; Garrison, Lance; Mullin, Keith; Barry, Kevin; Foster, Marjorie (2022). Cetacean and sea turtle spatial density model outputs from visual observations using line-transect survey methods aboard NOAA vessel and aircraft platforms in the Gulf of Mexico from 2003-06-12 to 2019-07-31 (NCEI Accession 0256800). [indicate subset used]. NOAA National Centers for Environmental Information. Dataset. https://doi.org/10.25921/efv4-9z56. Accessed July 28, 2022.",
-  description = "Based on ship-based and aerial line-transect surveys conducted in the U.S. waters of the Gulf of Mexico between 2003 and 2019, the NOAA Southeast Fisheries Science Center (SEFSC) developed spatial density models (SDMs) for cetacean and sea turtle species for the entire Gulf of Mexico. SDMs were developed using a generalized additive modeling (GAM) framework to determine the relationship between species abundance and environmental variables (monthly averaged oceanographic conditions during 2015 - 2019). Models were extrapolated beyond the U.S. Gulf of Mexico to provide insight into potential high density areas throughout the Gulf of Mexico. However, extrapolations of this type should be interpreted with caution. This dataset includes 19 shapefiles for the SDMs for each cetacean and sea turtle species or species group.",
-  response_type  = "density",             
-    # response_type: one of: occurrence [occs], range [rng], suitability [suit], probability [pr], biomass [m], density [dens], abundance [n]
-  # taxa_groups: one or more of: fish [fish], invertebrates [inverts], marine mammals [marmams], cetaceans [cets], sea turtles [turtles], seabirds [birds], etc.
-  taxa_groups     = "cetacean, sea turtle", 
-  year_pub       = 2022,
-  date_obs_beg   = "2003-06-12", 
-  date_obs_end   = "2019-08-01",            # up to, but not including *_end
-  date_env_beg   = "2015-01-01", 
-  date_env_end   = "2020-01-01",            # up to, but not including *_end
-  regions        = list("Gulf of Mexico"))  # array
-# names(d_dataset) |> paste(collapse = ", ") |> cat()
-
-t_datasets <- Id(schema = schema, table = "sdm_datasets")
-
-row_exists <- tbl(con, t_datasets) |> filter(ds_key == !!d_datasets$ds_key) |> collect() |> nrow() == 1
-if (!row_exists){
-  
-  # append, except array columns: regions
-  dbWriteTable(
-    con, t_datasets, append = T,
-    d_datasets |> 
-      select(-regions) )
-  
-  # append array column: regions
-  regions_sql <- glue(
-    "ARRAY['{d_datasets$regions |> unlist() |> paste(collapse = ', ')}']")
-  dbExecute(
-    con, 
-    glue(
-      "UPDATE sdm_datasets 
-      SET   regions = {regions_sql}
-      WHERE ds_key  = 'gm'") )
-}
-
-tbl(con, t_datasets) |> 
-  filter(ds_key == "gm") |> 
-  collect() |>
-  glimpse()
-```
+## Models + species crosswalk
 
 ```{r}
-#| label: d_geoms
-# helper functions ----
-get_annual_density <- function(d_sf, i=0){
-  # i = 12; d_sf <- d$sf[[i]]
-  message(glue("{i} of {nrow(d_sf)} in get_annual_density() ~ {Sys.time()}"))
+#| label: models
 
-  # get geometries
-  geoms <- d_sf %>%
-    select(hexid = HEXID, geom = geometry)
-
-  # get *_n abundance (#/40km2) per month and calculate annual average density (#/km2)
-  mos_n <- glue("{month.abb}_n")
-  attrs <- d_sf %>%
-    st_drop_geometry() %>%
-    select(hexid = HEXID, any_of(mos_n)) %>%
-    pivot_longer(-hexid, names_to = "mo_n", values_to = "n") %>%
-    filter(n != -9999) %>%
-    group_by(hexid) %>%
-    summarize(
-      n = mean(n),
-      .groups = "drop") %>%
-    mutate(
-      density = n / 40) %>%
-    select(hexid, density) # individuals / km2
-
-  # return geometries joined with summarized attributes
-  d_sum <- geoms %>%
-    left_join(
-      attrs, by = "hexid")
-  d_sum
-}
-
-# read layers ----
-dir_shp   <- "/Users/bbest/My Drive/projects/offhab/data/raw/ncei.noaa.gov - GoMex cetacean & sea turtle SDMs/0256800/2.2/data/0-data/NOAA_SEFSC_Cetacean_SeaTurtle_SDM_shapefiles"
-taxa_xls <- glue("{dir_shp}/../spp_gmx.xlsx")
-
-d_taxa <- read_excel(taxa_xls)
-
-t_geoms <- Id(schema = schema, table = "sdm_geometries")
-
-rows_exist <- (
-  tbl(con, t_geoms) |> 
-    filter(ds_key == "gm") |> 
-    collect() |> 
-    nrow() ) > 1
-if (!rows_exist){
-  d <- tibble(
-    path_shp = list.files(dir_shp, "shp$", full.names=T)) |> 
-    mutate(
-      base_shp = basename(path_shp) |> path_ext_remove(),
-      taxa_shp = str_replace(base_shp, "(.*)_Monthly_.*", "\\1")) |> 
-    left_join(
-      d_taxa  |> 
-        select(taxa_shp, taxa_sci, taxa_doc),
-      by = "taxa_shp")  |> 
-    mutate(
-      population = map_chr(
-        base_shp, ~{
-          if (str_detect(.x, "^(Oceanic)|(Shelf)")) {
-            return(str_replace(.x, "^(Oceanic|Shelf)_(.*)", "\\1"))
-          } else {
-            return(NA)
-          } }),
-      sf         = map(path_shp, read_sf),
-      d_density  = imap(sf, get_annual_density),
-      months_lst = map(sf, ~{
-        intersect(
-          colnames(.),
-          glue("{month.abb}_n")) %>%
-          str_replace("_n", "")  }),
-      n_months = map_int(months_lst, length),
-      months   = map_chr(months_lst, paste, collapse=";") )
-  
-  # get unique geometries
-  d_geoms <- d |> 
-    select(sf) |> 
-    mutate(
-      sf = map(sf, \(x){ x |> select(gid = HEXID) } ) ) |> 
-    unnest(cols = c(sf)) |> 
-    distinct() |> 
-    arrange(gid) |> 
-    st_as_sf() |> 
-    # exclude "POLYGON" whole hexagon duplicates
-    filter(st_geometry_type(geometry) == "MULTIPOLYGON") |> 
-    rename(geom_id = gid) |> 
-    mutate(
-      geom_id = as.integer(geom_id),
-      ds_key  = "gm") |> 
-    relocate(ds_key, .before = geom_id) |> 
-    st_transform(4326) |> # from: USA_Contiguous_Lambert_Conformal_Conic
-    # mapView(d_geoms)
-    st_set_geometry("geom")
-  
-  st_write(d_geoms, con, t_geoms, append = T)
-}
-
-q <- "SELECT * FROM sdm_geometries WHERE ds_key = 'gm'"
-# st_read(con, query = q) |> 
-#   mapView()
-```
-
-
-```{r}
-#| label: d_vals
-t_vals <- Id(schema = schema, table = "sdm_values")
-
-rows_exist <- tbl(con, t_vals) |> filter(ds_key == "gm") |> summarize(n()) |> pull() > 0
-if (!rows_exist){
-  
-  # get unique values
-  d_vals <- d |> 
-    select(sp_key = taxa_sci, population, data = sf) |> 
-    mutate(
-      data = map(data, \(x){
-        x |> 
-          st_drop_geometry() |>
-          rename(geom_id = HEXID) |> 
-          pivot_longer(
-            cols      = -geom_id,
-            names_to  = "mo_var",
-            values_to = "val") |>
-          filter(val != -9999) |> 
-          separate(
-            col  = mo_var,
-            into = c("mo", "var"),
-            sep  = "_")
-        } ) ) |> 
-    unnest(cols = c(data)) |> 
-    mutate(
-      ds_key = "gm") |> 
-    relocate(ds_key, .before = taxa_sci)
-  # A tibble: 15,445,842 × 7
-  
-  yr <- 2019 # using last year of obs/env so ISO 8601 compliant
-  d_vals <- d_vals |> 
-    mutate(
-     mm            = setNames(1:12, month.abb)[mo],
-     mm_str        = stringr::str_pad(mm, 2, pad = "0"),
-     # Time Interval notation using [ISO 8601])(https://en.wikipedia.org/wiki/ISO_8601)
-     time_interval = glue("{yr}-{mm_str}/P1M")) |> 
-    select(
-      -mo, -mm, -mm_str)
-  
-  # summarize d_vals to d_models
-  d_mdls <- d_vals |> 
-    group_by(
-      ds_key, sp_key, population, time_interval, var) |> 
-    summarize(.groups = "drop") |> 
-    rowid_to_column("mdl_id") |>
-    mutate(
-      mdl_id = "gm") |> 
-    relocate(ds_key, .before = mdl_id)
-  
-  d_vals <- d_vals |> 
-    left_join(
-      d_models, 
-      by = c("ds_key", "sp_key", "population", "time_interval", "var")) |> 
-    select(
-      ds_key, mdl_id, geom_id, val)
-  
-  d_spp <- d_taxa |> 
-    group_by(taxa_sci) |>
-    summarize(
-      taxa_common = first(taxa_common) |> str_replace_all("Oceanic ", "") ) |> 
-    mutate(
-      ds_key = "gm") |>
-    select(ds_key, sp_key = taxa_sci, sp_common = taxa_common) |> 
-    mutate(
-      sp_scientific = sp_key)
-  
-  t_spp <- Id(schema = schema, table = "sdm_species")
-  
-  rows_exist <- tbl(con, t_spp) |> filter(ds_key == "gm") |> summarize(n()) |> pull() > 0
-  if (!rows_exist)
-    dbWriteTable(con, t_spp, d_spp, append = T)
-  
-  t_mdls <- Id(schema = schema, table = "sdm_models")
-  
-  rows_exist <- tbl(con, t_mdls) |> filter(ds_key == "gm") |> summarize(n()) |> pull() > 0
-  if (!rows_exist)
-    dbWriteTable(con, t_mdls, d_mdls, append = T)
-  
-  # check: d_vals |> select(mo, time_interval) |> table()
-  dbWriteTable(con, t_vals, d_vals, append = T)
-}
-
-t_mdls <- Id(schema = schema, table = "sdm_models")
-tbl(con, t_mdls) |> 
-  select(-description) |> 
-  collect() |> 
-  datatable()
-
-tbl(con, t_vals) |> 
-  head() |> 
-  collect() |> 
-  kable()
-```
-
-The map output is too big, but the following runs in RStudio.
-
-```{r}
-#| label: d_map
-#| eval:  FALSE
-
-# build query
-# tbl(con, t_mdls) |>
-#   filter(
-#     ds_key        == "gm",
-#     # sp_key        == "Stenella frontalis",
-#     # population    == "Oceanic",
-#     sp_key        == "Balaenoptera ricei",
-#     time_interval == "2019-01/P1M",
-#     var           == "n") |>
-#   select(ds_key, mdl_id) |> 
-#   left_join(
-#     tbl(con, t_vals),
-#     by = c("ds_key", "mdl_id") ) |>
-#   left_join(
-#     tbl(con, t_geoms),
-#     by = c("ds_key", "geom_id")) |> 
-#   select(val, geom) |> 
-#   show_query() # explain()
-
-q <- "
-SELECT v.val, g.geom
-FROM (
-  SELECT ds_key, mdl_id
-  FROM public.sdm_models
-  WHERE
-    ds_key        = 'gm'                 AND
- -- sp_key        = 'Stenella frontalis' AND
- -- population    = 'Oceanic'            AND
-    sp_key        = 'Balaenoptera ricei' AND
-    time_interval = '2019-01/P1M'     AND
-    var           = 'n' ) AS m
-LEFT JOIN public.sdm_values AS v ON (
-  m.ds_key = v.ds_key AND
-  m.mdl_id = v.mdl_id )
-LEFT JOIN public.sdm_geometries AS g ON (
-  m.ds_key  = g.ds_key AND
-  v.geom_id = g.geom_id )"
-p <- st_read(con, query = q)
-mapView(p)
-```
-
-![Screenshot of running above query in RStudio.](./images/ingest_sdm-gm/gm_mapview.png)
-
-```{r}
-#| label: OLD
-#| eval: FALSE
-
-gm_models <- d %>%
-  select(mdl_id, taxa_sci, taxa_doc, months, n_months)
-
-mdl_hex <- d %>%
-  select(
-    mdl_id, d_density) %>%
-  unnest(d_density)
-
-gm_model_hexagons <- mdl_hex %>%
-  group_by(hexid, geom) %>%
-  summarize(.groups="drop") %>%
-  st_as_sf()
-
-gm_model_hexagon_densities<- mdl_hex %>%
-  st_drop_geometry() %>%
-  select(mdl_id, hexid, density) %>%
-  filter(!is.na(density))
-
-# helper functions ----
-get_annual_density <- function(d_sf, i=0){
-  # i = 12; d_sf <- d$sf[[i]]
-  message(glue("{i} of {nrow(d)} in get_annual_density() ~ {Sys.time()}"))
-
-  # get geometries
-  geoms <- d_sf %>%
-    select(hexid = HEXID, geom = geometry)
-
-  # get *_n abundance (#/40km2) per month and calculate annual average density (#/km2)
-  mos_n <- glue("{month.abb}_n")
-  attrs <- d_sf %>%
-    st_drop_geometry() %>%
-    select(hexid = HEXID, any_of(mos_n)) %>%
-    pivot_longer(-hexid, names_to = "mo_n", values_to = "n") %>%
-    filter(n != -9999) %>%
-    group_by(hexid) %>%
-    summarize(
-      n = mean(n),
-      .groups = "drop") %>%
-    mutate(
-      density = n / 40) %>%
-    select(hexid, density) # individuals / km2
-
-  # return geometries joined with summarized attributes
-  d_sum <- geoms %>%
-    left_join(
-      attrs, by = "hexid")
-  d_sum
-}
-
-
-# add aphia_id ----
-gm_models <- wm_add_aphia_id(gm_models, taxa_sci)
-
-# TODO?: combine Oceanic_* & Shelf_* for AtlanticSpotted_Dolphin + CommonBottlenose_Dolphin
-
-# write to database ----
-con <- oh_pg_con()
-dbWriteTable(con, "gm_models", gm_models, overwrite=T)
-st_write(gm_model_hexagons, con, "gm_model_hexagons", delete_layer=T)
-dbWriteTable(con, "gm_model_hexagon_densities", gm_model_hexagon_densities, overwrite=T)
-
-create_index(con, "gm_models", "mdl_id", unique = T)
-create_index(con, "gm_model_hexagons", "hexid", unique = T)
-create_index(con, "gm_model_hexagon_densities", c("mdl_id", "hexid"), unique = T)
-
-# hexid x cell_id ----
-tbl(con, "gm_model_hexagons")
-oh_cells_ply <- dbGetQuery(
-  con,
-  "WITH
-  c  AS (
-    SELECT
-      cell_id, geom
-    FROM oh_cells),
-  d AS (
-    SELECT
-      hexid AS ply_id, ST_Transform(geom, 4326) AS geom
-    FROM gm_model_hexagons)
-  SELECT DISTINCT ON (tbl, ply_id, cell_id)
-    'gm_model_hexagons' AS tbl,
-    d.ply_id,
-    c.cell_id
-  FROM c JOIN
-    d ON ST_Covers(d.geom, c.geom)") %>%
-  tibble()
-oh_cells_ply
-dbSendQuery(con, "DELETE FROM oh_cells_ply WHERE tbl = 'gm_model_hexagons'")
-dbAppendTable(con, "oh_cells_ply", oh_cells_ply)
-
-# test model output ----
-con <- oh_pg_con()
-r_d <- tbl(con, "gm_models") %>%
-  filter(taxa_sci == "Ziphius") %>%
-  left_join(
-    tbl(con, "gm_model_hexagon_densities"),
-    by = "mdl_id") %>%
-  left_join(
-    tbl(con, "oh_cells_ply") %>%
-      filter(tbl == "gm_model_hexagons"),
-    by = c("hexid" = "ply_id")) %>%
-  select(cell_id, density) %>%
-  filter(            # 1,977,010 -> 1,959,979
-    !is.na(cell_id),
-    !is.na(density)) %>%
-  collect()
-
-library(terra)
-r <- oh_rast()
-r[r_d$cell_id] <- r_d$density
-tmp_tif <- tempfile(fileext = ".tif")
-r <- trim(r)
-plot(r)
-mapView(r, maxpixels=ncell(r))
-
-
-# redo rast ----
-librarian::shelf(
-  here, readr, terra)
-options(readr.show_col_types = F)
-
-dir_lyrs_tif <- "/Users/bbest/My Drive/projects/offhab/data/derived/lyrs_tif"
-lyrs_csv     <- here("data-raw/layers.csv")
-ds_key       <- "gm"
-
-# match with aphia_id
-D <- d |>
-  left_join(
-    tbl(con, "taxa") |> # distinct(tbl) |> pull(tbl)
-      filter(tbl == "gm_models") |>
-      select(
-        taxa_sci = taxa,
-        aphia_id) |>
-      collect(),
-    by = "taxa_sci")
-
-# combine:
-#           Stenella frontalis | Tursiops truncatus
-#  oceanic |                 8 |                  9
-#    shelf |                15 |                 16
-d_sf <- D |>
-  filter(
-    mdl_id == 8) |>
-  select(aphia_id, d_density) |>
-  unnest(d_density) |>
-  rename(density_oceanic = density) |>
-  left_join(
-    D |>
-      filter(
-        mdl_id == 15) |>
-      select(mdl_id, d_density) |>
-      unnest(d_density) |>
-      select(
-        hexid, density_shelf = density),
-    by = "hexid") |>
+# one row per shapefile: species (+ Oceanic/Shelf population), monthly abundance columns.
+d_taxa <- read_excel(taxa_xls)                           # cols: taxa_shp, taxa_sci, taxa_doc, taxa_common
+m <- tibble(path_shp = dir_ls(shp_dir, glob = "*.shp")) |>
   mutate(
-    density = map2_dbl(
-      density_oceanic, density_shelf, sum, na.rm = T)) |>
-  select(-density_oceanic, -density_shelf) |>
-  nest(
-    d_density = c(hexid, geom, density))
-d_tt <- D |>
-  filter(
-    mdl_id == 9) |>
-  select(aphia_id, d_density) |>
-  unnest(d_density) |>
-  rename(density_oceanic = density) |>
-  left_join(
-    D |>
-      filter(
-        mdl_id == 16) |>
-      select(mdl_id, d_density) |>
-      unnest(d_density) |>
-      select(
-        hexid, density_shelf = density),
-    by = "hexid") |>
-  mutate(
-    density = map2_dbl(
-      density_oceanic, density_shelf, sum, na.rm = T)) |>
-  select(-density_oceanic, -density_shelf) |>
-  nest(
-    d_density = c(hexid, geom, density))
-D <- D |>
-  filter(!mdl_id %in% c(8,9,15,16)) |>
-  select(aphia_id, d_density) |>
-  rbind(
-    d_sf,
-    d_tt)
+    base_shp = path_ext_remove(path_file(path_shp)),
+    taxa_shp = str_replace(base_shp, "(.*)_Monthly_.*", "\\1"),
+    # the two split-population dolphins: Oceanic_* / Shelf_* -> combine per taxa
+    population = if_else(str_detect(base_shp, "^(Oceanic|Shelf)_"),
+                         str_replace(base_shp, "^(Oceanic|Shelf)_.*", "\\1"), NA_character_)) |>
+  left_join(select(d_taxa, taxa_shp, taxa_sci, taxa_common = any_of("taxa_common")), by = "taxa_shp")
 
-# iterate over rasters
-r_na <- oh_rast("NA")
-# for (i in 1:nrow(D)){ # i = 1
-for (i in 16:nrow(D)){ # i = 16
-
-  aphia_id <- D$aphia_id[i]
-  lyr_key <- glue("{ds_key}_{aphia_id}")
-  r_tif <- glue("{dir_lyrs_tif}/{lyr_key}.tif")
-  message(glue("{i} of {nrow(D)}: {basename(r_tif)} ~ {Sys.time()}"))
-
-  # get density, geom
-  d <- D |>
-    slice(i) |>
-    pull(d_density) %>%
-    .[[1]] |>
-    st_as_sf()
-  # mapView(d, zcol = "density")
-
-  # convert to raster
-  r <- d |>
-    st_transform(3857) |>
-    rasterize(
-      r_na, "density")
-  # plet(r, tiles="Esri.NatGeoWorldMap")
-
-  # rescale 0 to 100; set 0 -> NA
-  (vr <- range(values(r, na.rm = T)))
-  r <- setValues(
-    r,
-    scales::rescale(
-      values(r),
-      to = c(0, 100)) )
-  r[r==0] <- NA
-  # plet(r, tiles="Esri.NatGeoWorldMap")
-
-  # write raster
-  write_rast(r, r_tif)
-
-  # write min, max to layers.csv
-  d <- read_csv(lyrs_csv) |>
-    filter(
-      lyr_key != !!lyr_key) |>
-    bind_rows(
-      tibble(
-        lyr_key     = lyr_key,
-        ds_key      = ds_key,
-        aphia_id    = aphia_id,
-        val_min	    = vr[1],
-        val_max     = vr[2],
-        rescale_min	= 0,
-        rescale_max = 100) )
-  # message(glue("  nrow(lyrs_csv): {nrow(d)}"))
-  write_csv(d, lyrs_csv)
+# resolve taxa_sci -> single WoRMS AphiaID (WORMS:{id}); species groups fall back to GUILD:{taxa_shp}
+resolve_sp_id <- function(sci, shp) {
+  id <- tryCatch(worrms::wm_name2id(sci), error = function(e) NA_integer_)
+  if (length(id) == 1 && !is.na(id)) glue("WORMS:{id}") else glue("GUILD:{shp}")
 }
-
+m <- m |> mutate(sp_id = map2_chr(taxa_sci, taxa_shp, resolve_sp_id))
+log_info("gm shapefiles: {nrow(m)}; sp_id: {n_distinct(m$sp_id)}; split-pop taxa: {sum(!is.na(m$population))}")
+knitr::kable(m |> count(sp_id, name = "n_shp") |> arrange(desc(n_shp)) |> head(8))
 ```
 
+## Rasterize + rescale per species
+
+```{r}
+#| label: rasterize
+
+# per hexagon shapefile -> long monthly density (#/km2 = {Mon}_n / 40), summed across populations.
+hex_density <- function(paths) {
+  sf <- bind_rows(lapply(paths, function(p) {
+    x <- read_sf(p) |> st_transform(4326)
+    mos <- intersect(glue("{month.abb}_n"), names(x))
+    x |> select(hexid = HEXID, all_of(mos), geom = geometry)
+  }))
+  mos <- intersect(glue("{month.abb}_n"), names(sf))
+  long <- sf |> st_drop_geometry() |>
+    pivot_longer(all_of(mos), names_to = "mo_n", values_to = "n") |>
+    filter(n != NA_VAL) |>
+    mutate(mm = sprintf("%02d", match(str_remove(mo_n, "_n"), month.abb)),
+           density = n / 40)                             # individuals / km2
+  geoms <- sf |> select(hexid) |> distinct()
+  list(long = long, geoms = geoms)
+}
+
+# rasterize a per-hexagon density onto the 0.05° grid, then read grid cells
+cells_from_hex <- function(geoms, dens) {                # dens: tibble(hexid, density)
+  g <- geoms |> left_join(dens, by = "hexid") |> filter(!is.na(density))
+  if (!nrow(g)) return(tibble(cell_id = integer(), val = numeric()))
+  r <- terra::rasterize(terra::vect(g), r_grid, field = "density")
+  msens::cells_from_raster(r, cellid_tif, min_value = 0)
+}
+
+sp_ids   <- sort(unique(m$sp_id))
+reg_rows <- list()
+for (sid in sp_ids) {
+  mi   <- m |> filter(sp_id == sid)
+  safe <- gsub("[^A-Za-z0-9._-]", "_", sid)
+  if (all(file_exists(pq_path(safe, NA))) && !redo_ingest) next
+
+  hd    <- hex_density(mi$path_shp)                      # combine Oceanic+Shelf populations
+  geoms <- hd$geoms
+  # sum densities across populations per (hexid, month)
+  bym   <- hd$long |> group_by(hexid, mm) |> summarise(density = sum(density), .groups = "drop")
+  cap   <- as.numeric(quantile(bym$density[bym$density > 0], p_cap, names = FALSE))
+  if (!is.finite(cap) || cap <= 0) cap <- max(bym$density, na.rm = TRUE)
+
+  cells_mo <- list()
+  for (mm in sort(unique(bym$mm))) {
+    d <- cells_from_hex(geoms, bym |> filter(mm == !!mm) |> select(hexid, density))
+    if (!nrow(d)) next
+    d <- d |> mutate(val = pmin(val / cap * 100, 100)) |> filter(val >= 1)
+    write_surface(d, sid, mm, safe); cells_mo[[mm]] <- d
+  }
+  if (length(cells_mo)) {                                # annual = mean across months per cell
+    da <- bind_rows(cells_mo) |> group_by(cell_id) |>
+      summarise(val = round(mean(val), 2), .groups = "drop")
+    write_surface(da, sid, NA, safe)
+  }
+  reg_rows[[sid]] <- mi |> distinct(sp_id, taxa_sci) |> slice(1) |>
+    mutate(val_cap = round(cap, 4), months = paste(sort(unique(bym$mm)), collapse = "|"),
+           populations = paste(sort(unique(na.omit(mi$population))), collapse = "|"))
+}
+```
+
+## Model registry (`model_gm.csv`)
+
+```{r}
+#| label: model-csv
+
+reg <- bind_rows(reg_rows)
+model_gm <- reg |> rowwise() |> do({
+  r <- .; mos <- strsplit(r$months, "\\|")[[1]]; safe <- gsub("[^A-Za-z0-9._-]", "_", r$sp_id)
+  tibble(
+    mdl_key  = c(glue("{ds_key}|{r$sp_id}|{mos}"), glue("{ds_key}|{r$sp_id}")),
+    interval = c(mos, "annual"),
+    sp_id = r$sp_id, scientific_name = r$taxa_sci,
+    val_cap = r$val_cap, populations = r$populations)
+}) |> ungroup() |>
+  filter(file_exists(glue("{dir_dist}/{ds_key}_{gsub('[^A-Za-z0-9._-]','_',sp_id)}{ifelse(interval=='annual','', paste0('_',interval))}.parquet")))
+
+write_csv(model_gm, mdl_csv)
+log_info("model_gm.csv: {nrow(model_gm)} mdl_keys ({sum(model_gm$interval=='annual')} annual)")
+knitr::kable(model_gm |> count(interval, name = "n"))
+```
+
+## Manifest
+
+```{r}
+#| label: manifest
+
+h    <- msens::hash_parquet(glue("{dir_dist}/*.parquet"))
+smry <- arrow::open_dataset(dir_dist) |>
+  summarise(n_rows = n(), n_mdl = n_distinct(mdl_key),
+            val_min = round(min(val), 2), val_max = round(max(val), 2)) |> collect()
+msens::report_table(smry, caption = "gm density model_cell surface (density → suitability [0,100])")
+
+msens::write_manifest(
+  manifest, target = "ingest_sdm_gm", content_hash = h,
+  stats = list(
+    ds_key = ds_key, n_sp_id = n_distinct(model_gm$sp_id), n_mdl = nrow(model_gm), p_cap = p_cap,
+    note = "monthly + annual density->[0,100]; Oceanic+Shelf summed; NOT yet in merge/scoring"),
+  force = msens::force_target("ingest_sdm_gm"))
+```

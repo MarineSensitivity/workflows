@@ -27,11 +27,15 @@ if (requireNamespace("pkgload", quietly = TRUE) &&
 }
 
 # build the target list from the `msens:` blocks in ./*.qmd.
-# gm/nc are not yet ingested (Phase D): their notebooks would fail and — via the
-# `[auto]` dependency — block build_registry/release/publish_native. Exclude them
-# until ready. Override with TARGETS_EXCLUDE="a,b" (or TARGETS_EXCLUDE="" for all).
+# Density ingests (Phase D) stay excluded until their density is folded into the merge — that is a
+# composite-scoring change to validate with `pra_score_delta` (merge_models_prep drops gm/nc unless
+# MERGE_FOLD_DENSITY=1). Override with TARGETS_EXCLUDE="a,b" (or TARGETS_EXCLUDE="" for all).
 # default excludes:
-#   ingest_sdm_gm/ingest_sdm_nc — not yet ingested (Phase D)
+#   ingest_sdm_nc — DONE (in-repo NCCOS COGs -> dist/dataset=nc, 313 mdl_keys); excluded pending
+#     native-density publishing + the merge fold-in decision, not because it fails.
+#   ingest_sdm_gm — rewritten to the v8 dist-Parquet pattern but UNRUN: its 19 shapefiles +
+#     spp_gmx.xlsx live on Drive, so it needs GM_SHP_DIR (or ~/_big hydration) + a run on a host
+#     with those inputs (e.g. msens1). Would fail without them.
 #   ingest_taxon — WIP notebook hardcoding its own Drive paths (connects to an invalid
 #     Drive sdm.duckdb); produces only DuckDB taxonomy (no Parquet) and its outputs already
 #     exist in spp.duckdb, so it's not needed for a fresh-Parquet render. Needs a separate
