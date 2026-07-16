@@ -1,470 +1,196 @@
 ---
 title: "Ingest SDMs: NCCOS Atlantic & Pacific Seabird Densities"
+subtitle: "Seasonal seabird density (#/km²) → suitability [0,100] on the global 0.05° grid"
 msens:
   target_name: ingest_sdm_nc
   workflow_type: ingest
-  dependency: [ingest_taxon, build_cell_grid]
+  dependency: [build_cell_grid]
   output: data/manifests/ingest_sdm_nc.json
   dataset: {ds_key: nc, response_type: density, source_authority: NOAA NCCOS, temporal_interval: seasonal, native_format: raster}
 editor_options:
   chunk_output_type: console
-format:
-  html:
-    code-fold: true
-    code-tools: true
 ---
 
-NCCOS Atlantic & Pacific Seabird Densities [@winship2018; @leirness2021]
+NCCOS at-sea seabird **density** models, Atlantic [@winship2018] + Pacific [@leirness2021], as
+seasonal COGs (`n_per_km2`, 2-km, oblique-mercator). v8 rasterizes each (species × season) onto
+the global 0.05° cell grid and rescales the heavy-tailed density to a graded **suitability [0,100]**
+per species (so seasons/regions share a scale), plus an **annual** mean surface for scoring.
 
-NCCOS Assessments: Modeling At-Sea Density of Marine Birds for Atlantic and Pacific
+- **Source COGs** (in-repo): `data/sdm/raw/nc_atl_birds_dens/*.tif` (140) + `nc_pac_birds_dens/*.tif`
+  (135); band 1 = `n_per_km2` (bands 2/3 = CV/CI). Also public at
+  `file.marinesensitivity.org/cog/sdm/raw/{ds}/{sp_code}_{season}.tif` (served natively via titiler).
+- **`mdl_key`**: seasonal `nc|{sp_id}|{season}` + annual `nc|{sp_id}` (`sp_id` = `GBIF:…`, or
+  `GUILD:{sp_code}` for the multi-species guilds that lack a single taxon id). Regions (atl/pac) are
+  spatially disjoint and **unioned** per `sp_id`.
 
-- Atlantic [NCCOS Assessment: Modeling At-Sea Density of Marine Birds to Support Atlantic Marine Renewable Energy Planning from 1978-2016 (NCEI Accession 0176682)](https://www.ncei.noaa.gov/access/metadata/landing-page/bin/iso?id=gov.noaa.nodc:0176682)
+> **Density → [0,100] is a modeling choice**, not a v7-faithful recipe (v7 never scored nc). Here:
+> per-`sp_id` linear rescale to the pooled **p99.5** of non-zero density (caps outliers), stored as
+> `val_cap` in `model_nc.csv` for reversibility. **NOT yet folded into merge/scoring** — see the note
+> at the end (merge treats non-`am` datasets as binary ranges; folding density in is a scoring change
+> to validate with `pra_score_delta`).
 
-- Pacific: [NCCOS Assessment: Modeling at-sea density of marine birds to support renewable energy planning on the Pacific Outer Continental Shelf of the contiguous United States (NCEI Accession 0242882)](https://www.ncei.noaa.gov/access/metadata/landing-page/bin/iso?id=gov.noaa.nodc:0242882)
-
-
-```
-/Users/bbest/My Drive/projects/_archive/offhab/data/raw/
-
-ncei.noaa.gov - seabirds, atlantic/
-- 0176682/1.1/data/0-data/NCCOS-Atlantic-Birds_ArchiveDataPackage/NCCOS-Atlantic-Birds_ArchiveDataPackage/Documentation/
-  - Atlantic_bird_mapping_data_documentation.pdf
-  - atl_spp.xlsx
-
-ncei.noaa.gov - seabirds, pacific/
-- 0242882/1.1/data/1-data/4LFC6T_PacificBirds_NCCOS/
-  - DataDocumentation.pdf
-  - pac_spp.xlsx
-```
+## Setup
 
 ```{r}
-#| messages: FALSE
-#| warning: FALSE
+#| label: setup
 
-# packages
-librarian::shelf(
-  # devtools, 
-  dplyr, DBI, DT, fs, gdalUtilities, glue, here, httr2, janitor, jsonlite, knitr,
-  mapview, purrr, readr,
-  readxl, sf, stringr, terra, tibble, tidyr, units,
-  quiet = T)
-options(readr.show_col_types = F)
+librarian::shelf(arrow, dplyr, fs, glue, here, jsonlite, logger, purrr, readr, sf, terra, tibble,
+                 tidyr, MarineSensitivity/msens, quiet = T)
+source(here("libs/paths.R"))
+source(here("libs/vars.R"))
+options(readr.show_col_types = FALSE)
+`%||%` <- function(a, b) if (is.null(a) || length(a) == 0 || all(is.na(a))) b else a
 
-source(here("libs/db.R")) # con, create_index()
+ds_key   <- "nc"
+dir_dist <- glue("{dir_big_v}/marine-atlas/dist/dataset={ds_key}"); dir_create(dir_dist)
+mdl_csv  <- glue("{dir_big_v}/marine-atlas/dist/model_{ds_key}.csv")
+manifest <- here("data/manifests/ingest_sdm_nc.json"); dir_create(path_dir(manifest))
+cog_base <- "https://file.marinesensitivity.org/cog/sdm/raw"
+p_cap    <- 0.995                                        # density percentile used as the 100 point
+stopifnot(file_exists(cellid_tif))
+
+if (redo_ingest && dir_exists(dir_dist)) { dir_delete(dir_dist); dir_create(dir_dist) }
+
+# write one model surface as (mdl_key, cell_id, val) parquet. ssn = NA -> annual key/file.
+pq_path <- function(safe, ssn) if (is.na(ssn)) glue("{dir_dist}/{ds_key}_{safe}.parquet") else
+                                              glue("{dir_dist}/{ds_key}_{safe}_{ssn}.parquet")
+write_parquet_row <- function(d, sid, ssn, safe) {
+  mk <- if (is.na(ssn)) glue("{ds_key}|{sid}") else glue("{ds_key}|{sid}|{ssn}")
+  msens::write_atlas_parquet(                              # V2/zstd/80MB row groups (Phase A)
+    tibble(mdl_key = as.character(mk), cell_id = as.integer(d$cell_id), val = d$val),
+    pq_path(safe, ssn))
+}
 ```
 
+## Models + species crosswalk
+
 ```{r}
-#| label: d_datasets
-schema <- "public"
+#| label: models
 
-d_dataset_atl <- tibble(
-  ds_key        = "nc_atl_birds_dens",
-  response_type = "density",             
-  # ds_key:     "{src}-{rgn}-{taxa}-{resp}"; see below for response_type, taxa_groups lookups
-  # name_short: "{source_broad} {regions} {taxa_groups} {response_type}"
-  name_short  = "NCCOS Atlantic Seabird Densities", 
-  name_full   = "NCCOS Assessment: Modeling At-Sea Density of Marine Birds to Support Atlantic Marine Renewable Energy Planning from 1978-2016 (NCEI Accession 0176682)",
-  link        = "https://www.ncei.noaa.gov/access/metadata/landing-page/bin/iso?id=gov.noaa.nodc:0176682",
-  citation    = "Winship, Arliss J.; Kinlan, Brian P.; White, Timothy P.; Leirness, Jeffery B.; Christensen, John (2018). NCCOS Assessment: Modeling At-Sea Density of Marine Birds to Support Atlantic Marine Renewable Energy Planning from 1978-2016 (NCEI Accession 0176682). [indicate subset used]. NOAA National Centers for Environmental Information. Dataset. https://doi.org/10.25921/8eq5-q834. Accessed October 6, 2022.",
-  description = "This dataset provides seasonal spatial rasters of predicted long-term (1980-2017) density of 33 individual species and 13 taxonomic groups of marine birds throughout the Pacific Outer Continental Shelf (OCS) and adjacent waters off the contiguous United States at 2-km spatial resolution. Two indications of the uncertainty associated with the model predictions are also provided: 1) seasonal spatial layers indicating areas with no survey effort and 2) seasonal spatial rasters of the precision of predicted density of each species/group characterized as its coefficient of variation (CV). Predicted density should always be considered in conjunction with these two indications of uncertainty. This dataset also includes spatial rasters of environmental predictor variables that were used in the predictive modeling.",
-  # response_type: one of: occurrence [occs], range [rng], suitability [suit], probability [pr], biomass [m], density [dens], abundance [n]
-  # taxa_groups: one or more of: fish [fish], invertebrates [inverts], marine mammals [marmams], cetaceans [cets], sea turtles [turtles], seabirds [birds], etc.
-  taxa_groups  = "seabirds", 
-  year_pub     = 2018,
-  date_obs_beg = "1980-01-01", 
-  date_obs_end = "2016-10-05",      # up to, but not including *_end
-  date_env_beg = "1992-01-01", 
-  date_env_end = "2018-01-01",      # up to, but not including *_end
-  regions      = list("Atlantic"))  # array
+# one row per (region, sp_code, season) at band 1 (density)
+m <- read_csv(here("data/nc_models.csv")) |>
+  filter(var == "n_per_km2") |>
+  transmute(region_ds = ds_key, region, sp_code, season, cog_url, bidx)
 
-d_dataset_pac <- tibble(
-  ds_key        = "nc_pac_birds_dens",
-  response_type = "density",             
-  # ds_key:     "{src}-{rgn}-{taxa}-{resp}"; see below for response_type, taxa_groups lookups
-  # name_short: "{source_broad} {regions} {taxa_groups} {response_type}"
-  name_short  = "NCCOS Pacific Seabird Densities", 
-  name_full   = "NCCOS Assessment: Modeling at-sea density of marine birds to support renewable energy planning on the Pacific Outer Continental Shelf of the contiguous United States (NCEI Accession 0242882)",
-  link        = "https://www.ncei.noaa.gov/access/metadata/landing-page/bin/iso?id=gov.noaa.nodc:0242882",
-  citation    = "Leirness, Jeffery B.; Adams, Josh; Ballance, Lisa T.; Coyne, Michael; Felis, Jonathan J.; Joyce, Trevor; Pereksta, David M.; Winship, Arliss J. (2022). NCCOS Assessment: Modeling at-sea density of marine birds to support renewable energy planning on the Pacific Outer Continental Shelf of the contiguous United States (NCEI Accession 0242882). [indicate subset used]. NOAA National Centers for Environmental Information. Dataset. https://doi.org/10.25921/xqf2-r853. Accessed October 6, 2022.",
-  description = "This dataset provides seasonal spatial rasters of predicted long-term (1980-2017) density of 33 individual species and 13 taxonomic groups of marine birds throughout the Pacific Outer Continental Shelf (OCS) and adjacent waters off the contiguous United States at 2-km spatial resolution. Two indications of the uncertainty associated with the model predictions are also provided: 1) seasonal spatial layers indicating areas with no survey effort and 2) seasonal spatial rasters of the precision of predicted density of each species/group characterized as its coefficient of variation (CV). Predicted density should always be considered in conjunction with these two indications of uncertainty. This dataset also includes spatial rasters of environmental predictor variables that were used in the predictive modeling.",
-  # response_type: one of: occurrence [occs], range [rng], suitability [suit], probability [pr], biomass [m], density [dens], abundance [n]
-  # taxa_groups: one or more of: fish [fish], invertebrates [inverts], marine mammals [marmams], cetaceans [cets], sea turtles [turtles], seabirds [birds], etc.
-  taxa_groups  = "seabirds", 
-  year_pub     = 2022,
-  date_obs_beg = "1978-01-01",
-  date_obs_end = "2017-01-01",     # up to, but not including *_end
-  date_env_beg = "1981-01-01", 
-  date_env_end = "2017-01-01",     # up to, but not including *_end
-  regions      = list("Pacific"))  # array
+# sp_code -> sp_id / names, unioned across the two regions' crosswalks; guilds get GUILD:{sp_code}
+read_xw <- function(f) {
+  if (!file_exists(f)) return(tibble())
+  read_csv(f) |> transmute(sp_code, sp_id = as.character(sp_id), sp_common, sp_scientific)
+}
+xw <- bind_rows(
+  read_xw(here("data/sdm/derived/nc_atl_birds_dens/mw_spp.csv")),
+  read_xw(here("data/sdm/derived/nc_pac_birds_dens/m_spp.csv")),
+  read_xw(here("data/sdm/derived/nc_pac_birds_dens/m_spp-multiple.csv")),
+  read_xw(here("data/sdm/derived/nc_atl_birds_dens/mw_spp-multiple.csv"))) |>
+  distinct(sp_code, .keep_all = TRUE)
 
-d_datasets <- bind_rows(d_dataset_atl, d_dataset_pac)
-# check: View(d_datasets); write_csv(d_datasets, "data/nc_datasets.csv"); glimpse(d_datasets)
-# names(d_dataset) |> paste(collapse = ", ") |> cat()
+m <- m |> left_join(xw, by = "sp_code") |>
+  mutate(
+    is_guild = is.na(sp_id) | grepl("/", sp_scientific %||% ""),
+    sp_id    = ifelse(is.na(sp_id), glue("GUILD:{sp_code}"), sp_id),
+    scientific_name = sp_scientific %||% sp_code)
+log_info("nc models: {nrow(m)} (species×season×region); {n_distinct(m$sp_id)} sp_id; guilds: {sum(m$is_guild & !duplicated(m$sp_id))}")
+knitr::kable(m |> count(region, season, name = "n") |> pivot_wider(names_from = season, values_from = n))
+```
 
-t_datasets <- Id(schema = schema, table = "sdm_datasets")
+## Rasterize + rescale per species
 
-row_exists <- tbl(con, t_datasets) |> filter(ds_key %in% !!d_datasets$ds_key) |> collect() |> nrow() == length(d_datasets$ds_key)
-if (!row_exists){
-  
-  # append, except array columns: regions
-  dbWriteTable(
-    con, t_datasets, append = T,
-    d_datasets |> 
-      select(-regions) )
-  
-  for (i in 1:nrow(d_datasets)){ # i=1
-    # append array column: regions
-    regions_sql <- glue(
-      "ARRAY['{d_datasets$regions[[i]] |> unlist() |> paste(collapse = ', ')}']")
-    dbExecute(
-      con, 
-      glue(
-        "UPDATE sdm_datasets 
-        SET   regions = {regions_sql}
-        WHERE ds_key  = '{d_datasets$ds_key[[i]]}'") )
-  }
+```{r}
+#| label: rasterize
+
+# local source cog for a model row (reproject omerc -> 4326, band 1)
+read_cog <- function(region_ds, sp_code, season) {
+  f <- here(glue("data/sdm/raw/{region_ds}/{sp_code}_{season}.tif"))
+  if (!file_exists(f)) return(NULL)
+  r <- rast(f, lyrs = 1)
+  terra::project(r, "EPSG:4326", method = "bilinear")
 }
 
-if (F){ # run once for quick fix
-  dbExecute(con, glue(
-    "UPDATE sdm_datasets 
-     SET   spatial_data_type = 'raster'"))
-  dbExecute(con, glue(
-    "UPDATE sdm_datasets 
-     SET   spatial_data_type = 'vector'
-     WHERE ds_key = 'gm'") )
-}
+# process per sp_id: pool all its (season×region) densities for a shared p99.5 cap, then write one
+# seasonal surface per season (regions unioned) + an annual mean. resumable (skip existing parquet).
+sp_ids   <- sort(unique(m$sp_id))
+reg_rows <- list()
+for (sid in sp_ids) {
+  mi   <- m |> filter(sp_id == sid)
+  safe <- gsub("[^A-Za-z0-9._-]", "_", sid)
+  done <- all(file_exists(glue("{dir_dist}/{ds_key}_{safe}_{unique(mi$season)}.parquet"))) &&
+          file_exists(glue("{dir_dist}/{ds_key}_{safe}.parquet"))
+  if (done && !redo_ingest) next
 
+  # read every source raster for this sp_id, pool non-zero densities -> cap
+  rs   <- pmap(list(mi$region_ds, mi$sp_code, mi$season), read_cog)
+  keep <- !vapply(rs, is.null, logical(1)); mi <- mi[keep, ]; rs <- rs[keep]
+  if (!length(rs)) { log_warn("no source rasters for {sid}"); next }
+  vals <- unlist(lapply(rs, function(r) { v <- values(r, mat = FALSE); v[!is.na(v) & v > 0] }))
+  cap  <- as.numeric(quantile(vals, p_cap, names = FALSE))
+  if (!is.finite(cap) || cap <= 0) cap <- max(vals, na.rm = TRUE)
 
-tbl(con, t_datasets) |> 
-  filter(ds_key %in% !!d_datasets$ds_key) |> 
-  collect() |>
-  glimpse()
-```
-
-```{r}
-#| label: rast
-# setup paths ----
-dir_g   <- "/Users/bbest/My Drive/projects/_archive/offhab/data/raw"
-dir_atl <- glue("{dir_g}/ncei.noaa.gov - seabirds, atlantic/0176682/1.1/data/0-data/NCCOS-Atlantic-Birds_ArchiveDataPackage")
-dir_pac <- glue("{dir_g}/ncei.noaa.gov - seabirds, pacific/0242882/1.1/data/0-data")
-
-spp_atl_xls <- glue("{dir_atl}/Documentation/atl_spp.xlsx")
-spp_pac_xls <- glue("{dir_pac}/4LFC6T_PacificBirds_NCCOS/pac_spp.xlsx")
-
-# get Atlantic rasters ----
-dir_atl_tif <- glue("{dir_atl}/Data/model_output_predictions")
-rx_atl  <- "(.+)_(.+)_predicted_relative_density_bootstrap_(.+)\\.tif$"
-d_atl <- tibble(
-  path_tif = list.files(dir_atl_tif, rx_atl, full.names = T, recursive = T)) |> 
-  mutate(
-    file_tif = basename(path_tif),
-    region   = "Atlantic",
-    sp_code  = str_replace(file_tif, rx_atl, "\\1"),
-    season   = str_replace(file_tif, rx_atl, "\\2"),
-    var      = str_replace(file_tif, rx_atl, "\\3"))
-# d_atl |> select(-path_tif) |> glimpse()
-# Rows: 420
-# Columns: 5
-# $ file_tif <chr> "ATPU_fall_predicted_relative_density_bootstrap_CV.tif", "ATPU_fall_predicted_relative_den…
-# $ region   <chr> "Atlantic", "Atlantic", "Atlantic", "Atlantic", "Atlantic", "Atlantic", "Atlantic", "Atlan…
-# $ sp_code  <chr> "ATPU", "ATPU", "ATPU", "AUSH", "AUSH", "AUSH", "BCPE", "BCPE", "BCPE", "BLKI", "BLKI", "B…
-# $ season   <chr> "fall", "fall", "fall", "fall", "fall", "fall", "fall", "fall", "fall", "fall", "fall", "f…
-# $ var      <chr> "CV", "QUANT_50", "RANGE_CI90", "CV", "QUANT_50", "RANGE_CI90", "CV", "QUANT_50", "RANGE_C…
-# check all tifs: fs::dir_ls(dir_atl_tif, glob="*.tif", recursive=T) |> length()
-           
-# get Pacific rasters ----
-dir_pac_tif <- glue("{dir_pac}/model_output_predictions")
-rx_pac      <- "(.+)_(.+)_predicted_(.*).tif$"
-d_pac       <- tibble(
-  path_tif = list.files(dir_pac_tif, rx_pac, full.names = T, recursive = T)) |> 
-  mutate(
-    file_tif = basename(path_tif),
-    region   = "Pacific",
-    sp_code  = str_replace(file_tif, rx_pac, "\\1"),
-    season   = str_replace(file_tif, rx_pac, "\\2"),
-    var      = str_replace(file_tif, rx_pac, "\\3"))
-# d_pac |> select(-path_tif) |> glimpse()
-# Rows: 270
-# Columns: 5
-# $ file_tif <chr> "ANMU_spring_predicted_density_CV.tif", "ANMU_spring_predicted_density.tif", "ASSP_fall_pred…
-# $ region   <chr> "Pacific", "Pacific", "Pacific", "Pacific", "Pacific", "Pacific", "Pacific", "Pacific", "Pac…
-# $ sp_code  <chr> "ANMU", "ANMU", "ASSP", "ASSP", "ASSP", "ASSP", "ASSP", "ASSP", "BFAL", "BFAL", "BFAL", "BFA…
-# $ season   <chr> "spring", "spring", "fall", "fall", "spring", "spring", "summer", "summer", "fall", "fall", …
-# $ var      <chr> "density_CV", "density", "density_CV", "density", "density_CV", "density", "density_CV", "de…
-# check for any missing TIFs: fs::dir_ls(dir_pac_tif, glob="*.tif", recursive=T) |> length()
-
-# combine Atlantic and Pacific ----
-d <- bind_rows(
-  d_atl,
-  d_pac)
-
-# run once
-if (F){
-  
-  # read in rasters ----
-  d <- d |> 
-    select(region, sp_code, season, var, path_tif) |> 
-    mutate(
-      r      = map(path_tif, terra::rast),
-      crs    = map_chr(r, crs, proj=T),
-      crs_tr = map_chr(crs, str_trunc, 24),
-      nrow   = map_int(r, nrow),
-      ncol   = map_int(r, ncol)) |> 
-    arrange(region, crs_tr, sp_code, season, var)
-  # confirm same dims per region: d |> select(nrow, ncol, region) |> table()
-  
-  # fix rasters in Atlantic missing crs ----
-  
-  # unique(d$crs)
-  # [1] "+proj=omerc +lat_0=35 +lonc=-75 +alpha=40 +gamma=40 +k=0.9996 +x_0=0 +y_0=0 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs"
-  # [2] ""
-  # [3] "+proj=omerc +lat_0=39 +lonc=-125 +alpha=75 +gamma=75 +k=0.9996 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
-  
-  # d |> select(crs_tr, region) |> table()
-  #                           region
-  # crs_tr                     Atlantic Pacific
-  #                                   7       0
-  #   +proj=omerc +lat_0=35...      413       0
-  #   +proj=omerc +lat_0=39...        0     270
-  
-  crs_atl <- d |> 
-    filter(region == "Atlantic" & crs != "") |> 
-    first() |> 
-    pull(crs)
-  
-  d <- d |> 
-    mutate(
-      r = map(r, \(x) {
-        if (crs(x) == "")
-          crs(x) <- crs_atl
-        x } ) ) |> 
-    select(-crs, -crs_tr, -nrow, -ncol)
-  
-  # write rasters per model (region-species-season), including all vars ----
-  dir_tif <- here("data/sdm/raw")
-  for (dir_ds in glue("{dir_tif}/{d_datasets$ds_key}"))
-    dir.create(dir_ds, recursive = T, showWarnings = F)
-  
-  # * standardize vars ----
-  # d |> select(region, var) |> table()
-  #           var
-  # region      CV density density_CV QUANT_50 RANGE_CI90
-  #   Atlantic 140       0          0      140        140
-  #   Pacific    0     135        135        0          0
-  d <- d |> 
-    mutate(
-      ds_key  = case_match(
-        region,
-        "Atlantic" ~ "nc_atl_birds_dens",
-        "Pacific"  ~ "nc_pac_birds_dens"),
-      mdl_tif = glue("{dir_tif}/{ds_key}/{sp_code}_{season}.tif"),
-      var     = case_match(
-        var,
-        "density"    ~ "n_per_km2",
-        "QUANT_50"   ~ "n_per_km2",
-        "density_CV" ~ "cv_n_per_km2",
-        "CV"         ~ "cv_n_per_km2",
-        "RANGE_CI90" ~ "ci90_n_per_km2") )
-  
-  d_mdls <- d |> 
-    arrange(
-      ds_key, region, sp_code, season, 
-      # arrange by var to ensure n_per_km2 (density) is first, cv second
-      factor(var, levels = c("n_per_km2", "cv_n_per_km2", "ci90_n_per_km2"))) |>
-    group_by(ds_key, region, sp_code, season, mdl_tif) |> 
-    nest() |> 
-    ungroup()
-  
-  # * write out rasters per model, convert to COG ----
-  d_mdls |>
-    select(data, mdl_tif) |>
-    pwalk(\(data, mdl_tif) {
-      
-      tmp_tif <- tempfile(fileext = ".tif")
-      
-      # if mdl_tif already exists and is a valid COG, skip
-      if (file_exists(mdl_tif)){
-        
-        # brew install rasterio
-        #       zsh completions have been installed to:
-        # /opt/homebrew/share/zsh/site-functions
-
-        
-        is_cog <- system(glue("rio cogeo validate {mdl_tif}"), intern=T) |> 
-          str_detect(" is a valid cloud optimized GeoTIFF")
-        
-        if (is_cog)
-          return()
-        
-        file_move(mdl_tif, tmp_tif)
-      } else {
-        r        <- rast(data$r)
-        names(r) <- data$var
-        writeRaster(r, file = tmp_tif, overwrite = T)
-      }
-      
-      system(glue("rio cogeo create {tmp_tif} {mdl_tif}"))
-      unlink(tmp_tif)
+  # per season: union regions' cells, rescale density->[0,100] by the shared cap
+  cells_season <- list()
+  for (ssn in unique(mi$season)) {
+    idx <- which(mi$season == ssn)
+    d <- map_dfr(idx, function(j) {
+      r <- rs[[j]]; r <- terra::clamp(r / cap * 100, upper = 100, values = TRUE)
+      msens::cells_from_raster(r, cellid_tif, min_value = 1)
     })
-  
-  # Uploaded all data/sdm/raw/{ds_key}/*.tif to rstudio.marinesensitivity.org:/share/public/cog/sdm/raw/{ds_key}/*.tif 
-  
-  # TODO: make COGs (*.tif) into STAC w/ json metadata
-  
-  # * write out temp csv (later db tbl) of all models for shiny app sdm-cog, including band index `bidx` ----
-  d |> 
-    arrange(
-      ds_key, region, sp_code, season, 
-      # arrange by var to ensure n_per_km2 (density) is first, cv second
-      factor(var, levels = c("n_per_km2", "cv_n_per_km2", "ci90_n_per_km2"))) |>
-    mutate(
-      cog_url = glue("https://file.marinesensitivity.org/cog/sdm/raw/{ds_key}/{basename(mdl_tif)}"),
-      bidx    = factor(var, levels = c("n_per_km2", "cv_n_per_km2", "ci90_n_per_km2")) |> as.integer()) |> 
-    select(-r, -path_tif, -mdl_tif) |> 
-    relocate(ds_key) |>
-    write_csv(here("data/nc_models.csv"))
-  # check: x |> select(var, bidx) |> table() 
+    if (!nrow(d)) next
+    d <- d |> group_by(cell_id) |> summarise(val = max(val), .groups = "drop")   # union regions (disjoint)
+    write_parquet_row(d, sid, ssn, safe)
+    cells_season[[ssn]] <- d
+  }
+  # annual = mean across the available seasons (per cell)
+  if (length(cells_season)) {
+    da <- bind_rows(cells_season, .id = "season") |>
+      group_by(cell_id) |> summarise(val = round(mean(val), 2), .groups = "drop")
+    write_parquet_row(da, sid, NA, safe)
+  }
+  reg_rows[[sid]] <- mi |> distinct(sp_id, sp_code, scientific_name, is_guild) |>
+    slice(1) |> mutate(val_cap = round(cap, 4),
+                       seasons = paste(sort(unique(mi$season)), collapse = "|"),
+                       regions = paste(sort(unique(mi$region)), collapse = "|"))
 }
-
-# TODO: write d_mdls, d_spp to db 
-#       use 'nc_*', not 'gm'
-#
-# t_mdls <- Id(schema = schema, table = "sdm_models")
-# rows_exist <- tbl(con, t_mdls) |> filter(ds_key == "gm") |> summarize(n()) |> pull() > 0
-# if (!rows_exist)
-#   dbWriteTable(con, t_mdls, d_mdls, append = T)
-# 
-# t_spp <- Id(schema = schema, table = "sdm_species")
-# rows_exist <- tbl(con, t_spp) |> filter(ds_key == "gm") |> summarize(n()) |> pull() > 0
-# if (!rows_exist)
-#   dbWriteTable(con, t_spp, d_spp, append = T)
-
-# table(d$var, d$region)
-#                  Atlantic Pacific
-#   ci90_n_per_km2      140       0
-#   cv_n_per_km2        140     135
-#   n_per_km2           140     135
-
-# TODO: Pacific: somehow include survey_effort_mask_{season}.shp
-  
-# d <- d |> 
-#   mutate(
-#     datatype = map_chr(r, datatype))
-# table(d$datatype, d$region)
-# FLT8S
 ```
 
+## Model registry (`model_nc.csv`)
+
 ```{r}
-#| label: map-cog
-# map COG ----
-cog_url        = "https://file.marinesensitivity.org/cog/sdm/raw/nc_atl_birds_dens/ARTE_summer.tif"
-cog_method     = "bilinear"
-cog_palette    = "spectral_r"
-lgnd_palette   = "Spectral"
-lgnd_palette_r = T
-bidx           = 1
+#| label: model-csv
 
-# * plot locally ----
-cog_tif <- str_replace(
-  cog_url,
-  "https://file.marinesensitivity.org/cog/sdm",
-  here("data/sdm"))
-stopifnot(file.exists(cog_tif))
-r <- rast(cog_tif, lyrs=bidx)
-plot(r) # plot native terra
+reg <- bind_rows(reg_rows)
+# expand to one mdl_key per (seasonal + annual) surface actually written
+model_nc <- reg |> rowwise() |> do({
+  r <- .; ssns <- strsplit(r$seasons, "\\|")[[1]]; safe <- gsub("[^A-Za-z0-9._-]","_",r$sp_id)
+  tibble(
+    mdl_key = c(glue("{ds_key}|{r$sp_id}|{ssns}"), glue("{ds_key}|{r$sp_id}")),
+    interval = c(ssns, "annual"),
+    sp_id = r$sp_id, sp_code = r$sp_code, scientific_name = r$scientific_name,
+    is_guild = r$is_guild, val_cap = r$val_cap, regions = r$regions,
+    cog_url = c(glue("{cog_base}/nc_{ifelse(r$regions=='Atlantic','atl','pac')}_birds_dens/{r$sp_code}_{ssns}.tif"), NA))
+}) |> ungroup() |>
+  filter(file_exists(glue("{dir_dist}/{ds_key}_{gsub('[^A-Za-z0-9._-]','_',sp_id)}{ifelse(interval=='annual','', paste0('_',interval))}.parquet")))
 
-# * plot via terra::plet() ----
-plet(
-  r, 
-  col = RColorBrewer::brewer.pal(
-    11, "Spectral") |> rev(),
-  tiles = "Esri.OceanBasemap")
+write_csv(model_nc, mdl_csv)
+log_info("model_nc.csv: {nrow(model_nc)} mdl_keys ({sum(model_nc$interval=='annual')} annual)")
+knitr::kable(model_nc |> count(interval, name = "n"))
+```
 
-# * plot via leaflet ----
-library(leaflet)
+## Manifest
 
-r_mer <- leaflet::projectRasterForLeaflet(
-  r, method = "bilinear")
-pal <- colorNumeric("Spectral", values(r_mer),
-  na.color = "transparent", reverse = T)
+```{r}
+#| label: manifest
 
-leaflet() |> 
-  addProviderTiles("Esri.OceanBasemap") |> 
-  addRasterImage(r_mer, colors = pal, opacity = 0.8) |>
-  addLegend(pal = pal, values = values(r_mer),
-    title = names(r_mer))
+# content-addressed, deterministic manifest (Phase A) — no wall-clock, so an identical re-ingest
+# produces byte-identical bytes and does NOT invalidate downstream targets.
+h    <- msens::hash_parquet(glue("{dir_dist}/*.parquet"))
+smry <- arrow::open_dataset(dir_dist) |>
+  summarise(n_rows = n(), n_mdl = n_distinct(mdl_key),
+            val_min = round(min(val), 2), val_max = round(max(val), 2)) |> collect()
+msens::report_table(smry, caption = "nc density model_cell surface (density → suitability [0,100])")
 
-# * get bounding box via titiler ----
-
-titiler_endpoint = "https://titiler.xyz"
-
-cog_bb <- request(titiler_endpoint) |> 
-  req_url_path_append("cog", "bounds") |> 
-  req_url_query(
-    url = cog_url,
-    bidx = bidx) |> 
-  req_perform() |> 
-  resp_body_json() |> 
-  unlist() |> 
-  as.numeric()
-cog_bb
-
-# * get range of values via titiler ----
-cog_rng <- request(titiler_endpoint) |> 
-  req_url_path_append("cog", "statistics") |> 
-  req_url_query(
-    url  = cog_url,
-    bidx = bidx) |> 
-  req_perform() |> 
-  resp_body_json() |>
-  pluck(glue("b{bidx}")) |> 
-  keep_at(~ .x %in% c("min", "max")) |> 
-  as.numeric()
-cog_rng
-
-# set cog_rng manually
-# cog_rng <- range(values(r, na.rm=T))
-
-tile_opts <- glue(
-  "bidx={bidx}&expression=b{bidx}&
-  unscale=false&
-  resampling={cog_method}&reproject={cog_method}&return_mask=true&
-  rescale={paste(cog_rng, collapse=',')}&
-  colormap_name={cog_palette}") |> str_replace_all("\\s+", "")
-sdm_tile_url  <- glue(
-  "{titiler_endpoint}/cog/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}@2x.png?url={cog_url}&{tile_opts}")
-
-# OLD: https://api.cogeo.xyz/docs#/Cloud%20Optimized%20GeoTIFF/tile_cog_tiles__TileMatrixSetId___z___x___y___scale_x__format__get
-# 
-# TODO: cogeo.xyz (bidx = 1,2,3) VS titiler.xyz (bidx = List [ 1, 2, 3]) ?
-#
-# NEW: https://titiler.xyz/api.html#/Cloud%20Optimized%20GeoTIFF/tile_cog_tiles__tileMatrixSetId___z___x___y___scale_x__format__get
-
-library(rdeck)
-
-dir_private <- switch(
-  Sys.info()[["sysname"]],
-  "Darwin" = "/Users/bbest/My Drive/private",
-  "Linux"  = "/share/private")
-
-mb_token_txt <- glue("{dir_private}/mapbox_token_bdbest.txt")
-mb_token <- readLines(mb_token_txt)
-options(rdeck.mapbox_access_token = mb_token)
-
-bb <- cog_bb
-
-rdeck(
-  map_style      = mapbox_dark(),
-  theme          = "light",
-  initial_bounds = st_bbox(
-    c(xmin=bb[1], ymin=bb[2], xmax=bb[3], ymax=bb[4]),
-    crs = st_crs(4326) ) )  |>
-  add_tile_layer(
-    id                = "sdm",
-    name              = "sdm",
-    # visible           = F,
-    # visibility_toggle = T,
-    opacity           = 0.5,
-    data              = sdm_tile_url)
+msens::write_manifest(
+  manifest, target = "ingest_sdm_nc", content_hash = h,
+  stats = list(
+    ds_key = ds_key, n_sp_id = n_distinct(model_nc$sp_id), n_mdl = nrow(model_nc), p_cap = p_cap,
+    note = "seasonal + annual density->[0,100]; NOT yet folded into merge/scoring"),
+  force = msens::force_target("ingest_sdm_nc"))
 ```
