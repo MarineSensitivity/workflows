@@ -49,6 +49,9 @@ p_cap    <- 0.995
 NA_VAL   <- -9999
 
 # Drive-hosted inputs (override with GM_SHP_DIR); default to a hydrated ~/_big copy if present.
+# local default (Ben's Drive); override on any other host by exporting GM_SHP_DIR in the environment
+if (!nzchar(Sys.getenv("GM_SHP_DIR")))
+  Sys.setenv(GM_SHP_DIR = "~/My Drive/projects/msens/data/raw/ncei.noaa.gov - GoMex cetacean & sea turtle SDMs/0256800/2.2/data/0-data/NOAA_SEFSC_Cetacean_SeaTurtle_SDM_shapefiles")
 shp_dir  <- Sys.getenv("GM_SHP_DIR", unset = path.expand("~/_big/msens/raw/sdm/gm"))
 taxa_xls <- if (file_exists(glue("{shp_dir}/spp_gmx.xlsx"))) {
   glue("{shp_dir}/spp_gmx.xlsx")
@@ -164,18 +167,25 @@ for (sid in sp_ids) {
 ```{r}
 #| label: model-csv
 
-reg <- bind_rows(reg_rows)
-model_gm <- reg |> rowwise() |> do({
-  r <- .; mos <- strsplit(r$months, "\\|")[[1]]; safe <- gsub("[^A-Za-z0-9._-]", "_", r$sp_id)
-  tibble(
-    mdl_key  = c(glue("{ds_key}|{r$sp_id}|{mos}"), glue("{ds_key}|{r$sp_id}")),
-    interval = c(mos, "annual"),
-    sp_id = r$sp_id, scientific_name = r$taxa_sci,
-    val_cap = r$val_cap, populations = r$populations)
-}) |> ungroup() |>
-  filter(file_exists(glue("{dir_dist}/{ds_key}_{gsub('[^A-Za-z0-9._-]','_',sp_id)}{ifelse(interval=='annual','', paste0('_',interval))}.parquet")))
-
-write_csv(model_gm, mdl_csv)
+# resumable: a re-render with every surface already on disk leaves reg_rows empty (the rasterize
+# loop `next`s), so keep the existing registry rather than rebuilding it from nothing.
+if (length(reg_rows) == 0 && file_exists(mdl_csv)) {
+  model_gm <- read_csv(mdl_csv)
+} else {
+  reg <- bind_rows(reg_rows)
+  model_gm <- reg |> rowwise() |> do({
+    r <- .; mos <- strsplit(r$months, "\\|")[[1]]
+    tibble(
+      mdl_key  = c(glue("{ds_key}|{r$sp_id}|{mos}"), glue("{ds_key}|{r$sp_id}")),
+      interval = c(mos, "annual"),
+      sp_id = r$sp_id, scientific_name = r$taxa_sci,
+      val_cap = r$val_cap, populations = r$populations)
+  }) |> ungroup()
+  model_gm <- model_gm |> rowwise() |> filter(file_exists(
+    glue("{dir_dist}/{ds_key}_{gsub('[^A-Za-z0-9._-]','_',sp_id)}{ifelse(interval=='annual','', paste0('_',interval))}.parquet"))) |>
+    ungroup()
+  write_csv(model_gm, mdl_csv)
+}
 log_info("model_gm.csv: {nrow(model_gm)} mdl_keys ({sum(model_gm$interval=='annual')} annual)")
 knitr::kable(model_gm |> count(interval, name = "n"))
 ```
@@ -198,3 +208,21 @@ msens::write_manifest(
     note = "monthly + annual density->[0,100]; Oceanic+Shelf summed; NOT yet in merge/scoring"),
   force = msens::force_target("ingest_sdm_gm"))
 ```
+
+## Compare with AquaMaps
+
+Most of these cetaceans + sea turtles also have an **AquaMaps** model, so the two SDMs can be
+contrasted directly. Drag the **swipe** divider left/right: **AquaMaps** (native 0.5° suitability) on
+the left vs this **GoMex** surface (0.05°, months averaged to one annual surface) on the right — both
+rescaled to 0–100 (spectral). AquaMaps paints broad, coarse suitability across (and beyond) the Gulf;
+the SEFSC survey model resolves fine density structure within it. Pick any species that has both
+models (the swipe is a [`mapgl::compare()`](https://walker-data.com/mapgl/reference/compare.html)-style
+[maplibre-gl](https://maplibre.org) slider):
+
+```{=html}
+<iframe src="compare.html?embed=1" width="100%" height="780" loading="lazy"
+        style="border:1px solid #2b3a47; border-radius:6px;"
+        title="AquaMaps vs GoMex SDM swipe compare"></iframe>
+```
+
+Full-screen on the [compare page](compare.html){target="_blank"}.

@@ -156,20 +156,27 @@ for (sid in sp_ids) {
 ```{r}
 #| label: model-csv
 
-reg <- bind_rows(reg_rows)
-# expand to one mdl_key per (seasonal + annual) surface actually written
-model_nc <- reg |> rowwise() |> do({
-  r <- .; ssns <- strsplit(r$seasons, "\\|")[[1]]; safe <- gsub("[^A-Za-z0-9._-]","_",r$sp_id)
-  tibble(
-    mdl_key = c(glue("{ds_key}|{r$sp_id}|{ssns}"), glue("{ds_key}|{r$sp_id}")),
-    interval = c(ssns, "annual"),
-    sp_id = r$sp_id, sp_code = r$sp_code, scientific_name = r$scientific_name,
-    is_guild = r$is_guild, val_cap = r$val_cap, regions = r$regions,
-    cog_url = c(glue("{cog_base}/nc_{ifelse(r$regions=='Atlantic','atl','pac')}_birds_dens/{r$sp_code}_{ssns}.tif"), NA))
-}) |> ungroup() |>
-  filter(file_exists(glue("{dir_dist}/{ds_key}_{gsub('[^A-Za-z0-9._-]','_',sp_id)}{ifelse(interval=='annual','', paste0('_',interval))}.parquet")))
-
-write_csv(model_nc, mdl_csv)
+# resumable: a re-render with every surface already on disk leaves reg_rows empty (the rasterize
+# loop `next`s), so keep the existing registry rather than rebuilding it from nothing.
+if (length(reg_rows) == 0 && file_exists(mdl_csv)) {
+  model_nc <- read_csv(mdl_csv)
+} else {
+  reg <- bind_rows(reg_rows)
+  # expand to one mdl_key per (seasonal + annual) surface actually written
+  model_nc <- reg |> rowwise() |> do({
+    r <- .; ssns <- strsplit(r$seasons, "\\|")[[1]]
+    tibble(
+      mdl_key = c(glue("{ds_key}|{r$sp_id}|{ssns}"), glue("{ds_key}|{r$sp_id}")),
+      interval = c(ssns, "annual"),
+      sp_id = r$sp_id, sp_code = r$sp_code, scientific_name = r$scientific_name,
+      is_guild = r$is_guild, val_cap = r$val_cap, regions = r$regions,
+      cog_url = c(glue("{cog_base}/nc_{ifelse(r$regions=='Atlantic','atl','pac')}_birds_dens/{r$sp_code}_{ssns}.tif"), NA))
+  }) |> ungroup() |>
+    rowwise() |>
+    filter(file_exists(glue("{dir_dist}/{ds_key}_{gsub('[^A-Za-z0-9._-]','_',sp_id)}{ifelse(interval=='annual','', paste0('_',interval))}.parquet"))) |>
+    ungroup()
+  write_csv(model_nc, mdl_csv)
+}
 log_info("model_nc.csv: {nrow(model_nc)} mdl_keys ({sum(model_nc$interval=='annual')} annual)")
 knitr::kable(model_nc |> count(interval, name = "n"))
 ```
