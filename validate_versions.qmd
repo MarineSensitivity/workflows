@@ -1,0 +1,156 @@
+---
+title: "Version comparison: Program-Area score equivalence"
+subtitle: "Parameterized v7 ↔ v8 (or any two versions) composite-score delta report"
+params:
+  version_a: v7
+  version_b: v8
+  metric_key: score_extriskspcat_primprod_ecoregionrescaled_equalweights
+  mean_tol: 5
+  max_tol: 15
+format:
+  html:
+    toc: true
+    code-fold: true
+editor_options:
+  chunk_output_type: console
+---
+
+> **Not a pipeline stage** — a standalone, parameterized *report* (no `msens:` target block, so
+> `tar_make()` never runs it). Render it on demand for any two release versions whose `sdm.duckdb`
+> are on disk. The reusable comparison **core lives in `msens`** (`score_delta`, `score_delta_summary`,
+> `assert_within_tolerance`, `pra_score_delta`) so this notebook only *orchestrates* — the math is
+> unit-tested in `msens/tests/testthat/test-validate.R` and can't drift from what's reported here.
+>
+> ```r
+> # render with version suffixes in the output filename (see scripts/render_validate.R):
+> source("scripts/render_validate.R"); render_versions("v7", "v8")   # -> _output/validate_v7_v8.html
+> # or directly:
+> quarto render validate_versions.qmd -P version_a:v7 -P version_b:v8 --output validate_v7_v8.html
+> ```
+>
+> **Scope note:** the `nc` / `gm` **density** surfaces are *not* folded into either version's scores
+> (v8 built with `MERGE_FOLD_DENSITY` off — density is published but excluded from the merge), so this
+> compares the *same* extinction-risk composite on each version's species set.
+
+## Setup
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+
+librarian::shelf(DBI, duckdb, dplyr, ggplot2, glue, knitr, scales,
+                 MarineSensitivity/msens, quiet = TRUE)
+source(here::here("libs/paths.R"))
+
+va <- params$version_a
+vb <- params$version_b
+mk <- params$metric_key
+
+# resolve each version's sdm.duckdb by swapping the version segment of the configured path
+sdm_for <- function(v) sub(glue("/{ver}/"), glue("/{v}/"), path.expand(sdm_db))
+db_a <- sdm_for(va); db_b <- sdm_for(vb)
+stopifnot(file.exists(db_a), file.exists(db_b))
+
+con_a <- dbConnect(duckdb(), db_a, read_only = TRUE)
+con_b <- dbConnect(duckdb(), db_b, read_only = TRUE)
+
+cat(glue("Comparing **{va}** ← → **{vb}**  \n",
+         "- A ({va}): `{db_a}`  \n",
+         "- B ({vb}): `{db_b}`  \n",
+         "- composite metric: `{mk}`\n"))
+```
+
+## Overall Program-Area composite delta
+
+The headline equivalence gate: the composite score (`{r} mk`) per BOEM Program Area, in each version,
+inner-joined so only Program Areas present in **both** are compared. `delta = {vb} − {va}`.
+
+```{r}
+#| label: pra-delta
+
+d <- msens::pra_score_delta(con_a, con_b, metric_key = mk, labels = c(va, vb))
+s <- msens::score_delta_summary(d)
+
+# soft equivalence verdict — report, never hard-stop (a report must render either way)
+gate <- tryCatch(
+  { msens::assert_within_tolerance(d, mean_tol = params$mean_tol, max_tol = params$max_tol); "PASS" },
+  error = function(e) conditionMessage(e))
+
+knitr::kable(
+  tibble::tibble(
+    metric = c("Program Areas compared", glue("mean |Δ|"), glue("max |Δ|"), "RMSE",
+               glue("tolerance (mean / max)"), "verdict"),
+    value  = c(s$n, round(s$mean_abs, 3), round(s$max_abs, 3), round(s$rmse, 3),
+               glue("{params$mean_tol} / {params$max_tol}"),
+               ifelse(gate == "PASS", "✅ within tolerance", paste0("⚠️ ", gate)))),
+  caption = glue("Composite-score equivalence, {va} → {vb}"))
+```
+
+```{r}
+#| label: pra-delta-plot
+#| fig-height: 6
+#| fig-width: 8
+
+va_col <- glue("score_{va}"); vb_col <- glue("score_{vb}")
+d_plot <- d |>
+  mutate(programarea_key = factor(programarea_key, levels = programarea_key[order(delta)]),
+         sign = ifelse(delta >= 0, glue("higher in {vb}"), glue("higher in {va}")))
+
+ggplot(d_plot, aes(delta, programarea_key, fill = sign)) +
+  geom_col() +
+  geom_vline(xintercept = 0, linewidth = 0.3) +
+  scale_fill_manual(values = setNames(c("#20c997", "#e8590c"),
+                                      c(glue("higher in {vb}"), glue("higher in {va}")))) +
+  labs(x = glue("Δ composite score  ({vb} − {va})"), y = NULL, fill = NULL,
+       title = glue("Program-Area composite-score change: {va} → {vb}")) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top")
+```
+
+```{r}
+#| label: pra-delta-table
+
+d |>
+  transmute(`Program Area` = programarea_key,
+            !!va := round(.data[[va_col]], 2),
+            !!vb := round(.data[[vb_col]], 2),
+            `Δ` = round(delta, 2),
+            `Δ %` = round(100 * delta / .data[[va_col]], 1)) |>
+  knitr::kable(caption = glue("Per-Program-Area composite scores ({va} vs {vb}), sorted by |Δ|"))
+```
+
+## Per-category breakdown
+
+The same delta, computed for each **species-category** ecoregion-rescaled extinction-risk metric that
+exists in **both** versions — so a shift in the composite can be attributed to a category (bird, fish,
+mammal, …) rather than read as one opaque number. Uses the same `msens::score_delta` core per metric.
+
+```{r}
+#| label: category-delta
+
+# metrics shared by both versions, of the per-category ecoregion-rescaled family
+metrics_in <- function(con) DBI::dbGetQuery(con, "SELECT metric_key FROM metric")$metric_key
+shared <- intersect(metrics_in(con_a), metrics_in(con_b))
+cat_metrics <- grep("^extrisk_[a-z_]+_ecoregion_rescaled$", shared, value = TRUE)
+
+# reuse the schema-adaptive core once per metric (handles the v7 `value` / v8 `val` rename)
+cat_summary <- purrr::map_dfr(cat_metrics, function(metric) {
+  dd <- msens::pra_score_delta(con_a, con_b, metric_key = metric, labels = c(va, vb))
+  ss <- msens::score_delta_summary(dd)
+  tibble::tibble(
+    category = sub("^extrisk_(.*)_ecoregion_rescaled$", "\\1", metric),
+    n = ss$n, `mean |Δ|` = round(ss$mean_abs, 3),
+    `max |Δ|` = round(ss$max_abs, 3), rmse = round(ss$rmse, 3))
+}) |> arrange(desc(`mean |Δ|`))
+
+knitr::kable(cat_summary,
+  caption = glue("Per-category ecoregion-rescaled extinction-risk delta, {va} → {vb}"))
+```
+
+```{r}
+#| label: cleanup
+#| include: false
+DBI::dbDisconnect(con_a, shutdown = TRUE)
+DBI::dbDisconnect(con_b, shutdown = TRUE)
+```
