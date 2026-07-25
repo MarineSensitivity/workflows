@@ -119,6 +119,109 @@ Review your answers
  ● How much should I implement now?
    → Everything I can locally
 
+----
+
+Committed across all six repos and deployed. Everything verified live.
+
+Commits
+
+┌─────────────────────────────┬───────────────────────────────────────────────────────────────────────────────────────────┐
+│            Repo             │                                          Commits                                          │
+├─────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────┤
+│ msens                       │ 1b1d45a — analytics module, v0.6.0 + NEWS                                                 │
+├─────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────┤
+│ apps                        │ 8091558 — both apps instrumented, stale landing links fixed                               │
+├─────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────┤
+│ docs                        │ f5c1076 analytics, 44b64a6 pre-render refresh (kept separate — unrelated generated churn) │
+├─────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────┤
+│ MarineSensitivity.github.io │ c8b6ea5 — tag moved to _analytics.html                                                    │
+├─────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────┤
+│ workflows                   │ 848af8ae analytics, 4d3be079 your dev notes, 25507ab Jekyll fix                           │
+├─────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────┤
+│ server                      │ 4bda0d3 — MSENS_LOG_URL passthrough                                                       │
+└─────────────────────────────┴───────────────────────────────────────────────────────────────────────────────────────────┘
+
+Deploy
+
+Ran DEPLOY_APPS=1 RELEASE_NO_S3=1 quarto render release_marine-atlas.qmd. RELEASE_NO_S3=1 was essential — do_s3 defaults to TRUE, so a bare render would have pushed a full S3 data release and view-DB cutover rather than just the apps. With both flags, only the deploy-apps chunk touched production.
+
+Server confirmed: apps_v8 at 8091558, msens at 1b1d45a, msens 0.6.0 installed in the container, both restart.txt touched 41s before check. v7 untouched.
+
+One failure, found and fixed
+
+The Jekyll build failed with Liquid Exception: stack level too deep (~10k frames). Cause was my own doc comment: I'd written a literal {% include analytics.html %} inside _includes/analytics.html to explain how it's used — and Liquid parses HTML comments, so the file included itself forever.
+
+Fixing it surfaced a second latent problem: the injector only skipped already-tagged files, so editing the snippet would leave 63 files permanently stale, and a naive re-inject would stack a second gtag block and double-count page views. The snippet is now delimited by msens:analytics:begin/end markers so re-runs replace; I restored the 63 files to pre-injection state and re-injected cleanly. Verified: exactly one gtag block per file, zero Liquid tags in any block, and index.html keeps its own card-building Liquid untouched. The script now also refuses any snippet containing {%.
+
+Verified live
+
+┌──────────────────────────────────────┬─────┬──────────────────────────────┐
+│               Product                │     │                              │
+├──────────────────────────────────────┼─────┼──────────────────────────────┤
+│ marinesensitivity.org                │ ✓   │ home                         │
+├──────────────────────────────────────┼─────┼──────────────────────────────┤
+│ /docs/                               │ ✓   │ docs                         │
+├──────────────────────────────────────┼─────┼──────────────────────────────┤
+│ /workflows/ + /workflows/schema.html │ ✓   │ workflows                    │
+├──────────────────────────────────────┼─────┼──────────────────────────────┤
+│ /msens/                              │ ✓   │ msens                        │
+├──────────────────────────────────────┼─────┼──────────────────────────────┤
+│ scores_v8 / species_v8               │ ✓   │ scores / species, APP_VER=v8 │
+└──────────────────────────────────────┴─────┴──────────────────────────────┘
+
+I also drove the production species app in a browser: search_species and a fully-resolved select_species (Minke Whale, sp_cat, taxon_id, redlist_code) both fired, as did select_tab and select_layer in scores.
+
+Remaining — needs you
+
+LOG_URL="" in production, so the Sheet leg is currently a silent no-op and GA4 alone is collecting. To turn on the detail log: create the Sheet with the ms_log_header() row, deploy apps/analytics/Code.gs as a web app, set MSENS_LOG_URL in the server .env, then docker compose up -d rstudio (an env change needs container recreation — I deliberately skipped that, since recreating now would have restarted the v7 apps for no gain). Steps are in apps/analytics/README.md.
+
+Two unrelated things I noticed but left alone: the scores species table errors locally with Error in select: Can't select columns that don't exist (pre-existing — my diffs were pure additions and don't touch that query), and _output/ingest_usgs-gap-turtles.html is 50.45 MB, over GitHub's recommended limit.
+
+----
+
+https://script.google.com/macros/s/AKfycbxRbq0yNMiL9TvXGn8rz5y7i_a5FB_jBZYeDxLcqBQUuuOQdySv1697ICA-FZWRCU3zlg/exec
+
+----
+
+Build is running in the background (full recompile against R 4.6.1); I'll pick it up when it finishes. Interim status:
+
+Done and pushed
+- v7 apps instrumented (apps@v7: mapgl + mapsp, commit 0fd72b5) — same two channels as v8, with content_group = product so v7/v8 aggregate together and app_version separates them.
+- Real bug found via v7 tracing, fixed in both generations: select_species fired at startup for the default species, so every session logged a Dermochelys "selection" nobody made — which would have made it the most-viewed taxon in your data. Seeded the dedupe with sel_sp_default; verified a plain load now emits zero events while a deep link still logs (apps@main 69dbfed, apps@v7 0fd72b5).
+- DEPLOY_APPS_V7=1 added to release_marine-atlas.qmd so v7 deploys reproducibly instead of by ad-hoc ssh — deliberately not implied by RELEASE_DEPLOY, so a routine v8 release still never restarts the default-live v7 apps (d993ab71).
+- CLAUDE.md + memory: reproducibility beats uptime, never docker exec a change into a running container, drift is a bug to fix now, and changes must cover v7 and v8.
+- MSENS_LOG_URL set in the server .env (gitignored, backed up).
+
+The container drift you green-lit me to fix properly
+The live container had 378 packages vs 328 in its image — 50 installed ad-hoc and never declared, including mapgl, ggiraph, conductor, bsicons, plotme, duckdbfs, logger, targets. Some were already in the Dockerfile, meaning the image had simply never been rebuilt since that earlier fix. All 50 are now declared, plus:
+- rocker/geospatial:4.4.1 → 4.6.1 (pinned to an exact patch, not latest). The newer snapshot also resolves otel/snowflakeauth, which 4.4.1 couldn't — I verified all 92 packages resolve against 4.6.1 before starting the build, after a first build failed on exactly those two.
+- GitHub packages pinned to commits: bbest/mapgl@1e52f60 — the head of walkerke/mapgl#211 (https://github.com/walkerke/mapgl/pull/211), which is still open, so the fork is genuinely required; the comment says to drop it once #211 lands. Also h3-r@6b658e8, plotme@ff9ea91.
+
+One thing needs you — the endpoint still returns 403
+
+Your deployment settings are correct ("Execute as: Me", "Who has access: Anyone"), so don't change the Sheet's sharing — the script runs as you and already has write access; making the Sheet public would only expose data. The Sheet itself is verified good: header matches ms_log_header() exactly, and it's empty, consistent with nothing ever reaching it.
+
+Both GET and POST return a bare 403 anonymously. Quickest way to confirm and narrow it:
+1. Open the /exec URL in an incognito window. If it shows "Access denied" there, the endpoint isn't actually public despite the dialog.
+2. If so, the usual cause on a Workspace domain like ecoquants.com is an admin policy restricting Apps Script web apps from being shared outside the organization (Admin console → Apps → Additional Google services → Apps Script).
+3. Also worth re-deploying as a new version on the existing deployment (pencil → Version: New version → Deploy) — that keeps the same /exec URL, and an access change doesn't always take effect until a new version ships.
+
+Everything else is wired, so the moment that endpoint goes public the rows will start landing — no redeploy needed.
+
+----
+
+Ah I think I see the issue when I open the link in Incognito (I am in Italy):
+
+https://script.google.com/macros/s/AKfycbxRbq0yNMiL9TvXGn8rz5y7i_a5FB_jBZYeDxLcqBQUuuOQdySv1697ICA-FZWRCU3zlg/exec
+Funzione script non trovata: doGet
+
+So it's running a GET, not a POST, yet the only function defined in Code.gs is `doPost(e)`
+
+----
+
+
+
+
 ## 2026-07-17 obis hex occs speed up
 
 [in marinebon/obisindicators]
