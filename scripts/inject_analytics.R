@@ -13,8 +13,11 @@
 # notebook is re-rendered — which for a finished ingest may be never. This script
 # backfills those, so every published page is tagged today.
 #
-# IDEMPOTENT: a file that already contains the measurement ID is skipped, so it
-# is safe to re-run (and safe to run after a partial pipeline re-render).
+# IDEMPOTENT *AND* UPDATABLE: the snippet is delimited by
+# `<!-- msens:analytics:begin -->` / `:end`, so a re-run REPLACES an older
+# injected block rather than skipping it or stacking a second copy. Files whose
+# block already matches the current snippet are left untouched. Safe to re-run,
+# and safe after a partial pipeline re-render.
 #
 # Usage:
 #   Rscript scripts/inject_analytics.R          # inject
@@ -29,7 +32,16 @@ stopifnot("missing _output/_includes/analytics.html" = file.exists(snippet_f))
 
 snippet <- paste(readLines(snippet_f, warn = FALSE), collapse = "\n")
 ga_id   <- regmatches(snippet, regexpr("G-[A-Z0-9]{8,}", snippet))
-stopifnot("no G- measurement id found in the snippet" = length(ga_id) == 1)
+stopifnot(
+  "no G- measurement id found in the snippet" = length(ga_id) == 1,
+  "snippet must carry the msens:analytics begin/end markers" =
+    grepl("msens:analytics:begin", snippet) && grepl("msens:analytics:end", snippet),
+  # Liquid parses HTML comments too: a literal include tag naming this file makes
+  # _layouts/default.html include it recursively ("stack level too deep").
+  "snippet must not contain a Liquid tag" = !grepl("\\{%", snippet))
+
+# matches a previously injected block, markers included
+block_rx <- "(?s)<!-- msens:analytics:begin -->.*?<!-- msens:analytics:end -->\\s*"
 
 # standalone Quarto output only: the Jekyll pages carry front matter (they get the
 # tag from the layout, and injecting there would double-count page views).
@@ -39,21 +51,25 @@ is_jekyll_page <- function(f) {
   length(l1) > 0 && trimws(l1)[1] == "---"
 }
 
-n_done <- 0L; n_skip <- 0L; n_jek <- 0L; n_nohead <- 0L
+n_new <- 0L; n_upd <- 0L; n_skip <- 0L; n_jek <- 0L; n_nohead <- 0L
 for (f in htmls) {
   if (is_jekyll_page(f)) { n_jek <- n_jek + 1L; next }
-  txt <- paste(readLines(f, warn = FALSE), collapse = "\n")
-  if (grepl(ga_id, txt, fixed = TRUE)) { n_skip <- n_skip + 1L; next }
-  if (!grepl("</head>", txt, fixed = TRUE)) { n_nohead <- n_nohead + 1L; next }
+  txt  <- paste(readLines(f, warn = FALSE), collapse = "\n")
+  had  <- grepl(block_rx, txt, perl = TRUE)
+  # strip any previous block so a re-run replaces rather than stacks
+  base <- if (had) sub(block_rx, "", txt, perl = TRUE) else txt
+  if (had && identical(txt, sub(block_rx, paste0(snippet, "\n"), txt, perl = TRUE))) {
+    n_skip <- n_skip + 1L; next                       # already current
+  }
+  if (!grepl("</head>", base, fixed = TRUE)) { n_nohead <- n_nohead + 1L; next }
   if (!check_only) {
     # inject before the FIRST </head> only
-    txt <- sub("</head>", paste0(snippet, "\n</head>"), txt, fixed = TRUE)
-    writeLines(txt, f)
+    writeLines(sub("</head>", paste0(snippet, "\n</head>"), base, fixed = TRUE), f)
   }
-  n_done <- n_done + 1L
+  if (had) n_upd <- n_upd + 1L else n_new <- n_new + 1L
 }
 
 message(sprintf(
-  "%s: %d notebook HTML %s, %d already tagged, %d Jekyll pages (tagged via layout), %d without <head>",
+  "%s: %d newly tagged, %d block%s updated, %d already current, %d Jekyll pages (tagged via layout), %d without <head>",
   if (check_only) "CHECK" else "INJECTED",
-  n_done, if (check_only) "would be tagged" else "tagged", n_skip, n_jek, n_nohead))
+  n_new, n_upd, if (n_upd == 1L) "" else "s", n_skip, n_jek, n_nohead))
