@@ -46,6 +46,9 @@ do_s3     <- !nzchar(Sys.getenv("RELEASE_NO_S3"))
 do_raw    <-  nzchar(Sys.getenv("RELEASE_RAW"))
 do_deploy <-  nzchar(Sys.getenv("RELEASE_DEPLOY"))
 do_apps   <-  do_deploy || nzchar(Sys.getenv("DEPLOY_APPS"))        # (re)deploy the v8 Shiny apps
+# v7 apps are the DEFAULT live apps on a separate checkout/branch — deliberately NOT implied by
+# RELEASE_DEPLOY, so a routine v8 release can never restart them. Opt in explicitly.
+do_apps_v7 <- nzchar(Sys.getenv("DEPLOY_APPS_V7"))
 do_s3_tbl <-  do_s3     || nzchar(Sys.getenv("RELEASE_S3_TABLES"))  # push derived tables (native_asset) without the full serve cutover
 # server targets (parallel titiler-v8)
 srv_repo  <- "/share/github/MarineSensitivity/server"
@@ -283,6 +286,36 @@ if (!do_apps) {
   out <- system2("ssh", c("msens", shQuote(cmd)), stdout = TRUE, stderr = TRUE)
   if (!any(grepl("APPS_OK", out))) stop(paste(tail(out, 15), collapse = "\n"))
   log_info("deployed v8 apps [{paste(v8_apps, collapse=', ')}] + reinstalled msens; v7 apps untouched: {tail(out,1)}")
+}
+```
+
+## Deploy the v7 Shiny apps (opt-in — normally left alone)
+
+The v7 apps are a **separate checkout** (`/share/github/MarineSensitivity/apps` on branch
+`v7`, symlinked as `/share/shiny_apps/{species,scores}` → `mapsp`/`mapgl`). They are the
+*default* live apps, so they stay untouched by a routine v8 release — hence a dedicated
+`DEPLOY_APPS_V7=1` flag that `RELEASE_DEPLOY` deliberately does **not** imply.
+
+Use it when a change must reach both generations — e.g. the usage-analytics instrumentation,
+which is only meaningful if it covers the apps people actually use today. msens is installed
+into the shared container by the v8 chunk above; v7 picks it up from the same library.
+
+```{r}
+#| label: deploy-apps-v7
+
+if (!do_apps_v7) {
+  log_info("DEPLOY_APPS_V7 unset — v7 apps left untouched (the default)")
+} else {
+  apps_v7_co <- "/share/github/MarineSensitivity/apps"   # branch v7; symlinked as scores/species
+  v7_apps    <- c("mapsp", "mapgl")                      # = species / scores
+  touches_v7 <- paste(sprintf("touch %s/%s/restart.txt", apps_v7_co, v7_apps), collapse = "; ")
+  # ff-only against origin/v7 (NOT main — this checkout tracks the v7 branch)
+  cmd_v7 <- glue("set -e; ",
+                 "cd {apps_v7_co} && git fetch --quiet origin && git merge --ff-only origin/v7; ",
+                 "{touches_v7}; echo APPSV7_OK $(git -C {apps_v7_co} rev-parse --short HEAD)")
+  out_v7 <- system2("ssh", c("msens", shQuote(cmd_v7)), stdout = TRUE, stderr = TRUE)
+  if (!any(grepl("APPSV7_OK", out_v7))) stop(paste(tail(out_v7, 15), collapse = "\n"))
+  log_info("deployed v7 apps [{paste(v7_apps, collapse=', ')}]: {tail(out_v7,1)}")
 }
 ```
 

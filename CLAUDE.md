@@ -51,10 +51,25 @@ requirements, both mandatory:
    `purl(...) + source()` is for quick diagnostics ONLY — it skips the HTML and the content-hash
    checkpoint, so it is not a substitute for a real run.
 
+3. **Reproducibility beats uptime — always.** When a reproducible fix and a fast in-place
+   workaround are both available, take the reproducible one **even if it means brief downtime**.
+   Never `docker exec` a change into a running container, hand-edit config inside one, or write
+   to `Renviron.site` to dodge a rebuild. Missing packages or env → fix `server/rstudio/Dockerfile`
+   or `server/docker-compose.yml`, rebuild the image, recreate the container. Drift between a
+   running container and its image is a **bug to fix now** (bake it in), not a reason to avoid
+   recreating. A brief outage is cheaper than state nobody can reproduce.
+
+**Both app generations.** A user-facing change must reach **v7 and v8**, not just the newer one:
+v7 = `apps` branch `v7` → `mapgl` (scores) + `mapsp` (species), served as `/scores`, `/species`;
+v8 = `apps` branch `main` → `apps_v8/{scores,species}`, served as `/scores_v8`, `/species_v8`.
+`DEPLOY_APPS=1` reloads v8; `DEPLOY_APPS_V7=1` reloads v7 (deliberately NOT implied by
+`RELEASE_DEPLOY`, so a routine v8 release never restarts the default-live v7 apps).
+
 **Env flags** (gate expensive/side-effecting steps): `REDO_INGEST=1` (rebuild an ingest),
 `REDO_WORMS=1` (rebuild the worms table), `SCORE_V7COMMON=1` (score only v7's species, for
 apples-to-apples), `SCORE_ALLBIRDS=1` (disable the marine-bird cull), `RELEASE_NO_S3=1` /
-`RELEASE_RAW=1` / `RELEASE_DEPLOY=1` (release + serving).
+`RELEASE_RAW=1` / `RELEASE_DEPLOY=1` (release + serving), `DEPLOY_APPS=1` / `DEPLOY_APPS_V7=1`
+(reload the v8 / v7 Shiny apps).
 
 ### Unit tests (non-negotiable — the model logic must stay guarded)
 
