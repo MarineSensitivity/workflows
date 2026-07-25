@@ -34,6 +34,223 @@
   Let's write a manuscript (with a plan first to discuss) on forwarding the vision of this project to the next iteration (plan )
   '/Users/bbest/Library/CloudStorage/GoogleDrive-ben@ecoquants.com/.shortcut-targets-by-id/1sppUmlMtZ-sXaBm72M1-8PnjVudXO91v/US MBON Public Folder/Working Groups/BioIndicators/manuscripts/atlas/atlas _ BioIndicators manuscript.md'
 
+## 2026-07-17 Google Analytics
+
+Review existing Google Analytics coverage throughout repos in @~/Github/MarineSensitivity. I have an existing Property ID 413466008, but it looks to only be covering the homepage MarineSensitivity.org, ie @../MarineSensitivity.github.io.
+
+I want to track usage across all online products, including documentation @../docs and active apps @../apps (species/, scores/). For apps, I want to track much more detailed usage about which layers and tabs users select, and particularly what they download and species searched for. This is probably better as a Google Analytics sheet, but I don't want to bog down the app with writes. There is some existing similar work in @../../CalCOFI/db-viz-hex/.
+
+----
+
+I've surveyed all seven repos. Here's what I found.
+
+Current coverage: one tag, one page
+
+┌─────────────────┬───────────────────────────────────────┬──────────────────────────────────────────────────────────────┐
+│     Product     │                  URL                  │                          GA status                           │
+├─────────────────┼───────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
+│ Homepage        │ marinesensitivity.org                 │ ✅ G-9HW6L751XG — MarineSensitivity.github.io/_quarto.yml:10 │
+├─────────────────┼───────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
+│ Docs book       │ marinesensitivity.org/docs/           │ ❌ commented out — docs/_quarto.yml:37                       │
+├─────────────────┼───────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
+│ Workflows site  │ marinesensitivity.org/workflows/      │ ❌ none — workflows/_output/_layouts/default.html            │
+├─────────────────┼───────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
+│ msens pkgdown   │ marinesensitivity.org/msens/          │ ❌ none — msens/_pkgdown.yml                                 │
+├─────────────────┼───────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
+│ scores app      │ app.marinesensitivity.org/scores_v8/  │ ❌ none                                                      │
+├─────────────────┼───────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
+│ species app     │ app.marinesensitivity.org/species_v8/ │ ❌ none                                                      │
+├─────────────────┼───────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
+│ apps landing    │ apps/index.html                       │ ❌ none — and stale: links mapgl/ + mapsp/, which no longer  │
+│                 │                                       │ exist (now scores_v8/species_v8)                             │
+├─────────────────┼───────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
+│ api / file /    │ subdomains                            │ n/a (no browser)                                             │
+│ titiler / h3t   │                                       │                                                              │
+└─────────────────┴───────────────────────────────────────┴──────────────────────────────────────────────────────────────┘
+
+Your suspicion is confirmed — that one line is the only gtag in the org. Two notes: docs/_quarto.yml:37 references G-V3HZN14Z8G, a different measurement ID than the homepage's — worth checking GA admin whether that's a real orphaned stream or a copy-paste from another project. And file.marinesensitivity.org/reports/* serves generated reports with Content-Disposition: attachment (server/caddy/Caddyfile), so actual report file fetches happen on a host with no JS — they can only be counted from the app side at generation time.
+
+Use one measurement ID everywhere, not five
+
+Everything browser-facing is on marinesensitivity.org or app.marinesensitivity.org. gtag sets the _ga cookie at the registrable domain, so a single stream tracks subdomains natively — no cross-domain config needed. Keeping G-9HW6L751XG everywhere preserves whole journeys (homepage → docs → app) in one session; minting per-product IDs fragments them irreversibly. Separate products with a content_group param (home/docs/workflows/msens/app-scores/app-species) plus the built-in hostname dimension.
+
+What the apps actually expose
+
+scores (apps/scores/app.R) — main_tabs navset already has an id (line 806), so tab switches are observable with no UI change. Sidebar: sel_subregion, sel_unit, sel_lyr (the lapalette. Downloads: download_tbl CSV (:2029) andbtn_rpt_submit → POST to api…/report with title/ver/format/areas (:2328) — that's your highest-value download event.
+
+species (apps/species/app.R) — sel_sp (selectize), us_only, sel_mask, ds_layer (merged vs each raw input), representation   (Original/Interpolated), tgl_obis, plus ?mdl_key=o downloadHandler at all; its "downloads" areoutbound links to native COG/PMTiles assets.                                                                                
+One gotcha for species search: CalCOFI's generic $(document).on('change','select',…) handler won't work here — selectize    hides the underlying <select> and .val() returns om R where you have the resolved scientific +common name. Separately, the typed search string (including failed searches — arguably the more interesting signal) is only reachable from selectize's client-side type event
+
+GA4 vs Sheet — your instinct is right, but CalCOF
+
+CalCOFI/db-viz-hex/app/logging.R is a good templaalready argues the split correctly. The reason tokeep the Sheet for species detail is cardinality: with ~16k taxa, GA4 will bucket species names into (other) in standard reports once you exceed the daily row limit. GA4 ownloads (bounded), the Sheet for species-leveldetail.
+
+But log_query() calls httr2::req_perform() synchronously (logging.R:71-77), which blocks the Shiny reactive thread for the
+whole Apps Script round-trip (300 ms–2 s, and /exy species selection that's a visible stall —exactly what you want to avoid. Three fixes, and I'd combine the first two:
+
+1. Client-side navigator.sendBeacon() for UI interactions — zero R cost, fire-and-forget by design, survives page unload.
+2. Buffer + batch anything that must come from R lved taxon IDs, errors): queue in memory, flushevery N rows / T seconds. Also protects the Apps Script execution quota.
+3. Async POST — the scores app already runs promi configured workers for the report POST (:2380),so that plumbing exists if you'd rather reuse it.
+
+Worth knowing: GA4's BigQuery export is free and unsampled, gives you full-cardinality event rows with zero extra app code,
+and would make the Sheet redundant for analysis.  is being directly browsable by non-technicalpeople — which is CalCOFI's stated rationale and may matter for BOEM.
+
+Implementation shape
+
+Given this repo's rules (logic in msens, not duplicated in app strings; side effects behind env flags; deploys baked into
+release_marine-atlas.qmd):
+
+- One committed snippet, e.g. msens::ga_tag() + my both apps — so the two apps can't drift.
+- Sheet endpoint as MSENS_LOG_URL, silent no-op when unset (local dev writes nothing); the container Renviron committed under
+server/.
+- Quarto sites: uncomment docs/_quarto.yml:37 with the homepage's ID, add google-analytics to msens/_pkgdown.yml, add the
+snippet to workflows/_output/_layouts/default.htmle workflows site — schema, query, compare,versions, and every notebook HTML).
+- Docs also has downloads: [pdf, docx] (_quarto.yd their own click events; the google-analytics key alone won't catch them.
+
+Two decisions before I build anything:
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☒ Detail log  ☒ Scope  ✔ Submit  →
+
+Review your answers
+
+ ● Where should the detailed per-interaction log lir selections, download params)?
+   → Google Sheet, async + batched
+ ● How much should I implement now?
+   → Everything I can locally
+
+## 2026-07-17 obis hex occs speed up
+
+[in marinebon/obisindicators]
+
+With recent changes (including subsequent to this session in adding an OBIS hexagon occurences layer to @../../MarineSensitivity/apps/species/ app), the hexagon rendering seems to have slowed down significantly. I am wondering if the @../../CalCOFI/api-h3t-py/ rendered on @../../MarineSensitivity/server/h3t/ got switched from querying locally on duckdb to parquet or switched to S3 remotely. When I go to https://app.marinesensitivity.org/species_v8/ and zoom in/out the hexagon layer is very slow to load at finer resolutions
+
+## 2026-07-16
+
+The msens vignette looks great, but is not showing the leatherback distribution, just a blank basemap [Image #7]. Also the Changelog (ie NEWS.md) is not getting updated with each new version -- the last version logged was 0.3.4 and the current version is 0.5.0; let's update the CLAUDE.md for that repo to always add an entry in NEWS.md describing changes with each version bump; let's revisit the git commit history to populate the changelog retroactively.
+
+----
+
+The extension can't open file:// URLs, so I can't screenshot the local render directly. But the fix is verified mechanically: the re-rendered vignette embeds the titiler-v8/cog tile URL (0 broken titilecache refs), and I confirmed those exact COG tiles return 200 image/png at global zoom levels — so the leatherback whole-range distribution will render. You'll see it on your next pkgdown::build_site().
+
+Both done
+
+1. Map fix (msens 6a29610) — root cause: cell_tile_url()'s default base was the v7 titilecache Varnish, whose API takes ?sql= and returns 422 on the v8 ?mdl_key= param → blank tiles. The apps already overrode base=titiler-v8, but the vignette used the default. Fixed the default (and cell_stats) → titiler-v8. Also upgraded the vignette's section 4 to retrieve the published whole-range merged COG from native_asset and render it via cog_tile_url — matching the "whole-range surface" text (the old code used the US-only model_cell).
+
+2. Changelog — retroactively reconstructed the two missing versions from the version-bump commits:
+- 0.4.0 (v8 Marine Atlas foundation: attach_atlas, Parquet/manifest helpers, mdl_key, ingest helpers, native/gridded publishing, STAC v8, build_targets_list, pra_score_delta)
+- 0.5.0 (merge_sql/turtle_sql single source of truth, attach_atlas view composability, getting-started article + STAC R/Python, cell_tile_url→titiler-v8)
+
+Committed to msens (dcca5c6). And added a "Changelog (NEWS.md is not optional)" section to the governing R-package CLAUDE.md — every DESCRIPTION version bump must ship a matching NEWS.md entry in the same change (ai_guidance 6d88aa3).
+
+One heads-up: since my recent atlas/vignette/tile-url work landed under the already-set 0.5.0 (no bump), I folded it into the 0.5.0 entry rather than starting a new version — per the new rule ("keep appending until you bump"). If you'd rather cut those as 0.5.1, just bump DESCRIPTION and I'll split the entry.
+
+----
+
+I added to `@ingest_sdm-gm.qmd` so hopefully this is ready to run and evaluate:
+
+```r
+Sys.setenv(GM_SHP_DIR = "~/My Drive/projects/msens/data/raw/ncei.noaa.gov - GoMex cetacean & sea turtle SDMs/0256800/2.2/data/0-data/NOAA_SEFSC_Cetacean_SeaTurtle_SDM_shapefiles")
+```
+
+I want to see a side-by-side swipable compare of AquaMaps vs this new SDM for a given species. For the sake of the model input, we will have to average across months to produce a single species distribution.
+
+----
+
+Both parts are done. Here's the summary:
+
+gm ingest — run & validated ✅
+
+With your Drive path hydrated, the ingest ran clean: 19 shapefiles → 17 species (the Oceanic+Shelf Atlantic-spotted and bottlenose dolphins summed per hexagon) → 214 surfaces (17 annual + monthly), density → suitability [1–100], deterministic content-hash manifest. Then I published the 17 annual gm|{sp_id} COGs to S3 (native/gm/) for tile serving.
+
+Swipe compare — live ✅
+
+https://marinesensitivity.org/workflows/compare.html (linked as compare in the workflows nav):
+- Drag a divider between AquaMaps (native 0.5° suitability, left) and the NOAA SEFSC GoMex SDM (0.05°, months averaged to one annual surface, right).
+- Dropdown of the 12 species that have both models (Sperm Whale, Bottlenose/Spotted/Spinner/Striped/Clymene/Pantropical/Risso's dolphins, and the 4 sea turtles).
+- Both served from titiler /cog; verified working in-browser (rich density visualization, swipe functional). The contrast is exactly the point: AquaMaps paints broad coarse suitability across (and beyond) the Gulf, while the SEFSC survey model resolves fine density structure — and, being Gulf-only, the GoMex side is intentionally blank outside the Gulf.
+
+Committed + pushed (9bdb27e8); the two helper scripts (publish_gm_cogs.R, build_compare_data.R) are in workflows/scripts/.
+
+Two notes:
+1. The committed ingest_sdm-gm.qmd stays env-var-driven (GM_SHP_DIR) so it's ready to run on msens1; your local Sys.setenv(...) line is a per-machine convenience (I didn't commit it, to keep the repo path-agnostic).
+2. gm density is still not folded into merge/scoring — that composite-score change stays behind MERGE_FOLD_DENSITY=1 pending pra_score_delta validation.
+
+That closes out #7 (both nc + gm). The only remaining backlog item is #21 (tiered token auth), which you're reviewing.
+
+✻ Worked for 23m 38s
+
+※ recap: Building out the v8 Marine Atlas: the gm density ingest now runs and the AquaMaps-vs-GoMex swipe-compare page is live and verified. Next, confirm you're happy with the compare page, or point me at the last item (#21 token auth). (disable recaps in /config)
+
+  25 tasks (24 done, 1 open)
+  ◻ Tiered token auth for restricted datasets
+  ✔ Phase A1: msens Parquet + manifest + guard helpers
+  ✔ Phase A pilot + verify determinism
+  ✔ Phase A rollout across ~22 notebooks
+  ✔ Phase A: _quarto.yml + workflows index
+   … +20 completed
+
+----
+
+I like the species picker and color ramps, but I don't see a slider at https://walker-data.com/mapgl/articles/getting-started.html#comparing-map-views [Image #9]. Can you use [`mapgl::compare()`](https://walker-data.com/mapgl/reference/compare.html) instead? And move it to the end of the notebook https://marinesensitivity.org/workflows/ingest_sdm-gm.html?
+
+### species differences b/n v7 and v8
+
+I didn’t catch you response about species differences between v7 and v8. I didn’t think they were supposed to be different, but may e it was just dropping “other” and properly folding species into the rest of the sp_cat
+
+----
+
+That confirms it. Here's the real breakdown — and it's not the version-equivalence check, which is an important distinction.
+
+What my report actually compared
+
+validate\_versions.qmd compared each version's full production scores — but v7 and v8 deliberately score different species sets with different categorization. So that \~4-point delta bundles all the intended v8 changes together. The equivalence gate (pra\_score\_delta on common inputs via SCORE\_V7COMMON — score only v7's species with matching categorization) is the apples-to-apples "should be \~zero" test, and I did not run that — the report is the full v7-vs-v8, not the gate.
+
+Where the composite drop (27.8 → 24.5) comes from
+
+The composite is an equal-weight blend across 7 sp\_cat categories. Per-category, mean over the 20 Program Areas:
+
+`┌───────────────────────────────────┬──────┬──────┬──────────────────┐`  
+`│             category              │  v7  │  v8  │        Δ         │`  
+`├───────────────────────────────────┼──────┼──────┼──────────────────┤`  
+`│ bird                              │ 54.0 │ 37.8 │ −16.2 ⟵ dominant│`  
+`├───────────────────────────────────┼──────┼──────┼──────────────────┤`  
+`│ turtle                            │ 39.1 │ 33.0 │ −6.1             │`  
+`├───────────────────────────────────┼──────┼──────┼──────────────────┤`  
+`│ 7th slot (other→primary_producer) │ 18.1 │ 12.4 │ −5.7             │`  
+`├───────────────────────────────────┼──────┼──────┼──────────────────┤`  
+`│ mammal                            │ 52.6 │ 50.6 │ −1.9             │`  
+`├───────────────────────────────────┼──────┼──────┼──────────────────┤`  
+`│ invertebrate                      │ 21.1 │ 20.6 │ −0.5             │`  
+`├───────────────────────────────────┼──────┼──────┼──────────────────┤`  
+`│ coral                             │ 13.5 │ 13.7 │ +0.2             │`  
+`├───────────────────────────────────┼──────┼──────┼──────────────────┤`  
+`│ fish                              │ 22.4 │ 23.8 │ +1.4             │`  
+`└───────────────────────────────────┴──────┴──────┴──────────────────┘`  
+So your hypothesis is partly right — but birds dominate
+
+* The other→primary\_producer swap (−5.7) is exactly what you described: v7's "other" grab-bag is gone, those species folded into their proper sp\_cat, primary\_producer split out, reptile/amphibian excluded. Real, but only \~a third of the story.  
+* The biggest single driver is birds (−16.2), from two deliberate v8 bird changes, not the other reshuffle:  
+  * v8 ingests the whole BirdLife BOTW (10,999 birds vs v7's 614), so the scored marine-bird set is broader and, after the is\_marine cull, differently composed.  
+  * v8 scopes the MBTA extinction-risk floor to the FWS CFR 50 §10.13 list, not all Aves — the floored share dropped from 22% (137/614) in v7 to 9% (996/10,999) in v8. v7 was over-applying the protective floor to every bird, inflating bird scores.
+
+Bottom line: the difference is the intended v8 corrections concentrated in birds \+ the sp\_cat cleanup — not a regression in the merge/scoring math. The one thing worth a sanity-check is whether the bird handling (MBTA-floor-by-CFR-list \+ whole-BOTW marine cull) lowering birds \~16 points is the behavior you want.
+
+Want me to run the true equivalence check (SCORE\_V7COMMON — v7's exact species/categorization through v8) so we have the definitive near-zero number? It's a full re-score, so it'll take a bit.
+
+----
+
+29 tasks (28 done, 1 open)
+  ◻ Tiered token auth for restricted datasets
+  ✔ Phase A1: msens Parquet + manifest + guard helpers
+  ✔ Phase A pilot + verify determinism
+  ✔ Phase A rollout across ~22 notebooks
+  ✔ Phase A: _quarto.yml + workflows index
+
+```bash
+claude --resume 23f961e1-6664-4a36-b1cc-95d20e8ce50d
+```
+
 ## 2026-07-13 parquet 2.0
 
 We made lots of progress with `v8`. Let's improve upon it in several ways:
