@@ -236,10 +236,14 @@ dbExecute(cv, glue("CREATE VIEW model_cell AS
 # Report-tab area). Deliberately a LOCAL path on the server, never S3: those
 # queries touch many partitions, and over HTTPS that is exactly the pattern that
 # fails. It is small enough to keep on disk (1.4 GB across 422 tiles).
-cell_glob <- if (do_deploy) glue("{srv_cellmodel}/*/*.parquet") else glue("{cell_mc}/*/*.parquet")
+# NOTE the view is created against the LOCAL staged path here. DuckDB validates
+# a read_parquet() glob when the view is CREATED, so a server path cannot be
+# used from the laptop — those files do not exist until the deploy chunk rsyncs
+# them. The deploy chunk therefore REPLACES this view server-side, pointing at
+# the server's local copy.
 dbExecute(cv, glue("CREATE VIEW cell_model AS
   SELECT cm.tile, cm.mdl_id, cm.cell_id, cm.val, cm.val AS value
-  FROM read_parquet('{cell_glob}', hive_partitioning = true) cm"))
+  FROM read_parquet('{cell_mc}/*/*.parquet', hive_partitioning = true) cm"))
 dbDisconnect(cv, shutdown = TRUE)
 log_info("view DB {viewdb} ({round(file_size(viewdb)/1e3,1)} KB) — {if (do_s3 || do_s3_tbl) 'S3' else 'LOCAL'} sources, model_cell by mdl_id, cell_model by spatial tile (local)")
 ```
@@ -276,6 +280,21 @@ system2("ssh", c("msens", glue("mkdir -p {path_dir(srv_viewdb)} {srv_stac}")))
 system2("rsync", c("-aq", "--delete", glue("{cell_mc}/"), glue("msens:{srv_cellmodel}/")))
 log_info("synced cell_model -> msens:{srv_cellmodel}")
 system2("rsync", c("-aq", viewdb, glue("msens:{srv_viewdb}")))
+# repoint cell_model at the server's LOCAL copy (the staged view still names the
+# laptop path). Done here, after the rsync, because DuckDB validates the glob at
+# CREATE VIEW time — it must run where the files actually are.
+fix_view <- glue(
+  "docker exec rstudio Rscript -e ",
+  shQuote(glue(
+    "con <- DBI::dbConnect(duckdb::duckdb('{srv_viewdb}')); ",
+    "DBI::dbExecute(con, \"CREATE OR REPLACE VIEW cell_model AS SELECT cm.tile, cm.mdl_id, ",
+    "cm.cell_id, cm.val, cm.val AS value FROM read_parquet('{srv_cellmodel}/*/*.parquet', ",
+    "hive_partitioning = true) cm\"); ",
+    "cat('CELLMODEL_OK', DBI::dbGetQuery(con, 'SELECT count(*) n FROM cell_model')$n, '\\n'); ",
+    "DBI::dbDisconnect(con, shutdown = TRUE)")))
+out_cm <- system2("ssh", c("msens", shQuote(fix_view)), stdout = TRUE, stderr = TRUE)
+if (!any(grepl("CELLMODEL_OK", out_cm))) stop(paste(tail(out_cm, 15), collapse = "\n"))
+log_info("cell_model view repointed on server: {grep('CELLMODEL_OK', out_cm, value = TRUE)}")
 system2("rsync", c("-aq", glue("{stac_dir}/{ver}/"), glue("msens:{srv_stac}/")))
 # add this version as a child of the STAC root (keep other versions)
 system2("ssh", c("msens", shQuote(glue(
