@@ -104,6 +104,34 @@ zm_hash <- msens::hash_query(con, "zone_metric")
 dbDisconnect(con, shutdown=TRUE)
 ```
 
+## Zone × taxon table (what the apps read)
+
+`zone_taxon` is the per-zone species list the scores app shows (and downloads as CSV).
+It is **precomputed here**, not aggregated in the app: the server holds only the KB-sized
+`serve.duckdb`, whose `model_cell` is a view over S3 Parquet **partitioned by `mdl_id`** for
+per-model point reads (titiler tiles). A zone-wide aggregation there would have to list and
+scan the whole ~580M-row dataset over HTTPS, and in practice fails outright
+(`IO Error: ... HTTP GET .../serve/model_cell/`). v7 shipped such a table; v8 dropped it,
+which is what left the app's Table of Species broken.
+
+Rules live in `msens::species_for_zone()` / `build_zone_taxon()` and are unit-tested against
+synthetic v7 **and** v8 fixtures, so this notebook and the tests cannot drift.
+
+```{r}
+#| label: zone_taxon
+
+# the pa_score chunk closes `con`; reopen for this step
+con <- dbConnect(duckdb(sdm_db))
+n_zt <- msens::build_zone_taxon(con)
+d_zt <- tbl(con, "zone_taxon") |>
+  group_by(zone_fld) |>
+  summarize(n_zones = n_distinct(zone_value), n_rows = n(), .groups = "drop") |>
+  collect()
+log_info("zone_taxon: {n_zt} rows across {sum(d_zt$n_zones)} zones")
+dbDisconnect(con, shutdown = TRUE)
+d_zt
+```
+
 ## v7 equivalence gate (pra_score_delta)
 
 ```{r}
