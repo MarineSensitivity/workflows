@@ -219,7 +219,47 @@ So it's running a GET, not a POST, yet the only function defined in Code.gs is `
 
 ----
 
+All six repos clean and deployed. Here's where things landed.
 
+Species table: fixed and live in production
+
+It turned out to be three stacked bugs, not one:
+
+1. Schema drift — v8 renamed is_ok→is_valid_usa, mdl_seq→ms_merge_key/mdl_key, value→val, and the app carried its own inline copy of the query against the old names.
+2. The real root cause — v7 shipped a precomputed zone_taxon table and v8 never built one. My first fix computed it live, which worked locally and then failed in production: the server holds only the 268 KB serve.duckdb, whose model_cell is S3 Parquet partitioned by mdl_id for per-model tile reads. A zone-wide scan tries to list the bucket and dies with IO Error: … HTTP GET …/serve/model_cell/. That's why v7 precomputed it.
+3. A correctness bug the rewrite exposed — the study-area table's first row was a cane toad. is_valid_usa only means "has cells in US waters"; v7 baked the marine/category cull into is_ok.
+
+Now: msens::build_zone_taxon() runs in score_zone_metrics.qmd where model_cell is local (115,700 rows / 36 zones), the release ships it, and species_for_zone() reads it — falling back to live aggregation locally. 5.7 s → 0.021 s (0.3 s over S3).
+
+Verified in production: 9,632 species, CSV downloads 9,632 rows, model links point at species_v8 keyed on mdl_key, zero errors in the logs. Guarded by 41 tests using synthetic v7 and v8 fixtures carrying identical numbers.
+
+Two smaller bugs fixed in passing: "Full study area" mapped to a nonexistent zone value (so the default view returned nothing even once the schema was right), and the model link pointed at ../species/ — the v7 app.
+
+Needs a decision from you
+
+The clicked-cell species list still can't work. A single cell requires scanning model_cell, which is organized by model, not by cell — the same wall. It now shows an explanatory notification instead of a red error. A real fix needs either a cell-oriented surface or an API endpoint; I didn't want to invent that architecture unilaterally.
+
+Your MapTiler key is publicly readable on marinesensitivity.org in 25 files / 27 commits. Your source is clean — mapgl::maptiler_style() bakes the key from ~/.Renviron into the rendered HTML. These keys are client-side by design, so check whether it's domain-restricted; if not, rotate it.
+
+Not done
+
+The 50 MB HTMLs. I diagnosed but didn't fix them: ingest_usgs-gap-turtles.html is 52.9 MB, of which 52.8 MB is inline <script> — full-resolution turtle polygons as GeoJSON, one block alone being 26.4 MB. Three siblings are 43–49 MB. The fix is simplifying geometry before mapping, but it only takes effect when those notebooks re-render, and re-rendering ingest notebooks is expensive enough that I'd rather not kick it off unattended at the end of a long session. Say the word and I'll do it.
+
+Also unchanged: the two pre-existing interp.R test failures, which are in code explicitly marked DORMANT since the H3 rollback.
+
+✻ Cogitated for 13m 20s
+
+※ recap: Goal was analytics across all MarineSensitivity products; that's live on all four apps, and I also fixed the v8 species table, now working in production. Next: simplify the map geometry bloating those 50 MB workflow HTMLs, if you want it.
+
+❯ Yes, we definitely want local parquet files for the apps on the server. Besides the clicked cell, there is also the Report tab which allows for an arbitrary area. That report generation can also be quite slow, and presumably for the same reason. Seems like we could also create a cell_model table that is partitioned perhaps by cell (too many partitions?) containing the same data as model_cell, but for querying by cell (vs model).
+
+  For the 50 MB HTML, use webshot2 and htmlwidgets::saveWidget() on the bigger map images. Comment out or delete DORMANT test failures in interp.R.
+
+----
+
+Yes, we definitely want local parquet files for the apps on the server. Besides the clicked cell, there is also the Report tab which allows for an arbitrary area. That report generation can also be quite slow, and presumably for the same reason. Seems like we could also create a cell_model table that is partitioned perhaps by cell (too many partitions?) containing the same data as model_cell, but for querying by cell (vs model).
+
+  For the 50 MB HTML, use webshot2 and htmlwidgets::saveWidget() on the bigger map images. Comment out or delete DORMANT test failures in interp.R.
 
 
 ## 2026-07-17 obis hex occs speed up
