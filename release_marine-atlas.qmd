@@ -53,6 +53,8 @@ do_s3_tbl <-  do_s3     || nzchar(Sys.getenv("RELEASE_S3_TABLES"))  # push deriv
 # server targets (parallel titiler-v8)
 srv_repo  <- "/share/github/MarineSensitivity/server"
 srv_viewdb<- glue("/share/data/big/{ver}/serve.duckdb")
+# cell_model lives as LOCAL Parquet on the server (see the viewdb chunk)
+srv_cellmodel <- glue("/share/data/big/{ver}/cell_model")
 srv_stac  <- glue("/share/data/derived/stac/{ver}")
 titiler_v8<- glue("https://titiler-{ver}.marinesensitivity.org/msens")
 stopifnot("run build_registry first" = {
@@ -97,6 +99,32 @@ if (!dir_exists(serve_mc) || nzchar(Sys.getenv("RELEASE_REDO_SERVE"))) {
 } else {
   log_info("serve/model_cell/ exists — skipping repartition (RELEASE_REDO_SERVE=1 to force)")
 }
+# CELL-ORIENTED surface: the same model_cell data, partitioned by a 2.5-degree
+# SPATIAL TILE so it can be queried BY CELL. serve/model_cell is partitioned by
+# mdl_id, which serves a titiler tile as one point read but makes any per-cell or
+# per-polygon question (the scores app's clicked cell, and the Report tab's
+# arbitrary area) a full scan of ~580M rows — over HTTPS that fails outright.
+#
+# tile = 50x50 cells on the 7200-col global grid -> 422 partitions, avg 1.4M rows
+# (p95 5.0M, max 10.2M), so one cell reads one small partition. Deliberately NOT
+# globally sorted: an ORDER BY over 580M rows previously spilled ~500GB.
+# Callers must filter on `tile` as well as `cell_id` to get partition pruning —
+# msens::cell_model_tiles() computes the tile ids for a set of cells.
+cell_mc <- glue("{serve_dir}/cell_model")
+if (!dir_exists(cell_mc) || nzchar(Sys.getenv("RELEASE_REDO_CELL_MODEL"))) {
+  if (dir_exists(cell_mc)) dir_delete(cell_mc)
+  dbExecute(con, "SET partitioned_write_max_open_files=1024")
+  msens::copy_atlas_parquet(
+    con,
+    paste("SELECT", msens::cell_model_tile_sql("c.cell_id"), "AS tile,",
+          "m.mdl_id, c.cell_id, c.val",
+          "FROM model_cell c JOIN model m USING (mdl_key)"),
+    cell_mc, partition_by = "tile")
+  log_info("built serve/cell_model/ ({length(dir_ls(cell_mc, type='directory'))} tiles)")
+} else {
+  log_info("serve/cell_model/ exists — skipping (RELEASE_REDO_CELL_MODEL=1 to force)")
+}
+
 # content fingerprint of the served surface (source table = deterministic, cheaper than scanning parts)
 serve_hash <- msens::hash_query(con, "SELECT mdl_key, cell_id, val FROM model_cell")
 n_parts    <- length(dir_ls(serve_mc, type = "directory"))
@@ -203,8 +231,17 @@ dbExecute(cv, glue("CREATE VIEW model_cell AS
   SELECT m.mdl_key, mc.mdl_id, mc.cell_id, mc.val, mc.val AS value
   FROM read_parquet('{mc_glob}', hive_partitioning = true) mc
   JOIN model m USING (mdl_id)"))
+# cell_model — the SAME rows partitioned by a 2.5-degree spatial tile, for the
+# per-CELL and per-POLYGON questions model_cell cannot answer (clicked cell,
+# Report-tab area). Deliberately a LOCAL path on the server, never S3: those
+# queries touch many partitions, and over HTTPS that is exactly the pattern that
+# fails. It is small enough to keep on disk (1.4 GB across 422 tiles).
+cell_glob <- if (do_deploy) glue("{srv_cellmodel}/*/*.parquet") else glue("{cell_mc}/*/*.parquet")
+dbExecute(cv, glue("CREATE VIEW cell_model AS
+  SELECT cm.tile, cm.mdl_id, cm.cell_id, cm.val, cm.val AS value
+  FROM read_parquet('{cell_glob}', hive_partitioning = true) cm"))
 dbDisconnect(cv, shutdown = TRUE)
-log_info("view DB {viewdb} ({round(file_size(viewdb)/1e3,1)} KB) — {if (do_s3 || do_s3_tbl) 'S3' else 'LOCAL'} sources, model_cell partitioned by mdl_id (public key = mdl_key)")
+log_info("view DB {viewdb} ({round(file_size(viewdb)/1e3,1)} KB) — {if (do_s3 || do_s3_tbl) 'S3' else 'LOCAL'} sources, model_cell by mdl_id, cell_model by spatial tile (local)")
 ```
 
 ## Emit STAC catalog (tile links → titiler-{ver})
@@ -232,6 +269,12 @@ if (!do_deploy) {
 } else {
 # 1. the KB view DB + the STAC version subtree (data stays on S3 — no big rsync)
 system2("ssh", c("msens", glue("mkdir -p {path_dir(srv_viewdb)} {srv_stac}")))
+# ... EXCEPT cell_model, which is deliberately local on the server: the per-cell /
+# per-polygon queries it serves touch many partitions, which is precisely what
+# fails over HTTPS. ~1.4 GB, so rsync only what changed (--delete prunes stale
+# tiles if the grid or model set ever changes).
+system2("rsync", c("-aq", "--delete", glue("{cell_mc}/"), glue("msens:{srv_cellmodel}/")))
+log_info("synced cell_model -> msens:{srv_cellmodel}")
 system2("rsync", c("-aq", viewdb, glue("msens:{srv_viewdb}")))
 system2("rsync", c("-aq", glue("{stac_dir}/{ver}/"), glue("msens:{srv_stac}/")))
 # add this version as a child of the STAC root (keep other versions)
