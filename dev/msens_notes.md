@@ -262,6 +262,30 @@ Yes, we definitely want local parquet files for the apps on the server. Besides 
   For the 50 MB HTML, use webshot2 and htmlwidgets::saveWidget() on the bigger map images. Comment out or delete DORMANT test failures in interp.R.
 
 
+----
+
+Everything is clean — no stray processes, all test ports released, nothing pending locally or on the server.
+
+Final state confirmed:
+
+┌──────────────────────┬─────────────────────────────────────────────┐
+│                      │                                             │
+├──────────────────────┼─────────────────────────────────────────────┤
+│ cell_model on server │ 1.3 GB, 422 tiles, local Parquet            │
+├──────────────────────┼─────────────────────────────────────────────┤
+│ container msens      │ 0.9.2                                       │
+├──────────────────────┼─────────────────────────────────────────────┤
+│ apps_v8 / apps v7    │ a77c356 / 0fd72b5                           │
+├──────────────────────┼─────────────────────────────────────────────┤
+│ All 7 repos          │ clean, pushed                               │
+├──────────────────────┼─────────────────────────────────────────────┤
+│ msens test suite     │ 245 passing, 0 failures, 2 documented skips │
+└──────────────────────┴─────────────────────────────────────────────┘
+
+Those three notifications were stale until-loop wrappers I'd left waiting on work that had already finished — the deploys themselves completed and were verified directly, not inferred: the 1.4 GB rsync landed, the server-side view reported CELLMODEL_OK 580568326 (exactly matching the source), APPSV7_OK confirmed the v7 reload, and a clicked cell returned 7,466 species in 1.22 s through serve.duckdb.
+
+Nothing further is running or needs attention. The two open items remain as I flagged them: check whether your MapTiler key is domain-restricted (it's public in 25 files), and the three oversized notebooks will shrink whenever they're next rendered somewhere with their source data — noting that ingest_productivity can't render anywhere right now, since it still opens the retired PostGIS stack.
+
 ## 2026-07-17 obis hex occs speed up
 
 [in marinebon/obisindicators]
