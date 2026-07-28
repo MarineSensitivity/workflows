@@ -355,28 +355,9 @@ something the apps scan.
 if (!do_tables) {
   log_info("RELEASE_DEPLOY/DEPLOY_TABLES unset — leaving the server's table views as they are")
 } else {
-  system2("ssh", c("msens", glue("mkdir -p {srv_tables}")))
+  system2("ssh", c("msens", glue("mkdir -p {srv_tables} {srv_modelcell}")))
   system2("rsync", c("-aq", "--delete", glue("{tbl_dir}/"), glue("msens:{srv_tables}/")))
   log_info("synced tables -> msens:{srv_tables}")
-  # repoint every released table view at the server's local copy, preserving the
-  # `val AS value` back-compat alias the apps still rely on. Verified with a real
-  # count so a half-synced directory FAILS LOUDLY instead of serving broken views.
-  fix_tbls <- glue(
-    "docker exec rstudio Rscript -e ",
-    shQuote(glue(
-      "vt <- strsplit('cell_metric,zone_metric,zone', ',')[[1]]; ",
-      "tt <- strsplit('{paste(rel_tables, collapse = \",\")}', ',')[[1]]; ",
-      "con <- DBI::dbConnect(duckdb::duckdb('{srv_viewdb}')); ",
-      "for (t in tt) DBI::dbExecute(con, sprintf(",
-      "\"CREATE OR REPLACE VIEW %s AS SELECT *%s FROM read_parquet('{srv_tables}/%s.parquet')\", ",
-      "t, if (t %in% vt) ', val AS value' else '', t)); ",
-      "cat('TABLES_OK', length(tt), DBI::dbGetQuery(con, ",
-      "'SELECT count(*) n FROM zone_metric')$n, '\\n'); ",
-      "DBI::dbDisconnect(con, shutdown = TRUE)")))
-  out_tb <- system2("ssh", c("msens", shQuote(fix_tbls)), stdout = TRUE, stderr = TRUE)
-  if (!any(grepl("TABLES_OK", out_tb))) stop(paste(tail(out_tb, 15), collapse = "\n"))
-  log_info("table views repointed to local Parquet: {grep('TABLES_OK', out_tb, value = TRUE)}")
-
   # model_cell too — the LAST remote table. The v8 species app reads it in two
   # places (mdl_bbox() for fit_bounds, and the clicked-cell value), and both are
   # degrading silently today: the S3 GLOB needs LIST credentials the app
@@ -386,22 +367,47 @@ if (!do_tables) {
   # Safe for tiles: titiler builds its own read_parquet path from the
   # SERVE_MODEL_CELL env var (server/titiler/factory.py) and only uses this DB
   # for the `model` registry — it never reads this view.
-  system2("ssh", c("msens", glue("mkdir -p {srv_modelcell}")))
   system2("rsync", c("-aq", "--delete", glue("{serve_mc}/"), glue("msens:{srv_modelcell}/")))
   log_info("synced model_cell -> msens:{srv_modelcell}")
-  fix_mc <- glue(
-    "docker exec rstudio Rscript -e ",
-    shQuote(glue(
-      "con <- DBI::dbConnect(duckdb::duckdb('{srv_viewdb}')); ",
-      "DBI::dbExecute(con, \"CREATE OR REPLACE VIEW model_cell AS SELECT m.mdl_key, ",
-      "mc.mdl_id, mc.cell_id, mc.val, mc.val AS value FROM read_parquet(",
-      "'{srv_modelcell}/*/*.parquet', hive_partitioning = true) mc JOIN model m USING (mdl_id)\"); ",
-      "cat('MODELCELL_OK', DBI::dbGetQuery(con, ",
-      "'SELECT count(*) n FROM model_cell WHERE mdl_id = (SELECT min(mdl_id) FROM model)')$n, '\\n'); ",
-      "DBI::dbDisconnect(con, shutdown = TRUE)")))
-  out_mc <- system2("ssh", c("msens", shQuote(fix_mc)), stdout = TRUE, stderr = TRUE)
-  if (!any(grepl("MODELCELL_OK", out_mc))) stop(paste(tail(out_mc, 15), collapse = "\n"))
-  log_info("model_cell view repointed to local Parquet: {grep('MODELCELL_OK', out_mc, value = TRUE)}")
+
+  # Repoint the views — into a COPY, then swap it in atomically.
+  #
+  # Editing serve.duckdb in place needs a WRITE lock, and every running Shiny
+  # session holds a read-only one, so a live server fails with
+  #   Could not set lock on file ".../serve.duckdb": Conflicting lock is held
+  # (it only ever succeeded when no app happened to be open). Copying first
+  # needs no lock — readers never mutate the file — and `mv` is atomic within
+  # the filesystem: in-flight sessions keep serving from the old inode, and the
+  # restart.txt touch rolls them onto the new one.
+  #
+  # `val AS value` is preserved (the apps still reference `value`), and each
+  # repoint is verified with a real count so a half-synced directory FAILS
+  # LOUDLY here rather than being discovered later as an empty app panel.
+  repoint <- glue(
+    "vt <- strsplit('cell_metric,zone_metric,zone', ',')[[1]]; ",
+    "tt <- strsplit('{paste(rel_tables, collapse = \",\")}', ',')[[1]]; ",
+    "con <- DBI::dbConnect(duckdb::duckdb('{srv_viewdb}.new')); ",
+    "for (t in tt) DBI::dbExecute(con, sprintf(",
+    "\"CREATE OR REPLACE VIEW %s AS SELECT *%s FROM read_parquet('{srv_tables}/%s.parquet')\", ",
+    "t, if (t %in% vt) ', val AS value' else '', t)); ",
+    "DBI::dbExecute(con, \"CREATE OR REPLACE VIEW model_cell AS SELECT m.mdl_key, ",
+    "mc.mdl_id, mc.cell_id, mc.val, mc.val AS value FROM read_parquet(",
+    "'{srv_modelcell}/*/*.parquet', hive_partitioning = true) mc JOIN model m USING (mdl_id)\"); ",
+    "cat('VIEWS_OK', length(tt), ",
+    "DBI::dbGetQuery(con, 'SELECT count(*) n FROM zone_metric')$n, ",
+    "DBI::dbGetQuery(con, 'SELECT count(*) n FROM model_cell WHERE mdl_id = ",
+    "(SELECT min(mdl_id) FROM model)')$n, '\\n'); ",
+    "DBI::dbDisconnect(con, shutdown = TRUE)")
+  v8_apps <- c("species", "scores")
+  cmd_rp <- glue(
+    "set -e; ",
+    "cp -f {srv_viewdb} {srv_viewdb}.new; ",                       # no lock needed
+    "docker exec rstudio Rscript -e {shQuote(repoint)}; ",
+    "mv -f {srv_viewdb}.new {srv_viewdb}; ",                       # atomic swap
+    "{paste(sprintf('touch /share/github/MarineSensitivity/apps_v8/%s/restart.txt', v8_apps), collapse='; ')}")
+  out_rp <- system2("ssh", c("msens", shQuote(cmd_rp)), stdout = TRUE, stderr = TRUE)
+  if (!any(grepl("VIEWS_OK", out_rp))) stop(paste(tail(out_rp, 20), collapse = "\n"))
+  log_info("views repointed to local Parquet + v8 apps reloaded: {grep('VIEWS_OK', out_rp, value = TRUE)}")
 }
 ```
 
