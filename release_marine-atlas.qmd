@@ -59,6 +59,7 @@ srv_viewdb<- glue("/share/data/big/{ver}/serve.duckdb")
 # cell_model + the derived tables live as LOCAL Parquet on the server (see the viewdb chunk)
 srv_cellmodel <- glue("/share/data/big/{ver}/cell_model")
 srv_tables    <- glue("/share/data/big/{ver}/tables")
+srv_modelcell <- glue("/share/data/big/{ver}/model_cell")
 srv_stac  <- glue("/share/data/derived/stac/{ver}")
 titiler_v8<- glue("https://titiler-{ver}.marinesensitivity.org/msens")
 stopifnot("run build_registry first" = {
@@ -375,6 +376,69 @@ if (!do_tables) {
   out_tb <- system2("ssh", c("msens", shQuote(fix_tbls)), stdout = TRUE, stderr = TRUE)
   if (!any(grepl("TABLES_OK", out_tb))) stop(paste(tail(out_tb, 15), collapse = "\n"))
   log_info("table views repointed to local Parquet: {grep('TABLES_OK', out_tb, value = TRUE)}")
+
+  # model_cell too — the LAST remote table. The v8 species app reads it in two
+  # places (mdl_bbox() for fit_bounds, and the clicked-cell value), and both are
+  # degrading silently today: the S3 GLOB needs LIST credentials the app
+  # container lacks, so the tryCatch around each returns NULL/NA and the app
+  # quietly falls back to the study-area extent and a blank value. 3.3 GB.
+  #
+  # Safe for tiles: titiler builds its own read_parquet path from the
+  # SERVE_MODEL_CELL env var (server/titiler/factory.py) and only uses this DB
+  # for the `model` registry — it never reads this view.
+  system2("ssh", c("msens", glue("mkdir -p {srv_modelcell}")))
+  system2("rsync", c("-aq", "--delete", glue("{serve_mc}/"), glue("msens:{srv_modelcell}/")))
+  log_info("synced model_cell -> msens:{srv_modelcell}")
+  fix_mc <- glue(
+    "docker exec rstudio Rscript -e ",
+    shQuote(glue(
+      "con <- DBI::dbConnect(duckdb::duckdb('{srv_viewdb}')); ",
+      "DBI::dbExecute(con, \"CREATE OR REPLACE VIEW model_cell AS SELECT m.mdl_key, ",
+      "mc.mdl_id, mc.cell_id, mc.val, mc.val AS value FROM read_parquet(",
+      "'{srv_modelcell}/*/*.parquet', hive_partitioning = true) mc JOIN model m USING (mdl_id)\"); ",
+      "cat('MODELCELL_OK', DBI::dbGetQuery(con, ",
+      "'SELECT count(*) n FROM model_cell WHERE mdl_id = (SELECT min(mdl_id) FROM model)')$n, '\\n'); ",
+      "DBI::dbDisconnect(con, shutdown = TRUE)")))
+  out_mc <- system2("ssh", c("msens", shQuote(fix_mc)), stdout = TRUE, stderr = TRUE)
+  if (!any(grepl("MODELCELL_OK", out_mc))) stop(paste(tail(out_mc, 15), collapse = "\n"))
+  log_info("model_cell view repointed to local Parquet: {grep('MODELCELL_OK', out_mc, value = TRUE)}")
+}
+```
+
+## Deploy the plumber API (`DEPLOY_API=1`)
+
+The `/report` and `/species.csv` endpoints run in the **plumber** container, which is a *separate*
+image from `rstudio` — the `DEPLOY_APPS` msens reinstall never reached it. Left unpinned, its msens
+layer cached at **0.5.0** while the package moved to 0.12.0, so `/report?ver=v8` answered
+`Cannot open database "…/v8/sdm.duckdb"` (no `serve.duckdb` fallback, msens 0.9.1) and drawn areas
+had no `cell_model` support (0.9.0). `server/plumber/Dockerfile` now pins msens by commit and
+asserts the version at build time, so this cannot recur silently.
+
+Rebuild is required (not just a restart): msens lives in the image, not on a volume.
+
+```{r}
+#| label: deploy-api
+
+if (!nzchar(Sys.getenv("DEPLOY_API"))) {
+  log_info("DEPLOY_API unset — leaving the plumber API as it is")
+} else {
+  api_co <- "/share/github/MarineSensitivity/api"
+  cmd_api <- glue(
+    "set -e; ",
+    "cd {api_co}    && git fetch --quiet origin && git merge --ff-only origin/main; ",
+    "cd {srv_repo}  && git fetch --quiet origin && git merge --ff-only origin/main; ",
+    "docker compose up -d --build plumber; ",
+    "echo API_OK $(git -C {api_co} rev-parse --short HEAD)")
+  out_api <- system2("ssh", c("msens", shQuote(cmd_api)), stdout = TRUE, stderr = TRUE)
+  if (!any(grepl("API_OK", out_api))) stop(paste(tail(out_api, 20), collapse = "\n"))
+  # assert the container actually carries the msens the endpoints need
+  chk <- system2("ssh", c("msens", shQuote(glue(
+    "docker exec plumber Rscript -e ",
+    shQuote("cat('MSENS', as.character(packageVersion('msens')), '\\n')")))),
+    stdout = TRUE, stderr = TRUE)
+  log_info("plumber API deployed: {grep('API_OK', out_api, value = TRUE)} | {grep('MSENS', chk, value = TRUE)}")
+  if (!any(grepl("MSENS 0\\.(1[2-9]|[2-9][0-9])", chk)))
+    stop("plumber msens < 0.12.0 — the v8 drawn-area path needs cells_in_polygon(poly, con)")
 }
 ```
 

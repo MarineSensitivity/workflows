@@ -70,7 +70,9 @@ v8 = `apps` branch `main` → `apps_v8/{scores,species}`, served as `/scores_v8`
 `REDO_WORMS=1` (rebuild the worms table), `SCORE_V7COMMON=1` (score only v7's species, for
 apples-to-apples), `SCORE_ALLBIRDS=1` (disable the marine-bird cull), `RELEASE_NO_S3=1` /
 `RELEASE_RAW=1` / `RELEASE_DEPLOY=1` (release + serving), `DEPLOY_APPS=1` / `DEPLOY_APPS_V7=1`
-(reload the v8 / v7 Shiny apps), `DEPLOY_TABLES=1` (sync `tables/` local + repoint the views).
+(reload the v8 / v7 Shiny apps), `DEPLOY_TABLES=1` (sync `tables/` + `model_cell/` local + repoint
+the views), `DEPLOY_API=1` (pull the api repo + **rebuild** the plumber image — msens lives in that
+image, which is separate from `rstudio`, so `DEPLOY_APPS` never updates it).
 
 **Serving reads LOCAL Parquet, not S3.** S3 is the published artifact; the server keeps a versioned
 copy under `/share/data/big/{ver}/` and `serve.duckdb`'s views point there. Over HTTPS every query
