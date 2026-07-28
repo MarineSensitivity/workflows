@@ -45,7 +45,8 @@ requirements, both mandatory:
    ad-hoc `ssh`/`aws`/scratch script. Deploys live in `release_marine-atlas.qmd`: `RELEASE_DEPLOY`
    (serve.duckdb + titiler-v8 + STAC), `DEPLOY_APPS` (pull `apps_v8` + reload only the v8 apps via
    `restart.txt`; v7 untouched), `RELEASE_S3_TABLES` (push `tables/` incl `native_asset` without the
-   full serve cutover).
+   full serve cutover), `DEPLOY_TABLES` (rsync `tables/` to the server + repoint the views at that
+   LOCAL copy — no S3 push, no titiler/caddy restart).
 2. **Rendered to HTML** — run via `targets::tar_make()` or `quarto render`, which produce the tracked
    `_output/*.html` (Design mermaid + summary tables) that the workflows landing page links.
    `purl(...) + source()` is for quick diagnostics ONLY — it skips the HTML and the content-hash
@@ -69,7 +70,15 @@ v8 = `apps` branch `main` → `apps_v8/{scores,species}`, served as `/scores_v8`
 `REDO_WORMS=1` (rebuild the worms table), `SCORE_V7COMMON=1` (score only v7's species, for
 apples-to-apples), `SCORE_ALLBIRDS=1` (disable the marine-bird cull), `RELEASE_NO_S3=1` /
 `RELEASE_RAW=1` / `RELEASE_DEPLOY=1` (release + serving), `DEPLOY_APPS=1` / `DEPLOY_APPS_V7=1`
-(reload the v8 / v7 Shiny apps).
+(reload the v8 / v7 Shiny apps), `DEPLOY_TABLES=1` (sync `tables/` local + repoint the views).
+
+**Serving reads LOCAL Parquet, not S3.** S3 is the published artifact; the server keeps a versioned
+copy under `/share/data/big/{ver}/` and `serve.duckdb`'s views point there. Over HTTPS every query
+re-reads each Parquet footer — a ~140 ms floor that costs **18–24×** on the small interactive
+queries (Program-areas panel: 0.147 s S3 vs 0.008 s local warm; 0.364 s vs 0.015 s cold). `tables/`
+is only 445 MB and syncs in ~14 s. `cell_model` follows the same rule for a different reason (its
+per-cell/per-polygon queries touch many partitions, which fails outright over HTTPS). Only
+`model_cell` stays on S3 — titiler reads exactly one partition per tile as a point read.
 
 ### Unit tests (non-negotiable — the model logic must stay guarded)
 

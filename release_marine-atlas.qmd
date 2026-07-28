@@ -50,11 +50,15 @@ do_apps   <-  do_deploy || nzchar(Sys.getenv("DEPLOY_APPS"))        # (re)deploy
 # RELEASE_DEPLOY, so a routine v8 release can never restart them. Opt in explicitly.
 do_apps_v7 <- nzchar(Sys.getenv("DEPLOY_APPS_V7"))
 do_s3_tbl <-  do_s3     || nzchar(Sys.getenv("RELEASE_S3_TABLES"))  # push derived tables (native_asset) without the full serve cutover
+# the derived tables are ALSO served from local Parquet on the server (see the tables chunk);
+# DEPLOY_TABLES=1 refreshes just that, with no S3 push and no titiler/caddy restart.
+do_tables <- do_deploy || nzchar(Sys.getenv("DEPLOY_TABLES"))
 # server targets (parallel titiler-v8)
 srv_repo  <- "/share/github/MarineSensitivity/server"
 srv_viewdb<- glue("/share/data/big/{ver}/serve.duckdb")
-# cell_model lives as LOCAL Parquet on the server (see the viewdb chunk)
+# cell_model + the derived tables live as LOCAL Parquet on the server (see the viewdb chunk)
 srv_cellmodel <- glue("/share/data/big/{ver}/cell_model")
+srv_tables    <- glue("/share/data/big/{ver}/tables")
 srv_stac  <- glue("/share/data/derived/stac/{ver}")
 titiler_v8<- glue("https://titiler-{ver}.marinesensitivity.org/msens")
 stopifnot("run build_registry first" = {
@@ -318,6 +322,59 @@ code <- system2("curl", c("-s","-o","/dev/null","-w","%{http_code}","--retry","3
   glue("{titiler_v8}/tilejson.json?mdl_key={URLencode(mk, reserved = TRUE)}")), stdout = TRUE)
 log_info("titiler-{ver} /tilejson.json?mdl_key={mk} smoke test: HTTP {code} (expect 200)")
 if (!identical(code, "200")) log_warn("titiler-{ver} merged-surface smoke test != 200 — check the factory")
+}
+```
+
+## Serve the derived tables from LOCAL Parquet (versioned sync)
+
+S3 stays the published artifact; **serving** reads a server-local copy. Every app interaction
+re-reads each Parquet footer over HTTPS, which puts a **~140 ms floor** under every query — worst
+for the small, interactive ones. Benchmarked on msens1 itself (same region as the bucket, so
+best-case S3), running the scores app's real queries:
+
+| query | rows | cold S3 | cold local | warm S3 | warm local |
+|---|---|---|---|---|---|
+| Program-areas panel (`app.R:1488`) | 20 | 0.364 s | 0.015 s | 0.147 s | 0.008 s |
+| cell layer, full study area | 623,212 | 1.267 s | 0.244 s | 0.247 s | 0.180 s |
+| species table for one Program Area | 3,232 | 0.468 s | 0.041 s | 0.054 s | 0.012 s |
+| clicked-cell environment | 1 | 0.710 s | 0.175 s | 0.150 s | 0.068 s |
+
+18–24× on the interactive queries, and *cold* is what every new app session pays. The whole set is
+**445 MB** and syncs in ~14 s, so there is no reason to pay that. Same rsync-then-repoint pattern as
+`cell_model`, and for the same reason: DuckDB validates a `read_parquet()` path at **CREATE VIEW**
+time, so the repoint must run where the files are. Versioned by `{ver}` on both ends, so a version
+bump lands in its own directory and the views follow it.
+
+`model_cell` deliberately stays on S3 — it is the per-model point-read surface titiler uses, not
+something the apps scan.
+
+```{r}
+#| label: tables-local
+
+if (!do_tables) {
+  log_info("RELEASE_DEPLOY/DEPLOY_TABLES unset — leaving the server's table views as they are")
+} else {
+  system2("ssh", c("msens", glue("mkdir -p {srv_tables}")))
+  system2("rsync", c("-aq", "--delete", glue("{tbl_dir}/"), glue("msens:{srv_tables}/")))
+  log_info("synced tables -> msens:{srv_tables}")
+  # repoint every released table view at the server's local copy, preserving the
+  # `val AS value` back-compat alias the apps still rely on. Verified with a real
+  # count so a half-synced directory FAILS LOUDLY instead of serving broken views.
+  fix_tbls <- glue(
+    "docker exec rstudio Rscript -e ",
+    shQuote(glue(
+      "vt <- strsplit('cell_metric,zone_metric,zone', ',')[[1]]; ",
+      "tt <- strsplit('{paste(rel_tables, collapse = \",\")}', ',')[[1]]; ",
+      "con <- DBI::dbConnect(duckdb::duckdb('{srv_viewdb}')); ",
+      "for (t in tt) DBI::dbExecute(con, sprintf(",
+      "\"CREATE OR REPLACE VIEW %s AS SELECT *%s FROM read_parquet('{srv_tables}/%s.parquet')\", ",
+      "t, if (t %in% vt) ', val AS value' else '', t)); ",
+      "cat('TABLES_OK', length(tt), DBI::dbGetQuery(con, ",
+      "'SELECT count(*) n FROM zone_metric')$n, '\\n'); ",
+      "DBI::dbDisconnect(con, shutdown = TRUE)")))
+  out_tb <- system2("ssh", c("msens", shQuote(fix_tbls)), stdout = TRUE, stderr = TRUE)
+  if (!any(grepl("TABLES_OK", out_tb))) stop(paste(tail(out_tb, 15), collapse = "\n"))
+  log_info("table views repointed to local Parquet: {grep('TABLES_OK', out_tb, value = TRUE)}")
 }
 ```
 
