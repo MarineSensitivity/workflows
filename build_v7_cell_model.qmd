@@ -46,7 +46,7 @@ flowchart LR
 ```{r}
 #| label: setup
 
-librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, quiet = T)
+librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, rlang, quiet = T)
 source(here("libs/paths.R"))
 
 V7_NCOL   <- 3103L                       # v7 grid width (regional 0-360 raster)
@@ -162,6 +162,20 @@ the filesystem, so in-flight sessions finish on the old inode and `restart.txt` 
 if (!do_deploy) {
   log_info("DEPLOY_V7_CELLMODEL unset — built locally only")
 } else {
+  # HARD GUARD, ordering matters. msens < 0.13.0 has no cell_grid_ncol(), so
+  # species_for_cells() would tile v7 cells with the 7200 default, prune away the
+  # very partitions holding them, and return FEWER SPECIES WITH NO ERROR. Ship
+  # msens first (DEPLOY_APPS=1 / DEPLOY_API=1), then register the view.
+  v <- system2("ssh", c("msens", shQuote(glue(
+    "docker exec -u shiny rstudio Rscript -e ",
+    shQuote("cat(as.character(packageVersion('msens')))")))), stdout = TRUE, stderr = TRUE)
+  v <- utils::tail(grep("^[0-9]+\\.[0-9]+", v, value = TRUE), 1)
+  if (!length(v) || package_version(v) < "0.13.0")
+    stop(glue("server msens is {v %||% '?'}; need >= 0.13.0 for cell_grid_ncol() — ",
+              "run DEPLOY_APPS=1 (and DEPLOY_API=1) on release_marine-atlas.qmd first, ",
+              "else v7 reports silently lose species"))
+  log_info("server msens {v} >= 0.13.0 — safe to register the v7 cell_model view")
+
   system2("ssh", c("msens", glue("mkdir -p {srv_v7}/cell_model")))
   system2("rsync", c("-aq", "--delete", glue("{cell_mc}/"), glue("msens:{srv_v7}/cell_model/")))
   log_info("synced cell_model -> msens:{srv_v7}/cell_model")
