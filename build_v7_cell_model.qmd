@@ -1,0 +1,208 @@
+---
+title: "Build v7 cell_model — the cell-oriented twin of v7 model_cell"
+msens:
+  target_name: build_v7_cell_model
+  workflow_type: release
+  dependency: []
+  output: data/manifests/build_v7_cell_model.json
+editor_options:
+  chunk_output_type: console
+---
+
+v7 is the **default live** generation (`/scores`, `/species`, and the API's `ver=latest`), and its
+drawn-area report path scans `model_cell` — partitioned by nothing, keyed by `mdl_seq` — for every
+per-cell question. This builds v7 the same cell-oriented surface v8 already has, so
+`msens::species_for_cells()` prunes to a handful of spatial partitions instead.
+
+Two things make this **not** a rerun of the v8 recipe:
+
+1. **A different grid.** v8 tiles a global 7200 × 3600 grid; v7's `cell_id`s come from the regional
+   0–360 bio-oracle raster, **3103 × 2006**. The tile key must use 3103, and readers must *discover*
+   that rather than assume it — hence `msens::cell_grid_ncol()` and the `cell_grid` sidecar table
+   written below. Using 7200 here would not error; it would simply scatter a compact polygon across
+   many tiles and forfeit the pruning.
+2. **Half the rows are unreachable.** `model_cell` holds 1,184,895,607 rows across 30,061 models,
+   but `species_for_cells()` joins `taxon ON taxon.mdl_seq = model_cell.mdl_seq` — and **13,678
+   models / 613,315,679 rows (52%) are not referenced by any taxon**. They are the raw per-dataset
+   inputs the species app browses individually (10,997 `am_0.05`, 1,518 `rng_iucn`, …), reachable
+   via their own COGs. Including them would double the artifact for no reader. `V7_CELLMODEL_ALL=1`
+   overrides.
+
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "v7 model_cell (by mdl_seq) → cell_model (by 2.5° spatial tile), taxon-linked only"
+flowchart LR
+  mc["v7 model_cell<br/>1.18B rows / 30,061 models"] --> f{"referenced<br/>by a taxon?"}
+  f -- "no: 613.3M / 13,678" --> x["skipped<br/>(raw inputs, own COGs)"]
+  f -- "yes: 571.6M / 16,383" --> t["tile = f(cell_id, ncol=3103)"]
+  t --> p["cell_model/tile=*/​*.parquet"]
+  p --> v["v7 sdm.duckdb:<br/>cell_model VIEW + cell_grid"]
+```
+
+## Setup
+
+```{r}
+#| label: setup
+
+librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, quiet = T)
+source(here("libs/paths.R"))
+
+V7_NCOL   <- 3103L                       # v7 grid width (regional 0-360 raster)
+v7_db     <- msens::sdm_db_path("v7")
+dir_v7    <- path_dir(v7_db)
+cell_mc   <- glue("{dir_v7}/cell_model")   # local build target
+srv_v7    <- "/share/data/big/v7"
+do_all    <- nzchar(Sys.getenv("V7_CELLMODEL_ALL"))     # include non-taxon models
+do_build  <- !dir_exists(cell_mc) || nzchar(Sys.getenv("V7_CELLMODEL_REDO"))
+do_deploy <- nzchar(Sys.getenv("DEPLOY_V7_CELLMODEL"))
+
+stopifnot("v7 sdm.duckdb not found" = file_exists(v7_db))
+log_info("v7 db: {v7_db} ({round(file_size(v7_db)/1e9, 2)} GB) -> {cell_mc}")
+
+# ONE connection for the whole notebook, closed in the last chunk. `on.exit()` is
+# the wrong idiom here: knitr fires it at the end of the chunk that registered it,
+# so a connection opened in one chunk is already dead in the next.
+con <- dbConnect(duckdb(v7_db, read_only = TRUE))
+dbExecute(con, "PRAGMA memory_limit='12GB'"); dbExecute(con, "PRAGMA threads=6")
+dbExecute(con, glue("PRAGMA temp_directory='{dir_v7}/duckdb_tmp'"))
+```
+
+## Build the partitioned surface
+
+Partitioned, never globally sorted: an `ORDER BY` over ~572M rows previously spilled ~500 GB on the
+v8 build. `partitioned_write_max_open_files` is raised because every tile is written concurrently.
+
+```{r}
+#| label: build
+
+if (!do_build) {
+  log_info("{cell_mc} exists — skipping build (V7_CELLMODEL_REDO=1 to force)")
+} else {
+  if (dir_exists(cell_mc)) dir_delete(cell_mc)
+  dbExecute(con, "SET partitioned_write_max_open_files=2048")
+
+  # the tile key comes from msens so writer and reader cannot drift (test-cell-model.R
+  # asserts they agree on this exact grid)
+  tile_sql <- msens::cell_model_tile_sql("mc.cell_id", ncol = V7_NCOL)
+  join_sql <- if (do_all) "" else
+    "JOIN (SELECT DISTINCT mdl_seq FROM taxon WHERE mdl_seq IS NOT NULL) t USING (mdl_seq)"
+
+  t0 <- Sys.time()
+  dbExecute(con, glue(
+    "COPY (SELECT {tile_sql} AS tile, mc.mdl_seq, mc.cell_id, mc.value AS val ",
+    "      FROM model_cell mc {join_sql}) ",
+    "TO '{cell_mc}' (FORMAT PARQUET, PARTITION_BY tile, OVERWRITE_OR_IGNORE)"))
+  log_info("built in {round(as.numeric(difftime(Sys.time(), t0, units='mins')), 1)} min")
+}
+```
+
+## Validate
+
+A wrong tile id is still a *valid* tile id, so a writer/reader mismatch returns **fewer rows, not an
+error**. These checks would catch that: the same cells must resolve identically whether read by
+`tile` (pruned) or by `cell_id` alone (unpruned).
+
+```{r}
+#| label: validate
+
+mc_glob <- glue("{cell_mc}/*/*.parquet")
+
+smry <- dbGetQuery(con, glue(
+  "SELECT count(*) n_rows, count(DISTINCT mdl_seq) n_models,
+          count(DISTINCT tile) n_tiles, count(DISTINCT cell_id) n_cells
+   FROM read_parquet('{mc_glob}', hive_partitioning = true)"))
+log_info("cell_model: {format(smry$n_rows, big.mark=',')} rows, {smry$n_models} models, ",
+         "{smry$n_tiles} tiles, {format(smry$n_cells, big.mark=',')} cells, ",
+         "{round(as.numeric(sum(file_size(dir_ls(cell_mc, recurse = TRUE, type = 'file'))))/1e9, 2)} GB")
+
+# pruned vs unpruned must agree for a sample of cells
+set.seed(42)
+cid   <- dbGetQuery(con, glue(
+  "SELECT DISTINCT cell_id FROM read_parquet('{mc_glob}', hive_partitioning = true)
+   USING SAMPLE 200 ROWS"))$cell_id
+tiles <- msens::cell_model_tiles(cid, ncol = V7_NCOL)
+ids   <- paste(cid, collapse = ",")
+n_pruned <- dbGetQuery(con, glue(
+  "SELECT count(*) n FROM read_parquet('{mc_glob}', hive_partitioning = true)
+   WHERE tile IN ({paste(tiles, collapse=',')}) AND cell_id IN ({ids})"))$n
+n_plain  <- dbGetQuery(con, glue(
+  "SELECT count(*) n FROM read_parquet('{mc_glob}', hive_partitioning = true)
+   WHERE cell_id IN ({ids})"))$n
+log_info("tile pruning: {n_pruned} == {n_plain} over {length(cid)} cells, {length(tiles)} tiles")
+stopifnot("tile pruning drops rows — writer/reader grid mismatch" = n_pruned == n_plain)
+
+# and against the source table, so the taxon filter did not lose anything it should keep
+n_src <- dbGetQuery(con, glue(
+  "SELECT count(*) n FROM model_cell mc
+   {if (do_all) '' else 'JOIN (SELECT DISTINCT mdl_seq FROM taxon WHERE mdl_seq IS NOT NULL) t USING (mdl_seq)'}"))$n
+stopifnot("row count differs from source" = smry$n_rows == n_src)
+log_info("row count matches source: {format(n_src, big.mark=',')}")
+
+msens::report_table(tibble::tibble(
+  rows = smry$n_rows, models = smry$n_models, tiles = smry$n_tiles,
+  cells = smry$n_cells, grid_ncol = V7_NCOL,
+  scope = if (do_all) "all models" else "taxon-linked only"))
+```
+
+## Deploy to msens1 (`DEPLOY_V7_CELLMODEL=1`)
+
+rsync the parquet, then register it in the server's v7 `sdm.duckdb` — a `cell_model` VIEW (so
+`species_for_cells()` picks it up via `use_cm`) plus the `cell_grid` sidecar so
+`msens::cell_grid_ncol()` returns 3103 rather than the v8 default.
+
+The DDL runs against a **copy** which is then swapped in atomically: every live v7 Shiny session
+holds a read lock, so an in-place write fails with `Conflicting lock is held`. `mv` is atomic within
+the filesystem, so in-flight sessions finish on the old inode and `restart.txt` rolls them over.
+
+```{r}
+#| label: deploy
+
+if (!do_deploy) {
+  log_info("DEPLOY_V7_CELLMODEL unset — built locally only")
+} else {
+  system2("ssh", c("msens", glue("mkdir -p {srv_v7}/cell_model")))
+  system2("rsync", c("-aq", "--delete", glue("{cell_mc}/"), glue("msens:{srv_v7}/cell_model/")))
+  log_info("synced cell_model -> msens:{srv_v7}/cell_model")
+
+  register <- glue(
+    "con <- DBI::dbConnect(duckdb::duckdb('{srv_v7}/sdm.duckdb.new')); ",
+    "DBI::dbExecute(con, \"CREATE OR REPLACE VIEW cell_model AS SELECT cm.tile, cm.mdl_seq, ",
+    "cm.cell_id, cm.val, cm.val AS value FROM read_parquet('{srv_v7}/cell_model/*/*.parquet', ",
+    "hive_partitioning = true) cm\"); ",
+    "DBI::dbExecute(con, 'CREATE OR REPLACE TABLE cell_grid AS SELECT {V7_NCOL} AS ncol'); ",
+    "cat('V7CM_OK', DBI::dbGetQuery(con, ",
+    "'SELECT count(*) n FROM cell_model WHERE tile = (SELECT min(tile) FROM cell_model)')$n, '\\n'); ",
+    "DBI::dbDisconnect(con, shutdown = TRUE)")
+  v7_apps <- c("mapgl", "mapsp")
+  cmd <- glue(
+    "set -e; ",
+    "cp -f {srv_v7}/sdm.duckdb {srv_v7}/sdm.duckdb.new; ",
+    "docker exec rstudio Rscript -e {shQuote(register)}; ",
+    "mv -f {srv_v7}/sdm.duckdb.new {srv_v7}/sdm.duckdb; ",
+    "{paste(sprintf('touch /share/github/MarineSensitivity/apps/%s/restart.txt', v7_apps), collapse='; ')}")
+  out <- system2("ssh", c("msens", shQuote(cmd)), stdout = TRUE, stderr = TRUE)
+  if (!any(grepl("V7CM_OK", out))) stop(paste(tail(out, 20), collapse = "\n"))
+  log_info("v7 cell_model registered + apps reloaded: {grep('V7CM_OK', out, value = TRUE)}")
+}
+```
+
+## Manifest
+
+```{r}
+#| label: manifest
+
+msens::write_manifest(
+  here("data/manifests/build_v7_cell_model.json"),
+  target       = "build_v7_cell_model",
+  content_hash = msens::hash_query(
+    con, glue("SELECT tile, mdl_seq, cell_id, val FROM read_parquet('{mc_glob}', hive_partitioning = true)")),
+  stats = list(
+    rows = smry$n_rows, models = smry$n_models, tiles = smry$n_tiles,
+    cells = smry$n_cells, grid_ncol = V7_NCOL,
+    scope = if (do_all) "all" else "taxon_linked"),
+  force = msens::force_target("build_v7_cell_model"))
+
+dbDisconnect(con, shutdown = TRUE)
+```
