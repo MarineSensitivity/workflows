@@ -1,0 +1,225 @@
+---
+title: "Publish a searchable STAC API — per-model Items over stac-geoparquet"
+msens:
+  target_name: publish_stac_api
+  workflow_type: release
+  dependency: [build_registry]
+  output: data/manifests/publish_stac_api.json
+editor_options:
+  chunk_output_type: console
+---
+
+The **static** catalog (`file.marinesensitivity.org/stac`) is a dataset-level document: one Item per
+collection, whose assets are S3 **prefixes** (`…/native/am_native/`, which 403s), and whose bbox is
+the whole dataset envelope. So it cannot answer the two questions STAC exists for — *give me the
+asset for this model*, and *which models cover this area*. Reaching a single model's COG is done by
+filename convention, not by traversal.
+
+This publishes the missing half: **one Item per model**, served by
+[stac-fastapi-duckdb](https://github.com/Healy-Hyperspatial/stac-fastapi-duckdb) over
+**stac-geoparquet** — DuckDB reading Parquet, which is what the rest of this stack already is. The
+static catalog stays as-is; this is additive.
+
+> **The backend is marked Experimental** by both its repo and the
+> [stac-fastapi docs](https://stac-utils.github.io/stac-fastapi/#backends) (pgstac and
+> Elasticsearch/OpenSearch are the production-ready ones). It is a good fit here because our items
+> are already Parquet, but it should not be treated as load-bearing infrastructure yet.
+
+## The schema it actually wants
+
+Not documented upstream — read from `stac_fastapi/duckdb/{database_logic,utilities}.py`. Queries are
+`SELECT *, ? AS collection FROM read_parquet(?)` with `ST_Intersects(geometry, …)`, and
+`create_stac_item()` treats these as special: `id, geometry, assets, links, type, bbox,
+stac_version, stac_extensions, collection`. **Every other column becomes a property automatically**,
+so this is flatter than full stac-geoparquet.
+
+| column | type | note |
+|---|---|---|
+| `geometry` | `BLOB` | **required**, WKB — shapely `loads()` |
+| `id` | `VARCHAR` | unique within the collection |
+| `bbox` | `DOUBLE[]` | 4 or 6 values |
+| `assets` | `MAP(VARCHAR, STRUCT(...))` | → dict of asset objects |
+| `datetime`, `mdl_key`, `sdm:*` | any | folded into `properties` |
+
+Collections are read from disk, one directory each: `STAC_FILE_PATH/{collection_id}/collection.json`.
+The directory name IS the collection id, so directories are named `msens-{ver}-{ds_key}` to match the
+`id` inside the existing static collection JSONs.
+
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "native_asset → per-model Items as stac-geoparquet → stac-fastapi-duckdb"
+flowchart LR
+  na["native_asset<br/>(mdl_key, representation, asset_url, bbox)"] --> gp["items.parquet per ds_key<br/>WKB geometry + assets MAP"]
+  st["static stac/{ver}/{ds}/collection.json"] --> tree["stac-api/{ver}/msens-{ver}-{ds}/"]
+  gp --> tree
+  tree --> api["stac-fastapi-duckdb :8084<br/>/collections /items /search"]
+  api --> cad["caddy → stac.marinesensitivity.org"]
+```
+
+## Setup
+
+```{r}
+#| label: setup
+
+librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, quiet = T)
+source(here("libs/paths.R"))
+
+stac_api  <- glue("{dir_big_v}/marine-atlas/stac-api/{ver}")   # local build target
+stac_src  <- glue("{dir_big_v}/marine-atlas/stac/{ver}")       # static catalog (collection.json)
+srv_api   <- glue("/share/data/derived/stac-api/{ver}")
+srv_repo  <- "/share/github/MarineSensitivity/server"
+do_deploy <- nzchar(Sys.getenv("DEPLOY_STAC_API"))
+
+stopifnot("static STAC not built — render release_marine-atlas.qmd first" = dir_exists(stac_src))
+con <- dbConnect(duckdb(sdm_db, read_only = TRUE))
+dbExecute(con, "INSTALL spatial; LOAD spatial;")
+log_info("stac-api tree: {stac_api}")
+```
+
+## Build one Items parquet per collection
+
+```{r}
+#| label: build
+
+ds_keys <- dbGetQuery(con, "SELECT DISTINCT ds_key FROM native_asset ORDER BY 1")$ds_key
+if (dir_exists(stac_api)) dir_delete(stac_api)
+dir_create(stac_api, recurse = TRUE)
+
+# COG render params live in native_asset (rescale_min/max, colormap) — carried as
+# properties so a client can render an asset without guessing.
+build_one <- function(ds) {
+  cid <- glue("msens-{ver}-{ds}")
+  dir_create(glue("{stac_api}/{cid}"))
+  file_copy(glue("{stac_src}/{ds}/collection.json"),
+            glue("{stac_api}/{cid}/collection.json"), overwrite = TRUE)
+  pq <- glue("{stac_api}/{cid}/items.parquet")
+  dbExecute(con, glue("
+    COPY (
+      SELECT
+        regexp_replace(regexp_replace(a.mdl_key, '[|]', '-', 'g'), '[:]', '-', 'g') AS id,
+        ST_AsWKB(ST_MakeEnvelope(min(a.xmin), min(a.ymin), max(a.xmax), max(a.ymax))) AS geometry,
+        [min(a.xmin), min(a.ymin), max(a.xmax), max(a.ymax)]                         AS bbox,
+        TIMESTAMP '2023-01-01 00:00:00'                                              AS datetime,
+        a.mdl_key, any_value(a.ms_merge_key) AS ms_merge_key, a.ds_key,
+        any_value(t.scientific_name) AS 'sdm:scientific_name',
+        any_value(t.common_name)     AS 'sdm:common_name',
+        any_value(t.sp_cat)          AS 'sdm:sp_cat',
+        any_value(a.rescale_min)     AS 'sdm:rescale_min',
+        any_value(a.rescale_max)     AS 'sdm:rescale_max',
+        any_value(a.colormap)        AS 'sdm:colormap',
+        map_from_entries(list(struct_pack(
+          key   := a.representation,
+          value := struct_pack(
+            href  := a.asset_url,
+            \"type\" := 'image/tiff; application=geotiff; profile=cloud-optimized',
+            title := CASE a.representation WHEN 'native' THEN 'Native/original surface'
+                                            ELSE 'Model surface (0.05 deg grid)' END,
+            roles := ['data','visual'])))) AS assets
+      FROM native_asset a
+      LEFT JOIN taxon t ON t.ms_merge_key = a.ms_merge_key
+      WHERE a.ds_key = '{ds}'
+      GROUP BY a.mdl_key, a.ds_key
+    ) TO '{pq}' (FORMAT PARQUET)"))
+  n <- dbGetQuery(con, glue("SELECT count(*) n FROM read_parquet('{pq}')"))$n
+  tibble::tibble(collection = cid, items = n,
+                 mb = round(as.numeric(file_size(pq)) / 1e6, 2))
+}
+d_built <- dplyr::bind_rows(lapply(ds_keys, build_one))
+log_info("built {nrow(d_built)} collections, {format(sum(d_built$items), big.mark=',')} items")
+
+# PARQUET_URLS_JSON: collection id -> parquet path INSIDE the container
+urls <- setNames(
+  as.list(glue("file:///app/stac_collections/{d_built$collection}/items.parquet")),
+  d_built$collection)
+write_json(urls, glue("{stac_api}/parquet_urls.json"), auto_unbox = TRUE, pretty = TRUE)
+
+msens::report_table(d_built)
+```
+
+## Validate
+
+The backend only ever does `SELECT *` — a malformed geometry or a MAP that will not convert shows up
+as a 500 at request time, not here. So check the shape the Python side depends on.
+
+```{r}
+#| label: validate
+
+pq_am <- glue("{stac_api}/msens-{ver}-am/items.parquet")
+schema <- dbGetQuery(con, glue("DESCRIBE SELECT * FROM read_parquet('{pq_am}')"))
+stopifnot(
+  "geometry must be WKB BLOB" =
+    schema$column_type[schema$column_name == "geometry"] == "BLOB",
+  "bbox must be a DOUBLE list" =
+    schema$column_type[schema$column_name == "bbox"] == "DOUBLE[]",
+  "assets must be a MAP" =
+    grepl("^MAP", schema$column_type[schema$column_name == "assets"]))
+
+# geometry must round-trip, and ST_Intersects must work (that is the search path)
+chk <- dbGetQuery(con, glue("
+  SELECT count(*) n_total,
+         count(*) FILTER (WHERE ST_Intersects(ST_GeomFromWKB(geometry),
+           ST_MakeEnvelope(-121, 34, -119, 35.5))) AS n_socal
+  FROM read_parquet('{pq_am}')"))
+log_info("am items: {format(chk$n_total, big.mark=',')} total, {chk$n_socal} intersect the SoCal bbox")
+stopifnot("ST_Intersects returned nothing — geometry is unusable" = chk$n_socal > 0)
+
+# the Leatherback example must be reachable by id with both assets
+ex <- dbGetQuery(con, glue(
+  "SELECT id, mdl_key, map_keys(assets) AS ks FROM read_parquet('{pq_am}')
+   WHERE mdl_key = 'am|Rep-3437'"))
+log_info("example: id={ex$id} mdl_key={ex$mdl_key} assets={paste(ex$ks[[1]], collapse=',')}")
+stopifnot("example item missing" = nrow(ex) == 1)
+```
+
+## Deploy (`DEPLOY_STAC_API=1`)
+
+rsync the tree, then bring up the `stac-api` service defined in `server/docker-compose.yml`. The
+image builds from the upstream repo pinned by commit; `PARQUET_URLS_JSON` is passed from the file
+generated above so adding a dataset needs no compose edit.
+
+```{r}
+#| label: deploy
+
+if (!do_deploy) {
+  log_info("DEPLOY_STAC_API unset — built locally only")
+} else {
+  ok <- function(rc, what)
+    if (!identical(as.integer(rc), 0L)) stop(glue("{what} failed, exit {rc}"))
+  ok(system2("ssh", c("msens", shQuote(glue("mkdir -p {srv_api}")))), "mkdir")
+  ok(system2("rsync", c("-a", "--delete", glue("{stac_api}/"), glue("msens:{srv_api}/"))),
+     "rsync stac-api")
+  log_info("synced stac-api -> msens:{srv_api}")
+
+  pu  <- paste(readLines(glue("{stac_api}/parquet_urls.json")), collapse = "")
+  # `docker compose restart caddy`, not `caddy reload`: the Caddyfile is a
+  # SINGLE-FILE bind mount, so a git pull replaces the inode and the running
+  # container keeps serving the old one.
+  cmd <- glue(
+    "set -e; cd {srv_repo} && git fetch --quiet origin && git merge --ff-only origin/main; ",
+    "PARQUET_URLS_JSON={shQuote(pu)} docker compose up -d --build --force-recreate stac-api; ",
+    "docker compose restart caddy; sleep 12; ",
+    "echo STAC_HTTP $(curl -s -o /dev/null -w '%{{http_code}}' http://localhost:8085/collections)")
+  out <- system2("ssh", c("msens", shQuote(cmd)), stdout = TRUE, stderr = TRUE)
+  if (!any(grepl("STAC_HTTP 200", out)))
+    stop(glue("stac-api did not come up:\n"), paste(utils::tail(out, 25), collapse = "\n"))
+  log_info("stac-api up: {grep('STAC_HTTP', out, value = TRUE)}")
+}
+```
+
+## Manifest
+
+```{r}
+#| label: manifest
+
+msens::write_manifest(
+  here("data/manifests/publish_stac_api.json"),
+  target       = "publish_stac_api",
+  content_hash = digest::digest(d_built),
+  stats = list(collections = nrow(d_built), items = sum(d_built$items),
+               ver = ver, backend = "stac-fastapi-duckdb (experimental)"),
+  force = msens::force_target("publish_stac_api"))
+
+dbDisconnect(con, shutdown = TRUE)
+```
