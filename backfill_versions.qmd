@@ -1,0 +1,210 @@
+---
+title: "Backfill a past release into the multi-version atlas"
+msens:
+  target_name: backfill_versions
+  workflow_type: release
+  dependency: [build_zone_cells]
+  output: data/manifests/backfill_versions.json
+params:
+  ver: v7
+editor_options:
+  chunk_output_type: console
+---
+
+Every release v1–v7 exists only as a monolithic `sdm.duckdb` on the server. To render one in the
+current app it needs what v8 has: **app-facing tables as Parquet**, a **`mdl_seq` ↔ `mdl_key`
+crosswalk**, **COGs** for its surfaces, and a **`manifest.json`** describing all of it.
+
+This does that for one release, parameterized by `ver`, so the same notebook backfills each in turn.
+
+> **Two halves, deliberately separated.** The tables + crosswalk + manifest are cheap (minutes) and
+> are what make a version *discoverable*. The COG build is expensive — ~30,000 rasters from a
+> 1.18-billion-row surface — and is gated behind `BACKFILL_COGS=1`. That box also serves the live
+> apps on 4 cores, so the heavy half should be run deliberately, not as a side effect.
+
+## What makes this affordable
+
+The content-addressed store means a release only pays for surfaces nobody has published yet.
+Measured across v3/v5/v6/v7: 120,974 model-rows collapse to **19,766 unique surfaces (6.12×)**, and
+v6↔v7 is **30,061/30,061 identical**. So the first `usa05` backfill is the expensive one and each
+subsequent release is mostly hashing.
+
+## Setup
+
+```{r}
+#| label: setup
+#| message: false
+
+librarian::shelf(arrow, DBI, dplyr, duckdb, glue, knitr, logger, terra,
+                 MarineSensitivity/msens, quiet = TRUE)
+source(here::here("libs/paths.R"))
+
+bver     <- params$ver
+do_cogs  <- Sys.getenv("BACKFILL_COGS") != ""
+test_n   <- suppressWarnings(as.integer(Sys.getenv("BACKFILL_TEST_N", "")))
+n_work   <- as.integer(Sys.getenv("BACKFILL_WORKERS", "2"))
+
+grid_id  <- msens::grid_for_ver(bver)
+db       <- path.expand(sub(glue("/{ver}/"), glue("/{bver}/"), sdm_db))
+dir_v    <- path.expand(glue("{dir_big}/{bver}"))
+dir_tbl  <- file.path(dir_v, "tables")
+dir_cog  <- file.path(dir_v, "backfill_cogs")
+dir.create(dir_tbl, recursive = TRUE, showWarnings = FALSE)
+
+stopifnot("release database not found" = file.exists(db))
+log_info("backfilling {bver} (grid {grid_id}) from {db}; cogs={do_cogs}")
+
+con <- dbConnect(duckdb(), db, read_only = TRUE)
+val <- if ("val" %in% dbListFields(con, "model_cell")) "val" else "value"   # v8 vs v1-v7
+log_info("model_cell value column: {val}")
+```
+
+## The `mdl_seq` ↔ `mdl_key` crosswalk
+
+`mdl_seq` is an autoincrement that **renumbers on every rebuild**, so a v6 deep link resolves to a
+different species in v7 — which is why URLs had to move to the stable `mdl_key`. The old `model`
+table happens to carry everything needed to mint one: `ds_key` plus `taxa`, which *is* the source
+species id (`am_0.05` / `ITS-Mam-180528`). So the crosswalk is mechanical, not hand-built.
+
+```{r}
+#| label: crosswalk
+
+model <- dbGetQuery(con, "SELECT mdl_seq, ds_key, taxa FROM model")
+
+# v1-v7 spell AquaMaps 'am_0.05'; the mdl_key grammar uses 'am'
+norm_ds <- function(x) sub("^am_0\\.05$", "am", x)
+
+xwalk <- model |>
+  mutate(ds_key  = norm_ds(ds_key),
+         mdl_key = msens::mdl_key_raw(ds_key, taxa))
+stopifnot("mdl_key collision" = !any(duplicated(xwalk$mdl_key)))
+
+log_info("{nrow(xwalk)} models crosswalked")
+knitr::kable(head(xwalk, 5))
+```
+
+## Content-hash every surface
+
+```{r}
+#| label: hashes
+
+t0 <- Sys.time()
+h  <- msens::content_hashes(con, "model_cell", by = "mdl_seq", cols = c("cell_id", val))
+log_info("hashed {nrow(h)} models in {round(as.numeric(difftime(Sys.time(), t0, units='secs')))}s")
+
+ENC <- "int1u-nd0-noovr"   # encoding is part of the object identity; see content_hash_encoded()
+h <- h |>
+  mutate(payload_hash = content_hash,
+         content_hash = msens::content_hash_encoded(content_hash, ENC)) |>
+  left_join(xwalk, by = "mdl_seq") |>
+  mutate(cog_url = msens::content_url(grid_id, content_hash))
+
+store <- tryCatch(msens::cog_store_index(grid_id), error = function(e) character())
+log_info("{length(store)} object(s) already in cog/{grid_id}/; {sum(!h$content_hash %in% store)} new")
+
+knitr::kable(
+  h |> summarise(models = n(), unique_surfaces = n_distinct(content_hash),
+                 already_published = sum(content_hash %in% store)))
+```
+
+## Build the COGs (gated)
+
+```{r}
+#| label: cogs
+
+built <- 0L
+if (do_cogs) {
+  dir.create(dir_cog, recursive = TRUE, showWarnings = FALSE)
+  grid <- msens::grid_spec_for(grid_id)
+
+  todo <- h |> distinct(content_hash, .keep_all = TRUE) |> filter(!content_hash %in% store)
+  if (!is.na(test_n) && test_n > 0) { todo <- head(todo, test_n); log_warn("TEST_N={test_n}") }
+  log_info("{nrow(todo)} raster(s) to build")
+
+  for (i in seq_len(nrow(todo))) {
+    r   <- todo[i, ]
+    out <- file.path(dir_cog, basename(msens::content_key(grid_id, r$content_hash)))
+    if (file.exists(out)) next
+    d <- dbGetQuery(con, glue("SELECT cell_id, {val} AS val FROM model_cell WHERE mdl_seq = {r$mdl_seq}"))
+    if (nrow(d)) {
+      msens::publish_cog(d$cell_id, d$val, out, grid,
+                         datatype = "INT1U", nodata = 0, overview = FALSE)
+      built <- built + 1L
+    }
+    if (i %% 500 == 0) log_info("  {i}/{nrow(todo)}")
+  }
+  log_info("built {built} COG(s), {round(sum(file.info(list.files(dir_cog, full.names=TRUE))$size, na.rm=TRUE)/1024^2)} MB")
+} else {
+  log_info("BACKFILL_COGS unset - skipping the expensive half")
+}
+```
+
+## Export the app-facing tables
+
+```{r}
+#| label: tables
+
+want <- c("cell", "taxon", "model", "metric", "cell_metric", "zone", "zone_cell",
+          "zone_metric", "zone_taxon", "dataset", "taxon_model", "listing")
+have <- intersect(want, dbListTables(con))
+
+sizes <- vapply(have, function(t) {
+  d <- dbGetQuery(con, glue("SELECT * FROM {t}"))
+  f <- file.path(dir_tbl, paste0(t, ".parquet"))
+  arrow::write_parquet(d, f, compression = "zstd")
+  nrow(d)
+}, numeric(1))
+
+# the crosswalk ships as a table of its own: it is what lets a legacy
+# ?mdl_seq= link resolve, and what a merged COG href hangs off
+model_asset <- h |>
+  transmute(mdl_key, mdl_seq, ds_key, sp_id = taxa, n_cells = n,
+            content_hash, cog_url, grid_id = grid_id, ver = bver)
+arrow::write_parquet(model_asset, file.path(dir_tbl, "model_asset.parquet"), compression = "zstd")
+
+knitr::kable(data.frame(table = c(have, "model_asset"), rows = c(sizes, nrow(model_asset))),
+             caption = glue("{bver} tables exported to {dir_tbl}"))
+```
+
+## Manifest
+
+```{r}
+#| label: manifest
+
+versions <- readr::read_csv(here::here("data/versions.csv"), show_col_types = FALSE)
+v_row    <- versions |> filter(ver == bver)
+stopifnot("version missing from data/versions.csv" = nrow(v_row) == 1)
+
+mfst <- msens::manifest_build(
+  con, bver,
+  status = v_row$status,
+  base   = msens::atlas_base_url(),
+  # COGs are declared only once they exist; until then the app must not offer a
+  # layer it cannot draw
+  capabilities = list(score_cogs = FALSE, model_cogs = built > 0 || length(store) > 0),
+  extra = list(title = v_row$title, released = as.character(v_row$released),
+               models = glue("{msens::atlas_base_url()}/{bver}/tables/model_asset.parquet")))
+
+f_mfst <- file.path(dir_v, "manifest.json")
+writeLines(as.character(jsonlite::toJSON(mfst, auto_unbox = TRUE, pretty = TRUE, na = "null")), f_mfst)
+msens::validate_manifest(jsonlite::fromJSON(f_mfst), ver = bver)
+dbDisconnect(con, shutdown = TRUE)
+
+cat(glue("{bver}: id_field={mfst$id_field} grid={mfst$grid_id} tables={length(mfst$tables)} ",
+         "metrics={nrow(mfst$metrics)} zones={nrow(mfst$zones)}\n"))
+```
+
+## Target manifest
+
+```{r}
+#| label: target-manifest
+
+msens::write_manifest(
+  here::here("data/manifests/backfill_versions.json"),
+  target       = "backfill_versions",
+  content_hash = digest::digest(list(bver, h$content_hash), algo = "xxhash64"),
+  stats = list(ver = bver, grid_id = grid_id, n_models = nrow(h),
+               n_unique_surfaces = length(unique(h$content_hash)),
+               n_cogs_built = built, n_tables = length(have)),
+  force = msens::force_target("backfill_versions"))
+```
