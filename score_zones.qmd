@@ -23,7 +23,7 @@ cell-id grid. Scoring formulas need `zone_cell.pct_covered` at every step.
 flowchart LR
   mrg["dist_merged model_cell"] --> mc["model_cell (sdm.duckdb)"]
   mtx["merge.duckdb taxon<br/>+ v7 in_v7/is_er_spatial"] --> tx["taxon (scoring)"]
-  ply["program-area + ecoregion polys<br/>→ exact_extract vs cellid grid"] --> zc["zone + zone_cell<br/>(pct_covered 0-100)"]
+  ply["zones/{zone_set_key}/{grid_id}<br/>zone_cell.parquet (shared)"] --> zc["zone + zone_cell<br/>(+ zone_set_key)"]
   mc --> mf["hash_query(model_cell,taxon,zone,zone_cell)<br/>→ content-addressed manifest"]
   tx --> mf
   zc --> mf
@@ -34,7 +34,7 @@ flowchart LR
 ```{r}
 #| label: setup
 
-librarian::shelf(DBI, dplyr, duckdb, exactextractr, fs, glue, here, jsonlite, logger, readr,
+librarian::shelf(arrow, DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, readr,
                  sf, terra, tibble, MarineSensitivity/msens, quiet = T)
 source(here("libs/paths.R"))
 source(here("libs/vars.R"))
@@ -103,47 +103,67 @@ knitr::kable(dbGetQuery(con, "SELECT sp_cat, count(*) n FROM taxon WHERE is_vali
 ```{r}
 #| label: zones
 
-zone_specs <- list(
-  list(tbl = glue("ply_programareas_2026_{ver}"), fld = "programarea_key", gpkg = pa_gpkg),
-  list(tbl = "ply_ecoregions_2025",               fld = "ecoregion_key",   gpkg = er_gpkg))
+# Zones now come from the SHARED zone-set store, not a per-version exactextractr
+# pass. zone_cell is a function of (geometry x grid) alone, so re-extracting it
+# per release was pure repetition: measured, ONE program-area geometry covers v2
+# through v8 and ONE ecoregion geometry covers v1 through v8. build_zone_cells
+# computes each pair once, and its gate asserts the result reproduces what this
+# chunk used to build, byte for byte.
+zone_sets <- readr::read_csv(here("data/zone_sets.csv"), show_col_types = FALSE)
+msens::validate_zone_sets(zone_sets)
+grid_id <- msens::grid_for_ver(ver)
 
-r_cell <- rast(cellid_tif)
+# every zone set extracted on THIS version's grid — so a release is scored over
+# each registered spatial unit, not only its contemporaneous one
+zsets <- zone_sets |>
+  mutate(pq = glue("{dir_derived}/zones/{zone_set_key}/{grid_id}/zone_cell.parquet")) |>
+  filter(file.exists(path.expand(pq)))
+stopifnot("no zone-set extracts for this grid — run build_zone_cells" = nrow(zsets) > 0)
+
+# back-compat `tbl`/`fld`: the apps query zone by these, so they keep the names
+# they have always had. `zone_set_key` is additive, and is what makes a spatial
+# unit comparable across releases.
+tbl_of <- c(programarea = glue("ply_programareas_2026_{ver}"),
+            ecoregion   = "ply_ecoregions_2025",
+            subregion   = glue("ply_subregions_2026_{ver}"),
+            planarea    = "ply_planareas_2025")
+
 zone_rows <- list(); zc_rows <- list(); zseq <- 0L
-for (zs in zone_specs) {
-  ply <- st_read(zs$gpkg, quiet = TRUE) |> st_make_valid() |>
-    st_transform(4326) |> select(all_of(zs$fld))
-  for (i in seq_len(nrow(ply))) {
+for (i in seq_len(nrow(zsets))) {
+  z  <- zsets[i, ]
+  zc <- arrow::read_parquet(path.expand(z$pq))
+  for (k in sort(unique(zc$zone_key))) {
     zseq <- zseq + 1L
-    zval <- ply[[zs$fld]][i]
     zone_rows[[length(zone_rows) + 1]] <- tibble(
-      zone_seq = zseq, tbl = zs$tbl, fld = zs$fld, val = as.character(zval))
-    # coverage fraction of this zone polygon over each cell -> pct_covered (0-100)
-    df <- exact_extract(r_cell, ply[i, ], progress = FALSE)[[1]]   # exactextractr's own `value` col
-    df <- df[!is.na(df$value) & df$coverage_fraction > 0, , drop = FALSE]
-    if (nrow(df) > 0) zc_rows[[length(zc_rows) + 1]] <- tibble(
-      zone_seq = zseq, cell_id = as.integer(df$value),
-      pct_covered = as.integer(round(df$coverage_fraction * 100)))
+      zone_seq = zseq, zone_set_key = z$zone_set_key,
+      tbl = as.character(tbl_of[[z$zone_type]]), fld = paste0(z$zone_type, "_key"),
+      val = as.character(k))
+    d <- zc[zc$zone_key == k, ]
+    zc_rows[[length(zc_rows) + 1]] <- tibble(
+      zone_seq = zseq, cell_id = d$cell_id, pct_covered = d$pct_covered)
   }
-  log_info("{zs$fld}: {nrow(ply)} zones")
+  log_info("{z$zone_set_key}: {n_distinct(zc$zone_key)} zones, {nrow(zc)} cells")
 }
 
-# subregion zones (USA / AK / GA / PA) = unions of their member Program Areas (the v7 grouping,
-# `{ver_prev}/subregion_programareas.csv`). No polygon source — build from the PA zones' cells so
-# the apps' "Study area" filter (subregion_key) works.
-sr_map   <- read_csv(glue("{dir_data}/derived/{ver_prev}/subregion_programareas.csv"), show_col_types = FALSE)
-zone_df  <- bind_rows(zone_rows); zc_df <- bind_rows(zc_rows)
-pa_zones <- zone_df |> filter(fld == "programarea_key") |> select(pa_seq = zone_seq, programarea_key = val)
-for (sr in sort(unique(sr_map$subregion_key))) {
+# `USA` stays a synthesized pseudo-zone (the union of the canonical subregions),
+# because the apps use subregion_key = 'USA' for "whole study area". It is the
+# absence of a filter rather than a polygon, so it is built from the cells —
+# extracting a dissolved USA polygon would double-count nothing, but taking the
+# max over member cells is what the previous implementation did and keeps the
+# value identical.
+zone_df <- bind_rows(zone_rows); zc_df <- bind_rows(zc_rows)
+sr_seqs <- zone_df$zone_seq[zone_df$fld == "subregion_key"]
+if (length(sr_seqs)) {
   zseq <- zseq + 1L
-  member_seqs <- pa_zones$pa_seq[pa_zones$programarea_key %in% sr_map$programarea_key[sr_map$subregion_key == sr]]
-  sr_cells <- zc_df |> filter(zone_seq %in% member_seqs) |>
+  usa <- zc_df |> filter(zone_seq %in% sr_seqs) |>
     group_by(cell_id) |> summarise(pct_covered = max(pct_covered), .groups = "drop")
   zone_rows[[length(zone_rows) + 1]] <- tibble(
-    zone_seq = zseq, tbl = glue("ply_subregions_2026_{ver}"), fld = "subregion_key", val = sr)
-  if (nrow(sr_cells)) zc_rows[[length(zc_rows) + 1]] <- tibble(
-    zone_seq = zseq, cell_id = sr_cells$cell_id, pct_covered = sr_cells$pct_covered)
+    zone_seq = zseq, zone_set_key = zsets$zone_set_key[zsets$zone_type == "subregion"][1],
+    tbl = as.character(tbl_of[["subregion"]]), fld = "subregion_key", val = "USA")
+  zc_rows[[length(zc_rows) + 1]] <- tibble(
+    zone_seq = zseq, cell_id = usa$cell_id, pct_covered = usa$pct_covered)
+  log_info("subregion USA: {nrow(usa)} cells (union of the canonical subregions)")
 }
-log_info("subregion_key: {n_distinct(sr_map$subregion_key)} zones")
 
 dbWriteTable(con, "zone",      bind_rows(zone_rows), overwrite = TRUE)
 dbWriteTable(con, "zone_cell", bind_rows(zc_rows) |> filter(pct_covered > 0), overwrite = TRUE)
