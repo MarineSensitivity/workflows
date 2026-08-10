@@ -1,0 +1,266 @@
+---
+title: "Build the version registry (`latest.txt`, `versions.json`, `manifest.json`)"
+msens:
+  target_name: build_version_manifest
+  workflow_type: release
+  dependency: [score_zone_metrics]
+  output: data/manifests/build_version_manifest.json
+editor_options:
+  chunk_output_type: console
+---
+
+Every MST release so far has shipped by **forking the apps repo** — freeze `apps` at a commit,
+clone it to `apps_v{n}`, symlink `/share/shiny_apps/{scores,species}_v{n}` at it. Nine such forks
+exist, and every app improvement is stranded in the newest one: v6's app will never get v8's
+deep-link handling or a bug fix, because it is a different checkout of a different commit.
+
+The cause is that the version is a **code** fact — `ver <- "v8"` hardcoded in each app, propagating
+into data paths, table names, a per-version titiler service and the symlink name. This notebook
+publishes the files that make it a **data** fact instead, so one app can render any release:
+
+| file | what it settles |
+|---|---|
+| `marine-atlas/latest.txt` | which version an app shows when the URL says nothing |
+| `marine-atlas/versions.json` | which versions exist, and whether each is showable |
+| `marine-atlas/{ver}/manifest.json` | everything needed to *render* that version |
+
+The manifest is the contract: publishing v9 means publishing a manifest, **not** editing an app.
+
+> **Promotion is gated and separate from publishing.** Writing data does not make it live —
+> `latest.txt` is only rewritten under `PROMOTE_LATEST=1`, after the validation chunk passes. So
+> `latest.txt` today names **v7** (the default-live release), while v8 remains a `prerelease`
+> reachable only as `?ver=v8`. This mirrors the CalCOFI release registry, where promotion is gated
+> on a query-test pass rather than done by the build.
+
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "Curated registry + release introspection → the three published registry files"
+flowchart LR
+  csv["data/versions.csv<br/>(curated: status, date, title)"] --> vj["versions.json"]
+  db[("{ver}/sdm.duckdb")] --> mb["msens::manifest_build()<br/>introspects tables, metrics,<br/>zones, public model id"]
+  mb --> mj["{ver}/manifest.json"]
+  vj --> s3[["s3://…/marine-atlas/"]]
+  mj --> s3
+  vj -.->|"PROMOTE_LATEST=1<br/>after validation"| lt["latest.txt"]
+  lt --> s3
+```
+
+## Setup
+
+```{r}
+#| label: setup
+#| message: false
+
+librarian::shelf(
+  DBI, dplyr, duckdb, glue, jsonlite, knitr, readr,
+  MarineSensitivity/msens, quiet = TRUE)
+source(here::here("libs/paths.R"))
+
+# env flags (default OFF, per the repo's reproducibility rule: expensive or
+# side-effecting steps are opt-in, and every step lives in this notebook)
+do_s3    <- Sys.getenv("MANIFEST_NO_S3")   == ""   # push to S3 unless told not to
+promote  <- Sys.getenv("PROMOTE_LATEST")   != ""   # rewrite latest.txt (gated below)
+
+s3_root  <- s3_atlas                                # s3://oceanmetrics.io-public/marine-atlas
+http_root <- msens::atlas_base_url()
+dir_reg  <- glue("{dir_big_v}/registry-files")      # local staging, mirrors the S3 layout
+dir.create(glue("{dir_reg}/{ver}"), recursive = TRUE, showWarnings = FALSE)
+
+message(glue("ver={ver}  s3={s3_root}  push_s3={do_s3}  promote_latest={promote}"))
+```
+
+## The curated version registry
+
+Release *status* and *dates* are editorial facts — they cannot be introspected from a database, and
+they must not be guessed. They live in a committed CSV so the registry is reviewable in a diff, and
+so the apps, the versioned docs and the storage index all read one source rather than three.
+
+Deliberately a **registry, not a changelog**: `ver`, `status`, `released`, `title` and nothing more.
+What each release *changed* is prose, it already lives in the docs timeline, and a second copy here
+would drift from it — which is the very problem the versioned-docs work exists to fix.
+
+```{r}
+#| label: versions
+
+versions <- readr::read_csv(here::here("data/versions.csv"), show_col_types = FALSE)
+
+stopifnot(
+  "versions.csv has duplicate ver"        = !any(duplicated(versions$ver)),
+  "unknown status in versions.csv"        = all(versions$status %in% c("released", "prerelease", "retired")),
+  "current ver missing from versions.csv" = ver %in% versions$ver,
+  "no released version to promote"        = any(versions$status == "released"))
+
+# newest first, so a consumer can take the head without sorting
+versions <- versions |> arrange(desc(released))
+knitr::kable(versions |> select(ver, status, released, title))
+```
+
+## The manifest for this version
+
+`msens::manifest_build()` *introspects* the release rather than being told about it — which model
+id is public (`mdl_key` from v8, `mdl_seq` before it), which tables exist, which metrics are
+cell-level, which spatial units were scored. That is what keeps a manifest from drifting from the
+data it describes, and it is why capabilities derive from **presence** and default to FALSE: a
+release without `cell_model` must not advertise a per-cell species list.
+
+```{r}
+#| label: manifest
+
+con <- dbConnect(duckdb(), path.expand(sdm_db), read_only = TRUE)
+
+# Some surfaces are NOT tables in the build database, and are not on S3 either.
+# v8's `cell_model` (the per-cell species list) is a partitioned Parquet
+# DIRECTORY that lives only on the server — deliberately, since its per-cell and
+# per-polygon queries touch many partitions and fail outright over HTTPS. So:
+#   - deriving from `con` alone advertises cell_species_list = FALSE and switches
+#     off a panel that works today;
+#   - checking S3 also says FALSE, because it is intentionally not published there.
+# The authoritative test is the SERVING surface on the server. Check it there
+# (read-only) and print the answer, so a manifest built from a laptop describes
+# the release rather than the laptop.
+srv_has <- function(path) {
+  if (dir.exists(path.expand(glue("{dir_big_v}/{path}")))) return(TRUE)   # running ON the server
+  out <- suppressWarnings(system2(
+    "ssh", c("-o", "ConnectTimeout=15", "msens",
+             shQuote(glue("test -e /share/data/big/{ver}/{path} && echo yes || echo no"))),
+    stdout = TRUE, stderr = FALSE))
+  isTRUE(any(grepl("^yes$", trimws(out))))
+}
+
+caps_override <- list(cell_species_list = srv_has("cell_model"))
+message(glue("serving surface check: cell_model present = {caps_override$cell_species_list}"))
+
+v_row <- versions |> filter(ver == !!ver)
+mfst  <- msens::manifest_build(
+  con, ver,
+  status       = v_row$status,
+  base         = http_root,
+  capabilities = caps_override,
+  extra  = list(
+    title    = v_row$title,
+    released = as.character(v_row$released),
+    # score COGs and the vintage-labelled zone-set registry arrive in later
+    # phases; until then the manifest declares what is true today, and
+    # `capabilities$score_cogs` stays FALSE so no app promises a layer it
+    # cannot draw.
+    grid     = as.list(msens::grid_spec_for(msens::grid_for_ver(ver))[
+                 c("nc", "nr", "xmin", "ymax", "resx", "resy", "lon360")])))
+
+dbDisconnect(con, shutdown = TRUE)
+
+cat(glue(
+  "ver={mfst$ver}  status={mfst$status}  grid={mfst$grid_id}  id_field={mfst$id_field}\n",
+  "tables={length(mfst$tables)}  metrics={nrow(mfst$metrics)}  zone_sets={nrow(mfst$zones)}\n"))
+knitr::kable(mfst$zones)
+```
+
+```{r}
+#| label: capabilities
+
+knitr::kable(
+  data.frame(capability = names(mfst$capabilities),
+             supported  = unlist(mfst$capabilities)),
+  row.names = FALSE)
+```
+
+## Validate, then write
+
+The same `validate_manifest()` the apps call on read is applied here on write, so a manifest that
+would break an app can never be published in the first place.
+
+```{r}
+#| label: write
+
+msens::validate_manifest(mfst, ver = ver)
+
+# jsonlite writes NULL as [] and NA as null; pretty-print for reviewable diffs
+wr <- function(obj, path) {
+  writeLines(as.character(jsonlite::toJSON(obj, auto_unbox = TRUE, pretty = TRUE, na = "null")), path)
+  path
+}
+
+f_versions <- wr(list(versions = versions), glue("{dir_reg}/versions.json"))
+f_manifest <- wr(mfst,                      glue("{dir_reg}/{ver}/manifest.json"))
+
+# round-trip: parse what we just wrote, exactly as an app would
+msens::validate_manifest(jsonlite::fromJSON(f_manifest), ver = ver)
+cat(glue("wrote {f_versions}\n     {f_manifest}\n"))
+```
+
+## Promote `latest.txt` (gated)
+
+`latest.txt` is the one file that changes what users see by default, so it is written **only** when
+`PROMOTE_LATEST=1` and only naming a `released` version. A pre-release is never promoted implicitly
+— it stays reachable at `?ver={ver}` until someone decides otherwise.
+
+```{r}
+#| label: promote
+
+latest <- versions |> filter(status == "released") |> slice_head(n = 1) |> pull(ver)
+
+if (promote) {
+  f_latest <- glue("{dir_reg}/latest.txt")
+  writeLines(latest, f_latest)
+  cat(glue("PROMOTED latest.txt -> {latest}\n"))
+} else {
+  cat(glue("latest.txt would be '{latest}' (set PROMOTE_LATEST=1 to write it)\n"))
+}
+```
+
+## Publish to S3
+
+```{r}
+#| label: s3
+
+if (do_s3) {
+  # system2() runs the command through a shell, so unquoted glob patterns are
+  # expanded by the shell against the CWD before aws ever sees them (an
+  # unquoted `--exclude *` becomes the entire repo listing). shQuote them, and
+  # expand `~` ourselves since the CLI does not.
+  args <- c("s3", "sync", shQuote(path.expand(dir_reg)), shQuote(s3_root),
+            "--exclude", shQuote("*"),
+            "--include", shQuote("*.json"), "--include", shQuote("latest.txt"),
+            "--content-type", shQuote("application/json"),
+            # these three are MUTABLE pointers; S3 has no default cache-control but
+            # CDNs and browsers will happily hold a stale registry, which shows the
+            # wrong version list long after a promotion
+            "--cache-control", shQuote("no-cache"),
+            "--only-show-errors", "--no-progress")
+  out <- system2("aws", args, stdout = TRUE, stderr = TRUE)
+  if (!is.null(attr(out, "status")) && attr(out, "status") != 0)
+    stop("aws s3 sync failed: ", paste(out, collapse = "\n"))
+
+  # verify by READING BACK through the public URL, not by trusting the exit
+  # status — a zero exit has already proved not to mean the objects are there
+  # (CalCOFI's index publisher learned this the expensive way)
+  got <- msens::atlas_manifest(ver, base = http_root, refresh = TRUE)
+  stopifnot("published manifest does not round-trip" = identical(got$ver, ver))
+  cat(glue("verified {http_root}/{ver}/manifest.json\n"))
+} else {
+  cat("MANIFEST_NO_S3 set - staged locally only\n")
+}
+```
+
+## Target manifest
+
+```{r}
+#| label: target-manifest
+
+msens::write_manifest(
+  here::here("data/manifests/build_version_manifest.json"),
+  target        = "build_version_manifest",
+  content_hash  = digest::digest(list(mfst, versions), algo = "xxhash64"),
+  stats = list(
+    ver          = ver,
+    status       = mfst$status,
+    grid_id      = mfst$grid_id,
+    id_field     = mfst$id_field,
+    n_versions   = nrow(versions),
+    n_metrics    = nrow(mfst$metrics),
+    n_zone_sets  = nrow(mfst$zones),
+    latest       = latest,
+    promoted     = promote),
+  force = msens::force_target("build_version_manifest"))
+```
