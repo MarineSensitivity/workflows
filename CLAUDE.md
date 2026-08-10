@@ -200,3 +200,31 @@ on `mdl_key` (`msens::mdl_key_raw()` / `mdl_key_merged()`). Values live in a `va
   done files). Don't rely on per-ingest table writes that can be silently dropped (the v8 registry
   gap) — consolidate in one target.
 - **gm/nc density models are NOT yet ingested** (need density #/km² → suitability [0,100]).
+- **`mermaid-format: png` is DISABLED — leave it that way.** It is commented out in
+  `_quarto.yml`, so Design `{mermaid}` blocks render client-side via mermaid.js and **no
+  browser is involved**. PNG bought zoomable lightbox diagrams and cost far more than it was
+  worth: it routed every diagram through headless Chrome, which hangs *indefinitely and
+  unpredictably*. Diagnosed in the sibling `CalCOFI/workflows` (2026-07-30), where one
+  **60 KB** diagram wedged **3h15m** at 0.2% CPU after rendering in ~2 min on the previous
+  run, ignored `SIGTERM`, and silently took down two `tar_make()` runs — first misdiagnosed
+  as external kills, because the only symptom is a run that stops progressing. This bites
+  hardest under `tar_make()`, where a stalled notebook looks like a stalled pipeline. Do not
+  re-enable it to get the lightbox back without asking.
+
+  `Sys.setenv(QUARTO_CHROMIUM_HEADLESS_MODE = "new")` in `_targets.R` addresses a *different*
+  Chrome failure (≥132 dropped legacy `--headless`) and does **not** prevent this hang. It is
+  harmless to keep.
+
+  **If you meet a hung render anyway** (a notebook that sets `mermaid-format: png` itself):
+  - `pgrep -f "headless=new"` gives Quarto's Chrome, parented to its `deno`. **Check
+    parentage before killing** — the user's real Chrome is a separate tree under PID 1.
+    Then `kill -9`; SIGTERM is ignored. Quarto exits.
+  - R chunks all run *before* the mermaid step, so data outputs survive; only the HTML is
+    lost. On the long scoring/merge notebooks, do not assume a hang discarded the work —
+    check the outputs before re-running tens of minutes of compute.
+  - Every kill leaves a **stale targets lock and an orphaned `rmd.R`**. Clear both
+    (`targets::tar_unblock_process()`, `pgrep -f rmd.R`) before re-running.
+  - Presence of figures is *not* a reliable "render finished" signal, and absence is *not*
+    reliably "graph too large": this hang produced no figures on a tiny graph. Still bound
+    what a diagram enumerates rather than letting it walk every dataset/taxon/table — it is
+    slow and unreadable even without Chrome in the path.
