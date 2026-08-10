@@ -268,7 +268,97 @@ One more silent bug caught by rendering for real: the file glob ran in setup, be
 
 The registry now holds 9 zone sets from 23 layers. Remaining in Phase 2 is relocating zone_cell to (zone_set_key, grid_id) — the payoff being that programarea_2026-03 covers v3–v8 and ecoregion_2025-06 covers v1–v8, so one extraction replaces what score_zones.qmd currently redoes per release — then 2c, making score_zone_metrics iterate zone sets.
 
+----
 
+hase 2 is complete and verified. Everything pushed and clean.
+
+Phase 2c: scoring across zone sets
+
+The composite is now computed for every zone set a release carries, not just Program Areas — v8 now scores ecoregion_2025-06 (12 zones, 9.3–35.2) and subregion_2025-06 (5 zones, 17.0–34.0) alongside programarea_2026-01 (20 zones, 9.3–48.4). That's what makes "how did this Program Area move from v3 to v8?" answerable.
+
+The correctness gate held throughout. I snapshotted v8's Program-Area scores before touching anything and re-checked after each change:
+
+- score_zones rebuilt from the shared store → all 20 PA scores identical, max |delta| exactly 0
+- score_cell_metrics unchanged: 623,212 composite cells, range 0–96
+- v7 equivalence gate unchanged: mean 4.12, max 10.31, rmse 5.18, cor 0.937
+- widening score_zone_metrics to all zone sets → PA scores still exactly 0
+
+I also separately confirmed the ecoregion extract matches v8's existing zone_cell (630,944 rows, 12 zones), which mattered because score_cell_metrics rescales by ecoregion — the earlier gate only covered program areas.
+
+pra_score_delta now takes zone_set_key to pin comparisons to one spatial unit. Databases predating the column (v1–v7) fall back to the fld filter rather than returning nothing, and naming a zone set a release doesn't carry is an error rather than an empty join reporting a spurious zero delta.
+
+What changed in the data
+
+zone grew 36 → 37 rows and gained zone_set_key; zone_cell grew 1,679,162 → 2,241,876. That's the Atlantic arriving: the canonical AK/AT/GA/PA subregions can represent it, where the old Program-Area-derived subregions structurally could not.
+
+tbl/fld keep the names they've always had, because the apps query on them — the new column is purely additive, so nothing downstream breaks.
+
+Two smaller things
+
+score_delta now refuses identical labels. Passing c("v8","v8") collided both into one column and surfaced as an opaque rlang data-pronoun error several frames from the cause — I hit it sanity-checking a v8↔v8 comparison.
+
+And the v7 equivalence gate's query previously selected every zone carrying the composite metric, which was only unambiguous while Program Areas were the sole zone set scored. It now says fld='programarea_key' explicitly — otherwise widening the scope would have silently pulled ecoregions into the v7 comparison.
+
+Phases 1 and 2 are done: registries (version, grid, zone-set, COG-store) in msens at 484 tests, v8 manifest published, zone_cell shared and proven identical, scoring generalized. Next is Phase 3 — score surfaces to COGs, which is the step that lets the titiler custom factory be retired.
+
+----
+
+Phase 3a done and pushed (54cdafa4, msens at 6007446).
+
+Score surfaces are now COGs
+
+102 payloads (metric × subregion, incl. a FULL pseudo-subregion) → 93 distinct rasters, 42.4 MB. The 9 that collapsed are genuine dedup: cell_metric only covers in_usa cells, so a metric's USA mask and its FULL surface are the same pixels — content addressing caught that without being told.
+
+manifest.json now carries each COG's href and a build-time rescale, which removes the runtime /statistics round-trip the app currently makes on every layer switch. capabilities.score_cogs is true.
+
+Verification: identical where comparable
+
+The FULL surfaces are 6/6 byte-identical to the factory at z2–z7, across three different metrics (composite, extrisk_bird, primprod).
+
+Subregion surfaces are not comparable right now and differ by design — the server's serve.duckdb still holds the old Program-Area-derived AK/PA/GA/USA, while these COGs come from the canonical AK/AT/GA/PA. I checked both to confirm that's the explanation rather than assuming it.
+
+Two bugs the comparison forced out
+
+Overviews were wrong here. My first build had them, and z5+ matched exactly while z2–z4 differed on ~10% of pixels. The factory decimates from full resolution on every request, so an overview pyramid is a different (also valid) downsample. Dropping them made every zoom identical and cut each file from 0.64 to 0.22 MB — the cell-id COG already uses OVERVIEWS=NONE for a related reason.
+
+My content-addressing was subtly wrong. The key hashed the payload, but the bytes also depend on the encoding. Rewriting every object at its existing URL left GDAL's /vsicurl holding a cached header for bytes that no longer existed — z5+ fine, z2–z4 HTTP 500, and a cache-busted URL 200. content_hash_encoded() now folds an encoding tag in, so any encoding change publishes to a new URL and no cache can go stale. Worth catching now rather than during the 60k-object species backfill.
+
+Also fixed along the way: cog_store_index() treated an empty store as a failure (aws s3 ls exits 1 with no output on a missing prefix), and the redo flag couldn't force a rewrite when the file already existed — which is exactly what you need when the encoding changes but the payload doesn't.
+
+What's next
+
+Phase 3b is the app-side half: scores/app.R drops cell_sql/cell_stats/cell_tile_url for cog_tile_url reading manifest.metrics, then the factory can actually be deleted and the two titiler services collapsed into one stock instance behind Varnish. The subregion COGs need re-verifying once the server carries the canonical subregions — that comes with the next v8 release cutover, not before.
+
+491 tests green throughout.
+
+----
+
+Phase 3b done. All three repos clean and pushed; 496 tests green.
+
+The scores app now draws from COGs
+
+All three tile sites moved off the SQL-per-tile path: the startup warm, the reactive layer rebuild, and the "cells outside Program Areas" overlay. The manifest supplies both the COG href and a build-time rescale, so the per-layer-switch round-trip to /statistics is gone too — the app previously had to fetch min/max over the network before it could draw anything.
+
+Every path falls back to the SQL factory if the manifest, the capability, or a specific surface is missing, so an app pointed at a release predating the COGs still draws rather than blanking.
+
+Verified against the live manifest: 103 surfaces resolve, including the overlay and the new AT subregion.
+
+Two things the work turned up
+
+The overlay isn't a metric. _outside_pra was silently dropped from the manifest because manifest_build() left-joins metrics onto the release's metric table, and an overlay has no row there. It's a raster the app draws, not a quantity it scores — so the manifest now models overlays separately. The symptom was benign (a NULL that fell back to SQL), but it would have quietly kept the factory alive forever.
+
+color used to partial-match colormap. The old cog_tile_url() signature had no color argument, so R's partial matching accepted color="#222222" and emitted colormap_name=#222222 — a nonsense request that failed at the server rather than in R. Now both are real arguments, so the match is exact. The flat mask renders correctly: exactly two colours in the tile, transparent and #222222.
+
+The content store also behaved exactly as designed on this round — adding the mask meant 93 reused, 1 written.
+
+What still blocks retiring the factory
+
+I've left it running deliberately, and created a task for it. Two real dependencies:
+
+1. The species app still uses cell_tile_url for its am-only taxa fallback — that surface has no COG yet.
+2. The subregion COGs need re-verifying once the server carries the canonical AK/AT/GA/PA. Right now the server's serve.duckdb still has the old Program-Area-derived AK/PA/GA/USA, so those two can't be compared — which is why my verification was limited to the FULL surfaces (where it was 6/6 byte-identical across three metrics).
+
+Both resolve at the next v8 release cutover, which pushes the rebuilt tables and the new subregions to the server. That's the natural next step, along with the app-side ?ver= handling that makes the whole thing multi-version.
 
 ## 2026-07-31 analytics repo
 
