@@ -238,51 +238,39 @@ My proposed mapping was wrong on four of twelve — and the correction is better
 
 The ecoregion layer carries region_key/region_name: AK, AT, GA, PA. No hand-written lookup, no guessing — and notably it includes Atlantic, which v8's Program-Area-derived subregions cannot represent at all.
 
-----
+---
 
-Verified in the published release. calcofi_ctd-cast is off the orphan list entirely (was 9 cruises), and calcofi_mets is down to 1 — the position-less 1207OS, ungridded by design. The rest is the documented backlog, now ratcheted.
+Everything committed and pushed; laptop, server and origin all clean at 15ccd709.
 
-┌─────────────────────┬─────────────┬───────────────┐
-│                     │ v2026.08.08 │  v2026.08.10  │
-├─────────────────────┼─────────────┼───────────────┤
-│ CTD cruises in obs  │         133 │           142 │
-├─────────────────────┼─────────────┼───────────────┤
-│ CTD obs rows        │  12,614,758 │    13,488,402 │
-├─────────────────────┼─────────────┼───────────────┤
-│ mets obs rows       │     470,882 │       501,582 │
-├─────────────────────┼─────────────┼───────────────┤
-│ CTD orphan cruises  │           9 │             0 │
-├─────────────────────┼─────────────┼───────────────┤
-│ mets orphan cruises │           5 │ 1 (by design) │
-└─────────────────────┴─────────────┴───────────────┘
+Uncommitted work — committed in five focused commits
 
-  Pushed to main, ran 1 shell command
+Your _quarto.yml mermaid fix and its CLAUDE.md documentation went together as one commit, since they're a pair. Then build_v7_cell_model.qmd's exit-status checking, the session notes plus re-rendered outputs, and the final-report scripts. Two untracked items I deliberately didn't commit: __pycache__/ (bytecode) and .claude/settings.local.json (per-user permissions, not project config) — both added to .gitignore instead.
 
-Release A is done and published. Timeline for the hour you asked about:
+Committing your _quarto.yml made my per-notebook mermaid-format: js override redundant, so I removed it.
 
-- 16:50 relaunched after the d_cov fix
-- 17:38 release_database completed (48m 48s) — froze and uploaded v2026.08.10
-- 17:45 test_release passed (6m 32s) and promoted latest.txt
-- 17:47 verified against the published parquet, committed and pushed (cc3e21d)
+Server: both issues resolved, one of them wasn't what I said
 
-The promotion happened the right way round: the consumer-contract suite ran against the frozen release before latest.txt moved, so a schema drift would have failed the release rather than the apps.
+GitHub credentials — the server already had a working SSH key authenticating as bbest; the server repo used it, but msens, workflows and api had HTTPS remotes. Switched all three to git@github.com:. Push access verified, and I've since pushed from the server twice.
 
-obs is now 26,296,720 rows; obs_ctd_full 274,857,042.
+"uid alignment" was my mischaracterization. The uids are already aligned — the container's rstudio user is uid 1000/gid 1000, matching host ubuntu. The actual cause is that docker exec defaults to root (the image's USER, which RStudio Server's init needs). The sweep found 23,729 root-owned files under /share/data, including pipeline inputs like r_cellid.tif that a non-root render couldn't have overwritten. All swept back to ubuntu:staff; scripts/srv_render.sh now runs renders as -u 1000:1000 and re-checks afterward.
 
-Consumers are still on the old data — they cache locally and need refreshing. That's the deploy-consumers skill's job (the one I created an hour ago from the section I cut out of CLAUDE.md — it gets its first real use). It needs ssh calcofi, so I'd be touching the CalCOFI server: git pull in three repos, two prep_db.R rebuilds inside the rstudio container, touch restart.txt, plus gh workflow run refresh.yml for db-viz-station.
+I flagged but did not change the deploy chunks in release_marine-atlas.qmd and build_v7_cell_model.qmd that docker exec into /share — same latent risk, but they're deploy paths I can't exercise here. Noted in CLAUDE.md. R CMD INSTALL is a genuine exception; it wants root.
 
-Want me to run the consumer deploys now? Two things worth knowing before I do:
+My first version of srv_render.sh had a real bug: it rendered whatever the server happened to have, and silently produced HTML from a checkout two commits behind while reporting success. It now fast-forwards to origin/main first and refuses to render if it can't.
 
-1. db-viz-hex's prep_db.R has form here — memory records it exhausting 16 GB plus swap on the spatial join and wedging shiny-server, to the point ssh died. I'd background it with docker exec -d and tail the log rather than fire and forget.
-2. ctd-transects is your tree right now (921 uncommitted files of GEBCO work). Its refresh is a GitHub Action that rebuilds shards from the release, so running it would collide with what you're doing locally. I'd skip that one and leave it to you.
+Phase 2b: canonical subregions
 
-Separately, Release B is queued and unstarted: obs carrying ungridded observations across 11 ingests, with the per-dataset findings and provider questions you asked for, plus the consumer audit. That's the several-hour piece — say when.
+My proposed ecoregion rollup was wrong on four of twelve — and the correction is better than what either of us had. The layer already carries region_key/region_name, so there's no lookup to curate. GOA is the Gulf of Alaska while EGOA/WCGOA are the Gulf of America (I had those exactly inverted); HAR is High Arctic, not Hawaii; PUR rolls up to Atlantic and PIS to Pacific.
 
-----
+The canonical set is subregion_2025-06 = AK, AT, GA, PA, vintage inherited from the source ecoregions so a rebuild can't mint a spurious one. It includes the Atlantic, which every previous release's subregions structurally could not — they were all unions of Program Areas, and the 2026 program has no Atlantic areas.
 
-I already finished with commit/push/deploy of ctd-transects local/remote, so ok to run again. Yes, do full consumer deploys
+One more silent bug caught by rendering for real: the file glob ran in setup, before the subregion chunk creates the layer, so the first run wrote a 17.8 MB gpkg and then omitted it from the registry entirely.
 
-## 2026-07-31
+The registry now holds 9 zone sets from 23 layers. Remaining in Phase 2 is relocating zone_cell to (zone_set_key, grid_id) — the payoff being that programarea_2026-03 covers v3–v8 and ecoregion_2025-06 covers v1–v8, so one extraction replaces what score_zones.qmd currently redoes per release — then 2c, making score_zone_metrics iterate zone sets.
+
+
+
+## 2026-07-31 analytics repo
 
 Create an analytics repo like @../../CalCOFI/analytics/ for all of these MarineSensitivity online products,
   including apps with special logs
