@@ -1,0 +1,192 @@
+---
+title: "Build the zone-set registry (spatial units as vintages, not per-version copies)"
+msens:
+  target_name: build_zone_sets
+  workflow_type: schema
+  dependency: [build_cell_grid]
+  output: data/manifests/build_zone_sets.json
+editor_options:
+  chunk_output_type: console
+---
+
+Every release so far baked its own copy of the spatial units — `ply_programareas_2026_v3.gpkg`
+through `…_v8.gpkg`, each with its own `zone_cell` re-extracted by `score_zones.qmd`. That makes
+the question users actually ask — *how did **this** Program Area's score change from v3 to v8?* —
+unanswerable, because nothing guarantees two releases meant the same polygon.
+
+This notebook identifies a spatial unit by its **geometry**, not by the release that used it:
+
+```
+zone_set_key = {zone_type}_{YYYY-MM}      e.g. programarea_2026-03
+```
+
+The vintage is the year-month the geometry **first appeared on disk**, so the label is a checkable
+fact rather than an editorial guess, and keys sort chronologically.
+
+> **The per-version files are mostly the same layer copied forward.** Measured across every
+> published gpkg, `programarea` is 8 files but only **2** distinct geometries (v2 alone; v3–v8 are
+> byte-identical), and `ecoregion` is 10 files but **2**. So `zone_cell` — which depends only on
+> (geometry × grid) — is computed **once** per `(zone_set_key, grid_id)` and reused by every release
+> on that grid, instead of being re-extracted per version.
+
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "Fingerprint every zone layer, collapse identical ones into vintages, emit the registry"
+flowchart LR
+  gp["ply_*.gpkg<br/>(top level + every version dir)"] --> gh["msens::zone_geom_hash()<br/>order-invariant WKB fingerprint"]
+  gh --> gr["group by (zone_type, geom_hash)<br/>vintage = earliest mtime YYYY-MM"]
+  gr --> vz["msens::validate_zone_sets()<br/>one key ↔ one geometry"]
+  vz --> csv["data/zone_sets.csv"]
+```
+
+## Setup
+
+```{r}
+#| label: setup
+#| message: false
+
+librarian::shelf(dplyr, glue, knitr, readr, MarineSensitivity/msens, quiet = TRUE)
+source(here::here("libs/paths.R"))
+
+# Every zone layer anywhere under derived/ — the top level and every version dir.
+# `ply_ecoregion_programarea_*` is a CROSSWALK (ecoregion x programarea slivers),
+# not a spatial unit in its own right, and `ply_boem-usa` is the study-area
+# outline; neither is a zone set.
+gpkgs <- Sys.glob(c(path.expand(glue("{dir_derived}/ply_*.gpkg")),
+                    path.expand(glue("{dir_derived}/*/ply_*.gpkg"))))
+gpkgs <- grep("ecoregion_programarea|boem-usa", gpkgs, value = TRUE, invert = TRUE)
+
+message(glue("scanning {length(gpkgs)} zone layer(s) under {dir_derived}"))
+```
+
+::: {.callout-warning}
+This scan is only as complete as the machine it runs on. The **server** holds every version's
+`derived/` tree; a laptop holds only the current version's. Render this where the whole tree is,
+or the registry will silently omit vintages.
+:::
+
+## Fingerprint every layer
+
+```{r}
+#| label: fingerprint
+
+zone_type_of <- function(f)
+  dplyr::case_when(
+    grepl("programarea", f) ~ "programarea",
+    grepl("planarea",    f) ~ "planarea",
+    grepl("ecoregion",   f) ~ "ecoregion",
+    grepl("subregion",   f) ~ "subregion",
+    .default = NA_character_)
+
+scan <- lapply(gpkgs, function(f) {
+  h <- msens::zone_geom_hash(f)
+  tibble::tibble(
+    source    = sub(paste0(path.expand(dir_derived), "/"), "", f),
+    zone_type = zone_type_of(basename(f)),
+    n_zones   = h$n,
+    key_col   = h$key_col,
+    geom_hash = h$geom_hash,
+    mtime     = file.info(f)$mtime)
+}) |> bind_rows() |> filter(!is.na(zone_type))
+
+# which release used it: the version directory it sits in ("" = top level, i.e.
+# a staging copy no release scored)
+scan <- scan |> mutate(ver = ifelse(grepl("/", source), sub("/.*", "", source), NA_character_))
+
+knitr::kable(scan |> select(source, zone_type, n_zones, ver, geom_hash))
+```
+
+## Collapse identical layers into vintages
+
+```{r}
+#| label: vintages
+
+vint <- scan |>
+  group_by(zone_type, geom_hash) |>
+  summarise(n_zones = first(n_zones),
+            vintage = format(min(mtime), "%Y-%m"),   # first appearance on disk
+            n_files = n(),
+            versions = paste(sort(na.omit(ver)), collapse = " "),
+            source   = source[which.min(mtime)],
+            .groups  = "drop") |>
+  mutate(zone_set_key = msens::zone_set_key(zone_type, vintage)) |>
+  arrange(zone_type, vintage)
+
+# Two DISTINCT geometries of one type first appearing in the same month would
+# collide on the key. Stop rather than silently merge two different maps.
+dup <- vint$zone_set_key[duplicated(vint$zone_set_key)]
+if (length(dup))
+  stop(glue("zone_set_key collision ({paste(dup, collapse=', ')}): two distinct geometries ",
+            "first appeared in the same month. Disambiguate the vintage by hand (e.g. -a/-b) ",
+            "before publishing."))
+
+msens::validate_zone_sets(vint)
+
+knitr::kable(vint |> select(zone_set_key, n_zones, n_files, versions, geom_hash))
+```
+
+```{r}
+#| label: summary
+
+vint |>
+  count(zone_type, name = "distinct_vintages") |>
+  left_join(scan |> count(zone_type, name = "files"), by = "zone_type") |>
+  relocate(files, .after = zone_type) |>
+  knitr::kable(caption = "How many spatial units really exist, versus how many files")
+```
+
+## Write the registry
+
+```{r}
+#| label: write
+
+f_csv <- here::here("data/zone_sets.csv")
+
+# generated-but-committed, like a lockfile: deterministic given the files on
+# disk, and reviewable in a diff when a new vintage appears
+out <- vint |> select(zone_set_key, zone_type, vintage, n_zones, geom_hash, versions, source)
+readr::write_csv(out, f_csv)
+
+msens::validate_zone_sets(readr::read_csv(f_csv, show_col_types = FALSE))
+message(glue("wrote {f_csv} ({nrow(out)} zone sets)"))
+```
+
+## Not yet covered: subregions
+
+Subregions are **not** a published layer for most releases — they are synthesized in the database as
+unions of that version's Planning/Program Areas, and they drifted accordingly:
+
+| release | subregion keys |
+|---|---|
+| v1 | `AK`, `AKL48`, `L48`, `USA` |
+| v2, v3 | *two different sets under one `fld`* — `AK/AKL48/L48/USA` **and** `AK/GA/PA/USA` |
+| v4–v6 | `AK`, `GA`, `PA`, `USA` |
+| v7 | `AK`, `FULL`, `GA`, `PA`, `USA` |
+| v8 | 4 keys |
+
+Because they were derived from each release's own Program Areas, a subregion is not comparable
+across versions — and v2/v3 are ambiguous even within one database. The next step is a single
+**canonical, version-independent** `subregion_usa` set spanning all US waters, registered here like
+any other vintage, so every release shares one subregion list and the score-COG matrix
+(metrics × subregions) has the same shape everywhere.
+
+## Target manifest
+
+```{r}
+#| label: target-manifest
+
+msens::write_manifest(
+  here::here("data/manifests/build_zone_sets.json"),
+  target       = "build_zone_sets",
+  content_hash = digest::digest(out, algo = "xxhash64"),
+  stats = list(
+    n_files       = nrow(scan),
+    n_zone_sets   = nrow(out),
+    by_type       = paste(sprintf("%s=%d", vint$zone_type, 1), collapse = ""),
+    programarea_n = sum(vint$zone_type == "programarea"),
+    ecoregion_n   = sum(vint$zone_type == "ecoregion"),
+    planarea_n    = sum(vint$zone_type == "planarea")),
+  force = msens::force_target("build_zone_sets"))
+```
