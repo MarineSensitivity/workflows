@@ -134,12 +134,22 @@ message(glue("serving surface check: cell_model present = {caps_override$cell_sp
 
 # score COGs, when published: their presence is what flips capabilities$score_cogs,
 # so the app only offers a raster layer once the raster exists
-f_scog <- path.expand(glue("{dir_big_v}/tables/score_cog.parquet"))
-scog <- if (file.exists(f_scog))
-  arrow::read_parquet(f_scog) |>
+f_scog   <- path.expand(glue("{dir_big_v}/tables/score_cog.parquet"))
+scog_all <- if (file.exists(f_scog)) arrow::read_parquet(f_scog) else NULL
+
+# `_`-prefixed keys are OVERLAYS, not metrics: the app's "cells outside Program
+# Areas" mask is a raster it draws but not a quantity it scores. They must be
+# separated, because manifest_build() left-joins metrics onto the release's
+# `metric` table -- an overlay has no row there and was silently dropped.
+scog <- if (!is.null(scog_all))
+  scog_all |> filter(!startsWith(metric_key, "_")) |>
     transmute(metric_key, subregion_key, cog = cog_url,
               rescale_min, rescale_max, colormap) else NULL
-message(glue("score COGs: {if (is.null(scog)) 0 else nrow(scog)}"))
+overlays <- if (!is.null(scog_all))
+  scog_all |> filter(startsWith(metric_key, "_")) |>
+    transmute(overlay_key = metric_key, subregion_key, cog = cog_url, colormap) else NULL
+message(glue("score COGs: {if (is.null(scog)) 0 else nrow(scog)} metric, ",
+             "{if (is.null(overlays)) 0 else nrow(overlays)} overlay"))
 
 v_row <- versions |> filter(ver == !!ver)
 mfst  <- msens::manifest_build(
@@ -151,6 +161,7 @@ mfst  <- msens::manifest_build(
   extra  = list(
     title    = v_row$title,
     released = as.character(v_row$released),
+    overlays = overlays,
     # score COGs and the vintage-labelled zone-set registry arrive in later
     # phases; until then the manifest declares what is true today, and
     # `capabilities$score_cogs` stays FALSE so no app promises a layer it
