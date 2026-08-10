@@ -62,3 +62,17 @@ v8 is `z.val` key + `zone_metric.val`, `dataset=`… — parameterize the pull. 
 
 Re-scoring the SAME inputs must reproduce (`cor = 1.000`). If not, a reserved-word (`value`/`val`,
 `class`) or stale-table (CREATE IF NOT EXISTS keeping an old schema) bug is likely.
+
+
+## Gates added with the multi-version work (2026-08)
+
+- **`pra_score_delta(..., zone_set_key=)`** pins the comparison to ONE spatial unit rather than
+  trusting that two releases meant the same polygons. Databases predating the column (v1–v7) fall
+  back to the `fld` filter; naming a zone set a release lacks is an ERROR, not an empty join.
+- **`build_zone_cells.qmd` gate**: the relocated `zone_cell` must reproduce the release's existing
+  one row-for-row (zone keys, cell ids, coverage) before anything downstream uses it.
+- **Score-COG equivalence**: a COG tile must be byte-identical to the factory's for the same
+  (metric, subregion) at every zoom before the factory is retired. Overviews break this — the
+  factory decimates from full resolution per request.
+- **After any scoring change, re-check Program-Area scores are unmoved.** The zone_cell relocation
+  and the zone-set generalization were both verified at max |delta| == 0 across all 20 areas.

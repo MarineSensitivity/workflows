@@ -172,13 +172,61 @@ on `mdl_key` (`msens::mdl_key_raw()` / `mdl_key_merged()`). Values live in a `va
 
 - **`release_marine-atlas.qmd`** publishes Parquet to S3 (`msens::attach_atlas()` reads it back;
   the dotted bucket `oceanmetrics.io-public` needs **path-style** addressing + the `aws` extension
-  for globs). The **serving surface** `serve/model_cell.parquet` is ONE file **sorted by mdl_key**
-  (row-group pruning) so a titiler tile is an HTTP-range point read.
+  for globs). The **serving surface** is `serve/model_cell/mdl_id=*/data_0.parquet` — Hive-**partitioned
+  by the dense `mdl_id`**, so a titiler tile reads exactly one partition as a point read. (It was
+  once a single file sorted by `mdl_key`; the release now syncs with `--delete` to prune that.)
 - **Serving = a tiny view-only DuckDB** (`serve.duckdb`, KB) whose `model_cell` is a VIEW over the
   S3 Parquet — never a multi-GB DB. `titiler-v8` (parallel to v7) reads it; the factory
   (`../server/titiler/factory.py`) is env-driven and its SQL validator blocks `read_parquet` in
   *client* SQL, so the client sends `SELECT cell_id, val AS value FROM model_cell WHERE mdl_key='…'`.
 - **STAC** via `msens::stac_build(version="v8")`. Deploy is gated behind `RELEASE_DEPLOY=1`.
+
+### One app, every version (2026-08)
+
+The version is **data, not a code fork**. Releases used to ship as frozen copies of the apps repo
+symlinked at `/scores_v{n}`, stranding every improvement in the newest fork. Three
+version-independent registries replace that:
+
+| registry | what it settles | where |
+|---|---|---|
+| **version** | which releases exist, which is promoted, how to draw each | `latest.txt`, `versions.json`, `{ver}/manifest.json` on S3; `msens/R/version.R` |
+| **grid** | which grid a release's `cell_id` indexes | `msens/R/grid.R` |
+| **zone-set** | spatial units by *vintage*, not by release | `data/zone_sets.csv`; `msens/R/zone_set.R` |
+
+- **`manifest.json` is the contract.** `msens::manifest_build()` *introspects* a release (public
+  model id, tables present, cell-level metrics, spatial units) so it cannot drift from the data.
+  Capabilities derive from **presence and default to FALSE** — a release without `cell_model` must
+  not advertise a per-cell species list. Publishing v9 means publishing a manifest, not editing an app.
+- **Promotion is gated**: `latest.txt` is written only under `PROMOTE_LATEST=1` and only names a
+  `released` version. It currently says **v7**; v8 is a `prerelease` reachable at `?ver=v8`.
+- **Two grids, and `cell_id` means a different place on each.** `usa05` (v1–v7) is 3103×2006 in
+  **0–360 longitude**, running 141.10°E east *across the antimeridian*; `global05` (v8) is
+  7200×3600 in −180..180. The cell-id COGs are **lookup images** (pixel value = cell id), so never
+  infer a grid's geometry from them — use `msens::grid_spec_for()`.
+- **`zone_cell` is shared, not per-release.** It depends only on (geometry × grid), so it lives at
+  `zones/{zone_set_key}/{grid_id}/zone_cell.parquet` and one extraction serves every release on that
+  grid. Measured: one program-area geometry covers v2–v8, one ecoregion geometry covers v1–v8.
+  Subregions are the canonical `AK/AT/GA/PA` dissolved from the ecoregion `region_key` rollup —
+  Program-Area-derived subregions could never represent the **Atlantic**, since the 2026 program has
+  no Atlantic areas.
+- **Scores are COGs, not SQL-per-tile.** `publish_score_cogs.qmd` writes one raster per
+  (metric × subregion) into the content-addressed store; the app reads the href and a build-time
+  rescale from the manifest. Verified byte-identical to the old factory on `FULL` surfaces.
+  **No overviews** — the factory decimates from full resolution per request, so a pyramid disagrees
+  at low zoom.
+- **The object key includes the ENCODING, not just the payload** (`content_hash_encoded()`).
+  Rewriting objects at a stable URL left GDAL's `/vsicurl` serving a cached header for bytes that no
+  longer existed: z5+ fine, z2–z4 HTTP 500.
+
+### Server gotchas (both cost real time)
+
+- **`docker exec` runs as ROOT.** Use `scripts/srv_render.sh` (which passes `-u 1000:1000` and
+  re-checks afterwards), never a bare `docker exec rstudio quarto render`. Uids are *not* misaligned —
+  the container's `rstudio` user is already uid 1000 — you just have to ask. A sweep found **23,729**
+  root-owned files under `/share/data`; the damage is silent until `git merge` aborts with
+  `unable to unlink … Permission denied`.
+- **All four repos push over SSH.** `msens`, `workflows` and `api` had `https://` remotes and could
+  not push from the server at all.
 
 ## Where things live
 
@@ -237,6 +285,9 @@ on `mdl_key` (`msens::mdl_key_raw()` / `mdl_key_merged()`). Values live in a `va
   as external kills, because the only symptom is a run that stops progressing. This bites
   hardest under `tar_make()`, where a stalled notebook looks like a stalled pipeline. Do not
   re-enable it to get the lightbox back without asking.
+
+  **The sibling `docs` repo still sets `mermaid-format: png`** and its CI installs chromium
+  deliberately, so it works there — but it is the same hang risk if run locally.
 
   `Sys.setenv(QUARTO_CHROMIUM_HEADLESS_MODE = "new")` in `_targets.R` addresses a *different*
   Chrome failure (≥132 dropped legacy `--headless`) and does **not** prevent this hang. It is

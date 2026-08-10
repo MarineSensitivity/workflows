@@ -1,6 +1,6 @@
 ---
 name: publish-sdm
-description: Release the MarineSensitivity marine-atlas to S3 and stand up its serving (view-DB over S3 Parquet + parallel titiler + STAC). Use when publishing a v8 data release or deploying/updating the tile serving.
+description: Release the MarineSensitivity marine-atlas to S3 and stand up its serving (view-DB over S3 Parquet + stock-titiler COGs + STAC + the version registry). Use when publishing a data release or deploying/updating the tile serving.
 ---
 
 # Publish + serve the marine-atlas
@@ -10,6 +10,29 @@ ad-hoc `ssh`/`aws`/scratch scripts, and never `purl + source` (which executes ch
 tracked `_output/*.html` + content-hash checkpoint; diagnostics only). See
 feedback_reproducible_by_default. The notebook stages tables + the serving surface, syncs to S3,
 builds the view DB, emits STAC, and (gated) deploys the server + the v8 Shiny apps.
+
+## A release is not finished until the registry says so (2026-08)
+
+One app now renders any version, driven by files on S3. A data push that skips these is invisible
+to the apps and the docs:
+
+| notebook | publishes |
+|---|---|
+| `build_zone_sets.qmd` | `data/zone_sets.csv` — spatial units by vintage |
+| `build_zone_cells.qmd` | `zones/{zone_set_key}/{grid_id}/zone_cell.parquet` (shared across releases) |
+| `publish_score_cogs.qmd` | one COG per (metric × subregion) + `tables/score_cog.parquet` |
+| `build_version_manifest.qmd` | `versions.json`, `{ver}/manifest.json`, and (gated) `latest.txt` |
+| `publish_storage_index.qmd` | the browsable index behind storage.marinesensitivity.org |
+
+- **`PROMOTE_LATEST=1` is the only thing that changes what users see by default.** Publishing data
+  does not. `latest.txt` names the newest `released` version — today **v7**, with v8 a `prerelease`.
+- **`PUBLISH_MERGED_COG=1` is NOT optional when rebuilding the registry.** Without it `merged_reg`
+  is an empty tibble and the bind is guarded on `nrow()`, so a re-render silently DROPS every real
+  merged-COG row and leaves only the am-only aliases.
+- **Render on the server with `scripts/srv_render.sh`**, never a bare `docker exec` — that runs as
+  root and leaves files git cannot touch.
+- **Measure coverage against `is_valid_global`**, the filter the species app actually uses; using
+  `is_marine` alone overstates gaps badly.
 
 ## Release (data → S3)
 
