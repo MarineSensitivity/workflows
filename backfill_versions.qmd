@@ -73,14 +73,30 @@ species id (`am_0.05` / `ITS-Mam-180528`). So the crosswalk is mechanical, not h
 ```{r}
 #| label: crosswalk
 
-model <- dbGetQuery(con, "SELECT mdl_seq, ds_key, taxa FROM model")
+# MERGED models need the taxon's identity, not the model row's `taxa`: v7 stores
+# "ms_merge:430645" there, which would mint ms_merge|ms_merge:430645 and match
+# nothing. The merged key is ms_merge|{AUTHORITY}:{taxon_id} -- so a v7 merged
+# model and a v8 one for the SAME species share a key, which is the whole point.
+model <- dbGetQuery(con, "
+  SELECT m.mdl_seq, m.ds_key, m.taxa, t.taxon_authority, t.taxon_id
+  FROM model m LEFT JOIN taxon t ON t.mdl_seq = m.mdl_seq")
 
 # v1-v7 spell AquaMaps 'am_0.05'; the mdl_key grammar uses 'am'
 norm_ds <- function(x) sub("^am_0\\.05$", "am", x)
 
+is_merged <- model$ds_key == "ms_merge"
 xwalk <- model |>
   mutate(ds_key  = norm_ds(ds_key),
-         mdl_key = msens::mdl_key_raw(ds_key, taxa))
+         mdl_key = ifelse(
+           is_merged & !is.na(taxon_authority),
+           msens::mdl_key_merged(ifelse(is.na(taxon_authority), "WORMS", taxon_authority),
+                                 taxon_id),
+           msens::mdl_key_raw(ds_key, taxa)))
+
+# a merged model with no taxon row cannot be keyed; report rather than mint a
+# plausible-looking key that resolves to nothing
+n_orphan <- sum(is_merged & is.na(model$taxon_authority))
+if (n_orphan) log_warn("{n_orphan} merged model(s) have no taxon row - keyed from `taxa` instead")
 stopifnot("mdl_key collision" = !any(duplicated(xwalk$mdl_key)))
 
 log_info("{nrow(xwalk)} models crosswalked")
