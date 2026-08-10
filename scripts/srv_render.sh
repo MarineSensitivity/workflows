@@ -44,6 +44,20 @@ echo "==> rendering $QMD on $HOST as uid $UIDGID"
 # shellcheck disable=SC2029  # $QMD/$envs are meant to expand locally
 ssh "$HOST" "set -e
   cd '$REPO'
+
+  # Render the COMMITTED notebook, never whatever the server happens to hold.
+  # Without this the first version of this script silently rendered a checkout
+  # two commits behind and reported success -- the exact class of bug that makes
+  # a 'reproducible' render worthless.
+  git fetch --quiet origin
+  if ! git merge --ff-only origin/main >/dev/null 2>&1; then
+    echo \"ERROR: cannot fast-forward to origin/main. Local commits or dirty tracked\" >&2
+    echo \"       files on the server; resolve there before rendering.\" >&2
+    git status --short | head -10 >&2
+    exit 1
+  fi
+  echo \"    at \$(git rev-parse --short HEAD)\"
+
   docker exec -u $UIDGID -w '$REPO'$envs rstudio quarto render '$QMD'
 
   # Belt and braces: a render can still shell out to something that escalates,
