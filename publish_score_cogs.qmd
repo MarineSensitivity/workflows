@@ -1,0 +1,242 @@
+---
+title: "Publish score surfaces as COGs (retiring the SQL→tile factory)"
+msens:
+  target_name: publish_score_cogs
+  workflow_type: release
+  dependency: [score_zone_metrics]
+  output: data/manifests/publish_score_cogs.json
+editor_options:
+  chunk_output_type: console
+---
+
+Today a scores tile is computed **on every request**: the app base64-encodes a `SELECT` over
+`cell_metric`, a custom titiler factory runs it against DuckDB, builds a dense value array indexed
+by `cell_id`, reads the cell-id COG, and looks up a value per pixel. It is a neat trick, and it buys
+nothing here — every layer the app draws is precomputed, so the SQL is the same handful of queries
+over and over.
+
+The cost is real: a bespoke factory to maintain, a SQL validator guarding an injection surface, a
+1M-row cap the US grid already sits just under, and a per-version titiler service. This publishes
+the same surfaces as ordinary **COGs**, so stock titiler `/cog` serves them and the factory can go.
+
+Rasters are content-addressed in the shared store (`cog/{grid_id}/{hash}.tif`), the same one the
+per-model surfaces use — so a metric whose values did not change between releases is stored **once**
+and every version's manifest points at it.
+
+## What gets published
+
+One COG per **(metric_key × subregion_key)**, mirroring what `cell_sql()` builds today:
+
+- `FULL` — every cell carrying the metric (no spatial filter)
+- each subregion — cells masked to it, so the app's "Study area" filter is a raster, not a query
+
+`rescale` is computed here (plain `min`/`max`, matching the app's `c(stats$min, stats$max)`), which
+is what removes the runtime `/statistics` round-trip on every layer switch.
+
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "cell_metric × subregions → content-addressed COGs + a score_cog registry"
+flowchart LR
+  cm["cell_metric × metric"] --> pay["payload per<br/>(metric × subregion)"]
+  zc["zone_cell (subregion zones)"] --> pay
+  pay --> h["msens::content_hashes()<br/>one pass, all payloads"]
+  h --> st{"already in<br/>cog/{grid_id}/?"}
+  st -->|no| pc["msens::publish_cog()"]
+  st -->|yes| reuse["reuse object"]
+  pc --> reg["score_cog registry<br/>+ rescale"]
+  reuse --> reg
+  reg --> s3[["s3://…/cog/{grid_id}/"]]
+```
+
+## Setup
+
+```{r}
+#| label: setup
+#| message: false
+
+librarian::shelf(arrow, DBI, dplyr, duckdb, glue, knitr, logger, terra,
+                 MarineSensitivity/msens, quiet = TRUE)
+source(here::here("libs/paths.R"))
+
+do_s3   <- Sys.getenv("SCORE_COGS_NO_S3") == ""
+redo    <- Sys.getenv("REDO_SCORE_COGS")  != ""
+test_n  <- suppressWarnings(as.integer(Sys.getenv("SCORE_COGS_TEST_N", "")))
+
+grid_id <- msens::grid_for_ver(ver)
+grid    <- msens::grid_spec_for(grid_id, cellid_tif = path.expand(cellid_tif))
+dir_cog <- path.expand(glue("{dir_big_v}/score_cogs"))
+dir.create(dir_cog, recursive = TRUE, showWarnings = FALSE)
+
+con <- dbConnect(duckdb(), path.expand(sdm_db), read_only = TRUE)
+log_info("ver={ver} grid={grid_id} ({grid$nc}x{grid$nr}) s3={do_s3}")
+```
+
+## Assemble one payload per (metric × subregion)
+
+```{r}
+#| label: payloads
+
+# `k` is the payload identity: metric_key + subregion. Built as ONE table so the
+# content hashes come from a single grouped pass rather than a query per COG.
+dbExecute(con, "DROP TABLE IF EXISTS cog_payload")
+dbExecute(con, "
+  CREATE TEMP TABLE cog_payload AS
+  -- FULL: every cell carrying the metric, no spatial filter
+  SELECT m.metric_key || '__FULL' AS k, cm.cell_id, cm.val
+    FROM cell_metric cm JOIN metric m USING (metric_seq)
+   WHERE cm.val IS NOT NULL
+  UNION ALL
+  -- per subregion: the same values masked to that zone's cells
+  SELECT m.metric_key || '__' || z.val AS k, cm.cell_id, cm.val
+    FROM cell_metric cm
+    JOIN metric m     USING (metric_seq)
+    JOIN zone_cell zc ON zc.cell_id = cm.cell_id
+    JOIN zone z       ON z.zone_seq = zc.zone_seq
+   WHERE z.fld = 'subregion_key' AND cm.val IS NOT NULL")
+
+n_pay <- dbGetQuery(con, "SELECT count(DISTINCT k) n FROM cog_payload")$n
+log_info("{n_pay} payloads ({dbGetQuery(con, 'SELECT count(*) n FROM cog_payload')$n} rows)")
+```
+
+## Content-hash them in one pass
+
+```{r}
+#| label: hashes
+
+# How the raster is written is part of the object's identity, not just its
+# values -- see msens::content_hash_encoded(). Bump this tag whenever the
+# encoding changes, so the new bytes land on a NEW url instead of replacing the
+# old ones under a key that caches still hold.
+ENC <- "flt4s-nd9999-noovr"
+
+h <- msens::content_hashes(con, "cog_payload", by = "k", cols = c("cell_id", "val"))
+
+h <- h |>
+  mutate(metric_key    = sub("__[^_]*$", "", k),
+         subregion_key = sub("^.*__",    "", k),
+         payload_hash  = content_hash,
+         content_hash  = msens::content_hash_encoded(content_hash, ENC),
+         cog_key       = msens::content_key(grid_id, content_hash),
+         url           = msens::content_url(grid_id, content_hash)) |>
+  arrange(metric_key, subregion_key)
+
+# Identical payloads collapse to ONE object. On v8 that is not hypothetical:
+# cell_metric covers only in_usa cells, so a metric's USA mask and its FULL
+# surface are the same pixels.
+knitr::kable(
+  h |> count(n_distinct_hashes = n_distinct(content_hash), payloads = n()) |> select(-n),
+  caption = "payloads vs distinct rasters")
+
+if (!is.na(test_n) && test_n > 0) {
+  h <- head(h, test_n); log_warn("SCORE_COGS_TEST_N={test_n} — publishing a SUBSET only")
+}
+```
+
+## Write the COGs
+
+```{r}
+#| label: write
+
+store <- if (redo) character() else tryCatch(msens::cog_store_index(grid_id),
+                                             error = function(e) { log_warn("store index: {conditionMessage(e)}"); character() })
+log_info("{length(store)} object(s) already in cog/{grid_id}/")
+
+todo <- h |> distinct(content_hash, .keep_all = TRUE) |> filter(redo | !content_hash %in% store)
+log_info("{nrow(todo)} raster(s) to write ({n_distinct(h$content_hash) - nrow(todo)} reused)")
+
+rescale <- list()
+for (i in seq_len(nrow(h))) {
+  r   <- h[i, ]
+  out <- file.path(dir_cog, basename(r$cog_key))
+  d   <- dbGetQuery(con, glue("SELECT cell_id, val FROM cog_payload WHERE k = '{r$k}'"))
+  rescale[[r$k]] <- c(min(d$val, na.rm = TRUE), max(d$val, na.rm = TRUE))
+
+  # `redo` must force a rewrite even when the file is there: the content hash is
+  # of the PAYLOAD, so a change to how the raster is written (datatype, overviews)
+  # leaves the key identical and would otherwise never be re-emitted.
+  if (redo || (!file.exists(out) && !r$content_hash %in% store)) {
+    # FLT4S, not the INT1U used for suitability: scores are continuous and 0 is a
+    # LEGITIMATE value, so 0 cannot double as NoData. Cells absent from
+    # cell_metric stay NA -> NoData, exactly as the SQL surface left them
+    # transparent.
+    #
+    # NO OVERVIEWS, deliberately. The factory decimates from full resolution on
+    # every request; an overview pyramid is a DIFFERENT (also valid) downsample,
+    # so low-zoom tiles disagreed -- measured, z5+ matched exactly while z2-z4
+    # differed on ~10% of pixels. Dropping overviews makes every zoom
+    # pixel-identical to the factory AND cuts each file from 0.64 to 0.22 MB;
+    # these rasters are small enough that full-resolution reads cost nothing.
+    msens::publish_cog(d$cell_id, d$val, out, grid,
+                       datatype = "FLT4S", nodata = -9999, overview = FALSE)
+  }
+}
+
+sz <- sum(file.info(list.files(dir_cog, full.names = TRUE))$size, na.rm = TRUE)
+log_info("{length(list.files(dir_cog))} file(s), {round(sz/1024^2, 1)} MB local")
+```
+
+## The `score_cog` registry
+
+```{r}
+#| label: registry
+
+score_cog <- h |>
+  rowwise() |>
+  mutate(rescale_min = rescale[[k]][1], rescale_max = rescale[[k]][2]) |>
+  ungroup() |>
+  transmute(ver, grid_id, metric_key, subregion_key, payload_hash, content_hash,
+            cog_url = url, rescale_min, rescale_max, colormap = "spectral_r")
+
+f_reg <- glue("{dir_big_v}/tables/score_cog.parquet")
+dir.create(dirname(path.expand(f_reg)), recursive = TRUE, showWarnings = FALSE)
+arrow::write_parquet(score_cog, path.expand(f_reg), compression = "zstd")
+
+knitr::kable(score_cog |> select(metric_key, subregion_key, rescale_min, rescale_max) |> head(12))
+dbDisconnect(con, shutdown = TRUE)
+```
+
+## Publish to S3
+
+```{r}
+#| label: s3
+
+if (do_s3 && nrow(todo)) {
+  args <- c("s3", "sync", shQuote(dir_cog),
+            shQuote(glue("{s3_atlas}/cog/{grid_id}")),
+            "--exclude", shQuote("*"), "--include", shQuote("*.tif"),
+            "--only-show-errors", "--no-progress")
+  out <- system2("aws", args, stdout = TRUE, stderr = TRUE)
+  if (!is.null(attr(out, "status")) && attr(out, "status") != 0)
+    stop("aws s3 sync failed: ", paste(out, collapse = "\n"))
+
+  # verify by READING BACK, not by trusting the exit status
+  probe <- score_cog$cog_url[1]
+  code  <- tryCatch({ con2 <- url(probe, open = "rb"); close(con2); 200L },
+                    error = function(e) 404L)
+  stopifnot("published COG is not readable" = code == 200L)
+  log_info("verified {probe}")
+} else {
+  log_info("S3 push skipped (SCORE_COGS_NO_S3 set, or nothing new)")
+}
+```
+
+## Target manifest
+
+```{r}
+#| label: target-manifest
+
+msens::write_manifest(
+  here::here("data/manifests/publish_score_cogs.json"),
+  target       = "publish_score_cogs",
+  content_hash = digest::digest(score_cog, algo = "xxhash64"),
+  stats = list(
+    ver          = ver,
+    grid_id      = grid_id,
+    n_payloads   = nrow(score_cog),
+    n_rasters    = n_distinct(score_cog$content_hash),
+    n_written    = nrow(todo),
+    mb_local     = round(sz / 1024^2, 1)),
+  force = msens::force_target("publish_score_cogs"))
+```
