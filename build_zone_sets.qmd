@@ -67,6 +67,57 @@ This scan is only as complete as the machine it runs on. The **server** holds ev
 or the registry will silently omit vintages.
 :::
 
+## Derive the canonical subregions
+
+Subregions were never a published layer: each release synthesized them in the database as unions of
+**its own** Planning/Program Areas, so they drifted (v1 `AK/AKL48/L48/USA`, v4–v6 `AK/GA/PA/USA`,
+v7 adds `FULL`) and v2/v3 carry *two different sets under one `fld`*. Worse, a set derived from the
+2026 Program Areas **cannot cover the Atlantic at all** — the 2026 National OCS Program has no
+Atlantic areas — so it can never be the frame for comparing releases across all US waters.
+
+The ecoregion layer already solves this. It is **byte-identical across v1–v8**, it spans every US
+water, and it carries the rollup as a column: `region_key` / `region_name`. So the canonical
+subregions are a dissolve of that column — no hand-written lookup to curate, and nothing to guess:
+
+| region | ecoregions |
+|---|---|
+| `AK` Alaska | High Arctic, Chukchi & Beaufort Seas, East Bering Sea, **Gulf of Alaska** |
+| `AT` Atlantic | NE Continental Shelf, SE Continental Shelf, Puerto Rico & USVI |
+| `GA` Gulf of America | **Eastern**, **Western & Central** Gulf of America |
+| `PA` Pacific | California Current, Washington/Oregon, Pacific Island Territories |
+
+> Note `GOA` is the Gulf of **Alaska** while `EGOA`/`WCGOA` are the Gulf of **America** — the codes
+> invite exactly the wrong inference, which is why this reads `region_key` from the layer rather
+> than mapping ecoregion codes by hand.
+
+The vintage is **inherited from the source ecoregions** (not the build date), since the geometry is
+a pure function of them — so rebuilding never mints a spurious new vintage.
+
+```{r}
+#| label: subregions
+#| message: false
+
+librarian::shelf(sf, quiet = TRUE)
+
+eco_src <- path.expand(glue("{dir_derived}/v1/ply_ecoregions_2025.gpkg"))
+eco_vin <- format(file.info(eco_src)$mtime, "%Y-%m")     # the ecoregion vintage
+f_sub   <- path.expand(glue("{dir_derived}/ply_subregions_usa_{eco_vin}.gpkg"))
+
+eco <- sf::st_read(eco_src, quiet = TRUE)
+stopifnot("ecoregion layer lacks region_key" = all(c("region_key", "region_name") %in% names(eco)))
+
+sub <- eco |>
+  group_by(subregion_key = region_key, subregion_name = region_name) |>
+  summarise(n_ecoregions = n(), .groups = "drop") |>
+  sf::st_make_valid()
+
+sf::st_write(sub, f_sub, delete_dsn = TRUE, quiet = TRUE)
+knitr::kable(sf::st_drop_geometry(sub), caption = glue("Canonical subregions -> {basename(f_sub)}"))
+```
+
+`USA` (all waters) and `FULL` (the whole map extent) stay **pseudo-subregions**: they are not
+polygons but the absence of a filter, so materializing them as geometry would double-count.
+
 ## Fingerprint every layer
 
 ```{r}
@@ -106,7 +157,16 @@ knitr::kable(scan |> select(source, zone_type, n_zones, ver, geom_hash))
 vint <- scan |>
   group_by(zone_type, geom_hash) |>
   summarise(n_zones = first(n_zones),
-            vintage = format(min(mtime), "%Y-%m"),   # first appearance on disk
+            # First appearance on disk -- EXCEPT the derived canonical subregions,
+            # whose vintage is inherited from the ecoregions they dissolve (it is
+            # encoded in their filename). Using their build mtime would mint a
+            # new vintage on every rebuild for geometry that never changed.
+            vintage = {
+              inherited <- sub(".*subregions_usa_([0-9]{4}-[0-9]{2})\\.gpkg$", "\\1",
+                               grep("subregions_usa_", source, value = TRUE)[1])
+              if (!is.na(inherited) && grepl("^[0-9]{4}-[0-9]{2}$", inherited))
+                inherited else format(min(mtime), "%Y-%m")
+            },
             n_files = n(),
             versions = paste(sort(na.omit(ver)), collapse = " "),
             source   = source[which.min(mtime)],
@@ -153,10 +213,10 @@ msens::validate_zone_sets(readr::read_csv(f_csv, show_col_types = FALSE))
 message(glue("wrote {f_csv} ({nrow(out)} zone sets)"))
 ```
 
-## Not yet covered: subregions
+## What each release used, and what replaces it
 
-Subregions are **not** a published layer for most releases — they are synthesized in the database as
-unions of that version's Planning/Program Areas, and they drifted accordingly:
+The per-release subregions this supersedes — note they are not comparable to each other, and v2/v3
+are ambiguous even within one database:
 
 | release | subregion keys |
 |---|---|
@@ -164,13 +224,11 @@ unions of that version's Planning/Program Areas, and they drifted accordingly:
 | v2, v3 | *two different sets under one `fld`* — `AK/AKL48/L48/USA` **and** `AK/GA/PA/USA` |
 | v4–v6 | `AK`, `GA`, `PA`, `USA` |
 | v7 | `AK`, `FULL`, `GA`, `PA`, `USA` |
-| v8 | 4 keys |
+| v8 | `AK`, `GA`, `PA`, `USA` |
 
-Because they were derived from each release's own Program Areas, a subregion is not comparable
-across versions — and v2/v3 are ambiguous even within one database. The next step is a single
-**canonical, version-independent** `subregion_usa` set spanning all US waters, registered here like
-any other vintage, so every release shares one subregion list and the score-COG matrix
-(metrics × subregions) has the same shape everywhere.
+Every one of them is missing the **Atlantic**, because all were unions of Program Areas and the 2026
+National OCS Program has none there. The canonical set derived above does not have that hole, and
+being a function of the v1–v8-identical ecoregions, it applies unchanged to every release.
 
 ## Target manifest
 
