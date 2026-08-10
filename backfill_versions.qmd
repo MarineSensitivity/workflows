@@ -214,6 +214,40 @@ cat(glue("{bver}: id_field={mfst$id_field} grid={mfst$grid_id} tables={length(mf
          "metrics={nrow(mfst$metrics)} zones={nrow(mfst$zones)}\n"))
 ```
 
+## Publish to S3
+
+```{r}
+#| label: publish
+
+do_s3 <- Sys.getenv("BACKFILL_NO_S3") == ""
+if (do_s3) {
+  s3_ver <- glue("{s3_atlas}/{bver}")
+  push <- function(src, dst, ct = NULL) {
+    a <- c("s3", "sync", shQuote(src), shQuote(dst),
+           if (!is.null(ct)) c("--content-type", shQuote(ct)),
+           "--only-show-errors", "--no-progress")
+    o <- system2("aws", a, stdout = TRUE, stderr = TRUE)
+    if (!is.null(attr(o, "status")) && attr(o, "status") != 0)
+      stop(glue("aws s3 sync {src} failed: "), paste(o, collapse = "\n"))
+  }
+  push(dir_tbl, glue("{s3_ver}/tables"))
+  # the manifest is a MUTABLE pointer: a cached copy advertises capabilities the
+  # release no longer has
+  system2("aws", c("s3", "cp", shQuote(f_mfst), shQuote(glue("{s3_ver}/manifest.json")),
+                   "--content-type", shQuote("application/json"),
+                   "--cache-control", shQuote("no-cache"), "--only-show-errors"))
+  if (do_cogs && dir.exists(dir_cog))
+    push(dir_cog, glue("{s3_atlas}/cog/{grid_id}"))
+
+  # verify by READING BACK through the public URL, as the app would
+  got <- msens::atlas_manifest(bver, refresh = TRUE)
+  stopifnot("published manifest does not round-trip" = identical(got$ver, bver))
+  log_info("verified {msens::atlas_base_url()}/{bver}/manifest.json")
+} else {
+  log_info("BACKFILL_NO_S3 set - staged locally only")
+}
+```
+
 ## Target manifest
 
 ```{r}
