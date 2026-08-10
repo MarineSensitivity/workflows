@@ -176,8 +176,15 @@ if (!do_deploy) {
               "else v7 reports silently lose species"))
   log_info("server msens {v} >= 0.13.0 — safe to register the v7 cell_model view")
 
-  system2("ssh", c("msens", glue("mkdir -p {srv_v7}/cell_model")))
-  system2("rsync", c("-aq", "--delete", glue("{cell_mc}/"), glue("msens:{srv_v7}/cell_model/")))
+  # check every exit status explicitly: system2() reports failure only through its
+  # return value here, so an unchecked mkdir/rsync fails the render with NO usable
+  # message (the first attempt died exactly this way — 962 bytes of log, no error)
+  ok <- function(rc, what)
+    if (!identical(as.integer(rc), 0L)) stop(glue("{what} failed, exit {rc}"))
+
+  ok(system2("ssh", c("msens", shQuote(glue("mkdir -p {srv_v7}/cell_model")))), "mkdir")
+  ok(system2("rsync", c("-a", "--delete", glue("{cell_mc}/"),
+                        glue("msens:{srv_v7}/cell_model/"))), "rsync cell_model")
   log_info("synced cell_model -> msens:{srv_v7}/cell_model")
 
   register <- glue(
@@ -197,7 +204,9 @@ if (!do_deploy) {
     "mv -f {srv_v7}/sdm.duckdb.new {srv_v7}/sdm.duckdb; ",
     "{paste(sprintf('touch /share/github/MarineSensitivity/apps/%s/restart.txt', v7_apps), collapse='; ')}")
   out <- system2("ssh", c("msens", shQuote(cmd)), stdout = TRUE, stderr = TRUE)
-  if (!any(grepl("V7CM_OK", out))) stop(paste(tail(out, 20), collapse = "\n"))
+  if (!any(grepl("V7CM_OK", out)))
+    stop(glue("register failed (exit {attr(out, 'status') %||% 0}):\n"),
+         paste(utils::tail(out, 25), collapse = "\n"))
   log_info("v7 cell_model registered + apps reloaded: {grep('V7CM_OK', out, value = TRUE)}")
 }
 ```
