@@ -1,0 +1,132 @@
+---
+title: "Publish a browsable index for the public bucket (storage.marinesensitivity.org)"
+msens:
+  target_name: publish_storage_index
+  workflow_type: release
+  dependency: [release_marine_atlas]
+  output: data/manifests/publish_storage_index.json
+editor_options:
+  chunk_output_type: console
+---
+
+The marine-atlas is public, but nobody can look at it. S3 serves **objects, not directories**: a URL
+ending in `/` 404s unless an object literally has that key, and anonymous `ListBucket` is denied on
+this bucket (verified — `403 AccessDenied`), so a browser cannot enumerate anything. The only way in
+is to already know an object's exact key.
+
+This generates a real `index.html` for each directory, with credentials, at publish time. A Caddy
+vhost (`server/caddy/Caddyfile`) then rewrites folder URLs to those objects, so
+`storage.marinesensitivity.org/marine-atlas/v8/` browses the way people expect.
+
+Named `storage` rather than `s3` so the URL survives a move to another provider.
+
+> **Machine-only trees are summarized, not walked.** `serve/model_cell/` alone is ~17,765 Hive
+> partitions and `cog/` is tens of thousands of content-addressed rasters. A page each would be
+> tens of thousands of documents nobody reads, so those subtrees are shown at their parent with a
+> count and marked *not browsable* — rather than linked to a page that would never exist.
+
+## Setup
+
+```{r}
+#| label: setup
+#| message: false
+
+librarian::shelf(dplyr, glue, knitr, logger, MarineSensitivity/msens, quiet = TRUE)
+source(here::here("libs/paths.R"))
+
+do_s3   <- Sys.getenv("STORAGE_INDEX_NO_S3") == ""
+bucket  <- "s3://oceanmetrics.io-public"
+site    <- "https://storage.marinesensitivity.org"
+obj_url <- msens::atlas_base_url()                       # path-style HTTPS, dotted bucket
+obj_url <- sub("/marine-atlas$", "", obj_url)            # bucket root
+dir_out <- path.expand(glue("{dir_big_v}/storage-index"))
+
+unlink(dir_out, recursive = TRUE); dir.create(dir_out, recursive = TRUE)
+log_info("bucket={bucket} site={site} push_s3={do_s3}")
+```
+
+## List the bucket
+
+```{r}
+#| label: list
+
+# ONLY the published atlas. The bucket also holds `backups/` -- including a
+# 3.1 GB database dump -- which is technically public but should not be
+# advertised: indexing turns "readable if you know the exact key" into
+# "discoverable and crawlable". The Caddy vhost enforces the same restriction,
+# so a page outside marine-atlas cannot be reached through the browse host even
+# by exact path.
+objs <- msens::s3_list_all(bucket, prefix = "marine-atlas")
+log_info("{format(nrow(objs), big.mark=',')} objects under marine-atlas/, ",
+         "{round(sum(objs$size)/1024^3, 1)} GB")
+
+objs |>
+  mutate(top = sub("/.*$", "", key)) |>
+  count(top, name = "objects", wt = NULL) |>
+  left_join(objs |> mutate(top = sub("/.*$", "", key)) |>
+              group_by(top) |> summarise(gb = round(sum(size)/1024^3, 2), .groups = "drop"),
+            by = "top") |>
+  arrange(desc(objects)) |>
+  knitr::kable(caption = "objects by top-level prefix")
+```
+
+## Generate the pages
+
+```{r}
+#| label: generate
+
+ix <- msens::build_storage_index(objs, site_url = site, obj_url = obj_url)
+log_info("{nrow(ix)} index page(s)")
+
+for (i in seq_len(nrow(ix))) {
+  f <- file.path(dir_out, ix$key[i])
+  dir.create(dirname(f), recursive = TRUE, showWarnings = FALSE)
+  writeLines(ix$html[i], f)
+}
+
+knitr::kable(head(ix["key"], 15), caption = "generated pages (first 15)")
+```
+
+## Publish + verify
+
+```{r}
+#| label: publish
+
+if (do_s3 && nrow(ix)) {
+  args <- c("s3", "sync", shQuote(dir_out), shQuote(bucket),
+            "--exclude", shQuote("*"), "--include", shQuote("*index.html"),
+            "--content-type", shQuote("text/html"),
+            # regenerated whenever the bucket changes; a cached copy shows a
+            # listing that no longer matches what is there
+            "--cache-control", shQuote("no-cache"),
+            "--only-show-errors", "--no-progress")
+  out <- system2("aws", args, stdout = TRUE, stderr = TRUE)
+  if (!is.null(attr(out, "status")) && attr(out, "status") != 0)
+    stop("aws s3 sync failed: ", paste(out, collapse = "\n"))
+
+  # verify the DEEPEST page, not the shallowest: CalCOFI's generator reported
+  # success while every nested page silently stayed local, because a zero exit
+  # status does not mean the objects are there
+  deepest <- ix$key[which.max(lengths(strsplit(ix$key, "/", fixed = TRUE)))]
+  url <- sprintf("%s/%s", obj_url, deepest)
+  code <- tryCatch({ con <- url(url, open = "rb"); close(con); 200L }, error = function(e) 404L)
+  stopifnot("deepest index page is not readable after upload" = code == 200L)
+  log_info("verified {url}")
+} else {
+  log_info("STORAGE_INDEX_NO_S3 set - staged locally at {dir_out}")
+}
+```
+
+## Target manifest
+
+```{r}
+#| label: target-manifest
+
+msens::write_manifest(
+  here::here("data/manifests/publish_storage_index.json"),
+  target       = "publish_storage_index",
+  content_hash = digest::digest(ix$key, algo = "xxhash64"),
+  stats = list(n_objects = nrow(objs), n_pages = nrow(ix),
+               gb = round(sum(objs$size) / 1024^3, 2)),
+  force = msens::force_target("publish_storage_index"))
+```
