@@ -200,6 +200,33 @@ on `mdl_key` (`msens::mdl_key_raw()` / `mdl_key_merged()`). Values live in a `va
   done files). Don't rely on per-ingest table writes that can be silently dropped (the v8 registry
   gap) — consolidate in one target.
 - **gm/nc density models are NOT yet ingested** (need density #/km² → suitability [0,100]).
+- **Rendering on the server: always `docker exec -u 1000:1000`** — use
+  `scripts/srv_render.sh <notebook.qmd>`, never a bare `docker exec rstudio quarto render`.
+  `docker exec` runs as **root** (the image's `USER`, which RStudio Server's init needs), so a
+  bare render writes root-owned files into `/share`. The uids are *not* misaligned — the
+  container's `rstudio` user is already uid 1000/gid 1000, matching host `ubuntu` — you just
+  have to ask for it. Use the numeric uid, not `-u rstudio`: docker-compose sets
+  `DEFAULT_USER: admin`, so the account *name* changes on the next container recreate while
+  the uid does not.
+
+  The damage is silent until git touches it: `git merge` aborts with `unable to unlink …
+  Permission denied`, because unlinking needs write permission on the **containing directory**
+  and a render's nested `_files/` dirs are root-owned too. A sweep on 2026-08-10 found
+  **23,729** root-owned files under `/share/data`, including pipeline inputs like
+  `r_cellid.tif` that a non-root render could not have overwritten. If a merge ever aborts
+  this way: `sudo chown -R ubuntu:ubuntu` the checkout, `git restore --source=HEAD --staged
+  --worktree <path>`, then merge. `git stash push -- <path>` first if the changes matter —
+  a partially-applied stash is recoverable from `git stash list`.
+
+  Deploy chunks that `docker exec rstudio Rscript` into `/share` (`release_marine-atlas.qmd`
+  repoint/serve steps, `build_v7_cell_model.qmd` register) carry the same latent risk and
+  should get `-u 1000:1000` when next touched. `R CMD INSTALL` is the exception — it writes
+  the container's own R library and genuinely wants root.
+- **The server pushes over SSH, not HTTPS.** `msens`, `workflows` and `api` had
+  `https://github.com/…` remotes, so a server-side commit could not be pushed
+  (`could not read Username for 'https://github.com'`) and had to be fetched to a laptop over
+  ssh and pushed from there. All four repos now use `git@github.com:…`, which the server's
+  existing key already authenticates as `bbest`.
 - **`mermaid-format: png` is DISABLED — leave it that way.** It is commented out in
   `_quarto.yml`, so Design `{mermaid}` blocks render client-side via mermaid.js and **no
   browser is involved**. PNG bought zoomable lightbox diagrams and cost far more than it was
