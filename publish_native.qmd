@@ -581,6 +581,42 @@ if (exists("merged_reg") && nrow(merged_reg)) {
   native_asset <- bind_rows(native_asset, relocate(merged_rows, ms_merge_key))
 }
 
+# am-only taxa: the merged surface IS the AquaMaps surface ----
+# For a taxon whose only source is AquaMaps there is nothing to merge, so the
+# pipeline never writes it to dist_merged_global and it gets no merged COG --
+# 19,699 served taxa, for which the species app fell back to the custom SQL tile
+# factory. Verified on a 150-taxon sample: the merged surface is byte-identical
+# to the am surface (same count + bit_xor over (cell_id, val)), so the existing
+# native/am COG already IS their merged raster.
+#
+# Alias rather than duplicate: same asset_url, same bbox, zero new bytes.
+have_merged <- native_asset$ms_merge_key[native_asset$ds_key == "ms_merge"]
+dbExecute(con, glue("ATTACH IF NOT EXISTS '{merge_db}' AS mrg (READ_ONLY)"))
+amonly_keys <- dbGetQuery(con, "
+  SELECT ms_merge_key, max(mdl_key) AS am_key FROM (
+    SELECT t.ms_merge_key, tm.mdl_key
+    FROM mrg.taxon t JOIN mrg.taxon_model tm USING (ms_merge_key)
+    WHERE t.is_marine AND t.ms_merge_key IS NOT NULL
+      AND t.sp_cat NOT IN ('reptile','amphibian'))
+  GROUP BY 1 HAVING count(*) = 1 AND max(split_part(mdl_key,'|',1)) = 'am'")
+
+am_src <- native_asset |>
+  filter(ds_key == "am", representation == "model", asset_type == "cog") |>
+  select(am_key = mdl_key, asset_url, any_of(bbox_cols), rescale_min, rescale_max, colormap) |>
+  distinct(am_key, .keep_all = TRUE)
+
+alias_rows <- amonly_keys |>
+  filter(!ms_merge_key %in% have_merged) |>
+  inner_join(am_src, by = "am_key") |>
+  mutate(mdl_key = ms_merge_key, ds_key = "ms_merge",
+         asset_type = "cog", representation = "model") |>
+  select(-am_key)
+
+if (nrow(alias_rows)) {
+  native_asset <- bind_rows(native_asset, relocate(alias_rows, ms_merge_key))
+  log_info("am-only merged aliases: {nrow(alias_rows)} taxa now have a merged COG (0 new objects)")
+}
+
 dbWriteTable(con, "native_asset", native_asset, overwrite = TRUE)
 smry <- dbGetQuery(con, "SELECT representation, asset_type, count(*) n_rows,
   count(DISTINCT mdl_key) n_models, count(DISTINCT ms_merge_key) n_taxa, count(DISTINCT ds_key) n_ds
