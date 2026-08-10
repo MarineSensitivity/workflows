@@ -162,6 +162,8 @@ Good work! Please cleanup the reference index by adding roxygen2 concepts, inclu
 
 Done and pushed. Laptop, server, and origin all at a0d3c715; msens at 8daf9ab.
 
+----
+
 **`msens` Reference index**
 
 It had drifted badly: two of five sections keyed on **concepts no function carries** (the analysis concept is calc, not analyze), so ~90 of 126 topics fell into one undifferentiated "Other". Now 13 purpose-based sections keyed on real @concept tags, with pkgdown::check_pkgdown() passing — every topic listed exactly once. `atlas.R`'s four exports got the `atlas` concept they were missing.
@@ -204,6 +206,81 @@ The _v3…_v8 filename suffixes were naming noise. One ecoregion geometry spans 
 Your uncommitted work (CLAUDE.md, _quarto.yml, build_v7_cell_model.qmd, dev/msens_notes.md) is untouched throughout.
 
 Next up is 2b/2c: the canonical subregion set, relocating zone_cell, and making score_zone_metrics iterate zone sets so one Program Area becomes comparable across releases.
+
+----
+
+Server work is done and verified. Before I build the canonical subregion set, one call is genuinely yours — and the data reframes it.
+
+The v8 subregions are unions of that release's Program Areas: AK = 15 Alaska areas, GA = GAB+GAA, PA = CEC/NOC/SOC, USA = all 20. Note the 2026 program has no Atlantic areas at all, so a subregion set derived from Program Areas can never cover Atlantic, Pacific Islands or Caribbean waters — which is exactly why it can't be the version-independent frame you want.
+
+Meanwhile, the measurement turned up something useful: the ecoregion layer is byte-identical across all of v1–v8 (ecoregion_2025-06, 12 zones: CAC, CBS, EBS, EGOA, GOA, HAR, NECS, PIS, PUR, SECS, WAOR, WCGOA). It's already the one spatial frame every release shares.
+
+⏺ User answered Claude's questions:
+· What should the canonical, version-independent subregion set be? It defines the app's zoom presets and the score-COG matrix shape (metrics × subregions) for every version, so it needs to cover all US waters rather than only the current Program Areas. → Roll up the 12 ecoregions
+
+----
+
+My proposed mapping was wrong on four of twelve — and the correction is better than either option, because the authoritative rollup is already a column in the layer:
+
+┌──────────────────────────┬────────────────────────────────────────────────────────────────┐
+│         my guess         │                             actual                             │
+├──────────────────────────┼────────────────────────────────────────────────────────────────┤
+│ GOA → Gulf of America    │ Gulf of Alaska → AK                                            │
+├──────────────────────────┼────────────────────────────────────────────────────────────────┤
+│ EGOA/WCGOA → Alaska      │ Eastern / Western-Central Gulf of America → GA (exact inverse) │
+├──────────────────────────┼────────────────────────────────────────────────────────────────┤
+│ HAR → Hawaii Archipelago │ High Arctic → AK                                               │
+├──────────────────────────┼────────────────────────────────────────────────────────────────┤
+│ PUR → Caribbean          │ Puerto Rico & USVI → AT                                        │
+├──────────────────────────┼────────────────────────────────────────────────────────────────┤
+│ PIS → Pacific Islands    │ Pacific Island Territories → PA                                │
+└──────────────────────────┴────────────────────────────────────────────────────────────────┘
+
+The ecoregion layer carries region_key/region_name: AK, AT, GA, PA. No hand-written lookup, no guessing — and notably it includes Atlantic, which v8's Program-Area-derived subregions cannot represent at all.
+
+----
+
+Verified in the published release. calcofi_ctd-cast is off the orphan list entirely (was 9 cruises), and calcofi_mets is down to 1 — the position-less 1207OS, ungridded by design. The rest is the documented backlog, now ratcheted.
+
+┌─────────────────────┬─────────────┬───────────────┐
+│                     │ v2026.08.08 │  v2026.08.10  │
+├─────────────────────┼─────────────┼───────────────┤
+│ CTD cruises in obs  │         133 │           142 │
+├─────────────────────┼─────────────┼───────────────┤
+│ CTD obs rows        │  12,614,758 │    13,488,402 │
+├─────────────────────┼─────────────┼───────────────┤
+│ mets obs rows       │     470,882 │       501,582 │
+├─────────────────────┼─────────────┼───────────────┤
+│ CTD orphan cruises  │           9 │             0 │
+├─────────────────────┼─────────────┼───────────────┤
+│ mets orphan cruises │           5 │ 1 (by design) │
+└─────────────────────┴─────────────┴───────────────┘
+
+  Pushed to main, ran 1 shell command
+
+Release A is done and published. Timeline for the hour you asked about:
+
+- 16:50 relaunched after the d_cov fix
+- 17:38 release_database completed (48m 48s) — froze and uploaded v2026.08.10
+- 17:45 test_release passed (6m 32s) and promoted latest.txt
+- 17:47 verified against the published parquet, committed and pushed (cc3e21d)
+
+The promotion happened the right way round: the consumer-contract suite ran against the frozen release before latest.txt moved, so a schema drift would have failed the release rather than the apps.
+
+obs is now 26,296,720 rows; obs_ctd_full 274,857,042.
+
+Consumers are still on the old data — they cache locally and need refreshing. That's the deploy-consumers skill's job (the one I created an hour ago from the section I cut out of CLAUDE.md — it gets its first real use). It needs ssh calcofi, so I'd be touching the CalCOFI server: git pull in three repos, two prep_db.R rebuilds inside the rstudio container, touch restart.txt, plus gh workflow run refresh.yml for db-viz-station.
+
+Want me to run the consumer deploys now? Two things worth knowing before I do:
+
+1. db-viz-hex's prep_db.R has form here — memory records it exhausting 16 GB plus swap on the spatial join and wedging shiny-server, to the point ssh died. I'd background it with docker exec -d and tail the log rather than fire and forget.
+2. ctd-transects is your tree right now (921 uncommitted files of GEBCO work). Its refresh is a GitHub Action that rebuilds shards from the release, so running it would collide with what you're doing locally. I'd skip that one and leave it to you.
+
+Separately, Release B is queued and unstarted: obs carrying ungridded observations across 11 ingests, with the per-dataset findings and provider questions you asked for, plus the consumer audit. That's the several-hour piece — say when.
+
+----
+
+I already finished with commit/push/deploy of ctd-transects local/remote, so ok to run again. Yes, do full consumer deploys
 
 ## 2026-07-31
 
