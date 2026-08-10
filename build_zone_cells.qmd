@@ -1,0 +1,201 @@
+---
+title: "Build zone_cell once per (zone set × grid), not once per release"
+msens:
+  target_name: build_zone_cells
+  workflow_type: schema
+  dependency: [build_zone_sets]
+  output: data/manifests/build_zone_cells.json
+editor_options:
+  chunk_output_type: console
+---
+
+`zone_cell` — which cells each zone covers, and by how much — is a function of **geometry and grid
+alone**. Nothing about a release changes it. Yet `score_zones.qmd` recomputes it per version, so the
+seven releases sharing `programarea_2026-03` each paid for the same `exactextractr` pass, and the
+nine sharing `ecoregion_2025-06` did too.
+
+Keyed on `(zone_set_key, grid_id)` it is computed **once** and reused:
+
+```
+{dir_derived}/zones/{zone_set_key}/{grid_id}/zone_cell.parquet
+```
+
+That is also what makes a Program Area comparable across releases: v3 and v8 now read the *same*
+`zone_cell` rows rather than two independently-extracted ones that merely ought to agree.
+
+> **Semantics are preserved exactly.** `msens::zone_cells()` rounds coverage to whole percent and
+> drops anything rounding to zero, matching the per-version implementation line for line — and the
+> validation chunk below asserts the reproduction against v8's existing `zone_cell` before anything
+> downstream is allowed to use it. Relocating this computation must not move a single score.
+
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "Each zone set is extracted once per grid its releases use"
+flowchart LR
+  zs["data/zone_sets.csv"] --> pair["(zone_set × grid) pairs<br/>grid from grid_for_ver(versions)"]
+  cog["cell-id COG per grid<br/>usa05 / global05"] --> ze["msens::zone_cells()<br/>exactextractr, whole-percent"]
+  pair --> ze
+  ze --> pq["zones/{zone_set_key}/{grid_id}/zone_cell.parquet"]
+  pq --> chk["validate vs v8 zone_cell<br/>(must match exactly)"]
+```
+
+## Setup
+
+```{r}
+#| label: setup
+#| message: false
+
+librarian::shelf(
+  arrow, DBI, dplyr, duckdb, glue, knitr, readr, sf, terra, tidyr,
+  exactextractr, MarineSensitivity/msens, quiet = TRUE)
+
+`%||%` <- function(x, y) if (is.null(x) || is.na(x)) y else x
+source(here::here("libs/paths.R"))
+
+redo    <- Sys.getenv("REDO_ZONE_CELLS") != ""
+dir_zc  <- path.expand(glue("{dir_derived}/zones"))
+dir.create(dir_zc, recursive = TRUE, showWarnings = FALSE)
+
+zone_sets <- readr::read_csv(here::here("data/zone_sets.csv"), show_col_types = FALSE)
+msens::validate_zone_sets(zone_sets)
+
+# each grid's cell-id COG. These are LOOKUP IMAGES (pixel value = cell id), so
+# the ids come back in that grid's id-space whatever frame the raster uses.
+grid_cog <- c(
+  usa05    = path.expand(glue("{dir_derived}/r_cellid.tif")),
+  global05 = path.expand(glue("{dir_derived}/r_cellid_global.tif")))
+
+message(glue("{nrow(zone_sets)} zone sets; grids: {paste(names(grid_cog), collapse=', ')}"))
+```
+
+## Which (zone set × grid) pairs are needed
+
+A zone set is needed on whichever grids its releases use — `usa05` for v1–v7, `global05` for v8.
+A set no release has used yet (a staged layer, or the new canonical subregions) is built on **every**
+grid, so it is ready the moment a release adopts it.
+
+```{r}
+#| label: pairs
+
+pairs <- zone_sets |>
+  rowwise() |>
+  mutate(grids = {
+    vs <- trimws(strsplit(versions %||% "", " ")[[1]])
+    vs <- vs[nzchar(vs)]
+    if (!length(vs)) paste(names(grid_cog), collapse = " ")
+    else paste(sort(unique(vapply(vs, msens::grid_for_ver, character(1)))), collapse = " ")
+  }) |>
+  ungroup() |>
+  tidyr::separate_rows(grids, sep = " ") |>
+  rename(grid_id = grids) |>
+  filter(grid_id %in% names(grid_cog)) |>
+  mutate(out = glue("{dir_zc}/{zone_set_key}/{grid_id}/zone_cell.parquet"),
+         built = file.exists(out))
+
+knitr::kable(pairs |> select(zone_set_key, grid_id, n_zones, built))
+```
+
+## Extract
+
+```{r}
+#| label: extract
+
+todo <- if (redo) pairs else pairs |> filter(!built)
+message(glue("{nrow(todo)} pair(s) to build ({nrow(pairs) - nrow(todo)} already present)"))
+
+for (i in seq_len(nrow(todo))) {
+  p   <- todo[i, ]
+  src <- path.expand(glue("{dir_derived}/{p$source}"))
+  cog <- grid_cog[[p$grid_id]]
+  stopifnot("zone source missing"  = file.exists(src),
+            "cell-id COG missing"  = file.exists(cog))
+
+  ply <- sf::st_read(src, quiet = TRUE)
+  kc  <- grep("key$", names(ply), value = TRUE)[1]
+
+  t0 <- Sys.time()
+  zc <- msens::zone_cells(ply, cog, kc)
+  dir.create(dirname(p$out), recursive = TRUE, showWarnings = FALSE)
+  arrow::write_parquet(zc, p$out, compression = "zstd")
+
+  message(glue("  {p$zone_set_key} x {p$grid_id}: {nrow(zc)} rows, ",
+               "{n_distinct(zc$zone_key)} zones, ",
+               "{round(as.numeric(difftime(Sys.time(), t0, units='secs')))}s"))
+}
+```
+
+```{r}
+#| label: inventory
+
+inv <- pairs |>
+  mutate(rows = vapply(out, function(f)
+    if (file.exists(f)) nrow(arrow::read_parquet(f, col_select = "cell_id")) else NA_integer_,
+    integer(1))) |>
+  select(zone_set_key, grid_id, n_zones, rows)
+knitr::kable(inv, caption = "zone_cell inventory")
+```
+
+## Validation — the reproduction must match v8 exactly
+
+The gate on the whole relocation. v8's `zone_cell` was built by the per-version code this replaces,
+so a mismatch anywhere means the new path would move scores.
+
+```{r}
+#| label: validate
+
+f_v8 <- glue("{dir_zc}/programarea_2026-03/global05/zone_cell.parquet")
+
+# Read v8's zone/zone_cell from the RELEASED Parquet, not sdm.duckdb: the full
+# build database lives only on the laptop, so keying the gate on it would let it
+# silently skip on the server -- which is precisely where the extraction runs.
+# The released tables exist in both places (locally under {dir_big_v}/tables,
+# else over path-style HTTPS from the public bucket).
+tbl_src <- function(t) {
+  loc <- path.expand(glue("{dir_big_v}/tables/{t}.parquet"))
+  if (file.exists(loc)) loc else glue("{msens::atlas_base_url()}/{ver}/tables/{t}.parquet")
+}
+
+if (file.exists(f_v8)) {
+  con <- dbConnect(duckdb())
+  dbExecute(con, "INSTALL httpfs; LOAD httpfs; SET s3_url_style='path';")
+  old <- dbGetQuery(con, glue("
+    SELECT z.val AS zone_key, zc.cell_id, zc.pct_covered
+      FROM read_parquet('{tbl_src('zone_cell')}') zc
+      JOIN read_parquet('{tbl_src('zone')}')      z USING (zone_seq)
+     WHERE z.fld = 'programarea_key'")) |> arrange(zone_key, cell_id)
+  dbDisconnect(con, shutdown = TRUE)
+
+  new <- arrow::read_parquet(f_v8) |> arrange(zone_key, cell_id)
+
+  cat(glue("old (v8 sdm.duckdb): {nrow(old)} rows, {n_distinct(old$zone_key)} zones\n",
+           "new (zone set):      {nrow(new)} rows, {n_distinct(new$zone_key)} zones\n\n"))
+
+  stopifnot(
+    "row count differs"  = nrow(old) == nrow(new),
+    "zone keys differ"   = identical(sort(unique(old$zone_key)), sort(unique(new$zone_key))),
+    "cell ids differ"    = identical(old$cell_id, new$cell_id),
+    "coverage differs"   = identical(as.integer(old$pct_covered), as.integer(new$pct_covered)))
+  cat("PASS — the relocated zone_cell reproduces v8's byte for byte\n")
+} else {
+  cat("skipped: the programarea_2026-03 x global05 extract is not built yet\n")
+}
+```
+
+## Target manifest
+
+```{r}
+#| label: target-manifest
+
+msens::write_manifest(
+  here::here("data/manifests/build_zone_cells.json"),
+  target       = "build_zone_cells",
+  content_hash = digest::digest(inv, algo = "xxhash64"),
+  stats = list(
+    n_pairs     = nrow(pairs),
+    n_built     = sum(!is.na(inv$rows)),
+    total_rows  = sum(inv$rows, na.rm = TRUE),
+    grids       = paste(sort(unique(pairs$grid_id)), collapse = " ")),
+  force = msens::force_target("build_zone_cells"))
+```
