@@ -334,15 +334,28 @@ if (do_pmt) {
     keep <- intersect(c(kc, sub("_key$", "_name", kc)), names(ply))
     msens::publish_pmtiles(ply[, keep], out, layer = z$zone_type,
                            keep_attrs = keep, quiet = TRUE)
+
+    # ALSO publish the polygons as GeoParquet beside the tiles. PMTiles are for
+    # drawing; this is for computing. The scores app's Report tab needs the real
+    # geometry of a Program Area the user added (it goes on to the scoring API),
+    # and it read that from a per-version gpkg on the server -- a local file that
+    # existed only for v3-v8. Geometry depends on the VINTAGE, not the release,
+    # so one file per zone_set_key serves every version that uses it.
+    out_pq <- glue("{dir_pmt}/{z$zone_set_key}/zones.parquet")
+    sf::st_write(ply[, keep], out_pq, driver = "Parquet",
+                 delete_dsn = TRUE, quiet = TRUE)
+
     pmt <- dplyr::bind_rows(pmt, tibble::tibble(
       zone_set_key = z$zone_set_key, pmtiles = as.character(out)))
-    message(glue("  {z$zone_set_key}: {round(file.info(out)$size/1024^2, 1)} MB"))
+    message(glue("  {z$zone_set_key}: {round(file.info(out)$size/1024^2, 1)} MB tiles, ",
+                 "{round(file.info(out_pq)$size/1024, 1)} KB parquet"))
   }
 
   if (Sys.getenv("ZONE_PMTILES_NO_S3") == "") {
     out <- system2("aws", c("s3", "sync", shQuote(dir_pmt),
                             shQuote(glue("{s3_atlas}/zones")),
-                            "--exclude", shQuote("*"), "--include", shQuote("*.pmtiles"),
+                            "--exclude", shQuote("*"),
+                            "--include", shQuote("*.pmtiles"), "--include", shQuote("*.parquet"),
                             "--only-show-errors", "--no-progress"),
                    stdout = TRUE, stderr = TRUE)
     if (!is.null(attr(out, "status")) && attr(out, "status") != 0)
