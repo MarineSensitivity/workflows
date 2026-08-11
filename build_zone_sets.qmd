@@ -228,6 +228,67 @@ msens::validate_zone_sets(readr::read_csv(f_csv, show_col_types = FALSE))
 message(glue("wrote {f_csv} ({nrow(out)} zone sets)"))
 ```
 
+## Publish each vintage as PMTiles
+
+Zone outlines are drawn by both apps, and until now came from
+`ply_programareas_2026.pmtiles` / `ply_ecoregions_2025.pmtiles` on the file host —
+**unversioned**, and inherited artifacts of an archived v7 notebook that nothing
+re-runs. So the tiles a v3 map draws were whatever the last hand-run produced.
+
+Built here per vintage, keyed like everything else, and published to S3 beside the
+data:
+
+```
+zones/{zone_set_key}/zones.pmtiles
+```
+
+Vector tiles are versioned by their OWN vintage and shared across MST releases —
+six releases share one program-area geometry, so they share one tile set.
+
+```{r}
+#| label: pmtiles
+
+do_pmt <- Sys.getenv("ZONE_PMTILES") != "" && nzchar(Sys.which("tippecanoe"))
+if (Sys.getenv("ZONE_PMTILES") != "" && !nzchar(Sys.which("tippecanoe")))
+  log_warn("ZONE_PMTILES set but tippecanoe is not installed - skipping")
+
+pmt <- tibble::tibble(zone_set_key = character(), pmtiles = character())
+if (do_pmt) {
+  dir_pmt <- path.expand(glue("{dir_derived}/zones"))
+  for (i in seq_len(nrow(vint))) {
+    z   <- vint[i, ]
+    src <- path.expand(glue("{dir_derived}/{z$source}"))
+    out <- glue("{dir_pmt}/{z$zone_set_key}/zones.pmtiles")
+    dir.create(dirname(out), recursive = TRUE, showWarnings = FALSE)
+
+    ply <- sf::st_read(src, quiet = TRUE)
+    kc  <- msens::zone_key_col(z$zone_type, names(ply))
+    # carry the KEY plus any name column, so the app can label without a join
+    keep <- intersect(c(kc, sub("_key$", "_name", kc)), names(ply))
+    msens::publish_pmtiles(ply[, keep], out, layer = z$zone_type,
+                           keep_attrs = keep, quiet = TRUE)
+    pmt <- dplyr::bind_rows(pmt, tibble::tibble(
+      zone_set_key = z$zone_set_key, pmtiles = as.character(out)))
+    log_info("{z$zone_set_key}: {round(file.info(out)$size/1024^2, 1)} MB")
+  }
+
+  if (Sys.getenv("ZONE_PMTILES_NO_S3") == "") {
+    out <- system2("aws", c("s3", "sync", shQuote(dir_pmt),
+                            shQuote(glue("{s3_atlas}/zones")),
+                            "--exclude", shQuote("*"), "--include", shQuote("*.pmtiles"),
+                            "--only-show-errors", "--no-progress"),
+                   stdout = TRUE, stderr = TRUE)
+    if (!is.null(attr(out, "status")) && attr(out, "status") != 0)
+      stop("aws s3 sync failed: ", paste(out, collapse = "\n"))
+    log_info("published {nrow(pmt)} zone tile set(s) to {s3_atlas}/zones")
+  }
+  knitr::kable(pmt |> dplyr::mutate(mb = round(file.info(pmtiles)$size/1024^2, 1)) |>
+                 dplyr::select(zone_set_key, mb))
+} else {
+  log_info("ZONE_PMTILES unset - skipping tile build")
+}
+```
+
 ## What each release used, and what replaces it
 
 The per-release subregions this supersedes — note they are not comparable to each other, and v2/v3
