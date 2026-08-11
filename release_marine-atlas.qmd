@@ -383,6 +383,14 @@ if (!do_tables) {
   # `val AS value` is preserved (the apps still reference `value`), and each
   # repoint is verified with a real count so a half-synced directory FAILS
   # LOUDLY here rather than being discovered later as an empty app panel.
+  #
+  # The model_cell probe must draw its mdl_id from model_cell, NOT from `model`.
+  # `model` registers every model including the raw per-dataset ones, and only
+  # merged models have cells -- so `min(mdl_id) FROM model` is a raw model whose
+  # count is legitimately 0. That probe therefore returned 0 on a PERFECTLY
+  # HEALTHY release and would have returned 0 on a broken one too: a check that
+  # cannot distinguish the two states verifies nothing. It printed 0 beside
+  # "VIEWS_OK" for the 580,568,326-row v8 release.
   repoint <- glue(
     "vt <- strsplit('cell_metric,zone_metric,zone', ',')[[1]]; ",
     "tt <- strsplit('{paste(rel_tables, collapse = \",\")}', ',')[[1]]; ",
@@ -393,10 +401,12 @@ if (!do_tables) {
     "DBI::dbExecute(con, \"CREATE OR REPLACE VIEW model_cell AS SELECT m.mdl_key, ",
     "mc.mdl_id, mc.cell_id, mc.val, mc.val AS value FROM read_parquet(",
     "'{srv_modelcell}/*/*.parquet', hive_partitioning = true) mc JOIN model m USING (mdl_id)\"); ",
-    "cat('VIEWS_OK', length(tt), ",
-    "DBI::dbGetQuery(con, 'SELECT count(*) n FROM zone_metric')$n, ",
-    "DBI::dbGetQuery(con, 'SELECT count(*) n FROM model_cell WHERE mdl_id = ",
-    "(SELECT min(mdl_id) FROM model)')$n, '\\n'); ",
+    "zm <- DBI::dbGetQuery(con, 'SELECT count(*) n FROM zone_metric')$n; ",
+    "mc <- DBI::dbGetQuery(con, 'SELECT count(*) n FROM model_cell WHERE mdl_id = ",
+    "(SELECT min(mdl_id) FROM model_cell)')$n; ",
+    "stopifnot(\'zone_metric view is empty\' = zm > 0, ",
+    "\'model_cell view returned no rows for its own first mdl_id\' = mc > 0); ",
+    "cat('VIEWS_OK', length(tt), zm, mc, '\\n'); ",
     "DBI::dbDisconnect(con, shutdown = TRUE)")
   v8_apps <- c("species", "scores")
   cmd_rp <- glue(
