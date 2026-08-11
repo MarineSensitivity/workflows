@@ -96,8 +96,19 @@ copy under `/share/data/big/{ver}/` and `serve.duckdb`'s views point there. Over
 re-reads each Parquet footer — a ~140 ms floor that costs **18–24×** on the small interactive
 queries (Program-areas panel: 0.147 s S3 vs 0.008 s local warm; 0.364 s vs 0.015 s cold). `tables/`
 is only 445 MB and syncs in ~14 s. `cell_model` follows the same rule for a different reason (its
-per-cell/per-polygon queries touch many partitions, which fails outright over HTTPS). Only
-`model_cell` stays on S3 — titiler reads exactly one partition per tile as a point read.
+per-cell/per-polygon queries touch many partitions, which fails outright over HTTPS).
+
+`model_cell` is served **both ways, by different consumers** — the one case where "stays on S3" is
+only half true, so read this before deciding a `DEPLOY_TABLES` sync is redundant:
+
+- **titiler reads it from S3**, one partition per tile as a point read, via its own `read_parquet`
+  path built from the `SERVE_MODEL_CELL` env var (`server/titiler/factory.py`). It uses
+  `serve.duckdb` only for the `model` registry and never touches that view.
+- **the apps read a LOCAL copy** (~3.3 GB, 40k small files, so budget ~1 h for the rsync).
+  `DEPLOY_TABLES=1` syncs it. Without it the S3 glob needs LIST credentials the app container does
+  not have, and the failure is **silent**: the `tryCatch` around `mdl_bbox()` and the clicked-cell
+  lookup returns NULL/NA, so the species app quietly falls back to the study-area extent and a
+  blank value rather than erroring.
 
 ### Unit tests (non-negotiable — the model logic must stay guarded)
 
