@@ -31,7 +31,7 @@ Named `storage` rather than `s3` so the URL survives a move to another provider.
 #| label: setup
 #| message: false
 
-librarian::shelf(dplyr, glue, knitr, logger, MarineSensitivity/msens, quiet = TRUE)
+librarian::shelf(dplyr, glue, knitr, logger, yaml, MarineSensitivity/msens, quiet = TRUE)
 source(here::here("libs/paths.R"))
 
 do_s3   <- Sys.getenv("STORAGE_INDEX_NO_S3") == ""
@@ -75,8 +75,22 @@ objs |>
 ```{r}
 #| label: generate
 
-ix <- msens::build_storage_index(objs, site_url = site, obj_url = obj_url)
+# Per-directory explanations, rendered above each listing. A file listing says
+# WHAT is there but never what it means, how it was made, or how to reach it
+# without a browser -- STAC search, DuckDB over Parquet, GDAL /vsicurl.
+readme <- yaml::read_yaml(here::here("data/storage_readme.yml"))
+log_info("{length(readme)} directory README(s)")
+
+ix <- msens::build_storage_index(objs, site_url = site, obj_url = obj_url, readme = readme)
 log_info("{nrow(ix)} index page(s)")
+
+# publish the SAME text as README.md beside the data, so `aws s3 cp` and `curl`
+# users get the explanation the browser shows
+for (k in names(readme)) {
+  f <- file.path(dir_out, if (k == ".") "README.md" else file.path(k, "README.md"))
+  dir.create(dirname(f), recursive = TRUE, showWarnings = FALSE)
+  writeLines(readme[[k]], f)
+}
 
 for (i in seq_len(nrow(ix))) {
   f <- file.path(dir_out, ix$key[i])
@@ -94,8 +108,8 @@ knitr::kable(head(ix["key"], 15), caption = "generated pages (first 15)")
 
 if (do_s3 && nrow(ix)) {
   args <- c("s3", "sync", shQuote(dir_out), shQuote(bucket),
-            "--exclude", shQuote("*"), "--include", shQuote("*index.html"),
-            "--content-type", shQuote("text/html"),
+            "--exclude", shQuote("*"),
+            "--include", shQuote("*index.html"), "--include", shQuote("*README.md"),
             # regenerated whenever the bucket changes; a cached copy shows a
             # listing that no longer matches what is there
             "--cache-control", shQuote("no-cache"),

@@ -1,0 +1,180 @@
+# Per-directory explanations for storage.marinesensitivity.org.
+#
+# A file listing says WHAT is in a folder but never what it MEANS, how it was
+# made, or how to reach it without a browser. Keys are S3 key prefixes ("." is
+# the bucket root); values are markdown. Each is rendered above that folder's
+# listing AND published as README.md beside the data, so `aws s3 cp` and `curl`
+# users get the same explanation.
+
+".": |
+  ## MarineSensitivity public storage
+
+  Open data behind the **Marine Sensitivity Toolkit** (MST) — species distribution
+  models, extinction-risk-weighted sensitivity scores, and the spatial units they
+  are summarized over, for U.S. offshore energy planning. Sponsored by
+  [BOEM](https://www.boem.gov/).
+
+  Everything here is public and requires no credentials. Browse below, or see
+  [`marine-atlas/`](https://storage.marinesensitivity.org/marine-atlas/) for the
+  data itself.
+
+"marine-atlas": |
+  ## marine-atlas
+
+  One folder per **MST release** (`v1` … `v8`), plus three registry files that
+  describe what exists. Releases are immutable; the registry is what changes.
+
+  | file | what it settles |
+  |---|---|
+  | `latest.txt` | the promoted release — what an app shows when the URL says nothing |
+  | `versions.json` | every release, its status (`released` / `prerelease` / `retired`) and date |
+  | `{ver}/manifest.json` | everything needed to *render* that release |
+
+  **Resolve the current release, then read its manifest:**
+
+  ```bash
+  VER=$(curl -s https://storage.marinesensitivity.org/marine-atlas/latest.txt)
+  curl -s https://storage.marinesensitivity.org/marine-atlas/$VER/manifest.json | jq .
+  ```
+
+  ```r
+  # R
+  remotes::install_github("MarineSensitivity/msens")
+  m <- msens::atlas_manifest()          # "latest"; or atlas_manifest("v7")
+  m$capabilities; head(m$metrics)
+  ```
+
+  **Do not hardcode a version** in anything you want to keep working — resolve
+  `latest.txt`. Pin one deliberately (`v7`) when you need reproducibility.
+
+  `cog/` is shared by every release: rasters are content-addressed, so a surface
+  that did not change between releases is stored once and referenced by both.
+
+  ### Finding data without browsing
+
+  This bucket denies anonymous listing, so **do not** try to enumerate it — query
+  a catalog instead.
+
+  **STAC API** (searchable, spatial) — one Item per model, with its raster as an
+  asset: <https://stac-api.marinesensitivity.org>
+
+  ```r
+  # R: rstac
+  library(rstac)
+  s <- stac("https://stac-api.marinesensitivity.org")
+  it <- s |> stac_search(bbox = c(-98, 25, -80, 31), limit = 5) |> get_request()
+  it$features[[1]]$assets                      # -> COG href, readable via /vsicurl
+  ```
+
+  ```python
+  # Python: pystac-client
+  from pystac_client import Client
+  cat = Client.open("https://stac-api.marinesensitivity.org")
+  items = cat.search(bbox=[-98, 25, -80, 31], limit=5).item_collection()
+  print(items[0].assets)
+  ```
+
+  ```bash
+  # plain HTTP
+  curl -s "https://stac-api.marinesensitivity.org/search?bbox=-98,25,-80,31&limit=2" | jq '.features[].assets'
+  ```
+
+  **Parquet tables** (tabular, exact) — resolve a species or metric to its raster
+  via `{ver}/tables/model_asset.parquet` or `score_cog.parquet`, then read the COG
+  in place with GDAL:
+
+  ```bash
+  gdalinfo /vsicurl/<cog_url>
+  gdal_translate /vsicurl/<cog_url> local.tif -projwin -98 31 -80 25
+  ```
+
+"marine-atlas/cog": |
+  ## Content-addressed raster store
+
+  Cloud-Optimized GeoTIFFs named by a hash of their **contents**, not by species
+  or release. That is why a surface unchanged between releases is stored once:
+  measured across v3/v5/v6/v7, 120,974 model-surfaces collapse to 19,766 distinct
+  rasters.
+
+  Subfolders are **grids**, because a `cell_id` means a different place on each:
+
+  - `usa05` — v1–v7: 3103 × 2006 at 0.05°
+  - `global05` — v8+: 7200 × 3600 at 0.05°
+
+  You are not expected to guess a filename. Resolve one from a release's
+  `tables/model_asset.parquet` (species) or `tables/score_cog.parquet` (scores),
+  or search the **STAC API** (see `marine-atlas/{ver}/`).
+
+  ```bash
+  # any COG here is a normal GDAL raster, readable in place
+  gdalinfo /vsicurl/https://storage.marinesensitivity.org/marine-atlas/cog/global05/<hash>.tif
+  ```
+
+"marine-atlas/v8": |
+  ## v8 — Marine Atlas (pre-release)
+
+  A ground-up rebuild: every species modeled across its **whole global range** on
+  a shared 0.05° ocean grid, with "how marine" derived rather than assumed.
+
+  - `tables/` — the analysis tables (Parquet)
+  - `native/` — per-model source-format surfaces (COGs, PMTiles)
+  - `serve/` — Hive-partitioned surfaces for per-model tile reads
+  - `registry/` — dataset + model provenance
+  - `manifest.json` — the contract an app reads to render this release
+
+  ```r
+  # query the tables directly, no download
+  library(duckdb); con <- dbConnect(duckdb())
+  dbGetQuery(con, "SELECT * FROM read_parquet(
+    'https://storage.marinesensitivity.org/marine-atlas/v8/tables/taxon.parquet') LIMIT 5")
+  ```
+
+"marine-atlas/v8/tables": |
+  ## Analysis tables (Parquet)
+
+  The scored model, one file per table. Readable in place over HTTPS — DuckDB,
+  Polars, pandas and Arrow all range-request Parquet, so you do not need to
+  download a file to query it.
+
+  Key tables: `taxon` (species + extinction risk), `cell_metric` (per-cell
+  scores), `zone` / `zone_metric` (Program Areas, ecoregions, subregions),
+  `model_asset` (model → raster crosswalk), `score_cog` (score → COG + rescale).
+
+  ```python
+  import duckdb
+  duckdb.sql("""
+    SELECT sp_cat, count(*) FROM read_parquet(
+      'https://storage.marinesensitivity.org/marine-atlas/v8/tables/taxon.parquet')
+    GROUP BY 1 ORDER BY 2 DESC""").show()
+  ```
+
+"marine-atlas/v8/native": |
+  ## Per-model surfaces, in their source form
+
+  One asset per distribution model: raster sources as COGs, vector ranges as
+  PMTiles. `am_native` keeps AquaMaps at its own 0.5° resolution; `am` is the
+  0.05° interpolation used in scoring — the same model at two representations.
+
+  Find the asset for a species via `tables/native_asset.parquet`, or search
+  spatially with the STAC API rather than guessing filenames.
+
+"marine-atlas/v8/serve": |
+  ## Serving surfaces (Hive-partitioned Parquet)
+
+  Partitioned so a map tile reads exactly one partition as a point lookup. This
+  is a **machine** layout: partition directories are listed here but each holds a
+  single file, and you almost certainly want `tables/` or `cog/` instead.
+
+  ```r
+  # DuckDB understands the partitioning; do not download it
+  duckdb::dbGetQuery(con, "SELECT * FROM read_parquet(
+    'https://storage.marinesensitivity.org/marine-atlas/v8/serve/model_cell/*/*.parquet',
+     hive_partitioning = true) LIMIT 5")
+  ```
+
+"marine-atlas/v8/registry": |
+  ## Provenance
+
+  Which datasets went in, and which models came out — source, method, time period
+  and citation per dataset. Start here to answer "where did this number come
+  from".

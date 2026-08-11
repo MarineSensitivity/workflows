@@ -360,6 +360,117 @@ I've left it running deliberately, and created a task for it. Two real dependenc
 
 Both resolve at the next v8 release cutover, which pushes the rebuilt tables and the new subregions to the server. That's the natural next step, along with the app-side ?ver= handling that makes the whole thing multi-version.
 
+----
+
+Everything is committed and pushed across all five repos, clean and in sync. 527 tests green.
+
+**Apps — version switching live**
+
+The scores app now draws entirely from COGs: 34 COG tile requests, zero factory calls, verified in a real browser. The legend reads 0–88 for Alaska vs 0–96 for the full extent — that's the per-subregion COG and its build-time rescale coming from the manifest, which also removes the /statistics round-trip on every layer switch. The header's "(v8)" is now a picker listing all nine releases, and ?ver= is accepted, validated and echoed into the URL by both apps. Deployed to the v8 preview (/scores_v8/), not the default-live v7.
+
+**Docs — versioned with a switcher**
+
+marinesensitivity.org/docs/ now publishes per release to /docs/{VERSION}/ with a switcher fed by the same versions.json the apps read. The publish step had to change: quarto-actions/publish replaces the whole gh-pages branch, so publishing v8 would have deleted v7. Versions whose docs aren't built yet are probed and disabled rather than handed to the reader as 404s.
+
+Two silent failures caught only by looking: .gitignore's *.html swallowed the switcher file, and CI reported success while publishing docs without it — Quarto doesn't error on a missing include. Then the script raced the DOM on cached loads, appearing on the index but not inner pages, with no console error.
+
+**storage.marinesensitivity.org — live**
+
+89,933 objects / 18.1 GB browsable. It indexed backups/ on the first run — including a 3.1 GB database dump. Already public, but indexing turns "readable if you know the key" into "discoverable and crawlable", so I removed that page, scoped the generator to marine-atlas/, and the Caddy vhost enforces it server-side (/backups/… now 404s).
+
+**Multi-version data — two versions live**
+
+atlas_manifest() resolves v7 and v8. v7's backfill ran: 32,315 models crosswalked, 30,061 surfaces hashed in 22 s, 13 tables + manifest published. The mdl_seq → mdl_key crosswalk mints merged keys from taxon identity, so a v7 and a v8 merged model for the same species share a key — the point of the whole exercise.
+
+Also: the 192-taxon gap turned out to be upstream, not aliasing. They're multi-source taxa present in dist_merged but absent from dist_merged_global.
+
+**Three things I deliberately did not do unattended**
+
+1. v7's 30,061 COGs — a multi-hour job on the 4-core box that also serves BOEM's live apps.
+2. Recreating the rstudio container to pick up the awscli I added — a recreate resets its R library, breaking the live apps until packages are reinstalled. Notebooks now stage locally and print the host command instead.
+3. The /scores cutover — user-visible, and the app still renders only the release it was built against.
+
+All three are queued as tasks with the reasoning. The most useful thing to look at first is the deployed preview at /scores_v8/ and /docs/v8/.
+
+----
+
+Clean up your tasks: says 9 done, 4 open. Recreate the rstudio container if needed to build and push the COGs to S3, which is the next priority
+
+----
+
+Build and publish are chained and running in the background. Status while that finishes:
+
+Task list cleaned
+
+Nine completed tasks removed (they're recorded in commits). Four remain, all genuinely open: retire the titiler factory, the 192-taxon dist_merged_global gap, this v7 COG build, and the /scores cutover.
+
+Container recreated
+
+Rebuilt and recreated as you asked. Two things had to be fixed first, and one nearly bit:
+
+The msens pin. The Dockerfile pins msens as a floor precisely so a recreate can't roll it back — it warns this bit three times on 2026-07-28. That pin was 0.13.1, which predates everything the apps now use. Recreating without bumping it would have degraded the v8 apps silently: atlas_manifest() and version_picker_html() are both wrapped in tryCatch, so an old msens falls back to SQL-per-tile with no error anywhere. Worse, cog_tile_url(color=) would partial-match colormap on the old signature. Bumped to 0.14.0 and added build assertions for the new functions.
+
+awscli isn't in that base image (no installation candidate), so I switched to Amazon's official v2 bundle with an aws --version assertion.
+
+Credentials, caught before the fact. The container got the CLI but had no credentials — NoCredentials. That would have failed the publish step after ~90 minutes of building, exactly the failure mode I'd complained about. I've mounted /home/ubuntu/.aws read-only in docker-compose (next recreate) and, more importantly, changed the notebook to probe sts get-caller-identity rather than just which aws — presence of the CLI was never the question.
+
+All four apps verified healthy after the recreate, v7 and v8.
+
+Build in progress
+
+~12,000 of 19,752 COGs at last check. Two things worth noting:
+
+- It's 19,752, not 30,061 — v7 dedups 1.52× against itself, before any cross-version sharing.
+- They average ~21 KB, so the set is ~415 MB rather than the ~6 GB I estimated.
+
+I verified the risky part with real data: the usa05 0–360 → −180..180 remapping places rasters correctly (COG extent −178.70..167.25 exactly contains its cells' −178.68..167.22), including a Pacific-spanning species that crosses the antimeridian.
+
+Load is ~1.0 of 4 cores. The 12.9 s I first measured on /scores/ was a cold start — warm requests are 1.2 s.
+
+I'll publish to S3 from the host as soon as the build lands and report the final numbers.
+
+----
+
+### storage browsable, README.md (especially for STAC folder)
+
+Also, why are some folders "not browsable" at storage.marinesensitivity.org? That defeats the purpose of having this interactive browsing layer to S3 [Image #3] [Image #4]
+[Image #3]
+[Image #4]
+
+----
+
+You're right — that was over-applied. My reasoning conflated two different costs, and only one is real.
+
+The expensive thing is the number of pages (directories), not objects. cog/global05/ is one directory — a single page, however many files it holds. Only serve/model_cell/ is genuinely pathological: 17,765 Hive partition directories, which would be 17,765 pages. I wrote a prefix blocklist when I should have budgeted by child-directory count.
+
+----
+
+v7 COG build finished: 19,752 COGs, 340 MB, now published to S3. (The render did error at push() exactly as predicted — no credentials in the container — so the host-side publish took over; the COGs were already safe on disk.)
+
+v7 is live end-to-end: 30,061 models → 19,752 COGs, and one serves through stock titiler (tile 200, 6,899 bytes). Now fixing the browsing.
+
+----
+
+The behaviour is right but my test asserted on the wrong page. And it revealed a better option: a partition directory holding exactly one file should link straight to that file rather than to a page.
+
+✻ Building v7 COGs… (12m 16s · ↓ 11.4k tokens)
+◻ Phase 3c: retire the titiler custom factory
+◻ Fix: 192 served taxa missing from dist_merged_global
+◼ Phase 5: build v7's 30,061 COGs (supervised)
+◻ Phase 8: cutover /scores + /species to the multi-version app
+
+----
+
+wrt storage, can we create explanatory README.md per folder and surface those in the storage browser to provide directory level explanations (and alternative ways of discovering, eg via STAC API searchable endpoint and tools like curl, gdal, rstac or PySTAC
+
+----
+
+Good idea — directory-level explanations plus the non-browser routes (STAC, curl, GDAL, rstac/PySTAC). Let me check what markdown renderer is available.
+
+Now the README content itself — including the non-browser discovery routes you asked for.
+
+
+
 ## 2026-07-31 analytics repo
 
 Create an analytics repo like @../../CalCOFI/analytics/ for all of these MarineSensitivity online products,
