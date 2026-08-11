@@ -147,8 +147,24 @@ if (nzchar(Sys.getenv("GRID_COG_S3"))) {
 ## Summary + manifest
 
 ```{r summary}
-con  <- dbConnect(duckdb(cell_db, read_only = TRUE))
-smry <- dbGetQuery(con, "
+# The cell grid is built on the laptop; the SERVER carries only serve.duckdb and
+# the published Parquet, so `cell_db` does not exist there. Summarise whichever
+# is present -- otherwise this notebook cannot be rendered on the server at all,
+# which is exactly where the cell-id COGs above have to be published from.
+cell_src <- if (file.exists(cell_db)) {
+  list(kind = "db", from = glue("'{cell_db}'"))
+} else {
+  pq <- path.expand(glue("{dir_big_v}/tables/cell.parquet"))
+  if (file.exists(pq)) list(kind = "parquet", from = glue("read_parquet('{pq}')"))
+  else NULL
+}
+stopifnot("no cell table: neither the grid database nor tables/cell.parquet" =
+            !is.null(cell_src))
+message(glue("summarising cell from {cell_src$kind}"))
+
+con  <- if (cell_src$kind == "db") dbConnect(duckdb(cell_db, read_only = TRUE)) else dbConnect(duckdb())
+tbl_expr <- if (cell_src$kind == "db") "cell" else cell_src$from
+smry <- dbGetQuery(con, glue("
   SELECT count(*) AS n_cell,
          count(*) FILTER (WHERE in_usa) AS n_usa,
          count(*) FILTER (WHERE in_pra) AS n_pra,
@@ -156,9 +172,9 @@ smry <- dbGetQuery(con, "
          round(max(area_km2), 3) AS area_max_km2,
          round(min(lon),1) AS lon_min, round(max(lon),1) AS lon_max,
          count(*) FILTER (WHERE depth_mean IS NULL) AS n_null_depth
-  FROM cell")
+  FROM {tbl_expr}"))
 # content fingerprint of the cell table (before disconnect)
-h <- msens::hash_query(con, "cell")
+h <- msens::hash_query(con, tbl_expr)
 dbDisconnect(con, shutdown = TRUE)
 msens::report_table(smry, caption = "global 0.05° cell grid summary")
 
