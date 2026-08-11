@@ -195,14 +195,32 @@ versions <- readr::read_csv(here::here("data/versions.csv"), show_col_types = FA
 v_row    <- versions |> filter(ver == bver)
 stopifnot("version missing from data/versions.csv" = nrow(v_row) == 1)
 
+# score COGs, if publish_score_cogs.qmd has run for this release. They are
+# produced by a separate notebook, so a release's manifest is written before they
+# exist and must be regenerated afterwards -- re-running this notebook is cheap
+# once the content store is warm (every raster is already published).
+f_scog   <- file.path(dir_v, "tables", "score_cog.parquet")
+scog_all <- if (file.exists(f_scog)) arrow::read_parquet(f_scog) else NULL
+scog <- if (!is.null(scog_all))
+  scog_all |> dplyr::filter(!startsWith(metric_key, "_")) |>
+    dplyr::transmute(metric_key, subregion_key, cog = cog_url,
+                     rescale_min, rescale_max, colormap) else NULL
+overlays <- if (!is.null(scog_all))
+  scog_all |> dplyr::filter(startsWith(metric_key, "_")) |>
+    dplyr::transmute(overlay_key = metric_key, subregion_key, cog = cog_url, colormap) else NULL
+log_info("score COGs for {bver}: {if (is.null(scog)) 0 else nrow(scog)} metric, ",
+         "{if (is.null(overlays)) 0 else nrow(overlays)} overlay")
+
 mfst <- msens::manifest_build(
   con, bver,
-  status = v_row$status,
-  base   = msens::atlas_base_url(),
+  status  = v_row$status,
+  base    = msens::atlas_base_url(),
+  metrics = scog,
   # COGs are declared only once they exist; until then the app must not offer a
   # layer it cannot draw
-  capabilities = list(score_cogs = FALSE, model_cogs = built > 0 || length(store) > 0),
+  capabilities = list(model_cogs = built > 0 || length(store) > 0),
   extra = list(title = v_row$title, released = as.character(v_row$released),
+               overlays = overlays,
                models = glue("{msens::atlas_base_url()}/{bver}/tables/model_asset.parquet")))
 
 f_mfst <- file.path(dir_v, "manifest.json")
