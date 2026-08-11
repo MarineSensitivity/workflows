@@ -5,6 +5,8 @@ msens:
   workflow_type: release
   dependency: [score_zone_metrics]
   output: data/manifests/publish_score_cogs.json
+params:
+  ver: null
 editor_options:
   chunk_output_type: console
 ---
@@ -58,19 +60,30 @@ flowchart LR
 
 librarian::shelf(arrow, DBI, dplyr, duckdb, glue, knitr, logger, terra,
                  MarineSensitivity/msens, quiet = TRUE)
+
+`%||%` <- function(x, y) if (is.null(x)) y else x
 source(here::here("libs/paths.R"))
 
 do_s3   <- Sys.getenv("SCORE_COGS_NO_S3") == ""
 redo    <- Sys.getenv("REDO_SCORE_COGS")  != ""
 test_n  <- suppressWarnings(as.integer(Sys.getenv("SCORE_COGS_TEST_N", "")))
 
-grid_id <- msens::grid_for_ver(ver)
-grid    <- msens::grid_spec_for(grid_id, cellid_tif = path.expand(cellid_tif))
-dir_cog <- path.expand(glue("{dir_big_v}/score_cogs"))
+# parameterized by version so the SAME notebook publishes score COGs for a
+# backfilled release; defaults to the configured `ver`
+sver    <- params$ver %||% ver
+grid_id <- msens::grid_for_ver(sver)
+grid    <- msens::grid_spec_for(grid_id)
+db      <- path.expand(msens::sdm_db_path(sver))
+dir_v   <- dirname(db)
+dir_cog <- file.path(dir_v, "score_cogs")
 dir.create(dir_cog, recursive = TRUE, showWarnings = FALSE)
 
-con <- dbConnect(duckdb(), path.expand(sdm_db), read_only = TRUE)
-log_info("ver={ver} grid={grid_id} ({grid$nc}x{grid$nr}) s3={do_s3}")
+stopifnot("release database not found" = file.exists(db))
+con <- dbConnect(duckdb(), db, read_only = TRUE)
+# v8 renamed the value column to `val` (`value` is a DuckDB reserved word)
+cmv <- if ("val" %in% dbListFields(con, "cell_metric")) "val" else "value"
+zv  <- if ("val" %in% dbListFields(con, "zone"))        "val" else "value"
+log_info("ver={sver} grid={grid_id} ({grid$nc}x{grid$nr}) cell_metric.{cmv} s3={do_s3}")
 ```
 
 ## Assemble one payload per (metric × subregion)
@@ -81,20 +94,20 @@ log_info("ver={ver} grid={grid_id} ({grid$nc}x{grid$nr}) s3={do_s3}")
 # `k` is the payload identity: metric_key + subregion. Built as ONE table so the
 # content hashes come from a single grouped pass rather than a query per COG.
 dbExecute(con, "DROP TABLE IF EXISTS cog_payload")
-dbExecute(con, "
+dbExecute(con, glue("
   CREATE TEMP TABLE cog_payload AS
   -- FULL: every cell carrying the metric, no spatial filter
-  SELECT m.metric_key || '__FULL' AS k, cm.cell_id, cm.val
+  SELECT m.metric_key || '__FULL' AS k, cm.cell_id, cm.{cmv} AS val
     FROM cell_metric cm JOIN metric m USING (metric_seq)
-   WHERE cm.val IS NOT NULL
+   WHERE cm.{cmv} IS NOT NULL
   UNION ALL
   -- per subregion: the same values masked to that zone's cells
-  SELECT m.metric_key || '__' || z.val AS k, cm.cell_id, cm.val
+  SELECT m.metric_key || '__' || z.{zv} AS k, cm.cell_id, cm.{cmv} AS val
     FROM cell_metric cm
     JOIN metric m     USING (metric_seq)
     JOIN zone_cell zc ON zc.cell_id = cm.cell_id
     JOIN zone z       ON z.zone_seq = zc.zone_seq
-   WHERE z.fld = 'subregion_key' AND cm.val IS NOT NULL
+   WHERE z.fld = 'subregion_key' AND cm.{cmv} IS NOT NULL
   UNION ALL
   -- the app's 'cells outside Program Areas' overlay: a BINARY mask. It is the
   -- last thing the scores app needs the custom factory for (it uses the
@@ -104,7 +117,7 @@ dbExecute(con, "
     FROM (SELECT DISTINCT cell_id FROM cell_metric) c
    WHERE c.cell_id NOT IN (
      SELECT zc.cell_id FROM zone_cell zc JOIN zone z ON zc.zone_seq = z.zone_seq
-      WHERE z.fld = 'programarea_key')")
+      WHERE z.fld = 'programarea_key')"))
 
 n_pay <- dbGetQuery(con, "SELECT count(DISTINCT k) n FROM cog_payload")$n
 log_info("{n_pay} payloads ({dbGetQuery(con, 'SELECT count(*) n FROM cog_payload')$n} rows)")
@@ -196,10 +209,10 @@ score_cog <- h |>
   rowwise() |>
   mutate(rescale_min = rescale[[k]][1], rescale_max = rescale[[k]][2]) |>
   ungroup() |>
-  transmute(ver, grid_id, metric_key, subregion_key, payload_hash, content_hash,
+  transmute(ver = sver, grid_id, metric_key, subregion_key, payload_hash, content_hash,
             cog_url = url, rescale_min, rescale_max, colormap = "spectral_r")
 
-f_reg <- glue("{dir_big_v}/tables/score_cog.parquet")
+f_reg <- glue("{dir_v}/tables/score_cog.parquet")
 dir.create(dirname(path.expand(f_reg)), recursive = TRUE, showWarnings = FALSE)
 arrow::write_parquet(score_cog, path.expand(f_reg), compression = "zstd")
 
@@ -242,7 +255,7 @@ msens::write_manifest(
   target       = "publish_score_cogs",
   content_hash = digest::digest(score_cog, algo = "xxhash64"),
   stats = list(
-    ver          = ver,
+    ver          = sver,
     grid_id      = grid_id,
     n_payloads   = nrow(score_cog),
     n_rasters    = n_distinct(score_cog$content_hash),
