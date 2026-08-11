@@ -1,7 +1,7 @@
 ## TODO
 
-- GCS storage browser.
-
+- populate /docs with past versions
+- 
 - [ ] manage disk space! especially with Varnish caching raster PNGs now
   ```bash
   df -H  # 2026-04-23
@@ -469,7 +469,91 @@ Good idea — directory-level explanations plus the non-browser routes (STAC, cu
 
 Now the README content itself — including the non-browser discovery routes you asked for.
 
+----
 
+Both done. Everything committed and pushed.
+
+**Why folders were "not browsable" — my error, now fixed**
+
+I conflated two different costs. The expense of this index is the number of pages (directories), not objects. cog/global05/ holds ~20,000 files but is one page — there was never a reason to block it. Only serve/model_cell/ is genuinely pathological: ~17,765 Hive partition directories, which would be 17,765 pages.
+
+I'd written a prefix blocklist (cog/, serve/, dist_merged/, dist/) plus a depth cap of 3, which blocked most of the bucket. It's now a max_child_dirs budget instead: 6 pages became 432, and nothing reads "not browsable". Two refinements fell out — a partition holding exactly one object links straight to that file rather than to a page saying "here is one file", and huge listings cap with an explicit "showing N of M" rather than emitting a multi-megabyte document. I also dropped the 0-byte directory-marker key that was rendering as that blank row you saw.
+
+**READMEs, with the non-browser routes**
+
+`data/storage_readme.yml` carries markdown per prefix, rendered above each listing and published as README.md beside the data so aws s3 cp and curl users get the same text. Since the bucket denies anonymous listing, the emphasis is on catalogs rather than enumeration: STAC API via rstac / pystac-client / plain curl, DuckDB and pandas reading Parquet in place over HTTPS, gdalinfo /vsicurl and gdal_translate to clip a window, and latest.txt → manifest.json with an explicit "don't hardcode a version".
+
+**v7 backfill complete**
+
+**19,752 COGs, 340 MB**, published to `cog/usa05/`. 30,061 models → 19,752 rasters, so v7 dedups 1.52× against itself. A v7 COG serves through stock titiler (/cog/info 200, tile 200).
+
+The render did fail at its publish step exactly as I predicted — the container had the CLI but no credentials — so the host-side sync took over and the COGs were never at risk. I've fixed both halves: credentials are mounted in docker-compose for the next recreate, and the notebook now probes sts get-caller-identity rather than which aws, because presence of the CLI was never the question.
+
+The container rebuild also needed the msens pin bumped to 0.14.0 — without it the recreate would have silently degraded the v8 apps back to SQL-per-tile, since atlas_manifest() and version_picker_html() are both inside tryCatch. Build assertions now cover the new functions. All four apps verified healthy afterward.
+
+**Tasks**
+
+Cleaned to four real ones: retire the titiler factory, the 192-taxon dist_merged_global gap, backfill v6→v1, and the /scores cutover. v6 should be nearly free — it's measured 30,061/30,061 identical to v7, so it'll publish close to zero new rasters.
+
+### PMTiles for zones and SDMs?
+
+I am also expecting to see PMTile vector representations of zones (ie Program Areas / Planning Areas) and vector SDMs (eg NOAA NMFS / FWS  Core Areas / Critical Habitats / etc), but perhaps that is a later task
+  ❯ These PMTiles should end up in the S3 storage.* and should have full resolution at finest detail zoom level (eg maptile zoom=10)
+
+----
+
+Those are real gaps I flagged in the plan but haven't implemented — you're right to call them out. Two distinct problems:
+
+- **Zone PMTiles** aren't reproducible at all (inherited artifacts from the archived v7 notebook) and live on file.marinesensitivity.org, not S3.
+- **Vector SDM PMTiles** are on S3 but built at -z6 with simplification applied at every zoom, so the deepest tiles are coarser than the source and every higher zoom overzooms from them.
+
+Let me fix the tippecanoe flags first, since everything else depends on them.
+
+----
+
+Once PMTiles for zones and SDM land, the apps need to be rewired to use those
+
+----
+
+To answer your questions directly, and then where things stand:
+
+Am I running the backfill? I wasn't — now I am, and v6→v1 is already done
+
+You were right to check. The three shells you saw were stale monitors from the v7 build that finished at 07:43 — until-loops whose ssh sessions had dropped, so they hung instead of exiting. Stopped all three.
+
+The v6→v1 backfill has since completed, and the content-addressing paid off exactly as measured:
+
+┌─────────────────┬───────────────────────────────────┐
+│     version     │             new COGs              │
+├─────────────────┼───────────────────────────────────┤
+│ v6, v5, v4b, v4 │ 5 total (19,752 already in store) │
+├─────────────────┼───────────────────────────────────┤
+│ v2              │ +3,106                            │
+├─────────────────┼───────────────────────────────────┤
+│ v1              │ +32                               │
+└─────────────────┴───────────────────────────────────┘
+
+22,905 COGs now cover all of v1–v7 — against 226,133 model-rows naively, that's 9.9× dedup. 426 MB total.
+
+v3 failed, and only v3. msens::sdm_db_path("v3") had a legacy special case returning derived/sdm_v3.duckdb, which no longer exists — v3 moved to the standard big/v3/ layout years ago. Worse, the existing unit test asserted that legacy path unconditionally, so it encoded the bug and stayed green while every real v3 caller failed. Fixed both; v3 is re-running now.
+
+Score COGs for all versions — running
+
+publish_score_cogs.qmd is parameterized and schema-adaptive (v1–v7 use value, v8 uses val). One gap I had to close first: backfill_versions writes each manifest before score COGs exist, so it now folds them in on a re-run. The chain running is: v3 backfill → score COGs v7…v1 → manifest regeneration.
+
+PMTiles — you're right, and the flags are now fixed
+
+Both gaps were in my approved plan and I hadn't done them. The tippecanoe fix is in and tested:
+
+--simplify-only-low-zooms   maxzoom keeps full source resolution
+--no-tiny-polygon-reduction stop dropping small polygons at low zoom
+-z 10 (was 6)               at z6 the finest detail was ~2.4 km
+
+--simplification applied at every zoom including the max, so the deepest tiles were coarser than the source and every higher zoom overzoomed from them — no view anywhere showed the real boundary. I also added keep_attrs, since zone layers carry their own key columns and have no mdl_key.
+
+Still to do, queued as tasks: build the zone PMTiles reproducibly (they're currently inherited artifacts from the archived v7 notebook, served off file.marinesensitivity.org rather than S3), rebuild the 3,009 vector SDM PMTiles at z10, and then rewire the apps to read those S3 URLs from the manifest so a version switch picks up the right vintage.
+
+One note on v8: its manifest shows model_cogs: FALSE because it's built by a different notebook and uses native_asset instead — cosmetic inconsistency I'll align when I touch the PMTiles work.
 
 ## 2026-07-31 analytics repo
 
