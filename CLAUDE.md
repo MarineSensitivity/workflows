@@ -52,7 +52,24 @@ requirements, both mandatory:
    `purl(...) + source()` is for quick diagnostics ONLY — it skips the HTML and the content-hash
    checkpoint, so it is not a substitute for a real run.
 
-3. **Reproducibility beats uptime — always.** When a reproducible fix and a fast in-place
+3. **The orchestration is part of the process — commit the loop too.** A notebook parameterized by
+   version is only half reproducible if the *loop over versions* lives in a throwaway shell script.
+   Multi-version / multi-dataset drivers are committed under `scripts/` (`backfill_all.sh`,
+   `render_validate.R`) and **must go through `scripts/srv_render.sh`**, never `docker exec quarto
+   render` directly — that bypasses its `git merge --ff-only origin/main` guard, which is how a v3
+   run once rendered a stale `sdm_db_path()` and reported success while producing nothing.
+   Likewise, forcing a rebuild is an **env flag** (`REDO_*`), never moving output directories aside
+   by hand: a hand-`mv` leaves no record of what was rebuilt or why.
+
+   Corollary — **`MSENS_MIN` guards the package, because the version number is not proof.** A
+   notebook whose logic lives in `msens` is only as current as the *installed* package. The server
+   once reported `msens 0.14.0` while running a `manifest_build()` that predated zone PMTiles, so
+   all seven v1–v7 manifests regenerated there came out silently missing their zone tiles. Every
+   `msens` behavior change gets a `Version:` bump **and** a `NEWS.md` entry (see `../CLAUDE.md`) so
+   "same version" actually means "same code", and the Dockerfile's `MSENS_REF`/`MSENS_MIN` pins
+   move with it — otherwise the next container recreate restores the stale build.
+
+4. **Reproducibility beats uptime — always.** When a reproducible fix and a fast in-place
    workaround are both available, take the reproducible one **even if it means brief downtime**.
    Never `docker exec` a change into a running container, hand-edit config inside one, or write
    to `Renviron.site` to dodge a rebuild. Missing packages or env → fix `server/rstudio/Dockerfile`
