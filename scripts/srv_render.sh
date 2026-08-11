@@ -36,8 +36,25 @@ HOST="${MSENS_HOST:-msens}"
 REPO="${MSENS_REPO:-/share/github/MarineSensitivity/workflows}"
 UIDGID="1000:1000"
 
+# Split trailing args: VAR=value -> docker env; everything else -> quarto.
+# This is what lets a version loop (backfill_all.sh) go through THIS script,
+# with its git guard, instead of calling `docker exec` directly and rendering
+# whatever the server happens to hold.
 envs=""
-for kv in "$@"; do envs="$envs -e $kv"; done
+qargs=""
+for a in "$@"; do
+  case "$a" in
+    [A-Z_]*=*) envs="$envs -e $a" ;;
+    *)         qargs="$qargs $a"  ;;
+  esac
+done
+
+# A notebook whose LOGIC lives in msens is only as current as the installed
+# package. MSENS_MIN guards that: the server reported 0.14.0 while running a
+# manifest_build() that predated zone PMTiles, so manifests regenerated there
+# came out silently missing them. Same version number, different code -- which
+# is exactly what the NEWS/Version rule exists to make impossible.
+minver="${MSENS_MIN:-}"
 
 echo "==> rendering $QMD on $HOST as uid $UIDGID"
 
@@ -58,7 +75,17 @@ ssh "$HOST" "set -e
   fi
   echo \"    at \$(git rev-parse --short HEAD)\"
 
-  docker exec -u $UIDGID -w '$REPO'$envs rstudio quarto render '$QMD'
+  if [ -n '$minver' ]; then
+    have=\$(docker exec rstudio Rscript -e 'cat(as.character(packageVersion(\"msens\")))' 2>/dev/null)
+    if ! docker exec rstudio Rscript -e 'q(status = as.integer(packageVersion(\"msens\") < \"$minver\"))' 2>/dev/null; then
+      echo \"ERROR: server msens \$have < required $minver. Reinstall it there first:\" >&2
+      echo \"       docker exec rstudio Rscript -e 'devtools::install(\\\"/share/github/MarineSensitivity/msens\\\")'\" >&2
+      exit 1
+    fi
+    echo \"    msens \$have (>= $minver)\"
+  fi
+
+  docker exec -u $UIDGID -w '$REPO'$envs rstudio quarto render '$QMD'$qargs
 
   # Belt and braces: a render can still shell out to something that escalates,
   # and one root-owned file is enough to wedge the next git operation. Report it
