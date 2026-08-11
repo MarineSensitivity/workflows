@@ -186,6 +186,55 @@ knitr::kable(data.frame(table = c(have, "model_asset"), rows = c(sizes, nrow(mod
              caption = glue("{bver} tables exported to {dir_tbl}"))
 ```
 
+## The per-version view DB
+
+The app resolves its database as `{dir_big}/serve.duckdb`, falling back to the multi-GB
+`sdm.duckdb`. Only v8 had a `serve.duckdb`, so every other release could only be opened by
+attaching its whole 1.9–3.4 GB database — which is why the app pinned one version at startup
+instead of switching on `?ver=`.
+
+This writes the same **KB-sized view DB** for this release: views over the Parquet in
+`{ver}/tables/`, which the release already syncs to the server. Views are created **only for
+tables that exist** — v1/v2 genuinely lack `listing` and `taxon_model`, and a view over a missing
+file fails at `CREATE VIEW` time, not at query time, so declaring one would break the whole DB
+rather than degrade one panel.
+
+`val AS value` is aliased for the v8-era column rename, matching what `release_marine-atlas.qmd`
+does, so one app can query either generation without knowing which it is.
+
+```{r}
+#| label: viewdb
+
+f_serve <- file.path(dir_v, "serve.duckdb")
+if (file.exists(f_serve)) unlink(f_serve)
+sv <- dbConnect(duckdb::duckdb(), f_serve)
+
+# `zone`/`cell_metric`/`zone_metric` carry the scored value; the apps still say `value`
+vt   <- c("cell_metric", "zone_metric", "zone")
+made <- character()
+for (t in c(have, "model_asset")) {
+  f <- file.path(dir_tbl, paste0(t, ".parquet"))
+  if (!file.exists(f)) next
+  # ask DuckDB what the file holds rather than assuming the generation: v1-v7 name
+  # the column `value`, v8 renamed it `val`, and aliasing a column that is already
+  # there is a duplicate-name error
+  nms  <- names(dbGetQuery(sv, glue("SELECT * FROM read_parquet('{f}') LIMIT 0")))
+  cols <- if (t %in% vt && "val" %in% nms && !"value" %in% nms) "*, val AS value" else "*"
+  dbExecute(sv, glue("CREATE OR REPLACE VIEW {t} AS SELECT {cols} FROM read_parquet('{f}')"))
+  made <- c(made, t)
+}
+
+# prove each view actually reads, so a missing/corrupt Parquet fails HERE rather than
+# surfacing later as an empty panel in the app
+counts <- vapply(made, function(t)
+  dbGetQuery(sv, glue("SELECT count(*) n FROM {t}"))$n, numeric(1))
+dbDisconnect(sv, shutdown = TRUE)
+stopifnot("every view must return rows" = all(counts > 0))
+
+log_info("{bver} serve.duckdb: {length(made)} views, {round(file.size(f_serve)/1024)} KB")
+knitr::kable(data.frame(view = made, rows = counts), caption = glue("{bver} serve.duckdb views"))
+```
+
 ## Manifest
 
 ```{r}
