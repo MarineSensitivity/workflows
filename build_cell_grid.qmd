@@ -106,6 +106,44 @@ if (need_build) {
 }
 ```
 
+## Publish the cell-id COGs (gated)
+
+The apps resolve a clicked point through titiler's `/cog/point/{lon},{lat}`: one call for the
+layer's value, one for the cell id. That needs the cell-id lookups **on S3**, not just on the
+server's disk.
+
+Cell ids are **categorical**, so these are written `INT4U` with **no overviews** — a resampled
+pyramid would average neighbouring ids into ids that do not exist. Both grids are published:
+`usa05` serves v1–v7, `global05` serves v8.
+
+> Resolving a click by reading the raster in the app was the source of three separate bugs: the
+> band is named `r_cellid` on one grid and `depth_mean` on the other (so selecting `$cell_id`
+> returned NULL), the app shifted longitude to 0–360 while both rasters are stored −180..180 (so
+> every Americas click read outside the image), and a `SpatRaster` cached across Shiny sessions is
+> a stale external pointer that **segfaults** the process. One HTTP call has none of those modes.
+
+```{r publish_cellid}
+#| label: publish-cellid
+
+if (nzchar(Sys.getenv("GRID_COG_S3"))) {
+  grids <- msens::grid_registry()
+  for (i in seq_len(nrow(grids))) {
+    gid <- grids$grid_id[i]
+    src <- path.expand(glue("{dir_derived}/{grids$cellid_tif[i]}"))
+    if (!file.exists(src)) { message(glue("  {gid}: {basename(src)} absent - skip")); next }
+    dst <- glue("{s3_atlas}/grid/{gid}/cellid.tif")
+    out <- system2("aws", c("s3", "cp", shQuote(src), shQuote(dst),
+                            "--only-show-errors", "--no-progress"),
+                   stdout = TRUE, stderr = TRUE)
+    if (!is.null(attr(out, "status")) && attr(out, "status") != 0)
+      stop("aws s3 cp failed: ", paste(out, collapse = "\n"))
+    message(glue("  {gid}: {round(file.size(src)/1024^2, 1)} MB -> {dst}"))
+  }
+} else {
+  message("GRID_COG_S3 unset - not publishing cell-id COGs")
+}
+```
+
 ## Summary + manifest
 
 ```{r summary}
