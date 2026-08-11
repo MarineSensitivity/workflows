@@ -23,7 +23,8 @@ Both drive a `native_asset` registry (`mdl_key → asset_type + url`) that STAC 
 We only publish inputs that feed a **served taxon** (`is_valid_usa & is_marine`, non
 reptile/amphibian) — the set the species app actually lists.
 
-**Flags:** `REDO_NATIVE=1` (rebuild PMTiles + re-sort am), `NATIVE_SKIP_AM` / `NATIVE_SKIP_PMTILES`,
+**Flags:** `REDO_NATIVE=1` (rebuild PMTiles + IUCN gpkg + re-sort am), `REDO_PMTILES=1` (rebuild
+just the vector tiles), `NATIVE_SKIP_AM` / `NATIVE_SKIP_PMTILES`,
 `NATIVE_TEST_N=<n>` (only first n am COGs, smoke test), `NATIVE_NO_S3` (stage locally, skip upload),
 `NATIVE_WORKERS=<n>`.
 
@@ -68,6 +69,8 @@ redo        <- nzchar(Sys.getenv("REDO_NATIVE"))
 do_s3       <- !nzchar(Sys.getenv("NATIVE_NO_S3"))
 skip_am     <- nzchar(Sys.getenv("NATIVE_SKIP_AM"))
 skip_pmt    <- nzchar(Sys.getenv("NATIVE_SKIP_PMTILES"))
+# narrower than REDO_NATIVE, which also rebuilds the ~7 GB IUCN gpkg and re-sorts am
+redo_pmt    <- redo || nzchar(Sys.getenv("REDO_PMTILES"))
 test_n      <- as.integer(Sys.getenv("NATIVE_TEST_N", "0"))
 n_workers   <- as.integer(Sys.getenv("NATIVE_WORKERS", "6"))
 s3_ver      <- glue("{s3_atlas}/{ver}")
@@ -217,14 +220,20 @@ if (!skip_pmt) for (ds in pmt_ds) {
   keys <- served_by_ds[[ds]]
   if (is.null(keys)) { log_warn("no served keys for {ds} — skip PMTiles"); next }
   dir_ds <- glue("{dir_pmt}/{ds}"); dir_create(dir_ds)
-  # one PMTiles per model (resumable — skips existing unless REDO_NATIVE). z6 is plenty for
-  # coarse range overlays; a single range tiles to a few KB so no per-dataset density blowup.
+  # one PMTiles per model (resumable — skips existing unless REDO_PMTILES/REDO_NATIVE).
+  # Built to z10 so the deepest tiles carry full source resolution: every higher zoom
+  # overzooms from maxzoom, so tiles built at z6 were coarser than the source everywhere
+  # above it. A single range still tiles to a few KB, so there is no density blowup.
+  #
+  # REDO_PMTILES exists separately from REDO_NATIVE because the latter also rebuilds the
+  # ~7 GB IUCN gpkg and re-sorts AquaMaps. Forcing a tile rebuild used to mean moving the
+  # output directory aside by hand, which leaves no record of what was rebuilt or why.
   if (ds == "rng_iucn") {
     # IUCN's full-res source is ~7 GB — read each model on demand from the indexed gpkg
     # (never load it all into memory), one index hit per species.
     log_info("{ds}: {length(keys)} models -> per-model PMTiles from indexed gpkg ({n_workers} workers)")
     built <- publish_pmtiles_from_gpkg(iucn_gpkg, "rng_iucn", keys, dir_ds,
-                                       workers = n_workers, redo = redo, minzoom = 0, maxzoom = 10)
+                                       workers = n_workers, redo = redo_pmt, minzoom = 0, maxzoom = 10)
   } else {
     log_info("reading source polygons for {ds} ({length(keys)} served models) …")
     x <- pmt_specs[[ds]]()
@@ -234,7 +243,7 @@ if (!skip_pmt) for (ds in pmt_ds) {
     if (!nrow(x)) { log_warn("{ds}: 0 features after served-join — skip"); next }
     log_info("{ds}: {nrow(x)} features, {n_distinct(x$mdl_key)} models -> per-model PMTiles ({n_workers} workers)")
     built <- publish_pmtiles_models(x, dir_ds, layer = ds, workers = n_workers,
-                                    redo = redo, minzoom = 0, maxzoom = 10)
+                                    redo = redo_pmt, minzoom = 0, maxzoom = 10)
   }
   if (is.null(built) || !nrow(built)) { log_warn("{ds}: no PMTiles built"); next }
   pmt_rows[[ds]] <- built |> transmute(

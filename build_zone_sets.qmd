@@ -212,6 +212,63 @@ vint |>
   knitr::kable(caption = "How many spatial units really exist, versus how many files")
 ```
 
+## Which releases actually *use* each vintage
+
+`versions` above records which version directory a **gpkg file** was found in — provenance, not
+usage. Those are different: v7 draws Planning Areas and Ecoregions but ships no gpkg of its own for
+them, so it went unlisted while plainly using them. Manifests resolve a release's zone tiles by
+looking itself up in this column, so under-reporting usage published seven manifests with no zone
+outlines at all.
+
+So read usage where it is actually recorded — each release's own `zone` table — and match to a
+vintage by `(zone_type, n_zones)`. A count that matches nothing stays unmatched rather than being
+attached to the nearest vintage: v7's 5-zone subregion set is its own `AK/GA/PA/USA/FULL` synthesis,
+not the canonical 4-zone layer, and quietly equating them would draw the wrong outlines.
+
+```{r}
+#| label: used-by
+
+used <- lapply(msens::atlas_versions()$ver, function(v) {
+  f <- msens::sdm_db_path(v)
+  if (!file.exists(f)) return(NULL)
+  con <- DBI::dbConnect(duckdb::duckdb(), f, read_only = TRUE)
+  on.exit(DBI::dbDisconnect(con, shutdown = TRUE), add = TRUE)
+  if (!"zone" %in% DBI::dbListTables(con)) return(NULL)
+  DBI::dbGetQuery(con, "SELECT fld, count(*) n FROM zone GROUP BY 1") |>
+    transmute(ver = v, zone_type = sub("_key$", "", fld), n_zones = n)
+}) |> bind_rows()
+
+used <- used |>
+  left_join(vint |> select(zone_type, n_zones, zone_set_key), by = c("zone_type", "n_zones"))
+
+knitr::kable(used |> arrange(zone_type, ver),
+             caption = "Zone usage read from each release's `zone` table")
+
+unmatched <- used |> filter(is.na(zone_set_key))
+if (nrow(unmatched))
+  message(glue("unmatched zone usage (no vintage with that count): ",
+               "{paste(unmatched$ver, unmatched$zone_type, unmatched$n_zones, collapse='; ')}"))
+
+# fold usage into `versions`, so a manifest resolving itself by version finds
+# every vintage it draws -- not only the ones whose file happened to live in its
+# own directory
+vint <- vint |>
+  left_join(
+    used |> filter(!is.na(zone_set_key)) |>
+      group_by(zone_set_key) |>
+      summarise(used_by = paste(sort(unique(ver)), collapse = " "), .groups = "drop"),
+    by = "zone_set_key") |>
+  mutate(versions = vapply(seq_len(n()), function(i) {
+    both <- unique(c(strsplit(versions[i], "\\s+")[[1]],
+                     strsplit(ifelse(is.na(used_by[i]), "", used_by[i]), "\\s+")[[1]]))
+    both <- both[nzchar(both)]
+    paste(both[order(as.integer(sub("^v([0-9]+).*", "\\1", both)), both)], collapse = " ")
+  }, character(1))) |>
+  select(-used_by)
+
+knitr::kable(vint |> select(zone_set_key, n_zones, versions))
+```
+
 ## Write the registry
 
 ```{r}
