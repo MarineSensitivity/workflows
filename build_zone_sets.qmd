@@ -335,27 +335,31 @@ if (do_pmt) {
     msens::publish_pmtiles(ply[, keep], out, layer = z$zone_type,
                            keep_attrs = keep, quiet = TRUE)
 
-    # ALSO publish the polygons as GeoParquet beside the tiles. PMTiles are for
+    # ALSO publish the polygons as FlatGeobuf beside the tiles. PMTiles are for
     # drawing; this is for computing. The scores app's Report tab needs the real
     # geometry of a Program Area the user added (it goes on to the scoring API),
     # and it read that from a per-version gpkg on the server -- a local file that
     # existed only for v3-v8. Geometry depends on the VINTAGE, not the release,
     # so one file per zone_set_key serves every version that uses it.
-    out_pq <- glue("{dir_pmt}/{z$zone_set_key}/zones.parquet")
-    sf::st_write(ply[, keep], out_pq, driver = "Parquet",
+    #
+    # FlatGeobuf, not GeoParquet: the server's GDAL has no Parquet driver
+    # (st_write failed with "Driver not available"), while FlatGeobuf is present,
+    # cloud-optimized and spatially indexed, so it reads over /vsicurl directly.
+    out_fgb <- glue("{dir_pmt}/{z$zone_set_key}/zones.fgb")
+    sf::st_write(ply[, keep], out_fgb, driver = "FlatGeobuf",
                  delete_dsn = TRUE, quiet = TRUE)
 
     pmt <- dplyr::bind_rows(pmt, tibble::tibble(
       zone_set_key = z$zone_set_key, pmtiles = as.character(out)))
     message(glue("  {z$zone_set_key}: {round(file.info(out)$size/1024^2, 1)} MB tiles, ",
-                 "{round(file.info(out_pq)$size/1024, 1)} KB parquet"))
+                 "{round(file.info(out_fgb)$size/1024, 1)} KB fgb"))
   }
 
   if (Sys.getenv("ZONE_PMTILES_NO_S3") == "") {
     out <- system2("aws", c("s3", "sync", shQuote(dir_pmt),
                             shQuote(glue("{s3_atlas}/zones")),
                             "--exclude", shQuote("*"),
-                            "--include", shQuote("*.pmtiles"), "--include", shQuote("*.parquet"),
+                            "--include", shQuote("*.pmtiles"), "--include", shQuote("*.fgb"),
                             "--only-show-errors", "--no-progress"),
                    stdout = TRUE, stderr = TRUE)
     if (!is.null(attr(out, "status")) && attr(out, "status") != 0)
