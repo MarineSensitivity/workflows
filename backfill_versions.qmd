@@ -177,6 +177,44 @@ sizes <- vapply(have, function(t) {
   nrow(d)
 }, numeric(1))
 
+# Reconstruct `taxon_model` for the releases that predate it (v1/v2).
+#
+# Those releases record the taxon->model edges WIDE: one integer column per
+# dataset on `taxon` (am_0.05, bl, ch_fws, ch_nmfs, rng_fws, +rng_iucn in v2)
+# holding that dataset's contributing mdl_seq, plus `mdl_seq` for the merged
+# model and `n_ds` for how many datasets contributed. Unpivoting recovers the
+# real edges -- this is derived, not invented.
+#
+# Without it v1/v2 have no taxon->model relation at all: their view DBs carry 11
+# views instead of 13, and nothing can answer "which models fed this taxon" for
+# the two oldest releases.
+if (!"taxon_model" %in% have) {
+  tcols <- dbListFields(con, "taxon")
+  ds_cols <- intersect(c("am_0.05", "bl", "ch_fws", "ch_nmfs", "rng_fws", "rng_iucn"), tcols)
+  if (length(ds_cols) && all(c("mdl_seq", "n_ds") %in% tcols)) {
+    sel <- paste(sprintf(
+      "SELECT taxon_id, '%s' AS ds_key, \"%s\" AS mdl_seq FROM taxon WHERE \"%s\" IS NOT NULL",
+      ds_cols, ds_cols, ds_cols), collapse = " UNION ALL ")
+    tm <- dbGetQuery(con, glue(
+      "{sel} UNION ALL SELECT taxon_id, 'ms_merge', mdl_seq FROM taxon WHERE mdl_seq IS NOT NULL"))
+
+    # n_ds says how many datasets contributed, so it is an independent check on
+    # the unpivot: per-dataset edges (excluding the merged row) must equal it.
+    chk <- dbGetQuery(con, glue(
+      "SELECT sum(n_ds) AS expected FROM taxon WHERE n_ds IS NOT NULL"))$expected
+    got <- sum(tm$ds_key != "ms_merge")
+    if (!isTRUE(all.equal(as.numeric(chk), as.numeric(got))))
+      log_warn("taxon_model reconstruct: {got} per-dataset edges vs n_ds total {chk}")
+    stopifnot("reconstructed taxon_model is empty" = nrow(tm) > 0)
+
+    arrow::write_parquet(tm, file.path(dir_tbl, "taxon_model.parquet"), compression = "zstd")
+    have <- c(have, "taxon_model")
+    sizes <- c(sizes, taxon_model = nrow(tm))
+    log_info("taxon_model RECONSTRUCTED for {bver}: {nrow(tm)} edges ",
+             "({got} per-dataset + {sum(tm$ds_key == 'ms_merge')} merged) from {length(ds_cols)} wide columns")
+  }
+}
+
 # the crosswalk ships as a table of its own: it is what lets a legacy
 # ?mdl_seq= link resolve, and what a merged COG href hangs off
 model_asset <- h |>
