@@ -198,13 +198,24 @@ if (!"taxon_model" %in% have) {
     tm <- dbGetQuery(con, glue(
       "{sel} UNION ALL SELECT taxon_id, 'ms_merge', mdl_seq FROM taxon WHERE mdl_seq IS NOT NULL"))
 
-    # n_ds says how many datasets contributed, so it is an independent check on
-    # the unpivot: per-dataset edges (excluding the merged row) must equal it.
+    # n_ds is recorded independently of the wide columns, so it checks the unpivot:
+    # per-dataset edges (excluding the merged row) should equal it.
+    #
+    # A small shortfall is EXPECTED and is a ceiling of the source layout, not a
+    # bug here: one integer column per dataset can hold only ONE model per dataset
+    # per taxon, so a taxon with two models from the same dataset is counted twice
+    # by n_ds and stored once. Measured on v1: 5 taxa, 8 edges of 17,676 (0.045%),
+    # all BirdLife-id taxa carrying only rng_fws. Warn with the number so the
+    # magnitude stays visible; do not fail, and do not silently accept a LARGE gap.
     chk <- dbGetQuery(con, glue(
       "SELECT sum(n_ds) AS expected FROM taxon WHERE n_ds IS NOT NULL"))$expected
     got <- sum(tm$ds_key != "ms_merge")
-    if (!isTRUE(all.equal(as.numeric(chk), as.numeric(got))))
-      log_warn("taxon_model reconstruct: {got} per-dataset edges vs n_ds total {chk}")
+    if (!isTRUE(all.equal(as.numeric(chk), as.numeric(got)))) {
+      pct <- 100 * (as.numeric(chk) - got) / as.numeric(chk)
+      log_warn("taxon_model reconstruct: {got} per-dataset edges vs n_ds {chk} ",
+               "({round(pct, 3)}% short — the wide layout holds one model per dataset per taxon)")
+      stopifnot("taxon_model reconstruct is missing >1% of edges" = pct < 1)
+    }
     stopifnot("reconstructed taxon_model is empty" = nrow(tm) > 0)
 
     arrow::write_parquet(tm, file.path(dir_tbl, "taxon_model.parquet"), compression = "zstd")
