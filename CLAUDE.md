@@ -43,8 +43,8 @@ requirements, both mandatory:
 1. **Baked into the QMD** — every step (ingest, merge, score, publish, **S3 sync, server + Shiny-app
    deploy**) is a chunk in the owning notebook, gated behind an env flag (default off), **never** an
    ad-hoc `ssh`/`aws`/scratch script. Deploys live in `release_marine-atlas.qmd`: `RELEASE_DEPLOY`
-   (serve.duckdb + titiler-v8 + STAC), `DEPLOY_APPS` (pull `apps_v8` + reload only the v8 apps via
-   `restart.txt`; v7 untouched), `RELEASE_S3_TABLES` (push `tables/` incl `native_asset` without the
+   (serve.duckdb + titiler-v8 + STAC), `DEPLOY_APPS` (pull `apps_v8` + reload it via `restart.txt`
+   — since the 2026-08-12 cutover this IS the live `/scores` + `/species`), `RELEASE_S3_TABLES` (push `tables/` incl `native_asset` without the
    full serve cutover), `DEPLOY_TABLES` (rsync `tables/` to the server + repoint the views at that
    LOCAL copy — no S3 push, no titiler/caddy restart).
 2. **Rendered to HTML** — run via `targets::tar_make()` or `quarto render`, which produce the tracked
@@ -77,17 +77,23 @@ requirements, both mandatory:
    running container and its image is a **bug to fix now** (bake it in), not a reason to avoid
    recreating. A brief outage is cheaper than state nobody can reproduce.
 
-**Both app generations.** A user-facing change must reach **v7 and v8**, not just the newer one:
-v7 = `apps` branch `v7` → `mapgl` (scores) + `mapsp` (species), served as `/scores`, `/species`;
-v8 = `apps` branch `main` → `apps_v8/{scores,species}`, served as `/scores_v8`, `/species_v8`.
-`DEPLOY_APPS=1` reloads v8; `DEPLOY_APPS_V7=1` reloads v7 (deliberately NOT implied by
-`RELEASE_DEPLOY`, so a routine v8 release never restarts the default-live v7 apps).
+**ONE app, every version (cutover 2026-08-12).** There is no longer a per-generation fork to
+keep in sync. `apps` branch `main` → `apps_v8/{scores,species}` is served as **`/scores` and
+`/species`**, and renders any published release from `?ver=` (default = `latest.txt`, currently
+v7). `DEPLOY_APPS=1` reloads it — and since the cutover that means **restarting what everyone
+sees**, not a parallel deployment.
+
+The 18 former instances (`mapgl`, `mapsp`, `mapgl_v1-v6`, `mapsp_v1-v6`, `scores_v6/v8`,
+`species_v6/v8`) are in `/share/shiny_apps_retired/` — moved aside, not deleted, so the cutover
+is reversible — with Caddy 301ing every old URL to `/scores/?ver=v{n}` (and `/mapgl`, `/mapsp` to
+`?ver=v7`, which is what they were). `DEPLOY_APPS_V7=1` still exists but has nothing to restart;
+the v7 checkout is retired.
 
 **Env flags** (gate expensive/side-effecting steps): `REDO_INGEST=1` (rebuild an ingest),
 `REDO_WORMS=1` (rebuild the worms table), `SCORE_V7COMMON=1` (score only v7's species, for
 apples-to-apples), `SCORE_ALLBIRDS=1` (disable the marine-bird cull), `RELEASE_NO_S3=1` /
 `RELEASE_RAW=1` / `RELEASE_DEPLOY=1` (release + serving), `DEPLOY_APPS=1` / `DEPLOY_APPS_V7=1`
-(reload the v8 / v7 Shiny apps), `DEPLOY_TABLES=1` (sync `tables/` + `model_cell/` local + repoint
+(reload the Shiny apps; the `_V7` variant is vestigial post-cutover), `DEPLOY_TABLES=1` (sync `tables/` + `model_cell/` local + repoint
 the views), `DEPLOY_API=1` (pull the api repo + **rebuild** the plumber image — msens lives in that
 image, which is separate from `rstudio`, so `DEPLOY_APPS` never updates it).
 
