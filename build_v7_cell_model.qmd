@@ -175,10 +175,17 @@ if (!do_deploy) {
   # species_for_cells() would tile v7 cells with the 7200 default, prune away the
   # very partitions holding them, and return FEWER SPECIES WITH NO ERROR. Ship
   # msens first (DEPLOY_APPS=1 / DEPLOY_API=1), then register the view.
-  v <- system2("ssh", c("msens", shQuote(glue(
-    "docker exec -u shiny rstudio Rscript -e ",
-    shQuote("cat(as.character(packageVersion('msens')))")))), stdout = TRUE, stderr = TRUE)
-  v <- utils::tail(grep("^[0-9]+\\.[0-9]+", v, value = TRUE), 1)
+  # Rendering ON the server (scripts/srv_render.sh) means the build target ALREADY
+  # is the server path: nothing to rsync, and `ssh msens` from inside the container
+  # fails outright -- which is how the first v6 run died after a fully successful
+  # build (571,579,928 rows, pruning verified) with only "Error in system2()".
+  on_server <- identical(fs::path_real(dir_v7), fs::path_real(srv_v7))
+  v <- if (on_server) as.character(packageVersion("msens")) else {
+    o <- system2("ssh", c("msens", shQuote(glue(
+      "docker exec -u shiny rstudio Rscript -e ",
+      shQuote("cat(as.character(packageVersion('msens')))")))), stdout = TRUE, stderr = TRUE)
+    utils::tail(grep("^[0-9]+\\.[0-9]+", o, value = TRUE), 1)
+  }
   if (!length(v) || package_version(v) < "0.13.0")
     stop(glue("server msens is {v %||% '?'}; need >= 0.13.0 for cell_grid_ncol() — ",
               "run DEPLOY_APPS=1 (and DEPLOY_API=1) on release_marine-atlas.qmd first, ",
@@ -191,10 +198,14 @@ if (!do_deploy) {
   ok <- function(rc, what)
     if (!identical(as.integer(rc), 0L)) stop(glue("{what} failed, exit {rc}"))
 
-  ok(system2("ssh", c("msens", shQuote(glue("mkdir -p {srv_v7}/cell_model")))), "mkdir")
-  ok(system2("rsync", c("-a", "--delete", glue("{cell_mc}/"),
-                        glue("msens:{srv_v7}/cell_model/"))), "rsync cell_model")
-  log_info("synced cell_model -> msens:{srv_v7}/cell_model")
+  if (on_server) {
+    log_info("already on the server ({dir_v7}) — no rsync needed")
+  } else {
+    ok(system2("ssh", c("msens", shQuote(glue("mkdir -p {srv_v7}/cell_model")))), "mkdir")
+    ok(system2("rsync", c("-a", "--delete", glue("{cell_mc}/"),
+                          glue("msens:{srv_v7}/cell_model/"))), "rsync cell_model")
+    log_info("synced cell_model -> msens:{srv_v7}/cell_model")
+  }
 
   register <- glue(
     "con <- DBI::dbConnect(duckdb::duckdb('{srv_v7}/sdm.duckdb.new')); ",
@@ -221,7 +232,8 @@ if (!do_deploy) {
     "docker exec rstudio Rscript -e {shQuote(register)}; ",
     "mv -f {srv_v7}/sdm.duckdb.new {srv_v7}/sdm.duckdb; ",
     "{paste(sprintf('touch /share/github/MarineSensitivity/apps_v8/%s/restart.txt', live_apps), collapse='; ')}")
-  out <- system2("ssh", c("msens", shQuote(cmd)), stdout = TRUE, stderr = TRUE)
+  out <- if (on_server) system2("bash", c("-c", shQuote(cmd)), stdout = TRUE, stderr = TRUE)
+         else            system2("ssh", c("msens", shQuote(cmd)), stdout = TRUE, stderr = TRUE)
   if (!any(grepl("V7CM_OK", out)))
     stop(glue("register failed (exit {attr(out, 'status') %||% 0}):\n"),
          paste(utils::tail(out, 25), collapse = "\n"))
