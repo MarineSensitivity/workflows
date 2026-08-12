@@ -1,5 +1,5 @@
 ---
-title: "Build the model + dataset registry (`dataset` + `model` tables)"
+title: "Build the model + dataset registry (`dataset`, `model`, `taxon_model`, `listing`)"
 msens:
   target_name: build_registry
   workflow_type: schema
@@ -17,20 +17,34 @@ was never consolidated. Building it **once here** (rather than per-ingest) makes
 first-class target that **fails loudly if an ingested dataset is missing its metadata** — the
 single source of truth for STAC, the marine-atlas release, apps and the API.
 
-Written to `sdm.duckdb` (`dataset`, `model`) and staged as Parquet for the release.
+Also carries across the two **relational** tables the merge stage already built into
+`merge.duckdb` but which nothing forwarded — `taxon_model` (taxon ↔ contributing models) and
+`listing` (the federal MMPA/MBTA/ESA lookup). v3–v7 published both; without this v8 was the
+only release whose published tables could not answer *which models fed this taxon*.
+
+Those edges also settle **which datasets actually fed the scores**: `dataset.is_scored` is
+introspected from `taxon_model`, not declared. `gm` + `nc` are ingested to `dist/` but their
+density (#/km²) is not yet on the [0,100] suitability scale, so they are excluded from the
+merge and contribute to no score — without the flag the registry reads as 11 input datasets
+where 8 produced the numbers.
+
+Written to `sdm.duckdb` (`dataset`, `model`, `taxon_model`, `listing`) and staged as Parquet
+for the release.
 
 ## Design
 
 ```{mermaid}
 %%| label: fig-design
-%%| fig-cap: "Registry consolidation: dataset props from front-matter, model props from per-ingest CSVs + merged taxa"
+%%| fig-cap: "Registry consolidation: dataset props from front-matter, model props from per-ingest CSVs + merged taxa, relations from the merge stage"
 flowchart LR
   fm["ingest_*.qmd<br/>msens: dataset: blocks"] --> ds["dataset table"]
   csv["dist/model_{ds}.csv<br/>(per-ingest)"] --> mdl["model table"]
   tax["merge.duckdb taxon<br/>(ms_merge models)"] --> mdl
+  rel["merge.duckdb<br/>taxon_model + listing"] --> rl["taxon_model + listing"]
   ds --> db[("sdm.duckdb + registry/*.parquet<br/>V2/zstd")]
   mdl --> db
-  db --> mf["hash_query(dataset)+hash_query(model)<br/>→ content-addressed manifest"]
+  rl --> db
+  db --> mf["hash_query() of all four<br/>→ content-addressed manifest"]
 ```
 
 ## Setup
@@ -141,11 +155,81 @@ model <- bind_rows(model_raw |> mutate(sp_cat = NA_character_), model_merged) |>
   mutate(ds_key = as.character(ds_key))
 # stable integer id per mdl_key: the compact partition key for the serving surface
 # (serve/model_cell/mdl_id=*, so a titiler tile is a partition-pruned point read) and
-# the mdl_key->mdl_id map the app/tile-URL builder joins on. dense_rank over the unique
-# sorted mdl_key makes it a deterministic function of the model set (1..N).
-model <- model |> mutate(mdl_id = dense_rank(mdl_key)) |> relocate(mdl_id, .after = mdl_key)
+# the mdl_key->mdl_id map the app/tile-URL builder joins on.
+#
+# This was `dense_rank(mdl_key)`, which makes the id a function of the model SET — so
+# adding a model renumbers every model sorted after it. Ingesting gm + nc into v8's
+# dist/ (registered, deliberately NOT merged) moved 45,499 of 80,261 ids; nothing would
+# have failed, the registry and the published partitions would just disagree and titiler
+# would serve the wrong species past ch_nmfs. So ids are assigned AGAINST the published
+# registry when this version has already shipped: published keys keep their id, new keys
+# append above the max (msens::assign_mdl_id()).
+#
+# Reachability is asserted, not tolerated: for a version listed in versions.json the
+# published registry MUST be readable, else a transient network failure silently
+# downgrades to renumber-everything. Only a version that has never shipped starts fresh.
+is_published <- ver %in% msens::atlas_versions()$ver
+published <- if (is_published) {
+  cx <- dbConnect(duckdb()); on.exit(dbDisconnect(cx, shutdown = TRUE), add = TRUE)
+  dbExecute(cx, "INSTALL httpfs; LOAD httpfs; SET s3_url_style='path'; SET s3_region='us-east-1';")
+  dbGetQuery(cx, glue(
+    "SELECT mdl_key, mdl_id FROM read_parquet('{msens::atlas_base_url()}/{ver}/tables/model.parquet')"))
+} else NULL
+model <- model |>
+  mutate(mdl_id = msens::assign_mdl_id(mdl_key, published)) |>
+  relocate(mdl_id, .after = mdl_key)
+if (!is.null(published)) {
+  kept <- inner_join(published, select(model, mdl_key, new_id = mdl_id), by = "mdl_key")
+  stopifnot("published mdl_id renumbered — serve/model_cell partitions would be wrong" =
+              all(kept$mdl_id == kept$new_id))
+  log_info("mdl_id: {nrow(kept)} published ids preserved, ",
+           "{nrow(model) - nrow(kept)} new models appended above {max(published$mdl_id)}")
+} else log_info("mdl_id: {nrow(model)} assigned fresh ({ver} not yet in versions.json)")
 log_info("model registry: {nrow(model)} models ({n_distinct(model_raw$ds_key)} raw datasets + ms_merge)")
 knitr::kable(model |> count(ds_key, name = "n_models"))
+```
+
+## `taxon_model` + `listing` — the relational tables the merge stage already built
+
+```{r}
+#| label: relational
+
+# v3–v7 published `taxon_model` (which models fed a taxon) and `listing` (the federal
+# MMPA/MBTA/ESA lookup). v8 BUILT both — merge_models_prep writes them to merge.duckdb —
+# but nothing carried them into sdm.duckdb, so the release staged neither and the NEWEST
+# release became the only one unable to answer "which models fed this taxon". They belong
+# here rather than in the release notebook because `manifest_build()` introspects
+# sdm.duckdb: a table staged straight to `tables/` is published but undiscoverable (the
+# same trap the v1/v2 taxon_model reconstruction hit).
+con <- dbConnect(duckdb(merge_db, read_only = TRUE))
+taxon_model <- dbGetQuery(con, "SELECT mdl_key, taxon_authority, taxon_id, ms_merge_key FROM taxon_model")
+listing     <- dbGetQuery(con, "SELECT * FROM listing")
+dbDisconnect(con, shutdown = TRUE)
+
+# ds_key is derived from the key grammar, never re-split inline — mdl_key_parse() is the
+# single source of truth for what a `|`-separated mdl_key means.
+taxon_model <- taxon_model |>
+  mutate(ds_key = msens::mdl_key_parse(mdl_key)$dataset_key) |>
+  relocate(ds_key, .after = mdl_key) |>
+  arrange(ms_merge_key, ds_key, mdl_key)
+
+# every edge must point at a model in the registry, else the relation is decorative
+orphan <- setdiff(taxon_model$mdl_key, model$mdl_key)
+stopifnot("taxon_model references mdl_keys absent from the model registry" = !length(orphan))
+log_info("taxon_model: {nrow(taxon_model)} edges over {n_distinct(taxon_model$ms_merge_key)} taxa; ",
+         "listing: {nrow(listing)} rows")
+
+# `is_scored` — registered is NOT used. gm + nc are ingested to dist/ but their density
+# (#/km2) is not yet mapped onto the [0,100] suitability scale, so they are excluded from
+# the merge and contribute to no score. Without this flag the docs (and anyone reading the
+# registry) count 11 input datasets where 8 fed the numbers. Introspected from the edges
+# rather than declared in front-matter, so it cannot drift from the merge.
+dataset <- dataset |>
+  mutate(is_scored = msens::dataset_is_scored(ds_key, taxon_model$ds_key)) |>
+  relocate(is_scored, .after = is_mask)
+log_info("datasets scored: {paste(dataset$ds_key[dataset$is_scored], collapse=', ')}; ",
+         "registered but unscored: {paste(dataset$ds_key[!dataset$is_scored], collapse=', ')}")
+knitr::kable(taxon_model |> count(ds_key, name = "n_edges"))
 ```
 
 ## Write registry → `sdm.duckdb` + release Parquet
@@ -154,15 +238,19 @@ knitr::kable(model |> count(ds_key, name = "n_models"))
 #| label: write
 
 con <- dbConnect(duckdb(sdm_db))
-dbWriteTable(con, "dataset", dataset, overwrite = TRUE)
-dbWriteTable(con, "model",   model,   overwrite = TRUE)
+dbWriteTable(con, "dataset",     dataset,     overwrite = TRUE)
+dbWriteTable(con, "model",       model,       overwrite = TRUE)
+dbWriteTable(con, "taxon_model", taxon_model, overwrite = TRUE)
+dbWriteTable(con, "listing",     listing,     overwrite = TRUE)
 # stage as Parquet (V2/zstd/80MB row groups) alongside the other release tables
 reg_dir <- glue("{dir_atlas}/registry"); dir_create(reg_dir)
-msens::copy_atlas_parquet(con, "dataset", glue("{reg_dir}/dataset.parquet"))
-msens::copy_atlas_parquet(con, "model",   glue("{reg_dir}/model.parquet"))
-smry <- dbGetQuery(con, "SELECT (SELECT count(*) FROM dataset) n_datasets, (SELECT count(*) FROM model) n_models")
-# content fingerprints of both registry tables (fold into one manifest hash)
-reg_hash <- paste0(msens::hash_query(con, "dataset"), msens::hash_query(con, "model"))
+for (t in c("dataset", "model", "taxon_model", "listing"))
+  msens::copy_atlas_parquet(con, t, glue("{reg_dir}/{t}.parquet"))
+smry <- dbGetQuery(con, "SELECT (SELECT count(*) FROM dataset) n_datasets, (SELECT count(*) FROM model) n_models,
+  (SELECT count(*) FROM taxon_model) n_taxon_model, (SELECT count(*) FROM listing) n_listing")
+# content fingerprints of all four registry tables (fold into one manifest hash)
+reg_hash <- paste0(msens::hash_query(con, "dataset"), msens::hash_query(con, "model"),
+                   msens::hash_query(con, "taxon_model"), msens::hash_query(con, "listing"))
 dbDisconnect(con, shutdown = TRUE)
 msens::report_table(smry, caption = "registry counts")
 ```
@@ -176,6 +264,7 @@ msens::report_table(smry, caption = "registry counts")
 msens::write_manifest(
   manifest, target = "build_registry", content_hash = reg_hash,
   stats = list(ver = ver, n_datasets = smry$n_datasets, n_models = smry$n_models,
+               n_taxon_model = smry$n_taxon_model, n_listing = smry$n_listing,
                ingested = paste(sort(ingested), collapse = ","),
                not_ingested = if (length(not_ingested)) paste(sort(not_ingested), collapse = ",") else ""),
   force = msens::force_target("build_registry"))

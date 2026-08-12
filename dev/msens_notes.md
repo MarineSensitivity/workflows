@@ -64,6 +64,38 @@ Review your answers
  ● The previous plan's §11/§12 tail is unfinished (schema.qmd not updated, 2 skills still describe the retired factory, workflows index never rebuilt, am_0.05→am untested and living in a QMD, v1/v2 taxon_model never reconstructed). Fold into this plan?
    → Fold in the docs-of-record items only. Can you write a seperate plan to `@dev/plans/2026-08-12 finish One app, every version` to wrap up the other items not yet finished with the plan `@dev/plans/2026-08-10 One app, every version; retire the per-version app forks.md` in this session before clearing and moving onto the next docs plan
 
+----
+
+Execute Plan B: per-version documentation for the Marine Sensitivity Toolkit.
+
+The plan is at workflows/dev/plans/2026-08-12 documentation per version.md — read it
+first; it is self-contained (B1–B6 plus six verification criteria). Its companion,
+2026-08-12 finish One app, every version.md, records the prerequisite state that
+just landed and two verification bugs worth not repeating.
+
+Context you need up front:
+- The docs repo is ../docs (a Quarto book). The apps now render nine releases
+  (v1, v2, v3, v4, v4b, v5, v6, v7, v8) from one codebase via ?ver=; the docs do
+  not — a single build currently mixes FOUR different versions, so rebuilding a v4
+  doc set today would print v8 numbers under a v4 label. Killing that is the point.
+- Code is authoritative over the docs, which are often stale.
+- Generate every number from the published tables; never transcribe one.
+- Work reproducibly: committed .qmd rendered to HTML, per workflows/CLAUDE.md.
+  No one-off scripts.
+
+Start with B1 (docs/libs/versioned.R + removing the competing hardcodes), since
+every other section depends on it.
+
+Two things to handle deliberately:
+1. B3b is a prerequisite, not a footnote. v8 publishes neither taxon_model nor
+   listing and its model table has no taxon_id, so the NEWEST release is the only
+   one that cannot answer "which models fed this taxon". Decide early whether to
+   fix it at the source or gate the section — don't discover it mid-chapter.
+2. B3's releases/v1.qmd draws on the 2025 final report DOCX. Resolve its internal
+   AquaMaps vintage contradiction ("Accessed October 2025" vs "AquaMaps 2019")
+   before writing, and do not carry forward its counts or the figures it flags as
+   wrong.
+
 ## 2026-08-10 Refactor app versioning and data serving strategy
 
 Let's scope a large update and shift in strategy. So far, we have been releasing a new set of scores and species apps per MST version by freezing the @../apps to a specific commit and then sym linking to a suffixed version on the server to the per version repo. Any features of subsequent app development are then unavailable to the old versions.

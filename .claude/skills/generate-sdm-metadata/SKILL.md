@@ -10,9 +10,23 @@ writes are exactly what silently disappeared in the rewrite.
 
 ## Registry — `build_registry.qmd`
 
-Rebuilds `dataset` + `model` tables (which the ingests only *imply*): `dataset` from every
+Rebuilds `dataset` + `model` + `taxon_model` + `listing`: `dataset` from every
 `msens: dataset:` front-matter block (inherits v7 name/citation where keys match; v8 props
-authoritative); `model` from unioning every `model_{ds}.csv` + the merged taxon. **Fails loudly**
+authoritative); `model` from unioning every `model_{ds}.csv` + the merged taxon; `taxon_model` and
+`listing` carried across from `merge.duckdb`, which builds them but nothing forwarded — v8 was the
+only release whose published tables could not answer *which models fed this taxon*.
+
+Two derived facts are stamped here, both **introspected rather than declared**:
+
+- **`dataset.is_scored`** (`msens::dataset_is_scored()`) — a dataset is scored iff it has
+  `taxon_model` edges. `gm`/`nc` are ingested but excluded from the merge, so they read FALSE and no
+  documented count includes them. Registered is not used.
+- **`model.mdl_id`** (`msens::assign_mdl_id()`) — the serve partition key. It reuses the PUBLISHED
+  registry's ids and appends new keys above the max, because a plain `dense_rank(mdl_key)` is a
+  function of the model set: adding gm+nc moved 45,499 of 80,261 ids, which would have made titiler
+  serve the wrong species with nothing failing.
+
+**Fails loudly**
 if an ingested dataset lacks a metadata block; **warns** on declared-but-not-ingested (gm/nc).
 Run it before release/STAC/apps. Do NOT re-add per-ingest `INSERT INTO dataset/model`.
 
@@ -47,3 +61,19 @@ v8 keeps whole (largely terrestrial) bird ranges, so cull terrestrial birds from
 The **family allow-list** is what kills the sub-pixel-island confound (kiwis/white-eyes score high
 pct but aren't marine families). `pct_marine` MUST come from the **raw global bl ranges** (the merged
 model_cell is US-scoped ~100%). Non-bird taxa → `is_marine = TRUE`.
+
+## Metadata is per-RELEASE, and the docs read it that way
+
+Every release publishes its own `dataset`/`taxon`/`metric` tables, and they disagree by design —
+so a fact stated without a version is wrong for eight of nine releases:
+
+| question | answered by | moves between releases |
+|---|---|---|
+| how many source datasets? | `dataset` where `is_scored` | v1 5 · v3 7 · v8 8 |
+| which categories are scored? | `sp_cat` ∩ `extrisk_{cat}` in `metric` | v1 scores `reptile`; v3+ do not; v8 drops `other`, adds `primary_producer` |
+| what is a valid species? | `is_ok` (v1–v7) / `is_valid_usa AND is_marine` (v8) | the DEFINITION changed at v3 and v7, so the count is not a trend |
+| which models fed a taxon? | `taxon_model` | v1/v2 reconstructed from wide columns; v8 now publishes it |
+
+`msens::sdm_cols(con)` resolves the column names per release (`is_ok`/`is_valid_usa`,
+`mdl_seq`/`ms_merge_key`, `value`/`val`) by introspection — use it rather than branching on a version
+string. The versioned documentation calls the same function for the same reason.

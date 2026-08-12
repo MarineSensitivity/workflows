@@ -148,7 +148,7 @@ check_schema <- function(con, expected, core, db_label) {
 infer_desc <- function(col) {
   known <- c(
     cell_id="global 0.05° grid cell id (1:ncell)", mdl_key="stable model id {ds_key}|{sp_id}",
-    mdl_id="dense integer model id (serving partition key; renumbers per release)",
+    mdl_id="dense integer model id (serving partition key; NEVER renumbered for a published model -- see assign_mdl_id)",
     ms_merge_key="merged-taxon model id ms_merge|{authority}:{id}", ds_key="dataset key",
     metric_seq="metric sequence id", zone_seq="zone sequence id", sp_id="species id within dataset",
     sp_key="species key in source dataset", sp_cat="taxonomy-based scoring category",
@@ -277,11 +277,84 @@ cell tally so species outside the US still list in the app.
 
 ---
 
-# serve.duckdb — public serving surface
+# The published release — any version
 
-The database consumers query: a few KB of **views** over the partitioned Parquet published to
-`s3://oceanmetrics.io-public/marine-atlas/v8/`. titiler-v8 resolves `mdl_key → mdl_id` and reads a
-single `serve/model_cell/mdl_id=*/…parquet` partition per tile (anonymous HTTP range read).
+`serve.duckdb` is a few KB of **views** over the partitioned Parquet published to
+`s3://oceanmetrics.io-public/marine-atlas/{ver}/`. Its *content* is the release, so the published
+schema can be read from the release itself rather than from a local build — for **any** version,
+with no server access.
+
+This section does exactly that: it introspects the release named by `SCHEMA_VER` (default: this
+checkout's `ver`), so the schema of v3 can be documented without a v3 database on disk. The
+`sdm`/`merge`/`spp` sections that follow describe the **local build** databases, which exist only
+for whichever version was last built here.
+
+```{r}
+#| label: published-schema
+#| echo: false
+#| output: asis
+
+pub_ver <- Sys.getenv("SCHEMA_VER", ver)
+pub_m   <- tryCatch(msens::atlas_manifest(pub_ver), error = function(e) NULL)
+
+if (is.null(pub_m)) {
+  cat(glue("::: {{.callout-warning}}\nCould not read the manifest for `{pub_ver}`.\n:::\n\n"))
+} else {
+  con_pub <- dbConnect(duckdb())
+  dbExecute(con_pub, "INSTALL httpfs; LOAD httpfs; SET s3_url_style='path'; SET s3_region='us-east-1';")
+
+  cat(glue(
+    "**`{pub_ver}`** — grid `{pub_m$grid_id}`, public model id `{pub_m$id_field}`, ",
+    "{length(pub_m$tables)} published tables.\n\n"))
+
+  # capabilities are derived from PRESENCE and default to FALSE, so what a release
+  # does NOT publish is as informative as what it does
+  caps <- unlist(pub_m$capabilities)
+  cat("Capabilities: ",
+      paste0("`", names(caps), "` ", ifelse(caps, "yes", "**no**"), collapse = " · "), "\n\n")
+
+  for (t in names(pub_m$tables)) {
+    d <- tryCatch(
+      dbGetQuery(con_pub, glue("DESCRIBE SELECT * FROM read_parquet('{pub_m$tables[[t]]}')")),
+      error = function(e) NULL)
+    if (is.null(d)) next
+    n <- tryCatch(
+      dbGetQuery(con_pub, glue("SELECT count(*) n FROM read_parquet('{pub_m$tables[[t]]}')"))$n,
+      error = function(e) NA)
+    cat(glue("\n### `{t}` — {ifelse(is.na(n), '?', format(n, big.mark = ','))} rows\n\n"))
+    print(knitr::kable(
+      tibble(Column = d$column_name, Type = d$column_type,
+             Description = vapply(d$column_name, infer_desc, "")),
+      format = "pipe"))
+    cat("\n")
+  }
+  dbDisconnect(con_pub, shutdown = TRUE)
+}
+```
+
+## Zone sets — geometry by vintage, not by release
+
+`zone_cell` depends only on (geometry × grid), so it is **not** a per-release table: it lives at
+`zones/{zone_set_key}/{grid_id}/zone_cell.parquet` and one extraction serves every release on that
+grid. Measured, one program-area geometry covers v2–v8 and one ecoregion geometry covers v1–v8.
+
+The registry that settles which vintage a release used is `data/zone_sets.csv`, and each release's
+manifest names its `zone_set_key` per spatial unit — which is what lets an app (or this
+documentation) draw the correct outlines for the version being viewed instead of the newest ones.
+
+```{r}
+#| label: zone-sets
+#| echo: false
+zs <- readr::read_csv(here::here("data/zone_sets.csv"), show_col_types = FALSE)
+knitr::kable(zs |> dplyr::select(zone_set_key, zone_type, vintage, n_zones, versions, canonical))
+```
+
+---
+
+# serve.duckdb — the local view database
+
+titiler resolves `mdl_key → mdl_id` and reads a single `serve/model_cell/mdl_id=*/…parquet`
+partition per tile (anonymous HTTP range read).
 
 ```{r}
 #| label: serve-changes

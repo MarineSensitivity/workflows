@@ -40,10 +40,20 @@ to the apps and the docs:
 quarto render release_marine-atlas.qmd            # or: Rscript -e 'targets::tar_make(release_marine_atlas)'
 ```
 Produces `s3://oceanmetrics.io-public/marine-atlas/{ver}/`: `tables/` (cell, taxon, dataset, model,
-cell_metric, zone*, metric, native_asset), `dist_merged/`, `registry/`, and **`serve/model_cell/`** —
-Hive-**partitioned by the integer `mdl_id`** (dense_rank over mdl_key; stored rows are cell_id,val) so a
-titiler tile is an exact-partition point read. The STABLE public key stays **`mdl_key`** (the factory
-resolves mdl_key→mdl_id). Flags: `RELEASE_NO_S3=1` (stage only), `RELEASE_S3_TABLES=1` (push `tables/`
+cell_metric, zone*, metric, native_asset, **taxon_model, listing**), `dist_merged/`, `registry/`, and
+**`serve/model_cell/`** — Hive-**partitioned by the integer `mdl_id`** (stored rows are cell_id,val) so a
+titiler tile is an exact-partition point read. The STABLE public key stays **`mdl_key`**.
+
+**`mdl_id` must never renumber a published model.** It is the serve PARTITION key, so
+`msens::assign_mdl_id(mdl_key, published)` reuses the published registry's ids and appends new keys
+above the max; `build_registry.qmd` fetches that registry and asserts nothing moved. It was
+`dense_rank(mdl_key)`, which is a function of the model SET — ingesting `gm`+`nc` into v8's `dist/`
+moved **45,499 of 80,261** ids, and nothing would have failed: the registry and the partitions would
+simply disagree, and titiler would serve the wrong species past `ch_nmfs`.
+
+**`dataset.is_scored` separates registered from used.** `gm`/`nc` are ingested but excluded from the
+merge, so they contribute to no score; the flag is introspected from `taxon_model`
+(`msens::dataset_is_scored()`), never declared, and the docs count datasets by it. Flags: `RELEASE_NO_S3=1` (stage only), `RELEASE_S3_TABLES=1` (push `tables/`
 incl `native_asset` WITHOUT the serve cutover), `RELEASE_REDO_SERVE=1` (re-partition when the model set
 changed — e.g. after a merge/crosswalk change renumbers mdl_id), `RELEASE_RAW=1` (also push raw `dist/`).
 
@@ -67,15 +77,23 @@ SQL, ~0.07s tile; if cold reads ever exceed 1–2s, fall back to a local `/share
 - **`RELEASE_DEPLOY=1`** — the notebook rsyncs the KB view DB + STAC subtree to `msens1`, `git pull`s
   the server repo and (re)builds the **parallel** `titiler-{ver}` service (picks up the mdl_key→mdl_id
   factory), restarts caddy, smoke-tests.
-- **`DEPLOY_APPS=1`** (also implied by `RELEASE_DEPLOY`) — the `deploy-apps` chunk pulls the `apps_v8`
-  checkout (`MarineSensitivity/apps@main`, symlinked `/share/shiny_apps/{species,scores}_v8`) and reloads
-  ONLY the v8 apps via Shiny Server `restart.txt`. The v7 apps are a separate checkout in the same
-  container and are **not** restarted — no container bounce, v7 uninterrupted.
+- **`DEPLOY_APPS=1`** (also implied by `RELEASE_DEPLOY`) — pulls the `apps_v8` checkout
+  (`MarineSensitivity/apps@main`) and reloads it via Shiny Server `restart.txt`. **Since the
+  2026-08-12 cutover this IS the live `/scores` + `/species`**, one app rendering every release from
+  `?ver=` — so it restarts what everyone sees, not a parallel deployment. The 18 former per-version
+  instances are in `/share/shiny_apps_retired/` (moved aside, not deleted) with Caddy 301ing every old
+  URL to `/scores/?ver=v{n}`.
 
-titiler-v8 (`titiler-v8.marinesensitivity.org`, port 8001) runs parallel to v7 (A/B). The factory
-(`../server/titiler/factory.py`) is env-driven (`MSENS_DUCKDB`=view DB, `MSENS_CELLID_COG`=global COG)
-and its SQL validator **blocks `read_parquet` in client SQL** — the view expands server-side, so
-clients send `SELECT cell_id, val AS value FROM model_cell WHERE mdl_key='…'`.
+titiler-v8 (`titiler-v8.marinesensitivity.org`, port 8001) runs parallel to v7 (A/B).
+
+**The custom `/msens` cells factory is RETIRED but kept** (`MSENS_FACTORY=1`, off by default, and
+deliberately NOT behind Varnish). Every app layer now reads a **pre-rendered COG** through stock
+`/cog` routes, with the href + build-time rescale coming from the release manifest — nothing reaches
+the factory, because every metric on v1–v8 has a COG. Verified equivalent before retiring: 100/105
+tiles byte-identical, the rest 3–6 px of 262,144 from float32 storage. Score COGs carry **no
+overviews** (the renderer decimates per request, so a pyramid disagrees at low zoom) and their object
+key includes the **encoding** (`content_hash_encoded()`) — rewriting bytes at a stable URL left
+`/vsicurl` serving a cached header for bytes that no longer existed: fine at z5+, HTTP 500 at z2–z4.
 
 ## STAC
 

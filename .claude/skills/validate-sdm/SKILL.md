@@ -71,8 +71,16 @@ Re-scoring the SAME inputs must reproduce (`cor = 1.000`). If not, a reserved-wo
   back to the `fld` filter; naming a zone set a release lacks is an ERROR, not an empty join.
 - **`build_zone_cells.qmd` gate**: the relocated `zone_cell` must reproduce the release's existing
   one row-for-row (zone keys, cell ids, coverage) before anything downstream uses it.
-- **Score-COG equivalence**: a COG tile must be byte-identical to the factory's for the same
-  (metric, subregion) at every zoom before the factory is retired. Overviews break this — the
-  factory decimates from full resolution per request.
+- **Score-COG equivalence** (done — the factory is retired as of 2026-08): a COG tile had to be
+  byte-identical to the factory's for the same (metric, subregion) at every zoom. Measured 100/105
+  byte-identical, the rest 3–6 px of 262,144 from float32 storage. Overviews break this — the
+  renderer decimates from full resolution per request, so score COGs are published WITHOUT them.
+  Re-run this check whenever the COG writer changes.
+- **`mdl_id` stability**: `msens::assign_mdl_id()` must leave every published id untouched.
+  `build_registry.qmd` asserts it against the published `model.parquet`. A renumbered id does not
+  fail anything — it makes titiler serve the wrong species from the right-looking partition.
+- **`dataset.is_scored`**: after a merge change, confirm the flag still matches which datasets have
+  `taxon_model` edges. A dataset that is ingested but unmerged (gm, nc) must read FALSE, or every
+  dataset count in the docs overstates the inputs.
 - **After any scoring change, re-check Program-Area scores are unmoved.** The zone_cell relocation
   and the zone-set generalization were both verified at max |delta| == 0 across all 20 areas.
