@@ -626,6 +626,62 @@ if (nrow(alias_rows)) {
   log_info("am-only merged aliases: {nrow(alias_rows)} taxa now have a merged COG (0 new objects)")
 }
 
+# am-only taxa with MORE THAN ONE AquaMaps model cannot be aliased.
+#
+# The alias above is a pass-through, and that is only sound when a taxon has
+# exactly one contributing model. 192 served taxa have two or more (387 models
+# between them), so their merged surface is a max across those models -- a
+# genuinely different raster from any single one of them. They are also absent
+# from dist_merged_global, because that holds RANGE-derived global surfaces.
+# The result was 192 served taxa with no merged COG at all: 14,799 of 14,991
+# am-only taxa were covered, and the remainder looked like a rounding error
+# rather than a category the alias could never handle.
+#
+# Build them properly: max over the taxon's am partitions, one COG each.
+amonly_multi <- dbGetQuery(con, "
+  SELECT ms_merge_key, list(mdl_key) AS mdl_keys FROM (
+    SELECT t.ms_merge_key, tm.mdl_key
+    FROM mrg.taxon t JOIN mrg.taxon_model tm USING (ms_merge_key)
+    WHERE t.is_marine AND t.ms_merge_key IS NOT NULL
+      AND t.sp_cat NOT IN ('reptile','amphibian'))
+  GROUP BY 1 HAVING count(*) > 1 AND bool_and(split_part(mdl_key,'|',1) = 'am')")
+amonly_multi <- amonly_multi |> filter(!ms_merge_key %in% native_asset$ms_merge_key[
+  native_asset$ds_key == "ms_merge" & native_asset$asset_type == "cog"])
+
+if (nrow(amonly_multi) && dir_exists(am_parts)) {
+  dir_mm <- glue("{dir_native}/merged"); dir_create(dir_mm)
+  grid_mm <- grid_spec(rast(cellid_tif))
+  built_mm <- 0L
+  mm_rows <- list()
+  for (i in seq_len(nrow(amonly_multi))) {
+    key  <- amonly_multi$ms_merge_key[i]
+    mids <- am_map$mid[am_map$mdl_key %in% amonly_multi$mdl_keys[[i]]]
+    out  <- glue("{dir_mm}/{safe_key(key)}.tif")
+    if (!length(mids)) next
+    globs <- paste(sprintf("'%s/mid=%d/*.parquet'", am_parts, mids), collapse = ", ")
+    d <- dbGetQuery(con, glue("
+      SELECT cell_id, max(val) AS val FROM read_parquet([{globs}]) GROUP BY 1"))
+    if (!nrow(d)) next
+    if (!file_exists(out)) {
+      msens::publish_cog(d$cell_id, d$val, out, grid_mm,
+                         datatype = "INT1U", nodata = 0, overview = FALSE)
+      built_mm <- built_mm + 1L
+    }
+    # bbox from the cells themselves, same convention as the other COG rows
+    ll <- msens::cell_lonlat(d$cell_id, grid_mm)
+    mm_rows[[length(mm_rows) + 1]] <- tibble(
+      ms_merge_key = key, mdl_key = key, ds_key = "ms_merge",
+      asset_type = "cog", representation = "model",
+      asset_url = glue("{s3_http}/native/merged/{safe_key(key)}.tif"),
+      xmin = min(ll$lon), xmax = max(ll$lon), ymin = min(ll$lat), ymax = max(ll$lat),
+      rescale_min = 1L, rescale_max = 100L, colormap = "spectral_r")
+  }
+  if (length(mm_rows)) {
+    native_asset <- bind_rows(native_asset, bind_rows(mm_rows))
+    log_info("am-only MULTI-model merged COGs: {length(mm_rows)} taxa, {built_mm} newly built")
+  }
+}
+
 dbWriteTable(con, "native_asset", native_asset, overwrite = TRUE)
 smry <- dbGetQuery(con, "SELECT representation, asset_type, count(*) n_rows,
   count(DISTINCT mdl_key) n_models, count(DISTINCT ms_merge_key) n_taxa, count(DISTINCT ds_key) n_ds
