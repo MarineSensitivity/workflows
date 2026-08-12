@@ -177,6 +177,10 @@ sizes <- vapply(have, function(t) {
   nrow(d)
 }, numeric(1))
 
+# Whether `taxon_model` is DERIVED here rather than published by that release --
+# recorded in the manifest so nobody mistakes reconstructed edges for original.
+tm_reconstructed <- FALSE
+
 # Reconstruct `taxon_model` for the releases that predate it (v1/v2).
 #
 # Those releases record the taxon->model edges WIDE: one integer column per
@@ -218,7 +222,22 @@ if (!"taxon_model" %in% have) {
     }
     stopifnot("reconstructed taxon_model is empty" = nrow(tm) > 0)
 
-    arrow::write_parquet(tm, file.path(dir_tbl, "taxon_model.parquet"), compression = "zstd")
+    f_tm <- file.path(dir_tbl, "taxon_model.parquet")
+    arrow::write_parquet(tm, f_tm, compression = "zstd")
+
+    # manifest_build() introspects the CONNECTION, never dir_tbl -- deliberately,
+    # so a manifest cannot claim a table the release does not have. The cost is
+    # that a table written only as a FILE is published but never advertised: the
+    # first run of this reconstruction shipped taxon_model.parquet to S3 for v1
+    # and v2 (198/208 KB, verified present) while both manifests omitted it, so
+    # nothing downstream could discover the table that had just been built.
+    # Registering it keeps introspection authoritative and makes it see exactly
+    # what was published. A TEMP view is enough (and works on the read-only
+    # connection), so the historical release DB is never mutated.
+    dbExecute(con, glue(
+      "CREATE OR REPLACE TEMP VIEW taxon_model AS SELECT * FROM read_parquet('{f_tm}')"))
+    tm_reconstructed <- TRUE
+
     have <- c(have, "taxon_model")
     sizes <- c(sizes, taxon_model = nrow(tm))
     log_info("taxon_model RECONSTRUCTED for {bver}: {nrow(tm)} edges ",
@@ -365,7 +384,12 @@ mfst <- msens::manifest_build(
   zone_sets  = zsets,
   # COGs are declared only once they exist; until then the app must not offer a
   # layer it cannot draw
-  capabilities = list(model_cogs = built > 0 || length(store) > 0),
+  capabilities = list(model_cogs = built > 0 || length(store) > 0,
+                      # provenance, not a feature: v1/v2 taxon->model edges are
+                      # unpivoted from that release's wide `taxon` columns, not
+                      # published by it. Boolean so `manifest_can()`'s isTRUE()
+                      # reads it like any other capability.
+                      taxon_model_reconstructed = tm_reconstructed),
   extra = list(title = v_row$title, released = as.character(v_row$released),
                overlays = overlays,
                models = glue("{msens::atlas_base_url()}/{bver}/tables/model_asset.parquet")))
