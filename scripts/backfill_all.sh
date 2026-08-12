@@ -32,9 +32,15 @@
 #   scripts/backfill_all.sh --stage scores --vers v3
 #
 # STAGES (in dependency order; `all` runs the three in sequence)
-#   models    backfill_versions.qmd  BACKFILL_COGS=1  -> model COGs into the shared store
-#   scores    publish_score_cogs.qmd                  -> metric x subregion COGs
-#   manifest  backfill_versions.qmd                   -> manifest.json, now citing both
+#   models    backfill_versions.qmd     BACKFILL_COGS=1  -> model COGs into the store
+#   scores    publish_score_cogs.qmd                     -> metric x subregion COGs
+#   cellmodel build_v7_cell_model.qmd   DEPLOY_V7_CELLMODEL=1
+#                                        -> the cell-oriented twin of model_cell,
+#                                           WITHOUT which a release advertises
+#                                           cell_species_list:false and a clicked
+#                                           cell cannot list species. ~1.2B rows per
+#                                           version: slow, run deliberately.
+#   manifest  backfill_versions.qmd                     -> manifest.json + serve.duckdb
 #
 # `manifest` runs LAST and separately on purpose: a manifest is a projection of
 # what exists, so regenerating it before the COGs land publishes a contract the
@@ -81,6 +87,12 @@ for V in $VERS; do
   esac
   case "$STAGE" in
     all|scores)   run "$V" "score COGs"  publish_score_cogs.qmd publish_score_cogs ;;
+  esac
+  # NOT in `all`: this is the single largest compute item in the pipeline and
+  # should be asked for explicitly, one version at a time.
+  case "$STAGE" in
+    cellmodel)    run "$V" "cell_model"  build_v7_cell_model.qmd build_v7_cell_model \
+                      DEPLOY_V7_CELLMODEL=1 ;;
   esac
 done
 

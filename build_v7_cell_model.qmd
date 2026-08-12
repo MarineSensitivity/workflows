@@ -1,5 +1,7 @@
 ---
-title: "Build v7 cell_model — the cell-oriented twin of v7 model_cell"
+title: "Build cell_model — the cell-oriented twin of a release's model_cell"
+params:
+  ver: v7
 msens:
   target_name: build_v7_cell_model
   workflow_type: release
@@ -49,17 +51,24 @@ flowchart LR
 librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, rlang, quiet = T)
 source(here("libs/paths.R"))
 
-V7_NCOL   <- 3103L                       # v7 grid width (regional 0-360 raster)
-v7_db     <- msens::sdm_db_path("v7")
+# Parameterized by release. v1-v6 need this surface exactly as v7 did -- without
+# it their manifests declare `cell_species_list: false` and a clicked cell cannot
+# list species. They share v7's `usa05` grid, so the tile arithmetic is identical;
+# the width still comes from the REGISTRY rather than a literal, because using the
+# wrong ncol does not error, it just scatters a compact polygon across many tiles
+# and silently forfeits the pruning this artifact exists for.
+cver      <- params$ver
+V7_NCOL   <- as.integer(msens::grid_spec_for(msens::grid_for_ver(cver))$nc)
+v7_db     <- msens::sdm_db_path(cver)
 dir_v7    <- path_dir(v7_db)
 cell_mc   <- glue("{dir_v7}/cell_model")   # local build target
-srv_v7    <- "/share/data/big/v7"
+srv_v7    <- glue("/share/data/big/{cver}")
 do_all    <- nzchar(Sys.getenv("V7_CELLMODEL_ALL"))     # include non-taxon models
 do_build  <- !dir_exists(cell_mc) || nzchar(Sys.getenv("V7_CELLMODEL_REDO"))
 do_deploy <- nzchar(Sys.getenv("DEPLOY_V7_CELLMODEL"))
 
-stopifnot("v7 sdm.duckdb not found" = file_exists(v7_db))
-log_info("v7 db: {v7_db} ({round(file_size(v7_db)/1e9, 2)} GB) -> {cell_mc}")
+stopifnot("sdm.duckdb not found for this release" = file_exists(v7_db))
+log_info("{cver} db: {v7_db} ({round(file_size(v7_db)/1e9, 2)} GB), grid ncol {V7_NCOL} -> {cell_mc}")
 
 # ONE connection for the whole notebook, closed in the last chunk. `on.exit()` is
 # the wrong idiom here: knitr fires it at the end of the chunk that registered it,
@@ -196,18 +205,27 @@ if (!do_deploy) {
     "cat('V7CM_OK', DBI::dbGetQuery(con, ",
     "'SELECT count(*) n FROM cell_model WHERE tile = (SELECT min(tile) FROM cell_model)')$n, '\\n'); ",
     "DBI::dbDisconnect(con, shutdown = TRUE)")
-  v7_apps <- c("mapgl", "mapsp")
+  # Post-cutover (2026-08-12) there is ONE app, at apps_v8, serving every release
+  # from ?ver=. `mapgl`/`mapsp` are retired to /share/shiny_apps_retired, so
+  # touching their restart.txt would reload nothing.
+  #
+  # The view also has to land in serve.duckdb, not only sdm.duckdb: the app
+  # resolves `{dir_big}/serve.duckdb` first and every release now has one, so a
+  # view registered solely in sdm.duckdb would never be read. backfill_versions'
+  # viewdb chunk adds it from the parquet on the next `--stage manifest`, which is
+  # also what flips `cell_species_list` to true in the manifest.
+  live_apps <- c("species", "scores")
   cmd <- glue(
     "set -e; ",
     "cp -f {srv_v7}/sdm.duckdb {srv_v7}/sdm.duckdb.new; ",
     "docker exec rstudio Rscript -e {shQuote(register)}; ",
     "mv -f {srv_v7}/sdm.duckdb.new {srv_v7}/sdm.duckdb; ",
-    "{paste(sprintf('touch /share/github/MarineSensitivity/apps/%s/restart.txt', v7_apps), collapse='; ')}")
+    "{paste(sprintf('touch /share/github/MarineSensitivity/apps_v8/%s/restart.txt', live_apps), collapse='; ')}")
   out <- system2("ssh", c("msens", shQuote(cmd)), stdout = TRUE, stderr = TRUE)
   if (!any(grepl("V7CM_OK", out)))
     stop(glue("register failed (exit {attr(out, 'status') %||% 0}):\n"),
          paste(utils::tail(out, 25), collapse = "\n"))
-  log_info("v7 cell_model registered + apps reloaded: {grep('V7CM_OK', out, value = TRUE)}")
+  log_info("{cver} cell_model registered + apps reloaded: {grep('V7CM_OK', out, value = TRUE)}")
 }
 ```
 
@@ -217,15 +235,15 @@ if (!do_deploy) {
 #| label: manifest
 
 msens::write_manifest(
-  here("data/manifests/build_v7_cell_model.json"),
-  target       = "build_v7_cell_model",
+  here(glue("data/manifests/build_v7_cell_model{if (cver == 'v7') '' else paste0('_', cver)}.json")),
+  target       = glue("build_v7_cell_model{if (cver == 'v7') '' else paste0('_', cver)}"),
   content_hash = msens::hash_query(
     con, glue("SELECT tile, mdl_seq, cell_id, val FROM read_parquet('{mc_glob}', hive_partitioning = true)")),
   stats = list(
     rows = smry$n_rows, models = smry$n_models, tiles = smry$n_tiles,
     cells = smry$n_cells, grid_ncol = V7_NCOL,
     scope = if (do_all) "all" else "taxon_linked"),
-  force = msens::force_target("build_v7_cell_model"))
+  force = msens::force_target("build_v7_cell_model"))   # v7 keeps the original target name
 
 dbDisconnect(con, shutdown = TRUE)
 ```
