@@ -79,6 +79,38 @@ their documentation cannot say which models fed a taxon.
 
 ---
 
+---
+
+## Outcome (2026-08-12) — all five items done
+
+| item | result |
+|---|---|
+| A1 | `cell_model` built and registered for v1–v6; **`cell_species_list: true` on all nine** manifests |
+| A2 | `msens::normalize_ds_key()` exported + tested; `backfill_versions.qmd` calls it |
+| A3 | crosswalk round-trips on real published `model_asset.parquet` rows |
+| A4 | v1 **35,229** / v2 **36,745** edges; both view DBs 13 views; queryable via `serve.duckdb` |
+| A5 | nine manifests validate, nine versions HTTP 200, `devtools::test("../msens")` **745 pass / 0 fail** |
+
+Two bugs surfaced while verifying, both of the "a check that cannot fail" kind:
+
+- **`manifest_build()` introspects the CONNECTION, not `dir_tbl`.** The first reconstruction run
+  wrote `taxon_model.parquet` and pushed it to S3 for v1/v2, yet both manifests omitted the table —
+  published but undiscoverable. Fixed by registering the written parquet as a TEMP view so
+  introspection stays authoritative (commit `1d020206`). Anything else written straight to
+  `dir_tbl` has the same hazard.
+- **`curl -sf` treats an S3 301 `PermanentRedirect` as success.** Fetching manifests from the wrong
+  regional endpoint returned nine "OK"s that were 448-byte error XML. Assert the payload parses,
+  never just the exit status.
+
+### Found, NOT fixed — v8 publishes fewer relational tables than v3–v7
+
+v8 has **no `taxon_model` and no `listing`** on S3, and its `model` table carries no `taxon_id`, so
+the taxon→model relation cannot be derived from the published tables at all. v3–v7 publish both.
+Out of scope here (A4 is explicitly v1/v2) and it needs a v8 merge/release change plus a
+re-publish, not a manifest tweak. It matters for the docs work — a v8 chapter cannot say which
+models fed a taxon — so resolve it before or during Plan B's `data-sources`/`model-merging`
+chapters.
+
 ## Notes for whoever runs this
 
 - **Verify by watching the thing work, not by absence of evidence.** This session twice concluded

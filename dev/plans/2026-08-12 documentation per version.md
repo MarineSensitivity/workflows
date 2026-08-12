@@ -99,6 +99,18 @@ Code is authoritative. Concrete corrections found — sweep each chapter, this i
   Resolve first: the report's **AquaMaps vintage contradicts itself** — "Accessed October 2025"
   (Methods) vs "AquaMaps 2019" (Conclusions §6.2).
 
+## B3b. Resolve the v8 relational gap before writing its chapters
+
+Found while finishing Plan A: **v8 publishes neither `taxon_model` nor `listing`**, and its `model`
+table has no `taxon_id` — so unlike v3–v7, the taxon→model relation is not derivable from v8's
+published tables. v1/v2 now have reconstructed edges (flagged
+`capabilities.taxon_model_reconstructed`), which leaves the **newest** release as the only one that
+cannot answer "which models fed this taxon".
+
+Fix it at the source (export both from the merge stage in `release_marine-atlas.qmd`) rather than
+writing around it — a chapter that silently omits the relation for v8 alone reads as if v8 lost a
+capability it never published. Until then, gate that section on `manifest$tables`, per B4.
+
 ## B4. Capability-gate the historical versions
 
 v1/v2 have no `listing` and no `er_score`; v1 has Planning Areas and no Program Areas. Gate every
