@@ -64,7 +64,7 @@ done
 
 # The floor is the msens that introduced manifest zone PMTiles + zone_cells().
 # Bump this whenever a notebook here starts depending on newer msens logic.
-export MSENS_MIN="${MSENS_MIN:-0.16.0}"
+export MSENS_MIN="${MSENS_MIN:-0.21.1}"
 
 run() {  # run <ver> <label> <qmd> <output-stem> [extra args...]
   local ver="$1" label="$2" qmd="$3" stem="$4"; shift 4
