@@ -175,6 +175,36 @@ Fix
 
 Want me to start with 1+2 (restores the data and stops the recurrence), and fold 3 into the species-app version work?
 
+----
+
+No — I have made zero changes to any repo. Everything so far has been read-only investigation.
+
+What I ran:
+- git log / git status / grep / sed -n (reads) across apps, msens, workflows
+- curl against the S3 registry (latest.txt, versions.json, manifests)
+- DuckDB read-only queries over the published S3 Parquet
+- aws s3 ls (listing only)
+- two ssh msens commands: a git log/grep in apps_v8, and read-only DuckDB opens of serve.duckdb / an attempted sdm.duckdb (which doesn't exist there)
+
+The only files I wrote are two throwaway query scripts in the session scratchpad, outside any repo:
+
+/private/tmp/claude-501/.../scratchpad/q_leatherback.R
+/private/tmp/claude-501/.../scratchpad/q_impact.R
+
+So your other session's working tree is untouched by me. For reference, the pre-existing dirty state I saw at session start in workflows was already there:
+
+ M _output/release_marine-atlas.html
+ M dev/msens_notes.md
+ M release_marine-atlas.qmd
+
+apps was clean at c877f66, matching origin/main and the server checkout.
+
+One thing worth flagging for the commit in that other session: workflows/data/manifests/ is not tracked by git (git ls-files returns nothing for it), so the publish_native.json recording n_pmtiles_native: 0 — the artifact that documents the registry regression — isn't in version control. That's likely why the loss left no reviewable trace.
+
+----
+
+Ok, please get going with 1-4
+
 ## 2026-08-12 docs update
 
 Excellent! Next, let's tackle the documentation per version so datasets and methods align with the apps. Note the datestamp associated with the apps 
@@ -576,6 +606,54 @@ I reported v2 as "intended Program Areas, planarea carried forward." That was wr
 
 ----
 
+Everything you asked about is committed, pushed and deployed — but verifying surfaced one genuine gap I should flag rather than paper over.
+
+**Committed, pushed, deployed ✅**
+
+┌───────────┬──────────────────────────────────────────────────────────────────────┐
+│   repo    │                                state                                 │
+├───────────┼──────────────────────────────────────────────────────────────────────┤
+│ msens     │ a390797 — 0.23.0, zone_score_delta(), 780 tests pass                 │
+├───────────┼──────────────────────────────────────────────────────────────────────┤
+│ workflows │ 4a9748b1 — docker exec -u 1000:1000 deploy fix                       │
+├───────────┼──────────────────────────────────────────────────────────────────────┤
+│ docs      │ 42e861b — reported-units work; CI running                            │
+├───────────┼──────────────────────────────────────────────────────────────────────┤
+│ apps      │ c877f66 — deployed to server, v1/v2 both HTTP 200, v2 cache 41 lines │
+└───────────┴──────────────────────────────────────────────────────────────────────┘
+
+All four: 0 uncommitted, 0 unpushed. The v8 server tables carry `taxon_model.parquet` + `listing.parquet`, and the scores app fix is live.
+
+Two things I'd initially missed and have now fixed: zone_score_delta() was sitting uncommitted in msens, and the -u 1000:1000 change was deployed but not committed — which is exactly the drift the repo's reproducibility rule exists to prevent.
+
+**One real gap remaining ⚠️**
+
+The rstudio container runs msens 0.21.1, and the Dockerfile pins are older still (MSENS_MIN=0.16.0). None of the new functions exist there:
+
+assign_mdl_id      FALSE
+dataset_is_scored  FALSE
+sdm_cols           FALSE
+zone_score_delta   FALSE
+
+**So `build_registry.qmd` cannot run on the server** — it would fail on msens::assign_mdl_id(). It fails loudly rather than silently, which is the good case, but it's still broken. This is precisely the hazard CLAUDE.md describes: "the server once reported msens 0.14.0 while running a manifest_build() that predated zone PMTiles" — and the fix it prescribes is that MSENS_REF/MSENS_MIN move with the version.
+
+Nothing currently live is affected — the v8 release was built on your laptop, and the apps don't use those functions.
+
+**I didn't fix this unasked** because it needs a Dockerfile bump plus an image rebuild and container recreate, which restarts RStudio and both Shiny apps. That's a deploy decision with user-visible downtime, and committing the pin without rebuilding would create exactly the Dockerfile-vs-container drift the same rule forbids.
+
+Say the word and I'll bump MSENS_REF to a390797 / MSENS_MIN to 0.23.0, rebuild and recreate — or leave it until the next time the server needs to render pipeline notebooks.
+
+----
+
+Yes, bump and build, so all works on server
+
+Approved — doing both. First committing the docs fix, then the server bump:
+
+  Ran 2 shell commands
+
+❯ Also note from other Claude session:
+
+❯ One thing worth flagging for the commit in that other session: workflows/data/manifests/ is not tracked by git (git ls-files returns nothing for it), so the publish_native.json recording n_pmtiles_native: 0 — the artifact that documents the registry regression — isn't in version control. That's likely why the loss left no reviewable trace.
 
 
 ## 2026-08-10 Refactor app versioning and data serving strategy
