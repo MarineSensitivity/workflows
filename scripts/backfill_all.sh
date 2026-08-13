@@ -62,9 +62,12 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# The floor is the msens that introduced manifest zone PMTiles + zone_cells().
+# The floor is the msens whose backfill_versions.qmd records the serving grid
+# (cell_grid_write) and verifies the stored tile ids against it (cell_model_tile_check) --
+# without which every usa05 release ships a cell_model whose partitions the reader prunes
+# away, answering "no species" for a clicked cell instead of failing.
 # Bump this whenever a notebook here starts depending on newer msens logic.
-export MSENS_MIN="${MSENS_MIN:-0.21.1}"
+export MSENS_MIN="${MSENS_MIN:-0.25.0}"
 
 run() {  # run <ver> <label> <qmd> <output-stem> [extra args...]
   local ver="$1" label="$2" qmd="$3" stem="$4"; shift 4

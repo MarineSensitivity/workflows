@@ -254,6 +254,14 @@ dbExecute(cv, glue("CREATE VIEW model_cell AS
 dbExecute(cv, glue("CREATE VIEW cell_model AS
   SELECT cm.tile, cm.mdl_id, cm.cell_id, cm.val, cm.val AS value
   FROM read_parquet('{cell_mc}/*/*.parquet', hive_partitioning = true) cm"))
+# RECORD THE GRID this release tiles on, then prove the stored tile ids agree with it.
+# msens resolved the tile width from a `cell_grid` table that no release had ever written, so
+# it always fell back to global05's 7200 — right for v8 by coincidence, wrong for every usa05
+# release, where it computed a different but perfectly VALID tile id and pruned away the only
+# partition holding the cells. The clicked-cell species list then returned EMPTY rather than
+# failing. cell_model_tile_check() cannot pass on that mismatch.
+msens::cell_grid_write(cv, msens::grid_for_ver(ver))
+msens::cell_model_tile_check(cv)
 dbDisconnect(cv, shutdown = TRUE)
 log_info("view DB {viewdb} ({round(file_size(viewdb)/1e3,1)} KB) — {if (do_s3 || do_s3_tbl) 'S3' else 'LOCAL'} sources, model_cell by mdl_id, cell_model by spatial tile (local)")
 ```
@@ -418,6 +426,11 @@ if (!do_tables) {
     "(SELECT min(mdl_id) FROM model_cell)')$n; ",
     "stopifnot(\'zone_metric view is empty\' = zm > 0, ",
     "\'model_cell view returned no rows for its own first mdl_id\' = mc > 0); ",
+    # the repoint REPLACES the views, so it must also (re)record the grid and re-verify the
+    # tile ids here -- otherwise the server copy reverts to guessing the width, which is how
+    # the clicked-cell species list came back empty on every usa05 release.
+    "msens::cell_grid_write(con, msens::grid_for_ver('{ver}')); ",
+    "msens::cell_model_tile_check(con); ",
     "cat('VIEWS_OK', length(tt), zm, mc, '\\n'); ",
     "DBI::dbDisconnect(con, shutdown = TRUE)")
   v8_apps <- c("species", "scores")
