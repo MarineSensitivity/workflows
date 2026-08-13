@@ -28,6 +28,8 @@ Publish the **v8 marine-atlas** and stand up its serving, reproducibly:
 3. **STAC** — `stac_build(version)` → deploy the catalog to the file host `/stac`.
 4. **Deploy** (`RELEASE_DEPLOY=1`) — rsync the KB view DB + STAC to `msens1`, (re)build the
    parallel `titiler-v8` service, restart caddy. v7 serving is untouched (A/B).
+   Granular flags for the parts: `DEPLOY_APPS=1` (Shiny apps), `DEPLOY_TABLES=1` (local
+   Parquet + views), `DEPLOY_API=1` (plumber image), `DEPLOY_CADDY=1` (URL routing alone).
 
 ## Setup
 
@@ -49,6 +51,9 @@ do_apps   <-  do_deploy || nzchar(Sys.getenv("DEPLOY_APPS"))        # (re)deploy
 # v7 apps are the DEFAULT live apps on a separate checkout/branch — deliberately NOT implied by
 # RELEASE_DEPLOY, so a routine v8 release can never restart them. Opt in explicitly.
 do_apps_v7 <- nzchar(Sys.getenv("DEPLOY_APPS_V7"))
+# the URL surface (the 301s from every retired per-version app). Implied by a full release,
+# and available on its own so a routing fix need not rebuild titiler to ship.
+do_caddy  <-  do_deploy || nzchar(Sys.getenv("DEPLOY_CADDY"))
 do_s3_tbl <-  do_s3     || nzchar(Sys.getenv("RELEASE_S3_TABLES"))  # push derived tables (native_asset) without the full serve cutover
 # the derived tables are ALSO served from local Parquet on the server (see the tables chunk);
 # DEPLOY_TABLES=1 refreshes just that, with no S3 push and no titiler/caddy restart.
@@ -487,6 +492,50 @@ if (!nzchar(Sys.getenv("DEPLOY_API"))) {
   log_info("plumber API deployed: {grep('API_OK', out_api, value = TRUE)} | {grep('MSENS', chk, value = TRUE)}")
   if (!any(grepl("MSENS 0\\.(1[2-9]|[2-9][0-9])", chk)))
     stop("plumber msens < 0.12.0 — the v8 drawn-area path needs cells_in_polygon(poly, con)")
+}
+```
+
+## Deploy the Caddy routing (`DEPLOY_CADDY=1`)
+
+The **URL surface** is part of the release, not server trivia: since the cutover, every
+retired per-version app URL is a 301 into `/scores` or `/species`, so a routing change decides
+whether a link published in a report still resolves. It had its own bug — the redirect targets
+carry their own `?ver=`, which REPLACES the incoming query, so `/mapsp/?mdl_seq=1434` arrived
+as `/species/?ver=v7` and the app opened on its default taxon (MarineSensitivity/apps#6).
+
+Caddyfile-only changes had no reproducible home: the routing rode along with `RELEASE_DEPLOY`,
+which also rebuilds and force-recreates titiler. This flag is the narrow path — pull the server
+repo, restart caddy, nothing else. **`docker compose restart caddy`, not `caddy reload`**: the
+Caddyfile is a single-file bind mount, so a git pull replaces the inode and the running
+container keeps serving the file it opened at start.
+
+```{r}
+#| label: deploy-caddy
+
+if (!do_caddy) {
+  log_info("RELEASE_DEPLOY/DEPLOY_CADDY unset — Caddy routing left untouched")
+} else {
+  # `set -e` + ff-only, same as the other deploys: a stale pull must fail loudly rather
+  # than restart caddy onto the config it was already running.
+  out_caddy <- system2("ssh", c("msens", shQuote(glue(
+    "set -e; cd {srv_repo} && git fetch --quiet origin && git merge --ff-only origin/main && ",
+    "docker compose restart caddy && echo CADDY_OK $(git rev-parse --short HEAD)"))),
+    stdout = TRUE, stderr = TRUE)
+  if (!any(grepl("CADDY_OK", out_caddy))) stop(paste(tail(out_caddy, 15), collapse = "\n"))
+  log_info("caddy restarted: {grep('CADDY_OK', out_caddy, value = TRUE)}")
+
+  # PROVE THE REDIRECT KEEPS THE QUERY. `curl -sf` on a 301 is not a check — it follows
+  # nothing and reports success on exactly the failure being fixed. Read the Location back
+  # and assert the model id survived it.
+  for (u in c("mapsp/?mdl_seq=1434", "species_v8/?ver=v8&mdl_key=abc")) {
+    loc <- system2("curl", c("-s", "-o", "/dev/null", "-w", "%{redirect_url}",
+                             glue("https://app.marinesensitivity.org/{u}")), stdout = TRUE)
+    log_info("redirect {u} -> {loc}")
+    id <- if (grepl("mdl_seq", u)) "mdl_seq=1434" else "mdl_key=abc"
+    if (!grepl(id, loc, fixed = TRUE))
+      stop(glue("Caddy dropped the model id: /{u} -> {loc}"))
+  }
+  log_info("redirects preserve the model id")
 }
 ```
 

@@ -95,7 +95,10 @@ apples-to-apples), `SCORE_ALLBIRDS=1` (disable the marine-bird cull), `RELEASE_N
 `RELEASE_RAW=1` / `RELEASE_DEPLOY=1` (release + serving), `DEPLOY_APPS=1` / `DEPLOY_APPS_V7=1`
 (reload the Shiny apps; the `_V7` variant is vestigial post-cutover), `DEPLOY_TABLES=1` (sync `tables/` + `model_cell/` local + repoint
 the views), `DEPLOY_API=1` (pull the api repo + **rebuild** the plumber image — msens lives in that
-image, which is separate from `rstudio`, so `DEPLOY_APPS` never updates it).
+image, which is separate from `rstudio`, so `DEPLOY_APPS` never updates it),
+`DEPLOY_CADDY=1` (pull the server repo + `docker compose restart caddy` — the URL surface on its
+own, so a routing fix need not rebuild titiler; the retirement 301s live there, and they must
+carry `&{query}` or every published `?mdl_seq=` deep link loses its model id in flight).
 
 **Serving reads LOCAL Parquet, not S3.** S3 is the published artifact; the server keeps a versioned
 copy under `/share/data/big/{ver}/` and `serve.duckdb`'s views point there. Over HTTPS every query
