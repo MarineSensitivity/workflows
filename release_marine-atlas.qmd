@@ -294,7 +294,14 @@ system2("rsync", c("-aq", viewdb, glue("msens:{srv_viewdb}")))
 # laptop path). Done here, after the rsync, because DuckDB validates the glob at
 # CREATE VIEW time — it must run where the files actually are.
 fix_view <- glue(
-  "docker exec rstudio Rscript -e ",
+  # -u 1000:1000: `docker exec` runs as ROOT (the image USER, which RStudio
+  # Server's init needs), so a bare exec writes root-owned files into /share.
+  # The uids are NOT misaligned -- the container's rstudio user is already
+  # uid 1000 -- you just have to ask. Numeric, not `-u rstudio`: compose sets
+  # DEFAULT_USER, so the account NAME changes on the next container recreate
+  # while the uid does not. The damage is silent until git aborts a merge with
+  # "unable to unlink ...: Permission denied".
+  "docker exec -u 1000:1000 rstudio Rscript -e ",
   shQuote(glue(
     "con <- DBI::dbConnect(duckdb::duckdb('{srv_viewdb}')); ",
     "DBI::dbExecute(con, \"CREATE OR REPLACE VIEW cell_model AS SELECT cm.tile, cm.mdl_id, ",
@@ -417,7 +424,8 @@ if (!do_tables) {
   cmd_rp <- glue(
     "set -e; ",
     "cp -f {srv_viewdb} {srv_viewdb}.new; ",                       # no lock needed
-    "docker exec rstudio Rscript -e {shQuote(repoint)}; ",
+    # -u 1000:1000 for the same reason as the cell_model repoint above
+    "docker exec -u 1000:1000 rstudio Rscript -e {shQuote(repoint)}; ",
     "mv -f {srv_viewdb}.new {srv_viewdb}; ",                       # atomic swap
     "{paste(sprintf('touch /share/github/MarineSensitivity/apps_v8/%s/restart.txt', v8_apps), collapse='; ')}")
   out_rp <- system2("ssh", c("msens", shQuote(cmd_rp)), stdout = TRUE, stderr = TRUE)

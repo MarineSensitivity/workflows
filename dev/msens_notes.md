@@ -36,6 +36,145 @@
   Let's write a manuscript (with a plan first to discuss) on forwarding the vision of this project to the next iteration (plan )
   '/Users/bbest/Library/CloudStorage/GoogleDrive-ben@ecoquants.com/.shortcut-targets-by-id/1sppUmlMtZ-sXaBm72M1-8PnjVudXO91v/US MBON Public Folder/Working Groups/BioIndicators/manuscripts/atlas/atlas _ BioIndicators manuscript.md'
 
+## 2026-08-13 fix species app versions
+
+Why is the species app `@../apps/species` not showing earlier versions? I thought everything was already loaded.
+
+https://app.marinesensitivity.org/species/?ver=v7
+> Version v7 is not served here yet
+> This app currently renders v8. Showing it instead.
+
+This is especially troubling becase v7 is supposed to be the default view (v8 is pre-release).
+
+----
+
+**Diagnosis**
+
+The data is loaded — you're right about that. The app is what wasn't refactored.
+
+`apps/species/app.R:37` is `ver <- "v8"`, a module-level constant. The 2026-08-12 multi-version work landed in `scores/app.R` only. Species got just the contract half (commit 4363c6f "apps: version picker in the header; species accepts ?ver= too"): it validates `?ver=` against `versions.json` and says plainly that it can't render it, rather than drawing v8 under a v7 label. That modal is working as designed — it's honestly reporting an unimplemented feature.
+
+Compare the two apps:
+
+┌────────────────┬───────────────────────────────────┬─────────────────────────────────────────┐
+│                │           scores/app.R            │              species/app.R              │
+├────────────────┼───────────────────────────────────┼─────────────────────────────────────────┤
+│ version source │ ver_of(url_search) →              │ ver <- "v8" (line 37)                   │
+│                │ atlas_resolve_ver()               │                                         │
+├────────────────┼───────────────────────────────────┼─────────────────────────────────────────┤
+│ per-version    │ build_bundle(ver), memoised,      │ ~10 globals glued off ver (dir_v,       │
+│ startup        │ re-enclosed via environment(f) <- │ dir_big, sdm_db, tbl_pra, mask_tif,     │
+│                │  b                                │ zone_manifest, cell_tif)                │
+├────────────────┼───────────────────────────────────┼─────────────────────────────────────────┤
+│ default with   │ latest.txt → v7                   │ v8                                      │
+│ no ?ver=       │                                   │                                         │
+└────────────────┴───────────────────────────────────┴─────────────────────────────────────────┘
+
+Server checkout apps_v8 is at c877f66, identical to local main — so this is the code, not a stale deploy.
+
+**The worse half**
+
+Your instinct about the default is right, and it's the opposite of what you'd want: /species/ with no parameter renders v8, the pre-release. /scores/ resolves latest.txt and renders v7. Right now the two apps in the same nav are showing different releases, and species is the one advertising the unpromoted one.
+
+**What's actually ready**
+
+Everything the species app would need per version is published:
+
+- `serve.duckdb` view DBs for v1–v7 (the 268 KB backfill)
+- `cell_species_list`: true on all nine manifests
+- `model_cogs`: true on v1–v7, with {ver}/tables/model_asset.parquet — 30,061 per-model COGs for v7 on usa05, and it carries both mdl_key and mdl_seq, so the identifier gap is a lookup, not a rewrite
+
+**What the port actually costs**
+
+Four things, beyond copying the build_bundle pattern across:
+
+1. `id_field` — species is written against mdl_key (87 references, 0 for mdl_seq), including the ?mdl_key= deep link. v1–v7 are mdl_seq. model_asset bridges it.
+2. **Render path** — v8 draws the merged surface through titiler-v8's SQL model_cell view (msens::cell_tile_url); v1–v7 have no partitioned model_cell, but do have per-model COGs. The app already calls msens::cog_tile_url() at line 1341 for merged COGs, so that branch exists — v1–v7 just always take it.
+3. **`cell_tif` is hardcoded** to r_cellid_global.tif (global05) — must come from grid_spec_for(ver), and clicks go through /cog/point (the terra-SpatRaster segfault lesson).
+4. **Capability gating** — `native_representation` is v8-only, planareas is v1–v7-only, native_asset doesn't exist before v8.
+
+Want me to do the full port, or land the one-line-ish fix first (default to latest.txt so /species/ stops silently serving the pre-release) and schedule the refactor separately?
+
+----
+
+And this is seriously messed up by the fact that only the Merged and AquaMaps model show (n=2), yet it says "Merged Model
+(maximum of 5 inputs)", so nothing else showing up on the default species 
+
+----
+
+You're right that it's worse than the version bug, and it's a separate defect. The bar is reading two different tables and neither number is right.
+
+The leatherback actually has 6 inputs
+
+v8/tables/taxon_model.parquet for ms_merge|WORMS:137209:
+
+┌──────────────────────────────┬───────────────────────┐
+│           mdl_key            │        ds_key         │
+├──────────────────────────────┼───────────────────────┤
+│ am|Rep-3437                  │ AquaMaps              │
+├──────────────────────────────┼───────────────────────┤
+│ rng_iucn|6494                │ IUCN range            │
+├──────────────────────────────┼───────────────────────┤
+│ rng_fws|C00F                 │ FWS range             │
+├──────────────────────────────┼───────────────────────┤
+│ ch_fws|C00F                  │ FWS critical habitat  │
+├──────────────────────────────┼───────────────────────┤
+│ ch_nmfs|Dermochelys_coriacea │ NMFS critical habitat │
+├──────────────────────────────┼───────────────────────┤
+│ rng_turtle_swot_dps|DC       │ SWOT turtle DPS       │
+└──────────────────────────────┴───────────────────────┘
+
+The published native_asset registry lost every PMTiles row
+
+That table is what drives the pills (d_inputs pivot → input_ds_keys, app.R:325–329). All of it, across all taxa:
+
+┌──────────┬────────────────┬────────────┬────────┬────────┐
+│  ds_key  │ representation │ asset_type │  rows  │  taxa  │
+├──────────┼────────────────┼────────────┼────────┼────────┤
+│ am       │ model          │ cog        │ 16,818 │ 16,582 │
+├──────────┼────────────────┼────────────┼────────┼────────┤
+│ am       │ native         │ cog        │ 16,818 │ 16,582 │
+├──────────┼────────────────┼────────────┼────────┼────────┤
+│ ms_merge │ model          │ cog        │ 21,584 │ 21,584 │
+└──────────┴────────────────┴────────────┴────────┴────────┘
+
+Zero pmtiles rows. So the pivot never gets a rng_iucn/ch_nmfs/… column, input_ds_keys filters them out, and you get 1 input + the merged surface = the 2 pills you see.
+
+The tiles themselves are fine. s3://…/marine-atlas/v8/native/pmtiles/ still has all seven dataset prefixes and 2,654 files under rng_iucn/ alone, several rebuilt 2026-08-11. Nothing was deleted — the registry was rewritten without them.
+
+publish_native.qmd:518 is the mechanism:
+
+pmt_model_rows <- if (nrow(pmt_reg)) pmt_reg else tibble()
+...
+dbWriteTable(con, "native_asset", native_asset, overwrite = TRUE)   # line 685
+
+Any run that skips the PMTiles build (NATIVE_SKIP_PMTILES=1, or NATIVE_PMT_DS restricting it — most likely a merged-COG pass under PUBLISH_MERGED_COG=1) rewrites the whole registry from only what that run produced. And the checkpoint dutifully recorded the loss as a success — data/manifests/publish_native.json:
+
+{ "n_pmtiles_native": 0, "pmtiles_datasets": "", "native_assets": 55220 }
+
+A content hash that faithfully fingerprints the wrong table. Same failure mode as the ones in feedback_checks_that_cannot_fail.
+
+Impact: 2,240 input edges across 2,121 of the 17,112 US-valid scored taxa (12.4%) have no viewable asset — concentrated in exactly the ESA/IUCN-listed charismatic species, which is why the default species shows it so starkly.
+
+And "maximum of 5" is an off-by-one on top of that
+
+app.R:965:
+
+glue(" (maximum of {n_ds - 1} inputs)")   # assume 1 merged model + n_ds-1 inputs
+
+That assumption is wrong. n_ds is taxon.n_datasets, computed at merge_models_prep.qmd:181 as n_distinct(ds_key) over taxon_model — which contains only source models; ms_merge is never an edge. Leatherback is n_models = 6, n_datasets = 6. So the label under-reports by one for every taxon.
+
+Net: the bar says 5, means 6, and offers 1.
+
+Fix
+
+1. Re-run publish_native.qmd without skipping PMTiles — publish_pmtiles_from_gpkg() returns rows for already-built files, so it's a registry rebuild, not a 7 GB retile — then RELEASE_S3_TABLES=1 to push native_asset.parquet and touch restart.txt.
+2. Make the registry non-destructive: a run producing zero rows for an asset class the previous registry had should abort, not silently overwrite. That's the durable fix and belongs in the same change.
+3. Drop the - 1 at app.R:965.
+4. Worth considering: build the pill list from taxon_model (already a view in the live serve.duckdb) and disable inputs lacking an asset, instead of dropping them. That would have shown "5 of 6 unavailable" the day it broke rather than a plausible-looking bar.
+
+Want me to start with 1+2 (restores the data and stops the recurrence), and fold 3 into the species-app version work?
+
 ## 2026-08-12 docs update
 
 Excellent! Next, let's tackle the documentation per version so datasets and methods align with the apps. Note the datestamp associated with the apps 
@@ -95,6 +234,349 @@ Two things to handle deliberately:
    AquaMaps vintage contradiction ("Accessed October 2025" vs "AquaMaps 2019")
    before writing, and do not carry forward its counts or the figures it flags as
    wrong.
+
+----
+
+Plan B is built, verified locally, and pushed. CI is rendering all nine versions now.
+
+What landed
+
+B3b first, as a prerequisite — and it turned out to be more than a missing export. taxon_model and listing were built by the merge stage but never forwarded, so v8 was the only release whose published tables couldn't answer "which models fed this taxon". Fixed in build_registry.qmd (not the release notebook) because manifest_build() introspects the connection — staging straight to tables/ publishes a table undiscoverably. v8 now publishes 13 tables: 41,015 edges over 37,051 taxa, 11,532 listing rows.
+
+Rendering that notebook surfaced a live hazard: mdl_id was dense_rank(mdl_key), so ingesting gm/nc renumbered 45,499 of 80,261 models. mdl_id is the serve partition key, so nothing would have failed — titiler would have served the wrong species past ch_nmfs. Now msens::assign_mdl_id() reuses published ids and appends above the max, asserted against the published registry.
+
+Your is_active instinct was right and nothing like it existed (is_mask was NA for gm/nc by accident). It's dataset.is_scored, introspected from taxon_model rather than declared, so the docs count 8 datasets where the registry lists 11.
+
+B1–B6 — libs/versioned.R replaced four competing version constants; stats.R is deleted. The 7-vs-8-vs-9 dataset contradiction is now computed per release (v1 5, v3 7, v8 8). The AquaMaps contradiction resolved from the registry itself: Version 10/2019 is the model vintage, later dates are retrieval.
+
+Verification
+
+All automated criteria pass. Two caught real bugs mid-flight, both of which I'd introduced:
+
+- intro.html printed the literal r doc_ver(). Removing the setup chunks left those files with no code chunk, so knitr never evaluated their inline R — silent, no error. Then I reintroduced it in my own workflows.qmd rewrite.
+- My verify script set fail=1 inside $( ) — a subshell — so it printed "ALL PASSED" while four checks had failed. Exactly the class of bug this project keeps hitting; the fixed script is committed as libs/verify-versioned.sh.
+
+Numbers reproduce the plan's stated targets exactly: v6 → 9,424, v7 → 16,153 / 9,230.
+
+Not yet verified
+
+Criteria 3 and 4 depend on CI, which is still running — whether all nine publish, and whether the flat-root prune works. I'll report when it lands.
+
+One deliberate omission: the server's local /share/data/big/v8/tables is now stale relative to S3 (no is_scored, no taxon_model/listing views). DEPLOY_TABLES=1 would sync it, but that restarts the live /scores and /species for tables the apps don't yet read — I didn't think that trade was mine to make. Say the word and I'll run it.
+
+----
+
+CI is throttled by macOS runner concurrency (max-parallel: 2); v1, v2, v3, v4, v4b are still queued. The watcher will notify when the run completes.
+
+Where verification stands now:
+
+┌───────────────────────────────┬──────────────────────────────────────────────────────────────┐
+│           Criterion           │                            Status                            │
+├───────────────────────────────┼──────────────────────────────────────────────────────────────┤
+│ 1. No cross-version bleed     │ ✅ verified locally (v3 vs v8)                               │
+├───────────────────────────────┼──────────────────────────────────────────────────────────────┤
+│ 2. Numbers match the release  │ ✅ verified locally                                          │
+├───────────────────────────────┼──────────────────────────────────────────────────────────────┤
+│ 3. Every version builds and   │ ⏳ 4 of 9 green (v5–v8 live at 200); five queued             │
+│ publishes                     │                                                              │
+├───────────────────────────────┼──────────────────────────────────────────────────────────────┤
+│ 4. Root is clean              │ ✅ flat root pruned, stale pages 404 — root target           │
+│                               │ self-corrects to v7 on this run                              │
+├───────────────────────────────┼──────────────────────────────────────────────────────────────┤
+│ 5. Links resolve              │ ✅ verified locally                                          │
+├───────────────────────────────┼──────────────────────────────────────────────────────────────┤
+│ 6. Docs match live apps       │ ✅ verified against the running apps                         │
+└───────────────────────────────┴──────────────────────────────────────────────────────────────┘
+
+The three earlier failures were all mine and all the same shape — a check that couldn't see what it was meant to catch. Worth stating plainly since the plan exists to prevent exactly that: unevaluated inline R rendering as literal text, fail=1 inside a subshell so the verifier could only ever print PASS, and an HTML-only local gate that couldn't see a PDF-only image failure.
+
+I'll report the final matrix result when it lands. The one open item I'd flag for your call is the server's local /share/data/big/v8/tables, still stale relative to S3 — DEPLOY_TABLES=1 syncs it but restarts the live /scores and /species.
+
+----
+
+It didn't fully render [Image #15] https://marinesensitivity.org/docs/v4 gives 404. True for v1 to v4
+
+----
+
+Plan B is complete and verified in production.
+
+**All six criteria met**
+
+┌──────────────────────────────────┬───────────────────────────────────────────────────────────┐
+│            Criterion             │                          Result                           │
+├──────────────────────────────────┼───────────────────────────────────────────────────────────┤
+│ 1. No cross-version bleed        │ ✅ live v3 pages contain zero v8 vocabulary               │
+├──────────────────────────────────┼───────────────────────────────────────────────────────────┤
+│ 2. Numbers match the release     │ ✅ v1 17,379/5 · v3 9,795/7 · v6 9,424/8 · v7 16,153/8 ·  │
+│                                  │ v8 17,112/8                                               │
+├──────────────────────────────────┼───────────────────────────────────────────────────────────┤
+│ 3. Every version builds and      │ ✅ all nine return 200                                    │
+│ publishes                        │                                                           │
+├──────────────────────────────────┼───────────────────────────────────────────────────────────┤
+│ 4. Root is clean                 │ ✅ flat root pruned, root → v7 per latest.txt             │
+├──────────────────────────────────┼───────────────────────────────────────────────────────────┤
+│ 5. Links resolve                 │ ✅ no 404s; three known-broken refs gone                  │
+├──────────────────────────────────┼───────────────────────────────────────────────────────────┤
+│ 6. Docs match the live apps      │ ✅ /scores, /species, ?ver= all 200                       │
+└──────────────────────────────────┴───────────────────────────────────────────────────────────┘
+
+The v1/v6/v7 figures make the point the plan was built on: 9,424 → 16,153 isn't biodiversity changing, it's the definition of a valid species changing at v7 — and each page now states its own release's answer instead of the newest one.
+
+**Three findings worth keeping**
+
+**The `mdl_id` hazard was the most serious thing this touched, and it wasn't in the plan**. Rendering `build_registry.qmd` for B3b renumbered 45,499 of 80,261 models, because `dense_rank(mdl_key)` makes the serve partition key a function of the model set. Nothing would have failed — titiler would have served the wrong species' distribution for every model past `ch_nmfs`. Now guarded by `assign_mdl_id()` and asserted against the published registry.
+
+**Your `is_active` question was the right one**. No such flag existed, and `is_mask` being NA for `gm`/`nc` was accident, not signal. `dataset.is_scored` is derived from `taxon_model` edges rather than declared, so it can't drift from the merge — and it's why the docs say 8 datasets where the registry lists 11.
+
+**Four of my own checks couldn't fail**. Inline R rendering as literal text; fail=1 inside a subshell so the verifier only ever printed PASS; an HTML-only gate blind to a PDF-only image error; and max-parallel: 2 on nine jobs pushing to one branch, which didn't reduce the race so much as make it intermittent — v4 rendered perfectly and was discarded at the push. That last one is now structurally impossible: the matrix renders artifacts, and one job makes one commit.
+
+**Open item**
+
+The server's `/share/data/big/v8/tables` is still stale relative to S3 (no `is_scored`, no `taxon_model`/`listing`). `DEPLOY_TABLES=1` syncs it but restarts the live `/scores` and `/species` for tables the apps don't yet read — your call whether that's worth the restart.
+
+----
+
+Yes, definitely worth the sync and restart for v8
+
+----
+
+~88 MB of 375 MB, moving at roughly 5 MB/min — this is just uplink bandwidth, so expect another hour or so before the rsync finishes and the repoint runs.
+
+The waiter is armed and will notify me when the notebook finishes. Summary of what this deploy does when it lands:
+
+- tables/ → /share/data/big/v8/tables/ (adds taxon_model.parquet, listing.parquet; refreshes dataset.parquet with is_scored)
+- serve/model_cell/ → scan-only no-op (local and server already identical at 17,763 partitions)
+- serve.duckdb repointed into a copy, then atomically swapped — so live Shiny sessions keep serving from the old inode rather than hitting a lock conflict — going from 13 views to 15
+- restart.txt touched on /scores and /species, rolling sessions onto the new view DB
+
+I also fixed something on the way in that CLAUDE.md flagged as owed: both docker exec rstudio Rscript calls in the deploy path now pass -u 1000:1000. They were running as root and writing root-owned files into /share — the failure mode that's silent until git merge aborts with unable to unlink … Permission denied, and which a sweep once found 23,729 instances of.
+
+----
+
+When I look at the table of source datasets per version (eg https://marinesensitivity.org/docs/v1/data-sources.html#dataset-overview), which is one of the most important and distinguishing aspects of each version, it looks overly inclusive for earlier versions: **v1** and **v2** show `ch_fws`, `ch_nmfs` and `rng_fws`, but I'm pretty sure these datasets did not get introduced until **v3** (see https://marinesensitivity.org/#v3). Please do a deep dive and exhaustive review of datasets actually included in each version and update the tables accordingly.
+
+----
+
+Good catch — the table was misleading, though not in the way you expected.
+
+What the data says
+
+Your instinct that v1/v2 looked "overly inclusive" was right; the specific cause was different. ch_fws, ch_nmfs and rng_fws were in v1 — v1's own model registry has 29/34/106 of them, and its native wide-format taxon table carries their mdl_seq values. But they were tiny.
+
+Joining v1's scored zone_taxon back through the model registry:
+
+rng_fws 31  +  ch_fws 4  +  ch_nmfs 3  =  38 taxa
+
+which reproduces the 2025 final report's "the Critical Habitat and FWS range datasets contributed 38 pilot models (~0.2% of 17,333)" exactly. The report was right, the data agrees with it, and the table was hiding it.
+
+The actual defect
+
+The Models column counted the registry, not participation — models the release catalogued, not ones it used. So a 27-taxon pilot sat in the same column as AquaMaps' 16,871 with no way to tell them apart.
+
+It now shows Taxa + Share, computed from each release's own taxon_model ∩ valid species:
+
+┌─────────┬─────────────────────────────────────────────────────────────────────────┐
+│ version │                               composition                               │
+├─────────┼─────────────────────────────────────────────────────────────────────────┤
+│ v1      │ am 16,871 (97.1%) · bl 457 (2.6%) · rng_fws 92 · ch_nmfs 33 · ch_fws 27 │
+├─────────┼─────────────────────────────────────────────────────────────────────────┤
+│ v2      │ + rng_iucn 1,514 (8.7%)                                                 │
+├─────────┼─────────────────────────────────────────────────────────────────────────┤
+│ v3      │ + ca_nmfs 1                                                             │
+├─────────┼─────────────────────────────────────────────────────────────────────────┤
+│ v4–v6   │ + rng_turtle_swot_dps 6                                                 │
+├─────────┼─────────────────────────────────────────────────────────────────────────┤
+│ v7/v8   │ same eight                                                              │
+└─────────┴─────────────────────────────────────────────────────────────────────────┘
+
+So the genuinely new datasets are rng_iucn at v2, ca_nmfs at v3, and turtles at v4 — not the CH/FWS sets.
+
+Two judgement calls I made deliberately:
+
+- I didn't call the small ones "pilots." A dataset can be small because it's targeted and complete — rng_turtle_swot_dps covers 6 taxa because there are six sea turtle species. The callout separates "broad coverage" from "targeted designations" instead.
+- is_scored is now stricter: attaching to zero valid taxa means not scored, whatever the registry says.
+
+One more thing fell out of this: merging isn't constant across releases. v1 merged only the 91 taxa that had more than one source, so most v1 species were scored straight from their source model — which is why datasets appear directly in v1's scored output but only ms_merge does from v3. The page now states which regime a release used.
+
+Also, the v8 deploy landed while I was on this: serve.duckdb is at 15 views (was 13), taxon_model 41,015 / listing 11,532 live, is_scored FALSE: gm,nc on the server, and all four app URLs returned 200 after the reload.
+
+----
+
+Ok, good work! For each version, the landing page should a summary callout at the top on how the given version differs from the past (or for version 1, the basis for subsequent differences). Ideally, this is simplified into a few standardized bullets for comparison sake. Here are a few that come to mind, but also curious of others or modifications you suggest:
+
+- **Datasets**: new datasets added, and whether used for masking (eg IUCN) or for spatially mapping extinction risk status (eg v4 with turtles), etc
+- **Methods**: changes to extinction risk scoring, adding taxonomic floors (MMPA, MBTA), etc
+- **Technology**: reformatted from USA to global ingest, added STAC search, etc
+
+----
+
+All eleven CI jobs green, and the callout is live on all nine — each correctly chained to its predecessor, with v1 stating the basis rather than a diff.
+
+The chain also confirms the version registry is being read correctly end to end: v5 says "relative to v4b", not v4, so the intermediate release isn't skipped.
+
+Where everything stands
+
+**Plan B — complete and verified in production**. All six criteria pass, all nine versions live at `/docs/{ver}/`, root redirects to `v7` per `latest.txt`, and the stale 486-file flat root is gone.
+
+**Corrections you prompted, both real**:
+- The dataset table counted registered models rather than participating taxa, so a 27-taxon pilot looked equal to AquaMaps' 16,871. Now `Taxa` + `Share`, and v1 reads as what it was: am 97.1%, bl 2.6%, the rest under 0.5%. The deep dive also settled the factual question — CH/FWS were in v1, at exactly the 38 taxa the 2025 report documented.
+- Per-version summary callouts, four headings, editorial prose in a reviewable YAML with computed figures beside it.
+
+**Pipeline-side fixes that came out of this session, all pushed and deployed**:
+- `msens::assign_mdl_id()` — stops the 45,499-model renumbering that would have made titiler serve the wrong species from a right-looking partition
+- v8 publishes `taxon_model` + `listing` (41,015 edges / 11,532 rows), live on S3 and on the server's `serve.duckdb` (15 views, up from 13)
+- `dataset.is_scored` — your `is_active` idea, introspected from the merge rather than declared
+- CI restructured so the `gh-pages` push race is structurally impossible
+
+**Two suggestions I left on the table, both yours to call**:
+1. A dedicated "breaks compatibility" flag for v8's grid change — currently a clause mid-sentence, though it's the most consequential fact for anyone holding v7 cell ids.
+2. Publishing `pra_score_delta` per release, so v4/v4b/v5 get a real quantitative line instead of "9,795 → 9,795" — those releases changed values, not membership. That's a pipeline change rather than a docs one.
+
+----
+
+Let's switch the callout style of "What changed in..." to note (blue, info) from important (red, exclamation), which is too alarming
+
+----
+
+hanged to callout-note and pushed — CI is rebuilding all nine. Agreed on the reasoning: red-and-exclamation reads as something is wrong, when this is just orientation for everyone landing on the page.
+
+Two other callouts I introduced are still important, in case you want the same treatment:
+
+- `data-sources.qmd` — "Coverage is very uneven — read the Taxa column, not the row count", and on v8 "Registered but not scored" (the gm/nc note)
+- `taxonomy.qmd` — "Validity is not the same question as 'occurs in a Program Area'"
+
+Those are closer to genuine caveats — each one exists because misreading it leads to a wrong conclusion — so red arguably fits better there than it did on the version summary. Happy to soften any or all of them if you'd rather the red be reserved for something narrower.
+
+----
+
+Let's return to your two suggestions:
+
+1. I don't think we need a "breaks compatibility" since we're not expecting others to re-run these models. This is for informational purposes, not a technical document for full reproducability.
+
+2. Yes, I love the idea of publishing changes in Program Area scores between versions across all components: `pra_score_delta` per release. We will need to keep track of vintage between these. Also not sure how to handle wholesale changes from Planning Area to Program Area, nor smaller changes like Gulf of America Program Areas changing name and shape.
+
+----
+
+Something is seriously off with the Planning / Program areas in the scores app for v1 [Image #18]
+  and v2 [Image #19]. Neither show ANY choropleth values on the map. And when I look in the
+`~/My Drive/projects/msens/data/derived/` folder, I see different files used in the actual zones ingested and used for generating scores per version:
+
+- v1/ply_planareas_2025.gpkg
+- v2/ply_programareas_2026.gpkg
+- v3/ply_programareas_2026_v3.gpkg
+- v4/ply_programareas_2026_v4.gpkg
+- v4/ply_programareas_2026_v4b.gpkg
+- v5/ply_programareas_2026_v5.gpkg
+- v6/ply_programareas_2026_v6.gpkg
+- v7/ply_programareas_2026_v7.gpkg
+
+Now many of these are 7.4 MB, so may be the same.
+
+I think what really confused things is that I had asked for scores to be calculated across all zones (past and present), since I could imagine that being of interest. But that means there would also be mismatches between zones and underlying data. Most importantly we need to be clear about the intended zones reported on for the given version.
+
+----
+
+Fixed and verified server-side: v2's mapping is now byte-identical to v3's — 40 pairs, 20 Program Areas under USA, which is exactly what pra_keys needs to be non-empty.
+
+What was actually wrong
+
+Two separate bugs, both hiding behind the same blank map:
+
+v2 — a poisoned cache from a guessed table name.
+tbl_sr <- glue("ply_subregions_2026_{ver}")   # → "ply_subregions_2026_v2"
+v1/v2 name their zone tables without the version suffix; v3+ carry it. So filter(tbl == tbl_sr) matched nothing on v2, the subregion↔Program-Area mapping came out empty, and it was written to CSV. Since the app only recomputes that file when it's absent, one bad write was permanent — v2's cache had been 30 bytes of header since 2026-08-11. range(numeric(0)) returns c(Inf, -Inf), which is the InfM / -InfM legend you saw.
+
+v1 — offering a unit it never had. The Spatial units picker was hardcoded to cell + pra, with "Planning areas" commented out. v1 predates Program Areas entirely (capabilities.programareas = FALSE) and scored 36 Planning Areas — so the picker offered the one unit v1 lacks and hid the one it has.
+
+Fixes
+
+- Zone tables are now resolved from the database (SELECT DISTINCT tbl FROM zone WHERE fld = …), preferring the suffixed name where it exists. Naming conventions can change again; field names can't.
+- An empty mapping is never cached for a release whose manifest declares Program Areas — it warns instead. Empty is only legitimate on v1.
+- The picker is built from the release's capabilities, so v1 now offers Planning areas.
+
+On your broader point
+
+You're right that scoring across all zones, past and present, is what created the mismatch — and the data confirms your instinct about intent:
+
+┌─────────┬──────────────────────────────────────────┬─────────────────────────────────────────┐
+│ version │            zones with scores             │              intended unit              │
+├─────────┼──────────────────────────────────────────┼─────────────────────────────────────────┤
+│ v1      │ ecoregion 12, planarea 36                │ Planning Areas                          │
+├─────────┼──────────────────────────────────────────┼─────────────────────────────────────────┤
+│ v2      │ planarea 36, programarea 20              │ Program Areas (planarea carried         │
+│         │                                          │ forward)                                │
+├─────────┼──────────────────────────────────────────┼─────────────────────────────────────────┤
+│ v3–v6   │ programarea 20                           │ Program Areas                           │
+├─────────┼──────────────────────────────────────────┼─────────────────────────────────────────┤
+│ v7      │ programarea 20, subregion 1              │ Program Areas                           │
+├─────────┼──────────────────────────────────────────┼─────────────────────────────────────────┤
+│ v8      │ ecoregion 12, programarea 20, subregion  │ Program Areas                           │
+│         │ 5                                        │                                         │
+└─────────┴──────────────────────────────────────────┴─────────────────────────────────────────┘
+
+v2 is the transitional release scoring both. I'd suggest recording the intended reporting unit per version explicitly — it's editorial, so `release_notes.yml` is the natural home, and the app could then label the non-intended units as carried-forward rather than presenting them as equals. Want me to add that?
+
+One correction to something I said earlier: I reported Program Areas as unchanged v2–v8 based on keys, names and areas, and that still holds — but I should have checked the table names too, since that's where the real discontinuity was.
+
+----
+
+Yes to expanding `release_notes.yml`, but first I want you to check tables in the original duckdb versions:
+
+- ~/_big/msens/derived/v1/sdm.duckdb
+- ~/_big/msens/derived/v2/sdm.duckdb
+- ~/_big/msens/derived/v3/sdm.duckdb
+- ...
+
+I think the "truth" got muddled in the subsequent consolidation.
+
+----
+
+I checked the originals as you asked — and the answer is the opposite of what you suspected, in a useful way.
+
+The consolidation is faithful
+
+Comparing every original ~/_big/msens/derived/v{n}/sdm.duckdb against its published counterpart:
+
+- identical composite-score row counts by zone type, every version
+- identical values — max|d| = 0.000000 across all 20 Program Areas, v2 through v7
+
+So nothing was lost or invented in the copy. What was muddled was the interpretation — mine included.
+
+What the originals actually settle
+
+┌─────────┬──────────────────────────────────────────┬─────────────────────────────────────────┐
+│ version │       composite score computed on        │             reporting unit              │
+├─────────┼──────────────────────────────────────────┼─────────────────────────────────────────┤
+│ v1      │ ecoregion(12) + planarea(36)             │ Planning Areas — no Program Areas exist │
+│         │                                          │  at all                                 │
+├─────────┼──────────────────────────────────────────┼─────────────────────────────────────────┤
+│ v2      │ planarea(36) + programarea(20)           │ transitional — scores both              │
+├─────────┼──────────────────────────────────────────┼─────────────────────────────────────────┤
+│ v3–v6   │ programarea(20)                          │ Program Areas                           │
+├─────────┼──────────────────────────────────────────┼─────────────────────────────────────────┤
+│ v7      │ programarea(20) + subregion(1)           │ Program Areas                           │
+├─────────┼──────────────────────────────────────────┼─────────────────────────────────────────┤
+│ v8      │ ecoregion(12) + programarea(20) +        │ Program Areas + rollups                 │
+│         │ subregion(5)                             │                                         │
+└─────────┴──────────────────────────────────────────┴─────────────────────────────────────────┘
+
+The key distinction your question exposed: v3–v7 all still carry the 36 Planning Areas — geometry, membership, and 72 rows of non-composite metrics — and compute a composite for none of them. That's the residue of scoring across all zones. Reading "has zones" as "reports scores" is precisely what let the app offer a Program Areas view of v1.
+
+Changes
+
+release_notes.yml gains a zones heading ("Reported units"), with doc_scored_units() printing the measured answer beside the prose — same belt-and-braces as the other computed figures:
+
+▎ Reported units — The transitional release: scores are reported on both the 36 Planning Areas and the new 20 Program Areas… (measured: 36 planarea, 20 programarea scored on the composite metric.)
+
+Two scope entries contradicted it and are corrected. v2's said Program Areas "replace" Planning Areas — they don't; v2 scores both and the changeover completes at v3.
+
+Correction to something I told you earlier
+
+I reported v2 as "intended Program Areas, planarea carried forward." That was wrong — v2 genuinely scores both, deliberately, which is what makes it the one release where the two units are directly comparable on identical underlying data. Worth knowing if you ever want to quantify what the Planning→Program transition did to the numbers.
+
+----
+
+
 
 ## 2026-08-10 Refactor app versioning and data serving strategy
 
