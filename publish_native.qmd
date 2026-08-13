@@ -26,7 +26,9 @@ reptile/amphibian) — the set the species app actually lists.
 **Flags:** `REDO_NATIVE=1` (rebuild PMTiles + IUCN gpkg + re-sort am), `REDO_PMTILES=1` (rebuild
 just the vector tiles), `NATIVE_SKIP_AM` / `NATIVE_SKIP_PMTILES`,
 `NATIVE_TEST_N=<n>` (only first n am COGs, smoke test), `NATIVE_NO_S3` (stage locally, skip upload),
-`NATIVE_WORKERS=<n>`.
+`NATIVE_WORKERS=<n>`, `NATIVE_VEC_COG=1` / `PUBLISH_MERGED_COG=1` (opt-in COG classes),
+`NATIVE_REGISTRY_REBUILD=1` (publish ONLY what this run built — see the registry chunk; without it
+a skipped class is carried forward rather than deleted).
 
 ## Design
 
@@ -681,6 +683,26 @@ if (nrow(amonly_multi) && dir_exists(am_parts)) {
     log_info("am-only MULTI-model merged COGs: {length(mm_rows)} taxa, {built_mm} newly built")
   }
 }
+
+# the registry is CUMULATIVE: a run may not delete an asset class it did not rebuild ----
+#
+# Everything above assembles `native_asset` from what THIS run built, and the write below is
+# an overwrite — so a run that skips a build chunk (NATIVE_SKIP_PMTILES, or an opt-in class
+# like PUBLISH_MERGED_COG left off) used to publish a registry missing every class it never
+# touched, while those assets sat published and unreferenced. That is how all 2,234 vector-range
+# PMTiles rows vanished: the species app then showed AquaMaps as each taxon's only input, and the
+# content-hash checkpoint below faithfully fingerprinted the truncated table (n_pmtiles_native: 0).
+#
+# msens::registry_merge() carries forward any class this run produced no rows for and ERRORS on a
+# class that came back smaller (a partial build must not publish as a complete one). The rule lives
+# in the package so testthat asserts it — see msens/tests/testthat/test-publish.R.
+prior_asset  <- if (dbExistsTable(con, "native_asset")) dbReadTable(con, "native_asset") else NULL
+native_asset <- msens::registry_merge(
+  native_asset, prior_asset,
+  allow_shrink = nzchar(Sys.getenv("NATIVE_REGISTRY_REBUILD")))
+carried <- attr(native_asset, "carried")
+if (length(carried))
+  log_warn("registry: carried forward {length(carried)} class(es) not built this run: {paste(carried, collapse='; ')}")
 
 dbWriteTable(con, "native_asset", native_asset, overwrite = TRUE)
 smry <- dbGetQuery(con, "SELECT representation, asset_type, count(*) n_rows,
