@@ -6,7 +6,7 @@
 
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
 
-<meta name="dcterms.date" content="2026-08-13">
+<meta name="dcterms.date" content="2026-08-14">
 
 <title>Release marine-atlas — versioned Parquet → S3, view-DB serving, STAC</title>
 <style>
@@ -158,7 +158,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
     <div>
     <div class="quarto-title-meta-heading">Published</div>
     <div class="quarto-title-meta-contents">
-      <p class="date">2026-08-13</p>
+      <p class="date">2026-08-14</p>
     </div>
   </div>
   
@@ -330,7 +330,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <tbody>
 <tr class="odd">
 <td style="text-align: left;">tables/cell.parquet</td>
-<td style="text-align: right;">392.8</td>
+<td style="text-align: right;">391.3</td>
 </tr>
 <tr class="even">
 <td style="text-align: left;">tables/taxon.parquet</td>
@@ -354,7 +354,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 </tr>
 <tr class="odd">
 <td style="text-align: left;">tables/cell_metric.parquet</td>
-<td style="text-align: right;">67.9</td>
+<td style="text-align: right;">67.1</td>
 </tr>
 <tr class="even">
 <td style="text-align: left;">tables/zone.parquet</td>
@@ -667,75 +667,94 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"RELEASE_DEPLOY/DEPLOY_TABLES unset — leaving the server's table views as they are"</span>)</span>
 <span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a>} <span class="cf">else</span> {</span>
 <span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a>  <span class="fu">system2</span>(<span class="st">"ssh"</span>, <span class="fu">c</span>(<span class="st">"msens"</span>, <span class="fu">glue</span>(<span class="st">"mkdir -p {srv_tables} {srv_modelcell}"</span>)))</span>
-<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a>  <span class="fu">system2</span>(<span class="st">"rsync"</span>, <span class="fu">c</span>(<span class="st">"-aq"</span>, <span class="st">"--delete"</span>, <span class="fu">glue</span>(<span class="st">"{tbl_dir}/"</span>), <span class="fu">glue</span>(<span class="st">"msens:{srv_tables}/"</span>)))</span>
-<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"synced tables -&gt; msens:{srv_tables}"</span>)</span>
-<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a>  <span class="co"># model_cell too — the LAST remote table. The v8 species app reads it in two</span></span>
-<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a>  <span class="co"># places (mdl_bbox() for fit_bounds, and the clicked-cell value), and both are</span></span>
-<span id="cb17-9"><a href="#cb17-9" aria-hidden="true" tabindex="-1"></a>  <span class="co"># degrading silently today: the S3 GLOB needs LIST credentials the app</span></span>
-<span id="cb17-10"><a href="#cb17-10" aria-hidden="true" tabindex="-1"></a>  <span class="co"># container lacks, so the tryCatch around each returns NULL/NA and the app</span></span>
-<span id="cb17-11"><a href="#cb17-11" aria-hidden="true" tabindex="-1"></a>  <span class="co"># quietly falls back to the study-area extent and a blank value. 3.3 GB.</span></span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a>  <span class="co"># PULL from S3 on the server rather than PUSH from here.</span></span>
+<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a>  <span class="co">#</span></span>
+<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a>  <span class="co"># tables/ is ~445 MB and S3 is the published artifact sitting in the SAME REGION as msens1,</span></span>
+<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a>  <span class="co"># so the server fetches it in seconds; pushing it up from a laptop is a ~20-minute transfer</span></span>
+<span id="cb17-9"><a href="#cb17-9" aria-hidden="true" tabindex="-1"></a>  <span class="co"># over a ~400 KB/s link. That transfer failed three times in one night — the render process</span></span>
+<span id="cb17-10"><a href="#cb17-10" aria-hidden="true" tabindex="-1"></a>  <span class="co"># died mid-rsync each time, leaving an orphaned rsync still writing into the destination and,</span></span>
+<span id="cb17-11"><a href="#cb17-11" aria-hidden="true" tabindex="-1"></a>  <span class="co"># on one occasion, two concurrent `rsync --delete` runs against the same directory.</span></span>
 <span id="cb17-12"><a href="#cb17-12" aria-hidden="true" tabindex="-1"></a>  <span class="co">#</span></span>
-<span id="cb17-13"><a href="#cb17-13" aria-hidden="true" tabindex="-1"></a>  <span class="co"># Safe for tiles: titiler builds its own read_parquet path from the</span></span>
-<span id="cb17-14"><a href="#cb17-14" aria-hidden="true" tabindex="-1"></a>  <span class="co"># SERVE_MODEL_CELL env var (server/titiler/factory.py) and only uses this DB</span></span>
-<span id="cb17-15"><a href="#cb17-15" aria-hidden="true" tabindex="-1"></a>  <span class="co"># for the `model` registry — it never reads this view.</span></span>
-<span id="cb17-16"><a href="#cb17-16" aria-hidden="true" tabindex="-1"></a>  <span class="fu">system2</span>(<span class="st">"rsync"</span>, <span class="fu">c</span>(<span class="st">"-aq"</span>, <span class="st">"--delete"</span>, <span class="fu">glue</span>(<span class="st">"{serve_mc}/"</span>), <span class="fu">glue</span>(<span class="st">"msens:{srv_modelcell}/"</span>)))</span>
-<span id="cb17-17"><a href="#cb17-17" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"synced model_cell -&gt; msens:{srv_modelcell}"</span>)</span>
-<span id="cb17-18"><a href="#cb17-18" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb17-19"><a href="#cb17-19" aria-hidden="true" tabindex="-1"></a>  <span class="co"># Repoint the views — into a COPY, then swap it in atomically.</span></span>
-<span id="cb17-20"><a href="#cb17-20" aria-hidden="true" tabindex="-1"></a>  <span class="co">#</span></span>
-<span id="cb17-21"><a href="#cb17-21" aria-hidden="true" tabindex="-1"></a>  <span class="co"># Editing serve.duckdb in place needs a WRITE lock, and every running Shiny</span></span>
-<span id="cb17-22"><a href="#cb17-22" aria-hidden="true" tabindex="-1"></a>  <span class="co"># session holds a read-only one, so a live server fails with</span></span>
-<span id="cb17-23"><a href="#cb17-23" aria-hidden="true" tabindex="-1"></a>  <span class="co">#   Could not set lock on file ".../serve.duckdb": Conflicting lock is held</span></span>
-<span id="cb17-24"><a href="#cb17-24" aria-hidden="true" tabindex="-1"></a>  <span class="co"># (it only ever succeeded when no app happened to be open). Copying first</span></span>
-<span id="cb17-25"><a href="#cb17-25" aria-hidden="true" tabindex="-1"></a>  <span class="co"># needs no lock — readers never mutate the file — and `mv` is atomic within</span></span>
-<span id="cb17-26"><a href="#cb17-26" aria-hidden="true" tabindex="-1"></a>  <span class="co"># the filesystem: in-flight sessions keep serving from the old inode, and the</span></span>
-<span id="cb17-27"><a href="#cb17-27" aria-hidden="true" tabindex="-1"></a>  <span class="co"># restart.txt touch rolls them onto the new one.</span></span>
-<span id="cb17-28"><a href="#cb17-28" aria-hidden="true" tabindex="-1"></a>  <span class="co">#</span></span>
-<span id="cb17-29"><a href="#cb17-29" aria-hidden="true" tabindex="-1"></a>  <span class="co"># `val AS value` is preserved (the apps still reference `value`), and each</span></span>
-<span id="cb17-30"><a href="#cb17-30" aria-hidden="true" tabindex="-1"></a>  <span class="co"># repoint is verified with a real count so a half-synced directory FAILS</span></span>
-<span id="cb17-31"><a href="#cb17-31" aria-hidden="true" tabindex="-1"></a>  <span class="co"># LOUDLY here rather than being discovered later as an empty app panel.</span></span>
-<span id="cb17-32"><a href="#cb17-32" aria-hidden="true" tabindex="-1"></a>  <span class="co">#</span></span>
-<span id="cb17-33"><a href="#cb17-33" aria-hidden="true" tabindex="-1"></a>  <span class="co"># The model_cell probe must draw its mdl_id from model_cell, NOT from `model`.</span></span>
-<span id="cb17-34"><a href="#cb17-34" aria-hidden="true" tabindex="-1"></a>  <span class="co"># `model` registers every model including the raw per-dataset ones, and only</span></span>
-<span id="cb17-35"><a href="#cb17-35" aria-hidden="true" tabindex="-1"></a>  <span class="co"># merged models have cells -- so `min(mdl_id) FROM model` is a raw model whose</span></span>
-<span id="cb17-36"><a href="#cb17-36" aria-hidden="true" tabindex="-1"></a>  <span class="co"># count is legitimately 0. That probe therefore returned 0 on a PERFECTLY</span></span>
-<span id="cb17-37"><a href="#cb17-37" aria-hidden="true" tabindex="-1"></a>  <span class="co"># HEALTHY release and would have returned 0 on a broken one too: a check that</span></span>
-<span id="cb17-38"><a href="#cb17-38" aria-hidden="true" tabindex="-1"></a>  <span class="co"># cannot distinguish the two states verifies nothing. It printed 0 beside</span></span>
-<span id="cb17-39"><a href="#cb17-39" aria-hidden="true" tabindex="-1"></a>  <span class="co"># "VIEWS_OK" for the 580,568,326-row v8 release.</span></span>
-<span id="cb17-40"><a href="#cb17-40" aria-hidden="true" tabindex="-1"></a>  repoint <span class="ot">&lt;-</span> <span class="fu">glue</span>(</span>
-<span id="cb17-41"><a href="#cb17-41" aria-hidden="true" tabindex="-1"></a>    <span class="st">"vt &lt;- strsplit('cell_metric,zone_metric,zone', ',')[[1]]; "</span>,</span>
-<span id="cb17-42"><a href="#cb17-42" aria-hidden="true" tabindex="-1"></a>    <span class="st">"tt &lt;- strsplit('{paste(rel_tables, collapse = </span><span class="sc">\"</span><span class="st">,</span><span class="sc">\"</span><span class="st">)}', ',')[[1]]; "</span>,</span>
-<span id="cb17-43"><a href="#cb17-43" aria-hidden="true" tabindex="-1"></a>    <span class="st">"con &lt;- DBI::dbConnect(duckdb::duckdb('{srv_viewdb}.new')); "</span>,</span>
-<span id="cb17-44"><a href="#cb17-44" aria-hidden="true" tabindex="-1"></a>    <span class="st">"for (t in tt) DBI::dbExecute(con, sprintf("</span>,</span>
-<span id="cb17-45"><a href="#cb17-45" aria-hidden="true" tabindex="-1"></a>    <span class="st">"</span><span class="sc">\"</span><span class="st">CREATE OR REPLACE VIEW %s AS SELECT *%s FROM read_parquet('{srv_tables}/%s.parquet')</span><span class="sc">\"</span><span class="st">, "</span>,</span>
-<span id="cb17-46"><a href="#cb17-46" aria-hidden="true" tabindex="-1"></a>    <span class="st">"t, if (t %in% vt) ', val AS value' else '', t)); "</span>,</span>
-<span id="cb17-47"><a href="#cb17-47" aria-hidden="true" tabindex="-1"></a>    <span class="st">"DBI::dbExecute(con, </span><span class="sc">\"</span><span class="st">CREATE OR REPLACE VIEW model_cell AS SELECT m.mdl_key, "</span>,</span>
-<span id="cb17-48"><a href="#cb17-48" aria-hidden="true" tabindex="-1"></a>    <span class="st">"mc.mdl_id, mc.cell_id, mc.val, mc.val AS value FROM read_parquet("</span>,</span>
-<span id="cb17-49"><a href="#cb17-49" aria-hidden="true" tabindex="-1"></a>    <span class="st">"'{srv_modelcell}/*/*.parquet', hive_partitioning = true) mc JOIN model m USING (mdl_id)</span><span class="sc">\"</span><span class="st">); "</span>,</span>
-<span id="cb17-50"><a href="#cb17-50" aria-hidden="true" tabindex="-1"></a>    <span class="st">"zm &lt;- DBI::dbGetQuery(con, 'SELECT count(*) n FROM zone_metric')$n; "</span>,</span>
-<span id="cb17-51"><a href="#cb17-51" aria-hidden="true" tabindex="-1"></a>    <span class="st">"mc &lt;- DBI::dbGetQuery(con, 'SELECT count(*) n FROM model_cell WHERE mdl_id = "</span>,</span>
-<span id="cb17-52"><a href="#cb17-52" aria-hidden="true" tabindex="-1"></a>    <span class="st">"(SELECT min(mdl_id) FROM model_cell)')$n; "</span>,</span>
-<span id="cb17-53"><a href="#cb17-53" aria-hidden="true" tabindex="-1"></a>    <span class="st">"stopifnot(</span><span class="sc">\'</span><span class="st">zone_metric view is empty</span><span class="sc">\'</span><span class="st"> = zm &gt; 0, "</span>,</span>
-<span id="cb17-54"><a href="#cb17-54" aria-hidden="true" tabindex="-1"></a>    <span class="st">"</span><span class="sc">\'</span><span class="st">model_cell view returned no rows for its own first mdl_id</span><span class="sc">\'</span><span class="st"> = mc &gt; 0); "</span>,</span>
-<span id="cb17-55"><a href="#cb17-55" aria-hidden="true" tabindex="-1"></a>    <span class="co"># the repoint REPLACES the views, so it must also (re)record the grid and re-verify the</span></span>
-<span id="cb17-56"><a href="#cb17-56" aria-hidden="true" tabindex="-1"></a>    <span class="co"># tile ids here -- otherwise the server copy reverts to guessing the width, which is how</span></span>
-<span id="cb17-57"><a href="#cb17-57" aria-hidden="true" tabindex="-1"></a>    <span class="co"># the clicked-cell species list came back empty on every usa05 release.</span></span>
-<span id="cb17-58"><a href="#cb17-58" aria-hidden="true" tabindex="-1"></a>    <span class="st">"msens::cell_grid_write(con, msens::grid_for_ver('{ver}')); "</span>,</span>
-<span id="cb17-59"><a href="#cb17-59" aria-hidden="true" tabindex="-1"></a>    <span class="st">"msens::cell_model_tile_check(con); "</span>,</span>
-<span id="cb17-60"><a href="#cb17-60" aria-hidden="true" tabindex="-1"></a>    <span class="st">"cat('VIEWS_OK', length(tt), zm, mc, '</span><span class="sc">\\</span><span class="st">n'); "</span>,</span>
-<span id="cb17-61"><a href="#cb17-61" aria-hidden="true" tabindex="-1"></a>    <span class="st">"DBI::dbDisconnect(con, shutdown = TRUE)"</span>)</span>
-<span id="cb17-62"><a href="#cb17-62" aria-hidden="true" tabindex="-1"></a>  v8_apps <span class="ot">&lt;-</span> <span class="fu">c</span>(<span class="st">"species"</span>, <span class="st">"scores"</span>)</span>
-<span id="cb17-63"><a href="#cb17-63" aria-hidden="true" tabindex="-1"></a>  cmd_rp <span class="ot">&lt;-</span> <span class="fu">glue</span>(</span>
-<span id="cb17-64"><a href="#cb17-64" aria-hidden="true" tabindex="-1"></a>    <span class="st">"set -e; "</span>,</span>
-<span id="cb17-65"><a href="#cb17-65" aria-hidden="true" tabindex="-1"></a>    <span class="st">"cp -f {srv_viewdb} {srv_viewdb}.new; "</span>,                       <span class="co"># no lock needed</span></span>
-<span id="cb17-66"><a href="#cb17-66" aria-hidden="true" tabindex="-1"></a>    <span class="co"># -u 1000:1000 for the same reason as the cell_model repoint above</span></span>
-<span id="cb17-67"><a href="#cb17-67" aria-hidden="true" tabindex="-1"></a>    <span class="st">"docker exec -u 1000:1000 rstudio Rscript -e {shQuote(repoint)}; "</span>,</span>
-<span id="cb17-68"><a href="#cb17-68" aria-hidden="true" tabindex="-1"></a>    <span class="st">"mv -f {srv_viewdb}.new {srv_viewdb}; "</span>,                       <span class="co"># atomic swap</span></span>
-<span id="cb17-69"><a href="#cb17-69" aria-hidden="true" tabindex="-1"></a>    <span class="st">"{paste(sprintf('touch /share/github/MarineSensitivity/apps_v8/%s/restart.txt', v8_apps), collapse='; ')}"</span>)</span>
-<span id="cb17-70"><a href="#cb17-70" aria-hidden="true" tabindex="-1"></a>  out_rp <span class="ot">&lt;-</span> <span class="fu">system2</span>(<span class="st">"ssh"</span>, <span class="fu">c</span>(<span class="st">"msens"</span>, <span class="fu">shQuote</span>(cmd_rp)), <span class="at">stdout =</span> <span class="cn">TRUE</span>, <span class="at">stderr =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb17-71"><a href="#cb17-71" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">any</span>(<span class="fu">grepl</span>(<span class="st">"VIEWS_OK"</span>, out_rp))) <span class="fu">stop</span>(<span class="fu">paste</span>(<span class="fu">tail</span>(out_rp, <span class="dv">20</span>), <span class="at">collapse =</span> <span class="st">"</span><span class="sc">\n</span><span class="st">"</span>))</span>
-<span id="cb17-72"><a href="#cb17-72" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"views repointed to local Parquet + v8 apps reloaded: {grep('VIEWS_OK', out_rp, value = TRUE)}"</span>)</span>
-<span id="cb17-73"><a href="#cb17-73" aria-hidden="true" tabindex="-1"></a>}</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<span id="cb17-13"><a href="#cb17-13" aria-hidden="true" tabindex="-1"></a>  <span class="co"># Pulling is also the stronger guarantee: the server ends up holding exactly what was</span></span>
+<span id="cb17-14"><a href="#cb17-14" aria-hidden="true" tabindex="-1"></a>  <span class="co"># PUBLISHED, not whatever happens to be staged on the machine driving the release.</span></span>
+<span id="cb17-15"><a href="#cb17-15" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (do_s3_tbl) {</span>
+<span id="cb17-16"><a href="#cb17-16" aria-hidden="true" tabindex="-1"></a>    out_t <span class="ot">&lt;-</span> <span class="fu">system2</span>(<span class="st">"ssh"</span>, <span class="fu">c</span>(<span class="st">"msens"</span>, <span class="fu">shQuote</span>(<span class="fu">glue</span>(</span>
+<span id="cb17-17"><a href="#cb17-17" aria-hidden="true" tabindex="-1"></a>      <span class="st">"aws s3 sync {s3_ver}/tables/ {srv_tables}/ --delete --only-show-errors &amp;&amp; echo TABLES_OK"</span>))),</span>
+<span id="cb17-18"><a href="#cb17-18" aria-hidden="true" tabindex="-1"></a>      <span class="at">stdout =</span> <span class="cn">TRUE</span>, <span class="at">stderr =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb17-19"><a href="#cb17-19" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="sc">!</span><span class="fu">any</span>(<span class="fu">grepl</span>(<span class="st">"TABLES_OK"</span>, out_t))) <span class="fu">stop</span>(<span class="fu">paste</span>(<span class="fu">tail</span>(out_t, <span class="dv">15</span>), <span class="at">collapse =</span> <span class="st">"</span><span class="sc">\n</span><span class="st">"</span>))</span>
+<span id="cb17-20"><a href="#cb17-20" aria-hidden="true" tabindex="-1"></a>    <span class="fu">log_info</span>(<span class="st">"server pulled tables from S3 -&gt; {srv_tables}"</span>)</span>
+<span id="cb17-21"><a href="#cb17-21" aria-hidden="true" tabindex="-1"></a>  } <span class="cf">else</span> {</span>
+<span id="cb17-22"><a href="#cb17-22" aria-hidden="true" tabindex="-1"></a>    <span class="co"># nothing was pushed to S3 this run, so the local copy is the only source</span></span>
+<span id="cb17-23"><a href="#cb17-23" aria-hidden="true" tabindex="-1"></a>    <span class="fu">system2</span>(<span class="st">"rsync"</span>, <span class="fu">c</span>(<span class="st">"-aq"</span>, <span class="st">"--delete"</span>, <span class="fu">glue</span>(<span class="st">"{tbl_dir}/"</span>), <span class="fu">glue</span>(<span class="st">"msens:{srv_tables}/"</span>)))</span>
+<span id="cb17-24"><a href="#cb17-24" aria-hidden="true" tabindex="-1"></a>    <span class="fu">log_info</span>(<span class="st">"synced tables -&gt; msens:{srv_tables} (rsync — tables not on S3 this run)"</span>)</span>
+<span id="cb17-25"><a href="#cb17-25" aria-hidden="true" tabindex="-1"></a>  }</span>
+<span id="cb17-26"><a href="#cb17-26" aria-hidden="true" tabindex="-1"></a>  <span class="co"># model_cell too — the LAST remote table. The v8 species app reads it in two</span></span>
+<span id="cb17-27"><a href="#cb17-27" aria-hidden="true" tabindex="-1"></a>  <span class="co"># places (mdl_bbox() for fit_bounds, and the clicked-cell value), and both are</span></span>
+<span id="cb17-28"><a href="#cb17-28" aria-hidden="true" tabindex="-1"></a>  <span class="co"># degrading silently today: the S3 GLOB needs LIST credentials the app</span></span>
+<span id="cb17-29"><a href="#cb17-29" aria-hidden="true" tabindex="-1"></a>  <span class="co"># container lacks, so the tryCatch around each returns NULL/NA and the app</span></span>
+<span id="cb17-30"><a href="#cb17-30" aria-hidden="true" tabindex="-1"></a>  <span class="co"># quietly falls back to the study-area extent and a blank value. 3.3 GB.</span></span>
+<span id="cb17-31"><a href="#cb17-31" aria-hidden="true" tabindex="-1"></a>  <span class="co">#</span></span>
+<span id="cb17-32"><a href="#cb17-32" aria-hidden="true" tabindex="-1"></a>  <span class="co"># Safe for tiles: titiler builds its own read_parquet path from the</span></span>
+<span id="cb17-33"><a href="#cb17-33" aria-hidden="true" tabindex="-1"></a>  <span class="co"># SERVE_MODEL_CELL env var (server/titiler/factory.py) and only uses this DB</span></span>
+<span id="cb17-34"><a href="#cb17-34" aria-hidden="true" tabindex="-1"></a>  <span class="co"># for the `model` registry — it never reads this view.</span></span>
+<span id="cb17-35"><a href="#cb17-35" aria-hidden="true" tabindex="-1"></a>  <span class="fu">system2</span>(<span class="st">"rsync"</span>, <span class="fu">c</span>(<span class="st">"-aq"</span>, <span class="st">"--delete"</span>, <span class="fu">glue</span>(<span class="st">"{serve_mc}/"</span>), <span class="fu">glue</span>(<span class="st">"msens:{srv_modelcell}/"</span>)))</span>
+<span id="cb17-36"><a href="#cb17-36" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"synced model_cell -&gt; msens:{srv_modelcell}"</span>)</span>
+<span id="cb17-37"><a href="#cb17-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-38"><a href="#cb17-38" aria-hidden="true" tabindex="-1"></a>  <span class="co"># Repoint the views — into a COPY, then swap it in atomically.</span></span>
+<span id="cb17-39"><a href="#cb17-39" aria-hidden="true" tabindex="-1"></a>  <span class="co">#</span></span>
+<span id="cb17-40"><a href="#cb17-40" aria-hidden="true" tabindex="-1"></a>  <span class="co"># Editing serve.duckdb in place needs a WRITE lock, and every running Shiny</span></span>
+<span id="cb17-41"><a href="#cb17-41" aria-hidden="true" tabindex="-1"></a>  <span class="co"># session holds a read-only one, so a live server fails with</span></span>
+<span id="cb17-42"><a href="#cb17-42" aria-hidden="true" tabindex="-1"></a>  <span class="co">#   Could not set lock on file ".../serve.duckdb": Conflicting lock is held</span></span>
+<span id="cb17-43"><a href="#cb17-43" aria-hidden="true" tabindex="-1"></a>  <span class="co"># (it only ever succeeded when no app happened to be open). Copying first</span></span>
+<span id="cb17-44"><a href="#cb17-44" aria-hidden="true" tabindex="-1"></a>  <span class="co"># needs no lock — readers never mutate the file — and `mv` is atomic within</span></span>
+<span id="cb17-45"><a href="#cb17-45" aria-hidden="true" tabindex="-1"></a>  <span class="co"># the filesystem: in-flight sessions keep serving from the old inode, and the</span></span>
+<span id="cb17-46"><a href="#cb17-46" aria-hidden="true" tabindex="-1"></a>  <span class="co"># restart.txt touch rolls them onto the new one.</span></span>
+<span id="cb17-47"><a href="#cb17-47" aria-hidden="true" tabindex="-1"></a>  <span class="co">#</span></span>
+<span id="cb17-48"><a href="#cb17-48" aria-hidden="true" tabindex="-1"></a>  <span class="co"># `val AS value` is preserved (the apps still reference `value`), and each</span></span>
+<span id="cb17-49"><a href="#cb17-49" aria-hidden="true" tabindex="-1"></a>  <span class="co"># repoint is verified with a real count so a half-synced directory FAILS</span></span>
+<span id="cb17-50"><a href="#cb17-50" aria-hidden="true" tabindex="-1"></a>  <span class="co"># LOUDLY here rather than being discovered later as an empty app panel.</span></span>
+<span id="cb17-51"><a href="#cb17-51" aria-hidden="true" tabindex="-1"></a>  <span class="co">#</span></span>
+<span id="cb17-52"><a href="#cb17-52" aria-hidden="true" tabindex="-1"></a>  <span class="co"># The model_cell probe must draw its mdl_id from model_cell, NOT from `model`.</span></span>
+<span id="cb17-53"><a href="#cb17-53" aria-hidden="true" tabindex="-1"></a>  <span class="co"># `model` registers every model including the raw per-dataset ones, and only</span></span>
+<span id="cb17-54"><a href="#cb17-54" aria-hidden="true" tabindex="-1"></a>  <span class="co"># merged models have cells -- so `min(mdl_id) FROM model` is a raw model whose</span></span>
+<span id="cb17-55"><a href="#cb17-55" aria-hidden="true" tabindex="-1"></a>  <span class="co"># count is legitimately 0. That probe therefore returned 0 on a PERFECTLY</span></span>
+<span id="cb17-56"><a href="#cb17-56" aria-hidden="true" tabindex="-1"></a>  <span class="co"># HEALTHY release and would have returned 0 on a broken one too: a check that</span></span>
+<span id="cb17-57"><a href="#cb17-57" aria-hidden="true" tabindex="-1"></a>  <span class="co"># cannot distinguish the two states verifies nothing. It printed 0 beside</span></span>
+<span id="cb17-58"><a href="#cb17-58" aria-hidden="true" tabindex="-1"></a>  <span class="co"># "VIEWS_OK" for the 580,568,326-row v8 release.</span></span>
+<span id="cb17-59"><a href="#cb17-59" aria-hidden="true" tabindex="-1"></a>  repoint <span class="ot">&lt;-</span> <span class="fu">glue</span>(</span>
+<span id="cb17-60"><a href="#cb17-60" aria-hidden="true" tabindex="-1"></a>    <span class="st">"vt &lt;- strsplit('cell_metric,zone_metric,zone', ',')[[1]]; "</span>,</span>
+<span id="cb17-61"><a href="#cb17-61" aria-hidden="true" tabindex="-1"></a>    <span class="st">"tt &lt;- strsplit('{paste(rel_tables, collapse = </span><span class="sc">\"</span><span class="st">,</span><span class="sc">\"</span><span class="st">)}', ',')[[1]]; "</span>,</span>
+<span id="cb17-62"><a href="#cb17-62" aria-hidden="true" tabindex="-1"></a>    <span class="st">"con &lt;- DBI::dbConnect(duckdb::duckdb('{srv_viewdb}.new')); "</span>,</span>
+<span id="cb17-63"><a href="#cb17-63" aria-hidden="true" tabindex="-1"></a>    <span class="st">"for (t in tt) DBI::dbExecute(con, sprintf("</span>,</span>
+<span id="cb17-64"><a href="#cb17-64" aria-hidden="true" tabindex="-1"></a>    <span class="st">"</span><span class="sc">\"</span><span class="st">CREATE OR REPLACE VIEW %s AS SELECT *%s FROM read_parquet('{srv_tables}/%s.parquet')</span><span class="sc">\"</span><span class="st">, "</span>,</span>
+<span id="cb17-65"><a href="#cb17-65" aria-hidden="true" tabindex="-1"></a>    <span class="st">"t, if (t %in% vt) ', val AS value' else '', t)); "</span>,</span>
+<span id="cb17-66"><a href="#cb17-66" aria-hidden="true" tabindex="-1"></a>    <span class="st">"DBI::dbExecute(con, </span><span class="sc">\"</span><span class="st">CREATE OR REPLACE VIEW model_cell AS SELECT m.mdl_key, "</span>,</span>
+<span id="cb17-67"><a href="#cb17-67" aria-hidden="true" tabindex="-1"></a>    <span class="st">"mc.mdl_id, mc.cell_id, mc.val, mc.val AS value FROM read_parquet("</span>,</span>
+<span id="cb17-68"><a href="#cb17-68" aria-hidden="true" tabindex="-1"></a>    <span class="st">"'{srv_modelcell}/*/*.parquet', hive_partitioning = true) mc JOIN model m USING (mdl_id)</span><span class="sc">\"</span><span class="st">); "</span>,</span>
+<span id="cb17-69"><a href="#cb17-69" aria-hidden="true" tabindex="-1"></a>    <span class="st">"zm &lt;- DBI::dbGetQuery(con, 'SELECT count(*) n FROM zone_metric')$n; "</span>,</span>
+<span id="cb17-70"><a href="#cb17-70" aria-hidden="true" tabindex="-1"></a>    <span class="st">"mc &lt;- DBI::dbGetQuery(con, 'SELECT count(*) n FROM model_cell WHERE mdl_id = "</span>,</span>
+<span id="cb17-71"><a href="#cb17-71" aria-hidden="true" tabindex="-1"></a>    <span class="st">"(SELECT min(mdl_id) FROM model_cell)')$n; "</span>,</span>
+<span id="cb17-72"><a href="#cb17-72" aria-hidden="true" tabindex="-1"></a>    <span class="st">"stopifnot(</span><span class="sc">\'</span><span class="st">zone_metric view is empty</span><span class="sc">\'</span><span class="st"> = zm &gt; 0, "</span>,</span>
+<span id="cb17-73"><a href="#cb17-73" aria-hidden="true" tabindex="-1"></a>    <span class="st">"</span><span class="sc">\'</span><span class="st">model_cell view returned no rows for its own first mdl_id</span><span class="sc">\'</span><span class="st"> = mc &gt; 0); "</span>,</span>
+<span id="cb17-74"><a href="#cb17-74" aria-hidden="true" tabindex="-1"></a>    <span class="co"># the repoint REPLACES the views, so it must also (re)record the grid and re-verify the</span></span>
+<span id="cb17-75"><a href="#cb17-75" aria-hidden="true" tabindex="-1"></a>    <span class="co"># tile ids here -- otherwise the server copy reverts to guessing the width, which is how</span></span>
+<span id="cb17-76"><a href="#cb17-76" aria-hidden="true" tabindex="-1"></a>    <span class="co"># the clicked-cell species list came back empty on every usa05 release.</span></span>
+<span id="cb17-77"><a href="#cb17-77" aria-hidden="true" tabindex="-1"></a>    <span class="st">"msens::cell_grid_write(con, msens::grid_for_ver('{ver}')); "</span>,</span>
+<span id="cb17-78"><a href="#cb17-78" aria-hidden="true" tabindex="-1"></a>    <span class="st">"msens::cell_model_tile_check(con); "</span>,</span>
+<span id="cb17-79"><a href="#cb17-79" aria-hidden="true" tabindex="-1"></a>    <span class="st">"cat('VIEWS_OK', length(tt), zm, mc, '</span><span class="sc">\\</span><span class="st">n'); "</span>,</span>
+<span id="cb17-80"><a href="#cb17-80" aria-hidden="true" tabindex="-1"></a>    <span class="st">"DBI::dbDisconnect(con, shutdown = TRUE)"</span>)</span>
+<span id="cb17-81"><a href="#cb17-81" aria-hidden="true" tabindex="-1"></a>  v8_apps <span class="ot">&lt;-</span> <span class="fu">c</span>(<span class="st">"species"</span>, <span class="st">"scores"</span>)</span>
+<span id="cb17-82"><a href="#cb17-82" aria-hidden="true" tabindex="-1"></a>  cmd_rp <span class="ot">&lt;-</span> <span class="fu">glue</span>(</span>
+<span id="cb17-83"><a href="#cb17-83" aria-hidden="true" tabindex="-1"></a>    <span class="st">"set -e; "</span>,</span>
+<span id="cb17-84"><a href="#cb17-84" aria-hidden="true" tabindex="-1"></a>    <span class="st">"cp -f {srv_viewdb} {srv_viewdb}.new; "</span>,                       <span class="co"># no lock needed</span></span>
+<span id="cb17-85"><a href="#cb17-85" aria-hidden="true" tabindex="-1"></a>    <span class="co"># -u 1000:1000 for the same reason as the cell_model repoint above</span></span>
+<span id="cb17-86"><a href="#cb17-86" aria-hidden="true" tabindex="-1"></a>    <span class="st">"docker exec -u 1000:1000 rstudio Rscript -e {shQuote(repoint)}; "</span>,</span>
+<span id="cb17-87"><a href="#cb17-87" aria-hidden="true" tabindex="-1"></a>    <span class="st">"mv -f {srv_viewdb}.new {srv_viewdb}; "</span>,                       <span class="co"># atomic swap</span></span>
+<span id="cb17-88"><a href="#cb17-88" aria-hidden="true" tabindex="-1"></a>    <span class="st">"{paste(sprintf('touch /share/github/MarineSensitivity/apps_v8/%s/restart.txt', v8_apps), collapse='; ')}"</span>)</span>
+<span id="cb17-89"><a href="#cb17-89" aria-hidden="true" tabindex="-1"></a>  out_rp <span class="ot">&lt;-</span> <span class="fu">system2</span>(<span class="st">"ssh"</span>, <span class="fu">c</span>(<span class="st">"msens"</span>, <span class="fu">shQuote</span>(cmd_rp)), <span class="at">stdout =</span> <span class="cn">TRUE</span>, <span class="at">stderr =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb17-90"><a href="#cb17-90" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">any</span>(<span class="fu">grepl</span>(<span class="st">"VIEWS_OK"</span>, out_rp))) <span class="fu">stop</span>(<span class="fu">paste</span>(<span class="fu">tail</span>(out_rp, <span class="dv">20</span>), <span class="at">collapse =</span> <span class="st">"</span><span class="sc">\n</span><span class="st">"</span>))</span>
+<span id="cb17-91"><a href="#cb17-91" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"views repointed to local Parquet + v8 apps reloaded: {grep('VIEWS_OK', out_rp, value = TRUE)}"</span>)</span>
+<span id="cb17-92"><a href="#cb17-92" aria-hidden="true" tabindex="-1"></a>}</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </details>
 </div>
 </section>
@@ -1726,252 +1745,271 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <span id="cb23-397"><a href="#cb23-397" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"RELEASE_DEPLOY/DEPLOY_TABLES unset — leaving the server's table views as they are"</span>)</span>
 <span id="cb23-398"><a href="#cb23-398" aria-hidden="true" tabindex="-1"></a>} <span class="cf">else</span> {</span>
 <span id="cb23-399"><a href="#cb23-399" aria-hidden="true" tabindex="-1"></a>  <span class="fu">system2</span>(<span class="st">"ssh"</span>, <span class="fu">c</span>(<span class="st">"msens"</span>, <span class="fu">glue</span>(<span class="st">"mkdir -p {srv_tables} {srv_modelcell}"</span>)))</span>
-<span id="cb23-400"><a href="#cb23-400" aria-hidden="true" tabindex="-1"></a>  <span class="fu">system2</span>(<span class="st">"rsync"</span>, <span class="fu">c</span>(<span class="st">"-aq"</span>, <span class="st">"--delete"</span>, <span class="fu">glue</span>(<span class="st">"{tbl_dir}/"</span>), <span class="fu">glue</span>(<span class="st">"msens:{srv_tables}/"</span>)))</span>
-<span id="cb23-401"><a href="#cb23-401" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"synced tables -&gt; msens:{srv_tables}"</span>)</span>
-<span id="cb23-402"><a href="#cb23-402" aria-hidden="true" tabindex="-1"></a>  <span class="co"># model_cell too — the LAST remote table. The v8 species app reads it in two</span></span>
-<span id="cb23-403"><a href="#cb23-403" aria-hidden="true" tabindex="-1"></a>  <span class="co"># places (mdl_bbox() for fit_bounds, and the clicked-cell value), and both are</span></span>
-<span id="cb23-404"><a href="#cb23-404" aria-hidden="true" tabindex="-1"></a>  <span class="co"># degrading silently today: the S3 GLOB needs LIST credentials the app</span></span>
-<span id="cb23-405"><a href="#cb23-405" aria-hidden="true" tabindex="-1"></a>  <span class="co"># container lacks, so the tryCatch around each returns NULL/NA and the app</span></span>
-<span id="cb23-406"><a href="#cb23-406" aria-hidden="true" tabindex="-1"></a>  <span class="co"># quietly falls back to the study-area extent and a blank value. 3.3 GB.</span></span>
+<span id="cb23-400"><a href="#cb23-400" aria-hidden="true" tabindex="-1"></a>  <span class="co"># PULL from S3 on the server rather than PUSH from here.</span></span>
+<span id="cb23-401"><a href="#cb23-401" aria-hidden="true" tabindex="-1"></a>  <span class="co">#</span></span>
+<span id="cb23-402"><a href="#cb23-402" aria-hidden="true" tabindex="-1"></a>  <span class="co"># tables/ is ~445 MB and S3 is the published artifact sitting in the SAME REGION as msens1,</span></span>
+<span id="cb23-403"><a href="#cb23-403" aria-hidden="true" tabindex="-1"></a>  <span class="co"># so the server fetches it in seconds; pushing it up from a laptop is a ~20-minute transfer</span></span>
+<span id="cb23-404"><a href="#cb23-404" aria-hidden="true" tabindex="-1"></a>  <span class="co"># over a ~400 KB/s link. That transfer failed three times in one night — the render process</span></span>
+<span id="cb23-405"><a href="#cb23-405" aria-hidden="true" tabindex="-1"></a>  <span class="co"># died mid-rsync each time, leaving an orphaned rsync still writing into the destination and,</span></span>
+<span id="cb23-406"><a href="#cb23-406" aria-hidden="true" tabindex="-1"></a>  <span class="co"># on one occasion, two concurrent `rsync --delete` runs against the same directory.</span></span>
 <span id="cb23-407"><a href="#cb23-407" aria-hidden="true" tabindex="-1"></a>  <span class="co">#</span></span>
-<span id="cb23-408"><a href="#cb23-408" aria-hidden="true" tabindex="-1"></a>  <span class="co"># Safe for tiles: titiler builds its own read_parquet path from the</span></span>
-<span id="cb23-409"><a href="#cb23-409" aria-hidden="true" tabindex="-1"></a>  <span class="co"># SERVE_MODEL_CELL env var (server/titiler/factory.py) and only uses this DB</span></span>
-<span id="cb23-410"><a href="#cb23-410" aria-hidden="true" tabindex="-1"></a>  <span class="co"># for the `model` registry — it never reads this view.</span></span>
-<span id="cb23-411"><a href="#cb23-411" aria-hidden="true" tabindex="-1"></a>  <span class="fu">system2</span>(<span class="st">"rsync"</span>, <span class="fu">c</span>(<span class="st">"-aq"</span>, <span class="st">"--delete"</span>, <span class="fu">glue</span>(<span class="st">"{serve_mc}/"</span>), <span class="fu">glue</span>(<span class="st">"msens:{srv_modelcell}/"</span>)))</span>
-<span id="cb23-412"><a href="#cb23-412" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"synced model_cell -&gt; msens:{srv_modelcell}"</span>)</span>
-<span id="cb23-413"><a href="#cb23-413" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb23-414"><a href="#cb23-414" aria-hidden="true" tabindex="-1"></a>  <span class="co"># Repoint the views — into a COPY, then swap it in atomically.</span></span>
-<span id="cb23-415"><a href="#cb23-415" aria-hidden="true" tabindex="-1"></a>  <span class="co">#</span></span>
-<span id="cb23-416"><a href="#cb23-416" aria-hidden="true" tabindex="-1"></a>  <span class="co"># Editing serve.duckdb in place needs a WRITE lock, and every running Shiny</span></span>
-<span id="cb23-417"><a href="#cb23-417" aria-hidden="true" tabindex="-1"></a>  <span class="co"># session holds a read-only one, so a live server fails with</span></span>
-<span id="cb23-418"><a href="#cb23-418" aria-hidden="true" tabindex="-1"></a>  <span class="co">#   Could not set lock on file ".../serve.duckdb": Conflicting lock is held</span></span>
-<span id="cb23-419"><a href="#cb23-419" aria-hidden="true" tabindex="-1"></a>  <span class="co"># (it only ever succeeded when no app happened to be open). Copying first</span></span>
-<span id="cb23-420"><a href="#cb23-420" aria-hidden="true" tabindex="-1"></a>  <span class="co"># needs no lock — readers never mutate the file — and `mv` is atomic within</span></span>
-<span id="cb23-421"><a href="#cb23-421" aria-hidden="true" tabindex="-1"></a>  <span class="co"># the filesystem: in-flight sessions keep serving from the old inode, and the</span></span>
-<span id="cb23-422"><a href="#cb23-422" aria-hidden="true" tabindex="-1"></a>  <span class="co"># restart.txt touch rolls them onto the new one.</span></span>
-<span id="cb23-423"><a href="#cb23-423" aria-hidden="true" tabindex="-1"></a>  <span class="co">#</span></span>
-<span id="cb23-424"><a href="#cb23-424" aria-hidden="true" tabindex="-1"></a>  <span class="co"># `val AS value` is preserved (the apps still reference `value`), and each</span></span>
-<span id="cb23-425"><a href="#cb23-425" aria-hidden="true" tabindex="-1"></a>  <span class="co"># repoint is verified with a real count so a half-synced directory FAILS</span></span>
-<span id="cb23-426"><a href="#cb23-426" aria-hidden="true" tabindex="-1"></a>  <span class="co"># LOUDLY here rather than being discovered later as an empty app panel.</span></span>
-<span id="cb23-427"><a href="#cb23-427" aria-hidden="true" tabindex="-1"></a>  <span class="co">#</span></span>
-<span id="cb23-428"><a href="#cb23-428" aria-hidden="true" tabindex="-1"></a>  <span class="co"># The model_cell probe must draw its mdl_id from model_cell, NOT from `model`.</span></span>
-<span id="cb23-429"><a href="#cb23-429" aria-hidden="true" tabindex="-1"></a>  <span class="co"># `model` registers every model including the raw per-dataset ones, and only</span></span>
-<span id="cb23-430"><a href="#cb23-430" aria-hidden="true" tabindex="-1"></a>  <span class="co"># merged models have cells -- so `min(mdl_id) FROM model` is a raw model whose</span></span>
-<span id="cb23-431"><a href="#cb23-431" aria-hidden="true" tabindex="-1"></a>  <span class="co"># count is legitimately 0. That probe therefore returned 0 on a PERFECTLY</span></span>
-<span id="cb23-432"><a href="#cb23-432" aria-hidden="true" tabindex="-1"></a>  <span class="co"># HEALTHY release and would have returned 0 on a broken one too: a check that</span></span>
-<span id="cb23-433"><a href="#cb23-433" aria-hidden="true" tabindex="-1"></a>  <span class="co"># cannot distinguish the two states verifies nothing. It printed 0 beside</span></span>
-<span id="cb23-434"><a href="#cb23-434" aria-hidden="true" tabindex="-1"></a>  <span class="co"># "VIEWS_OK" for the 580,568,326-row v8 release.</span></span>
-<span id="cb23-435"><a href="#cb23-435" aria-hidden="true" tabindex="-1"></a>  repoint <span class="ot">&lt;-</span> <span class="fu">glue</span>(</span>
-<span id="cb23-436"><a href="#cb23-436" aria-hidden="true" tabindex="-1"></a>    <span class="st">"vt &lt;- strsplit('cell_metric,zone_metric,zone', ',')[[1]]; "</span>,</span>
-<span id="cb23-437"><a href="#cb23-437" aria-hidden="true" tabindex="-1"></a>    <span class="st">"tt &lt;- strsplit('{paste(rel_tables, collapse = </span><span class="sc">\"</span><span class="st">,</span><span class="sc">\"</span><span class="st">)}', ',')[[1]]; "</span>,</span>
-<span id="cb23-438"><a href="#cb23-438" aria-hidden="true" tabindex="-1"></a>    <span class="st">"con &lt;- DBI::dbConnect(duckdb::duckdb('{srv_viewdb}.new')); "</span>,</span>
-<span id="cb23-439"><a href="#cb23-439" aria-hidden="true" tabindex="-1"></a>    <span class="st">"for (t in tt) DBI::dbExecute(con, sprintf("</span>,</span>
-<span id="cb23-440"><a href="#cb23-440" aria-hidden="true" tabindex="-1"></a>    <span class="st">"</span><span class="sc">\"</span><span class="st">CREATE OR REPLACE VIEW %s AS SELECT *%s FROM read_parquet('{srv_tables}/%s.parquet')</span><span class="sc">\"</span><span class="st">, "</span>,</span>
-<span id="cb23-441"><a href="#cb23-441" aria-hidden="true" tabindex="-1"></a>    <span class="st">"t, if (t %in% vt) ', val AS value' else '', t)); "</span>,</span>
-<span id="cb23-442"><a href="#cb23-442" aria-hidden="true" tabindex="-1"></a>    <span class="st">"DBI::dbExecute(con, </span><span class="sc">\"</span><span class="st">CREATE OR REPLACE VIEW model_cell AS SELECT m.mdl_key, "</span>,</span>
-<span id="cb23-443"><a href="#cb23-443" aria-hidden="true" tabindex="-1"></a>    <span class="st">"mc.mdl_id, mc.cell_id, mc.val, mc.val AS value FROM read_parquet("</span>,</span>
-<span id="cb23-444"><a href="#cb23-444" aria-hidden="true" tabindex="-1"></a>    <span class="st">"'{srv_modelcell}/*/*.parquet', hive_partitioning = true) mc JOIN model m USING (mdl_id)</span><span class="sc">\"</span><span class="st">); "</span>,</span>
-<span id="cb23-445"><a href="#cb23-445" aria-hidden="true" tabindex="-1"></a>    <span class="st">"zm &lt;- DBI::dbGetQuery(con, 'SELECT count(*) n FROM zone_metric')$n; "</span>,</span>
-<span id="cb23-446"><a href="#cb23-446" aria-hidden="true" tabindex="-1"></a>    <span class="st">"mc &lt;- DBI::dbGetQuery(con, 'SELECT count(*) n FROM model_cell WHERE mdl_id = "</span>,</span>
-<span id="cb23-447"><a href="#cb23-447" aria-hidden="true" tabindex="-1"></a>    <span class="st">"(SELECT min(mdl_id) FROM model_cell)')$n; "</span>,</span>
-<span id="cb23-448"><a href="#cb23-448" aria-hidden="true" tabindex="-1"></a>    <span class="st">"stopifnot(</span><span class="sc">\'</span><span class="st">zone_metric view is empty</span><span class="sc">\'</span><span class="st"> = zm &gt; 0, "</span>,</span>
-<span id="cb23-449"><a href="#cb23-449" aria-hidden="true" tabindex="-1"></a>    <span class="st">"</span><span class="sc">\'</span><span class="st">model_cell view returned no rows for its own first mdl_id</span><span class="sc">\'</span><span class="st"> = mc &gt; 0); "</span>,</span>
-<span id="cb23-450"><a href="#cb23-450" aria-hidden="true" tabindex="-1"></a>    <span class="co"># the repoint REPLACES the views, so it must also (re)record the grid and re-verify the</span></span>
-<span id="cb23-451"><a href="#cb23-451" aria-hidden="true" tabindex="-1"></a>    <span class="co"># tile ids here -- otherwise the server copy reverts to guessing the width, which is how</span></span>
-<span id="cb23-452"><a href="#cb23-452" aria-hidden="true" tabindex="-1"></a>    <span class="co"># the clicked-cell species list came back empty on every usa05 release.</span></span>
-<span id="cb23-453"><a href="#cb23-453" aria-hidden="true" tabindex="-1"></a>    <span class="st">"msens::cell_grid_write(con, msens::grid_for_ver('{ver}')); "</span>,</span>
-<span id="cb23-454"><a href="#cb23-454" aria-hidden="true" tabindex="-1"></a>    <span class="st">"msens::cell_model_tile_check(con); "</span>,</span>
-<span id="cb23-455"><a href="#cb23-455" aria-hidden="true" tabindex="-1"></a>    <span class="st">"cat('VIEWS_OK', length(tt), zm, mc, '</span><span class="sc">\\</span><span class="st">n'); "</span>,</span>
-<span id="cb23-456"><a href="#cb23-456" aria-hidden="true" tabindex="-1"></a>    <span class="st">"DBI::dbDisconnect(con, shutdown = TRUE)"</span>)</span>
-<span id="cb23-457"><a href="#cb23-457" aria-hidden="true" tabindex="-1"></a>  v8_apps <span class="ot">&lt;-</span> <span class="fu">c</span>(<span class="st">"species"</span>, <span class="st">"scores"</span>)</span>
-<span id="cb23-458"><a href="#cb23-458" aria-hidden="true" tabindex="-1"></a>  cmd_rp <span class="ot">&lt;-</span> <span class="fu">glue</span>(</span>
-<span id="cb23-459"><a href="#cb23-459" aria-hidden="true" tabindex="-1"></a>    <span class="st">"set -e; "</span>,</span>
-<span id="cb23-460"><a href="#cb23-460" aria-hidden="true" tabindex="-1"></a>    <span class="st">"cp -f {srv_viewdb} {srv_viewdb}.new; "</span>,                       <span class="co"># no lock needed</span></span>
-<span id="cb23-461"><a href="#cb23-461" aria-hidden="true" tabindex="-1"></a>    <span class="co"># -u 1000:1000 for the same reason as the cell_model repoint above</span></span>
-<span id="cb23-462"><a href="#cb23-462" aria-hidden="true" tabindex="-1"></a>    <span class="st">"docker exec -u 1000:1000 rstudio Rscript -e {shQuote(repoint)}; "</span>,</span>
-<span id="cb23-463"><a href="#cb23-463" aria-hidden="true" tabindex="-1"></a>    <span class="st">"mv -f {srv_viewdb}.new {srv_viewdb}; "</span>,                       <span class="co"># atomic swap</span></span>
-<span id="cb23-464"><a href="#cb23-464" aria-hidden="true" tabindex="-1"></a>    <span class="st">"{paste(sprintf('touch /share/github/MarineSensitivity/apps_v8/%s/restart.txt', v8_apps), collapse='; ')}"</span>)</span>
-<span id="cb23-465"><a href="#cb23-465" aria-hidden="true" tabindex="-1"></a>  out_rp <span class="ot">&lt;-</span> <span class="fu">system2</span>(<span class="st">"ssh"</span>, <span class="fu">c</span>(<span class="st">"msens"</span>, <span class="fu">shQuote</span>(cmd_rp)), <span class="at">stdout =</span> <span class="cn">TRUE</span>, <span class="at">stderr =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb23-466"><a href="#cb23-466" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">any</span>(<span class="fu">grepl</span>(<span class="st">"VIEWS_OK"</span>, out_rp))) <span class="fu">stop</span>(<span class="fu">paste</span>(<span class="fu">tail</span>(out_rp, <span class="dv">20</span>), <span class="at">collapse =</span> <span class="st">"</span><span class="sc">\n</span><span class="st">"</span>))</span>
-<span id="cb23-467"><a href="#cb23-467" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"views repointed to local Parquet + v8 apps reloaded: {grep('VIEWS_OK', out_rp, value = TRUE)}"</span>)</span>
-<span id="cb23-468"><a href="#cb23-468" aria-hidden="true" tabindex="-1"></a>}</span>
-<span id="cb23-469"><a href="#cb23-469" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb23-470"><a href="#cb23-470" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb23-471"><a href="#cb23-471" aria-hidden="true" tabindex="-1"></a><span class="fu">## Deploy the plumber API (`DEPLOY_API=1`)</span></span>
-<span id="cb23-472"><a href="#cb23-472" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb23-473"><a href="#cb23-473" aria-hidden="true" tabindex="-1"></a>The <span class="in">`/report`</span> and <span class="in">`/species.csv`</span> endpoints run in the **plumber** container, which is a *separate*</span>
-<span id="cb23-474"><a href="#cb23-474" aria-hidden="true" tabindex="-1"></a>image from <span class="in">`rstudio`</span> — the <span class="in">`DEPLOY_APPS`</span> msens reinstall never reached it. Left unpinned, its msens</span>
-<span id="cb23-475"><a href="#cb23-475" aria-hidden="true" tabindex="-1"></a>layer cached at **0.5.0** while the package moved to 0.12.0, so <span class="in">`/report?ver=v8`</span> answered</span>
-<span id="cb23-476"><a href="#cb23-476" aria-hidden="true" tabindex="-1"></a><span class="in">`Cannot open database "…/v8/sdm.duckdb"`</span> (no <span class="in">`serve.duckdb`</span> fallback, msens 0.9.1) and drawn areas</span>
-<span id="cb23-477"><a href="#cb23-477" aria-hidden="true" tabindex="-1"></a>had no <span class="in">`cell_model`</span> support (0.9.0). <span class="in">`server/plumber/Dockerfile`</span> now pins msens by commit and</span>
-<span id="cb23-478"><a href="#cb23-478" aria-hidden="true" tabindex="-1"></a>asserts the version at build time, so this cannot recur silently.</span>
-<span id="cb23-479"><a href="#cb23-479" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb23-480"><a href="#cb23-480" aria-hidden="true" tabindex="-1"></a>Rebuild is required (not just a restart): msens lives in the image, not on a volume.</span>
-<span id="cb23-481"><a href="#cb23-481" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb23-484"><a href="#cb23-484" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb23-485"><a href="#cb23-485" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: deploy-api</span></span>
-<span id="cb23-486"><a href="#cb23-486" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb23-487"><a href="#cb23-487" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (<span class="sc">!</span><span class="fu">nzchar</span>(<span class="fu">Sys.getenv</span>(<span class="st">"DEPLOY_API"</span>))) {</span>
-<span id="cb23-488"><a href="#cb23-488" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"DEPLOY_API unset — leaving the plumber API as it is"</span>)</span>
-<span id="cb23-489"><a href="#cb23-489" aria-hidden="true" tabindex="-1"></a>} <span class="cf">else</span> {</span>
-<span id="cb23-490"><a href="#cb23-490" aria-hidden="true" tabindex="-1"></a>  api_co <span class="ot">&lt;-</span> <span class="st">"/share/github/MarineSensitivity/api"</span></span>
-<span id="cb23-491"><a href="#cb23-491" aria-hidden="true" tabindex="-1"></a>  cmd_api <span class="ot">&lt;-</span> <span class="fu">glue</span>(</span>
-<span id="cb23-492"><a href="#cb23-492" aria-hidden="true" tabindex="-1"></a>    <span class="st">"set -e; "</span>,</span>
-<span id="cb23-493"><a href="#cb23-493" aria-hidden="true" tabindex="-1"></a>    <span class="st">"cd {api_co}    &amp;&amp; git fetch --quiet origin &amp;&amp; git merge --ff-only origin/main; "</span>,</span>
-<span id="cb23-494"><a href="#cb23-494" aria-hidden="true" tabindex="-1"></a>    <span class="st">"cd {srv_repo}  &amp;&amp; git fetch --quiet origin &amp;&amp; git merge --ff-only origin/main; "</span>,</span>
-<span id="cb23-495"><a href="#cb23-495" aria-hidden="true" tabindex="-1"></a>    <span class="co"># --force-recreate, same reason the titiler deploy uses it: plumber.R is</span></span>
-<span id="cb23-496"><a href="#cb23-496" aria-hidden="true" tabindex="-1"></a>    <span class="co"># parsed ONCE at container start, and the api repo is a bind mount, so a</span></span>
-<span id="cb23-497"><a href="#cb23-497" aria-hidden="true" tabindex="-1"></a>    <span class="co"># source-only change leaves compose seeing no image change and the container</span></span>
-<span id="cb23-498"><a href="#cb23-498" aria-hidden="true" tabindex="-1"></a>    <span class="co"># keeps serving the old code indefinitely. (report.qmd is read per-render, so</span></span>
-<span id="cb23-499"><a href="#cb23-499" aria-hidden="true" tabindex="-1"></a>    <span class="co"># it updates without this — which made the gap easy to miss: the mdl_key fix</span></span>
-<span id="cb23-500"><a href="#cb23-500" aria-hidden="true" tabindex="-1"></a>    <span class="co"># took effect while the mapsp_base fix silently did not.)</span></span>
-<span id="cb23-501"><a href="#cb23-501" aria-hidden="true" tabindex="-1"></a>    <span class="st">"docker compose up -d --build --force-recreate plumber; "</span>,</span>
-<span id="cb23-502"><a href="#cb23-502" aria-hidden="true" tabindex="-1"></a>    <span class="st">"echo API_OK $(git -C {api_co} rev-parse --short HEAD)"</span>)</span>
-<span id="cb23-503"><a href="#cb23-503" aria-hidden="true" tabindex="-1"></a>  out_api <span class="ot">&lt;-</span> <span class="fu">system2</span>(<span class="st">"ssh"</span>, <span class="fu">c</span>(<span class="st">"msens"</span>, <span class="fu">shQuote</span>(cmd_api)), <span class="at">stdout =</span> <span class="cn">TRUE</span>, <span class="at">stderr =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb23-504"><a href="#cb23-504" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">any</span>(<span class="fu">grepl</span>(<span class="st">"API_OK"</span>, out_api))) <span class="fu">stop</span>(<span class="fu">paste</span>(<span class="fu">tail</span>(out_api, <span class="dv">20</span>), <span class="at">collapse =</span> <span class="st">"</span><span class="sc">\n</span><span class="st">"</span>))</span>
-<span id="cb23-505"><a href="#cb23-505" aria-hidden="true" tabindex="-1"></a>  <span class="co"># assert the container actually carries the msens the endpoints need</span></span>
-<span id="cb23-506"><a href="#cb23-506" aria-hidden="true" tabindex="-1"></a>  chk <span class="ot">&lt;-</span> <span class="fu">system2</span>(<span class="st">"ssh"</span>, <span class="fu">c</span>(<span class="st">"msens"</span>, <span class="fu">shQuote</span>(<span class="fu">glue</span>(</span>
-<span id="cb23-507"><a href="#cb23-507" aria-hidden="true" tabindex="-1"></a>    <span class="st">"docker exec plumber Rscript -e "</span>,</span>
-<span id="cb23-508"><a href="#cb23-508" aria-hidden="true" tabindex="-1"></a>    <span class="fu">shQuote</span>(<span class="st">"cat('MSENS', as.character(packageVersion('msens')), '</span><span class="sc">\\</span><span class="st">n')"</span>)))),</span>
-<span id="cb23-509"><a href="#cb23-509" aria-hidden="true" tabindex="-1"></a>    <span class="at">stdout =</span> <span class="cn">TRUE</span>, <span class="at">stderr =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb23-510"><a href="#cb23-510" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"plumber API deployed: {grep('API_OK', out_api, value = TRUE)} | {grep('MSENS', chk, value = TRUE)}"</span>)</span>
-<span id="cb23-511"><a href="#cb23-511" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">any</span>(<span class="fu">grepl</span>(<span class="st">"MSENS 0</span><span class="sc">\\</span><span class="st">.(1[2-9]|[2-9][0-9])"</span>, chk)))</span>
-<span id="cb23-512"><a href="#cb23-512" aria-hidden="true" tabindex="-1"></a>    <span class="fu">stop</span>(<span class="st">"plumber msens &lt; 0.12.0 — the v8 drawn-area path needs cells_in_polygon(poly, con)"</span>)</span>
-<span id="cb23-513"><a href="#cb23-513" aria-hidden="true" tabindex="-1"></a>}</span>
-<span id="cb23-514"><a href="#cb23-514" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb23-515"><a href="#cb23-515" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb23-516"><a href="#cb23-516" aria-hidden="true" tabindex="-1"></a><span class="fu">## Deploy the Caddy routing (`DEPLOY_CADDY=1`)</span></span>
-<span id="cb23-517"><a href="#cb23-517" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb23-518"><a href="#cb23-518" aria-hidden="true" tabindex="-1"></a>The **URL surface** is part of the release, not server trivia: since the cutover, every</span>
-<span id="cb23-519"><a href="#cb23-519" aria-hidden="true" tabindex="-1"></a>retired per-version app URL is a 301 into <span class="in">`/scores`</span> or <span class="in">`/species`</span>, so a routing change decides</span>
-<span id="cb23-520"><a href="#cb23-520" aria-hidden="true" tabindex="-1"></a>whether a link published in a report still resolves. It had its own bug — the redirect targets</span>
-<span id="cb23-521"><a href="#cb23-521" aria-hidden="true" tabindex="-1"></a>carry their own <span class="in">`?ver=`</span>, which REPLACES the incoming query, so <span class="in">`/mapsp/?mdl_seq=1434`</span> arrived</span>
-<span id="cb23-522"><a href="#cb23-522" aria-hidden="true" tabindex="-1"></a>as <span class="in">`/species/?ver=v7`</span> and the app opened on its default taxon (MarineSensitivity/apps#6).</span>
-<span id="cb23-523"><a href="#cb23-523" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb23-524"><a href="#cb23-524" aria-hidden="true" tabindex="-1"></a>Caddyfile-only changes had no reproducible home: the routing rode along with <span class="in">`RELEASE_DEPLOY`</span>,</span>
-<span id="cb23-525"><a href="#cb23-525" aria-hidden="true" tabindex="-1"></a>which also rebuilds and force-recreates titiler. This flag is the narrow path — pull the server</span>
-<span id="cb23-526"><a href="#cb23-526" aria-hidden="true" tabindex="-1"></a>repo, restart caddy, nothing else. **`docker compose restart caddy`, not `caddy reload`**: the</span>
-<span id="cb23-527"><a href="#cb23-527" aria-hidden="true" tabindex="-1"></a>Caddyfile is a single-file bind mount, so a git pull replaces the inode and the running</span>
-<span id="cb23-528"><a href="#cb23-528" aria-hidden="true" tabindex="-1"></a>container keeps serving the file it opened at start.</span>
-<span id="cb23-529"><a href="#cb23-529" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb23-532"><a href="#cb23-532" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb23-533"><a href="#cb23-533" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: deploy-caddy</span></span>
+<span id="cb23-408"><a href="#cb23-408" aria-hidden="true" tabindex="-1"></a>  <span class="co"># Pulling is also the stronger guarantee: the server ends up holding exactly what was</span></span>
+<span id="cb23-409"><a href="#cb23-409" aria-hidden="true" tabindex="-1"></a>  <span class="co"># PUBLISHED, not whatever happens to be staged on the machine driving the release.</span></span>
+<span id="cb23-410"><a href="#cb23-410" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (do_s3_tbl) {</span>
+<span id="cb23-411"><a href="#cb23-411" aria-hidden="true" tabindex="-1"></a>    out_t <span class="ot">&lt;-</span> <span class="fu">system2</span>(<span class="st">"ssh"</span>, <span class="fu">c</span>(<span class="st">"msens"</span>, <span class="fu">shQuote</span>(<span class="fu">glue</span>(</span>
+<span id="cb23-412"><a href="#cb23-412" aria-hidden="true" tabindex="-1"></a>      <span class="st">"aws s3 sync {s3_ver}/tables/ {srv_tables}/ --delete --only-show-errors &amp;&amp; echo TABLES_OK"</span>))),</span>
+<span id="cb23-413"><a href="#cb23-413" aria-hidden="true" tabindex="-1"></a>      <span class="at">stdout =</span> <span class="cn">TRUE</span>, <span class="at">stderr =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb23-414"><a href="#cb23-414" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="sc">!</span><span class="fu">any</span>(<span class="fu">grepl</span>(<span class="st">"TABLES_OK"</span>, out_t))) <span class="fu">stop</span>(<span class="fu">paste</span>(<span class="fu">tail</span>(out_t, <span class="dv">15</span>), <span class="at">collapse =</span> <span class="st">"</span><span class="sc">\n</span><span class="st">"</span>))</span>
+<span id="cb23-415"><a href="#cb23-415" aria-hidden="true" tabindex="-1"></a>    <span class="fu">log_info</span>(<span class="st">"server pulled tables from S3 -&gt; {srv_tables}"</span>)</span>
+<span id="cb23-416"><a href="#cb23-416" aria-hidden="true" tabindex="-1"></a>  } <span class="cf">else</span> {</span>
+<span id="cb23-417"><a href="#cb23-417" aria-hidden="true" tabindex="-1"></a>    <span class="co"># nothing was pushed to S3 this run, so the local copy is the only source</span></span>
+<span id="cb23-418"><a href="#cb23-418" aria-hidden="true" tabindex="-1"></a>    <span class="fu">system2</span>(<span class="st">"rsync"</span>, <span class="fu">c</span>(<span class="st">"-aq"</span>, <span class="st">"--delete"</span>, <span class="fu">glue</span>(<span class="st">"{tbl_dir}/"</span>), <span class="fu">glue</span>(<span class="st">"msens:{srv_tables}/"</span>)))</span>
+<span id="cb23-419"><a href="#cb23-419" aria-hidden="true" tabindex="-1"></a>    <span class="fu">log_info</span>(<span class="st">"synced tables -&gt; msens:{srv_tables} (rsync — tables not on S3 this run)"</span>)</span>
+<span id="cb23-420"><a href="#cb23-420" aria-hidden="true" tabindex="-1"></a>  }</span>
+<span id="cb23-421"><a href="#cb23-421" aria-hidden="true" tabindex="-1"></a>  <span class="co"># model_cell too — the LAST remote table. The v8 species app reads it in two</span></span>
+<span id="cb23-422"><a href="#cb23-422" aria-hidden="true" tabindex="-1"></a>  <span class="co"># places (mdl_bbox() for fit_bounds, and the clicked-cell value), and both are</span></span>
+<span id="cb23-423"><a href="#cb23-423" aria-hidden="true" tabindex="-1"></a>  <span class="co"># degrading silently today: the S3 GLOB needs LIST credentials the app</span></span>
+<span id="cb23-424"><a href="#cb23-424" aria-hidden="true" tabindex="-1"></a>  <span class="co"># container lacks, so the tryCatch around each returns NULL/NA and the app</span></span>
+<span id="cb23-425"><a href="#cb23-425" aria-hidden="true" tabindex="-1"></a>  <span class="co"># quietly falls back to the study-area extent and a blank value. 3.3 GB.</span></span>
+<span id="cb23-426"><a href="#cb23-426" aria-hidden="true" tabindex="-1"></a>  <span class="co">#</span></span>
+<span id="cb23-427"><a href="#cb23-427" aria-hidden="true" tabindex="-1"></a>  <span class="co"># Safe for tiles: titiler builds its own read_parquet path from the</span></span>
+<span id="cb23-428"><a href="#cb23-428" aria-hidden="true" tabindex="-1"></a>  <span class="co"># SERVE_MODEL_CELL env var (server/titiler/factory.py) and only uses this DB</span></span>
+<span id="cb23-429"><a href="#cb23-429" aria-hidden="true" tabindex="-1"></a>  <span class="co"># for the `model` registry — it never reads this view.</span></span>
+<span id="cb23-430"><a href="#cb23-430" aria-hidden="true" tabindex="-1"></a>  <span class="fu">system2</span>(<span class="st">"rsync"</span>, <span class="fu">c</span>(<span class="st">"-aq"</span>, <span class="st">"--delete"</span>, <span class="fu">glue</span>(<span class="st">"{serve_mc}/"</span>), <span class="fu">glue</span>(<span class="st">"msens:{srv_modelcell}/"</span>)))</span>
+<span id="cb23-431"><a href="#cb23-431" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"synced model_cell -&gt; msens:{srv_modelcell}"</span>)</span>
+<span id="cb23-432"><a href="#cb23-432" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-433"><a href="#cb23-433" aria-hidden="true" tabindex="-1"></a>  <span class="co"># Repoint the views — into a COPY, then swap it in atomically.</span></span>
+<span id="cb23-434"><a href="#cb23-434" aria-hidden="true" tabindex="-1"></a>  <span class="co">#</span></span>
+<span id="cb23-435"><a href="#cb23-435" aria-hidden="true" tabindex="-1"></a>  <span class="co"># Editing serve.duckdb in place needs a WRITE lock, and every running Shiny</span></span>
+<span id="cb23-436"><a href="#cb23-436" aria-hidden="true" tabindex="-1"></a>  <span class="co"># session holds a read-only one, so a live server fails with</span></span>
+<span id="cb23-437"><a href="#cb23-437" aria-hidden="true" tabindex="-1"></a>  <span class="co">#   Could not set lock on file ".../serve.duckdb": Conflicting lock is held</span></span>
+<span id="cb23-438"><a href="#cb23-438" aria-hidden="true" tabindex="-1"></a>  <span class="co"># (it only ever succeeded when no app happened to be open). Copying first</span></span>
+<span id="cb23-439"><a href="#cb23-439" aria-hidden="true" tabindex="-1"></a>  <span class="co"># needs no lock — readers never mutate the file — and `mv` is atomic within</span></span>
+<span id="cb23-440"><a href="#cb23-440" aria-hidden="true" tabindex="-1"></a>  <span class="co"># the filesystem: in-flight sessions keep serving from the old inode, and the</span></span>
+<span id="cb23-441"><a href="#cb23-441" aria-hidden="true" tabindex="-1"></a>  <span class="co"># restart.txt touch rolls them onto the new one.</span></span>
+<span id="cb23-442"><a href="#cb23-442" aria-hidden="true" tabindex="-1"></a>  <span class="co">#</span></span>
+<span id="cb23-443"><a href="#cb23-443" aria-hidden="true" tabindex="-1"></a>  <span class="co"># `val AS value` is preserved (the apps still reference `value`), and each</span></span>
+<span id="cb23-444"><a href="#cb23-444" aria-hidden="true" tabindex="-1"></a>  <span class="co"># repoint is verified with a real count so a half-synced directory FAILS</span></span>
+<span id="cb23-445"><a href="#cb23-445" aria-hidden="true" tabindex="-1"></a>  <span class="co"># LOUDLY here rather than being discovered later as an empty app panel.</span></span>
+<span id="cb23-446"><a href="#cb23-446" aria-hidden="true" tabindex="-1"></a>  <span class="co">#</span></span>
+<span id="cb23-447"><a href="#cb23-447" aria-hidden="true" tabindex="-1"></a>  <span class="co"># The model_cell probe must draw its mdl_id from model_cell, NOT from `model`.</span></span>
+<span id="cb23-448"><a href="#cb23-448" aria-hidden="true" tabindex="-1"></a>  <span class="co"># `model` registers every model including the raw per-dataset ones, and only</span></span>
+<span id="cb23-449"><a href="#cb23-449" aria-hidden="true" tabindex="-1"></a>  <span class="co"># merged models have cells -- so `min(mdl_id) FROM model` is a raw model whose</span></span>
+<span id="cb23-450"><a href="#cb23-450" aria-hidden="true" tabindex="-1"></a>  <span class="co"># count is legitimately 0. That probe therefore returned 0 on a PERFECTLY</span></span>
+<span id="cb23-451"><a href="#cb23-451" aria-hidden="true" tabindex="-1"></a>  <span class="co"># HEALTHY release and would have returned 0 on a broken one too: a check that</span></span>
+<span id="cb23-452"><a href="#cb23-452" aria-hidden="true" tabindex="-1"></a>  <span class="co"># cannot distinguish the two states verifies nothing. It printed 0 beside</span></span>
+<span id="cb23-453"><a href="#cb23-453" aria-hidden="true" tabindex="-1"></a>  <span class="co"># "VIEWS_OK" for the 580,568,326-row v8 release.</span></span>
+<span id="cb23-454"><a href="#cb23-454" aria-hidden="true" tabindex="-1"></a>  repoint <span class="ot">&lt;-</span> <span class="fu">glue</span>(</span>
+<span id="cb23-455"><a href="#cb23-455" aria-hidden="true" tabindex="-1"></a>    <span class="st">"vt &lt;- strsplit('cell_metric,zone_metric,zone', ',')[[1]]; "</span>,</span>
+<span id="cb23-456"><a href="#cb23-456" aria-hidden="true" tabindex="-1"></a>    <span class="st">"tt &lt;- strsplit('{paste(rel_tables, collapse = </span><span class="sc">\"</span><span class="st">,</span><span class="sc">\"</span><span class="st">)}', ',')[[1]]; "</span>,</span>
+<span id="cb23-457"><a href="#cb23-457" aria-hidden="true" tabindex="-1"></a>    <span class="st">"con &lt;- DBI::dbConnect(duckdb::duckdb('{srv_viewdb}.new')); "</span>,</span>
+<span id="cb23-458"><a href="#cb23-458" aria-hidden="true" tabindex="-1"></a>    <span class="st">"for (t in tt) DBI::dbExecute(con, sprintf("</span>,</span>
+<span id="cb23-459"><a href="#cb23-459" aria-hidden="true" tabindex="-1"></a>    <span class="st">"</span><span class="sc">\"</span><span class="st">CREATE OR REPLACE VIEW %s AS SELECT *%s FROM read_parquet('{srv_tables}/%s.parquet')</span><span class="sc">\"</span><span class="st">, "</span>,</span>
+<span id="cb23-460"><a href="#cb23-460" aria-hidden="true" tabindex="-1"></a>    <span class="st">"t, if (t %in% vt) ', val AS value' else '', t)); "</span>,</span>
+<span id="cb23-461"><a href="#cb23-461" aria-hidden="true" tabindex="-1"></a>    <span class="st">"DBI::dbExecute(con, </span><span class="sc">\"</span><span class="st">CREATE OR REPLACE VIEW model_cell AS SELECT m.mdl_key, "</span>,</span>
+<span id="cb23-462"><a href="#cb23-462" aria-hidden="true" tabindex="-1"></a>    <span class="st">"mc.mdl_id, mc.cell_id, mc.val, mc.val AS value FROM read_parquet("</span>,</span>
+<span id="cb23-463"><a href="#cb23-463" aria-hidden="true" tabindex="-1"></a>    <span class="st">"'{srv_modelcell}/*/*.parquet', hive_partitioning = true) mc JOIN model m USING (mdl_id)</span><span class="sc">\"</span><span class="st">); "</span>,</span>
+<span id="cb23-464"><a href="#cb23-464" aria-hidden="true" tabindex="-1"></a>    <span class="st">"zm &lt;- DBI::dbGetQuery(con, 'SELECT count(*) n FROM zone_metric')$n; "</span>,</span>
+<span id="cb23-465"><a href="#cb23-465" aria-hidden="true" tabindex="-1"></a>    <span class="st">"mc &lt;- DBI::dbGetQuery(con, 'SELECT count(*) n FROM model_cell WHERE mdl_id = "</span>,</span>
+<span id="cb23-466"><a href="#cb23-466" aria-hidden="true" tabindex="-1"></a>    <span class="st">"(SELECT min(mdl_id) FROM model_cell)')$n; "</span>,</span>
+<span id="cb23-467"><a href="#cb23-467" aria-hidden="true" tabindex="-1"></a>    <span class="st">"stopifnot(</span><span class="sc">\'</span><span class="st">zone_metric view is empty</span><span class="sc">\'</span><span class="st"> = zm &gt; 0, "</span>,</span>
+<span id="cb23-468"><a href="#cb23-468" aria-hidden="true" tabindex="-1"></a>    <span class="st">"</span><span class="sc">\'</span><span class="st">model_cell view returned no rows for its own first mdl_id</span><span class="sc">\'</span><span class="st"> = mc &gt; 0); "</span>,</span>
+<span id="cb23-469"><a href="#cb23-469" aria-hidden="true" tabindex="-1"></a>    <span class="co"># the repoint REPLACES the views, so it must also (re)record the grid and re-verify the</span></span>
+<span id="cb23-470"><a href="#cb23-470" aria-hidden="true" tabindex="-1"></a>    <span class="co"># tile ids here -- otherwise the server copy reverts to guessing the width, which is how</span></span>
+<span id="cb23-471"><a href="#cb23-471" aria-hidden="true" tabindex="-1"></a>    <span class="co"># the clicked-cell species list came back empty on every usa05 release.</span></span>
+<span id="cb23-472"><a href="#cb23-472" aria-hidden="true" tabindex="-1"></a>    <span class="st">"msens::cell_grid_write(con, msens::grid_for_ver('{ver}')); "</span>,</span>
+<span id="cb23-473"><a href="#cb23-473" aria-hidden="true" tabindex="-1"></a>    <span class="st">"msens::cell_model_tile_check(con); "</span>,</span>
+<span id="cb23-474"><a href="#cb23-474" aria-hidden="true" tabindex="-1"></a>    <span class="st">"cat('VIEWS_OK', length(tt), zm, mc, '</span><span class="sc">\\</span><span class="st">n'); "</span>,</span>
+<span id="cb23-475"><a href="#cb23-475" aria-hidden="true" tabindex="-1"></a>    <span class="st">"DBI::dbDisconnect(con, shutdown = TRUE)"</span>)</span>
+<span id="cb23-476"><a href="#cb23-476" aria-hidden="true" tabindex="-1"></a>  v8_apps <span class="ot">&lt;-</span> <span class="fu">c</span>(<span class="st">"species"</span>, <span class="st">"scores"</span>)</span>
+<span id="cb23-477"><a href="#cb23-477" aria-hidden="true" tabindex="-1"></a>  cmd_rp <span class="ot">&lt;-</span> <span class="fu">glue</span>(</span>
+<span id="cb23-478"><a href="#cb23-478" aria-hidden="true" tabindex="-1"></a>    <span class="st">"set -e; "</span>,</span>
+<span id="cb23-479"><a href="#cb23-479" aria-hidden="true" tabindex="-1"></a>    <span class="st">"cp -f {srv_viewdb} {srv_viewdb}.new; "</span>,                       <span class="co"># no lock needed</span></span>
+<span id="cb23-480"><a href="#cb23-480" aria-hidden="true" tabindex="-1"></a>    <span class="co"># -u 1000:1000 for the same reason as the cell_model repoint above</span></span>
+<span id="cb23-481"><a href="#cb23-481" aria-hidden="true" tabindex="-1"></a>    <span class="st">"docker exec -u 1000:1000 rstudio Rscript -e {shQuote(repoint)}; "</span>,</span>
+<span id="cb23-482"><a href="#cb23-482" aria-hidden="true" tabindex="-1"></a>    <span class="st">"mv -f {srv_viewdb}.new {srv_viewdb}; "</span>,                       <span class="co"># atomic swap</span></span>
+<span id="cb23-483"><a href="#cb23-483" aria-hidden="true" tabindex="-1"></a>    <span class="st">"{paste(sprintf('touch /share/github/MarineSensitivity/apps_v8/%s/restart.txt', v8_apps), collapse='; ')}"</span>)</span>
+<span id="cb23-484"><a href="#cb23-484" aria-hidden="true" tabindex="-1"></a>  out_rp <span class="ot">&lt;-</span> <span class="fu">system2</span>(<span class="st">"ssh"</span>, <span class="fu">c</span>(<span class="st">"msens"</span>, <span class="fu">shQuote</span>(cmd_rp)), <span class="at">stdout =</span> <span class="cn">TRUE</span>, <span class="at">stderr =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb23-485"><a href="#cb23-485" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">any</span>(<span class="fu">grepl</span>(<span class="st">"VIEWS_OK"</span>, out_rp))) <span class="fu">stop</span>(<span class="fu">paste</span>(<span class="fu">tail</span>(out_rp, <span class="dv">20</span>), <span class="at">collapse =</span> <span class="st">"</span><span class="sc">\n</span><span class="st">"</span>))</span>
+<span id="cb23-486"><a href="#cb23-486" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"views repointed to local Parquet + v8 apps reloaded: {grep('VIEWS_OK', out_rp, value = TRUE)}"</span>)</span>
+<span id="cb23-487"><a href="#cb23-487" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb23-488"><a href="#cb23-488" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb23-489"><a href="#cb23-489" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-490"><a href="#cb23-490" aria-hidden="true" tabindex="-1"></a><span class="fu">## Deploy the plumber API (`DEPLOY_API=1`)</span></span>
+<span id="cb23-491"><a href="#cb23-491" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-492"><a href="#cb23-492" aria-hidden="true" tabindex="-1"></a>The <span class="in">`/report`</span> and <span class="in">`/species.csv`</span> endpoints run in the **plumber** container, which is a *separate*</span>
+<span id="cb23-493"><a href="#cb23-493" aria-hidden="true" tabindex="-1"></a>image from <span class="in">`rstudio`</span> — the <span class="in">`DEPLOY_APPS`</span> msens reinstall never reached it. Left unpinned, its msens</span>
+<span id="cb23-494"><a href="#cb23-494" aria-hidden="true" tabindex="-1"></a>layer cached at **0.5.0** while the package moved to 0.12.0, so <span class="in">`/report?ver=v8`</span> answered</span>
+<span id="cb23-495"><a href="#cb23-495" aria-hidden="true" tabindex="-1"></a><span class="in">`Cannot open database "…/v8/sdm.duckdb"`</span> (no <span class="in">`serve.duckdb`</span> fallback, msens 0.9.1) and drawn areas</span>
+<span id="cb23-496"><a href="#cb23-496" aria-hidden="true" tabindex="-1"></a>had no <span class="in">`cell_model`</span> support (0.9.0). <span class="in">`server/plumber/Dockerfile`</span> now pins msens by commit and</span>
+<span id="cb23-497"><a href="#cb23-497" aria-hidden="true" tabindex="-1"></a>asserts the version at build time, so this cannot recur silently.</span>
+<span id="cb23-498"><a href="#cb23-498" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-499"><a href="#cb23-499" aria-hidden="true" tabindex="-1"></a>Rebuild is required (not just a restart): msens lives in the image, not on a volume.</span>
+<span id="cb23-500"><a href="#cb23-500" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-503"><a href="#cb23-503" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb23-504"><a href="#cb23-504" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: deploy-api</span></span>
+<span id="cb23-505"><a href="#cb23-505" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-506"><a href="#cb23-506" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (<span class="sc">!</span><span class="fu">nzchar</span>(<span class="fu">Sys.getenv</span>(<span class="st">"DEPLOY_API"</span>))) {</span>
+<span id="cb23-507"><a href="#cb23-507" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"DEPLOY_API unset — leaving the plumber API as it is"</span>)</span>
+<span id="cb23-508"><a href="#cb23-508" aria-hidden="true" tabindex="-1"></a>} <span class="cf">else</span> {</span>
+<span id="cb23-509"><a href="#cb23-509" aria-hidden="true" tabindex="-1"></a>  api_co <span class="ot">&lt;-</span> <span class="st">"/share/github/MarineSensitivity/api"</span></span>
+<span id="cb23-510"><a href="#cb23-510" aria-hidden="true" tabindex="-1"></a>  cmd_api <span class="ot">&lt;-</span> <span class="fu">glue</span>(</span>
+<span id="cb23-511"><a href="#cb23-511" aria-hidden="true" tabindex="-1"></a>    <span class="st">"set -e; "</span>,</span>
+<span id="cb23-512"><a href="#cb23-512" aria-hidden="true" tabindex="-1"></a>    <span class="st">"cd {api_co}    &amp;&amp; git fetch --quiet origin &amp;&amp; git merge --ff-only origin/main; "</span>,</span>
+<span id="cb23-513"><a href="#cb23-513" aria-hidden="true" tabindex="-1"></a>    <span class="st">"cd {srv_repo}  &amp;&amp; git fetch --quiet origin &amp;&amp; git merge --ff-only origin/main; "</span>,</span>
+<span id="cb23-514"><a href="#cb23-514" aria-hidden="true" tabindex="-1"></a>    <span class="co"># --force-recreate, same reason the titiler deploy uses it: plumber.R is</span></span>
+<span id="cb23-515"><a href="#cb23-515" aria-hidden="true" tabindex="-1"></a>    <span class="co"># parsed ONCE at container start, and the api repo is a bind mount, so a</span></span>
+<span id="cb23-516"><a href="#cb23-516" aria-hidden="true" tabindex="-1"></a>    <span class="co"># source-only change leaves compose seeing no image change and the container</span></span>
+<span id="cb23-517"><a href="#cb23-517" aria-hidden="true" tabindex="-1"></a>    <span class="co"># keeps serving the old code indefinitely. (report.qmd is read per-render, so</span></span>
+<span id="cb23-518"><a href="#cb23-518" aria-hidden="true" tabindex="-1"></a>    <span class="co"># it updates without this — which made the gap easy to miss: the mdl_key fix</span></span>
+<span id="cb23-519"><a href="#cb23-519" aria-hidden="true" tabindex="-1"></a>    <span class="co"># took effect while the mapsp_base fix silently did not.)</span></span>
+<span id="cb23-520"><a href="#cb23-520" aria-hidden="true" tabindex="-1"></a>    <span class="st">"docker compose up -d --build --force-recreate plumber; "</span>,</span>
+<span id="cb23-521"><a href="#cb23-521" aria-hidden="true" tabindex="-1"></a>    <span class="st">"echo API_OK $(git -C {api_co} rev-parse --short HEAD)"</span>)</span>
+<span id="cb23-522"><a href="#cb23-522" aria-hidden="true" tabindex="-1"></a>  out_api <span class="ot">&lt;-</span> <span class="fu">system2</span>(<span class="st">"ssh"</span>, <span class="fu">c</span>(<span class="st">"msens"</span>, <span class="fu">shQuote</span>(cmd_api)), <span class="at">stdout =</span> <span class="cn">TRUE</span>, <span class="at">stderr =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb23-523"><a href="#cb23-523" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">any</span>(<span class="fu">grepl</span>(<span class="st">"API_OK"</span>, out_api))) <span class="fu">stop</span>(<span class="fu">paste</span>(<span class="fu">tail</span>(out_api, <span class="dv">20</span>), <span class="at">collapse =</span> <span class="st">"</span><span class="sc">\n</span><span class="st">"</span>))</span>
+<span id="cb23-524"><a href="#cb23-524" aria-hidden="true" tabindex="-1"></a>  <span class="co"># assert the container actually carries the msens the endpoints need</span></span>
+<span id="cb23-525"><a href="#cb23-525" aria-hidden="true" tabindex="-1"></a>  chk <span class="ot">&lt;-</span> <span class="fu">system2</span>(<span class="st">"ssh"</span>, <span class="fu">c</span>(<span class="st">"msens"</span>, <span class="fu">shQuote</span>(<span class="fu">glue</span>(</span>
+<span id="cb23-526"><a href="#cb23-526" aria-hidden="true" tabindex="-1"></a>    <span class="st">"docker exec plumber Rscript -e "</span>,</span>
+<span id="cb23-527"><a href="#cb23-527" aria-hidden="true" tabindex="-1"></a>    <span class="fu">shQuote</span>(<span class="st">"cat('MSENS', as.character(packageVersion('msens')), '</span><span class="sc">\\</span><span class="st">n')"</span>)))),</span>
+<span id="cb23-528"><a href="#cb23-528" aria-hidden="true" tabindex="-1"></a>    <span class="at">stdout =</span> <span class="cn">TRUE</span>, <span class="at">stderr =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb23-529"><a href="#cb23-529" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"plumber API deployed: {grep('API_OK', out_api, value = TRUE)} | {grep('MSENS', chk, value = TRUE)}"</span>)</span>
+<span id="cb23-530"><a href="#cb23-530" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">any</span>(<span class="fu">grepl</span>(<span class="st">"MSENS 0</span><span class="sc">\\</span><span class="st">.(1[2-9]|[2-9][0-9])"</span>, chk)))</span>
+<span id="cb23-531"><a href="#cb23-531" aria-hidden="true" tabindex="-1"></a>    <span class="fu">stop</span>(<span class="st">"plumber msens &lt; 0.12.0 — the v8 drawn-area path needs cells_in_polygon(poly, con)"</span>)</span>
+<span id="cb23-532"><a href="#cb23-532" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb23-533"><a href="#cb23-533" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
 <span id="cb23-534"><a href="#cb23-534" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb23-535"><a href="#cb23-535" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (<span class="sc">!</span>do_caddy) {</span>
-<span id="cb23-536"><a href="#cb23-536" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"RELEASE_DEPLOY/DEPLOY_CADDY unset — Caddy routing left untouched"</span>)</span>
-<span id="cb23-537"><a href="#cb23-537" aria-hidden="true" tabindex="-1"></a>} <span class="cf">else</span> {</span>
-<span id="cb23-538"><a href="#cb23-538" aria-hidden="true" tabindex="-1"></a>  <span class="co"># `set -e` + ff-only, same as the other deploys: a stale pull must fail loudly rather</span></span>
-<span id="cb23-539"><a href="#cb23-539" aria-hidden="true" tabindex="-1"></a>  <span class="co"># than restart caddy onto the config it was already running.</span></span>
-<span id="cb23-540"><a href="#cb23-540" aria-hidden="true" tabindex="-1"></a>  out_caddy <span class="ot">&lt;-</span> <span class="fu">system2</span>(<span class="st">"ssh"</span>, <span class="fu">c</span>(<span class="st">"msens"</span>, <span class="fu">shQuote</span>(<span class="fu">glue</span>(</span>
-<span id="cb23-541"><a href="#cb23-541" aria-hidden="true" tabindex="-1"></a>    <span class="st">"set -e; cd {srv_repo} &amp;&amp; git fetch --quiet origin &amp;&amp; git merge --ff-only origin/main &amp;&amp; "</span>,</span>
-<span id="cb23-542"><a href="#cb23-542" aria-hidden="true" tabindex="-1"></a>    <span class="st">"docker compose restart caddy &amp;&amp; echo CADDY_OK $(git rev-parse --short HEAD)"</span>))),</span>
-<span id="cb23-543"><a href="#cb23-543" aria-hidden="true" tabindex="-1"></a>    <span class="at">stdout =</span> <span class="cn">TRUE</span>, <span class="at">stderr =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb23-544"><a href="#cb23-544" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">any</span>(<span class="fu">grepl</span>(<span class="st">"CADDY_OK"</span>, out_caddy))) <span class="fu">stop</span>(<span class="fu">paste</span>(<span class="fu">tail</span>(out_caddy, <span class="dv">15</span>), <span class="at">collapse =</span> <span class="st">"</span><span class="sc">\n</span><span class="st">"</span>))</span>
-<span id="cb23-545"><a href="#cb23-545" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"caddy restarted: {grep('CADDY_OK', out_caddy, value = TRUE)}"</span>)</span>
-<span id="cb23-546"><a href="#cb23-546" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb23-547"><a href="#cb23-547" aria-hidden="true" tabindex="-1"></a>  <span class="co"># PROVE THE REDIRECT KEEPS THE QUERY. `curl -sf` on a 301 is not a check — it follows</span></span>
-<span id="cb23-548"><a href="#cb23-548" aria-hidden="true" tabindex="-1"></a>  <span class="co"># nothing and reports success on exactly the failure being fixed. Read the Location back</span></span>
-<span id="cb23-549"><a href="#cb23-549" aria-hidden="true" tabindex="-1"></a>  <span class="co"># and assert the model id survived it.</span></span>
-<span id="cb23-550"><a href="#cb23-550" aria-hidden="true" tabindex="-1"></a>  <span class="cf">for</span> (u <span class="cf">in</span> <span class="fu">c</span>(<span class="st">"mapsp/?mdl_seq=1434"</span>, <span class="st">"species_v8/?ver=v8&amp;mdl_key=abc"</span>)) {</span>
-<span id="cb23-551"><a href="#cb23-551" aria-hidden="true" tabindex="-1"></a>    <span class="co"># shQuote is NOT optional: system2() runs through a shell, so a bare `&amp;` in the URL</span></span>
-<span id="cb23-552"><a href="#cb23-552" aria-hidden="true" tabindex="-1"></a>    <span class="co"># ends the command there. The unquoted form asked for `?ver=v8` alone and this check</span></span>
-<span id="cb23-553"><a href="#cb23-553" aria-hidden="true" tabindex="-1"></a>    <span class="co"># then blamed Caddy for dropping the parameter it had never been sent.</span></span>
-<span id="cb23-554"><a href="#cb23-554" aria-hidden="true" tabindex="-1"></a>    loc <span class="ot">&lt;-</span> <span class="fu">system2</span>(<span class="st">"curl"</span>, <span class="fu">c</span>(<span class="st">"-s"</span>, <span class="st">"-o"</span>, <span class="st">"/dev/null"</span>, <span class="st">"-w"</span>, <span class="st">"%{redirect_url}"</span>,</span>
-<span id="cb23-555"><a href="#cb23-555" aria-hidden="true" tabindex="-1"></a>                             <span class="fu">shQuote</span>(<span class="fu">glue</span>(<span class="st">"https://app.marinesensitivity.org/{u}"</span>))),</span>
-<span id="cb23-556"><a href="#cb23-556" aria-hidden="true" tabindex="-1"></a>                   <span class="at">stdout =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb23-557"><a href="#cb23-557" aria-hidden="true" tabindex="-1"></a>    <span class="fu">log_info</span>(<span class="st">"redirect {u} -&gt; {loc}"</span>)</span>
-<span id="cb23-558"><a href="#cb23-558" aria-hidden="true" tabindex="-1"></a>    id <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="fu">grepl</span>(<span class="st">"mdl_seq"</span>, u)) <span class="st">"mdl_seq=1434"</span> <span class="cf">else</span> <span class="st">"mdl_key=abc"</span></span>
-<span id="cb23-559"><a href="#cb23-559" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="sc">!</span><span class="fu">grepl</span>(id, loc, <span class="at">fixed =</span> <span class="cn">TRUE</span>))</span>
-<span id="cb23-560"><a href="#cb23-560" aria-hidden="true" tabindex="-1"></a>      <span class="fu">stop</span>(<span class="fu">glue</span>(<span class="st">"Caddy dropped the model id: /{u} -&gt; {loc}"</span>))</span>
-<span id="cb23-561"><a href="#cb23-561" aria-hidden="true" tabindex="-1"></a>  }</span>
-<span id="cb23-562"><a href="#cb23-562" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"redirects preserve the model id"</span>)</span>
-<span id="cb23-563"><a href="#cb23-563" aria-hidden="true" tabindex="-1"></a>}</span>
-<span id="cb23-564"><a href="#cb23-564" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb23-535"><a href="#cb23-535" aria-hidden="true" tabindex="-1"></a><span class="fu">## Deploy the Caddy routing (`DEPLOY_CADDY=1`)</span></span>
+<span id="cb23-536"><a href="#cb23-536" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-537"><a href="#cb23-537" aria-hidden="true" tabindex="-1"></a>The **URL surface** is part of the release, not server trivia: since the cutover, every</span>
+<span id="cb23-538"><a href="#cb23-538" aria-hidden="true" tabindex="-1"></a>retired per-version app URL is a 301 into <span class="in">`/scores`</span> or <span class="in">`/species`</span>, so a routing change decides</span>
+<span id="cb23-539"><a href="#cb23-539" aria-hidden="true" tabindex="-1"></a>whether a link published in a report still resolves. It had its own bug — the redirect targets</span>
+<span id="cb23-540"><a href="#cb23-540" aria-hidden="true" tabindex="-1"></a>carry their own <span class="in">`?ver=`</span>, which REPLACES the incoming query, so <span class="in">`/mapsp/?mdl_seq=1434`</span> arrived</span>
+<span id="cb23-541"><a href="#cb23-541" aria-hidden="true" tabindex="-1"></a>as <span class="in">`/species/?ver=v7`</span> and the app opened on its default taxon (MarineSensitivity/apps#6).</span>
+<span id="cb23-542"><a href="#cb23-542" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-543"><a href="#cb23-543" aria-hidden="true" tabindex="-1"></a>Caddyfile-only changes had no reproducible home: the routing rode along with <span class="in">`RELEASE_DEPLOY`</span>,</span>
+<span id="cb23-544"><a href="#cb23-544" aria-hidden="true" tabindex="-1"></a>which also rebuilds and force-recreates titiler. This flag is the narrow path — pull the server</span>
+<span id="cb23-545"><a href="#cb23-545" aria-hidden="true" tabindex="-1"></a>repo, restart caddy, nothing else. **`docker compose restart caddy`, not `caddy reload`**: the</span>
+<span id="cb23-546"><a href="#cb23-546" aria-hidden="true" tabindex="-1"></a>Caddyfile is a single-file bind mount, so a git pull replaces the inode and the running</span>
+<span id="cb23-547"><a href="#cb23-547" aria-hidden="true" tabindex="-1"></a>container keeps serving the file it opened at start.</span>
+<span id="cb23-548"><a href="#cb23-548" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-551"><a href="#cb23-551" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb23-552"><a href="#cb23-552" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: deploy-caddy</span></span>
+<span id="cb23-553"><a href="#cb23-553" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-554"><a href="#cb23-554" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (<span class="sc">!</span>do_caddy) {</span>
+<span id="cb23-555"><a href="#cb23-555" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"RELEASE_DEPLOY/DEPLOY_CADDY unset — Caddy routing left untouched"</span>)</span>
+<span id="cb23-556"><a href="#cb23-556" aria-hidden="true" tabindex="-1"></a>} <span class="cf">else</span> {</span>
+<span id="cb23-557"><a href="#cb23-557" aria-hidden="true" tabindex="-1"></a>  <span class="co"># `set -e` + ff-only, same as the other deploys: a stale pull must fail loudly rather</span></span>
+<span id="cb23-558"><a href="#cb23-558" aria-hidden="true" tabindex="-1"></a>  <span class="co"># than restart caddy onto the config it was already running.</span></span>
+<span id="cb23-559"><a href="#cb23-559" aria-hidden="true" tabindex="-1"></a>  out_caddy <span class="ot">&lt;-</span> <span class="fu">system2</span>(<span class="st">"ssh"</span>, <span class="fu">c</span>(<span class="st">"msens"</span>, <span class="fu">shQuote</span>(<span class="fu">glue</span>(</span>
+<span id="cb23-560"><a href="#cb23-560" aria-hidden="true" tabindex="-1"></a>    <span class="st">"set -e; cd {srv_repo} &amp;&amp; git fetch --quiet origin &amp;&amp; git merge --ff-only origin/main &amp;&amp; "</span>,</span>
+<span id="cb23-561"><a href="#cb23-561" aria-hidden="true" tabindex="-1"></a>    <span class="st">"docker compose restart caddy &amp;&amp; echo CADDY_OK $(git rev-parse --short HEAD)"</span>))),</span>
+<span id="cb23-562"><a href="#cb23-562" aria-hidden="true" tabindex="-1"></a>    <span class="at">stdout =</span> <span class="cn">TRUE</span>, <span class="at">stderr =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb23-563"><a href="#cb23-563" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">any</span>(<span class="fu">grepl</span>(<span class="st">"CADDY_OK"</span>, out_caddy))) <span class="fu">stop</span>(<span class="fu">paste</span>(<span class="fu">tail</span>(out_caddy, <span class="dv">15</span>), <span class="at">collapse =</span> <span class="st">"</span><span class="sc">\n</span><span class="st">"</span>))</span>
+<span id="cb23-564"><a href="#cb23-564" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"caddy restarted: {grep('CADDY_OK', out_caddy, value = TRUE)}"</span>)</span>
 <span id="cb23-565"><a href="#cb23-565" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb23-566"><a href="#cb23-566" aria-hidden="true" tabindex="-1"></a><span class="fu">## Deploy the v8 Shiny apps (reload only apps_v8; v7 untouched)</span></span>
-<span id="cb23-567"><a href="#cb23-567" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb23-568"><a href="#cb23-568" aria-hidden="true" tabindex="-1"></a>Reproducible app deploy — no ad-hoc ssh. Pull the **apps_v8** checkout</span>
-<span id="cb23-569"><a href="#cb23-569" aria-hidden="true" tabindex="-1"></a>(<span class="in">`MarineSensitivity/apps@main`</span>) and reload it via Shiny Server's per-app <span class="in">`restart.txt`</span>.</span>
-<span id="cb23-570"><a href="#cb23-570" aria-hidden="true" tabindex="-1"></a>Gated by <span class="in">`RELEASE_DEPLOY`</span> (full release) or the granular <span class="in">`DEPLOY_APPS=1`</span>.</span>
-<span id="cb23-571"><a href="#cb23-571" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb23-572"><a href="#cb23-572" aria-hidden="true" tabindex="-1"></a><span class="at">&gt; **Since the 2026-08-12 cutover this IS the live app.** </span><span class="in">`/share/shiny_apps/{scores,species}`</span></span>
-<span id="cb23-573"><a href="#cb23-573" aria-hidden="true" tabindex="-1"></a><span class="at">&gt; point at </span><span class="in">`apps_v8`</span><span class="at">, which renders any published release from </span><span class="in">`?ver=`</span><span class="at">, and the 18 former</span></span>
-<span id="cb23-574"><a href="#cb23-574" aria-hidden="true" tabindex="-1"></a><span class="at">&gt; per-version instances (</span><span class="in">`mapgl`</span><span class="at">, </span><span class="in">`mapsp`</span><span class="at">, </span><span class="in">`mapgl_v1-v6`</span><span class="at">, </span><span class="in">`mapsp_v1-v6`</span><span class="at">, </span><span class="in">`scores_v6/v8`</span><span class="at">,</span></span>
-<span id="cb23-575"><a href="#cb23-575" aria-hidden="true" tabindex="-1"></a><span class="at">&gt; </span><span class="in">`species_v6/v8`</span><span class="at">) now live in </span><span class="in">`/share/shiny_apps_retired/`</span><span class="at"> with Caddy 301ing their URLs to</span></span>
-<span id="cb23-576"><a href="#cb23-576" aria-hidden="true" tabindex="-1"></a><span class="at">&gt; </span><span class="in">`/scores/?ver=v{n}`</span><span class="at">. So a deploy here is no longer "the v8 apps beside the live v7 ones" —</span></span>
-<span id="cb23-577"><a href="#cb23-577" aria-hidden="true" tabindex="-1"></a><span class="at">&gt; it restarts what everyone sees. The touches target the CHECKOUT</span></span>
-<span id="cb23-578"><a href="#cb23-578" aria-hidden="true" tabindex="-1"></a><span class="at">&gt; (</span><span class="in">`apps_v8/{scores,species}/restart.txt`</span><span class="at">), not the symlink, so retiring the aliases did not</span></span>
-<span id="cb23-579"><a href="#cb23-579" aria-hidden="true" tabindex="-1"></a><span class="at">&gt; affect them.</span></span>
-<span id="cb23-580"><a href="#cb23-580" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb23-583"><a href="#cb23-583" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb23-584"><a href="#cb23-584" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: deploy-apps</span></span>
-<span id="cb23-585"><a href="#cb23-585" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb23-586"><a href="#cb23-586" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (<span class="sc">!</span>do_apps) {</span>
-<span id="cb23-587"><a href="#cb23-587" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"RELEASE_DEPLOY/DEPLOY_APPS unset — skipping Shiny app deploy"</span>)</span>
-<span id="cb23-588"><a href="#cb23-588" aria-hidden="true" tabindex="-1"></a>} <span class="cf">else</span> {</span>
-<span id="cb23-589"><a href="#cb23-589" aria-hidden="true" tabindex="-1"></a>  apps_co  <span class="ot">&lt;-</span> <span class="st">"/share/github/MarineSensitivity/apps_v8"</span>   <span class="co"># main branch; symlinked as *_v8</span></span>
-<span id="cb23-590"><a href="#cb23-590" aria-hidden="true" tabindex="-1"></a>  msens_co <span class="ot">&lt;-</span> <span class="st">"/share/github/MarineSensitivity/msens"</span></span>
-<span id="cb23-591"><a href="#cb23-591" aria-hidden="true" tabindex="-1"></a>  v8_apps  <span class="ot">&lt;-</span> <span class="fu">c</span>(<span class="st">"species"</span>, <span class="st">"scores"</span>)</span>
-<span id="cb23-592"><a href="#cb23-592" aria-hidden="true" tabindex="-1"></a>  touches  <span class="ot">&lt;-</span> <span class="fu">paste</span>(<span class="fu">sprintf</span>(<span class="st">"touch %s/%s/restart.txt"</span>, apps_co, v8_apps), <span class="at">collapse =</span> <span class="st">"; "</span>)</span>
-<span id="cb23-593"><a href="#cb23-593" aria-hidden="true" tabindex="-1"></a>  <span class="co"># `set -e` + explicit ff-only fetch (a silent `git pull --quiet` once left the app + msens</span></span>
-<span id="cb23-594"><a href="#cb23-594" aria-hidden="true" tabindex="-1"></a>  <span class="co"># stale for hours). ALSO reinstall msens into the shiny/rstudio container: a stale container</span></span>
-<span id="cb23-595"><a href="#cb23-595" aria-hidden="true" tabindex="-1"></a>  <span class="co"># msens lacked `cell_tile_url(mdl_key=)` and crashed the merged surface. Reload only the v8 apps.</span></span>
-<span id="cb23-596"><a href="#cb23-596" aria-hidden="true" tabindex="-1"></a>  cmd <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"set -e; "</span>,</span>
-<span id="cb23-597"><a href="#cb23-597" aria-hidden="true" tabindex="-1"></a>              <span class="st">"cd {apps_co}  &amp;&amp; git fetch --quiet origin &amp;&amp; git merge --ff-only origin/main; "</span>,</span>
-<span id="cb23-598"><a href="#cb23-598" aria-hidden="true" tabindex="-1"></a>              <span class="st">"cd {msens_co} &amp;&amp; git fetch --quiet origin &amp;&amp; git merge --ff-only origin/main &amp;&amp; "</span>,</span>
-<span id="cb23-599"><a href="#cb23-599" aria-hidden="true" tabindex="-1"></a>              <span class="st">"docker exec rstudio R CMD INSTALL --no-multiarch {msens_co} &gt;/dev/null 2&gt;&amp;1; "</span>,</span>
-<span id="cb23-600"><a href="#cb23-600" aria-hidden="true" tabindex="-1"></a>              <span class="st">"{touches}; echo APPS_OK $(git -C {apps_co} rev-parse --short HEAD)"</span>)</span>
-<span id="cb23-601"><a href="#cb23-601" aria-hidden="true" tabindex="-1"></a>  out <span class="ot">&lt;-</span> <span class="fu">system2</span>(<span class="st">"ssh"</span>, <span class="fu">c</span>(<span class="st">"msens"</span>, <span class="fu">shQuote</span>(cmd)), <span class="at">stdout =</span> <span class="cn">TRUE</span>, <span class="at">stderr =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb23-602"><a href="#cb23-602" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">any</span>(<span class="fu">grepl</span>(<span class="st">"APPS_OK"</span>, out))) <span class="fu">stop</span>(<span class="fu">paste</span>(<span class="fu">tail</span>(out, <span class="dv">15</span>), <span class="at">collapse =</span> <span class="st">"</span><span class="sc">\n</span><span class="st">"</span>))</span>
-<span id="cb23-603"><a href="#cb23-603" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"deployed v8 apps [{paste(v8_apps, collapse=', ')}] + reinstalled msens; v7 apps untouched: {tail(out,1)}"</span>)</span>
-<span id="cb23-604"><a href="#cb23-604" aria-hidden="true" tabindex="-1"></a>}</span>
-<span id="cb23-605"><a href="#cb23-605" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb23-606"><a href="#cb23-606" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb23-607"><a href="#cb23-607" aria-hidden="true" tabindex="-1"></a><span class="fu">## Deploy the v7 Shiny apps (opt-in — normally left alone)</span></span>
-<span id="cb23-608"><a href="#cb23-608" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb23-609"><a href="#cb23-609" aria-hidden="true" tabindex="-1"></a>The v7 apps are a **separate checkout** (<span class="in">`/share/github/MarineSensitivity/apps`</span> on branch</span>
-<span id="cb23-610"><a href="#cb23-610" aria-hidden="true" tabindex="-1"></a><span class="in">`v7`</span>, symlinked as <span class="in">`/share/shiny_apps/{species,scores}`</span> → <span class="in">`mapsp`</span>/<span class="in">`mapgl`</span>). They are the</span>
-<span id="cb23-611"><a href="#cb23-611" aria-hidden="true" tabindex="-1"></a>*default* live apps, so they stay untouched by a routine v8 release — hence a dedicated</span>
-<span id="cb23-612"><a href="#cb23-612" aria-hidden="true" tabindex="-1"></a><span class="in">`DEPLOY_APPS_V7=1`</span> flag that <span class="in">`RELEASE_DEPLOY`</span> deliberately does **not** imply.</span>
-<span id="cb23-613"><a href="#cb23-613" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb23-614"><a href="#cb23-614" aria-hidden="true" tabindex="-1"></a>Use it when a change must reach both generations — e.g. the usage-analytics instrumentation,</span>
-<span id="cb23-615"><a href="#cb23-615" aria-hidden="true" tabindex="-1"></a>which is only meaningful if it covers the apps people actually use today. msens is installed</span>
-<span id="cb23-616"><a href="#cb23-616" aria-hidden="true" tabindex="-1"></a>into the shared container by the v8 chunk above; v7 picks it up from the same library.</span>
-<span id="cb23-617"><a href="#cb23-617" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb23-620"><a href="#cb23-620" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb23-621"><a href="#cb23-621" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: deploy-apps-v7</span></span>
-<span id="cb23-622"><a href="#cb23-622" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb23-623"><a href="#cb23-623" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (<span class="sc">!</span>do_apps_v7) {</span>
-<span id="cb23-624"><a href="#cb23-624" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"DEPLOY_APPS_V7 unset — v7 apps left untouched (the default)"</span>)</span>
-<span id="cb23-625"><a href="#cb23-625" aria-hidden="true" tabindex="-1"></a>} <span class="cf">else</span> {</span>
-<span id="cb23-626"><a href="#cb23-626" aria-hidden="true" tabindex="-1"></a>  apps_v7_co <span class="ot">&lt;-</span> <span class="st">"/share/github/MarineSensitivity/apps"</span>   <span class="co"># branch v7; symlinked as scores/species</span></span>
-<span id="cb23-627"><a href="#cb23-627" aria-hidden="true" tabindex="-1"></a>  v7_apps    <span class="ot">&lt;-</span> <span class="fu">c</span>(<span class="st">"mapsp"</span>, <span class="st">"mapgl"</span>)                      <span class="co"># = species / scores</span></span>
-<span id="cb23-628"><a href="#cb23-628" aria-hidden="true" tabindex="-1"></a>  touches_v7 <span class="ot">&lt;-</span> <span class="fu">paste</span>(<span class="fu">sprintf</span>(<span class="st">"touch %s/%s/restart.txt"</span>, apps_v7_co, v7_apps), <span class="at">collapse =</span> <span class="st">"; "</span>)</span>
-<span id="cb23-629"><a href="#cb23-629" aria-hidden="true" tabindex="-1"></a>  <span class="co"># ff-only against origin/v7 (NOT main — this checkout tracks the v7 branch)</span></span>
-<span id="cb23-630"><a href="#cb23-630" aria-hidden="true" tabindex="-1"></a>  cmd_v7 <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"set -e; "</span>,</span>
-<span id="cb23-631"><a href="#cb23-631" aria-hidden="true" tabindex="-1"></a>                 <span class="st">"cd {apps_v7_co} &amp;&amp; git fetch --quiet origin &amp;&amp; git merge --ff-only origin/v7; "</span>,</span>
-<span id="cb23-632"><a href="#cb23-632" aria-hidden="true" tabindex="-1"></a>                 <span class="st">"{touches_v7}; echo APPSV7_OK $(git -C {apps_v7_co} rev-parse --short HEAD)"</span>)</span>
-<span id="cb23-633"><a href="#cb23-633" aria-hidden="true" tabindex="-1"></a>  out_v7 <span class="ot">&lt;-</span> <span class="fu">system2</span>(<span class="st">"ssh"</span>, <span class="fu">c</span>(<span class="st">"msens"</span>, <span class="fu">shQuote</span>(cmd_v7)), <span class="at">stdout =</span> <span class="cn">TRUE</span>, <span class="at">stderr =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb23-634"><a href="#cb23-634" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">any</span>(<span class="fu">grepl</span>(<span class="st">"APPSV7_OK"</span>, out_v7))) <span class="fu">stop</span>(<span class="fu">paste</span>(<span class="fu">tail</span>(out_v7, <span class="dv">15</span>), <span class="at">collapse =</span> <span class="st">"</span><span class="sc">\n</span><span class="st">"</span>))</span>
-<span id="cb23-635"><a href="#cb23-635" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"deployed v7 apps [{paste(v7_apps, collapse=', ')}]: {tail(out_v7,1)}"</span>)</span>
-<span id="cb23-636"><a href="#cb23-636" aria-hidden="true" tabindex="-1"></a>}</span>
-<span id="cb23-637"><a href="#cb23-637" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb23-638"><a href="#cb23-638" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb23-639"><a href="#cb23-639" aria-hidden="true" tabindex="-1"></a><span class="fu">## Manifest</span></span>
-<span id="cb23-640"><a href="#cb23-640" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb23-643"><a href="#cb23-643" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb23-644"><a href="#cb23-644" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: manifest</span></span>
-<span id="cb23-645"><a href="#cb23-645" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb23-646"><a href="#cb23-646" aria-hidden="true" tabindex="-1"></a><span class="co"># content-addressed: fingerprint of the served model_cell surface (run-mode flags like</span></span>
-<span id="cb23-647"><a href="#cb23-647" aria-hidden="true" tabindex="-1"></a><span class="co"># pushed_s3/deployed are side effects, not content, so they're excluded).</span></span>
-<span id="cb23-648"><a href="#cb23-648" aria-hidden="true" tabindex="-1"></a>msens<span class="sc">::</span><span class="fu">write_manifest</span>(</span>
-<span id="cb23-649"><a href="#cb23-649" aria-hidden="true" tabindex="-1"></a>  manifest, <span class="at">target =</span> <span class="st">"release_marine_atlas"</span>, <span class="at">content_hash =</span> serve_hash,</span>
-<span id="cb23-650"><a href="#cb23-650" aria-hidden="true" tabindex="-1"></a>  <span class="at">stats =</span> <span class="fu">list</span>(<span class="at">ver =</span> ver, <span class="at">s3 =</span> s3_ver, <span class="at">n_tables =</span> <span class="fu">length</span>(rel_tables),</span>
-<span id="cb23-651"><a href="#cb23-651" aria-hidden="true" tabindex="-1"></a>               <span class="at">tables =</span> <span class="fu">paste</span>(<span class="fu">sort</span>(rel_tables), <span class="at">collapse =</span> <span class="st">","</span>),</span>
-<span id="cb23-652"><a href="#cb23-652" aria-hidden="true" tabindex="-1"></a>               <span class="at">serve =</span> <span class="st">"serve/model_cell/ (partitioned by mdl_id)"</span>, <span class="at">n_partitions =</span> n_parts,</span>
-<span id="cb23-653"><a href="#cb23-653" aria-hidden="true" tabindex="-1"></a>               <span class="at">titiler =</span> titiler_v8),</span>
-<span id="cb23-654"><a href="#cb23-654" aria-hidden="true" tabindex="-1"></a>  <span class="at">force =</span> msens<span class="sc">::</span><span class="fu">force_target</span>(<span class="st">"release_marine_atlas"</span>))</span>
-<span id="cb23-655"><a href="#cb23-655" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb23-566"><a href="#cb23-566" aria-hidden="true" tabindex="-1"></a>  <span class="co"># PROVE THE REDIRECT KEEPS THE QUERY. `curl -sf` on a 301 is not a check — it follows</span></span>
+<span id="cb23-567"><a href="#cb23-567" aria-hidden="true" tabindex="-1"></a>  <span class="co"># nothing and reports success on exactly the failure being fixed. Read the Location back</span></span>
+<span id="cb23-568"><a href="#cb23-568" aria-hidden="true" tabindex="-1"></a>  <span class="co"># and assert the model id survived it.</span></span>
+<span id="cb23-569"><a href="#cb23-569" aria-hidden="true" tabindex="-1"></a>  <span class="cf">for</span> (u <span class="cf">in</span> <span class="fu">c</span>(<span class="st">"mapsp/?mdl_seq=1434"</span>, <span class="st">"species_v8/?ver=v8&amp;mdl_key=abc"</span>)) {</span>
+<span id="cb23-570"><a href="#cb23-570" aria-hidden="true" tabindex="-1"></a>    <span class="co"># shQuote is NOT optional: system2() runs through a shell, so a bare `&amp;` in the URL</span></span>
+<span id="cb23-571"><a href="#cb23-571" aria-hidden="true" tabindex="-1"></a>    <span class="co"># ends the command there. The unquoted form asked for `?ver=v8` alone and this check</span></span>
+<span id="cb23-572"><a href="#cb23-572" aria-hidden="true" tabindex="-1"></a>    <span class="co"># then blamed Caddy for dropping the parameter it had never been sent.</span></span>
+<span id="cb23-573"><a href="#cb23-573" aria-hidden="true" tabindex="-1"></a>    loc <span class="ot">&lt;-</span> <span class="fu">system2</span>(<span class="st">"curl"</span>, <span class="fu">c</span>(<span class="st">"-s"</span>, <span class="st">"-o"</span>, <span class="st">"/dev/null"</span>, <span class="st">"-w"</span>, <span class="st">"%{redirect_url}"</span>,</span>
+<span id="cb23-574"><a href="#cb23-574" aria-hidden="true" tabindex="-1"></a>                             <span class="fu">shQuote</span>(<span class="fu">glue</span>(<span class="st">"https://app.marinesensitivity.org/{u}"</span>))),</span>
+<span id="cb23-575"><a href="#cb23-575" aria-hidden="true" tabindex="-1"></a>                   <span class="at">stdout =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb23-576"><a href="#cb23-576" aria-hidden="true" tabindex="-1"></a>    <span class="fu">log_info</span>(<span class="st">"redirect {u} -&gt; {loc}"</span>)</span>
+<span id="cb23-577"><a href="#cb23-577" aria-hidden="true" tabindex="-1"></a>    id <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="fu">grepl</span>(<span class="st">"mdl_seq"</span>, u)) <span class="st">"mdl_seq=1434"</span> <span class="cf">else</span> <span class="st">"mdl_key=abc"</span></span>
+<span id="cb23-578"><a href="#cb23-578" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="sc">!</span><span class="fu">grepl</span>(id, loc, <span class="at">fixed =</span> <span class="cn">TRUE</span>))</span>
+<span id="cb23-579"><a href="#cb23-579" aria-hidden="true" tabindex="-1"></a>      <span class="fu">stop</span>(<span class="fu">glue</span>(<span class="st">"Caddy dropped the model id: /{u} -&gt; {loc}"</span>))</span>
+<span id="cb23-580"><a href="#cb23-580" aria-hidden="true" tabindex="-1"></a>  }</span>
+<span id="cb23-581"><a href="#cb23-581" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"redirects preserve the model id"</span>)</span>
+<span id="cb23-582"><a href="#cb23-582" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb23-583"><a href="#cb23-583" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb23-584"><a href="#cb23-584" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-585"><a href="#cb23-585" aria-hidden="true" tabindex="-1"></a><span class="fu">## Deploy the v8 Shiny apps (reload only apps_v8; v7 untouched)</span></span>
+<span id="cb23-586"><a href="#cb23-586" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-587"><a href="#cb23-587" aria-hidden="true" tabindex="-1"></a>Reproducible app deploy — no ad-hoc ssh. Pull the **apps_v8** checkout</span>
+<span id="cb23-588"><a href="#cb23-588" aria-hidden="true" tabindex="-1"></a>(<span class="in">`MarineSensitivity/apps@main`</span>) and reload it via Shiny Server's per-app <span class="in">`restart.txt`</span>.</span>
+<span id="cb23-589"><a href="#cb23-589" aria-hidden="true" tabindex="-1"></a>Gated by <span class="in">`RELEASE_DEPLOY`</span> (full release) or the granular <span class="in">`DEPLOY_APPS=1`</span>.</span>
+<span id="cb23-590"><a href="#cb23-590" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-591"><a href="#cb23-591" aria-hidden="true" tabindex="-1"></a><span class="at">&gt; **Since the 2026-08-12 cutover this IS the live app.** </span><span class="in">`/share/shiny_apps/{scores,species}`</span></span>
+<span id="cb23-592"><a href="#cb23-592" aria-hidden="true" tabindex="-1"></a><span class="at">&gt; point at </span><span class="in">`apps_v8`</span><span class="at">, which renders any published release from </span><span class="in">`?ver=`</span><span class="at">, and the 18 former</span></span>
+<span id="cb23-593"><a href="#cb23-593" aria-hidden="true" tabindex="-1"></a><span class="at">&gt; per-version instances (</span><span class="in">`mapgl`</span><span class="at">, </span><span class="in">`mapsp`</span><span class="at">, </span><span class="in">`mapgl_v1-v6`</span><span class="at">, </span><span class="in">`mapsp_v1-v6`</span><span class="at">, </span><span class="in">`scores_v6/v8`</span><span class="at">,</span></span>
+<span id="cb23-594"><a href="#cb23-594" aria-hidden="true" tabindex="-1"></a><span class="at">&gt; </span><span class="in">`species_v6/v8`</span><span class="at">) now live in </span><span class="in">`/share/shiny_apps_retired/`</span><span class="at"> with Caddy 301ing their URLs to</span></span>
+<span id="cb23-595"><a href="#cb23-595" aria-hidden="true" tabindex="-1"></a><span class="at">&gt; </span><span class="in">`/scores/?ver=v{n}`</span><span class="at">. So a deploy here is no longer "the v8 apps beside the live v7 ones" —</span></span>
+<span id="cb23-596"><a href="#cb23-596" aria-hidden="true" tabindex="-1"></a><span class="at">&gt; it restarts what everyone sees. The touches target the CHECKOUT</span></span>
+<span id="cb23-597"><a href="#cb23-597" aria-hidden="true" tabindex="-1"></a><span class="at">&gt; (</span><span class="in">`apps_v8/{scores,species}/restart.txt`</span><span class="at">), not the symlink, so retiring the aliases did not</span></span>
+<span id="cb23-598"><a href="#cb23-598" aria-hidden="true" tabindex="-1"></a><span class="at">&gt; affect them.</span></span>
+<span id="cb23-599"><a href="#cb23-599" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-602"><a href="#cb23-602" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb23-603"><a href="#cb23-603" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: deploy-apps</span></span>
+<span id="cb23-604"><a href="#cb23-604" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-605"><a href="#cb23-605" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (<span class="sc">!</span>do_apps) {</span>
+<span id="cb23-606"><a href="#cb23-606" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"RELEASE_DEPLOY/DEPLOY_APPS unset — skipping Shiny app deploy"</span>)</span>
+<span id="cb23-607"><a href="#cb23-607" aria-hidden="true" tabindex="-1"></a>} <span class="cf">else</span> {</span>
+<span id="cb23-608"><a href="#cb23-608" aria-hidden="true" tabindex="-1"></a>  apps_co  <span class="ot">&lt;-</span> <span class="st">"/share/github/MarineSensitivity/apps_v8"</span>   <span class="co"># main branch; symlinked as *_v8</span></span>
+<span id="cb23-609"><a href="#cb23-609" aria-hidden="true" tabindex="-1"></a>  msens_co <span class="ot">&lt;-</span> <span class="st">"/share/github/MarineSensitivity/msens"</span></span>
+<span id="cb23-610"><a href="#cb23-610" aria-hidden="true" tabindex="-1"></a>  v8_apps  <span class="ot">&lt;-</span> <span class="fu">c</span>(<span class="st">"species"</span>, <span class="st">"scores"</span>)</span>
+<span id="cb23-611"><a href="#cb23-611" aria-hidden="true" tabindex="-1"></a>  touches  <span class="ot">&lt;-</span> <span class="fu">paste</span>(<span class="fu">sprintf</span>(<span class="st">"touch %s/%s/restart.txt"</span>, apps_co, v8_apps), <span class="at">collapse =</span> <span class="st">"; "</span>)</span>
+<span id="cb23-612"><a href="#cb23-612" aria-hidden="true" tabindex="-1"></a>  <span class="co"># `set -e` + explicit ff-only fetch (a silent `git pull --quiet` once left the app + msens</span></span>
+<span id="cb23-613"><a href="#cb23-613" aria-hidden="true" tabindex="-1"></a>  <span class="co"># stale for hours). ALSO reinstall msens into the shiny/rstudio container: a stale container</span></span>
+<span id="cb23-614"><a href="#cb23-614" aria-hidden="true" tabindex="-1"></a>  <span class="co"># msens lacked `cell_tile_url(mdl_key=)` and crashed the merged surface. Reload only the v8 apps.</span></span>
+<span id="cb23-615"><a href="#cb23-615" aria-hidden="true" tabindex="-1"></a>  cmd <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"set -e; "</span>,</span>
+<span id="cb23-616"><a href="#cb23-616" aria-hidden="true" tabindex="-1"></a>              <span class="st">"cd {apps_co}  &amp;&amp; git fetch --quiet origin &amp;&amp; git merge --ff-only origin/main; "</span>,</span>
+<span id="cb23-617"><a href="#cb23-617" aria-hidden="true" tabindex="-1"></a>              <span class="st">"cd {msens_co} &amp;&amp; git fetch --quiet origin &amp;&amp; git merge --ff-only origin/main &amp;&amp; "</span>,</span>
+<span id="cb23-618"><a href="#cb23-618" aria-hidden="true" tabindex="-1"></a>              <span class="st">"docker exec rstudio R CMD INSTALL --no-multiarch {msens_co} &gt;/dev/null 2&gt;&amp;1; "</span>,</span>
+<span id="cb23-619"><a href="#cb23-619" aria-hidden="true" tabindex="-1"></a>              <span class="st">"{touches}; echo APPS_OK $(git -C {apps_co} rev-parse --short HEAD)"</span>)</span>
+<span id="cb23-620"><a href="#cb23-620" aria-hidden="true" tabindex="-1"></a>  out <span class="ot">&lt;-</span> <span class="fu">system2</span>(<span class="st">"ssh"</span>, <span class="fu">c</span>(<span class="st">"msens"</span>, <span class="fu">shQuote</span>(cmd)), <span class="at">stdout =</span> <span class="cn">TRUE</span>, <span class="at">stderr =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb23-621"><a href="#cb23-621" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">any</span>(<span class="fu">grepl</span>(<span class="st">"APPS_OK"</span>, out))) <span class="fu">stop</span>(<span class="fu">paste</span>(<span class="fu">tail</span>(out, <span class="dv">15</span>), <span class="at">collapse =</span> <span class="st">"</span><span class="sc">\n</span><span class="st">"</span>))</span>
+<span id="cb23-622"><a href="#cb23-622" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"deployed v8 apps [{paste(v8_apps, collapse=', ')}] + reinstalled msens; v7 apps untouched: {tail(out,1)}"</span>)</span>
+<span id="cb23-623"><a href="#cb23-623" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb23-624"><a href="#cb23-624" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb23-625"><a href="#cb23-625" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-626"><a href="#cb23-626" aria-hidden="true" tabindex="-1"></a><span class="fu">## Deploy the v7 Shiny apps (opt-in — normally left alone)</span></span>
+<span id="cb23-627"><a href="#cb23-627" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-628"><a href="#cb23-628" aria-hidden="true" tabindex="-1"></a>The v7 apps are a **separate checkout** (<span class="in">`/share/github/MarineSensitivity/apps`</span> on branch</span>
+<span id="cb23-629"><a href="#cb23-629" aria-hidden="true" tabindex="-1"></a><span class="in">`v7`</span>, symlinked as <span class="in">`/share/shiny_apps/{species,scores}`</span> → <span class="in">`mapsp`</span>/<span class="in">`mapgl`</span>). They are the</span>
+<span id="cb23-630"><a href="#cb23-630" aria-hidden="true" tabindex="-1"></a>*default* live apps, so they stay untouched by a routine v8 release — hence a dedicated</span>
+<span id="cb23-631"><a href="#cb23-631" aria-hidden="true" tabindex="-1"></a><span class="in">`DEPLOY_APPS_V7=1`</span> flag that <span class="in">`RELEASE_DEPLOY`</span> deliberately does **not** imply.</span>
+<span id="cb23-632"><a href="#cb23-632" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-633"><a href="#cb23-633" aria-hidden="true" tabindex="-1"></a>Use it when a change must reach both generations — e.g. the usage-analytics instrumentation,</span>
+<span id="cb23-634"><a href="#cb23-634" aria-hidden="true" tabindex="-1"></a>which is only meaningful if it covers the apps people actually use today. msens is installed</span>
+<span id="cb23-635"><a href="#cb23-635" aria-hidden="true" tabindex="-1"></a>into the shared container by the v8 chunk above; v7 picks it up from the same library.</span>
+<span id="cb23-636"><a href="#cb23-636" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-639"><a href="#cb23-639" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb23-640"><a href="#cb23-640" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: deploy-apps-v7</span></span>
+<span id="cb23-641"><a href="#cb23-641" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-642"><a href="#cb23-642" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (<span class="sc">!</span>do_apps_v7) {</span>
+<span id="cb23-643"><a href="#cb23-643" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"DEPLOY_APPS_V7 unset — v7 apps left untouched (the default)"</span>)</span>
+<span id="cb23-644"><a href="#cb23-644" aria-hidden="true" tabindex="-1"></a>} <span class="cf">else</span> {</span>
+<span id="cb23-645"><a href="#cb23-645" aria-hidden="true" tabindex="-1"></a>  apps_v7_co <span class="ot">&lt;-</span> <span class="st">"/share/github/MarineSensitivity/apps"</span>   <span class="co"># branch v7; symlinked as scores/species</span></span>
+<span id="cb23-646"><a href="#cb23-646" aria-hidden="true" tabindex="-1"></a>  v7_apps    <span class="ot">&lt;-</span> <span class="fu">c</span>(<span class="st">"mapsp"</span>, <span class="st">"mapgl"</span>)                      <span class="co"># = species / scores</span></span>
+<span id="cb23-647"><a href="#cb23-647" aria-hidden="true" tabindex="-1"></a>  touches_v7 <span class="ot">&lt;-</span> <span class="fu">paste</span>(<span class="fu">sprintf</span>(<span class="st">"touch %s/%s/restart.txt"</span>, apps_v7_co, v7_apps), <span class="at">collapse =</span> <span class="st">"; "</span>)</span>
+<span id="cb23-648"><a href="#cb23-648" aria-hidden="true" tabindex="-1"></a>  <span class="co"># ff-only against origin/v7 (NOT main — this checkout tracks the v7 branch)</span></span>
+<span id="cb23-649"><a href="#cb23-649" aria-hidden="true" tabindex="-1"></a>  cmd_v7 <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"set -e; "</span>,</span>
+<span id="cb23-650"><a href="#cb23-650" aria-hidden="true" tabindex="-1"></a>                 <span class="st">"cd {apps_v7_co} &amp;&amp; git fetch --quiet origin &amp;&amp; git merge --ff-only origin/v7; "</span>,</span>
+<span id="cb23-651"><a href="#cb23-651" aria-hidden="true" tabindex="-1"></a>                 <span class="st">"{touches_v7}; echo APPSV7_OK $(git -C {apps_v7_co} rev-parse --short HEAD)"</span>)</span>
+<span id="cb23-652"><a href="#cb23-652" aria-hidden="true" tabindex="-1"></a>  out_v7 <span class="ot">&lt;-</span> <span class="fu">system2</span>(<span class="st">"ssh"</span>, <span class="fu">c</span>(<span class="st">"msens"</span>, <span class="fu">shQuote</span>(cmd_v7)), <span class="at">stdout =</span> <span class="cn">TRUE</span>, <span class="at">stderr =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb23-653"><a href="#cb23-653" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">any</span>(<span class="fu">grepl</span>(<span class="st">"APPSV7_OK"</span>, out_v7))) <span class="fu">stop</span>(<span class="fu">paste</span>(<span class="fu">tail</span>(out_v7, <span class="dv">15</span>), <span class="at">collapse =</span> <span class="st">"</span><span class="sc">\n</span><span class="st">"</span>))</span>
+<span id="cb23-654"><a href="#cb23-654" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"deployed v7 apps [{paste(v7_apps, collapse=', ')}]: {tail(out_v7,1)}"</span>)</span>
+<span id="cb23-655"><a href="#cb23-655" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb23-656"><a href="#cb23-656" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb23-657"><a href="#cb23-657" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-658"><a href="#cb23-658" aria-hidden="true" tabindex="-1"></a><span class="fu">## Manifest</span></span>
+<span id="cb23-659"><a href="#cb23-659" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-662"><a href="#cb23-662" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb23-663"><a href="#cb23-663" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: manifest</span></span>
+<span id="cb23-664"><a href="#cb23-664" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-665"><a href="#cb23-665" aria-hidden="true" tabindex="-1"></a><span class="co"># content-addressed: fingerprint of the served model_cell surface (run-mode flags like</span></span>
+<span id="cb23-666"><a href="#cb23-666" aria-hidden="true" tabindex="-1"></a><span class="co"># pushed_s3/deployed are side effects, not content, so they're excluded).</span></span>
+<span id="cb23-667"><a href="#cb23-667" aria-hidden="true" tabindex="-1"></a>msens<span class="sc">::</span><span class="fu">write_manifest</span>(</span>
+<span id="cb23-668"><a href="#cb23-668" aria-hidden="true" tabindex="-1"></a>  manifest, <span class="at">target =</span> <span class="st">"release_marine_atlas"</span>, <span class="at">content_hash =</span> serve_hash,</span>
+<span id="cb23-669"><a href="#cb23-669" aria-hidden="true" tabindex="-1"></a>  <span class="at">stats =</span> <span class="fu">list</span>(<span class="at">ver =</span> ver, <span class="at">s3 =</span> s3_ver, <span class="at">n_tables =</span> <span class="fu">length</span>(rel_tables),</span>
+<span id="cb23-670"><a href="#cb23-670" aria-hidden="true" tabindex="-1"></a>               <span class="at">tables =</span> <span class="fu">paste</span>(<span class="fu">sort</span>(rel_tables), <span class="at">collapse =</span> <span class="st">","</span>),</span>
+<span id="cb23-671"><a href="#cb23-671" aria-hidden="true" tabindex="-1"></a>               <span class="at">serve =</span> <span class="st">"serve/model_cell/ (partitioned by mdl_id)"</span>, <span class="at">n_partitions =</span> n_parts,</span>
+<span id="cb23-672"><a href="#cb23-672" aria-hidden="true" tabindex="-1"></a>               <span class="at">titiler =</span> titiler_v8),</span>
+<span id="cb23-673"><a href="#cb23-673" aria-hidden="true" tabindex="-1"></a>  <span class="at">force =</span> msens<span class="sc">::</span><span class="fu">force_target</span>(<span class="st">"release_marine_atlas"</span>))</span>
+<span id="cb23-674"><a href="#cb23-674" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
 </code></pre></div><button title="Copy to Clipboard" class="code-copy-button" data-in-quarto-modal=""><i class="bi"></i></button></div>
 </div></div></div></div></div>
 </div> <!-- /content -->

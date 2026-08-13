@@ -381,8 +381,27 @@ if (!do_tables) {
   log_info("RELEASE_DEPLOY/DEPLOY_TABLES unset — leaving the server's table views as they are")
 } else {
   system2("ssh", c("msens", glue("mkdir -p {srv_tables} {srv_modelcell}")))
-  system2("rsync", c("-aq", "--delete", glue("{tbl_dir}/"), glue("msens:{srv_tables}/")))
-  log_info("synced tables -> msens:{srv_tables}")
+  # PULL from S3 on the server rather than PUSH from here.
+  #
+  # tables/ is ~445 MB and S3 is the published artifact sitting in the SAME REGION as msens1,
+  # so the server fetches it in seconds; pushing it up from a laptop is a ~20-minute transfer
+  # over a ~400 KB/s link. That transfer failed three times in one night — the render process
+  # died mid-rsync each time, leaving an orphaned rsync still writing into the destination and,
+  # on one occasion, two concurrent `rsync --delete` runs against the same directory.
+  #
+  # Pulling is also the stronger guarantee: the server ends up holding exactly what was
+  # PUBLISHED, not whatever happens to be staged on the machine driving the release.
+  if (do_s3_tbl) {
+    out_t <- system2("ssh", c("msens", shQuote(glue(
+      "aws s3 sync {s3_ver}/tables/ {srv_tables}/ --delete --only-show-errors && echo TABLES_OK"))),
+      stdout = TRUE, stderr = TRUE)
+    if (!any(grepl("TABLES_OK", out_t))) stop(paste(tail(out_t, 15), collapse = "\n"))
+    log_info("server pulled tables from S3 -> {srv_tables}")
+  } else {
+    # nothing was pushed to S3 this run, so the local copy is the only source
+    system2("rsync", c("-aq", "--delete", glue("{tbl_dir}/"), glue("msens:{srv_tables}/")))
+    log_info("synced tables -> msens:{srv_tables} (rsync — tables not on S3 this run)")
+  }
   # model_cell too — the LAST remote table. The v8 species app reads it in two
   # places (mdl_bbox() for fit_bounds, and the clicked-cell value), and both are
   # degrading silently today: the S3 GLOB needs LIST credentials the app
