@@ -216,8 +216,12 @@ if (!file_exists(iucn_gpkg) || redo_src) {
     # system2() goes through a shell, so every argument that contains SQL punctuation
     # ( ( ) | ' ) must be shQuote'd, and `~` must be expanded here rather than left for a
     # shell that will not see it inside quotes.
+    # `geom` MUST be in the SELECT list. ogr2ogr carries the geometry only if you ask for it,
+    # and a GPKG without a geometry column still reads back cleanly as a plain data.frame with
+    # the right row count and column names — so a check on nrow()/names() passes on a file that
+    # has no geometry at all. It surfaces much later, as st_zm() on a data.frame.
     sql_i <- glue("SELECT id_no, ('rng_iucn|' || CAST(id_no AS TEXT)) AS mdl_key, ",
-                  "'rng_iucn' AS ds_key FROM rng_iucn WHERE id_no IN ({ids_sql})")
+                  "'rng_iucn' AS ds_key, geom FROM rng_iucn WHERE id_no IN ({ids_sql})")
     st <- system2("ogr2ogr", c(
       "-f", "GPKG", shQuote(path.expand(iucn_gpkg)), shQuote(path.expand(iucn_all)),
       "-nln", "rng_iucn", "-nlt", "PROMOTE_TO_MULTI", "-sql", shQuote(sql_i)),
@@ -226,7 +230,15 @@ if (!file_exists(iucn_gpkg) || redo_src) {
       stop(paste(tail(st, 20), collapse = "\n"))
     system2("ogrinfo", c(shQuote(path.expand(iucn_gpkg)), "-sql",
                          shQuote("CREATE INDEX idx_mdlkey ON rng_iucn(mdl_key)")))
-    log_info("wrote {path_file(iucn_gpkg)}")
+    # assert it is REALLY spatial, the same way the consumer reads it (st_read + query), not
+    # merely that rows exist -- see the geom note above
+    chk <- st_read(iucn_gpkg, quiet = TRUE, as_tibble = FALSE,
+                   query = glue("SELECT * FROM \"rng_iucn\" WHERE id_no = {ids_srv[1]}"))
+    stopifnot(
+      "iucn src gpkg has no geometry column (geom missing from the ogr2ogr SELECT?)" =
+        inherits(chk, "sf"),
+      "iucn src gpkg geometry is empty" = nrow(chk) > 0 && !all(st_is_empty(chk)))
+    log_info("wrote {path_file(iucn_gpkg)} — geometry verified via st_read(query=)")
   } else {
   log_info("building {path_file(iucn_gpkg)} for {length(ids_srv)} served ids (source shapefiles) …")
   shps <- dir_ls(glue("{dir_raw}/iucnredlist.org"), glob = "*.shp", recurse = TRUE)
