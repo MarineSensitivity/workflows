@@ -20,11 +20,13 @@ far too large (up to ~19M cells) for the dense per-cell SQL tiler:
   from S3 by titiler-v8 `/cog`.
 
 Both drive a `native_asset` registry (`mdl_key → asset_type + url`) that STAC + the app read.
-We only publish inputs that feed a **listed taxon** (`is_valid_global & is_marine`, non
-reptile/amphibian) — the set the species app actually lists. This was `is_valid_usa`, which is
-NARROWER than the picker: the app lists every valid marine taxon, US or not, so a non-US species'
-inputs were never built and showed as unavailable while its merged surface drew fine (6,352 of
-25,404 input edges).
+We publish inputs for every taxon the toolkit considers valid in EITHER surface
+(`(is_valid_usa OR is_valid_global) & is_marine`, non reptile/amphibian). **Neither flag alone
+is a superset of the other**: v8 merges two surfaces (a global one and a US-scoped scoring one),
+so 4,473 taxa are global-only and **46 are US-only** — valid and scored in the US, absent from
+the global surface. Building for `is_valid_usa` alone left every non-US species' inputs
+unpublished; building for `is_valid_global` alone silently dropped those 46. The union is
+21,581 taxa / 25,450 input edges.
 
 **Flags:** `REDO_NATIVE=1` (rebuild PMTiles + IUCN gpkg + re-sort am), `REDO_PMTILES=1` (rebuild
 just the vector tiles), `NATIVE_SKIP_AM` / `NATIVE_SKIP_PMTILES`,
@@ -93,13 +95,16 @@ safe_key <- function(k) gsub("[^A-Za-z0-9._-]", "_", k)   # mdl_key -> filesyste
 con <- dbConnect(duckdb(), config = list(threads = "6", memory_limit = "10GB"))
 dbExecute(con, glue("SET temp_directory='{dir_atlas}/duckdb_tmp'"))
 dbExecute(con, glue("ATTACH '{merge_db}' AS m (READ_ONLY)"))
-# is_valid_GLOBAL, matching the species picker. Building for is_valid_usa left every non-US
-# taxon's inputs unpublished while its merged COG (built for all valid marine taxa) drew fine.
+# the UNION of the two validity flags. is_valid_global is NOT a superset of is_valid_usa --
+# 46 taxa are US-valid but absent from the global merged surface (n_cells == n_usa), and
+# scoping to is_valid_global alone dropped their merged-COG aliases, which is what
+# registry_merge() refused to publish as a shrink.
 served <- dbGetQuery(con, "
   SELECT DISTINCT tm.mdl_key, split_part(tm.mdl_key,'|',1) AS ds_key
   FROM m.taxon_model tm
   JOIN m.taxon t USING(ms_merge_key)
-  WHERE t.is_valid_global AND t.is_marine AND t.sp_cat NOT IN ('reptile','amphibian')")
+  WHERE (t.is_valid_usa OR t.is_valid_global) AND t.is_marine
+    AND t.sp_cat NOT IN ('reptile','amphibian')")
 dbDisconnect(con, shutdown = TRUE)
 served_by_ds <- split(served$mdl_key, served$ds_key)
 knitr::kable(served |> count(ds_key, name = "n_mdl") |> arrange(desc(n_mdl)))
@@ -672,7 +677,8 @@ dbExecute(con, glue("ATTACH '{merge_db}' AS m (READ_ONLY)"))
 # same scope as `served` above — an asset built for a taxon must be able to find that taxon
 tm <- dbGetQuery(con, "SELECT DISTINCT tm.mdl_key, tm.ms_merge_key
   FROM m.taxon_model tm JOIN m.taxon t USING(ms_merge_key)
-  WHERE t.is_valid_global AND t.is_marine AND t.sp_cat NOT IN ('reptile','amphibian')")
+  WHERE (t.is_valid_usa OR t.is_valid_global) AND t.is_marine
+    AND t.sp_cat NOT IN ('reptile','amphibian')")
 dbExecute(con, "DETACH m")
 
 native_asset <- if (nrow(asset_info) && "mdl_key" %in% names(asset_info)) {
