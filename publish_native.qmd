@@ -331,11 +331,31 @@ resumable (skip existing COGs).
 # test mode uses a separate parts dir + only the test subset, so it never poisons a full run
 am_keys <- if (length(served_by_ds[["am"]])) sort(served_by_ds[["am"]]) else character(0)
 am_take <- if (test_n > 0) head(am_keys, test_n) else am_keys
-am_map  <- tibble(mdl_key = am_take, mid = seq_along(am_take))       # stable int key per model
+# `mid` is POSITIONAL — seq_along over the sorted served keys — so it is a function of the
+# whole served SET, not of the model. Widening the served set (is_valid_usa -> is_valid_global)
+# moved 16,815 of 16,818 positions: mid=4 stopped meaning `am|Chn-0e47…` and started meaning
+# `am|Chn-08d9…`. The partitions were skipped because the DIRECTORY existed, so every COG built
+# afterwards read another species' cells and wrote them under the right filename. 1,054 COGs
+# came out that way, each internally consistent and silently wrong (am|Fis-112180: 6,469 cells
+# in dist, 100,981 in its COG).
+#
+# So the map is PERSISTED beside the partitions and the partitions are rebuilt whenever it
+# changes. Existence is not evidence of correctness; matching the map is. Same lesson as
+# msens::assign_mdl_id(), which exists because dense_rank() renumbers published partitions.
+am_map  <- tibble(mdl_key = am_take, mid = seq_along(am_take))
 am_parts<- glue("{dir_native}/_am_parts{if (test_n > 0) '_test' else ''}")
+am_map_csv <- glue("{am_parts}.map.csv")
 if (!skip_am && length(am_take)) {
-  if (!dir_exists(am_parts) || redo) {
-    if (dir_exists(am_parts)) dir_delete(am_parts)
+  map_ok <- file_exists(am_map_csv) && dir_exists(am_parts) && {
+    prev <- suppressMessages(readr::read_csv(am_map_csv, show_col_types = FALSE))
+    nrow(prev) == nrow(am_map) && all(prev$mdl_key == am_map$mdl_key) && all(prev$mid == am_map$mid)
+  }
+  if (!map_ok || redo) {
+    if (dir_exists(am_parts)) {
+      log_warn("_am_parts does not match the current served set — repartitioning ",
+               "(mid is positional; reusing it would paint the wrong species)")
+      dir_delete(am_parts)
+    }
     log_info("partitioning {length(am_take)} served am models by mid -> _am_parts …")
     con <- dbConnect(duckdb(), config = list(threads = "6", memory_limit = "10GB"))
     dbExecute(con, glue("SET temp_directory='{dir_atlas}/duckdb_tmp'"))
@@ -347,8 +367,9 @@ if (!skip_am && length(am_take)) {
       JOIN am_map map ON p.mdl_key = map.mdl_key"),
       am_parts, partition_by = "mid")
     dbDisconnect(con, shutdown = TRUE)
+    readr::write_csv(am_map, am_map_csv)
     log_info("_am_parts: {length(dir_ls(am_parts))} partitions, {round(sum(file_size(dir_ls(am_parts, recurse=TRUE, type='file')))/1e9,1)} GB")
-  } else log_info("_am_parts exists — skip repartition (REDO_NATIVE=1 to force)")
+  } else log_info("_am_parts matches the served set ({nrow(am_map)} models) — skip repartition")
 }
 ```
 
@@ -359,6 +380,35 @@ am_reg <- tibble()
 if (!skip_am && length(am_take) && dir_exists(am_parts)) {
   todo <- am_map[!file_exists(glue("{dir_cog}/{safe_key(am_map$mdl_key)}.tif")), ]
   log_info("am COGs: {nrow(am_map)} target, {nrow(todo)} to build ({nrow(am_map)-nrow(todo)} exist)")
+
+  # PROVE mid still addresses the model it names, on the DATA rather than on the map file.
+  # A COG painted from the wrong partition is internally valid — right filename, plausible
+  # raster — so nothing downstream can detect it; the only moment it is cheap to catch is
+  # here, by asking whether partition mid=N holds the cells `dist` records for that mdl_key.
+  if (nrow(todo)) {
+    conv <- dbConnect(duckdb(), config = list(threads = "4"))
+    smp  <- am_map[unique(round(seq(1, nrow(am_map), length.out = min(8, nrow(am_map))))), ]
+    bad  <- 0L
+    for (i in seq_len(nrow(smp))) {
+      pf <- glue("{am_parts}/mid={smp$mid[i]}")
+      if (!dir_exists(pf)) next
+      n_part <- dbGetQuery(conv, glue("SELECT count(*) n FROM read_parquet('{pf}/*.parquet')"))$n
+      n_dist <- dbGetQuery(conv, glue("
+        SELECT count(*) n FROM read_parquet('{dir_atlas}/dist/dataset=am/*.parquet')
+        WHERE mdl_key = '{smp$mdl_key[i]}'"))$n
+      if (n_part != n_dist) {
+        bad <- bad + 1L
+        log_error("mid={smp$mid[i]} ({smp$mdl_key[i]}): partition has {n_part} cells, dist has {n_dist}")
+      }
+    }
+    dbDisconnect(conv, shutdown = TRUE)
+    if (bad > 0)
+      stop(sprintf(paste0("_am_parts does not address the models am_map names (%d of %d sampled ",
+                          "disagree). Building COGs now would publish other species' surfaces ",
+                          "under these names — delete %s and re-run to repartition."),
+                   bad, nrow(smp), am_parts), call. = FALSE)
+    log_info("am partition addressing verified on {nrow(smp)} sampled models")
+  }
 
   grid <- grid_spec(rast(cellid_tif))
   build_batch <- function(rows) {
