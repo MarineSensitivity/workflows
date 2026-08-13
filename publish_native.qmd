@@ -20,8 +20,11 @@ far too large (up to ~19M cells) for the dense per-cell SQL tiler:
   from S3 by titiler-v8 `/cog`.
 
 Both drive a `native_asset` registry (`mdl_key → asset_type + url`) that STAC + the app read.
-We only publish inputs that feed a **served taxon** (`is_valid_usa & is_marine`, non
-reptile/amphibian) — the set the species app actually lists.
+We only publish inputs that feed a **listed taxon** (`is_valid_global & is_marine`, non
+reptile/amphibian) — the set the species app actually lists. This was `is_valid_usa`, which is
+NARROWER than the picker: the app lists every valid marine taxon, US or not, so a non-US species'
+inputs were never built and showed as unavailable while its merged surface drew fine (6,352 of
+25,404 input edges).
 
 **Flags:** `REDO_NATIVE=1` (rebuild PMTiles + IUCN gpkg + re-sort am), `REDO_PMTILES=1` (rebuild
 just the vector tiles), `NATIVE_SKIP_AM` / `NATIVE_SKIP_PMTILES`,
@@ -90,11 +93,13 @@ safe_key <- function(k) gsub("[^A-Za-z0-9._-]", "_", k)   # mdl_key -> filesyste
 con <- dbConnect(duckdb(), config = list(threads = "6", memory_limit = "10GB"))
 dbExecute(con, glue("SET temp_directory='{dir_atlas}/duckdb_tmp'"))
 dbExecute(con, glue("ATTACH '{merge_db}' AS m (READ_ONLY)"))
+# is_valid_GLOBAL, matching the species picker. Building for is_valid_usa left every non-US
+# taxon's inputs unpublished while its merged COG (built for all valid marine taxa) drew fine.
 served <- dbGetQuery(con, "
   SELECT DISTINCT tm.mdl_key, split_part(tm.mdl_key,'|',1) AS ds_key
   FROM m.taxon_model tm
   JOIN m.taxon t USING(ms_merge_key)
-  WHERE t.is_valid_usa AND t.is_marine AND t.sp_cat NOT IN ('reptile','amphibian')")
+  WHERE t.is_valid_global AND t.is_marine AND t.sp_cat NOT IN ('reptile','amphibian')")
 dbDisconnect(con, shutdown = TRUE)
 served_by_ds <- split(served$mdl_key, served$ds_key)
 knitr::kable(served |> count(ds_key, name = "n_mdl") |> arrange(desc(n_mdl)))
@@ -188,9 +193,41 @@ in one fast, off-Drive query (the derived per-group gpkgs are stale v7 and miss 
 #| label: iucn-src
 
 iucn_gpkg <- glue("{dir_native}/src/rng_iucn.gpkg"); dir_create(path_dir(iucn_gpkg))
-if (!file_exists(iucn_gpkg) || redo) {
+# REDO_IUCN_SRC exists separately from REDO_NATIVE for the same reason REDO_PMTILES does: this
+# gpkg is filtered to the SERVED ids, so widening the served set (e.g. is_valid_usa ->
+# is_valid_global) silently leaves the new species out of it — publish_pmtiles_from_gpkg then
+# finds no features and skips them, with no error. REDO_NATIVE would also re-sort am and rebuild
+# every existing tile, which is hours of work to add species that need only this one step.
+redo_src  <- redo || nzchar(Sys.getenv("REDO_IUCN_SRC"))
+# The INGEST's own filtered output is the source of truth: presence 1:3 / marine / category are
+# already applied in it, and it is indexed on id_no. Reading the raw shapefiles reproduces that
+# filter from scratch and needs ~20 GB of source this machine may not hold — keep it only as the
+# fallback for a box that has the shapefiles but not the derived gpkg.
+iucn_all <- glue("{dir_derived}/iucnredlist.org/rng_iucn_all.gpkg")
+if (!file_exists(iucn_gpkg) || redo_src) {
   iucn_ok <- c("CR","EN","VU","NT","LC","DD")
   ids_srv <- as.integer(sub("^rng_iucn\\|", "", served_by_ds[["rng_iucn"]]))
+  if (file_exists(iucn_all)) {
+    log_info("building {path_file(iucn_gpkg)} for {length(ids_srv)} served ids from {path_file(iucn_all)} …")
+    # ogr2ogr streams: the source is ~9 GB, far too large to hold as an sf. mdl_key is derived
+    # here so publish_pmtiles_from_gpkg can index-seek on it, exactly as before.
+    ids_sql <- paste(ids_srv, collapse = ",")
+    if (file_exists(iucn_gpkg)) file_delete(iucn_gpkg)
+    # system2() goes through a shell, so every argument that contains SQL punctuation
+    # ( ( ) | ' ) must be shQuote'd, and `~` must be expanded here rather than left for a
+    # shell that will not see it inside quotes.
+    sql_i <- glue("SELECT id_no, ('rng_iucn|' || CAST(id_no AS TEXT)) AS mdl_key, ",
+                  "'rng_iucn' AS ds_key FROM rng_iucn WHERE id_no IN ({ids_sql})")
+    st <- system2("ogr2ogr", c(
+      "-f", "GPKG", shQuote(path.expand(iucn_gpkg)), shQuote(path.expand(iucn_all)),
+      "-nln", "rng_iucn", "-nlt", "PROMOTE_TO_MULTI", "-sql", shQuote(sql_i)),
+      stdout = TRUE, stderr = TRUE)
+    if (!is.null(attr(st, "status")) && attr(st, "status") != 0)
+      stop(paste(tail(st, 20), collapse = "\n"))
+    system2("ogrinfo", c(shQuote(path.expand(iucn_gpkg)), "-sql",
+                         shQuote("CREATE INDEX idx_mdlkey ON rng_iucn(mdl_key)")))
+    log_info("wrote {path_file(iucn_gpkg)}")
+  } else {
   log_info("building {path_file(iucn_gpkg)} for {length(ids_srv)} served ids (source shapefiles) …")
   shps <- dir_ls(glue("{dir_raw}/iucnredlist.org"), glob = "*.shp", recurse = TRUE)
   gi <- map_dfr(shps, function(s) {
@@ -207,9 +244,17 @@ if (!file_exists(iucn_gpkg) || redo) {
   gi <- gi[!st_is_empty(gi), ]
   st_write(gi, iucn_gpkg, layer = "rng_iucn", quiet = TRUE, delete_dsn = TRUE)
   system2("ogrinfo", c(shQuote(iucn_gpkg), "-sql",
-                       shQuote("CREATE INDEX idx_idno ON rng_iucn(id_no)")))
+                       shQuote("CREATE INDEX idx_mdlkey ON rng_iucn(mdl_key)")))
   log_info("wrote {path_file(iucn_gpkg)}: {nrow(gi)} species")
-} else log_info("{path_file(iucn_gpkg)} exists — skip (REDO_NATIVE=1 to rebuild)")
+  }
+  # the src gpkg must cover the served set, or publish_pmtiles_from_gpkg silently skips the
+  # species it cannot find — the failure mode that left every widened run short
+  n_src <- as.integer(DBI::dbGetQuery(
+    DBI::dbConnect(RSQLite::SQLite(), path.expand(iucn_gpkg)),
+    "SELECT count(DISTINCT id_no) n FROM rng_iucn")$n)
+  if (n_src < length(ids_srv))
+    log_warn("iucn src gpkg holds {n_src} of {length(ids_srv)} served ids — {length(ids_srv) - n_src} will have no PMTiles")
+} else log_info("{path_file(iucn_gpkg)} exists — skip (REDO_IUCN_SRC=1 to rebuild)")
 ```
 
 ```{r}
@@ -562,9 +607,10 @@ if (nrow(bb_all) && "mdl_key" %in% names(asset_info)) asset_info <- asset_info |
 # directly to its input surfaces. A raw model may feed >1 merged taxon -> one row each.
 con <- dbConnect(duckdb(sdm_db))
 dbExecute(con, glue("ATTACH '{merge_db}' AS m (READ_ONLY)"))
+# same scope as `served` above — an asset built for a taxon must be able to find that taxon
 tm <- dbGetQuery(con, "SELECT DISTINCT tm.mdl_key, tm.ms_merge_key
   FROM m.taxon_model tm JOIN m.taxon t USING(ms_merge_key)
-  WHERE t.is_valid_usa AND t.is_marine AND t.sp_cat NOT IN ('reptile','amphibian')")
+  WHERE t.is_valid_global AND t.is_marine AND t.sp_cat NOT IN ('reptile','amphibian')")
 dbExecute(con, "DETACH m")
 
 native_asset <- if (nrow(asset_info) && "mdl_key" %in% names(asset_info)) {
