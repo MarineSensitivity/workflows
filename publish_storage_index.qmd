@@ -60,6 +60,24 @@ objs <- msens::s3_list_all(bucket, prefix = "marine-atlas")
 log_info("{format(nrow(objs), big.mark=',')} objects under marine-atlas/, ",
          "{round(sum(objs$size)/1024^3, 1)} GB")
 
+# A RESTRICTED release (`access` in versions.json -- a pre-release under review,
+# see build_version_manifest.qmd) is not advertised here. Its objects stay
+# exactly where the serving stack reads them; what changes is discoverability:
+# no page lists its directory, no page is generated inside it, and any page an
+# earlier run left there is removed in the publish chunk. "Readable if you know
+# the exact key" is the whole of what remains, which is the presentation-only
+# scope the review gate was given (data-level restriction is the separate
+# restricted-datasets plan).
+restricted <- msens::atlas_versions(refresh = TRUE) |>
+  filter(access == "restricted") |> pull(ver)
+if (length(restricted)) {
+  pat      <- sprintf("^marine-atlas/(%s)/", paste(restricted, collapse = "|"))
+  n_before <- nrow(objs)
+  objs     <- objs |> filter(!grepl(pat, key))
+  log_info("restricted release(s) {paste(restricted, collapse = ', ')}: ",
+           "{format(n_before - nrow(objs), big.mark = ',')} objects withheld from the index")
+} else log_info("no restricted release; every version is indexed")
+
 objs |>
   mutate(top = sub("/.*$", "", key)) |>
   count(top, name = "objects", wt = NULL) |>
@@ -126,6 +144,23 @@ if (do_s3 && nrow(ix)) {
   code <- tryCatch({ con <- url(url, open = "rb"); close(con); 200L }, error = function(e) 404L)
   stopifnot("deepest index page is not readable after upload" = code == 200L)
   log_info("verified {url}")
+
+  # restricted releases: remove the pages an earlier (public) run generated
+  # inside them, then PROVE the folder URL no longer resolves -- the check the
+  # Caddy rewrite would otherwise happily serve a stale page through
+  for (rv in restricted) {
+    args <- c("s3", "rm", shQuote(glue("{bucket}/marine-atlas/{rv}/")), "--recursive",
+              "--exclude", shQuote("*"),
+              "--include", shQuote("*index.html"), "--include", shQuote("*README.md"),
+              "--only-show-errors")
+    out <- system2("aws", args, stdout = TRUE, stderr = TRUE)
+    if (!is.null(attr(out, "status")) && attr(out, "status") != 0)
+      stop("aws s3 rm failed for ", rv, ": ", paste(out, collapse = "\n"))
+    gone <- sprintf("%s/marine-atlas/%s/index.html", obj_url, rv)
+    code <- tryCatch({ con <- url(gone, open = "rb"); close(con); 200L }, error = function(e) 404L)
+    stopifnot("a restricted release still has an index page after removal" = code != 200L)
+    log_info("restricted {rv}: index pages removed; {gone} no longer resolves")
+  }
 } else {
   log_info("STORAGE_INDEX_NO_S3 set - staged locally at {dir_out}")
 }

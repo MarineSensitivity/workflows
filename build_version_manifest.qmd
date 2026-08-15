@@ -21,7 +21,7 @@ publishes the files that make it a **data** fact instead, so one app can render 
 | file | what it settles |
 |---|---|
 | `marine-atlas/latest.txt` | which version an app shows when the URL says nothing |
-| `marine-atlas/versions.json` | which versions exist, and whether each is showable |
+| `marine-atlas/versions.json` | which versions exist, whether each is showable, and to whom (`access`) |
 | `marine-atlas/{ver}/manifest.json` | everything needed to *render* that version |
 
 The manifest is the contract: publishing v9 means publishing a manifest, **not** editing an app.
@@ -38,7 +38,7 @@ The manifest is the contract: publishing v9 means publishing a manifest, **not**
 %%| label: fig-design
 %%| fig-cap: "Curated registry + release introspection → the three published registry files"
 flowchart LR
-  csv["data/versions.csv<br/>(curated: status, date, title)"] --> vj["versions.json"]
+  csv["data/versions.csv<br/>(curated: status, access, date, title)"] --> vj["versions.json"]
   db[("{ver}/sdm.duckdb")] --> mb["msens::manifest_build()<br/>introspects tables, metrics,<br/>zones, public model id"]
   mb --> mj["{ver}/manifest.json"]
   vj --> s3[["s3://…/marine-atlas/"]]
@@ -77,24 +77,46 @@ Release *status* and *dates* are editorial facts — they cannot be introspected
 they must not be guessed. They live in a committed CSV so the registry is reviewable in a diff, and
 so the apps, the versioned docs and the storage index all read one source rather than three.
 
-Deliberately a **registry, not a changelog**: `ver`, `status`, `released`, `title` and nothing more.
-What each release *changed* is prose, it already lives in the docs timeline, and a second copy here
-would drift from it — which is the very problem the versioned-docs work exists to fix.
+Deliberately a **registry, not a changelog**: `ver`, `status`, `access`, `released`, `title` and
+nothing more. What each release *changed* is prose, it already lives in the docs timeline, and a
+second copy here would drift from it — which is the very problem the versioned-docs work exists to
+fix.
+
+`status` and `access` are **separate axes**: `status` says where a release is in its life
+(`prerelease` / `released` / `retired`); `access` says *who may be shown it* (`public` /
+`restricted`). A pre-release under review by SDM data providers and BOEM/NOAA colleagues is
+`restricted` — the apps and docs serve it only through the signed-in
+`preview.marinesensitivity.org` host (`msens::atlas_allow_access()`), while retired releases stay
+`public` because citations point at them. The column is written explicitly here; a reader that
+meets a `versions.json` predating it derives `access` fail-closed (`prerelease → restricted`, see
+`msens::atlas_access_default()`), so the column being present with `public` is what keeps a
+public pre-release public.
 
 ```{r}
 #| label: versions
 
 versions <- readr::read_csv(here::here("data/versions.csv"), show_col_types = FALSE)
 
+# a registry that predates the column gets the same fail-closed default the readers apply
+if (!"access" %in% names(versions)) versions$access <- msens::atlas_access_default(versions$status)
+
 stopifnot(
   "versions.csv has duplicate ver"        = !any(duplicated(versions$ver)),
   "unknown status in versions.csv"        = all(versions$status %in% c("released", "prerelease", "retired")),
+  "unknown access in versions.csv"        = all(versions$access %in% c("public", "restricted")),
   "current ver missing from versions.csv" = ver %in% versions$ver,
   "no released version to promote"        = any(versions$status == "released"))
 
+# The PROMOTED release -- what every app and the docs root show when the URL says
+# nothing -- can never sit behind a login. Asserted here on the registry, so a
+# `latest.txt` naming a restricted version cannot be written in the first place.
+promoted <- versions |> filter(status == "released") |> arrange(desc(released)) |> slice_head(n = 1)
+stopifnot("the newest released version (what latest.txt names) must be public" =
+            promoted$access == "public")
+
 # newest first, so a consumer can take the head without sorting
 versions <- versions |> arrange(desc(released))
-knitr::kable(versions |> select(ver, status, released, title))
+knitr::kable(versions |> select(ver, status, access, released, title))
 ```
 
 ## The manifest for this version
@@ -174,6 +196,7 @@ v_row <- versions |> filter(ver == !!ver)
 mfst  <- msens::manifest_build(
   con, ver,
   status       = v_row$status,
+  access       = v_row$access,
   base         = http_root,
   metrics      = scog,
   zone_tiles   = zone_tiles,
@@ -192,7 +215,7 @@ mfst  <- msens::manifest_build(
 dbDisconnect(con, shutdown = TRUE)
 
 cat(glue(
-  "ver={mfst$ver}  status={mfst$status}  grid={mfst$grid_id}  id_field={mfst$id_field}\n",
+  "ver={mfst$ver}  status={mfst$status}  access={mfst$access}  grid={mfst$grid_id}  id_field={mfst$id_field}\n",
   "tables={length(mfst$tables)}  metrics={nrow(mfst$metrics)}  zone_sets={nrow(mfst$zones)}\n"))
 knitr::kable(mfst$zones)
 ```
@@ -278,7 +301,14 @@ if (do_s3) {
   # (CalCOFI's index publisher learned this the expensive way)
   got <- msens::atlas_manifest(ver, base = http_root, refresh = TRUE)
   stopifnot("published manifest does not round-trip" = identical(got$ver, ver))
-  cat(glue("verified {http_root}/{ver}/manifest.json\n"))
+  # ...and the registry itself, read exactly as an app reads it: the `access` an
+  # app will enforce must be the `access` this notebook just wrote (a stale
+  # versions.json here would let the readers' fail-closed default hide a public
+  # pre-release, or an edited CSV fail to restrict one)
+  got_v <- msens::atlas_versions(base = http_root, refresh = TRUE)
+  stopifnot("published versions.json access does not match versions.csv" =
+              identical(got_v$access[match(versions$ver, got_v$ver)], versions$access))
+  cat(glue("verified {http_root}/{ver}/manifest.json and versions.json (access column)\n"))
 } else {
   cat("MANIFEST_NO_S3 set - staged locally only\n")
 }
@@ -296,6 +326,7 @@ msens::write_manifest(
   stats = list(
     ver          = ver,
     status       = mfst$status,
+    access       = mfst$access,
     grid_id      = mfst$grid_id,
     id_field     = mfst$id_field,
     n_versions   = nrow(versions),

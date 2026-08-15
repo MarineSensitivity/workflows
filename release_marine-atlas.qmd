@@ -60,6 +60,10 @@ do_s3_tbl <-  do_s3     || nzchar(Sys.getenv("RELEASE_S3_TABLES"))  # push deriv
 # the derived tables are ALSO served from local Parquet on the server (see the tables chunk);
 # DEPLOY_TABLES=1 refreshes just that, with no S3 push and no titiler/caddy restart.
 do_tables <- do_deploy || nzchar(Sys.getenv("DEPLOY_TABLES"))
+# the pre-release review gate (preview.marinesensitivity.org): force the docs-preview
+# sidecar to pull, and PROVE the gate with curl (see the two chunks at the end)
+do_docs   <- do_deploy || nzchar(Sys.getenv("DEPLOY_DOCS"))
+do_check_preview <- nzchar(Sys.getenv("CHECK_PREVIEW"))
 # server targets (parallel titiler-v8)
 srv_repo  <- "/share/github/MarineSensitivity/server"
 srv_viewdb<- glue("/share/data/big/{ver}/serve.duckdb")
@@ -526,9 +530,14 @@ as `/species/?ver=v7` and the app opened on its default taxon (MarineSensitivity
 
 Caddyfile-only changes had no reproducible home: the routing rode along with `RELEASE_DEPLOY`,
 which also rebuilds and force-recreates titiler. This flag is the narrow path — pull the server
-repo, restart caddy, nothing else. **`docker compose restart caddy`, not `caddy reload`**: the
-Caddyfile is a single-file bind mount, so a git pull replaces the inode and the running
-container keeps serving the file it opened at start.
+repo, (re)build the caddy image if its Dockerfile changed, **validate** the Caddyfile with that
+image, then restart caddy; nothing else. **`docker compose restart caddy`, not `caddy reload`**:
+the Caddyfile is a single-file bind mount, so a git pull replaces the inode and the running
+container keeps serving the file it opened at start. `up -d --build` alone is not enough for the
+same reason — it is a no-op when image and compose config are unchanged — so it is followed by
+an explicit restart. The validate step is what makes a typo in the Caddyfile a failed deploy
+rather than an outage: caddy will not start on a bad config, and `restart` would leave the box
+without its front door.
 
 ```{r}
 #| label: deploy-caddy
@@ -540,10 +549,13 @@ if (!do_caddy) {
   # than restart caddy onto the config it was already running.
   out_caddy <- system2("ssh", c("msens", shQuote(glue(
     "set -e; cd {srv_repo} && git fetch --quiet origin && git merge --ff-only origin/main && ",
-    "docker compose restart caddy && echo CADDY_OK $(git rev-parse --short HEAD)"))),
+    "docker compose build --quiet caddy && ",
+    "docker compose run --rm --no-deps -T caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null && ",
+    "docker compose up -d --no-deps caddy && docker compose restart caddy && ",
+    "echo CADDY_OK $(git rev-parse --short HEAD)"))),
     stdout = TRUE, stderr = TRUE)
   if (!any(grepl("CADDY_OK", out_caddy))) stop(paste(tail(out_caddy, 15), collapse = "\n"))
-  log_info("caddy restarted: {grep('CADDY_OK', out_caddy, value = TRUE)}")
+  log_info("caddy validated + restarted: {grep('CADDY_OK', out_caddy, value = TRUE)}")
 
   # PROVE THE REDIRECT KEEPS THE QUERY. `curl -sf` on a 301 is not a check — it follows
   # nothing and reports success on exactly the failure being fixed. Read the Location back
@@ -666,7 +678,15 @@ if (!do_apps) {
   apps_co  <- "/share/github/MarineSensitivity/apps_v8"   # main branch; symlinked as *_v8
   msens_co <- "/share/github/MarineSensitivity/msens"
   v8_apps  <- c("species", "scores")
-  touches  <- paste(sprintf("touch %s/%s/restart.txt", apps_co, v8_apps), collapse = "; ")
+  # BOTH instances of the one app: the public one (the checkout Shiny Server :3838
+  # serves) and the PREVIEW one (:3839; the wrapper app.R per app in the server
+  # repo, MS_PREVIEW=1, behind the signed-in preview host). Shiny Server watches
+  # restart.txt in the directory it SERVES, so the wrapper's own dir is what
+  # reloads the preview process -- touching the checkout alone would leave it
+  # running the old code.
+  touches  <- paste(c(sprintf("touch %s/%s/restart.txt", apps_co, v8_apps),
+                      sprintf("touch %s/rstudio/shiny_apps_preview/%s/restart.txt", srv_repo, v8_apps)),
+                    collapse = "; ")
   # `set -e` + explicit ff-only fetch (a silent `git pull --quiet` once left the app + msens
   # stale for hours). ALSO reinstall msens into the shiny/rstudio container: a stale container
   # msens lacked `cell_tile_url(mdl_key=)` and crashed the merged surface. Reload only the v8 apps.
@@ -677,7 +697,147 @@ if (!do_apps) {
               "{touches}; echo APPS_OK $(git -C {apps_co} rev-parse --short HEAD)")
   out <- system2("ssh", c("msens", shQuote(cmd)), stdout = TRUE, stderr = TRUE)
   if (!any(grepl("APPS_OK", out))) stop(paste(tail(out, 15), collapse = "\n"))
-  log_info("deployed v8 apps [{paste(v8_apps, collapse=', ')}] + reinstalled msens; v7 apps untouched: {tail(out,1)}")
+  log_info("deployed v8 apps [{paste(v8_apps, collapse=', ')}] on both instances (public + preview) + reinstalled msens: {tail(out,1)}")
+}
+```
+
+## Pull the restricted docs (`DEPLOY_DOCS=1`)
+
+The rendered books of **restricted** docs releases live on the docs repo's `gh-pages-preview`
+branch (GitHub Pages cannot be gated), cloned at `/share/docs_preview` and served by the
+signed-in preview vhost. The `docs-preview` compose sidecar polls that branch every 5 min, so
+normally nothing needs doing; this flag forces the pull now (a fresh clone if the branch was
+just created) and reports what is served.
+
+```{r}
+#| label: deploy-docs
+
+if (!do_docs) {
+  log_info("RELEASE_DEPLOY/DEPLOY_DOCS unset — docs-preview left to its own polling")
+} else {
+  # restarting the sidecar re-enters its loop, whose first act is clone-or-pull
+  out_docs <- system2("ssh", c("msens", shQuote(paste(
+    "set -e; docker restart docs-preview >/dev/null; sleep 20;",
+    "test -d /share/docs_preview/.git && echo DOCS_OK $(git -C /share/docs_preview rev-parse --short HEAD)",
+    "$(ls -d /share/docs_preview/v*/ 2>/dev/null | xargs -n1 basename | tr '\\n' ' ')",
+    "|| echo DOCS_NONE"))), stdout = TRUE, stderr = TRUE)
+  if (any(grepl("DOCS_NONE", out_docs)))
+    log_warn("docs-preview: no clone yet (gh-pages-preview branch absent?) — nothing served at /docs/ on the preview host")
+  else if (!any(grepl("DOCS_OK", out_docs))) stop(paste(tail(out_docs, 15), collapse = "\n"))
+  else log_info("docs-preview: {grep('DOCS_OK', out_docs, value = TRUE)}")
+}
+```
+
+## Prove the review gate (`CHECK_PREVIEW=1`)
+
+Checks that **cannot pass on broken input** — every one reads a sentinel or a status code and
+asserts on it, so a misrouted host or a leaked release fails the render. The apps put
+`<meta name="ms-ver">` / `<meta name="ms-preview">` in `<head>` for exactly this.
+
+- **public host, restricted version → NOT that version** (`ms-ver` = the promoted release,
+  `ms-preview` = 0); public versions render as themselves.
+- **preview host without a token → never 200** (Cloudflare Access 302s to its login; the
+  origin's `jwtauth` 401s). With a Cloudflare Access **service token**
+  (`CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` in the environment) → 200,
+  `ms-preview` = 1, `ms-ver` = the requested (restricted) version.
+- **origin-direct** (`--resolve` the preview hostname to this server's IP, bypassing
+  Cloudflare) → 401, never 200. This is what proves proxying only that hostname is safe.
+- **docs**: restricted versions 404 on GitHub Pages and (with a token) 200 on the preview host.
+
+Reachability failures (no DNS yet, no cert yet — Phase 0/1 of the plan) are **warned**, never
+counted as a pass; a 200 where the gate should hold is a hard stop.
+
+```{r}
+#| label: check-preview
+
+if (!do_check_preview) {
+  log_info("CHECK_PREVIEW unset — review-gate checks skipped")
+} else {
+  `%||%`    <- function(x, y) if (is.null(x)) y else x
+  vers      <- msens::atlas_versions(refresh = TRUE)
+  latest    <- msens::atlas_latest(refresh = TRUE)
+  prev_url  <- msens::atlas_preview_url()
+  prev_host <- sub("^https?://", "", prev_url)
+  restricted <- vers$ver[vers$access == "restricted"]
+  public     <- vers$ver[vers$access == "public"]
+  tok_id  <- Sys.getenv("CF_ACCESS_CLIENT_ID"); tok_sec <- Sys.getenv("CF_ACCESS_CLIENT_SECRET")
+  has_tok <- nzchar(tok_id) && nzchar(tok_sec)
+  tok_hdr <- if (has_tok) c("-H", shQuote(glue("CF-Access-Client-Id: {tok_id}")),
+                            "-H", shQuote(glue("CF-Access-Client-Secret: {tok_sec}"))) else character()
+  log_info("versions: restricted=[{paste(restricted, collapse=',')}] public=[{paste(public, collapse=',')}] latest={latest} token={has_tok}")
+
+  # one GET -> list(code, ms_ver, ms_preview, location, ok=reachable)
+  probe <- function(url, extra = character()) {
+    f <- tempfile(); on.exit(unlink(f))
+    out <- suppressWarnings(system2("curl", c("-sS", "-m", "90", "-o", shQuote(f),
+      "-w", shQuote("%{http_code} %{redirect_url}"), extra, shQuote(url)), stdout = TRUE, stderr = TRUE))
+    st <- attr(out, "status"); if (!is.null(st) && st != 0) return(list(ok = FALSE, err = paste(out, collapse = " ")))
+    w  <- strsplit(trimws(tail(out, 1)), " ")[[1]]
+    html <- if (file.exists(f)) paste(readLines(f, warn = FALSE), collapse = "\n") else ""
+    m <- function(nm) { r <- regmatches(html, regexec(sprintf('<meta name="%s" content="([^"]*)"', nm), html))[[1]]; if (length(r) > 1) r[2] else NA_character_ }
+    list(ok = TRUE, code = as.integer(w[1]), location = if (length(w) > 1) w[2] else "",
+         ms_ver = m("ms-ver"), ms_preview = m("ms-preview"), html = html)
+  }
+  fail <- character()
+  bad  <- function(msg) { fail <<- c(fail, msg); log_error(msg) }
+
+  # 1. the PUBLIC host never renders a restricted version; public ones render as themselves
+  for (a in c("scores", "species")) {
+    for (v in restricted) {
+      r <- probe(glue("https://app.marinesensitivity.org/{a}/?ver={v}"))
+      if (!r$ok) { bad(glue("public {a} ?ver={v}: unreachable ({r$err})")); next }
+      if (!identical(r$code, 200L) || !identical(r$ms_preview, "0") || identical(r$ms_ver, v))
+        bad(glue("LEAK: public {a} ?ver={v} -> code={r$code} ms-ver={r$ms_ver} ms-preview={r$ms_preview}"))
+      else log_info("public {a} ?ver={v} -> falls back to {r$ms_ver} (ok)")
+    }
+    for (v in public) {
+      r <- probe(glue("https://app.marinesensitivity.org/{a}/?ver={v}"))
+      if (!r$ok || !identical(r$code, 200L) || !identical(r$ms_ver, v))
+        bad(glue("public {a} ?ver={v} does not render {v}: ok={r$ok} code={r$code %||% NA} ms-ver={r$ms_ver %||% NA}"))
+    }
+  }
+
+  # 2. the preview host: closed without a token; open + preview=1 with one
+  origin_ip <- trimws(system2("dig", c("+short", "app.marinesensitivity.org"), stdout = TRUE))[1]
+  for (v in c(restricted, head(public, 1))) {
+    u <- glue("{prev_url}/scores/?ver={v}")
+    r <- probe(u)
+    if (!r$ok) log_warn("preview {u}: unreachable without token ({r$err}) — DNS/cert not in place yet?")
+    else if (identical(r$code, 200L)) bad(glue("OPEN: preview {u} answered 200 with no token"))
+    else log_info("preview {u} without token -> {r$code} {r$location} (closed)")
+    if (nzchar(origin_ip)) {
+      r0 <- probe(u, c("--resolve", shQuote(glue("{prev_host}:443:{origin_ip}"))))
+      if (!r0$ok) log_warn("origin-direct {u}: unreachable ({r0$err}) — no cert yet?")
+      else if (identical(r0$code, 200L)) bad(glue("OPEN: origin-direct {u} answered 200 (jwtauth not enforcing)"))
+      else log_info("origin-direct {u} -> {r0$code} (closed)")
+    }
+    if (has_tok) {
+      rt <- probe(u, tok_hdr)
+      if (!rt$ok || !identical(rt$code, 200L) || !identical(rt$ms_preview, "1") || !identical(rt$ms_ver, v))
+        bad(glue("preview {u} with token: ok={rt$ok} code={rt$code %||% NA} ms-ver={rt$ms_ver %||% NA} ms-preview={rt$ms_preview %||% NA}"))
+      else log_info("preview {u} with token -> {v}, preview=1 (ok)")
+    }
+  }
+
+  # 3. docs: restricted versions are NOT on GitHub Pages; with a token they are on the preview host
+  for (v in restricted) {
+    r <- probe(glue("https://marinesensitivity.org/docs/{v}/"))
+    if (r$ok && identical(r$code, 200L)) bad(glue("LEAK: docs {v} is still published on GitHub Pages"))
+    else log_info("docs {v} on GitHub Pages -> {r$code %||% 'unreachable'} (ok)")
+    if (has_tok) {
+      rt <- probe(glue("{prev_url}/docs/{v}/intro.html"), tok_hdr)
+      if (!rt$ok || !identical(rt$code, 200L) || !grepl(glue("documents release|>{v}</strong>"), rt$html))
+        bad(glue("preview docs {v}: ok={rt$ok} code={rt$code %||% NA} (intro sentence not found)"))
+      else log_info("preview docs {v} -> 200, documents {v} (ok)")
+    }
+  }
+  for (v in head(public, 2)) {
+    r <- probe(glue("https://marinesensitivity.org/docs/{v}/"))
+    if (!r$ok || !identical(r$code, 200L)) bad(glue("public docs {v} not served: {r$code %||% r$err}"))
+  }
+
+  if (length(fail)) stop("review-gate checks FAILED:\n  ", paste(fail, collapse = "\n  "))
+  log_info("review-gate checks passed ({length(restricted)} restricted, {length(public)} public; token={has_tok})")
 }
 ```
 

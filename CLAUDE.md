@@ -96,15 +96,36 @@ apples-to-apples), `SCORE_ALLBIRDS=1` (disable the marine-bird cull), `RELEASE_N
 (reload the Shiny apps; the `_V7` variant is vestigial post-cutover), `DEPLOY_TABLES=1` (sync `tables/` + `model_cell/` local + repoint
 the views), `DEPLOY_API=1` (pull the api repo + **rebuild** the plumber image — msens lives in that
 image, which is separate from `rstudio`, so `DEPLOY_APPS` never updates it),
-`DEPLOY_CADDY=1` (pull the server repo + `docker compose restart caddy` — the URL surface on its
-own, so a routing fix need not rebuild titiler; the retirement 301s live there, and they must
-carry `&{query}` or every published `?mdl_seq=` deep link loses its model id in flight),
+`DEPLOY_CADDY=1` (pull the server repo, `docker compose build caddy` (no-op unless its
+Dockerfile changed), **`caddy validate` the Caddyfile with that image**, then `up -d` + `restart
+caddy` — the URL surface on its own, so a routing fix need not rebuild titiler; the retirement
+301s live there, and they must carry `&{query}` or every published `?mdl_seq=` deep link loses
+its model id in flight), `DEPLOY_DOCS=1` (force the `docs-preview` sidecar to pull the docs
+repo's `gh-pages-preview` branch — the rendered books of *restricted* releases the preview host
+serves; it polls every 5 min anyway), `CHECK_PREVIEW=1` (curl-prove the review gate: public
+host never renders a restricted version, preview host is closed without a Cloudflare Access
+token and open with one, origin-direct is 401, restricted docs are off GitHub Pages),
 `DEPLOY_TITILER=1` (restart `titiler-v8` alone — **required after any `REDO_MERGED_COG` /
 `publish_native` run that repaints COGs**, because `native/*` keys are STABLE, so new bytes land
 under a URL whose header GDAL's `/vsicurl` has cached in-process; a shrunken COG then reads past
 EOF and z2–z4 return HTTP 500 while z5+ look fine),
 `REDO_MERGED_COG=1` (repaint just the merged whole-range COGs — what a re-merge invalidates,
 without `REDO_NATIVE`'s 7 GB IUCN gpkg rebuild and am re-sort).
+
+**The pre-release review gate (`preview.marinesensitivity.org`, 2026-08-15).** A release has
+`access` (`public` | `restricted`) beside `status` in `data/versions.csv` → `versions.json`; a
+`restricted` release (a pre-release under review by SDM providers / BOEM-NOAA colleagues) is
+served ONLY through the signed-in preview host (Cloudflare Access in front, Caddy `jwtauth`
+verifying the Access JWT at the origin). Enforcement in the apps is by **process, not header**:
+Shiny Server OSS opens its own websocket to the R worker, so no proxy header reaches
+`session$request` — instead a second Shiny Server block (`:3839`, `server/rstudio/shiny-server.conf`)
+serves 3-line wrapper apps that set `MS_PREVIEW=1`, and `msens::atlas_allow_access()` lets that
+process resolve restricted versions while the public `:3838` process cannot. Readers derive
+`access` fail-closed when a registry predates the field (`prerelease → restricted`), so **publish
+`versions.json` (`build_version_manifest`) BEFORE deploying an app/msens that reads it** or a
+public pre-release goes dark. Restricted docs are published by the docs CI to `gh-pages-preview`
+(GitHub Pages cannot be gated) and served from `/share/docs_preview`. Plan:
+`.claude/plans/2026-08-15 pre-release review gate — preview host + Cloudflare Access.md`.
 
 **Serving reads LOCAL Parquet, not S3.** S3 is the published artifact; the server keeps a versioned
 copy under `/share/data/big/{ver}/` and `serve.duckdb`'s views point there. Over HTTPS every query
