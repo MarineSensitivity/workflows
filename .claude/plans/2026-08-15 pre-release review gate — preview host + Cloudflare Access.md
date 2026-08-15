@@ -309,15 +309,38 @@ Learned: a wildcard `*.marinesensitivity.org → 100.25.173.0` already exists, s
 no DNS step for the dark deploy; `/share/docs_preview` must be chowned to uid 1000 (Docker creates
 bind sources root-owned).
 
+**Phase 0b (same day) — the path scheme + token binding.** msens 0.31.0 (`ver_token_sign/verify`,
+`preview_app_url/docs_url`, 28 tests), apps (hidden `ms_ver_token` input; `ver_of_session()`; preview
+picker links by path; no URL echo on preview), server (`preview_routes.caddy` + the functional test,
+`MS_TOKEN_SECRET` in `.env` → Renviron.site, verified reaching `su -l shiny`; caddy pinned 2.11.4;
+msens pin 0.31.0), docs (`doc_app_url()` path form for restricted), release notebook (routes test in
+`DEPLOY_CADDY`; `CHECK_PREVIEW` probes the path form and asserts the pre-path spelling is never 200).
+Verified: Chrome on the public host — the server rewrote `?ver=v6&probe=1` to `?ver=v6` (session bound
+to the token); in R — garbage token + client `?ver=v6` → v7, restricted-version token replayed on the
+public instance → v7, on preview → v9; on the server — `PREVIEW_ROUTES_OK` (401 without token;
+`/v8/scores/` → app, `ms-ver=v8`, `ms-preview=1`, identity in the badge; `?ver=v7` on `/v8/` overridden;
+sockjs + assets proxy; `/scores/?ver=v8` → 302 `/v8/scores/`, never proxied); `CHECK_PREVIEW` green.
+Gotcha met: query manipulation is `uri query <key> <value>` (no standalone `query` directive).
+
 ## Rollback
 
 - Access misbehaves → set `preview` DNS-only; the vhost then 401s everything (nothing leaks).
 - Cloudflare wholesale → point NS back to Squarespace (records were never deleted there).
 - Restricted → public: flip `access`, re-run `build_version_manifest` + docs CI; nothing else.
 
-## Open decision (raised by Ben 2026-08-15, during Phase 0): per-user, PER-VERSION access
+## Per-user, PER-VERSION access — ADOPTED 2026-08-15 (Ben: "hostname + path, e.g. /v9/, not ?ver=v9")
 
-**As built, authentication opens every restricted version**: one Access application covers the whole
+Implemented the same day (see the Phase 0 log): the preview host's URL scheme is
+`/{ver}/scores/`, `/{ver}/species/`, `/docs/{ver}/` (`server/caddy/preview_routes.caddy`, proven by
+`server/caddy/test/run.sh`, 15 assertions, run by `DEPLOY_CADDY`); the apps bind each session to the
+version its page was served for with `msens::ver_token_*` (0.31.0); `msens::preview_app_url()` is the
+single source of the URL shape (apps, docs, landing page, `CHECK_PREVIEW`). What remains is Phase 1's
+part: `access.sh` creates **one Access application per restricted version** (`/v9/*` + `/docs/v9/*`,
+its own reviewer policy) plus a catch-all for the landing page.
+
+The analysis that led here, kept for the record:
+
+**As built in Phase 0 proper, authentication opened every restricted version**: one Access application covers the whole
 host, the preview Shiny instance resolves any `access = restricted` version, and `/docs/{ver}/` serves
 every restricted book. A reviewer of v9 can also open v10.
 

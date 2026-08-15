@@ -120,7 +120,14 @@ verifying the Access JWT at the origin). Enforcement in the apps is by **process
 Shiny Server OSS opens its own websocket to the R worker, so no proxy header reaches
 `session$request` — instead a second Shiny Server block (`:3839`, `server/rstudio/shiny-server.conf`)
 serves 3-line wrapper apps that set `MS_PREVIEW=1`, and `msens::atlas_allow_access()` lets that
-process resolve restricted versions while the public `:3838` process cannot. Readers derive
+process resolve restricted versions while the public `:3838` process cannot. **On the preview host
+the version is the URL PATH** (`/v9/scores/`, `/v9/species/`, `/docs/v9/` —
+`msens::preview_app_url()`), never `?ver=`, because Cloudflare Access holds one reviewer policy per
+version and scopes it by path; `server/caddy/preview_routes.caddy` strips the prefix and forces
+`?ver=` for the app (`server/caddy/test/run.sh` proves the routes; `DEPLOY_CADDY` runs it). And the
+session renders the version its PAGE was served for: `ui(req)` embeds `msens::ver_token_sign(ver)`
+and the server trusts only that token (`ver_of_session()`), because `url_search`/`url_pathname`
+are client-supplied — a v9 reviewer must not steer the shared preview process to v10. Readers derive
 `access` fail-closed when a registry predates the field (`prerelease → restricted`), so **publish
 `versions.json` (`build_version_manifest`) BEFORE deploying an app/msens that reads it** or a
 public pre-release goes dark. Restricted docs are published by the docs CI to `gh-pages-preview`

@@ -557,6 +557,18 @@ if (!do_caddy) {
   if (!any(grepl("CADDY_OK", out_caddy))) stop(paste(tail(out_caddy, 15), collapse = "\n"))
   log_info("caddy validated + restarted: {grep('CADDY_OK', out_caddy, value = TRUE)}")
 
+  # PROVE THE PREVIEW ROUTES. caddy/test/run.sh starts a throwaway caddy from the
+  # same image importing the same routes file behind a test jwtauth, on the compose
+  # network, and asserts the URL scheme end to end (401 without a token, /v8/scores/
+  # renders v8 with ms-preview=1, ?ver= on that path is overridden, sockjs proxies,
+  # the pre-path spelling redirects and is never proxied). A routing regression is
+  # a failed deploy here, not a reviewer's bug report.
+  out_routes <- system2("ssh", c("msens", shQuote(glue("cd {srv_repo} && caddy/test/run.sh 2>&1"))),
+                        stdout = TRUE, stderr = TRUE)
+  cat(paste(out_routes, collapse = "\n"), "\n")
+  if (!any(grepl("PREVIEW_ROUTES_OK", out_routes))) stop("preview routes test failed (see above)")
+  log_info("preview routes test: PREVIEW_ROUTES_OK")
+
   # PROVE THE REDIRECT KEEPS THE QUERY. `curl -sf` on a 301 is not a check — it follows
   # nothing and reports success on exactly the failure being fixed. Read the Location back
   # and assert the model id survived it.
@@ -739,7 +751,9 @@ asserts on it, so a misrouted host or a leaked release fails the render. The app
 - **preview host without a token → never 200** (Cloudflare Access 302s to its login; the
   origin's `jwtauth` 401s). With a Cloudflare Access **service token**
   (`CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` in the environment) → 200,
-  `ms-preview` = 1, `ms-ver` = the requested (restricted) version.
+  `ms-preview` = 1, `ms-ver` = the requested (restricted) version. **The version is the PATH
+  there** (`/v9/scores/`, `msens::preview_app_url()`); the pre-path spelling `/scores/?ver=`
+  must redirect, never 200.
 - **origin-direct** (`--resolve` the preview hostname to this server's IP, bypassing
   Cloudflare) → 401, never 200. This is what proves proxying only that hostname is safe.
 - **docs**: restricted versions 404 on GitHub Pages and (with a token) 200 on the preview host.
@@ -800,7 +814,7 @@ if (!do_check_preview) {
   # 2. the preview host: closed without a token; open + preview=1 with one
   origin_ip <- trimws(system2("dig", c("+short", "app.marinesensitivity.org"), stdout = TRUE))[1]
   for (v in c(restricted, head(public, 1))) {
-    u <- glue("{prev_url}/scores/?ver={v}")
+    u <- msens::preview_app_url("scores", v)          # the version is the PATH on the preview host
     r <- probe(u)
     if (!r$ok) log_warn("preview {u}: unreachable without token ({r$err}) — DNS/cert not in place yet?")
     else if (identical(r$code, 200L)) bad(glue("OPEN: preview {u} answered 200 with no token"))
@@ -816,6 +830,11 @@ if (!do_check_preview) {
       if (!rt$ok || !identical(rt$code, 200L) || !identical(rt$ms_preview, "1") || !identical(rt$ms_ver, v))
         bad(glue("preview {u} with token: ok={rt$ok} code={rt$code %||% NA} ms-ver={rt$ms_ver %||% NA} ms-preview={rt$ms_preview %||% NA}"))
       else log_info("preview {u} with token -> {v}, preview=1 (ok)")
+      # the pre-path spelling must never be served: it would sit outside every
+      # per-version Access policy
+      rq <- probe(glue("{prev_url}/scores/?ver={v}"), tok_hdr)
+      if (rq$ok && identical(rq$code, 200L)) bad(glue("OPEN: {prev_url}/scores/?ver={v} answered 200 (unversioned path served)"))
+      else if (rq$ok) log_info("preview /scores/?ver={v} -> {rq$code} {rq$location} (redirected, ok)")
     }
   }
 
@@ -825,7 +844,7 @@ if (!do_check_preview) {
     if (r$ok && identical(r$code, 200L)) bad(glue("LEAK: docs {v} is still published on GitHub Pages"))
     else log_info("docs {v} on GitHub Pages -> {r$code %||% 'unreachable'} (ok)")
     if (has_tok) {
-      rt <- probe(glue("{prev_url}/docs/{v}/intro.html"), tok_hdr)
+      rt <- probe(paste0(msens::preview_docs_url(v), "intro.html"), tok_hdr)
       if (!rt$ok || !identical(rt$code, 200L) || !grepl(glue("documents release|>{v}</strong>"), rt$html))
         bad(glue("preview docs {v}: ok={rt$ok} code={rt$code %||% NA} (intro sentence not found)"))
       else log_info("preview docs {v} -> 200, documents {v} (ok)")
