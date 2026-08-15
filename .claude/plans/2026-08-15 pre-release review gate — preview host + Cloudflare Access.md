@@ -315,6 +315,36 @@ bind sources root-owned).
 - Cloudflare wholesale → point NS back to Squarespace (records were never deleted there).
 - Restricted → public: flip `access`, re-run `build_version_manifest` + docs CI; nothing else.
 
+## Open decision (raised by Ben 2026-08-15, during Phase 0): per-user, PER-VERSION access
+
+**As built, authentication opens every restricted version**: one Access application covers the whole
+host, the preview Shiny instance resolves any `access = restricted` version, and `/docs/{ver}/` serves
+every restricted book. A reviewer of v9 can also open v10.
+
+**Per-user-per-version needs two additions** (~half a day, best decided BEFORE Phase 1 creates the
+Access application, because it changes the URL scheme reviewers are given):
+
+1. **Version in the PATH on the preview host.** Cloudflare Access scopes applications by hostname +
+   path (wildcards) — never by query string. Docs already are (`/docs/v9/*`); the apps become
+   `preview…/v9/scores/…` and `/v9/species/…`: Caddy rewrites `/{ver}/{app}/*` → `/{app}/*` and
+   **forces** `?ver={ver}` on the page GET (any client `ver` is dropped). Then `access.sh` creates one
+   Access application per restricted version (`/v9/*` + `/docs/v9/*`) with its own Allow policy —
+   Access applies the most specific matching path — and a catch-all for the landing page. Reviewer
+   lists per version live in Cloudflare (or a private file beside `.env`), never in a public repo.
+2. **Bind the rendered version to the server-decided page.** `url_search` and `url_pathname` are
+   client-supplied over the websocket, so a v9 reviewer could otherwise steer the shared preview
+   process to v10. Fix: `ui(req)` (which sees Caddy's forced query) decides the version and embeds a
+   token signed with a per-process secret (`msens::ver_token()` / `ver_token_verify()`, ~30 lines +
+   tests); the server function trusts only `isolate(input$ms_ver_token)` (available at session start
+   from Shiny's init message, like `clientData`). This ALSO hardens the public instance against the
+   same steer, so it is worth doing regardless. Alternative rejected: one Shiny process per restricted
+   version (`MS_PREVIEW_VER`) — structural but a server block per release, i.e. config churn.
+
+Everything else stays: same host, one login, `access` still says *which* versions are restricted; the
+*who* per version becomes an Access policy per version. Follow-ons: landing page and `doc_app_url()`
+emit `/{ver}/scores/` for restricted versions; `CHECK_PREVIEW` gains a "v9 token cannot open v10"
+assertion. Per-user per-*dataset* within a version is a different axis (the restricted-datasets plan).
+
 ## Open items (not blocking; defaults in bold)
 
 - Host name: **`preview`** (vs `review`, `beta`). Session length: **24 h**.
