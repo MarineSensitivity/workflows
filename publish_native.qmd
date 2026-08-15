@@ -36,6 +36,13 @@ re-merge invalidates), `NATIVE_SKIP_AM` / `NATIVE_SKIP_PMTILES`,
 `NATIVE_REGISTRY_REBUILD=1` (publish ONLY what this run built — see the registry chunk; without it
 a skipped class is carried forward rather than deleted).
 
+> **`NATIVE_SKIP_AM` cannot be combined with a merged rebuild.** The am-only *aliases* — ~14,799
+> `ms_merge` registry rows pointing at an existing `native/am` COG — are derived from `am_reg`,
+> so skipping am empties their source and the `ms_merge` class comes out 21,584 → 6,785 rows.
+> `registry_merge()` refuses that as a shrink, which is the guard working, but the run has already
+> spent its time by then. Repaint merged COGs with `REDO_MERGED_COG=1` and leave am unskipped: am
+> is resumable by file existence, so an existing set costs one `file_exists` sweep.
+
 ## Design
 
 ```{mermaid}
@@ -783,25 +790,31 @@ if (nrow(amonly_multi) && dir_exists(am_parts)) {
   mm_rows <- list()
   for (i in seq_len(nrow(amonly_multi))) {
     key  <- amonly_multi$ms_merge_key[i]
-    mids <- am_map$mid[am_map$mdl_key %in% amonly_multi$mdl_keys[[i]]]
     out  <- glue("{dir_mm}/{safe_key(key)}.tif")
-    if (!length(mids)) next
-    globs <- paste(sprintf("'%s/mid=%d/*.parquet'", am_parts, mids), collapse = ", ")
-    d <- dbGetQuery(con, glue("
-      SELECT cell_id, max(val) AS val FROM read_parquet([{globs}]) GROUP BY 1"))
-    if (!nrow(d)) next
+    # Read the am partitions ONLY to build a COG that isn't there. This used to run
+    # unconditionally and re-derive the bbox from the cells even when the raster already
+    # existed -- a max GROUP BY over each taxon's global am surfaces, 192 taxa, ~4 h on a
+    # render that painted nothing. The check that follows the work has to come before it.
     if (!file_exists(out)) {
+      mids <- am_map$mid[am_map$mdl_key %in% amonly_multi$mdl_keys[[i]]]
+      if (!length(mids)) next
+      globs <- paste(sprintf("'%s/mid=%d/*.parquet'", am_parts, mids), collapse = ", ")
+      d <- dbGetQuery(con, glue("
+        SELECT cell_id, max(val) AS val FROM read_parquet([{globs}]) GROUP BY 1"))
+      if (!nrow(d)) next
       msens::publish_cog(d$cell_id, d$val, out, grid_mm,
                          datatype = "INT1U", nodata = 0, overview = FALSE)
       built_mm <- built_mm + 1L
     }
-    # bbox from the cells themselves, same convention as the other COG rows
-    ll <- msens::cell_lonlat(d$cell_id, grid_mm)
+    # bbox off the PUBLISHED raster, so the registry describes the artifact a client will
+    # fetch rather than a parallel derivation of it (and matches the edge convention the
+    # am / vec_grid rows use). This is also what DEPLOY_TITILER compares the served bounds to.
+    e <- terra::ext(terra::rast(out))
     mm_rows[[length(mm_rows) + 1]] <- tibble(
       ms_merge_key = key, mdl_key = key, ds_key = "ms_merge",
       asset_type = "cog", representation = "model",
       asset_url = glue("{s3_http}/native/merged/{safe_key(key)}.tif"),
-      xmin = min(ll$lon), xmax = max(ll$lon), ymin = min(ll$lat), ymax = max(ll$lat),
+      xmin = e$xmin, xmax = e$xmax, ymin = e$ymin, ymax = e$ymax,
       rescale_min = 1L, rescale_max = 100L, colormap = "spectral_r")
   }
   if (length(mm_rows)) {
