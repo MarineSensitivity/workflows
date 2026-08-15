@@ -595,19 +595,43 @@ if (!do_titiler) {
   if (!any(grepl("TITILER_OK", out_tt))) stop(paste(tail(out_tt, 15), collapse = "\n"))
   log_info("titiler-{ver} restarted: {grep('TITILER_OK', out_tt, value = TRUE)}")
 
+  # WAIT FOR READY before asserting anything. A container that has been asked to restart is not
+  # a container that is serving: the first version of this check queried /cog/info immediately,
+  # got an empty body back, and reported STALE HEADERS on COGs that were in fact correct. An
+  # unavailable service and a wrong answer are different failures and must not share an outcome.
+  tt_base <- sub("/msens$", "", titiler_v8)
+  ready <- FALSE
+  for (i in 1:30) {
+    code <- system2("curl", c("-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "10",
+                              shQuote(glue("{tt_base}/healthz"))), stdout = TRUE)
+    if (identical(code, "200")) { ready <- TRUE; break }
+    Sys.sleep(5)
+  }
+  if (!ready) stop(glue("titiler-{ver} did not answer /healthz within 150s of restarting"))
+  log_info("titiler-{ver} healthy after {i} probe(s)")
+
   # served bounds == registry bounds, on a sample of merged COGs
   c0 <- dbConnect(duckdb(sdm_db, read_only = TRUE))
   chk <- dbGetQuery(c0, "SELECT mdl_key, asset_url, ymin, ymax FROM native_asset
     WHERE ds_key = 'ms_merge' AND asset_type = 'cog' AND ymin IS NOT NULL
     ORDER BY mdl_key LIMIT 5")
   dbDisconnect(c0, shutdown = TRUE)
-  tt_base <- sub("/msens$", "", titiler_v8)
   bad <- character()
   for (i in seq_len(nrow(chk))) {
-    js <- system2("curl", c("-s", "--retry", "3", shQuote(glue(
-      "{tt_base}/cog/info?url={URLencode(chk$asset_url[i], reserved = TRUE)}"))), stdout = TRUE)
-    b <- tryCatch(jsonlite::fromJSON(paste(js, collapse = ""))$bounds, error = function(e) NULL)
-    if (is.null(b) || length(b) != 4) { bad <- c(bad, glue("{chk$mdl_key[i]}: no bounds")); next }
+    # retry the READ separately: a missing answer is "ask again", only a mismatched answer is
+    # a finding. --retry alone does not cover a 200 with an unparseable body.
+    b <- NULL
+    for (try in 1:3) {
+      js <- system2("curl", c("-s", "--max-time", "60", "--retry", "2", "--retry-all-errors",
+        shQuote(glue("{tt_base}/cog/info?url={URLencode(chk$asset_url[i], reserved = TRUE)}"))),
+        stdout = TRUE)
+      b <- tryCatch(jsonlite::fromJSON(paste(js, collapse = ""))$bounds, error = function(e) NULL)
+      if (!is.null(b) && length(b) == 4) break
+      Sys.sleep(5)
+    }
+    if (is.null(b) || length(b) != 4) {
+      bad <- c(bad, glue("{chk$mdl_key[i]}: no bounds after 3 tries")); next
+    }
     # 0.05 deg grid: agreement to a hundredth of a degree is exact, not approximate
     if (abs(b[2] - chk$ymin[i]) > 0.01 || abs(b[4] - chk$ymax[i]) > 0.01)
       bad <- c(bad, glue("{chk$mdl_key[i]}: served [{round(b[2],2)}, {round(b[4],2)}] != ",
