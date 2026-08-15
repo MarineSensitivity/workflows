@@ -6,7 +6,7 @@
 
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
 
-<meta name="dcterms.date" content="2026-08-12">
+<meta name="dcterms.date" content="2026-08-15">
 
 <title>Build the version registry (latest.txt, versions.json, manifest.json)</title>
 <style>
@@ -156,7 +156,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
     <div>
     <div class="quarto-title-meta-heading">Published</div>
     <div class="quarto-title-meta-contents">
-      <p class="date">2026-08-12</p>
+      <p class="date">2026-08-15</p>
     </div>
   </div>
   
@@ -188,7 +188,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 </tr>
 <tr class="even">
 <td><code>marine-atlas/versions.json</code></td>
-<td>which versions exist, and whether each is showable</td>
+<td>which versions exist, whether each is showable, and to whom (<code>access</code>)</td>
 </tr>
 <tr class="odd">
 <td><code>marine-atlas/{ver}/manifest.json</code></td>
@@ -206,7 +206,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <details class="code-fold">
 <summary>Code</summary>
 <div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb1"><pre class="sourceCode default code-with-copy"><code class="sourceCode default"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a>flowchart LR</span>
-<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>  csv["data/versions.csv&lt;br/&gt;(curated: status, date, title)"] --&gt; vj["versions.json"]</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>  csv["data/versions.csv&lt;br/&gt;(curated: status, access, date, title)"] --&gt; vj["versions.json"]</span>
 <span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>  db[("{ver}/sdm.duckdb")] --&gt; mb["msens::manifest_build()&lt;br/&gt;introspects tables, metrics,&lt;br/&gt;zones, public model id"]</span>
 <span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>  mb --&gt; mj["{ver}/manifest.json"]</span>
 <span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>  vj --&gt; s3[["s3://…/marine-atlas/"]]</span>
@@ -220,7 +220,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <div aria-describedby="fig-design-caption-0ceaefa1-69ba-4598-a22c-09a6ac19f8ca">
 <div>
 <pre class="mermaid mermaid-js" data-label="fig-design">flowchart LR
-  csv["data/versions.csv&lt;br/&gt;(curated: status, date, title)"] --&gt; vj["versions.json"]
+  csv["data/versions.csv&lt;br/&gt;(curated: status, access, date, title)"] --&gt; vj["versions.json"]
   db[("{ver}/sdm.duckdb")] --&gt; mb["msens::manifest_build()&lt;br/&gt;introspects tables, metrics,&lt;br/&gt;zones, public model id"]
   mb --&gt; mj["{ver}/manifest.json"]
   vj --&gt; s3[["s3://…/marine-atlas/"]]
@@ -265,28 +265,48 @@ Figure&nbsp;1: Curated registry + release introspection → the three published 
 <section id="the-curated-version-registry" class="level2" data-number="3">
 <h2 data-number="3" class="anchored" data-anchor-id="the-curated-version-registry"><span class="header-section-number">3</span> The curated version registry</h2>
 <p>Release <em>status</em> and <em>dates</em> are editorial facts — they cannot be introspected from a database, and they must not be guessed. They live in a committed CSV so the registry is reviewable in a diff, and so the apps, the versioned docs and the storage index all read one source rather than three.</p>
-<p>Deliberately a <strong>registry, not a changelog</strong>: <code>ver</code>, <code>status</code>, <code>released</code>, <code>title</code> and nothing more. What each release <em>changed</em> is prose, it already lives in the docs timeline, and a second copy here would drift from it — which is the very problem the versioned-docs work exists to fix.</p>
+<p>Deliberately a <strong>registry, not a changelog</strong>: <code>ver</code>, <code>status</code>, <code>access</code>, <code>released</code>, <code>title</code> and nothing more. What each release <em>changed</em> is prose, it already lives in the docs timeline, and a second copy here would drift from it — which is the very problem the versioned-docs work exists to fix.</p>
+<p><code>status</code> and <code>access</code> are <strong>separate axes</strong>: <code>status</code> says where a release is in its life (<code>prerelease</code> / <code>released</code> / <code>retired</code>); <code>access</code> says <em>who may be shown it</em> (<code>public</code> / <code>restricted</code>). A pre-release under review by SDM data providers and BOEM/NOAA colleagues is <code>restricted</code> — the apps and docs serve it only through the signed-in <code>preview.marinesensitivity.org</code> host (<code>msens::atlas_allow_access()</code>), while retired releases stay <code>public</code> because citations point at them. The column is written explicitly here; a reader that meets a <code>versions.json</code> predating it derives <code>access</code> fail-closed (<code>prerelease → restricted</code>, see <code>msens::atlas_access_default()</code>), so the column being present with <code>public</code> is what keeps a public pre-release public.</p>
 <div class="cell">
 <details class="code-fold">
 <summary>Code</summary>
 <div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb3"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a>versions <span class="ot">&lt;-</span> readr<span class="sc">::</span><span class="fu">read_csv</span>(here<span class="sc">::</span><span class="fu">here</span>(<span class="st">"data/versions.csv"</span>), <span class="at">show_col_types =</span> <span class="cn">FALSE</span>)</span>
 <span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="fu">stopifnot</span>(</span>
-<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>  <span class="st">"versions.csv has duplicate ver"</span>        <span class="ot">=</span> <span class="sc">!</span><span class="fu">any</span>(<span class="fu">duplicated</span>(versions<span class="sc">$</span>ver)),</span>
-<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>  <span class="st">"unknown status in versions.csv"</span>        <span class="ot">=</span> <span class="fu">all</span>(versions<span class="sc">$</span>status <span class="sc">%in%</span> <span class="fu">c</span>(<span class="st">"released"</span>, <span class="st">"prerelease"</span>, <span class="st">"retired"</span>)),</span>
-<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>  <span class="st">"current ver missing from versions.csv"</span> <span class="ot">=</span> ver <span class="sc">%in%</span> versions<span class="sc">$</span>ver,</span>
-<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>  <span class="st">"no released version to promote"</span>        <span class="ot">=</span> <span class="fu">any</span>(versions<span class="sc">$</span>status <span class="sc">==</span> <span class="st">"released"</span>))</span>
-<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="co"># newest first, so a consumer can take the head without sorting</span></span>
-<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>versions <span class="ot">&lt;-</span> versions <span class="sc">|&gt;</span> <span class="fu">arrange</span>(<span class="fu">desc</span>(released))</span>
-<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>knitr<span class="sc">::</span><span class="fu">kable</span>(versions <span class="sc">|&gt;</span> <span class="fu">select</span>(ver, status, released, title))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="co"># a registry that predates the column gets the same fail-closed default the readers apply</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (<span class="sc">!</span><span class="st">"access"</span> <span class="sc">%in%</span> <span class="fu">names</span>(versions)) versions<span class="sc">$</span>access <span class="ot">&lt;-</span> msens<span class="sc">::</span><span class="fu">atlas_access_default</span>(versions<span class="sc">$</span>status)</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="fu">stopifnot</span>(</span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>  <span class="st">"versions.csv has duplicate ver"</span>        <span class="ot">=</span> <span class="sc">!</span><span class="fu">any</span>(<span class="fu">duplicated</span>(versions<span class="sc">$</span>ver)),</span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>  <span class="st">"unknown status in versions.csv"</span>        <span class="ot">=</span> <span class="fu">all</span>(versions<span class="sc">$</span>status <span class="sc">%in%</span> <span class="fu">c</span>(<span class="st">"released"</span>, <span class="st">"prerelease"</span>, <span class="st">"retired"</span>)),</span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>  <span class="st">"unknown access in versions.csv"</span>        <span class="ot">=</span> <span class="fu">all</span>(versions<span class="sc">$</span>access <span class="sc">%in%</span> <span class="fu">c</span>(<span class="st">"public"</span>, <span class="st">"restricted"</span>)),</span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>  <span class="st">"current ver missing from versions.csv"</span> <span class="ot">=</span> ver <span class="sc">%in%</span> versions<span class="sc">$</span>ver,</span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>  <span class="st">"no released version to promote"</span>        <span class="ot">=</span> <span class="fu">any</span>(versions<span class="sc">$</span>status <span class="sc">==</span> <span class="st">"released"</span>))</span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="co"># The PROMOTED release -- what every app and the docs root show when the URL says</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="co"># nothing -- can never sit behind a login. Asserted here on the registry, so a</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="co"># `latest.txt` naming a restricted version cannot be written in the first place.</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>promoted <span class="ot">&lt;-</span> versions <span class="sc">|&gt;</span> <span class="fu">filter</span>(status <span class="sc">==</span> <span class="st">"released"</span>) <span class="sc">|&gt;</span> <span class="fu">arrange</span>(<span class="fu">desc</span>(released)) <span class="sc">|&gt;</span> <span class="fu">slice_head</span>(<span class="at">n =</span> <span class="dv">1</span>)</span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a><span class="fu">stopifnot</span>(<span class="st">"the newest released version (what latest.txt names) must be public"</span> <span class="ot">=</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>            promoted<span class="sc">$</span>access <span class="sc">==</span> <span class="st">"public"</span>)</span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a><span class="co"># newest first, so a consumer can take the head without sorting</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>versions <span class="ot">&lt;-</span> versions <span class="sc">|&gt;</span> <span class="fu">arrange</span>(<span class="fu">desc</span>(released))</span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>knitr<span class="sc">::</span><span class="fu">kable</span>(versions <span class="sc">|&gt;</span> <span class="fu">select</span>(ver, status, access, released, title))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </details>
 <div class="cell-output-display">
 <table class="caption-top table table-sm table-striped small">
+<colgroup>
+<col style="width: 5%">
+<col style="width: 15%">
+<col style="width: 9%">
+<col style="width: 15%">
+<col style="width: 53%">
+</colgroup>
 <thead>
 <tr class="header">
 <th style="text-align: left;">ver</th>
 <th style="text-align: left;">status</th>
+<th style="text-align: left;">access</th>
 <th style="text-align: left;">released</th>
 <th style="text-align: left;">title</th>
 </tr>
@@ -295,54 +315,63 @@ Figure&nbsp;1: Curated registry + release introspection → the three published 
 <tr class="odd">
 <td style="text-align: left;">v8</td>
 <td style="text-align: left;">prerelease</td>
+<td style="text-align: left;">public</td>
 <td style="text-align: left;">2026-07-28</td>
 <td style="text-align: left;">Marine Atlas</td>
 </tr>
 <tr class="even">
 <td style="text-align: left;">v7</td>
 <td style="text-align: left;">released</td>
+<td style="text-align: left;">public</td>
 <td style="text-align: left;">2026-06-12</td>
 <td style="text-align: left;">Validity decoupled from Program Areas</td>
 </tr>
 <tr class="odd">
 <td style="text-align: left;">v6</td>
 <td style="text-align: left;">retired</td>
+<td style="text-align: left;">public</td>
 <td style="text-align: left;">2026-04-09</td>
 <td style="text-align: left;">IUCN range outside US EEZ</td>
 </tr>
 <tr class="even">
 <td style="text-align: left;">v5</td>
 <td style="text-align: left;">retired</td>
+<td style="text-align: left;">public</td>
 <td style="text-align: left;">2026-03-24</td>
 <td style="text-align: left;">MMPA spatial floor</td>
 </tr>
 <tr class="odd">
 <td style="text-align: left;">v4b</td>
 <td style="text-align: left;">retired</td>
+<td style="text-align: left;">public</td>
 <td style="text-align: left;">2026-03-19</td>
 <td style="text-align: left;">Turtle multiplicative merge</td>
 </tr>
 <tr class="even">
 <td style="text-align: left;">v4</td>
 <td style="text-align: left;">retired</td>
+<td style="text-align: left;">public</td>
 <td style="text-align: left;">2026-03-01</td>
 <td style="text-align: left;">SWOT sea turtles</td>
 </tr>
 <tr class="odd">
 <td style="text-align: left;">v3</td>
 <td style="text-align: left;">retired</td>
+<td style="text-align: left;">public</td>
 <td style="text-align: left;">2026-02-01</td>
 <td style="text-align: left;">Merged models + extinction risk</td>
 </tr>
 <tr class="even">
 <td style="text-align: left;">v2</td>
 <td style="text-align: left;">retired</td>
+<td style="text-align: left;">public</td>
 <td style="text-align: left;">2026-01-01</td>
 <td style="text-align: left;">Program Areas</td>
 </tr>
 <tr class="odd">
 <td style="text-align: left;">v1</td>
 <td style="text-align: left;">retired</td>
+<td style="text-align: left;">public</td>
 <td style="text-align: left;">2023-09-01</td>
 <td style="text-align: left;">Planning Areas</td>
 </tr>
@@ -423,29 +452,30 @@ Figure&nbsp;1: Curated registry + release introspection → the three published 
 <span id="cb4-64"><a href="#cb4-64" aria-hidden="true" tabindex="-1"></a>mfst  <span class="ot">&lt;-</span> msens<span class="sc">::</span><span class="fu">manifest_build</span>(</span>
 <span id="cb4-65"><a href="#cb4-65" aria-hidden="true" tabindex="-1"></a>  con, ver,</span>
 <span id="cb4-66"><a href="#cb4-66" aria-hidden="true" tabindex="-1"></a>  <span class="at">status       =</span> v_row<span class="sc">$</span>status,</span>
-<span id="cb4-67"><a href="#cb4-67" aria-hidden="true" tabindex="-1"></a>  <span class="at">base         =</span> http_root,</span>
-<span id="cb4-68"><a href="#cb4-68" aria-hidden="true" tabindex="-1"></a>  <span class="at">metrics      =</span> scog,</span>
-<span id="cb4-69"><a href="#cb4-69" aria-hidden="true" tabindex="-1"></a>  <span class="at">zone_tiles   =</span> zone_tiles,</span>
-<span id="cb4-70"><a href="#cb4-70" aria-hidden="true" tabindex="-1"></a>  <span class="at">capabilities =</span> caps_override,</span>
-<span id="cb4-71"><a href="#cb4-71" aria-hidden="true" tabindex="-1"></a>  <span class="at">extra  =</span> <span class="fu">list</span>(</span>
-<span id="cb4-72"><a href="#cb4-72" aria-hidden="true" tabindex="-1"></a>    <span class="at">title    =</span> v_row<span class="sc">$</span>title,</span>
-<span id="cb4-73"><a href="#cb4-73" aria-hidden="true" tabindex="-1"></a>    <span class="at">released =</span> <span class="fu">as.character</span>(v_row<span class="sc">$</span>released),</span>
-<span id="cb4-74"><a href="#cb4-74" aria-hidden="true" tabindex="-1"></a>    <span class="at">overlays =</span> overlays,</span>
-<span id="cb4-75"><a href="#cb4-75" aria-hidden="true" tabindex="-1"></a>    <span class="co"># score COGs and the vintage-labelled zone-set registry arrive in later</span></span>
-<span id="cb4-76"><a href="#cb4-76" aria-hidden="true" tabindex="-1"></a>    <span class="co"># phases; until then the manifest declares what is true today, and</span></span>
-<span id="cb4-77"><a href="#cb4-77" aria-hidden="true" tabindex="-1"></a>    <span class="co"># `capabilities$score_cogs` stays FALSE so no app promises a layer it</span></span>
-<span id="cb4-78"><a href="#cb4-78" aria-hidden="true" tabindex="-1"></a>    <span class="co"># cannot draw.</span></span>
-<span id="cb4-79"><a href="#cb4-79" aria-hidden="true" tabindex="-1"></a>    <span class="at">grid     =</span> <span class="fu">as.list</span>(msens<span class="sc">::</span><span class="fu">grid_spec_for</span>(msens<span class="sc">::</span><span class="fu">grid_for_ver</span>(ver))[</span>
-<span id="cb4-80"><a href="#cb4-80" aria-hidden="true" tabindex="-1"></a>                 <span class="fu">c</span>(<span class="st">"nc"</span>, <span class="st">"nr"</span>, <span class="st">"xmin"</span>, <span class="st">"ymax"</span>, <span class="st">"resx"</span>, <span class="st">"resy"</span>, <span class="st">"lon360"</span>)])))</span>
-<span id="cb4-81"><a href="#cb4-81" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb4-82"><a href="#cb4-82" aria-hidden="true" tabindex="-1"></a><span class="fu">dbDisconnect</span>(con, <span class="at">shutdown =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb4-83"><a href="#cb4-83" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb4-84"><a href="#cb4-84" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span>(<span class="fu">glue</span>(</span>
-<span id="cb4-85"><a href="#cb4-85" aria-hidden="true" tabindex="-1"></a>  <span class="st">"ver={mfst$ver}  status={mfst$status}  grid={mfst$grid_id}  id_field={mfst$id_field}</span><span class="sc">\n</span><span class="st">"</span>,</span>
-<span id="cb4-86"><a href="#cb4-86" aria-hidden="true" tabindex="-1"></a>  <span class="st">"tables={length(mfst$tables)}  metrics={nrow(mfst$metrics)}  zone_sets={nrow(mfst$zones)}</span><span class="sc">\n</span><span class="st">"</span>))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<span id="cb4-67"><a href="#cb4-67" aria-hidden="true" tabindex="-1"></a>  <span class="at">access       =</span> v_row<span class="sc">$</span>access,</span>
+<span id="cb4-68"><a href="#cb4-68" aria-hidden="true" tabindex="-1"></a>  <span class="at">base         =</span> http_root,</span>
+<span id="cb4-69"><a href="#cb4-69" aria-hidden="true" tabindex="-1"></a>  <span class="at">metrics      =</span> scog,</span>
+<span id="cb4-70"><a href="#cb4-70" aria-hidden="true" tabindex="-1"></a>  <span class="at">zone_tiles   =</span> zone_tiles,</span>
+<span id="cb4-71"><a href="#cb4-71" aria-hidden="true" tabindex="-1"></a>  <span class="at">capabilities =</span> caps_override,</span>
+<span id="cb4-72"><a href="#cb4-72" aria-hidden="true" tabindex="-1"></a>  <span class="at">extra  =</span> <span class="fu">list</span>(</span>
+<span id="cb4-73"><a href="#cb4-73" aria-hidden="true" tabindex="-1"></a>    <span class="at">title    =</span> v_row<span class="sc">$</span>title,</span>
+<span id="cb4-74"><a href="#cb4-74" aria-hidden="true" tabindex="-1"></a>    <span class="at">released =</span> <span class="fu">as.character</span>(v_row<span class="sc">$</span>released),</span>
+<span id="cb4-75"><a href="#cb4-75" aria-hidden="true" tabindex="-1"></a>    <span class="at">overlays =</span> overlays,</span>
+<span id="cb4-76"><a href="#cb4-76" aria-hidden="true" tabindex="-1"></a>    <span class="co"># score COGs and the vintage-labelled zone-set registry arrive in later</span></span>
+<span id="cb4-77"><a href="#cb4-77" aria-hidden="true" tabindex="-1"></a>    <span class="co"># phases; until then the manifest declares what is true today, and</span></span>
+<span id="cb4-78"><a href="#cb4-78" aria-hidden="true" tabindex="-1"></a>    <span class="co"># `capabilities$score_cogs` stays FALSE so no app promises a layer it</span></span>
+<span id="cb4-79"><a href="#cb4-79" aria-hidden="true" tabindex="-1"></a>    <span class="co"># cannot draw.</span></span>
+<span id="cb4-80"><a href="#cb4-80" aria-hidden="true" tabindex="-1"></a>    <span class="at">grid     =</span> <span class="fu">as.list</span>(msens<span class="sc">::</span><span class="fu">grid_spec_for</span>(msens<span class="sc">::</span><span class="fu">grid_for_ver</span>(ver))[</span>
+<span id="cb4-81"><a href="#cb4-81" aria-hidden="true" tabindex="-1"></a>                 <span class="fu">c</span>(<span class="st">"nc"</span>, <span class="st">"nr"</span>, <span class="st">"xmin"</span>, <span class="st">"ymax"</span>, <span class="st">"resx"</span>, <span class="st">"resy"</span>, <span class="st">"lon360"</span>)])))</span>
+<span id="cb4-82"><a href="#cb4-82" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-83"><a href="#cb4-83" aria-hidden="true" tabindex="-1"></a><span class="fu">dbDisconnect</span>(con, <span class="at">shutdown =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb4-84"><a href="#cb4-84" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-85"><a href="#cb4-85" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span>(<span class="fu">glue</span>(</span>
+<span id="cb4-86"><a href="#cb4-86" aria-hidden="true" tabindex="-1"></a>  <span class="st">"ver={mfst$ver}  status={mfst$status}  access={mfst$access}  grid={mfst$grid_id}  id_field={mfst$id_field}</span><span class="sc">\n</span><span class="st">"</span>,</span>
+<span id="cb4-87"><a href="#cb4-87" aria-hidden="true" tabindex="-1"></a>  <span class="st">"tables={length(mfst$tables)}  metrics={nrow(mfst$metrics)}  zone_sets={nrow(mfst$zones)}</span><span class="sc">\n</span><span class="st">"</span>))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </details>
 <div class="cell-output cell-output-stdout">
-<pre><code>ver=v8  status=prerelease  grid=global05  id_field=mdl_key
+<pre><code>ver=v8  status=prerelease  access=public  grid=global05  id_field=mdl_key
 tables=13  metrics=102  zone_sets=3</code></pre>
 </div>
 <details class="code-fold">
@@ -556,6 +586,9 @@ tables=13  metrics=102  zone_sets=3</code></pre>
 
 $status
 [1] "prerelease"
+
+$access
+[1] "public"
 
 $grid_id
 [1] "global05"
@@ -1308,6 +1341,9 @@ $grid$lon360
 
 $status
 [1] "prerelease"
+
+$access
+[1] "public"
 
 $grid_id
 [1] "global05"
@@ -2101,13 +2137,20 @@ $grid$lon360
 <span id="cb16-21"><a href="#cb16-21" aria-hidden="true" tabindex="-1"></a>  <span class="co"># (CalCOFI's index publisher learned this the expensive way)</span></span>
 <span id="cb16-22"><a href="#cb16-22" aria-hidden="true" tabindex="-1"></a>  got <span class="ot">&lt;-</span> msens<span class="sc">::</span><span class="fu">atlas_manifest</span>(ver, <span class="at">base =</span> http_root, <span class="at">refresh =</span> <span class="cn">TRUE</span>)</span>
 <span id="cb16-23"><a href="#cb16-23" aria-hidden="true" tabindex="-1"></a>  <span class="fu">stopifnot</span>(<span class="st">"published manifest does not round-trip"</span> <span class="ot">=</span> <span class="fu">identical</span>(got<span class="sc">$</span>ver, ver))</span>
-<span id="cb16-24"><a href="#cb16-24" aria-hidden="true" tabindex="-1"></a>  <span class="fu">cat</span>(<span class="fu">glue</span>(<span class="st">"verified {http_root}/{ver}/manifest.json</span><span class="sc">\n</span><span class="st">"</span>))</span>
-<span id="cb16-25"><a href="#cb16-25" aria-hidden="true" tabindex="-1"></a>} <span class="cf">else</span> {</span>
-<span id="cb16-26"><a href="#cb16-26" aria-hidden="true" tabindex="-1"></a>  <span class="fu">cat</span>(<span class="st">"MANIFEST_NO_S3 set - staged locally only</span><span class="sc">\n</span><span class="st">"</span>)</span>
-<span id="cb16-27"><a href="#cb16-27" aria-hidden="true" tabindex="-1"></a>}</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<span id="cb16-24"><a href="#cb16-24" aria-hidden="true" tabindex="-1"></a>  <span class="co"># ...and the registry itself, read exactly as an app reads it: the `access` an</span></span>
+<span id="cb16-25"><a href="#cb16-25" aria-hidden="true" tabindex="-1"></a>  <span class="co"># app will enforce must be the `access` this notebook just wrote (a stale</span></span>
+<span id="cb16-26"><a href="#cb16-26" aria-hidden="true" tabindex="-1"></a>  <span class="co"># versions.json here would let the readers' fail-closed default hide a public</span></span>
+<span id="cb16-27"><a href="#cb16-27" aria-hidden="true" tabindex="-1"></a>  <span class="co"># pre-release, or an edited CSV fail to restrict one)</span></span>
+<span id="cb16-28"><a href="#cb16-28" aria-hidden="true" tabindex="-1"></a>  got_v <span class="ot">&lt;-</span> msens<span class="sc">::</span><span class="fu">atlas_versions</span>(<span class="at">base =</span> http_root, <span class="at">refresh =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb16-29"><a href="#cb16-29" aria-hidden="true" tabindex="-1"></a>  <span class="fu">stopifnot</span>(<span class="st">"published versions.json access does not match versions.csv"</span> <span class="ot">=</span></span>
+<span id="cb16-30"><a href="#cb16-30" aria-hidden="true" tabindex="-1"></a>              <span class="fu">identical</span>(got_v<span class="sc">$</span>access[<span class="fu">match</span>(versions<span class="sc">$</span>ver, got_v<span class="sc">$</span>ver)], versions<span class="sc">$</span>access))</span>
+<span id="cb16-31"><a href="#cb16-31" aria-hidden="true" tabindex="-1"></a>  <span class="fu">cat</span>(<span class="fu">glue</span>(<span class="st">"verified {http_root}/{ver}/manifest.json and versions.json (access column)</span><span class="sc">\n</span><span class="st">"</span>))</span>
+<span id="cb16-32"><a href="#cb16-32" aria-hidden="true" tabindex="-1"></a>} <span class="cf">else</span> {</span>
+<span id="cb16-33"><a href="#cb16-33" aria-hidden="true" tabindex="-1"></a>  <span class="fu">cat</span>(<span class="st">"MANIFEST_NO_S3 set - staged locally only</span><span class="sc">\n</span><span class="st">"</span>)</span>
+<span id="cb16-34"><a href="#cb16-34" aria-hidden="true" tabindex="-1"></a>}</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </details>
 <div class="cell-output cell-output-stdout">
-<pre><code>verified https://s3.us-east-1.amazonaws.com/oceanmetrics.io-public/marine-atlas/v8/manifest.json</code></pre>
+<pre><code>verified https://s3.us-east-1.amazonaws.com/oceanmetrics.io-public/marine-atlas/v8/manifest.json and versions.json (access column)</code></pre>
 </div>
 </div>
 </section>
@@ -2123,14 +2166,15 @@ $grid$lon360
 <span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">stats =</span> <span class="fu">list</span>(</span>
 <span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">ver          =</span> ver,</span>
 <span id="cb18-7"><a href="#cb18-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">status       =</span> mfst<span class="sc">$</span>status,</span>
-<span id="cb18-8"><a href="#cb18-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">grid_id      =</span> mfst<span class="sc">$</span>grid_id,</span>
-<span id="cb18-9"><a href="#cb18-9" aria-hidden="true" tabindex="-1"></a>    <span class="at">id_field     =</span> mfst<span class="sc">$</span>id_field,</span>
-<span id="cb18-10"><a href="#cb18-10" aria-hidden="true" tabindex="-1"></a>    <span class="at">n_versions   =</span> <span class="fu">nrow</span>(versions),</span>
-<span id="cb18-11"><a href="#cb18-11" aria-hidden="true" tabindex="-1"></a>    <span class="at">n_metrics    =</span> <span class="fu">nrow</span>(mfst<span class="sc">$</span>metrics),</span>
-<span id="cb18-12"><a href="#cb18-12" aria-hidden="true" tabindex="-1"></a>    <span class="at">n_zone_sets  =</span> <span class="fu">nrow</span>(mfst<span class="sc">$</span>zones),</span>
-<span id="cb18-13"><a href="#cb18-13" aria-hidden="true" tabindex="-1"></a>    <span class="at">latest       =</span> latest,</span>
-<span id="cb18-14"><a href="#cb18-14" aria-hidden="true" tabindex="-1"></a>    <span class="at">promoted     =</span> promote),</span>
-<span id="cb18-15"><a href="#cb18-15" aria-hidden="true" tabindex="-1"></a>  <span class="at">force =</span> msens<span class="sc">::</span><span class="fu">force_target</span>(<span class="st">"build_version_manifest"</span>))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<span id="cb18-8"><a href="#cb18-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">access       =</span> mfst<span class="sc">$</span>access,</span>
+<span id="cb18-9"><a href="#cb18-9" aria-hidden="true" tabindex="-1"></a>    <span class="at">grid_id      =</span> mfst<span class="sc">$</span>grid_id,</span>
+<span id="cb18-10"><a href="#cb18-10" aria-hidden="true" tabindex="-1"></a>    <span class="at">id_field     =</span> mfst<span class="sc">$</span>id_field,</span>
+<span id="cb18-11"><a href="#cb18-11" aria-hidden="true" tabindex="-1"></a>    <span class="at">n_versions   =</span> <span class="fu">nrow</span>(versions),</span>
+<span id="cb18-12"><a href="#cb18-12" aria-hidden="true" tabindex="-1"></a>    <span class="at">n_metrics    =</span> <span class="fu">nrow</span>(mfst<span class="sc">$</span>metrics),</span>
+<span id="cb18-13"><a href="#cb18-13" aria-hidden="true" tabindex="-1"></a>    <span class="at">n_zone_sets  =</span> <span class="fu">nrow</span>(mfst<span class="sc">$</span>zones),</span>
+<span id="cb18-14"><a href="#cb18-14" aria-hidden="true" tabindex="-1"></a>    <span class="at">latest       =</span> latest,</span>
+<span id="cb18-15"><a href="#cb18-15" aria-hidden="true" tabindex="-1"></a>    <span class="at">promoted     =</span> promote),</span>
+<span id="cb18-16"><a href="#cb18-16" aria-hidden="true" tabindex="-1"></a>  <span class="at">force =</span> msens<span class="sc">::</span><span class="fu">force_target</span>(<span class="st">"build_version_manifest"</span>))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </details>
 </div>
 <!-- -->
@@ -2613,7 +2657,7 @@ $grid$lon360
 <span id="cb19-21"><a href="#cb19-21" aria-hidden="true" tabindex="-1"></a><span class="pp">|</span> file <span class="pp">|</span> what it settles <span class="pp">|</span></span>
 <span id="cb19-22"><a href="#cb19-22" aria-hidden="true" tabindex="-1"></a><span class="pp">|---|---|</span></span>
 <span id="cb19-23"><a href="#cb19-23" aria-hidden="true" tabindex="-1"></a><span class="pp">|</span> <span class="in">`marine-atlas/latest.txt`</span> <span class="pp">|</span> which version an app shows when the URL says nothing <span class="pp">|</span></span>
-<span id="cb19-24"><a href="#cb19-24" aria-hidden="true" tabindex="-1"></a><span class="pp">|</span> <span class="in">`marine-atlas/versions.json`</span> <span class="pp">|</span> which versions exist, and whether each is showable <span class="pp">|</span></span>
+<span id="cb19-24"><a href="#cb19-24" aria-hidden="true" tabindex="-1"></a><span class="pp">|</span> <span class="in">`marine-atlas/versions.json`</span> <span class="pp">|</span> which versions exist, whether each is showable, and to whom (<span class="in">`access`</span>) <span class="pp">|</span></span>
 <span id="cb19-25"><a href="#cb19-25" aria-hidden="true" tabindex="-1"></a><span class="pp">|</span> <span class="in">`marine-atlas/{ver}/manifest.json`</span> <span class="pp">|</span> everything needed to *render* that version <span class="pp">|</span></span>
 <span id="cb19-26"><a href="#cb19-26" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb19-27"><a href="#cb19-27" aria-hidden="true" tabindex="-1"></a>The manifest is the contract: publishing v9 means publishing a manifest, **not** editing an app.</span>
@@ -2630,7 +2674,7 @@ $grid$lon360
 <span id="cb19-40"><a href="#cb19-40" aria-hidden="true" tabindex="-1"></a>%%| label: fig-design</span>
 <span id="cb19-41"><a href="#cb19-41" aria-hidden="true" tabindex="-1"></a>%%| fig-cap: <span class="ot">"</span><span class="st">Curated registry + release introspection → the three published registry files</span><span class="ot">"</span></span>
 <span id="cb19-42"><a href="#cb19-42" aria-hidden="true" tabindex="-1"></a>flowchart LR</span>
-<span id="cb19-43"><a href="#cb19-43" aria-hidden="true" tabindex="-1"></a>  csv[<span class="ot">"</span><span class="st">data/versions.csv&lt;br/&gt;(curated: status, date, title)</span><span class="ot">"</span>] --&gt; vj[<span class="ot">"</span><span class="st">versions.json</span><span class="ot">"</span>]</span>
+<span id="cb19-43"><a href="#cb19-43" aria-hidden="true" tabindex="-1"></a>  csv[<span class="ot">"</span><span class="st">data/versions.csv&lt;br/&gt;(curated: status, access, date, title)</span><span class="ot">"</span>] --&gt; vj[<span class="ot">"</span><span class="st">versions.json</span><span class="ot">"</span>]</span>
 <span id="cb19-44"><a href="#cb19-44" aria-hidden="true" tabindex="-1"></a>  db[(<span class="ot">"</span><span class="st">{ver}/sdm.duckdb</span><span class="ot">"</span>)] --&gt; mb[<span class="ot">"</span><span class="st">msens::manifest_build()&lt;br/&gt;introspects tables, metrics,&lt;br/&gt;zones, public model id</span><span class="ot">"</span>]</span>
 <span id="cb19-45"><a href="#cb19-45" aria-hidden="true" tabindex="-1"></a>  mb --&gt; mj[<span class="ot">"</span><span class="st">{ver}/manifest.json</span><span class="ot">"</span>]</span>
 <span id="cb19-46"><a href="#cb19-46" aria-hidden="true" tabindex="-1"></a>  vj --&gt; s3[[<span class="ot">"</span><span class="st">s3://…/marine-atlas/</span><span class="ot">"</span>]]</span>
@@ -2669,234 +2713,265 @@ $grid$lon360
 <span id="cb19-81"><a href="#cb19-81" aria-hidden="true" tabindex="-1"></a>they must not be guessed. They live in a committed CSV so the registry is reviewable in a diff, and</span>
 <span id="cb19-82"><a href="#cb19-82" aria-hidden="true" tabindex="-1"></a>so the apps, the versioned docs and the storage index all read one source rather than three.</span>
 <span id="cb19-83"><a href="#cb19-83" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-84"><a href="#cb19-84" aria-hidden="true" tabindex="-1"></a>Deliberately a **registry, not a changelog**: <span class="in">`ver`</span>, <span class="in">`status`</span>, <span class="in">`released`</span>, <span class="in">`title`</span> and nothing more.</span>
-<span id="cb19-85"><a href="#cb19-85" aria-hidden="true" tabindex="-1"></a>What each release *changed* is prose, it already lives in the docs timeline, and a second copy here</span>
-<span id="cb19-86"><a href="#cb19-86" aria-hidden="true" tabindex="-1"></a>would drift from it — which is the very problem the versioned-docs work exists to fix.</span>
-<span id="cb19-87"><a href="#cb19-87" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-90"><a href="#cb19-90" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb19-91"><a href="#cb19-91" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: versions</span></span>
-<span id="cb19-92"><a href="#cb19-92" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-93"><a href="#cb19-93" aria-hidden="true" tabindex="-1"></a>versions <span class="ot">&lt;-</span> readr<span class="sc">::</span><span class="fu">read_csv</span>(here<span class="sc">::</span><span class="fu">here</span>(<span class="st">"data/versions.csv"</span>), <span class="at">show_col_types =</span> <span class="cn">FALSE</span>)</span>
-<span id="cb19-94"><a href="#cb19-94" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-95"><a href="#cb19-95" aria-hidden="true" tabindex="-1"></a><span class="fu">stopifnot</span>(</span>
-<span id="cb19-96"><a href="#cb19-96" aria-hidden="true" tabindex="-1"></a>  <span class="st">"versions.csv has duplicate ver"</span>        <span class="ot">=</span> <span class="sc">!</span><span class="fu">any</span>(<span class="fu">duplicated</span>(versions<span class="sc">$</span>ver)),</span>
-<span id="cb19-97"><a href="#cb19-97" aria-hidden="true" tabindex="-1"></a>  <span class="st">"unknown status in versions.csv"</span>        <span class="ot">=</span> <span class="fu">all</span>(versions<span class="sc">$</span>status <span class="sc">%in%</span> <span class="fu">c</span>(<span class="st">"released"</span>, <span class="st">"prerelease"</span>, <span class="st">"retired"</span>)),</span>
-<span id="cb19-98"><a href="#cb19-98" aria-hidden="true" tabindex="-1"></a>  <span class="st">"current ver missing from versions.csv"</span> <span class="ot">=</span> ver <span class="sc">%in%</span> versions<span class="sc">$</span>ver,</span>
-<span id="cb19-99"><a href="#cb19-99" aria-hidden="true" tabindex="-1"></a>  <span class="st">"no released version to promote"</span>        <span class="ot">=</span> <span class="fu">any</span>(versions<span class="sc">$</span>status <span class="sc">==</span> <span class="st">"released"</span>))</span>
-<span id="cb19-100"><a href="#cb19-100" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-101"><a href="#cb19-101" aria-hidden="true" tabindex="-1"></a><span class="co"># newest first, so a consumer can take the head without sorting</span></span>
-<span id="cb19-102"><a href="#cb19-102" aria-hidden="true" tabindex="-1"></a>versions <span class="ot">&lt;-</span> versions <span class="sc">|&gt;</span> <span class="fu">arrange</span>(<span class="fu">desc</span>(released))</span>
-<span id="cb19-103"><a href="#cb19-103" aria-hidden="true" tabindex="-1"></a>knitr<span class="sc">::</span><span class="fu">kable</span>(versions <span class="sc">|&gt;</span> <span class="fu">select</span>(ver, status, released, title))</span>
-<span id="cb19-104"><a href="#cb19-104" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb19-84"><a href="#cb19-84" aria-hidden="true" tabindex="-1"></a>Deliberately a **registry, not a changelog**: <span class="in">`ver`</span>, <span class="in">`status`</span>, <span class="in">`access`</span>, <span class="in">`released`</span>, <span class="in">`title`</span> and</span>
+<span id="cb19-85"><a href="#cb19-85" aria-hidden="true" tabindex="-1"></a>nothing more. What each release *changed* is prose, it already lives in the docs timeline, and a</span>
+<span id="cb19-86"><a href="#cb19-86" aria-hidden="true" tabindex="-1"></a>second copy here would drift from it — which is the very problem the versioned-docs work exists to</span>
+<span id="cb19-87"><a href="#cb19-87" aria-hidden="true" tabindex="-1"></a>fix.</span>
+<span id="cb19-88"><a href="#cb19-88" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-89"><a href="#cb19-89" aria-hidden="true" tabindex="-1"></a><span class="in">`status`</span> and <span class="in">`access`</span> are **separate axes**: <span class="in">`status`</span> says where a release is in its life</span>
+<span id="cb19-90"><a href="#cb19-90" aria-hidden="true" tabindex="-1"></a>(<span class="in">`prerelease`</span> / <span class="in">`released`</span> / <span class="in">`retired`</span>); <span class="in">`access`</span> says *who may be shown it* (<span class="in">`public`</span> /</span>
+<span id="cb19-91"><a href="#cb19-91" aria-hidden="true" tabindex="-1"></a><span class="in">`restricted`</span>). A pre-release under review by SDM data providers and BOEM/NOAA colleagues is</span>
+<span id="cb19-92"><a href="#cb19-92" aria-hidden="true" tabindex="-1"></a><span class="in">`restricted`</span> — the apps and docs serve it only through the signed-in</span>
+<span id="cb19-93"><a href="#cb19-93" aria-hidden="true" tabindex="-1"></a><span class="in">`preview.marinesensitivity.org`</span> host (<span class="in">`msens::atlas_allow_access()`</span>), while retired releases stay</span>
+<span id="cb19-94"><a href="#cb19-94" aria-hidden="true" tabindex="-1"></a><span class="in">`public`</span> because citations point at them. The column is written explicitly here; a reader that</span>
+<span id="cb19-95"><a href="#cb19-95" aria-hidden="true" tabindex="-1"></a>meets a <span class="in">`versions.json`</span> predating it derives <span class="in">`access`</span> fail-closed (<span class="in">`prerelease → restricted`</span>, see</span>
+<span id="cb19-96"><a href="#cb19-96" aria-hidden="true" tabindex="-1"></a><span class="in">`msens::atlas_access_default()`</span>), so the column being present with <span class="in">`public`</span> is what keeps a</span>
+<span id="cb19-97"><a href="#cb19-97" aria-hidden="true" tabindex="-1"></a>public pre-release public.</span>
+<span id="cb19-98"><a href="#cb19-98" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-101"><a href="#cb19-101" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb19-102"><a href="#cb19-102" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: versions</span></span>
+<span id="cb19-103"><a href="#cb19-103" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-104"><a href="#cb19-104" aria-hidden="true" tabindex="-1"></a>versions <span class="ot">&lt;-</span> readr<span class="sc">::</span><span class="fu">read_csv</span>(here<span class="sc">::</span><span class="fu">here</span>(<span class="st">"data/versions.csv"</span>), <span class="at">show_col_types =</span> <span class="cn">FALSE</span>)</span>
 <span id="cb19-105"><a href="#cb19-105" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-106"><a href="#cb19-106" aria-hidden="true" tabindex="-1"></a><span class="fu">## The manifest for this version</span></span>
-<span id="cb19-107"><a href="#cb19-107" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-108"><a href="#cb19-108" aria-hidden="true" tabindex="-1"></a><span class="in">`msens::manifest_build()`</span> *introspects* the release rather than being told about it — which model</span>
-<span id="cb19-109"><a href="#cb19-109" aria-hidden="true" tabindex="-1"></a>id is public (<span class="in">`mdl_key`</span> from v8, <span class="in">`mdl_seq`</span> before it), which tables exist, which metrics are</span>
-<span id="cb19-110"><a href="#cb19-110" aria-hidden="true" tabindex="-1"></a>cell-level, which spatial units were scored. That is what keeps a manifest from drifting from the</span>
-<span id="cb19-111"><a href="#cb19-111" aria-hidden="true" tabindex="-1"></a>data it describes, and it is why capabilities derive from **presence** and default to FALSE: a</span>
-<span id="cb19-112"><a href="#cb19-112" aria-hidden="true" tabindex="-1"></a>release without <span class="in">`cell_model`</span> must not advertise a per-cell species list.</span>
-<span id="cb19-113"><a href="#cb19-113" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-116"><a href="#cb19-116" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb19-117"><a href="#cb19-117" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: manifest</span></span>
-<span id="cb19-118"><a href="#cb19-118" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-119"><a href="#cb19-119" aria-hidden="true" tabindex="-1"></a>con <span class="ot">&lt;-</span> <span class="fu">dbConnect</span>(<span class="fu">duckdb</span>(), <span class="fu">path.expand</span>(sdm_db), <span class="at">read_only =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb19-120"><a href="#cb19-120" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-121"><a href="#cb19-121" aria-hidden="true" tabindex="-1"></a><span class="co"># Some surfaces are NOT tables in the build database, and are not on S3 either.</span></span>
-<span id="cb19-122"><a href="#cb19-122" aria-hidden="true" tabindex="-1"></a><span class="co"># v8's `cell_model` (the per-cell species list) is a partitioned Parquet</span></span>
-<span id="cb19-123"><a href="#cb19-123" aria-hidden="true" tabindex="-1"></a><span class="co"># DIRECTORY that lives only on the server — deliberately, since its per-cell and</span></span>
-<span id="cb19-124"><a href="#cb19-124" aria-hidden="true" tabindex="-1"></a><span class="co"># per-polygon queries touch many partitions and fail outright over HTTPS. So:</span></span>
-<span id="cb19-125"><a href="#cb19-125" aria-hidden="true" tabindex="-1"></a><span class="co">#   - deriving from `con` alone advertises cell_species_list = FALSE and switches</span></span>
-<span id="cb19-126"><a href="#cb19-126" aria-hidden="true" tabindex="-1"></a><span class="co">#     off a panel that works today;</span></span>
-<span id="cb19-127"><a href="#cb19-127" aria-hidden="true" tabindex="-1"></a><span class="co">#   - checking S3 also says FALSE, because it is intentionally not published there.</span></span>
-<span id="cb19-128"><a href="#cb19-128" aria-hidden="true" tabindex="-1"></a><span class="co"># The authoritative test is the SERVING surface on the server. Check it there</span></span>
-<span id="cb19-129"><a href="#cb19-129" aria-hidden="true" tabindex="-1"></a><span class="co"># (read-only) and print the answer, so a manifest built from a laptop describes</span></span>
-<span id="cb19-130"><a href="#cb19-130" aria-hidden="true" tabindex="-1"></a><span class="co"># the release rather than the laptop.</span></span>
-<span id="cb19-131"><a href="#cb19-131" aria-hidden="true" tabindex="-1"></a>srv_has <span class="ot">&lt;-</span> <span class="cf">function</span>(path) {</span>
-<span id="cb19-132"><a href="#cb19-132" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="fu">dir.exists</span>(<span class="fu">path.expand</span>(<span class="fu">glue</span>(<span class="st">"{dir_big_v}/{path}"</span>)))) <span class="fu">return</span>(<span class="cn">TRUE</span>)   <span class="co"># running ON the server</span></span>
-<span id="cb19-133"><a href="#cb19-133" aria-hidden="true" tabindex="-1"></a>  out <span class="ot">&lt;-</span> <span class="fu">suppressWarnings</span>(<span class="fu">system2</span>(</span>
-<span id="cb19-134"><a href="#cb19-134" aria-hidden="true" tabindex="-1"></a>    <span class="st">"ssh"</span>, <span class="fu">c</span>(<span class="st">"-o"</span>, <span class="st">"ConnectTimeout=15"</span>, <span class="st">"msens"</span>,</span>
-<span id="cb19-135"><a href="#cb19-135" aria-hidden="true" tabindex="-1"></a>             <span class="fu">shQuote</span>(<span class="fu">glue</span>(<span class="st">"test -e /share/data/big/{ver}/{path} &amp;&amp; echo yes || echo no"</span>))),</span>
-<span id="cb19-136"><a href="#cb19-136" aria-hidden="true" tabindex="-1"></a>    <span class="at">stdout =</span> <span class="cn">TRUE</span>, <span class="at">stderr =</span> <span class="cn">FALSE</span>))</span>
-<span id="cb19-137"><a href="#cb19-137" aria-hidden="true" tabindex="-1"></a>  <span class="fu">isTRUE</span>(<span class="fu">any</span>(<span class="fu">grepl</span>(<span class="st">"^yes$"</span>, <span class="fu">trimws</span>(out))))</span>
-<span id="cb19-138"><a href="#cb19-138" aria-hidden="true" tabindex="-1"></a>}</span>
-<span id="cb19-139"><a href="#cb19-139" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-140"><a href="#cb19-140" aria-hidden="true" tabindex="-1"></a>caps_override <span class="ot">&lt;-</span> <span class="fu">list</span>(<span class="at">cell_species_list =</span> <span class="fu">srv_has</span>(<span class="st">"cell_model"</span>))</span>
-<span id="cb19-141"><a href="#cb19-141" aria-hidden="true" tabindex="-1"></a><span class="fu">message</span>(<span class="fu">glue</span>(<span class="st">"serving surface check: cell_model present = {caps_override$cell_species_list}"</span>))</span>
+<span id="cb19-106"><a href="#cb19-106" aria-hidden="true" tabindex="-1"></a><span class="co"># a registry that predates the column gets the same fail-closed default the readers apply</span></span>
+<span id="cb19-107"><a href="#cb19-107" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (<span class="sc">!</span><span class="st">"access"</span> <span class="sc">%in%</span> <span class="fu">names</span>(versions)) versions<span class="sc">$</span>access <span class="ot">&lt;-</span> msens<span class="sc">::</span><span class="fu">atlas_access_default</span>(versions<span class="sc">$</span>status)</span>
+<span id="cb19-108"><a href="#cb19-108" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-109"><a href="#cb19-109" aria-hidden="true" tabindex="-1"></a><span class="fu">stopifnot</span>(</span>
+<span id="cb19-110"><a href="#cb19-110" aria-hidden="true" tabindex="-1"></a>  <span class="st">"versions.csv has duplicate ver"</span>        <span class="ot">=</span> <span class="sc">!</span><span class="fu">any</span>(<span class="fu">duplicated</span>(versions<span class="sc">$</span>ver)),</span>
+<span id="cb19-111"><a href="#cb19-111" aria-hidden="true" tabindex="-1"></a>  <span class="st">"unknown status in versions.csv"</span>        <span class="ot">=</span> <span class="fu">all</span>(versions<span class="sc">$</span>status <span class="sc">%in%</span> <span class="fu">c</span>(<span class="st">"released"</span>, <span class="st">"prerelease"</span>, <span class="st">"retired"</span>)),</span>
+<span id="cb19-112"><a href="#cb19-112" aria-hidden="true" tabindex="-1"></a>  <span class="st">"unknown access in versions.csv"</span>        <span class="ot">=</span> <span class="fu">all</span>(versions<span class="sc">$</span>access <span class="sc">%in%</span> <span class="fu">c</span>(<span class="st">"public"</span>, <span class="st">"restricted"</span>)),</span>
+<span id="cb19-113"><a href="#cb19-113" aria-hidden="true" tabindex="-1"></a>  <span class="st">"current ver missing from versions.csv"</span> <span class="ot">=</span> ver <span class="sc">%in%</span> versions<span class="sc">$</span>ver,</span>
+<span id="cb19-114"><a href="#cb19-114" aria-hidden="true" tabindex="-1"></a>  <span class="st">"no released version to promote"</span>        <span class="ot">=</span> <span class="fu">any</span>(versions<span class="sc">$</span>status <span class="sc">==</span> <span class="st">"released"</span>))</span>
+<span id="cb19-115"><a href="#cb19-115" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-116"><a href="#cb19-116" aria-hidden="true" tabindex="-1"></a><span class="co"># The PROMOTED release -- what every app and the docs root show when the URL says</span></span>
+<span id="cb19-117"><a href="#cb19-117" aria-hidden="true" tabindex="-1"></a><span class="co"># nothing -- can never sit behind a login. Asserted here on the registry, so a</span></span>
+<span id="cb19-118"><a href="#cb19-118" aria-hidden="true" tabindex="-1"></a><span class="co"># `latest.txt` naming a restricted version cannot be written in the first place.</span></span>
+<span id="cb19-119"><a href="#cb19-119" aria-hidden="true" tabindex="-1"></a>promoted <span class="ot">&lt;-</span> versions <span class="sc">|&gt;</span> <span class="fu">filter</span>(status <span class="sc">==</span> <span class="st">"released"</span>) <span class="sc">|&gt;</span> <span class="fu">arrange</span>(<span class="fu">desc</span>(released)) <span class="sc">|&gt;</span> <span class="fu">slice_head</span>(<span class="at">n =</span> <span class="dv">1</span>)</span>
+<span id="cb19-120"><a href="#cb19-120" aria-hidden="true" tabindex="-1"></a><span class="fu">stopifnot</span>(<span class="st">"the newest released version (what latest.txt names) must be public"</span> <span class="ot">=</span></span>
+<span id="cb19-121"><a href="#cb19-121" aria-hidden="true" tabindex="-1"></a>            promoted<span class="sc">$</span>access <span class="sc">==</span> <span class="st">"public"</span>)</span>
+<span id="cb19-122"><a href="#cb19-122" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-123"><a href="#cb19-123" aria-hidden="true" tabindex="-1"></a><span class="co"># newest first, so a consumer can take the head without sorting</span></span>
+<span id="cb19-124"><a href="#cb19-124" aria-hidden="true" tabindex="-1"></a>versions <span class="ot">&lt;-</span> versions <span class="sc">|&gt;</span> <span class="fu">arrange</span>(<span class="fu">desc</span>(released))</span>
+<span id="cb19-125"><a href="#cb19-125" aria-hidden="true" tabindex="-1"></a>knitr<span class="sc">::</span><span class="fu">kable</span>(versions <span class="sc">|&gt;</span> <span class="fu">select</span>(ver, status, access, released, title))</span>
+<span id="cb19-126"><a href="#cb19-126" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb19-127"><a href="#cb19-127" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-128"><a href="#cb19-128" aria-hidden="true" tabindex="-1"></a><span class="fu">## The manifest for this version</span></span>
+<span id="cb19-129"><a href="#cb19-129" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-130"><a href="#cb19-130" aria-hidden="true" tabindex="-1"></a><span class="in">`msens::manifest_build()`</span> *introspects* the release rather than being told about it — which model</span>
+<span id="cb19-131"><a href="#cb19-131" aria-hidden="true" tabindex="-1"></a>id is public (<span class="in">`mdl_key`</span> from v8, <span class="in">`mdl_seq`</span> before it), which tables exist, which metrics are</span>
+<span id="cb19-132"><a href="#cb19-132" aria-hidden="true" tabindex="-1"></a>cell-level, which spatial units were scored. That is what keeps a manifest from drifting from the</span>
+<span id="cb19-133"><a href="#cb19-133" aria-hidden="true" tabindex="-1"></a>data it describes, and it is why capabilities derive from **presence** and default to FALSE: a</span>
+<span id="cb19-134"><a href="#cb19-134" aria-hidden="true" tabindex="-1"></a>release without <span class="in">`cell_model`</span> must not advertise a per-cell species list.</span>
+<span id="cb19-135"><a href="#cb19-135" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-138"><a href="#cb19-138" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb19-139"><a href="#cb19-139" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: manifest</span></span>
+<span id="cb19-140"><a href="#cb19-140" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-141"><a href="#cb19-141" aria-hidden="true" tabindex="-1"></a>con <span class="ot">&lt;-</span> <span class="fu">dbConnect</span>(<span class="fu">duckdb</span>(), <span class="fu">path.expand</span>(sdm_db), <span class="at">read_only =</span> <span class="cn">TRUE</span>)</span>
 <span id="cb19-142"><a href="#cb19-142" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-143"><a href="#cb19-143" aria-hidden="true" tabindex="-1"></a><span class="co"># score COGs, when published: their presence is what flips capabilities$score_cogs,</span></span>
-<span id="cb19-144"><a href="#cb19-144" aria-hidden="true" tabindex="-1"></a><span class="co"># so the app only offers a raster layer once the raster exists</span></span>
-<span id="cb19-145"><a href="#cb19-145" aria-hidden="true" tabindex="-1"></a>f_scog   <span class="ot">&lt;-</span> <span class="fu">path.expand</span>(<span class="fu">glue</span>(<span class="st">"{dir_big_v}/tables/score_cog.parquet"</span>))</span>
-<span id="cb19-146"><a href="#cb19-146" aria-hidden="true" tabindex="-1"></a>scog_all <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="fu">file.exists</span>(f_scog)) arrow<span class="sc">::</span><span class="fu">read_parquet</span>(f_scog) <span class="cf">else</span> <span class="cn">NULL</span></span>
-<span id="cb19-147"><a href="#cb19-147" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-148"><a href="#cb19-148" aria-hidden="true" tabindex="-1"></a><span class="co"># `_`-prefixed keys are OVERLAYS, not metrics: the app's "cells outside Program</span></span>
-<span id="cb19-149"><a href="#cb19-149" aria-hidden="true" tabindex="-1"></a><span class="co"># Areas" mask is a raster it draws but not a quantity it scores. They must be</span></span>
-<span id="cb19-150"><a href="#cb19-150" aria-hidden="true" tabindex="-1"></a><span class="co"># separated, because manifest_build() left-joins metrics onto the release's</span></span>
-<span id="cb19-151"><a href="#cb19-151" aria-hidden="true" tabindex="-1"></a><span class="co"># `metric` table -- an overlay has no row there and was silently dropped.</span></span>
-<span id="cb19-152"><a href="#cb19-152" aria-hidden="true" tabindex="-1"></a>scog <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="sc">!</span><span class="fu">is.null</span>(scog_all))</span>
-<span id="cb19-153"><a href="#cb19-153" aria-hidden="true" tabindex="-1"></a>  scog_all <span class="sc">|&gt;</span> <span class="fu">filter</span>(<span class="sc">!</span><span class="fu">startsWith</span>(metric_key, <span class="st">"_"</span>)) <span class="sc">|&gt;</span></span>
-<span id="cb19-154"><a href="#cb19-154" aria-hidden="true" tabindex="-1"></a>    <span class="fu">transmute</span>(metric_key, subregion_key, <span class="at">cog =</span> cog_url,</span>
-<span id="cb19-155"><a href="#cb19-155" aria-hidden="true" tabindex="-1"></a>              rescale_min, rescale_max, colormap) <span class="cf">else</span> <span class="cn">NULL</span></span>
-<span id="cb19-156"><a href="#cb19-156" aria-hidden="true" tabindex="-1"></a>overlays <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="sc">!</span><span class="fu">is.null</span>(scog_all))</span>
-<span id="cb19-157"><a href="#cb19-157" aria-hidden="true" tabindex="-1"></a>  scog_all <span class="sc">|&gt;</span> <span class="fu">filter</span>(<span class="fu">startsWith</span>(metric_key, <span class="st">"_"</span>)) <span class="sc">|&gt;</span></span>
-<span id="cb19-158"><a href="#cb19-158" aria-hidden="true" tabindex="-1"></a>    <span class="fu">transmute</span>(<span class="at">overlay_key =</span> metric_key, subregion_key, <span class="at">cog =</span> cog_url, colormap) <span class="cf">else</span> <span class="cn">NULL</span></span>
-<span id="cb19-159"><a href="#cb19-159" aria-hidden="true" tabindex="-1"></a><span class="fu">message</span>(<span class="fu">glue</span>(<span class="st">"score COGs: {if (is.null(scog)) 0 else nrow(scog)} metric, "</span>,</span>
-<span id="cb19-160"><a href="#cb19-160" aria-hidden="true" tabindex="-1"></a>             <span class="st">"{if (is.null(overlays)) 0 else nrow(overlays)} overlay"</span>))</span>
+<span id="cb19-143"><a href="#cb19-143" aria-hidden="true" tabindex="-1"></a><span class="co"># Some surfaces are NOT tables in the build database, and are not on S3 either.</span></span>
+<span id="cb19-144"><a href="#cb19-144" aria-hidden="true" tabindex="-1"></a><span class="co"># v8's `cell_model` (the per-cell species list) is a partitioned Parquet</span></span>
+<span id="cb19-145"><a href="#cb19-145" aria-hidden="true" tabindex="-1"></a><span class="co"># DIRECTORY that lives only on the server — deliberately, since its per-cell and</span></span>
+<span id="cb19-146"><a href="#cb19-146" aria-hidden="true" tabindex="-1"></a><span class="co"># per-polygon queries touch many partitions and fail outright over HTTPS. So:</span></span>
+<span id="cb19-147"><a href="#cb19-147" aria-hidden="true" tabindex="-1"></a><span class="co">#   - deriving from `con` alone advertises cell_species_list = FALSE and switches</span></span>
+<span id="cb19-148"><a href="#cb19-148" aria-hidden="true" tabindex="-1"></a><span class="co">#     off a panel that works today;</span></span>
+<span id="cb19-149"><a href="#cb19-149" aria-hidden="true" tabindex="-1"></a><span class="co">#   - checking S3 also says FALSE, because it is intentionally not published there.</span></span>
+<span id="cb19-150"><a href="#cb19-150" aria-hidden="true" tabindex="-1"></a><span class="co"># The authoritative test is the SERVING surface on the server. Check it there</span></span>
+<span id="cb19-151"><a href="#cb19-151" aria-hidden="true" tabindex="-1"></a><span class="co"># (read-only) and print the answer, so a manifest built from a laptop describes</span></span>
+<span id="cb19-152"><a href="#cb19-152" aria-hidden="true" tabindex="-1"></a><span class="co"># the release rather than the laptop.</span></span>
+<span id="cb19-153"><a href="#cb19-153" aria-hidden="true" tabindex="-1"></a>srv_has <span class="ot">&lt;-</span> <span class="cf">function</span>(path) {</span>
+<span id="cb19-154"><a href="#cb19-154" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="fu">dir.exists</span>(<span class="fu">path.expand</span>(<span class="fu">glue</span>(<span class="st">"{dir_big_v}/{path}"</span>)))) <span class="fu">return</span>(<span class="cn">TRUE</span>)   <span class="co"># running ON the server</span></span>
+<span id="cb19-155"><a href="#cb19-155" aria-hidden="true" tabindex="-1"></a>  out <span class="ot">&lt;-</span> <span class="fu">suppressWarnings</span>(<span class="fu">system2</span>(</span>
+<span id="cb19-156"><a href="#cb19-156" aria-hidden="true" tabindex="-1"></a>    <span class="st">"ssh"</span>, <span class="fu">c</span>(<span class="st">"-o"</span>, <span class="st">"ConnectTimeout=15"</span>, <span class="st">"msens"</span>,</span>
+<span id="cb19-157"><a href="#cb19-157" aria-hidden="true" tabindex="-1"></a>             <span class="fu">shQuote</span>(<span class="fu">glue</span>(<span class="st">"test -e /share/data/big/{ver}/{path} &amp;&amp; echo yes || echo no"</span>))),</span>
+<span id="cb19-158"><a href="#cb19-158" aria-hidden="true" tabindex="-1"></a>    <span class="at">stdout =</span> <span class="cn">TRUE</span>, <span class="at">stderr =</span> <span class="cn">FALSE</span>))</span>
+<span id="cb19-159"><a href="#cb19-159" aria-hidden="true" tabindex="-1"></a>  <span class="fu">isTRUE</span>(<span class="fu">any</span>(<span class="fu">grepl</span>(<span class="st">"^yes$"</span>, <span class="fu">trimws</span>(out))))</span>
+<span id="cb19-160"><a href="#cb19-160" aria-hidden="true" tabindex="-1"></a>}</span>
 <span id="cb19-161"><a href="#cb19-161" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-162"><a href="#cb19-162" aria-hidden="true" tabindex="-1"></a><span class="co"># layer presentation metadata (order/category/short label) moves into the</span></span>
-<span id="cb19-163"><a href="#cb19-163" aria-hidden="true" tabindex="-1"></a><span class="co"># manifest so the app stops needing a per-version layers_{ver}.csv on disk --</span></span>
-<span id="cb19-164"><a href="#cb19-164" aria-hidden="true" tabindex="-1"></a><span class="co"># see backfill_versions.qmd for the same join on the historical releases</span></span>
-<span id="cb19-165"><a href="#cb19-165" aria-hidden="true" tabindex="-1"></a>f_lyrs <span class="ot">&lt;-</span> <span class="fu">path.expand</span>(<span class="fu">glue</span>(<span class="st">"{dir_derived}/{ver}/layers_{ver}.csv"</span>))</span>
-<span id="cb19-166"><a href="#cb19-166" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (<span class="sc">!</span><span class="fu">is.null</span>(scog) <span class="sc">&amp;&amp;</span> <span class="fu">file.exists</span>(f_lyrs)) {</span>
-<span id="cb19-167"><a href="#cb19-167" aria-hidden="true" tabindex="-1"></a>  lyr_meta <span class="ot">&lt;-</span> readr<span class="sc">::</span><span class="fu">read_csv</span>(f_lyrs, <span class="at">show_col_types =</span> <span class="cn">FALSE</span>) <span class="sc">|&gt;</span></span>
-<span id="cb19-168"><a href="#cb19-168" aria-hidden="true" tabindex="-1"></a>    dplyr<span class="sc">::</span><span class="fu">transmute</span>(<span class="at">metric_key =</span> lyr, <span class="at">lyr_order =</span> order, category, <span class="at">label =</span> layer)</span>
-<span id="cb19-169"><a href="#cb19-169" aria-hidden="true" tabindex="-1"></a>  scog <span class="ot">&lt;-</span> dplyr<span class="sc">::</span><span class="fu">left_join</span>(scog, lyr_meta, <span class="at">by =</span> <span class="st">"metric_key"</span>)</span>
-<span id="cb19-170"><a href="#cb19-170" aria-hidden="true" tabindex="-1"></a>  <span class="fu">message</span>(<span class="fu">glue</span>(<span class="st">"layer metadata: {nrow(lyr_meta)} rows"</span>))</span>
-<span id="cb19-171"><a href="#cb19-171" aria-hidden="true" tabindex="-1"></a>}</span>
-<span id="cb19-172"><a href="#cb19-172" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-173"><a href="#cb19-173" aria-hidden="true" tabindex="-1"></a><span class="co"># zone PMTiles by vintage, so the app resolves outlines from the manifest rather</span></span>
-<span id="cb19-174"><a href="#cb19-174" aria-hidden="true" tabindex="-1"></a><span class="co"># than a hardcoded unversioned filename on the file host</span></span>
-<span id="cb19-175"><a href="#cb19-175" aria-hidden="true" tabindex="-1"></a>zone_sets <span class="ot">&lt;-</span> readr<span class="sc">::</span><span class="fu">read_csv</span>(here<span class="sc">::</span><span class="fu">here</span>(<span class="st">"data/zone_sets.csv"</span>), <span class="at">show_col_types =</span> <span class="cn">FALSE</span>)</span>
-<span id="cb19-176"><a href="#cb19-176" aria-hidden="true" tabindex="-1"></a>zone_tiles <span class="ot">&lt;-</span> <span class="fu">setNames</span>(</span>
-<span id="cb19-177"><a href="#cb19-177" aria-hidden="true" tabindex="-1"></a>  <span class="fu">as.list</span>(<span class="fu">glue</span>(<span class="st">"{http_root}/zones/{zone_sets$zone_set_key}/zones.pmtiles"</span>)),</span>
-<span id="cb19-178"><a href="#cb19-178" aria-hidden="true" tabindex="-1"></a>  zone_sets<span class="sc">$</span>zone_set_key)</span>
-<span id="cb19-179"><a href="#cb19-179" aria-hidden="true" tabindex="-1"></a><span class="fu">message</span>(<span class="fu">glue</span>(<span class="st">"zone tile sets: {length(zone_tiles)}"</span>))</span>
-<span id="cb19-180"><a href="#cb19-180" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-181"><a href="#cb19-181" aria-hidden="true" tabindex="-1"></a>v_row <span class="ot">&lt;-</span> versions <span class="sc">|&gt;</span> <span class="fu">filter</span>(ver <span class="sc">==</span> <span class="sc">!!</span>ver)</span>
-<span id="cb19-182"><a href="#cb19-182" aria-hidden="true" tabindex="-1"></a>mfst  <span class="ot">&lt;-</span> msens<span class="sc">::</span><span class="fu">manifest_build</span>(</span>
-<span id="cb19-183"><a href="#cb19-183" aria-hidden="true" tabindex="-1"></a>  con, ver,</span>
-<span id="cb19-184"><a href="#cb19-184" aria-hidden="true" tabindex="-1"></a>  <span class="at">status       =</span> v_row<span class="sc">$</span>status,</span>
-<span id="cb19-185"><a href="#cb19-185" aria-hidden="true" tabindex="-1"></a>  <span class="at">base         =</span> http_root,</span>
-<span id="cb19-186"><a href="#cb19-186" aria-hidden="true" tabindex="-1"></a>  <span class="at">metrics      =</span> scog,</span>
-<span id="cb19-187"><a href="#cb19-187" aria-hidden="true" tabindex="-1"></a>  <span class="at">zone_tiles   =</span> zone_tiles,</span>
-<span id="cb19-188"><a href="#cb19-188" aria-hidden="true" tabindex="-1"></a>  <span class="at">capabilities =</span> caps_override,</span>
-<span id="cb19-189"><a href="#cb19-189" aria-hidden="true" tabindex="-1"></a>  <span class="at">extra  =</span> <span class="fu">list</span>(</span>
-<span id="cb19-190"><a href="#cb19-190" aria-hidden="true" tabindex="-1"></a>    <span class="at">title    =</span> v_row<span class="sc">$</span>title,</span>
-<span id="cb19-191"><a href="#cb19-191" aria-hidden="true" tabindex="-1"></a>    <span class="at">released =</span> <span class="fu">as.character</span>(v_row<span class="sc">$</span>released),</span>
-<span id="cb19-192"><a href="#cb19-192" aria-hidden="true" tabindex="-1"></a>    <span class="at">overlays =</span> overlays,</span>
-<span id="cb19-193"><a href="#cb19-193" aria-hidden="true" tabindex="-1"></a>    <span class="co"># score COGs and the vintage-labelled zone-set registry arrive in later</span></span>
-<span id="cb19-194"><a href="#cb19-194" aria-hidden="true" tabindex="-1"></a>    <span class="co"># phases; until then the manifest declares what is true today, and</span></span>
-<span id="cb19-195"><a href="#cb19-195" aria-hidden="true" tabindex="-1"></a>    <span class="co"># `capabilities$score_cogs` stays FALSE so no app promises a layer it</span></span>
-<span id="cb19-196"><a href="#cb19-196" aria-hidden="true" tabindex="-1"></a>    <span class="co"># cannot draw.</span></span>
-<span id="cb19-197"><a href="#cb19-197" aria-hidden="true" tabindex="-1"></a>    <span class="at">grid     =</span> <span class="fu">as.list</span>(msens<span class="sc">::</span><span class="fu">grid_spec_for</span>(msens<span class="sc">::</span><span class="fu">grid_for_ver</span>(ver))[</span>
-<span id="cb19-198"><a href="#cb19-198" aria-hidden="true" tabindex="-1"></a>                 <span class="fu">c</span>(<span class="st">"nc"</span>, <span class="st">"nr"</span>, <span class="st">"xmin"</span>, <span class="st">"ymax"</span>, <span class="st">"resx"</span>, <span class="st">"resy"</span>, <span class="st">"lon360"</span>)])))</span>
-<span id="cb19-199"><a href="#cb19-199" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-200"><a href="#cb19-200" aria-hidden="true" tabindex="-1"></a><span class="fu">dbDisconnect</span>(con, <span class="at">shutdown =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb19-201"><a href="#cb19-201" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-202"><a href="#cb19-202" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span>(<span class="fu">glue</span>(</span>
-<span id="cb19-203"><a href="#cb19-203" aria-hidden="true" tabindex="-1"></a>  <span class="st">"ver={mfst$ver}  status={mfst$status}  grid={mfst$grid_id}  id_field={mfst$id_field}</span><span class="sc">\n</span><span class="st">"</span>,</span>
-<span id="cb19-204"><a href="#cb19-204" aria-hidden="true" tabindex="-1"></a>  <span class="st">"tables={length(mfst$tables)}  metrics={nrow(mfst$metrics)}  zone_sets={nrow(mfst$zones)}</span><span class="sc">\n</span><span class="st">"</span>))</span>
-<span id="cb19-205"><a href="#cb19-205" aria-hidden="true" tabindex="-1"></a>knitr<span class="sc">::</span><span class="fu">kable</span>(mfst<span class="sc">$</span>zones)</span>
-<span id="cb19-206"><a href="#cb19-206" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb19-207"><a href="#cb19-207" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-210"><a href="#cb19-210" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb19-211"><a href="#cb19-211" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: capabilities</span></span>
-<span id="cb19-212"><a href="#cb19-212" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-213"><a href="#cb19-213" aria-hidden="true" tabindex="-1"></a>knitr<span class="sc">::</span><span class="fu">kable</span>(</span>
-<span id="cb19-214"><a href="#cb19-214" aria-hidden="true" tabindex="-1"></a>  <span class="fu">data.frame</span>(<span class="at">capability =</span> <span class="fu">names</span>(mfst<span class="sc">$</span>capabilities),</span>
-<span id="cb19-215"><a href="#cb19-215" aria-hidden="true" tabindex="-1"></a>             <span class="at">supported  =</span> <span class="fu">unlist</span>(mfst<span class="sc">$</span>capabilities)),</span>
-<span id="cb19-216"><a href="#cb19-216" aria-hidden="true" tabindex="-1"></a>  <span class="at">row.names =</span> <span class="cn">FALSE</span>)</span>
-<span id="cb19-217"><a href="#cb19-217" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb19-218"><a href="#cb19-218" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-219"><a href="#cb19-219" aria-hidden="true" tabindex="-1"></a><span class="fu">## Validate, then write</span></span>
-<span id="cb19-220"><a href="#cb19-220" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-221"><a href="#cb19-221" aria-hidden="true" tabindex="-1"></a>The same <span class="in">`validate_manifest()`</span> the apps call on read is applied here on write, so a manifest that</span>
-<span id="cb19-222"><a href="#cb19-222" aria-hidden="true" tabindex="-1"></a>would break an app can never be published in the first place.</span>
-<span id="cb19-223"><a href="#cb19-223" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-226"><a href="#cb19-226" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb19-227"><a href="#cb19-227" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: write</span></span>
-<span id="cb19-228"><a href="#cb19-228" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-229"><a href="#cb19-229" aria-hidden="true" tabindex="-1"></a>msens<span class="sc">::</span><span class="fu">validate_manifest</span>(mfst, <span class="at">ver =</span> ver)</span>
+<span id="cb19-162"><a href="#cb19-162" aria-hidden="true" tabindex="-1"></a>caps_override <span class="ot">&lt;-</span> <span class="fu">list</span>(<span class="at">cell_species_list =</span> <span class="fu">srv_has</span>(<span class="st">"cell_model"</span>))</span>
+<span id="cb19-163"><a href="#cb19-163" aria-hidden="true" tabindex="-1"></a><span class="fu">message</span>(<span class="fu">glue</span>(<span class="st">"serving surface check: cell_model present = {caps_override$cell_species_list}"</span>))</span>
+<span id="cb19-164"><a href="#cb19-164" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-165"><a href="#cb19-165" aria-hidden="true" tabindex="-1"></a><span class="co"># score COGs, when published: their presence is what flips capabilities$score_cogs,</span></span>
+<span id="cb19-166"><a href="#cb19-166" aria-hidden="true" tabindex="-1"></a><span class="co"># so the app only offers a raster layer once the raster exists</span></span>
+<span id="cb19-167"><a href="#cb19-167" aria-hidden="true" tabindex="-1"></a>f_scog   <span class="ot">&lt;-</span> <span class="fu">path.expand</span>(<span class="fu">glue</span>(<span class="st">"{dir_big_v}/tables/score_cog.parquet"</span>))</span>
+<span id="cb19-168"><a href="#cb19-168" aria-hidden="true" tabindex="-1"></a>scog_all <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="fu">file.exists</span>(f_scog)) arrow<span class="sc">::</span><span class="fu">read_parquet</span>(f_scog) <span class="cf">else</span> <span class="cn">NULL</span></span>
+<span id="cb19-169"><a href="#cb19-169" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-170"><a href="#cb19-170" aria-hidden="true" tabindex="-1"></a><span class="co"># `_`-prefixed keys are OVERLAYS, not metrics: the app's "cells outside Program</span></span>
+<span id="cb19-171"><a href="#cb19-171" aria-hidden="true" tabindex="-1"></a><span class="co"># Areas" mask is a raster it draws but not a quantity it scores. They must be</span></span>
+<span id="cb19-172"><a href="#cb19-172" aria-hidden="true" tabindex="-1"></a><span class="co"># separated, because manifest_build() left-joins metrics onto the release's</span></span>
+<span id="cb19-173"><a href="#cb19-173" aria-hidden="true" tabindex="-1"></a><span class="co"># `metric` table -- an overlay has no row there and was silently dropped.</span></span>
+<span id="cb19-174"><a href="#cb19-174" aria-hidden="true" tabindex="-1"></a>scog <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="sc">!</span><span class="fu">is.null</span>(scog_all))</span>
+<span id="cb19-175"><a href="#cb19-175" aria-hidden="true" tabindex="-1"></a>  scog_all <span class="sc">|&gt;</span> <span class="fu">filter</span>(<span class="sc">!</span><span class="fu">startsWith</span>(metric_key, <span class="st">"_"</span>)) <span class="sc">|&gt;</span></span>
+<span id="cb19-176"><a href="#cb19-176" aria-hidden="true" tabindex="-1"></a>    <span class="fu">transmute</span>(metric_key, subregion_key, <span class="at">cog =</span> cog_url,</span>
+<span id="cb19-177"><a href="#cb19-177" aria-hidden="true" tabindex="-1"></a>              rescale_min, rescale_max, colormap) <span class="cf">else</span> <span class="cn">NULL</span></span>
+<span id="cb19-178"><a href="#cb19-178" aria-hidden="true" tabindex="-1"></a>overlays <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="sc">!</span><span class="fu">is.null</span>(scog_all))</span>
+<span id="cb19-179"><a href="#cb19-179" aria-hidden="true" tabindex="-1"></a>  scog_all <span class="sc">|&gt;</span> <span class="fu">filter</span>(<span class="fu">startsWith</span>(metric_key, <span class="st">"_"</span>)) <span class="sc">|&gt;</span></span>
+<span id="cb19-180"><a href="#cb19-180" aria-hidden="true" tabindex="-1"></a>    <span class="fu">transmute</span>(<span class="at">overlay_key =</span> metric_key, subregion_key, <span class="at">cog =</span> cog_url, colormap) <span class="cf">else</span> <span class="cn">NULL</span></span>
+<span id="cb19-181"><a href="#cb19-181" aria-hidden="true" tabindex="-1"></a><span class="fu">message</span>(<span class="fu">glue</span>(<span class="st">"score COGs: {if (is.null(scog)) 0 else nrow(scog)} metric, "</span>,</span>
+<span id="cb19-182"><a href="#cb19-182" aria-hidden="true" tabindex="-1"></a>             <span class="st">"{if (is.null(overlays)) 0 else nrow(overlays)} overlay"</span>))</span>
+<span id="cb19-183"><a href="#cb19-183" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-184"><a href="#cb19-184" aria-hidden="true" tabindex="-1"></a><span class="co"># layer presentation metadata (order/category/short label) moves into the</span></span>
+<span id="cb19-185"><a href="#cb19-185" aria-hidden="true" tabindex="-1"></a><span class="co"># manifest so the app stops needing a per-version layers_{ver}.csv on disk --</span></span>
+<span id="cb19-186"><a href="#cb19-186" aria-hidden="true" tabindex="-1"></a><span class="co"># see backfill_versions.qmd for the same join on the historical releases</span></span>
+<span id="cb19-187"><a href="#cb19-187" aria-hidden="true" tabindex="-1"></a>f_lyrs <span class="ot">&lt;-</span> <span class="fu">path.expand</span>(<span class="fu">glue</span>(<span class="st">"{dir_derived}/{ver}/layers_{ver}.csv"</span>))</span>
+<span id="cb19-188"><a href="#cb19-188" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (<span class="sc">!</span><span class="fu">is.null</span>(scog) <span class="sc">&amp;&amp;</span> <span class="fu">file.exists</span>(f_lyrs)) {</span>
+<span id="cb19-189"><a href="#cb19-189" aria-hidden="true" tabindex="-1"></a>  lyr_meta <span class="ot">&lt;-</span> readr<span class="sc">::</span><span class="fu">read_csv</span>(f_lyrs, <span class="at">show_col_types =</span> <span class="cn">FALSE</span>) <span class="sc">|&gt;</span></span>
+<span id="cb19-190"><a href="#cb19-190" aria-hidden="true" tabindex="-1"></a>    dplyr<span class="sc">::</span><span class="fu">transmute</span>(<span class="at">metric_key =</span> lyr, <span class="at">lyr_order =</span> order, category, <span class="at">label =</span> layer)</span>
+<span id="cb19-191"><a href="#cb19-191" aria-hidden="true" tabindex="-1"></a>  scog <span class="ot">&lt;-</span> dplyr<span class="sc">::</span><span class="fu">left_join</span>(scog, lyr_meta, <span class="at">by =</span> <span class="st">"metric_key"</span>)</span>
+<span id="cb19-192"><a href="#cb19-192" aria-hidden="true" tabindex="-1"></a>  <span class="fu">message</span>(<span class="fu">glue</span>(<span class="st">"layer metadata: {nrow(lyr_meta)} rows"</span>))</span>
+<span id="cb19-193"><a href="#cb19-193" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb19-194"><a href="#cb19-194" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-195"><a href="#cb19-195" aria-hidden="true" tabindex="-1"></a><span class="co"># zone PMTiles by vintage, so the app resolves outlines from the manifest rather</span></span>
+<span id="cb19-196"><a href="#cb19-196" aria-hidden="true" tabindex="-1"></a><span class="co"># than a hardcoded unversioned filename on the file host</span></span>
+<span id="cb19-197"><a href="#cb19-197" aria-hidden="true" tabindex="-1"></a>zone_sets <span class="ot">&lt;-</span> readr<span class="sc">::</span><span class="fu">read_csv</span>(here<span class="sc">::</span><span class="fu">here</span>(<span class="st">"data/zone_sets.csv"</span>), <span class="at">show_col_types =</span> <span class="cn">FALSE</span>)</span>
+<span id="cb19-198"><a href="#cb19-198" aria-hidden="true" tabindex="-1"></a>zone_tiles <span class="ot">&lt;-</span> <span class="fu">setNames</span>(</span>
+<span id="cb19-199"><a href="#cb19-199" aria-hidden="true" tabindex="-1"></a>  <span class="fu">as.list</span>(<span class="fu">glue</span>(<span class="st">"{http_root}/zones/{zone_sets$zone_set_key}/zones.pmtiles"</span>)),</span>
+<span id="cb19-200"><a href="#cb19-200" aria-hidden="true" tabindex="-1"></a>  zone_sets<span class="sc">$</span>zone_set_key)</span>
+<span id="cb19-201"><a href="#cb19-201" aria-hidden="true" tabindex="-1"></a><span class="fu">message</span>(<span class="fu">glue</span>(<span class="st">"zone tile sets: {length(zone_tiles)}"</span>))</span>
+<span id="cb19-202"><a href="#cb19-202" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-203"><a href="#cb19-203" aria-hidden="true" tabindex="-1"></a>v_row <span class="ot">&lt;-</span> versions <span class="sc">|&gt;</span> <span class="fu">filter</span>(ver <span class="sc">==</span> <span class="sc">!!</span>ver)</span>
+<span id="cb19-204"><a href="#cb19-204" aria-hidden="true" tabindex="-1"></a>mfst  <span class="ot">&lt;-</span> msens<span class="sc">::</span><span class="fu">manifest_build</span>(</span>
+<span id="cb19-205"><a href="#cb19-205" aria-hidden="true" tabindex="-1"></a>  con, ver,</span>
+<span id="cb19-206"><a href="#cb19-206" aria-hidden="true" tabindex="-1"></a>  <span class="at">status       =</span> v_row<span class="sc">$</span>status,</span>
+<span id="cb19-207"><a href="#cb19-207" aria-hidden="true" tabindex="-1"></a>  <span class="at">access       =</span> v_row<span class="sc">$</span>access,</span>
+<span id="cb19-208"><a href="#cb19-208" aria-hidden="true" tabindex="-1"></a>  <span class="at">base         =</span> http_root,</span>
+<span id="cb19-209"><a href="#cb19-209" aria-hidden="true" tabindex="-1"></a>  <span class="at">metrics      =</span> scog,</span>
+<span id="cb19-210"><a href="#cb19-210" aria-hidden="true" tabindex="-1"></a>  <span class="at">zone_tiles   =</span> zone_tiles,</span>
+<span id="cb19-211"><a href="#cb19-211" aria-hidden="true" tabindex="-1"></a>  <span class="at">capabilities =</span> caps_override,</span>
+<span id="cb19-212"><a href="#cb19-212" aria-hidden="true" tabindex="-1"></a>  <span class="at">extra  =</span> <span class="fu">list</span>(</span>
+<span id="cb19-213"><a href="#cb19-213" aria-hidden="true" tabindex="-1"></a>    <span class="at">title    =</span> v_row<span class="sc">$</span>title,</span>
+<span id="cb19-214"><a href="#cb19-214" aria-hidden="true" tabindex="-1"></a>    <span class="at">released =</span> <span class="fu">as.character</span>(v_row<span class="sc">$</span>released),</span>
+<span id="cb19-215"><a href="#cb19-215" aria-hidden="true" tabindex="-1"></a>    <span class="at">overlays =</span> overlays,</span>
+<span id="cb19-216"><a href="#cb19-216" aria-hidden="true" tabindex="-1"></a>    <span class="co"># score COGs and the vintage-labelled zone-set registry arrive in later</span></span>
+<span id="cb19-217"><a href="#cb19-217" aria-hidden="true" tabindex="-1"></a>    <span class="co"># phases; until then the manifest declares what is true today, and</span></span>
+<span id="cb19-218"><a href="#cb19-218" aria-hidden="true" tabindex="-1"></a>    <span class="co"># `capabilities$score_cogs` stays FALSE so no app promises a layer it</span></span>
+<span id="cb19-219"><a href="#cb19-219" aria-hidden="true" tabindex="-1"></a>    <span class="co"># cannot draw.</span></span>
+<span id="cb19-220"><a href="#cb19-220" aria-hidden="true" tabindex="-1"></a>    <span class="at">grid     =</span> <span class="fu">as.list</span>(msens<span class="sc">::</span><span class="fu">grid_spec_for</span>(msens<span class="sc">::</span><span class="fu">grid_for_ver</span>(ver))[</span>
+<span id="cb19-221"><a href="#cb19-221" aria-hidden="true" tabindex="-1"></a>                 <span class="fu">c</span>(<span class="st">"nc"</span>, <span class="st">"nr"</span>, <span class="st">"xmin"</span>, <span class="st">"ymax"</span>, <span class="st">"resx"</span>, <span class="st">"resy"</span>, <span class="st">"lon360"</span>)])))</span>
+<span id="cb19-222"><a href="#cb19-222" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-223"><a href="#cb19-223" aria-hidden="true" tabindex="-1"></a><span class="fu">dbDisconnect</span>(con, <span class="at">shutdown =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb19-224"><a href="#cb19-224" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-225"><a href="#cb19-225" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span>(<span class="fu">glue</span>(</span>
+<span id="cb19-226"><a href="#cb19-226" aria-hidden="true" tabindex="-1"></a>  <span class="st">"ver={mfst$ver}  status={mfst$status}  access={mfst$access}  grid={mfst$grid_id}  id_field={mfst$id_field}</span><span class="sc">\n</span><span class="st">"</span>,</span>
+<span id="cb19-227"><a href="#cb19-227" aria-hidden="true" tabindex="-1"></a>  <span class="st">"tables={length(mfst$tables)}  metrics={nrow(mfst$metrics)}  zone_sets={nrow(mfst$zones)}</span><span class="sc">\n</span><span class="st">"</span>))</span>
+<span id="cb19-228"><a href="#cb19-228" aria-hidden="true" tabindex="-1"></a>knitr<span class="sc">::</span><span class="fu">kable</span>(mfst<span class="sc">$</span>zones)</span>
+<span id="cb19-229"><a href="#cb19-229" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
 <span id="cb19-230"><a href="#cb19-230" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-231"><a href="#cb19-231" aria-hidden="true" tabindex="-1"></a><span class="co"># jsonlite writes NULL as [] and NA as null; pretty-print for reviewable diffs</span></span>
-<span id="cb19-232"><a href="#cb19-232" aria-hidden="true" tabindex="-1"></a>wr <span class="ot">&lt;-</span> <span class="cf">function</span>(obj, path) {</span>
-<span id="cb19-233"><a href="#cb19-233" aria-hidden="true" tabindex="-1"></a>  <span class="fu">writeLines</span>(<span class="fu">as.character</span>(jsonlite<span class="sc">::</span><span class="fu">toJSON</span>(obj, <span class="at">auto_unbox =</span> <span class="cn">TRUE</span>, <span class="at">pretty =</span> <span class="cn">TRUE</span>, <span class="at">na =</span> <span class="st">"null"</span>)), path)</span>
-<span id="cb19-234"><a href="#cb19-234" aria-hidden="true" tabindex="-1"></a>  path</span>
-<span id="cb19-235"><a href="#cb19-235" aria-hidden="true" tabindex="-1"></a>}</span>
-<span id="cb19-236"><a href="#cb19-236" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-237"><a href="#cb19-237" aria-hidden="true" tabindex="-1"></a>f_versions <span class="ot">&lt;-</span> <span class="fu">wr</span>(<span class="fu">list</span>(<span class="at">versions =</span> versions), <span class="fu">glue</span>(<span class="st">"{dir_reg}/versions.json"</span>))</span>
-<span id="cb19-238"><a href="#cb19-238" aria-hidden="true" tabindex="-1"></a>f_manifest <span class="ot">&lt;-</span> <span class="fu">wr</span>(mfst,                      <span class="fu">glue</span>(<span class="st">"{dir_reg}/{ver}/manifest.json"</span>))</span>
-<span id="cb19-239"><a href="#cb19-239" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-240"><a href="#cb19-240" aria-hidden="true" tabindex="-1"></a><span class="co"># round-trip: parse what we just wrote, exactly as an app would</span></span>
-<span id="cb19-241"><a href="#cb19-241" aria-hidden="true" tabindex="-1"></a>msens<span class="sc">::</span><span class="fu">validate_manifest</span>(jsonlite<span class="sc">::</span><span class="fu">fromJSON</span>(f_manifest), <span class="at">ver =</span> ver)</span>
-<span id="cb19-242"><a href="#cb19-242" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span>(<span class="fu">glue</span>(<span class="st">"wrote {f_versions}</span><span class="sc">\n</span><span class="st">     {f_manifest}</span><span class="sc">\n</span><span class="st">"</span>))</span>
-<span id="cb19-243"><a href="#cb19-243" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb19-244"><a href="#cb19-244" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-245"><a href="#cb19-245" aria-hidden="true" tabindex="-1"></a><span class="fu">## Promote `latest.txt` (gated)</span></span>
+<span id="cb19-233"><a href="#cb19-233" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb19-234"><a href="#cb19-234" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: capabilities</span></span>
+<span id="cb19-235"><a href="#cb19-235" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-236"><a href="#cb19-236" aria-hidden="true" tabindex="-1"></a>knitr<span class="sc">::</span><span class="fu">kable</span>(</span>
+<span id="cb19-237"><a href="#cb19-237" aria-hidden="true" tabindex="-1"></a>  <span class="fu">data.frame</span>(<span class="at">capability =</span> <span class="fu">names</span>(mfst<span class="sc">$</span>capabilities),</span>
+<span id="cb19-238"><a href="#cb19-238" aria-hidden="true" tabindex="-1"></a>             <span class="at">supported  =</span> <span class="fu">unlist</span>(mfst<span class="sc">$</span>capabilities)),</span>
+<span id="cb19-239"><a href="#cb19-239" aria-hidden="true" tabindex="-1"></a>  <span class="at">row.names =</span> <span class="cn">FALSE</span>)</span>
+<span id="cb19-240"><a href="#cb19-240" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb19-241"><a href="#cb19-241" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-242"><a href="#cb19-242" aria-hidden="true" tabindex="-1"></a><span class="fu">## Validate, then write</span></span>
+<span id="cb19-243"><a href="#cb19-243" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-244"><a href="#cb19-244" aria-hidden="true" tabindex="-1"></a>The same <span class="in">`validate_manifest()`</span> the apps call on read is applied here on write, so a manifest that</span>
+<span id="cb19-245"><a href="#cb19-245" aria-hidden="true" tabindex="-1"></a>would break an app can never be published in the first place.</span>
 <span id="cb19-246"><a href="#cb19-246" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-247"><a href="#cb19-247" aria-hidden="true" tabindex="-1"></a><span class="in">`latest.txt`</span> is the one file that changes what users see by default, so it is written **only** when</span>
-<span id="cb19-248"><a href="#cb19-248" aria-hidden="true" tabindex="-1"></a><span class="in">`PROMOTE_LATEST=1`</span> and only naming a <span class="in">`released`</span> version. A pre-release is never promoted implicitly</span>
-<span id="cb19-249"><a href="#cb19-249" aria-hidden="true" tabindex="-1"></a>— it stays reachable at <span class="in">`?ver={ver}`</span> until someone decides otherwise.</span>
-<span id="cb19-250"><a href="#cb19-250" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-253"><a href="#cb19-253" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb19-254"><a href="#cb19-254" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: promote</span></span>
-<span id="cb19-255"><a href="#cb19-255" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-256"><a href="#cb19-256" aria-hidden="true" tabindex="-1"></a>latest <span class="ot">&lt;-</span> versions <span class="sc">|&gt;</span> <span class="fu">filter</span>(status <span class="sc">==</span> <span class="st">"released"</span>) <span class="sc">|&gt;</span> <span class="fu">slice_head</span>(<span class="at">n =</span> <span class="dv">1</span>) <span class="sc">|&gt;</span> <span class="fu">pull</span>(ver)</span>
-<span id="cb19-257"><a href="#cb19-257" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-258"><a href="#cb19-258" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (promote) {</span>
-<span id="cb19-259"><a href="#cb19-259" aria-hidden="true" tabindex="-1"></a>  f_latest <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{dir_reg}/latest.txt"</span>)</span>
-<span id="cb19-260"><a href="#cb19-260" aria-hidden="true" tabindex="-1"></a>  <span class="fu">writeLines</span>(latest, f_latest)</span>
-<span id="cb19-261"><a href="#cb19-261" aria-hidden="true" tabindex="-1"></a>  <span class="fu">cat</span>(<span class="fu">glue</span>(<span class="st">"PROMOTED latest.txt -&gt; {latest}</span><span class="sc">\n</span><span class="st">"</span>))</span>
-<span id="cb19-262"><a href="#cb19-262" aria-hidden="true" tabindex="-1"></a>} <span class="cf">else</span> {</span>
-<span id="cb19-263"><a href="#cb19-263" aria-hidden="true" tabindex="-1"></a>  <span class="fu">cat</span>(<span class="fu">glue</span>(<span class="st">"latest.txt would be '{latest}' (set PROMOTE_LATEST=1 to write it)</span><span class="sc">\n</span><span class="st">"</span>))</span>
-<span id="cb19-264"><a href="#cb19-264" aria-hidden="true" tabindex="-1"></a>}</span>
-<span id="cb19-265"><a href="#cb19-265" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb19-266"><a href="#cb19-266" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-267"><a href="#cb19-267" aria-hidden="true" tabindex="-1"></a><span class="fu">## Publish to S3</span></span>
-<span id="cb19-268"><a href="#cb19-268" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-271"><a href="#cb19-271" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb19-272"><a href="#cb19-272" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: s3</span></span>
+<span id="cb19-249"><a href="#cb19-249" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb19-250"><a href="#cb19-250" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: write</span></span>
+<span id="cb19-251"><a href="#cb19-251" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-252"><a href="#cb19-252" aria-hidden="true" tabindex="-1"></a>msens<span class="sc">::</span><span class="fu">validate_manifest</span>(mfst, <span class="at">ver =</span> ver)</span>
+<span id="cb19-253"><a href="#cb19-253" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-254"><a href="#cb19-254" aria-hidden="true" tabindex="-1"></a><span class="co"># jsonlite writes NULL as [] and NA as null; pretty-print for reviewable diffs</span></span>
+<span id="cb19-255"><a href="#cb19-255" aria-hidden="true" tabindex="-1"></a>wr <span class="ot">&lt;-</span> <span class="cf">function</span>(obj, path) {</span>
+<span id="cb19-256"><a href="#cb19-256" aria-hidden="true" tabindex="-1"></a>  <span class="fu">writeLines</span>(<span class="fu">as.character</span>(jsonlite<span class="sc">::</span><span class="fu">toJSON</span>(obj, <span class="at">auto_unbox =</span> <span class="cn">TRUE</span>, <span class="at">pretty =</span> <span class="cn">TRUE</span>, <span class="at">na =</span> <span class="st">"null"</span>)), path)</span>
+<span id="cb19-257"><a href="#cb19-257" aria-hidden="true" tabindex="-1"></a>  path</span>
+<span id="cb19-258"><a href="#cb19-258" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb19-259"><a href="#cb19-259" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-260"><a href="#cb19-260" aria-hidden="true" tabindex="-1"></a>f_versions <span class="ot">&lt;-</span> <span class="fu">wr</span>(<span class="fu">list</span>(<span class="at">versions =</span> versions), <span class="fu">glue</span>(<span class="st">"{dir_reg}/versions.json"</span>))</span>
+<span id="cb19-261"><a href="#cb19-261" aria-hidden="true" tabindex="-1"></a>f_manifest <span class="ot">&lt;-</span> <span class="fu">wr</span>(mfst,                      <span class="fu">glue</span>(<span class="st">"{dir_reg}/{ver}/manifest.json"</span>))</span>
+<span id="cb19-262"><a href="#cb19-262" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-263"><a href="#cb19-263" aria-hidden="true" tabindex="-1"></a><span class="co"># round-trip: parse what we just wrote, exactly as an app would</span></span>
+<span id="cb19-264"><a href="#cb19-264" aria-hidden="true" tabindex="-1"></a>msens<span class="sc">::</span><span class="fu">validate_manifest</span>(jsonlite<span class="sc">::</span><span class="fu">fromJSON</span>(f_manifest), <span class="at">ver =</span> ver)</span>
+<span id="cb19-265"><a href="#cb19-265" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span>(<span class="fu">glue</span>(<span class="st">"wrote {f_versions}</span><span class="sc">\n</span><span class="st">     {f_manifest}</span><span class="sc">\n</span><span class="st">"</span>))</span>
+<span id="cb19-266"><a href="#cb19-266" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb19-267"><a href="#cb19-267" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-268"><a href="#cb19-268" aria-hidden="true" tabindex="-1"></a><span class="fu">## Promote `latest.txt` (gated)</span></span>
+<span id="cb19-269"><a href="#cb19-269" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-270"><a href="#cb19-270" aria-hidden="true" tabindex="-1"></a><span class="in">`latest.txt`</span> is the one file that changes what users see by default, so it is written **only** when</span>
+<span id="cb19-271"><a href="#cb19-271" aria-hidden="true" tabindex="-1"></a><span class="in">`PROMOTE_LATEST=1`</span> and only naming a <span class="in">`released`</span> version. A pre-release is never promoted implicitly</span>
+<span id="cb19-272"><a href="#cb19-272" aria-hidden="true" tabindex="-1"></a>— it stays reachable at <span class="in">`?ver={ver}`</span> until someone decides otherwise.</span>
 <span id="cb19-273"><a href="#cb19-273" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-274"><a href="#cb19-274" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (do_s3) {</span>
-<span id="cb19-275"><a href="#cb19-275" aria-hidden="true" tabindex="-1"></a>  <span class="co"># system2() runs the command through a shell, so unquoted glob patterns are</span></span>
-<span id="cb19-276"><a href="#cb19-276" aria-hidden="true" tabindex="-1"></a>  <span class="co"># expanded by the shell against the CWD before aws ever sees them (an</span></span>
-<span id="cb19-277"><a href="#cb19-277" aria-hidden="true" tabindex="-1"></a>  <span class="co"># unquoted `--exclude *` becomes the entire repo listing). shQuote them, and</span></span>
-<span id="cb19-278"><a href="#cb19-278" aria-hidden="true" tabindex="-1"></a>  <span class="co"># expand `~` ourselves since the CLI does not.</span></span>
-<span id="cb19-279"><a href="#cb19-279" aria-hidden="true" tabindex="-1"></a>  args <span class="ot">&lt;-</span> <span class="fu">c</span>(<span class="st">"s3"</span>, <span class="st">"sync"</span>, <span class="fu">shQuote</span>(<span class="fu">path.expand</span>(dir_reg)), <span class="fu">shQuote</span>(s3_root),</span>
-<span id="cb19-280"><a href="#cb19-280" aria-hidden="true" tabindex="-1"></a>            <span class="st">"--exclude"</span>, <span class="fu">shQuote</span>(<span class="st">"*"</span>),</span>
-<span id="cb19-281"><a href="#cb19-281" aria-hidden="true" tabindex="-1"></a>            <span class="st">"--include"</span>, <span class="fu">shQuote</span>(<span class="st">"*.json"</span>), <span class="st">"--include"</span>, <span class="fu">shQuote</span>(<span class="st">"latest.txt"</span>),</span>
-<span id="cb19-282"><a href="#cb19-282" aria-hidden="true" tabindex="-1"></a>            <span class="st">"--content-type"</span>, <span class="fu">shQuote</span>(<span class="st">"application/json"</span>),</span>
-<span id="cb19-283"><a href="#cb19-283" aria-hidden="true" tabindex="-1"></a>            <span class="co"># these three are MUTABLE pointers; S3 has no default cache-control but</span></span>
-<span id="cb19-284"><a href="#cb19-284" aria-hidden="true" tabindex="-1"></a>            <span class="co"># CDNs and browsers will happily hold a stale registry, which shows the</span></span>
-<span id="cb19-285"><a href="#cb19-285" aria-hidden="true" tabindex="-1"></a>            <span class="co"># wrong version list long after a promotion</span></span>
-<span id="cb19-286"><a href="#cb19-286" aria-hidden="true" tabindex="-1"></a>            <span class="st">"--cache-control"</span>, <span class="fu">shQuote</span>(<span class="st">"no-cache"</span>),</span>
-<span id="cb19-287"><a href="#cb19-287" aria-hidden="true" tabindex="-1"></a>            <span class="st">"--only-show-errors"</span>, <span class="st">"--no-progress"</span>)</span>
-<span id="cb19-288"><a href="#cb19-288" aria-hidden="true" tabindex="-1"></a>  out <span class="ot">&lt;-</span> <span class="fu">system2</span>(<span class="st">"aws"</span>, args, <span class="at">stdout =</span> <span class="cn">TRUE</span>, <span class="at">stderr =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb19-289"><a href="#cb19-289" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">is.null</span>(<span class="fu">attr</span>(out, <span class="st">"status"</span>)) <span class="sc">&amp;&amp;</span> <span class="fu">attr</span>(out, <span class="st">"status"</span>) <span class="sc">!=</span> <span class="dv">0</span>)</span>
-<span id="cb19-290"><a href="#cb19-290" aria-hidden="true" tabindex="-1"></a>    <span class="fu">stop</span>(<span class="st">"aws s3 sync failed: "</span>, <span class="fu">paste</span>(out, <span class="at">collapse =</span> <span class="st">"</span><span class="sc">\n</span><span class="st">"</span>))</span>
+<span id="cb19-276"><a href="#cb19-276" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb19-277"><a href="#cb19-277" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: promote</span></span>
+<span id="cb19-278"><a href="#cb19-278" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-279"><a href="#cb19-279" aria-hidden="true" tabindex="-1"></a>latest <span class="ot">&lt;-</span> versions <span class="sc">|&gt;</span> <span class="fu">filter</span>(status <span class="sc">==</span> <span class="st">"released"</span>) <span class="sc">|&gt;</span> <span class="fu">slice_head</span>(<span class="at">n =</span> <span class="dv">1</span>) <span class="sc">|&gt;</span> <span class="fu">pull</span>(ver)</span>
+<span id="cb19-280"><a href="#cb19-280" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-281"><a href="#cb19-281" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (promote) {</span>
+<span id="cb19-282"><a href="#cb19-282" aria-hidden="true" tabindex="-1"></a>  f_latest <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{dir_reg}/latest.txt"</span>)</span>
+<span id="cb19-283"><a href="#cb19-283" aria-hidden="true" tabindex="-1"></a>  <span class="fu">writeLines</span>(latest, f_latest)</span>
+<span id="cb19-284"><a href="#cb19-284" aria-hidden="true" tabindex="-1"></a>  <span class="fu">cat</span>(<span class="fu">glue</span>(<span class="st">"PROMOTED latest.txt -&gt; {latest}</span><span class="sc">\n</span><span class="st">"</span>))</span>
+<span id="cb19-285"><a href="#cb19-285" aria-hidden="true" tabindex="-1"></a>} <span class="cf">else</span> {</span>
+<span id="cb19-286"><a href="#cb19-286" aria-hidden="true" tabindex="-1"></a>  <span class="fu">cat</span>(<span class="fu">glue</span>(<span class="st">"latest.txt would be '{latest}' (set PROMOTE_LATEST=1 to write it)</span><span class="sc">\n</span><span class="st">"</span>))</span>
+<span id="cb19-287"><a href="#cb19-287" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb19-288"><a href="#cb19-288" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb19-289"><a href="#cb19-289" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-290"><a href="#cb19-290" aria-hidden="true" tabindex="-1"></a><span class="fu">## Publish to S3</span></span>
 <span id="cb19-291"><a href="#cb19-291" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-292"><a href="#cb19-292" aria-hidden="true" tabindex="-1"></a>  <span class="co"># verify by READING BACK through the public URL, not by trusting the exit</span></span>
-<span id="cb19-293"><a href="#cb19-293" aria-hidden="true" tabindex="-1"></a>  <span class="co"># status — a zero exit has already proved not to mean the objects are there</span></span>
-<span id="cb19-294"><a href="#cb19-294" aria-hidden="true" tabindex="-1"></a>  <span class="co"># (CalCOFI's index publisher learned this the expensive way)</span></span>
-<span id="cb19-295"><a href="#cb19-295" aria-hidden="true" tabindex="-1"></a>  got <span class="ot">&lt;-</span> msens<span class="sc">::</span><span class="fu">atlas_manifest</span>(ver, <span class="at">base =</span> http_root, <span class="at">refresh =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb19-296"><a href="#cb19-296" aria-hidden="true" tabindex="-1"></a>  <span class="fu">stopifnot</span>(<span class="st">"published manifest does not round-trip"</span> <span class="ot">=</span> <span class="fu">identical</span>(got<span class="sc">$</span>ver, ver))</span>
-<span id="cb19-297"><a href="#cb19-297" aria-hidden="true" tabindex="-1"></a>  <span class="fu">cat</span>(<span class="fu">glue</span>(<span class="st">"verified {http_root}/{ver}/manifest.json</span><span class="sc">\n</span><span class="st">"</span>))</span>
-<span id="cb19-298"><a href="#cb19-298" aria-hidden="true" tabindex="-1"></a>} <span class="cf">else</span> {</span>
-<span id="cb19-299"><a href="#cb19-299" aria-hidden="true" tabindex="-1"></a>  <span class="fu">cat</span>(<span class="st">"MANIFEST_NO_S3 set - staged locally only</span><span class="sc">\n</span><span class="st">"</span>)</span>
-<span id="cb19-300"><a href="#cb19-300" aria-hidden="true" tabindex="-1"></a>}</span>
-<span id="cb19-301"><a href="#cb19-301" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb19-302"><a href="#cb19-302" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-303"><a href="#cb19-303" aria-hidden="true" tabindex="-1"></a><span class="fu">## Target manifest</span></span>
-<span id="cb19-304"><a href="#cb19-304" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-307"><a href="#cb19-307" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb19-308"><a href="#cb19-308" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: target-manifest</span></span>
-<span id="cb19-309"><a href="#cb19-309" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb19-310"><a href="#cb19-310" aria-hidden="true" tabindex="-1"></a>msens<span class="sc">::</span><span class="fu">write_manifest</span>(</span>
-<span id="cb19-311"><a href="#cb19-311" aria-hidden="true" tabindex="-1"></a>  here<span class="sc">::</span><span class="fu">here</span>(<span class="st">"data/manifests/build_version_manifest.json"</span>),</span>
-<span id="cb19-312"><a href="#cb19-312" aria-hidden="true" tabindex="-1"></a>  <span class="at">target        =</span> <span class="st">"build_version_manifest"</span>,</span>
-<span id="cb19-313"><a href="#cb19-313" aria-hidden="true" tabindex="-1"></a>  <span class="at">content_hash  =</span> digest<span class="sc">::</span><span class="fu">digest</span>(<span class="fu">list</span>(mfst, versions), <span class="at">algo =</span> <span class="st">"xxhash64"</span>),</span>
-<span id="cb19-314"><a href="#cb19-314" aria-hidden="true" tabindex="-1"></a>  <span class="at">stats =</span> <span class="fu">list</span>(</span>
-<span id="cb19-315"><a href="#cb19-315" aria-hidden="true" tabindex="-1"></a>    <span class="at">ver          =</span> ver,</span>
-<span id="cb19-316"><a href="#cb19-316" aria-hidden="true" tabindex="-1"></a>    <span class="at">status       =</span> mfst<span class="sc">$</span>status,</span>
-<span id="cb19-317"><a href="#cb19-317" aria-hidden="true" tabindex="-1"></a>    <span class="at">grid_id      =</span> mfst<span class="sc">$</span>grid_id,</span>
-<span id="cb19-318"><a href="#cb19-318" aria-hidden="true" tabindex="-1"></a>    <span class="at">id_field     =</span> mfst<span class="sc">$</span>id_field,</span>
-<span id="cb19-319"><a href="#cb19-319" aria-hidden="true" tabindex="-1"></a>    <span class="at">n_versions   =</span> <span class="fu">nrow</span>(versions),</span>
-<span id="cb19-320"><a href="#cb19-320" aria-hidden="true" tabindex="-1"></a>    <span class="at">n_metrics    =</span> <span class="fu">nrow</span>(mfst<span class="sc">$</span>metrics),</span>
-<span id="cb19-321"><a href="#cb19-321" aria-hidden="true" tabindex="-1"></a>    <span class="at">n_zone_sets  =</span> <span class="fu">nrow</span>(mfst<span class="sc">$</span>zones),</span>
-<span id="cb19-322"><a href="#cb19-322" aria-hidden="true" tabindex="-1"></a>    <span class="at">latest       =</span> latest,</span>
-<span id="cb19-323"><a href="#cb19-323" aria-hidden="true" tabindex="-1"></a>    <span class="at">promoted     =</span> promote),</span>
-<span id="cb19-324"><a href="#cb19-324" aria-hidden="true" tabindex="-1"></a>  <span class="at">force =</span> msens<span class="sc">::</span><span class="fu">force_target</span>(<span class="st">"build_version_manifest"</span>))</span>
-<span id="cb19-325"><a href="#cb19-325" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb19-294"><a href="#cb19-294" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb19-295"><a href="#cb19-295" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: s3</span></span>
+<span id="cb19-296"><a href="#cb19-296" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-297"><a href="#cb19-297" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (do_s3) {</span>
+<span id="cb19-298"><a href="#cb19-298" aria-hidden="true" tabindex="-1"></a>  <span class="co"># system2() runs the command through a shell, so unquoted glob patterns are</span></span>
+<span id="cb19-299"><a href="#cb19-299" aria-hidden="true" tabindex="-1"></a>  <span class="co"># expanded by the shell against the CWD before aws ever sees them (an</span></span>
+<span id="cb19-300"><a href="#cb19-300" aria-hidden="true" tabindex="-1"></a>  <span class="co"># unquoted `--exclude *` becomes the entire repo listing). shQuote them, and</span></span>
+<span id="cb19-301"><a href="#cb19-301" aria-hidden="true" tabindex="-1"></a>  <span class="co"># expand `~` ourselves since the CLI does not.</span></span>
+<span id="cb19-302"><a href="#cb19-302" aria-hidden="true" tabindex="-1"></a>  args <span class="ot">&lt;-</span> <span class="fu">c</span>(<span class="st">"s3"</span>, <span class="st">"sync"</span>, <span class="fu">shQuote</span>(<span class="fu">path.expand</span>(dir_reg)), <span class="fu">shQuote</span>(s3_root),</span>
+<span id="cb19-303"><a href="#cb19-303" aria-hidden="true" tabindex="-1"></a>            <span class="st">"--exclude"</span>, <span class="fu">shQuote</span>(<span class="st">"*"</span>),</span>
+<span id="cb19-304"><a href="#cb19-304" aria-hidden="true" tabindex="-1"></a>            <span class="st">"--include"</span>, <span class="fu">shQuote</span>(<span class="st">"*.json"</span>), <span class="st">"--include"</span>, <span class="fu">shQuote</span>(<span class="st">"latest.txt"</span>),</span>
+<span id="cb19-305"><a href="#cb19-305" aria-hidden="true" tabindex="-1"></a>            <span class="st">"--content-type"</span>, <span class="fu">shQuote</span>(<span class="st">"application/json"</span>),</span>
+<span id="cb19-306"><a href="#cb19-306" aria-hidden="true" tabindex="-1"></a>            <span class="co"># these three are MUTABLE pointers; S3 has no default cache-control but</span></span>
+<span id="cb19-307"><a href="#cb19-307" aria-hidden="true" tabindex="-1"></a>            <span class="co"># CDNs and browsers will happily hold a stale registry, which shows the</span></span>
+<span id="cb19-308"><a href="#cb19-308" aria-hidden="true" tabindex="-1"></a>            <span class="co"># wrong version list long after a promotion</span></span>
+<span id="cb19-309"><a href="#cb19-309" aria-hidden="true" tabindex="-1"></a>            <span class="st">"--cache-control"</span>, <span class="fu">shQuote</span>(<span class="st">"no-cache"</span>),</span>
+<span id="cb19-310"><a href="#cb19-310" aria-hidden="true" tabindex="-1"></a>            <span class="st">"--only-show-errors"</span>, <span class="st">"--no-progress"</span>)</span>
+<span id="cb19-311"><a href="#cb19-311" aria-hidden="true" tabindex="-1"></a>  out <span class="ot">&lt;-</span> <span class="fu">system2</span>(<span class="st">"aws"</span>, args, <span class="at">stdout =</span> <span class="cn">TRUE</span>, <span class="at">stderr =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb19-312"><a href="#cb19-312" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">is.null</span>(<span class="fu">attr</span>(out, <span class="st">"status"</span>)) <span class="sc">&amp;&amp;</span> <span class="fu">attr</span>(out, <span class="st">"status"</span>) <span class="sc">!=</span> <span class="dv">0</span>)</span>
+<span id="cb19-313"><a href="#cb19-313" aria-hidden="true" tabindex="-1"></a>    <span class="fu">stop</span>(<span class="st">"aws s3 sync failed: "</span>, <span class="fu">paste</span>(out, <span class="at">collapse =</span> <span class="st">"</span><span class="sc">\n</span><span class="st">"</span>))</span>
+<span id="cb19-314"><a href="#cb19-314" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-315"><a href="#cb19-315" aria-hidden="true" tabindex="-1"></a>  <span class="co"># verify by READING BACK through the public URL, not by trusting the exit</span></span>
+<span id="cb19-316"><a href="#cb19-316" aria-hidden="true" tabindex="-1"></a>  <span class="co"># status — a zero exit has already proved not to mean the objects are there</span></span>
+<span id="cb19-317"><a href="#cb19-317" aria-hidden="true" tabindex="-1"></a>  <span class="co"># (CalCOFI's index publisher learned this the expensive way)</span></span>
+<span id="cb19-318"><a href="#cb19-318" aria-hidden="true" tabindex="-1"></a>  got <span class="ot">&lt;-</span> msens<span class="sc">::</span><span class="fu">atlas_manifest</span>(ver, <span class="at">base =</span> http_root, <span class="at">refresh =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb19-319"><a href="#cb19-319" aria-hidden="true" tabindex="-1"></a>  <span class="fu">stopifnot</span>(<span class="st">"published manifest does not round-trip"</span> <span class="ot">=</span> <span class="fu">identical</span>(got<span class="sc">$</span>ver, ver))</span>
+<span id="cb19-320"><a href="#cb19-320" aria-hidden="true" tabindex="-1"></a>  <span class="co"># ...and the registry itself, read exactly as an app reads it: the `access` an</span></span>
+<span id="cb19-321"><a href="#cb19-321" aria-hidden="true" tabindex="-1"></a>  <span class="co"># app will enforce must be the `access` this notebook just wrote (a stale</span></span>
+<span id="cb19-322"><a href="#cb19-322" aria-hidden="true" tabindex="-1"></a>  <span class="co"># versions.json here would let the readers' fail-closed default hide a public</span></span>
+<span id="cb19-323"><a href="#cb19-323" aria-hidden="true" tabindex="-1"></a>  <span class="co"># pre-release, or an edited CSV fail to restrict one)</span></span>
+<span id="cb19-324"><a href="#cb19-324" aria-hidden="true" tabindex="-1"></a>  got_v <span class="ot">&lt;-</span> msens<span class="sc">::</span><span class="fu">atlas_versions</span>(<span class="at">base =</span> http_root, <span class="at">refresh =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb19-325"><a href="#cb19-325" aria-hidden="true" tabindex="-1"></a>  <span class="fu">stopifnot</span>(<span class="st">"published versions.json access does not match versions.csv"</span> <span class="ot">=</span></span>
+<span id="cb19-326"><a href="#cb19-326" aria-hidden="true" tabindex="-1"></a>              <span class="fu">identical</span>(got_v<span class="sc">$</span>access[<span class="fu">match</span>(versions<span class="sc">$</span>ver, got_v<span class="sc">$</span>ver)], versions<span class="sc">$</span>access))</span>
+<span id="cb19-327"><a href="#cb19-327" aria-hidden="true" tabindex="-1"></a>  <span class="fu">cat</span>(<span class="fu">glue</span>(<span class="st">"verified {http_root}/{ver}/manifest.json and versions.json (access column)</span><span class="sc">\n</span><span class="st">"</span>))</span>
+<span id="cb19-328"><a href="#cb19-328" aria-hidden="true" tabindex="-1"></a>} <span class="cf">else</span> {</span>
+<span id="cb19-329"><a href="#cb19-329" aria-hidden="true" tabindex="-1"></a>  <span class="fu">cat</span>(<span class="st">"MANIFEST_NO_S3 set - staged locally only</span><span class="sc">\n</span><span class="st">"</span>)</span>
+<span id="cb19-330"><a href="#cb19-330" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb19-331"><a href="#cb19-331" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb19-332"><a href="#cb19-332" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-333"><a href="#cb19-333" aria-hidden="true" tabindex="-1"></a><span class="fu">## Target manifest</span></span>
+<span id="cb19-334"><a href="#cb19-334" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-337"><a href="#cb19-337" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb19-338"><a href="#cb19-338" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: target-manifest</span></span>
+<span id="cb19-339"><a href="#cb19-339" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-340"><a href="#cb19-340" aria-hidden="true" tabindex="-1"></a>msens<span class="sc">::</span><span class="fu">write_manifest</span>(</span>
+<span id="cb19-341"><a href="#cb19-341" aria-hidden="true" tabindex="-1"></a>  here<span class="sc">::</span><span class="fu">here</span>(<span class="st">"data/manifests/build_version_manifest.json"</span>),</span>
+<span id="cb19-342"><a href="#cb19-342" aria-hidden="true" tabindex="-1"></a>  <span class="at">target        =</span> <span class="st">"build_version_manifest"</span>,</span>
+<span id="cb19-343"><a href="#cb19-343" aria-hidden="true" tabindex="-1"></a>  <span class="at">content_hash  =</span> digest<span class="sc">::</span><span class="fu">digest</span>(<span class="fu">list</span>(mfst, versions), <span class="at">algo =</span> <span class="st">"xxhash64"</span>),</span>
+<span id="cb19-344"><a href="#cb19-344" aria-hidden="true" tabindex="-1"></a>  <span class="at">stats =</span> <span class="fu">list</span>(</span>
+<span id="cb19-345"><a href="#cb19-345" aria-hidden="true" tabindex="-1"></a>    <span class="at">ver          =</span> ver,</span>
+<span id="cb19-346"><a href="#cb19-346" aria-hidden="true" tabindex="-1"></a>    <span class="at">status       =</span> mfst<span class="sc">$</span>status,</span>
+<span id="cb19-347"><a href="#cb19-347" aria-hidden="true" tabindex="-1"></a>    <span class="at">access       =</span> mfst<span class="sc">$</span>access,</span>
+<span id="cb19-348"><a href="#cb19-348" aria-hidden="true" tabindex="-1"></a>    <span class="at">grid_id      =</span> mfst<span class="sc">$</span>grid_id,</span>
+<span id="cb19-349"><a href="#cb19-349" aria-hidden="true" tabindex="-1"></a>    <span class="at">id_field     =</span> mfst<span class="sc">$</span>id_field,</span>
+<span id="cb19-350"><a href="#cb19-350" aria-hidden="true" tabindex="-1"></a>    <span class="at">n_versions   =</span> <span class="fu">nrow</span>(versions),</span>
+<span id="cb19-351"><a href="#cb19-351" aria-hidden="true" tabindex="-1"></a>    <span class="at">n_metrics    =</span> <span class="fu">nrow</span>(mfst<span class="sc">$</span>metrics),</span>
+<span id="cb19-352"><a href="#cb19-352" aria-hidden="true" tabindex="-1"></a>    <span class="at">n_zone_sets  =</span> <span class="fu">nrow</span>(mfst<span class="sc">$</span>zones),</span>
+<span id="cb19-353"><a href="#cb19-353" aria-hidden="true" tabindex="-1"></a>    <span class="at">latest       =</span> latest,</span>
+<span id="cb19-354"><a href="#cb19-354" aria-hidden="true" tabindex="-1"></a>    <span class="at">promoted     =</span> promote),</span>
+<span id="cb19-355"><a href="#cb19-355" aria-hidden="true" tabindex="-1"></a>  <span class="at">force =</span> msens<span class="sc">::</span><span class="fu">force_target</span>(<span class="st">"build_version_manifest"</span>))</span>
+<span id="cb19-356"><a href="#cb19-356" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
 </code></pre></div><button title="Copy to Clipboard" class="code-copy-button" data-in-quarto-modal=""><i class="bi"></i></button></div>
 </div></div></div></div></div>
 </div> <!-- /content -->

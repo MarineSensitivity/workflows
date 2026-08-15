@@ -280,11 +280,34 @@ longer lists `v8/`; docs switcher and app picker on public show the lock + previ
 Then invite Tim: PIN arrives at his .gov mailbox, `/scores/?ver=v8` renders. That email landing
 is the acceptance test for decision 1.
 
+**Phase 2 hardening found while building Phase 0:** the plumber API's `POST /report` and
+`GET /summary` take `ver` freely (`api/plumber.R`), so an aggregate report of a restricted
+release could be rendered publicly. Small leak, but real: make them refuse `access = restricted`
+versions unless the request carries a shared secret the preview app instance sends
+(`MSENS_PREVIEW_TOKEN` in the rstudio + plumber env). Do it in Phase 2 with the flip.
+
 **Phase 3 — later, separate decisions.** Google IdP for Ben; `@boem.gov`/`@noaa.gov` domain
 policy; Microsoft IdP if DOI's tenant permits (test with Tim); Cloudflare in front of the *public*
 hosts for caching/rate-limits (the 2026-07-15 plan's edge layer — a per-record toggle now that the
 zone is there); the dataset-level restriction plan (private prefix + credentialed titiler/CI/app
 readers). None of these is needed for the review workflow.
+
+## Phase 0 log (2026-08-15)
+
+Built and deployed dark: msens 0.30.0 (`access`, `atlas_allow_access()`, classed
+`msens_restricted`, picker lock, `manifest_build(access=)`, 89+18 tests green), apps (`ver_of`
+policy, `<meta ms-ver/ms-preview>`, PREVIEW badge, restricted modal, `-preview` analytics
+tag), workflows (`versions.csv` `access` column, registry validation + round-trip, storage index
+withholding, `DEPLOY_CADDY` build+validate+restart, `DEPLOY_DOCS`, `CHECK_PREVIEW`), server
+(caddy-jwt image, preview vhost failing closed, second Shiny Server block + wrappers,
+`docs-preview` sidecar, `dns_before.txt`), docs (CI two-branch publish, access-aware switcher,
+`doc_app_url()` links). Verified locally before deploy: public instance refuses `?ver=v8` the
+moment the registry lacks `access` (fail-closed works — hence the ordering rule), preview
+instance renders it with the badge; wrapper serves the inner `www/`.
+
+Learned: a wildcard `*.marinesensitivity.org → 100.25.173.0` already exists, so `preview.` needed
+no DNS step for the dark deploy; `/share/docs_preview` must be chowned to uid 1000 (Docker creates
+bind sources root-owned).
 
 ## Rollback
 
