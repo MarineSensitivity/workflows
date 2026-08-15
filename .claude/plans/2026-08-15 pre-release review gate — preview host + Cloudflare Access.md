@@ -322,6 +322,17 @@ public instance → v7, on preview → v9; on the server — `PREVIEW_ROUTES_OK`
 sockjs + assets proxy; `/scores/?ver=v8` → 302 `/v8/scores/`, never proxied); `CHECK_PREVIEW` green.
 Gotcha met: query manipulation is `uri query <key> <value>` (no standalone `query` directive).
 
+**Status at end of 2026-08-15 — plainly.** Everything above is deployed but **DARK: no human can open
+any preview URL** (`preview.marinesensitivity.org/…` answers 401 — now with a page saying so — because
+the only door is Cloudflare Access and it is not in front yet). What "verified" meant: (a) the routes
++ app were driven by a throwaway Caddy holding a *test* JWT (`caddy/test/run.sh`); (b) the session-token
+binding was checked in Chrome on the **public** app (server rewrote `?ver=v6&probe=1` → `?ver=v6`).
+Neither is visible to a person. Ben chose to wait; nothing further today. **Phase 1 needs:** a
+Cloudflare account, the nameserver change at Squarespace (`cloudflare/dns_before.txt` is the "before"),
+then `access.sh` (one Access application per restricted version + landing catch-all + service token),
+`CF_ACCESS_TEAM/AUD` into the server `.env`, `DEPLOY_CADDY`. A basic-auth stopgap (env-switched auth
+file instead of jwtauth) was offered for a look-before-Phase-1 and declined.
+
 ## Rollback
 
 - Access misbehaves → set `preview` DNS-only; the vhost then 401s everything (nothing leaks).
