@@ -29,7 +29,8 @@ unpublished; building for `is_valid_global` alone silently dropped those 46. The
 21,581 taxa / 25,450 input edges.
 
 **Flags:** `REDO_NATIVE=1` (rebuild PMTiles + IUCN gpkg + re-sort am), `REDO_PMTILES=1` (rebuild
-just the vector tiles), `NATIVE_SKIP_AM` / `NATIVE_SKIP_PMTILES`,
+just the vector tiles), `REDO_MERGED_COG=1` (repaint just the merged whole-range COGs — what a
+re-merge invalidates), `NATIVE_SKIP_AM` / `NATIVE_SKIP_PMTILES`,
 `NATIVE_TEST_N=<n>` (only first n am COGs, smoke test), `NATIVE_NO_S3` (stage locally, skip upload),
 `NATIVE_WORKERS=<n>`, `NATIVE_VEC_COG=1` / `PUBLISH_MERGED_COG=1` (opt-in COG classes),
 `NATIVE_REGISTRY_REBUILD=1` (publish ONLY what this run built — see the registry chunk; without it
@@ -559,12 +560,23 @@ sort — then paint each per-taxon slice. Opt-in (`PUBLISH_MERGED_COG=1`); paral
 #| label: merged-cogs
 
 do_merged_cog <- nzchar(Sys.getenv("PUBLISH_MERGED_COG"))
+# REDO_MERGED_COG exists separately from REDO_NATIVE for the same reason REDO_PMTILES does: the
+# merged COGs are a pure function of dist_merged_global, so a re-merge invalidates every one of them
+# while the ~7 GB IUCN gpkg and the am re-sort REDO_NATIVE would also redo are untouched. The build
+# below is resumable by file existence, so repainting means clearing the outputs -- as a FLAG, never
+# a hand-`mv`, so the HTML records which run rebuilt them (apps#8 masking fix).
+redo_mcog   <- redo || nzchar(Sys.getenv("REDO_MERGED_COG"))
 merged_reg  <- tibble()
 merged_map  <- tibble()
 mparts      <- glue("{dir_native}/_merged_parts{if (test_n > 0) '_test' else ''}")
 dir_gmerged <- glue("{dir_atlas}/dist_merged_global/dataset=ms_merge")
 if (do_merged_cog && dir_exists(dir_gmerged)) {
-  dir_mcog <- glue("{dir_native}/merged"); dir_create(dir_mcog)
+  dir_mcog <- glue("{dir_native}/merged")
+  if (redo_mcog && dir_exists(dir_mcog)) {
+    log_info("REDO_MERGED_COG: clearing {length(dir_ls(dir_mcog, glob = '*.tif'))} merged COGs")
+    dir_delete(dir_mcog)
+  }
+  dir_create(dir_mcog)
   con <- dbConnect(duckdb(), config = list(threads = "6", memory_limit = "10GB"))
   dbExecute(con, glue("SET temp_directory='{dir_atlas}/duckdb_tmp'"))
   dbExecute(con, glue("ATTACH '{merge_db}' AS m (READ_ONLY)"))
@@ -576,7 +588,7 @@ if (do_merged_cog && dir_exists(dir_gmerged)) {
       USING (mdl_key)"))$mdl_key
   mkeys <- sort(mkeys); if (test_n > 0) mkeys <- head(mkeys, test_n)
   merged_map <- tibble(mdl_key = mkeys, mmid = seq_along(mkeys))
-  if (length(mkeys) && (!dir_exists(mparts) || redo)) {
+  if (length(mkeys) && (!dir_exists(mparts) || redo_mcog)) {
     if (dir_exists(mparts)) dir_delete(mparts)
     dbExecute(con, "SET partitioned_write_max_open_files=400")
     dbWriteTable(con, "merged_map", merged_map, overwrite = TRUE)

@@ -98,7 +98,13 @@ the views), `DEPLOY_API=1` (pull the api repo + **rebuild** the plumber image �
 image, which is separate from `rstudio`, so `DEPLOY_APPS` never updates it),
 `DEPLOY_CADDY=1` (pull the server repo + `docker compose restart caddy` — the URL surface on its
 own, so a routing fix need not rebuild titiler; the retirement 301s live there, and they must
-carry `&{query}` or every published `?mdl_seq=` deep link loses its model id in flight).
+carry `&{query}` or every published `?mdl_seq=` deep link loses its model id in flight),
+`DEPLOY_TITILER=1` (restart `titiler-v8` alone — **required after any `REDO_MERGED_COG` /
+`publish_native` run that repaints COGs**, because `native/*` keys are STABLE, so new bytes land
+under a URL whose header GDAL's `/vsicurl` has cached in-process; a shrunken COG then reads past
+EOF and z2–z4 return HTTP 500 while z5+ look fine),
+`REDO_MERGED_COG=1` (repaint just the merged whole-range COGs — what a re-merge invalidates,
+without `REDO_NATIVE`'s 7 GB IUCN gpkg rebuild and am re-sort).
 
 **Serving reads LOCAL Parquet, not S3.** S3 is the published artifact; the server keeps a versioned
 copy under `/share/data/big/{ver}/` and `serve.duckdb`'s views point there. Over HTTPS every query
@@ -141,6 +147,16 @@ such rule with a **testthat unit test** in `../msens/tests/testthat/`.
 - **Regression cases are permanent.** When a bug is found (e.g. the v8 rewrite dropping the
   `iucn_range_outside_us_eez` exclusion, or deduping multi-AquaMaps-model am cells), encode the
   fixed behavior as a named assertion so it can't regress.
+- **The merge has TWO output surfaces and BOTH are masked.** `$us` (scoring, `dist_merged`) and
+  `$global` (what the species app DRAWS, `dist_merged_global` → `native/merged/*.tif`) apply the
+  same range mask; they differ only by the `in_usa` trim and the am-only branch `$us` alone
+  carries. `$global` was briefly a FULL OUTER union with the whole am footprint, which painted raw
+  AquaMaps over-prediction into all 3,461 both-taxa COGs — half the walrus surface, down to 9.75°N
+  — for a month (MarineSensitivity/apps#8). **The merge manifest hash fingerprints `$us` only**, so
+  it structurally could not see it, and the existing global-surface tests described the union
+  instead of questioning it. Every assertion about `$global` must be one the union FAILS; the
+  general one (`no global cell outside the range footprint`) now lives in `test-merge.R` and is
+  re-asserted on the written parquet by `merge_models.qmd`'s masking-check chunk.
 
 Whole-pipeline correctness is ALSO enforced by `msens::pra_score_delta` (version-equivalence gate)
 and the `stopifnot`/content-hash validation chunks — but those catch *aggregate* drift; the unit

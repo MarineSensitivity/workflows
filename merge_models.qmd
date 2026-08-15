@@ -13,10 +13,12 @@ Combine every taxon's per-dataset models into one **merged `model_cell`**
 (`mdl_key = ms_merge|WORMS:…` / `BOTW:…`), reproducing v7's logic at the v8 global
 scale (~13B am cell-rows), so it must stream + spill rather than materialize:
 
-- **Default = max-merge, masked to the range footprint.** A taxon's merged cells are
-  its **range** cells if it has any (`rng_*`/`ch_*`/`ca_*`/`bl`), else its full `am`
-  footprint; at each kept cell `val = max` across the taxon's models. Streamed
-  straight to Parquet via a single `COPY` (one grouped scan), so no 13B-row table.
+- **Default = max-merge, masked to the range footprint — on BOTH surfaces.** A taxon's
+  merged cells are its **range** cells if it has any (`rng_*`/`ch_*`/`ca_*`/`bl`), else its
+  full `am` footprint; at each kept cell `val = max` across the taxon's models. Streamed
+  straight to Parquet via a single `COPY` (one grouped scan), so no 13B-row table. The
+  global surface applies the identical mask — it is the whole *range*, not the whole am
+  footprint (see @sec-masking).
 - **Turtles = multiplicative.** `val = pmax(1, round(er × suit / 100))` with
   critical-habitat max-override — computed from **only the 6 turtle taxa's files**
   (never a full am scan, which is what OOM'd the naive version).
@@ -25,10 +27,10 @@ scale (~13B am cell-rows), so it must stream + spill rather than materialize:
 
 ```{mermaid}
 %%| label: fig-design
-%%| fig-cap: "ONE batched merge → TWO surfaces from the same data. GLOBAL viz = am ∪ range (FULL OUTER, whole-range merged model) → COGs. US scoring = v7-faithful US-boundary-aware rule (range∩US max(er,am-at-range) UNION am∩US for taxa with no US range) — NOT a trim of global. Turtles multiplicative."
+%%| fig-cap: "ONE batched merge → TWO surfaces from the same data, BOTH masked to the range footprint. GLOBAL viz = the whole range, max(er, am-at-range) → COGs. US scoring = v7-faithful US-boundary-aware rule (range∩US max(er,am-at-range) UNION am∩US for taxa with no US range) — NOT a trim of global. Turtles multiplicative."
 flowchart LR
   raw["dist/*/*.parquet<br/>(raw model_cell)"] --> mcp[("mc_parts<br/>partitioned by mkey_id (int)")]
-  mcp --> gm["GLOBAL: er over range<br/>∪ am over whole am footprint<br/>(FULL OUTER)"]
+  mcp --> gm["GLOBAL: whole range,<br/>max(er, am-at-range)<br/>(am beyond range MASKED)"]
   mcp --> um["US: range∩US max(er,am@range)<br/>∪ am∩US for taxa w/ no US range"]
   mcp --> tt["turtles ×<br/>greatest(1, er·suit/100)"]
   gm --> g[("dist_merged_global/**<br/>whole-range → viz COGs")]
@@ -155,6 +157,8 @@ have_merged <- dir_exists(dir_merged) && dir_exists(dir_global) &&
 if (redo_merge || !have_merged) {
 if (dir_exists(dir_global)) dir_delete(dir_global); dir_create(dir_global)
 if (dir_exists(dir_merged)) dir_delete(dir_merged); dir_create(dir_merged)
+# survives the run so the masking check can re-run on a skipped re-render (see @sec-masking)
+dbExecute(con, "CREATE OR REPLACE TABLE range_counts (ms_merge_key VARCHAR, n_range BIGINT)")
 
 # turtles (done) → whole-range global + US-trim
 msens::copy_atlas_parquet(con, "SELECT mdl_key, cell_id, val FROM mc_turtle",
@@ -182,7 +186,10 @@ batches <- unname(split(cnt$mkey_id, cumsum(as.numeric(cnt$n)) %/% 40e6))
 log_info("merging {length(nonturtle)} non-turtle taxa in {length(batches)} cell-bounded batches (~40M cells each)")
 # The merge RULES are msens::merge_sql() — the SINGLE SOURCE OF TRUTH, unit-tested in
 # msens/tests/testthat/test-merge.R (every taxon category asserted). Two surfaces from the same batch:
-#  GLOBAL viz  ($global) = am ∪ range (FULL OUTER, whole-range merged model) → COGs.
+#  GLOBAL viz  ($global) = the WHOLE RANGE footprint, max(er, am-at-range) [am BEYOND the range is
+#    MASKED here too] → COGs. Whole *range*, not whole am footprint: this surface was briefly a FULL
+#    OUTER union with the entire am footprint, which painted raw AquaMaps over-prediction into every
+#    merged COG (MarineSensitivity/apps#8) while scoring stayed correct.
 #  US scoring  ($us)     = v7-faithful, IUCN-CONSTRAINED: range∩US max(er, am-at-range) [am BEYOND the
 #    range is MASKED] UNION raw am∩US for TRUE am-only taxa (global has_range=FALSE). A species whose
 #    IUCN range lies WHOLLY outside the US gets NO US presence — the iucn_range_outside_us_eez
@@ -195,14 +202,16 @@ for (i in seq_along(batches)) {
   dbExecute(con, glue("CREATE OR REPLACE TABLE b AS
     SELECT ms_merge_key, ds_key, cell_id, val FROM mc_parts WHERE mkey_id IN ({bk})"))
   dbExecute(con, msq$b_range)    # range footprint (non-am) valued by governing er_score
-  dbExecute(con, msq$b_am_all)   # (global) am over WHOLE am footprint of has_range taxa → am∪range
-  dbExecute(con, msq$b_am_rng)   # (US) am AT range cells only → range-footprint max(er, am-at-range)
+  dbExecute(con, msq$b_am_rng)   # am AT range cells only → range-footprint max(er, am-at-range)
+  # per-taxon range-cell tally, accumulated while b_range is in hand (free) — the masking check
+  # below needs it and would otherwise have to re-scan 12 GB of range parquet on every render
+  dbExecute(con, "INSERT INTO range_counts SELECT ms_merge_key, count(*) FROM b_range GROUP BY 1")
   msens::copy_atlas_parquet(con, glob_global_sql, glue("{dir_global}/b{i}"), per_thread = TRUE)
   msens::copy_atlas_parquet(con, us_sql,          glue("{dir_merged}/b{i}"), per_thread = TRUE)
   if (i %% 10 == 0) log_info("  batch {i}/{length(batches)}")
 }
 dbExecute(con, "DROP TABLE IF EXISTS b; DROP TABLE IF EXISTS b_range;
-  DROP TABLE IF EXISTS b_am_all; DROP TABLE IF EXISTS b_am_rng")
+  DROP TABLE IF EXISTS b_am_rng")
 } else log_info("dist_merged + dist_merged_global exist — skipping merge write (REDO_MERGE=1 to force)")
 
 # summaries: global (viz) + US (scoring); fingerprint the US scoring surface (the tracked output)
@@ -213,6 +222,36 @@ smry   <- dbGetQuery(con, glue("SELECT count(DISTINCT mdl_key) n_taxa, count(*) 
 h <- msens::hash_parquet(glue("{dir_merged}/**/*.parquet"), con)
 msens::report_table(smry_g, caption = "GLOBAL whole-range merged surface (ms_merge) → viz COGs")
 msens::report_table(smry,   caption = "US-trimmed merged model_cell (ms_merge) → scoring")
+```
+
+## Masking check {#sec-masking}
+
+The global surface is what the species app **draws**, and it is the one surface the manifest hash
+cannot see — the fingerprint is taken over `dist_merged` alone. So assert the mask here, on the
+written parquet, or nothing does: for every non-turtle taxon the global surface must have **exactly
+one cell per range cell**, because `$global` is `b_range LEFT JOIN b_am_rng` and `b_range` is
+`DISTINCT`. Any surplus is AquaMaps painted beyond the expert range — the apps#8 regression, which
+had 3,461 taxa carrying it (the walrus alone 743,749 surplus cells, reaching 9.75°N).
+
+Turtles are excluded: their footprint is the DPS extinction-risk surface, not the union of every
+non-am dataset, so the identity doesn't apply — `msens::turtle_sql()` masks them by construction and
+`test-merge.R` asserts it.
+
+```{r}
+#| label: masking_check
+
+if (dbExistsTable(con, "range_counts")) {
+  bad <- dbGetQuery(con, glue("
+    WITH g AS (SELECT mdl_key, count(*) AS n_global
+               FROM read_parquet('{dir_global}/**/*.parquet') GROUP BY 1)
+    SELECT g.mdl_key, r.n_range, g.n_global, g.n_global - r.n_range AS n_surplus
+    FROM g JOIN range_counts r ON r.ms_merge_key = g.mdl_key
+    WHERE g.n_global <> r.n_range ORDER BY n_surplus DESC"))
+  n_ck <- dbGetQuery(con, "SELECT count(*) n FROM range_counts")$n
+  if (nrow(bad)) msens::report_table(head(bad, 20), caption = "UNMASKED taxa (am beyond the range)")
+  log_info("masking check: {n_ck - nrow(bad)}/{n_ck} taxa masked to their range footprint")
+  stopifnot("global surface has cells beyond the range footprint (apps#8)" = nrow(bad) == 0)
+} else log_info("range_counts absent (merge skipped by a prior run) — REDO_MERGE=1 to re-check")
 dbDisconnect(con, shutdown = TRUE)
 ```
 

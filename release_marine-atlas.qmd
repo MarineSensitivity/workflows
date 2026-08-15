@@ -29,7 +29,9 @@ Publish the **v8 marine-atlas** and stand up its serving, reproducibly:
 4. **Deploy** (`RELEASE_DEPLOY=1`) — rsync the KB view DB + STAC to `msens1`, (re)build the
    parallel `titiler-v8` service, restart caddy. v7 serving is untouched (A/B).
    Granular flags for the parts: `DEPLOY_APPS=1` (Shiny apps), `DEPLOY_TABLES=1` (local
-   Parquet + views), `DEPLOY_API=1` (plumber image), `DEPLOY_CADDY=1` (URL routing alone).
+   Parquet + views), `DEPLOY_API=1` (plumber image), `DEPLOY_CADDY=1` (URL routing alone),
+   `DEPLOY_TITILER=1` (restart the tiler so it drops GDAL's cached headers for COGs
+   repainted at their existing URLs — run it after any `publish_native` that rebuilt them).
 
 ## Setup
 
@@ -559,6 +561,60 @@ if (!do_caddy) {
       stop(glue("Caddy dropped the model id: /{u} -> {loc}"))
   }
   log_info("redirects preserve the model id")
+}
+```
+
+## Restart titiler after REPAINTING COGs at stable URLs (`DEPLOY_TITILER=1`)
+
+`native/*` COGs live at **stable** keys — the app's `native_asset` registry points at them by
+name — so republishing a model repaints bytes behind a URL titiler has already read. GDAL's
+`/vsicurl` layer caches the header **per process**, and a repainted COG is usually a different
+size, so the running container keeps computing offsets from the old length and reads past EOF:
+z5+ served fine while z2–z4 returned HTTP 500. Restarting the container is the whole fix — the
+cache is memory, not disk.
+
+This is the narrow path, like `DEPLOY_CADDY`: pull the server repo and restart `titiler-{ver}`.
+No `--build`, because the factory has not changed; use `RELEASE_DEPLOY` when it has.
+
+The check reads the **served** bounds back and compares them to what the registry recorded for
+the same model. A stale header still reports the OLD extent, so this fails on exactly the
+condition it exists to catch — unlike an HTTP 200, which a stale-but-readable COG returns
+happily.
+
+```{r}
+#| label: deploy-titiler
+
+do_titiler <- nzchar(Sys.getenv("DEPLOY_TITILER"))
+if (!do_titiler) {
+  log_info("DEPLOY_TITILER unset — titiler-{ver} left running (set it after repainting COGs)")
+} else {
+  out_tt <- system2("ssh", c("msens", shQuote(glue(
+    "set -e; cd {srv_repo} && git fetch --quiet origin && git merge --ff-only origin/main && ",
+    "docker compose restart titiler-{ver} && echo TITILER_OK $(git rev-parse --short HEAD)"))),
+    stdout = TRUE, stderr = TRUE)
+  if (!any(grepl("TITILER_OK", out_tt))) stop(paste(tail(out_tt, 15), collapse = "\n"))
+  log_info("titiler-{ver} restarted: {grep('TITILER_OK', out_tt, value = TRUE)}")
+
+  # served bounds == registry bounds, on a sample of merged COGs
+  c0 <- dbConnect(duckdb(sdm_db, read_only = TRUE))
+  chk <- dbGetQuery(c0, "SELECT mdl_key, asset_url, ymin, ymax FROM native_asset
+    WHERE ds_key = 'ms_merge' AND asset_type = 'cog' AND ymin IS NOT NULL
+    ORDER BY mdl_key LIMIT 5")
+  dbDisconnect(c0, shutdown = TRUE)
+  tt_base <- sub("/msens$", "", titiler_v8)
+  bad <- character()
+  for (i in seq_len(nrow(chk))) {
+    js <- system2("curl", c("-s", "--retry", "3", shQuote(glue(
+      "{tt_base}/cog/info?url={URLencode(chk$asset_url[i], reserved = TRUE)}"))), stdout = TRUE)
+    b <- tryCatch(jsonlite::fromJSON(paste(js, collapse = ""))$bounds, error = function(e) NULL)
+    if (is.null(b) || length(b) != 4) { bad <- c(bad, glue("{chk$mdl_key[i]}: no bounds")); next }
+    # 0.05 deg grid: agreement to a hundredth of a degree is exact, not approximate
+    if (abs(b[2] - chk$ymin[i]) > 0.01 || abs(b[4] - chk$ymax[i]) > 0.01)
+      bad <- c(bad, glue("{chk$mdl_key[i]}: served [{round(b[2],2)}, {round(b[4],2)}] != ",
+                         "registry [{chk$ymin[i]}, {chk$ymax[i]}]"))
+  }
+  if (length(bad)) stop(paste(c("titiler is serving STALE COG headers:", bad), collapse = "\n"))
+  log_info("titiler-{ver} serves the republished COG extents ({nrow(chk)} models checked)")
 }
 ```
 
