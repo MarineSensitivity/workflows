@@ -36,6 +36,51 @@
   Let's write a manuscript (with a plan first to discuss) on forwarding the vision of this project to the next iteration (plan )
   '/Users/bbest/Library/CloudStorage/GoogleDrive-ben@ecoquants.com/.shortcut-targets-by-id/1sppUmlMtZ-sXaBm72M1-8PnjVudXO91v/US MBON Public Folder/Working Groups/BioIndicators/manuscripts/atlas/atlas _ BioIndicators manuscript.md'
 
+## 2026-08-15 auth for apps/docs
+
+What can we do to setup a login for specific versions of @../apps and @../docs (and allow retired, default to continue to be freely available)?
+
+I would much prefer using OAuth2 or similar to allow someone else store passwords, but this would not be for many users and might be more straightforward to simply assign username and password with permissions.
+
+I am mostly imagining using this for conducting pre-release reviews across SDM data providers and colleagues at BOEM/NOAA for new dataset ingestion and methods for normalizing density.
+
+I would want to do this at the per version level within the apps and docs.
+
+I see this R package for Shiny apps:
+https://lukakoning.github.io/shinyOAuth/llms.txt
+
+Not sure what to do for docs rendered by Github. Maybe easier to host on Caddy and handle it within Caddy?
+
+Then there's the aspect of source code for apps/docs and data (COGS/PMTiles/parquet). Not sure how to proceed, if for instance, an SDM data provider is OK with us using their dataset but not redistributing (but need COG in S3 for bucket). Some notion of this migth be possible based on this mention from setting up stac-fastapi-duckdb in past Claude session:
+> - The endpoint is public and gets constant credential-scanning (/.gcp/credentials.json, /laravel/.env). Mount is :ro with no secrets, but worth knowing.
+
+Feel free to ping me with Qs. I would like to start with writing a plan to @.claude/plans/, before clearing context and launching into it
+Listed directory .claude/plans/
+
+And I would like to initiate this 'hidden' authenticate view only for myself (ben@oceanmetrics.io - a Google workspace account) and project manager Tim White (timothy.white@boem.gov - a Microsoft .gov account). And specifically for the pre-release v8 of both apps and docs
+
+----
+
+Good — there's already a 2026-07-15_access-control_restricted-datasets.md plan. Let me read that plus the current serving surface before I ask you anything.
+
+----
+
+The plan is written to .claude/plans/2026-08-15 pre-release review gate — preview host + Cloudflare Access.md, ready for a fresh context.
+
+What it settles
+
+**Mechanism** — Cloudflare Access on one new host, preview.marinesensitivity.org, serving /scores, /species, /docs/{ver}/ under one login. Emailed one-time PIN first (works for Tim's .gov mailbox with nothing to consent to in DOI's tenant, and no passwords held anywhere); Google for you later as convenience; a one-line @boem.gov/@noaa.gov domain policy when reviewers multiply. Cost: moving marinesensitivity.org nameservers Squarespace → Cloudflare, with only preview proxied — every public host, the GitHub Pages apex and mail stay DNS-only and behave identically. Caddy verifies the Access JWT at the origin (caddy-jwt added to the existing xcaddy build), so bypassing the edge gets a 401.
+
+**Policy = registry, not config**. A new access ∈ {public, restricted} field in versions.csv → versions.json (defaulting prerelease → restricted) is read by the apps (msens::atlas_resolve_ver(allow_access=)), the docs CI (public books → gh-pages, restricted → gh-pages-preview, pulled by a tiny sidecar on the server), and the UI chrome (lock badges linking to the preview host). Cloudflare and Caddy gate a hostname and know nothing about versions; the promoted latest.txt version must be public by assertion.
+
+**The non-obvious finding that shaped it**: Shiny Server OSS opens its own websocket to the R worker (sockjs.js:167), so no proxy identity header ever reaches session$request — a header-trusting design would be steerable to v8 over the websocket. So enforcement is a second Shiny Server server { listen 3839 } block whose 3-line wrapper app.R sets MS_PREVIEW=1 and shinyAppDir()s the real app: the public process has no code path that renders a restricted version. Identity is only used for display (ui(req) sees it).
+
+**Verification is browser-free**: <meta name="ms-ver"> / ms-preview sentinels + an Access service token let curl prove which version each host served, plus origin-direct 401 and gh-pages 404 checks — baked into a CHECK_PREVIEW=1 chunk so it can't pass on broken input.
+
+**Phased**: 0 build dark (v8 stays public) → 1 Cloudflare zone + Access → 2 flip v8 restricted, docs CI moves it, invite Tim (his PIN email is the acceptance test) → 3 optional (Google IdP, domain policies, Microsoft IdP if DOI permits, the separate restricted-datasets plan for actual data confidentiality).
+
+Two things I'd flag before you clear context: (1) the plan pins caddy-jwt but says verify jwk_url/audience_whitelist support at the chosen version — a forward_auth verifier is the named fallback; (2) the Squarespace panel, not dig, is the source of truth for mail/TXT records during the DNS move — dns_snapshot.sh covers what the Caddyfile names, so a manual pass over the panel is a listed step, not skippable.
+
 ## 2026-08-13 fix species app versions
 
 Why is the species app `@../apps/species` not showing earlier versions? I thought everything was already loaded.
@@ -204,6 +249,156 @@ One thing worth flagging for the commit in that other session: workflows/data/ma
 ----
 
 Ok, please get going with 1-4
+
+----
+
+Waiting on the server sync. Status so far:
+
+Done and verified
+- Task 1 — msens::registry_merge() + 29 testthat assertions (810 pass overall), wired into publish_native.qmd, msens bumped 0.23.0 → 0.24.0 with a NEWS.md entry. A run that skips a build chunk now carries the untouched classes forward; a class that comes back smaller hard-fails naming the class and counts, escapable only via NATIVE_REGISTRY_REBUILD=1.
+- Task 3 — n_ds - 1 → n_ds at apps/species/app.R:1022.
+- Task 4 — inputs now come from taxon_model; unpublished ones render as disabled pills instead of vanishing. Verified against the real v8 tables: the leatherback reports 6 inputs and lists all 6.
+- Task 2, S3 half — native_asset is back to 57,452 rows with all 7 PMTiles classes (n_pmtiles_native: 0 → 2232), published to s3://…/v8/tables/native_asset.parquet.
+
+Two things that need your call once this lands:
+
+1. msens and workflows must be committed together. publish_native.qmd now calls msens::registry_merge(), which exists only in my uncommitted msens 0.24.0. If your other session commits workflows without msens, a server-side publish_native render breaks on a stale package — exactly the MSENS_MIN trap in CLAUDE.md. Uncommitted right now:
+  - msens: DESCRIPTION, NEWS.md, R/publish.R, man/registry_merge.Rd, tests/testthat/test-publish.R
+  - workflows: publish_native.qmd, data/manifests/publish_native.json, _output/publish_native.html
+2. DEPLOY_APPS=1 is still needed for the layer-bar fixes to reach the live app — this deploy only touches restart.txt, it doesn't git pull. Note it also fast-forwards the server's msens checkout (currently 0.21.1) to whatever is on origin/main and reinstalls it into the rstudio container. That's an upgrade the server is overdue for, but it's a side effect beyond what I previewed, so I'll ask before running it.
+
+✻ Sautéed for 26m 31s · 3 shells still running
+
+※ recap: Goal was fixing the species app's missing model layers: the registry restore is published to S3 and the server sync is finishing now. Next, confirm that sync succeeded, then get your OK to run DEPLOY_APPS so the app-code fixes go live. (disable recaps in /config)
+
+----
+
+1. commit both. of course
+2. deploy. of course
+
+----
+
+Done. Everything is committed, pushed, deployed and verified.
+
+The two open items you asked for
+
+Species app renders any release. /species/?ver=v7 now draws v7 — verified in-browser: header "(v7)", Merged Model (maximum of 6 inputs), all seven pills. /species/ with no parameter resolves to the promoted v7, no longer the v8 pre-release. v1 and the bare default also confirmed in-browser; all nine releases verified by building a real bundle from the shipped app.R against each release's serve.duckdb.
+
+vec_grid restored. The 2,232 vector 0.05° COGs — the interpolated representation of each range input, carrying er_score 1–100 — are back in native_asset (57,452 → 59,684 rows) and live. The leatherback now has both representations for all five of its vector inputs, so the Original/Interpolated toggle works on ranges.
+
+What I found while doing it
+
+Three more silent-failure bugs, all now fixed and guarded:
+
+┌────────────────────┬──────────────────────────────┬──────────────────────────────────────────┐
+│                    │           symptom            │                   fix                    │
+├────────────────────┼──────────────────────────────┼──────────────────────────────────────────┤
+│ cell_grid_ncol()   │ clicked-cell species list    │ cell_grid_write() +                      │
+│ fallback           │ returned empty on v1–v7 (v7: │ cell_model_tile_check(), which           │
+│                    │  477 models → 0 species)     │ recomputes tiles from cell_model itself  │
+├────────────────────┼──────────────────────────────┼──────────────────────────────────────────┤
+│ .species_sql ER    │ v1/v2 errored outright       │ typed NULLs, result shape preserved      │
+│ columns            │                              │                                          │
+├────────────────────┼──────────────────────────────┼──────────────────────────────────────────┤
+│ [[ on a table()    │ v1's layer bar died — 17,271 │ match(); harness now probes a no-edge    │
+│                    │  taxa have no input edges    │ taxon per release                        │
+└────────────────────┴──────────────────────────────┴──────────────────────────────────────────┘
+
+Final state, all nine releases: cell_grid recorded, tile check PASS, real species lists (v1 519, v7 475, v8 404).
+
+Commits — msens f1f73c1 → 36df726 (0.23.0 → 0.26.0, 832 tests pass); workflows eb2db829 → 2cdb690c; apps cd43b16 → e53f928. Only dev/msens_notes.md is left uncommitted — that's your other session's file, so I left it alone.
+
+Two things I deliberately did not do
+
+Both are genuine data gaps, now visible as struck-through pills instead of silently hidden — which is why I'm flagging rather than papering over them:
+
+1. **v7 publishes 1,518 `rng_iucn` COGs against 3,391 edges** (1,873 inputs unviewable).
+2. **v8 builds native inputs only for `is_valid_usa` taxa while the picker lists `is_valid_global`** — 6,400 of 25,404 edges, i.e. every non-US species' inputs. Their merged surface draws fine.
+
+Closing either means re-running COG builds for those releases (hours of compute), which is a scale decision I'd want you to make rather than assume.
+
+----
+
+Close both issues with missing / misaligned data. Ok to run COG builds and re-release for hours. Please persist. I will be mostly offline. Start a heartbeat monitor to check in every 30 min and check on progress, ensuring jobs didn't quietly die
+
+---
+
+Both issues are settled — but one of them dissolved rather than needing a build.
+
+Gap 1 (v7 IUCN): not a gap, and not buildable
+
+The 2,248 v7 rng_iucn models without a COG have zero rows in model_cell — n_buildable = 0. They contributed nothing to v7 at all; these are the iucn_range_outside_us_eez exclusions. There is no surface to build, so running COGs for them would produce nothing. The disabled pill is the correct answer, and I'd have burned hours to arrive back here.
+
+Gap 2 (v8 global taxa): real, and building now
+
+publish_native built for is_valid_usa while the picker lists is_valid_global. All 6,352 missing models are present in dist/ and buildable:
+
+┌──────────┬────────────────────────────┐
+│ dataset  │         new models         │
+├──────────┼────────────────────────────┤
+│ rng_iucn │ 4,283                      │
+├──────────┼────────────────────────────┤
+│ am       │ 1,833 (×2 representations) │
+├──────────┼────────────────────────────┤
+│ bl       │ 234                        │
+├──────────┼────────────────────────────┤
+│ ch_nmfs  │ 2                          │
+└──────────┴────────────────────────────┘
+
+One trap caught before launching: the 7 GB IUCN source gpkg is itself filtered to the served ids, so widening the scope would have silently skipped all 4,283 new species — publish_pmtiles_from_gpkg finds no features and moves on without error. It now rebuilds under its own REDO_IUCN_SRC flag and warns if coverage falls short. It rebuilt in 90 seconds from the ingest's own indexed gpkg (verified to contain all 6,187 needed ids) instead of re-deriving from raw shapefiles this laptop doesn't have.
+
+Committed as a023f45e.
+
+Monitoring while you're away
+
+- Cron 2310a5e5 — every 30 min: checks the render, and when it finishes, runs the release (RELEASE_S3_TABLES=1 DEPLOY_TABLES=1), reloads the apps, and verifies coverage reaches 25,404/25,404. If a render died, it diagnoses and restarts. Recurring jobs auto-expire after 7 days; cancel sooner with CronDelete("2310a5e5").
+- A persistent Monitor on the log, deliberately broad: it fires on progress markers and on Error/Killed/Quitting, plus a separate liveness watch that reports if the process vanishes without Output created. A silent death can't look like "still running".
+
+Expect roughly: IUCN tiling (the long pole, ~1.6× the original 2,654-model run), then am COGs, vec_grid, merged, registry, then the S3 sync of several thousand new objects, then a ~25 min tables rsync to msens1.
+
+Runs until you close this session · For durable cloud-based loops, use /schedule
+
+----
+
+Both issues are closed and everything is live and verified.
+
+Results
+
+v8 global-taxa gap — closed by building. Live on serve.duckdb and S3:
+
+┌─────────────────────┬─────────────────┬────────────────────────┐
+│                     │     before      │         after          │
+├─────────────────────┼─────────────────┼────────────────────────┤
+│ input edges covered │ 19,004 / 25,404 │ 25,450 / 25,450 (100%) │
+├─────────────────────┼─────────────────┼────────────────────────┤
+│ native_asset rows   │ 55,220          │ 72,484                 │
+├─────────────────────┼─────────────────┼────────────────────────┤
+│ am COGs (×2 reps)   │ 16,818          │ 18,697                 │
+├─────────────────────┼─────────────────┼────────────────────────┤
+│ IUCN PMTiles        │ 2,654           │ 6,187                  │
+├─────────────────────┼─────────────────┼────────────────────────┤
+│ vec_grid COGs       │ 2,232           │ 6,753                  │
+└─────────────────────┴─────────────────┴────────────────────────┘
+
+v7 IUCN gap — closed by analysis, correctly without building. The 2,248 models have zero rows in model_cell; they contributed nothing to v7. There was no COG to build, so hours of compute would have produced nothing. The disabled pill is the right answer.
+
+Four defects found, each caught by a check rather than luck
+
+1. IUCN gpkg silently had no geometry — my ogr2ogr SELECT omitted geom; the file read back with correct rows and column names, so my own smoke test passed. Now asserts sf + non-empty geometry.
+2. 1,054 am COGs held the wrong species — positional partition index vs. a changed served set. Now guarded by a persisted map and a data-level addressing assertion; caught again on the next run, as designed.
+3. 46 US-only taxa dropped from assets and hidden from the picker — is_valid_global isn't a superset of is_valid_usa. Surfaced by registry_merge() refusing the shrink.
+4. Deploy pushed 445 MB over a WAN link, failing three times. The server now pulls from S3 in-region: 70 s instead of 20 min.
+
+Plus 6 stale COGs corrected — all 46 US-only models now match dist exactly.
+
+Two of my own mistakes, stated plainly
+
+- My watchdog matched its own command line and reported a dead job as alive for 2 h 40 m — the precise guarantee you asked for, which my first version couldn't deliver. Now kill -0 <pid>.
+- My stall detector measured proxies (log bytes, then local-only file counts), firing false alarms during the log-silent tiling and remote-only sync phases.
+
+The ppid 1 orphan your other session flagged was my 6-COG rebuild; it finished cleanly and its restraint in not killing it was correct — a kill mid-registry would have left native_asset half-written.
+
+Cron 2310a5e5 is stopped and no long jobs remain queued from my side. Worth a browser check of /species/?ver=v8 when you're back — every input pill should now be live rather than struck through.
 
 ## 2026-08-12 docs update
 
@@ -655,6 +850,111 @@ Approved — doing both. First committing the docs fix, then the server bump:
 
 ❯ One thing worth flagging for the commit in that other session: workflows/data/manifests/ is not tracked by git (git ls-files returns nothing for it), so the publish_native.json recording n_pmtiles_native: 0 — the artifact that documents the registry regression — isn't in version control. That's likely why the loss left no reviewable trace.
 
+----
+
+You're right, and that one was my error. I added "Planning areas" to the picker on the strength of the release capability alone, without checking there was anything behind it — the pa branch of the map observer is commented-out dead code and the base map never creates a pa_src source. So selecting it left the raster cells on screen.
+
+That's the same failure mode as the bug it was meant to fix: a control whose emptiness looks like a rendering problem. I've taken it back out and deployed.
+
+Now:
+- v1 offers only Raster cells, with a line under the picker saying why — it scored Planning Areas, this map can't draw them yet, and the raster view carries the same scores at full resolution.
+- v2–v8 offer Raster cells + Program areas, working as before.
+- The Program Areas gate stays, since that one was a genuine fix — v1 has none, and offering them drew an empty map.
+
+All three versions returning 200 after the restart.
+
+What real Planning Areas support would take
+
+The data and tiles are already there — v1 scores 36 Planning Areas, v2 scores both, and zones/planarea_2025-06/zones.pmtiles returns 200. What's missing is entirely app-side:
+
+1. A pa_src PMTiles source plus pa_ln / pa_lbl layers in the base map
+2. A d_sr_pa subregion↔planarea mapping (mirroring the one I just fixed)
+3. Generalizing the choropleth branch, which is currently hardcoded to programarea_key throughout — fill, match_expr, tooltips, legend, layers control
+4. Click handling, the setPraTooltips JS channel, the Report tab map, and the flower plot — all Program-Area-specific
+
+That's a feature, and it'd be worth doing properly rather than bolting on, since it would also make v2 the release where Planning and Program Areas can be compared side by side on identical data.
+
+Two smaller things worth weighing first, if you want my read: whether v1 is important enough to warrant it at all, given the raster view already shows v1's scores faithfully — and whether it'd be better to generalize the choropleth to any zone field, which would give ecoregion and subregion views on v8 for the same work.
+
+✻ Sautéed for 5m 30s
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Yes, do this properly as requested initially. Please do not take shortcuts and thoroughly check
+  your work, git commit along the way. Yes, v1 is important. Yes, generalize for any zone
+  containing scores. The zones will likely change into the future
+
+----
+
+Done properly this time — one code path for any scored zone unit, committed in five stages and deployed.
+
+What each release now offers
+
+┌─────────┬──────────────────────────────────────────────────────────────────────┐
+│ version │                            Spatial units                             │
+├─────────┼──────────────────────────────────────────────────────────────────────┤
+│ v1      │ Raster cells · Planning areas (36) · Ecoregions (12)                 │
+├─────────┼──────────────────────────────────────────────────────────────────────┤
+│ v2      │ Raster cells · Program areas (20) · Planning areas (36)              │
+├─────────┼──────────────────────────────────────────────────────────────────────┤
+│ v3–v7   │ Raster cells · Program areas (20)                                    │
+├─────────┼──────────────────────────────────────────────────────────────────────┤
+│ v8      │ Raster cells · Program areas (20) · Ecoregions (12) · Subregions (4) │
+└─────────┴──────────────────────────────────────────────────────────────────────┘
+
+Nothing is hardcoded. A unit appears iff the release has zone rows, PMTiles, and more than one zone carrying a composite score — so a zone type nobody has invented yet appears on its own, with a capitalised-plural label as fallback.
+
+Two things the data forced
+
+**Scored ≠ drawable**. v8 scores 5 subregions but the geometry has 4 — USA is the study-area rollup, a total rather than a mappable subregion, and v7's lone scored subregion is the same thing named FULL. Intersecting scored keys against the geometry's keys excludes both without hardcoding either name, which matters since those rollup keys have already changed once.
+
+**The layer-ordering constants were a landmine**. `before_er`/`before_r` named the literal `"pra_ln"`, which no longer exists. Left alone that would have resurrected the documented cascade where one bad `before_id` leaves the map with nothing but labels. They now derive from the units actually created — v1 orders against planarea_ln, v8 against programarea_ln.
+
+Verification
+
+- **All nine bundles built** on the server — catching runtime errors a parse check can't see. That test is what caught my own mistake: I'd committed three stages without pushing, so it was validating stale code.
+- **Every unit binds real data**: v1 planarea 36 zones [7.2, 60.1], v1 ecoregion 12 [11.7, 39.5], v8 subregion 5 [17.0, 34.0] — 36/12/5 distinct values each, so the choropleth genuinely varies.
+- **Visually confirmed** on v1 (screenshot above).
+- All five versions live at 200; local, origin and server all at deb0163.
+
+
+### TODO: keep Study area masking, show any Spatial units (pa, pra, er, sr) scored, lyr still JS f'd?
+
+One deliberate asymmetry worth flagging: the study-area filter still applies only to Program Areas, since the subregion↔zone mapping only exists for them. Ecoregions and Planning Areas show all their scored zones regardless of study area — which is right for ecoregions (they're the rescaling baseline) but means the Planning Areas view ignores the Study area dropdown. Say the word if you'd rather that filter generalized too.
+
+----
+
+Done properly this time — one code path for any scored zone unit, committed in five stages and deployed.
+
+What each release now offers
+
+┌─────────┬──────────────────────────────────────────────────────────────────────┐
+│ version │                            Spatial units                             │
+├─────────┼──────────────────────────────────────────────────────────────────────┤
+│ v1      │ Raster cells · Planning areas (36) · Ecoregions (12)                 │
+├─────────┼──────────────────────────────────────────────────────────────────────┤
+│ v2      │ Raster cells · Program areas (20) · Planning areas (36)              │
+├─────────┼──────────────────────────────────────────────────────────────────────┤
+│ v3–v7   │ Raster cells · Program areas (20)                                    │
+├─────────┼──────────────────────────────────────────────────────────────────────┤
+│ v8      │ Raster cells · Program areas (20) · Ecoregions (12) · Subregions (4) │
+└─────────┴──────────────────────────────────────────────────────────────────────┘
+
+Nothing is hardcoded. A unit appears iff the release has zone rows, PMTiles, and more than one zone carrying a composite score — so a zone type nobody has invented yet appears on its own, with a capitalised-plural label as fallback.
+
+Two things the data forced
+
+**Scored ≠ drawable**. v8 scores 5 subregions but the geometry has 4 — USA is the study-area rollup, a total rather than a mappable subregion, and v7's lone scored subregion is the same thing named FULL. Intersecting scored keys against the geometry's keys excludes both without hardcoding either name, which matters since those rollup keys have already changed once.
+
+**The layer-ordering constants were a landmine**. `before_er`/`before_r` named the literal `"pra_ln"`, which no longer exists. Left alone that would have resurrected the documented cascade where one bad `before_id` leaves the map with nothing but labels. They now derive from the units actually created — v1 orders against `planarea_ln`, v8 against `programarea_ln`.
+
+Verification
+
+- **All nine bundles built on the server** — catching runtime errors a parse check can't see. That test is what caught my own mistake: I'd committed three stages without pushing, so it was validating stale code.
+- **Every unit binds real data**: v1 planarea 36 zones [7.2, 60.1], v1 ecoregion 12 [11.7, 39.5], v8 subregion 5 [17.0, 34.0] — 36/12/5 distinct values each, so the choropleth genuinely varies.
+- **Visually confirmed** on v1 (screenshot above).
+- All five versions live at 200; local, origin and server all at deb0163.
+
+One deliberate asymmetry worth flagging: the study-area filter still applies only to Program Areas, since the subregion↔zone mapping only exists for them. Ecoregions and Planning Areas show all their scored zones regardless of study area — which is right for ecoregions (they're the rescaling baseline) but means the Planning Areas view ignores the Study area dropdown. Say the word if you'd rather that filter generalized too.
 
 ## 2026-08-10 Refactor app versioning and data serving strategy
 
