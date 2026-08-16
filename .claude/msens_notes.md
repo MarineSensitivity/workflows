@@ -81,6 +81,37 @@ What it settles
 
 Two things I'd flag before you clear context: (1) the plan pins caddy-jwt but says verify jwk_url/audience_whitelist support at the chosen version — a forward_auth verifier is the named fallback; (2) the Squarespace panel, not dig, is the source of truth for mail/TXT records during the DNS move — dns_snapshot.sh covers what the Caddyfile names, so a manual pass over the panel is a listed step, not skippable.
 
+----
+
+And I would like to initiate this 'hidden' authenticate view only for myself (ben@oceanmetrics.io - a Google workspace account) and project manager Tim White (timothy.white@boem.gov - a Microsoft .gov
+  account). And specifically for the pre-release v8 of both apps and docs
+
+----
+
+Done — the path scheme is built, deployed (dark) and verified end to end. Summary of this second pass:
+
+**What changed for hostname + path**
+
+**Preview URL scheme** — preview.marinesensitivity.org/{ver}/scores/, /{ver}/species/, /docs/{ver}/; ?ver= is gone from that host. server/caddy/preview_routes.caddy strips the version prefix and forces ?ver= for the app (uri query, keeping Shiny's own params and the species ?mdl_key= deep links), 302s the old spelling /scores/?ver=v9 → /v9/scores/, and never proxies an unversioned app path — that would sit outside every per-version Access policy. Landing page, docs helper (doc_app_url()) and CHECK_PREVIEW all emit the path form via one source, msens::preview_app_url().
+
+**Session binding** (the necessary second half) — msens 0.31.0 ver_token_sign/verify: ui(req) embeds an HMAC-signed {ver}.{expiry}.{mac} in a hidden input; the server function renders only the token's version (re-resolved through the instance policy), never the client-supplied url_search. Secret MS_TOKEN_SECRET is in the server .env and verified to reach app processes even through Shiny Server's su -l shiny. This also hardens the public instance.
+
+**A committed functional test** — server/caddy/test/run.sh boots a throwaway Caddy from the same image importing the same routes file behind a test HS256 jwtauth, on the compose network, so the real preview instance answers: 15 assertions (401 without token; /v8/scores/ → ms-ver=v8, ms-preview=1, identity in the badge; ?ver=v7 on /v8/ overridden; sockjs + assets proxy; redirects; docs + landing; X-Robots-Tag). DEPLOY_CADDY runs it after every restart → PREVIEW_ROUTES_OK.
+
+**Verified live**: Chrome on the public host — the server rewrote ?ver=v6&probe=1 to ?ver=v6 (session bound to the token through Caddy → Shiny Server); in R — garbage token + client ?ver=v6 → v7, a restricted-version token replayed on the public instance → v7, on preview → v9; on the server — routes test all green; CHECK_PREVIEW green (preview /v8/scores/ 401 without token, origin-direct 401). Nothing user-visible changed.
+
+Two slips worth owning: I twice launched the release render from the wrong directory (harmless, just wasted minutes), and I first wrote a nonexistent query directive — Caddy's form is uri query; the Caddy tag is now pinned (2.11.4) for reproducibility, with an accurate comment.
+
+**Phase 1 (needs you)**
+
+Cloudflare account + nameserver move at Squarespace (cloudflare/dns_before.txt is committed for the after-diff). Then I write access.sh: one Access application per restricted version (/v9/* + /docs/v9/*, its own reviewer emails/policy) + a catch-all for the landing page, plus a service token so CHECK_PREVIEW can run headless. Say when the account exists and I'll take it from there.
+
+----
+
+What do you mean it's been verified? I don't see new URLs working at all
+
+
+
 ## 2026-08-13 fix species app versions
 
 Why is the species app `@../apps/species` not showing earlier versions? I thought everything was already loaded.
