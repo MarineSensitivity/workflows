@@ -322,6 +322,15 @@ public instance → v7, on preview → v9; on the server — `PREVIEW_ROUTES_OK`
 sockjs + assets proxy; `/scores/?ver=v8` → 302 `/v8/scores/`, never proxied); `CHECK_PREVIEW` green.
 Gotcha met: query manipulation is `uri query <key> <value>` (no standalone `query` directive).
 
+**Phase 1 is now a written runbook: `server/cloudflare/README.md`** (+ `access.sh`, dry-runnable).
+Manual steps that remain Ben's: create the Cloudflare account and Zero Trust team name, add the
+zone with **only `preview` proxied**, move the nameservers at Squarespace, add the **One-time PIN**
+identity provider (new orgs no longer get it automatically — verified in Cloudflare's docs
+2026-08-15; Tim has no Cloudflare account), and mint the API token. Everything after that is
+`access.sh` (per-version applications from `versions.json`) + `DEPLOY_ACCESS=1` / `DEPLOY_CADDY=1` /
+`CHECK_PREVIEW=1`. Also verified while writing it: Cloudflare Free cuts a request off at 100 s
+(524), and this server's preview Shiny worker answers a cold page in 14–19 s, warm ~1.4 s.
+
 **Status at end of 2026-08-15 — plainly.** Everything above is deployed but **DARK: no human can open
 any preview URL** (`preview.marinesensitivity.org/…` answers 401 — now with a page saying so — because
 the only door is Cloudflare Access and it is not in front yet). What "verified" meant: (a) the routes

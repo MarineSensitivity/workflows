@@ -63,6 +63,7 @@ do_tables <- do_deploy || nzchar(Sys.getenv("DEPLOY_TABLES"))
 # the pre-release review gate (preview.marinesensitivity.org): force the docs-preview
 # sidecar to pull, and PROVE the gate with curl (see the two chunks at the end)
 do_docs   <- do_deploy || nzchar(Sys.getenv("DEPLOY_DOCS"))
+do_access <- nzchar(Sys.getenv("DEPLOY_ACCESS"))   # sync Cloudflare Access apps to versions.json
 do_check_preview <- nzchar(Sys.getenv("CHECK_PREVIEW"))
 # server targets (parallel titiler-v8)
 srv_repo  <- "/share/github/MarineSensitivity/server"
@@ -737,6 +738,38 @@ if (!do_docs) {
     log_warn("docs-preview: no clone yet (gh-pages-preview branch absent?) — nothing served at /docs/ on the preview host")
   else if (!any(grepl("DOCS_OK", out_docs))) stop(paste(tail(out_docs, 15), collapse = "\n"))
   else log_info("docs-preview: {grep('DOCS_OK', out_docs, value = TRUE)}")
+}
+```
+
+## Sync the Cloudflare Access applications (`DEPLOY_ACCESS=1`)
+
+Who may see a restricted release is **per version**: the preview host serves each release under
+its own path (`/v9/scores/`, `/docs/v9/`) and Cloudflare Access holds one application + reviewer
+policy per version, because Access scopes by path and never by query string. Which versions are
+restricted is `versions.json` — so the applications are *derived from the registry*, not
+maintained by hand: `server/cloudflare/access.sh` reads it and converges (idempotent).
+
+Run this **after** `build_version_manifest.qmd` has published a changed `access`, and whenever a
+reviewer list changes. It runs on the server, where the API token and the reviewer lists live in
+`.env` (never in a repo). New application AUDs must then go into `CF_ACCESS_AUD` — the script
+prints the line — followed by `DEPLOY_CADDY=1`. Setup: `server/cloudflare/README.md`.
+
+```{r}
+#| label: deploy-access
+
+if (!do_access) {
+  log_info("DEPLOY_ACCESS unset — Cloudflare Access applications left as they are")
+} else {
+  out_acc <- system2("ssh", c("msens", shQuote(glue(
+    "set -e; cd {srv_repo} && git fetch --quiet origin && git merge --ff-only origin/main && ",
+    "set -a; . ./.env; set +a; cloudflare/access.sh"))), stdout = TRUE, stderr = TRUE)
+  cat(paste(out_acc, collapse = "\n"), "\n")
+  st <- attr(out_acc, "status")
+  if (!is.null(st) && st != 0) stop("access.sh failed (see above)")
+  # the AUD line is the hand-off to .env + DEPLOY_CADDY; surface it rather than
+  # leaving it buried in the log
+  aud <- grep("^CF_ACCESS_AUD=", out_acc, value = TRUE)
+  if (length(aud)) log_info("paste into the server .env, then DEPLOY_CADDY=1: {aud}")
 }
 ```
 

@@ -102,7 +102,9 @@ caddy` — the URL surface on its own, so a routing fix need not rebuild titiler
 301s live there, and they must carry `&{query}` or every published `?mdl_seq=` deep link loses
 its model id in flight), `DEPLOY_DOCS=1` (force the `docs-preview` sidecar to pull the docs
 repo's `gh-pages-preview` branch — the rendered books of *restricted* releases the preview host
-serves; it polls every 5 min anyway), `CHECK_PREVIEW=1` (curl-prove the review gate: public
+serves; it polls every 5 min anyway), `DEPLOY_ACCESS=1` (converge the Cloudflare Access applications on `versions.json` —
+one application + reviewer policy per restricted version, `server/cloudflare/access.sh`; setup
+runbook in `server/cloudflare/README.md`), `CHECK_PREVIEW=1` (curl-prove the review gate: public
 host never renders a restricted version, preview host is closed without a Cloudflare Access
 token and open with one, origin-direct is 401, restricted docs are off GitHub Pages),
 `DEPLOY_TITILER=1` (restart `titiler-v8` alone — **required after any `REDO_MERGED_COG` /
