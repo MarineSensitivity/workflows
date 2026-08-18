@@ -89,6 +89,15 @@ is reversible — with Caddy 301ing every old URL to `/scores/?ver=v{n}` (and `/
 `?ver=v7`, which is what they were). `DEPLOY_APPS_V7=1` still exists but has nothing to restart;
 the v7 checkout is retired.
 
+**Granular vs publishing runs.** A run that asks ONLY for `DEPLOY_*`/`CHECK_PREVIEW` targets
+converges the *server* on what is already published: it skips staging, the S3 push, the view DB,
+STAC and the manifest (`do_granular`/`do_stage` in `release_marine-atlas.qmd`), and it does not open
+`sdm_db`. This matters because `do_s3` defaults **on** — `DEPLOY_APPS=1` alone used to re-stage every
+table, re-hash the ~580M-row serving surface and then **push to S3** as a side effect of restarting
+two Shiny apps, so an app reload was only safe if you remembered `RELEASE_NO_S3=1`. Any publishing
+intent (`RELEASE_DEPLOY`, `RELEASE_RAW`, `RELEASE_S3_TABLES`, `RELEASE_CORS`, `PROMOTE_LATEST`) opts
+back into the full path. A granular deploy now takes ~45 s instead of minutes.
+
 **Env flags** (gate expensive/side-effecting steps): `REDO_INGEST=1` (rebuild an ingest),
 `REDO_WORMS=1` (rebuild the worms table), `SCORE_V7COMMON=1` (score only v7's species, for
 apples-to-apples), `SCORE_ALLBIRDS=1` (disable the marine-bird cull), `RELEASE_NO_S3=1` /

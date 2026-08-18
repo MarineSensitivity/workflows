@@ -65,6 +65,34 @@ do_tables <- do_deploy || nzchar(Sys.getenv("DEPLOY_TABLES"))
 do_docs   <- do_deploy || nzchar(Sys.getenv("DEPLOY_DOCS"))
 do_access <- nzchar(Sys.getenv("DEPLOY_ACCESS"))   # sync Cloudflare Access apps to versions.json
 do_check_preview <- nzchar(Sys.getenv("CHECK_PREVIEW"))
+
+# A GRANULAR run converges the server on what is ALREADY published; it must not
+# re-stage the release and must not push to S3.
+#
+# `do_s3` defaults ON, so `DEPLOY_APPS=1` on its own -- restarting two Shiny apps
+# -- also re-staged every table, re-hashed the ~580M-row serving surface, and
+# then SYNCED TO S3. Publishing as a side effect of a reload is not something a
+# flag should be able to do by accident; it took an explicit RELEASE_NO_S3=1 on
+# the command line to make an app restart safe, which is exactly backwards.
+#
+# So: if the run asks ONLY for granular targets, it publishes nothing. Any
+# publishing intent -- RELEASE_DEPLOY, RELEASE_RAW, RELEASE_S3_TABLES,
+# RELEASE_CORS, or an explicit PROMOTE_LATEST -- opts back into the full path.
+.granular_flags <- c("DEPLOY_APPS", "DEPLOY_APPS_V7", "DEPLOY_TABLES", "DEPLOY_API",
+                     "DEPLOY_CADDY", "DEPLOY_TITILER", "DEPLOY_DOCS", "DEPLOY_ACCESS",
+                     "CHECK_PREVIEW")
+.publish_flags  <- c("RELEASE_DEPLOY", "RELEASE_RAW", "RELEASE_S3_TABLES",
+                     "RELEASE_CORS", "PROMOTE_LATEST")
+do_granular <- any(nzchar(Sys.getenv(.granular_flags))) &&
+              !any(nzchar(Sys.getenv(.publish_flags)))
+# staging, the S3 push, the view DB, STAC and the manifest are all PUBLISHING
+# steps; a granular run skips them wholesale (see `eval:` on those chunks).
+do_stage <- !do_granular
+if (do_granular) {
+  do_s3 <- FALSE; do_s3_tbl <- FALSE
+  .on <- .granular_flags[nzchar(Sys.getenv(.granular_flags))]
+  log_info("granular run [{paste(.on, collapse=', ')}] — no staging, no S3 push, no manifest")
+}
 # server targets (parallel titiler-v8)
 srv_repo  <- "/share/github/MarineSensitivity/server"
 srv_viewdb<- glue("/share/data/big/{ver}/serve.duckdb")
@@ -74,7 +102,13 @@ srv_tables    <- glue("/share/data/big/{ver}/tables")
 srv_modelcell <- glue("/share/data/big/{ver}/model_cell")
 srv_stac  <- glue("/share/data/derived/stac/{ver}")
 titiler_v8<- glue("https://titiler-{ver}.marinesensitivity.org/msens")
-stopifnot("run build_registry first" = {
+# Guards the PUBLISHING path only. It opens sdm_db -- the multi-GB source DB,
+# which exists only where the pipeline runs -- so on a granular deploy it was
+# both unnecessary and fatal: it is why `scripts/srv_render.sh release-marine-
+# atlas.qmd DEPLOY_APPS=1` died at chunk 2 on the server, where v8's 31.9 GB
+# sdm.duckdb does not live. A granular run touches no source data, so it has
+# nothing to guard.
+if (do_stage) stopifnot("run build_registry first" = {
   con0 <- dbConnect(duckdb(sdm_db, read_only = TRUE)); on.exit(dbDisconnect(con0, shutdown = TRUE))
   all(c("dataset", "model", "model_cell") %in% dbListTables(con0)) })
 ```
@@ -83,6 +117,7 @@ stopifnot("run build_registry first" = {
 
 ```{r}
 #| label: stage
+#| eval: !expr do_stage
 
 con <- dbConnect(duckdb(sdm_db, read_only = TRUE))
 dbExecute(con, "PRAGMA memory_limit='12GB'"); dbExecute(con, "PRAGMA threads=6")
@@ -162,6 +197,7 @@ msens::report_table(tibble(
 
 ```{r}
 #| label: s3
+#| eval: !expr do_stage
 
 sync <- function(local, prefix, del = FALSE, tries = 4) {
   if (!dir_exists(local)) { log_warn("skip (missing): {local}"); return(invisible()) }
@@ -205,6 +241,7 @@ change. Roll back with the 2-line `{AllowedMethods:[GET], AllowedOrigins:[*]}` p
 
 ```{r}
 #| label: s3-cors
+#| eval: !expr do_stage
 cors_file <- here("data/s3/cors_public.json")
 if (nzchar(Sys.getenv("RELEASE_CORS")) && file_exists(cors_file)) {
   bucket <- sub("^s3://([^/]+)/.*$", "\\1", s3_ver)                    # oceanmetrics.io-public
@@ -218,6 +255,7 @@ if (nzchar(Sys.getenv("RELEASE_CORS")) && file_exists(cors_file)) {
 
 ```{r}
 #| label: viewdb
+#| eval: !expr do_stage
 
 viewdb <- glue("{serve_dir}/serve.duckdb")
 if (file_exists(viewdb)) file_delete(viewdb)
@@ -282,6 +320,7 @@ log_info("view DB {viewdb} ({round(file_size(viewdb)/1e3,1)} KB) — {if (do_s3 
 
 ```{r}
 #| label: stac
+#| eval: !expr do_stage
 
 suppressWarnings(try(library(msens), silent = TRUE))
 source(here("../msens/R/stac.R"))   # override any stale install with the current (v8) generators
@@ -927,6 +966,7 @@ if (!do_apps_v7) {
 
 ```{r}
 #| label: manifest
+#| eval: !expr do_stage
 
 # content-addressed: fingerprint of the served model_cell surface (run-mode flags like
 # pushed_s3/deployed are side effects, not content, so they're excluded).
