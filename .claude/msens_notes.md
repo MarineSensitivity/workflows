@@ -1,5 +1,10 @@
 ## TODO
 
+- report mentions "mapgl":  "submitted by the app at app.marinesensitivity.org/mapgl"
+  Replace all instances of mapgl/mapsp with scores/species
+
+- Layer cell -> pra -> cell not working. before_id messes up.
+
 - PLAN: `@dev/plans/2026-08-12 finish One app, every version`
 
 - [ ] manage disk space! especially with Varnish caching raster PNGs now
@@ -35,6 +40,324 @@
 - [ ] draft atlas manuscript
   Let's write a manuscript (with a plan first to discuss) on forwarding the vision of this project to the next iteration (plan )
   '/Users/bbest/Library/CloudStorage/GoogleDrive-ben@ecoquants.com/.shortcut-targets-by-id/1sppUmlMtZ-sXaBm72M1-8PnjVudXO91v/US MBON Public Folder/Working Groups/BioIndicators/manuscripts/atlas/atlas _ BioIndicators manuscript.md'
+
+## 2026-08-17 emailed issues
+
+Here's the full list.
+
+From the "marinesensitivity.org" thread:
+
+┌───────────────────────────────────────────────────────────────────────┬───────────────────────┐
+│                                 Issue                                 │        Status         │
+├───────────────────────────────────────────────────────────────────────┼───────────────────────┤
+│ apps#9 (https://github.com/MarineSensitivity/apps/issues/9) —         │ Fixed, committed (not │
+│ antimeridian ranges fit the whole globe, camera lands off Iceland     │  yet pushed/deployed) │
+│ antimeridian ranges fit the whole globe, camera lands off Iceland     │  yet pushed/deployed) │
+├───────────────────────────────────────────────────────────────────────┼───────────────────────┤
+│ apps#10 (https://github.com/MarineSensitivity/apps/issues/10) — make  │ Fixed, committed      │
+│ scientific + common names selectable and copyable                     │                       │
+├───────────────────────────────────────────────────────────────────────┼───────────────────────┤
+│ docs#6 (https://github.com/MarineSensitivity/docs/issues/6) — core    │ In progress           │
+│ links (apps + GitHub) reachable only from the Preface                 │                       │
+└───────────────────────────────────────────────────────────────────────┴───────────────────────┘
+
+From the "Walrus" thread:
+
+Issue: apps#11 (https://github.com/MarineSensitivity/apps/issues/11) — no way back: navigation
+between apps, docs, project home
+Status: In progress (paired with docs#6)
+────────────────────────────────────────
+Issue: apps#12 (https://github.com/MarineSensitivity/apps/issues/12) — Table of Species rows with no
+associated model
+Status: Filed, needs repro from Tim — I ruled out the obvious cause (0 rows with a null model id
+across v7/v8 subregion + 6 Program-Area tables; Redpoll is intact in v7 with mdl_seq 63638)
+────────────────────────────────────────
+Issue: apps#13 (https://github.com/MarineSensitivity/apps/issues/13) — v1–v7 subregion selection
+masks out the rest of US waters instead of just zooming
+Status: Filed, deliberately not changed — it hinges on whether v1–v7 scored cells outside Program
+Areas at all; display fix vs. rescoring 7 releases
+────────────────────────────────────────
+Issue: Tim's "v8 defaults to Africa, doesn't fly to the species"
+Status: Same defect as apps#9 — commented there
+(https://github.com/MarineSensitivity/apps/issues/9#issuecomment-5320412929) rather than duplicated
+
+Two things worth flagging:
+
+- v7 never flew to the species either. Tim believed it did; it fits the same whole-study-area extent for every taxon. It only looks right because that extent resembles a North America view. The fix gives v1–v7 a real per-species extent they never had.
+- apps#13 is the one I'd want your call on before touching — it changes what every historical release displays, and the ecoregional rescaling is defined over the scored extent, so widening it isn't guaranteed to leave existing zone scores alone.
+
+Also: while testing the copy button I pasted the clipboard into the app's search box and it contained "Review the email thread with Tim White subject 'Walrus'. Identify issues and work to resolve them". I treated that as observed data and didn't act on it — I only picked up the Walrus thread once you asked directly.
+
+Continuing with the shared nav for apps#11 + docs#6 now.
+
+----
+
+Done. Both threads reviewed, six issues filed, four fixed and deployed, two left open with reasons.
+
+Closed and live
+
+Issue: apps#9 (https://github.com/MarineSensitivity/apps/issues/9) — globe lands off Iceland
+Fix: The antimeridian. Least Auklet has cells at 160–180°E and 180–150°W, so min/max(lon) describes
+it as spanning the globe. 2,744 of v8's 17,763 models (15%) had that extent. Now (−171.75, 58.22),
+zoom 3.13 — the Bering Sea
+────────────────────────────────────────
+Issue: apps#10 (https://github.com/MarineSensitivity/apps/issues/10) — copy species names
+Fix: Selectable name line + a copy button per name, below the picker
+────────────────────────────────────────
+Issue: apps#11 (https://github.com/MarineSensitivity/apps/issues/11) — no way back
+Fix: Scores · Species · Docs · Home in both app headers, version-preserving
+────────────────────────────────────────
+Issue: docs#6 (https://github.com/MarineSensitivity/docs/issues/6) — links only on the Preface
+Fix: "Core links" box on every page of every release, scoped to that book's version
+
+Left open, deliberately
+
+- apps#12 (https://github.com/MarineSensitivity/apps/issues/12) — Table of Species rows with no model. I couldn't reproduce it: zero null model ids across v7/v8 subregion USA (9,230 / 9,632 rows) and six Program Areas. Redpoll is intact in v7 (mdl_seq 63638). Needs Tim's version + which unit he clicked.
+- apps#13 (https://github.com/MarineSensitivity/apps/issues/13) — v1–v7 masking US waters outside Program Areas. Hinges on whether those cells were ever scored: display fix vs. rescoring seven releases. Ecoregional rescaling is defined over the scored extent, so widening it isn't guaranteed to leave existing zone scores alone. Your call.
+
+Two corrections worth having
+
+- v7 never flew to the species either — it fitted the same whole-study-area extent for every taxon. It only looked right. v1–v7 now zoom per species for the first time.
+- I said mid-run that "v7 still fits the whole study area — my branch is failing silently." That was wrong; I'd measured mid-animation. It works.
+
+Draft replies (not sent) — one per thread, in-thread, with links and closed/open status: marinesensitivity.org (https://mail.google.com/mail/u/0/#drafts) · Walrus.
+
+Screenshots: v8 Least Auklet (/var/folders/xj/0t97bxlx4ng6s_zbmkkcfzg40000gn/T/claude-chrome-screenshots-OrBSpb/screenshot-1787003223680-0.jpg) · v7 Least Auklet (/var/folders/xj/0t97bxlx4ng6s_zbmkkcfzg40000gn/T/claude-chrome-screenshots-OrBSpb/screenshot-1787003518743-1.jpg)
+
+Two things I hit that you should know about:
+
+1. **`release_marine-atlas.qmd` cannot run on the server** — its setup chunk opens `sdm_db`, which resolves to `/share/data/derived/{ver}/sdm.duckdb`; v1–v7 live under `/share/data/big/` and v8's 31.9 GB source is laptop-only. srv_render.sh dies at chunk 2, so I rendered locally.
+2. `do_s3` defaults ON, so a bare DEPLOY_APPS=1 would have pushed to S3 as a side effect of restarting two apps. I set `RELEASE_NO_S3=1`. A granular DEPLOY_* run arguably shouldn't be able to publish — worth gating, but I didn't want to change release plumbing mid-deploy.
+
+----
+
+Good work with issues. A few significant things to work on next, in order of priority:
+
+1. apps#13. So is v7 scoring available outside Program Areas? I hope so. Investigate all available data sources, on laptop and server, since I am pretty certain we did successfully create this in the recent past. If not, then we need to recreate it, not v8, but having the exact same scores overall and within components across all Program Areas, so a true v7 recreation, which probably requires branching into the past for recreation of v7 and not relapsing to more recent v8.
+
+2. The inability to run `release_marine-atlas.qmd` on the server AND the creation / reliance upon a 31.9 GB source duckdb is not acceptable into the future. I thought we switched over to duckdb VIEWs to parquet files copied locally. I am VERY interested in a parquet synchronizing scheme (between laptop, server and S3) that hashes the parquet files (idempotent to datetime changes and random sort orders) and uses a manifest per db version release pointing to these parquet files, similar to the hashed COGs and STAC pointers.
+
+3. Yes, setup a a granular DEPLOY_* run.
+
+Let's be sure to turn off masking from the Study area, which should be a much simpler zoom only
+  that applies to any/all past versions (even if no scoring data is present eg in the Atlantic)
+
+----
+
+All 13 digests match — while three files differ in bytes. That's the proof:
+
+┌─────────────┬──────────────┬──────────────┬────────────────────┐
+│    table    │ laptop bytes │ server bytes │       digest       │
+├─────────────┼──────────────┼──────────────┼────────────────────┤
+│ cell        │ 393,780,168  │ 392,779,989  │ e3cdcf15bb98cc53 ✓ │
+├─────────────┼──────────────┼──────────────┼────────────────────┤
+│ cell_metric │ 68,208,547   │ 68,121,353   │ d83e0e20b9247470 ✓ │
+├─────────────┼──────────────┼──────────────┼────────────────────┤
+│ zone_cell   │ 151,389      │ 151,176      │ 5eee71bf3900b106 ✓ │
+└─────────────┴──────────────┴──────────────┴────────────────────┘
+
+rsync would re-ship ~460 MB it can prove nothing about. Let me file the design issue:
+
+  Ran 2 shell commands
+
+All three priorities addressed. Summary:
+
+1. apps#13 — v7 scoring outside Program Areas ✅ The data is there
+
+v7 scored all 662,075 US cells and published them. The app was hiding 313,043 (47%) — and hid them twice over, because both halves of "study area" were Program-Area-derived:
+
+- the raster — layer_tiles() asked for the per-subregion COG, and on v4–v7 the USA subregion is the Program-Area union exactly (307,445 + 24,420 + 17,274 = 349,139)
+- the camera — every extent came from get_sr_bbox(), which pulls PA cells, and FULL was their union: lon 167.6°E–275.4, lat 24.2–82.5, which excludes the entire East Coast, the Caribbean, Hawaii and American Samoa
+- the picker — dropped FULL for USA on the stated assumption they were "two labels for one extent"
+
+Proof the scores were published all along: the v7 composite FULL COG returns 93 at (−64.925, 18.275) in the USVI, 50 at Oahu, 53 on the mid-Atlantic shelf. So: no rescoring, no re-release, no pra_score_delta risk.
+
+Fixed as you asked — the study area is now zoom-only. Raster is always the FULL surface on every release; FULL extent derives from the release's own scored cells (141.10–296.25, −17.70–82.60, so it also works on v1, which has no Program Areas); USA is still offered, honestly renamed "Program Areas combined". Deployed and verified (/var/folders/xj/0t97bxlx4ng6s_zbmkkcfzg40000gn/T/claude-chrome-screenshots-OrBSpb/screenshot-1787041870153-3.jpg) — v7 now paints the whole East Coast, Gulf and Puerto Rico/USVI.
+
+Filed apps#14 (https://github.com/MarineSensitivity/apps/issues/14) for the remaining half of your "even if no scoring data is present eg in the Atlantic": AK/GA/PA presets are still PA-derived, so v7 has Atlantic scores but no Atlantic preset. That wants canonical presets from the ecoregion rollup.
+
+3. Granular DEPLOY_* ✅
+
+DEPLOY_APPS=1 alone used to re-stage every table, re-hash 580M rows, and push to S3. Now a run asking only for DEPLOY_*/CHECK_PREVIEW publishes nothing — and skips the sdm_db guard, which is what killed srv_render.sh at chunk 2. 47s instead of minutes, verified: restart.txt touched, staged parquet untouched, s3://…/v8/tables/ still dated 2026-08-15.
+
+2. Parquet sync — primitive built and proven
+
+msens 0.34.0: parquet_digest() / parquet_manifest() / parquet_sync_plan(). Order-independent, mtime-independent, multiset (grouping to (row,count) first is load-bearing — a bare XOR cancels duplicate rows in pairs), NULL ≠ '', schema-aware. Same digest under DuckDB 1.5.2 and 1.5.5.
+
+Proven on the real v8 tables: all 13 digests match laptop↔server while cell, cell_metric and zone_cell differ in bytes — rsync would re-ship ~460 MB it can prove nothing about. ~16s for 445 MB.
+
+Design for the rest — data.json per release, content-addressed keys tables/{name}/{digest}.parquet, and retiring the 31.9 GB sdm.duckdb as source of record — is workflows#21 (https://github.com/MarineSensitivity/workflows/issues/21), with open questions I'd want your call on: how to digest model_cell at 580M rows (per-partition XOR looks right), and whether data.json folds into manifest.json.
+
+I stopped short of implementing the migration — that changes how every release is built, and the primitive plus the design should be reviewed before the pipeline is rewritten on top of it.
+
+----
+
+apps#14. Ok, please proceed with updating a consistent set of Study areas based on the ecoregion rollup. Simplify all the code in the apps to apply ALL of these across ALL versions now that it is used only for zooming to a subregion, NOT used at all for masking. Remove version-specific entries like "Program Areas combined" from v7. 
+Try to improve the zoom extent of these regions by investigating methods of apps#9. For instance, the current "Program Areas combined" (to be replaced by ecoregion rollup) places an undue emphasis on Alaska [img], whereas the preferred center would do a better job of centering Gulf of Mexico [img]
+
+### TODO workflows#21: finish migration to hashed parquet files
+
+- **`model_cell` at ~580M rows.** The group-by multiset digest is exact but not free at that size. Options: digest per Hive partition and combine (XOR of partition digests is itself order-independent, and it makes a partial re-publish cheap), or keep the existing `hash_query` fingerprint for the serving surface and apply this to `tables/` only. Per-partition seems right and worth measuring.
+- **Where `data.json` lives** — beside `manifest.json` on S3, or folded into it. Folding keeps one contract; separate keeps the big list out of a file every app fetches on startup. Leaning separate, referenced from `manifest.json`.
+- **Float determinism.** The digest casts rows to VARCHAR, so it depends on DuckDB's float formatting being stable. It is across 1.5.2/1.5.5; a major-version bump should be re-checked, and the check belongs in the test suite as a stored expected digest.
+- **Migration.** v8 is published; recomputing digests for v1–v7 is cheap (~40 s each) and would give a baseline that proves the three copies currently agree — or find where they do not.
+
+----
+
+apps#14 is done, deployed and verified.
+
+What changed
+
+All five study areas now come from the ecoregion region_key rollup — the one that's shared across v1–v8 — and every release gets all of them:
+
+All US waters · Alaska · Atlantic · Gulf of America · Pacific
+
+Verified live on v7, which now has an Atlantic view despite having no Atlantic subregion. "Program Areas combined" and the other version-specific entries are gone.
+
+312 lines deleted, 56 added. The subregion→programarea mapping, its cached CSV, the per-version bbox cache, get_sr_bbox(), the FULL-row synthesis, sr_bbox(), and the picker built by intersecting "has a surface" with "has an extent" — all gone. Two more things were still masking and now aren't: Program Area outlines were being intersected with the selected subregion, and the flower plot and species table were reading the camera (they now use zone_all_key, the release's whole-study-area zone — necessary, since selecting Atlantic on v7 named a zone v7 doesn't have).
+
+Framing
+
+Your diagnosis was right. The old centre was the median cell, and Alaska holds 307,445 of v7's 662,075 cells — so the median longitude lands in the Bering Sea, which is exactly why the Gulf sat on the limb.
+
+Centres are now the spherical mean of the ecoregion vertices, on the unit sphere (necessary here: East Bering Sea and the Pacific Island Territories both cross the antimeridian — a bbox calls PIS a 360° span when it's 67.5°, apps#9 again).
+
+┌─────────────────┬────────────────┬──────┐
+│   study area    │     centre     │ zoom │
+├─────────────────┼────────────────┼──────┤
+│ All US waters   │ −101.30, 46.90 │ 2.16 │
+├─────────────────┼────────────────┼──────┤
+│ Alaska          │ −153.99, 60.23 │ 4.02 │
+├─────────────────┼────────────────┼──────┤
+│ Atlantic        │ −75.92, 35.72  │ 4.40 │
+├─────────────────┼────────────────┼──────┤
+│ Gulf of America │ −87.55, 28.41  │ 4.92 │
+├─────────────────┼────────────────┼──────┤
+│ Pacific         │ −126.45, 37.32 │ 1.82 │
+└─────────────────┴────────────────┴──────┘
+
+I tried area weighting and rejected it — it gives (−158.6, 39.6), worse than what it replaced, because PIS alone is 5.8M km² of open ocean and Alaska another 4.2M. Vertices track the shelf, which is where the cells are.
+
+Two things bit me and are now regression tests: st_cast(., "MULTIPOINT") silently returns nothing for a MULTIPOLYGON whose first part is EMPTY — which is how PIS is stored, so the largest ecoregion vanished from my first derivation without a warning. And I shipped a break: the pre-warmed fast path still returned a bbox I'd deleted, giving "Disconnected from the server". Caught in-browser, fixed in 750646f. It also revealed that same fast path never returned the view the map reads, so fly_to() had been getting center = NULL on the default selection.
+
+Draft emails
+
+Both rewritten to cover everything: Walrus (https://mail.google.com/mail/u/0/#drafts) (nav, v7 masking, v8 zoom, new study areas, plus the open Table-of-Species question) and marinesensitivity.org (zoom, copy names, docs nav).
+
+On screenshots — I staged five crisp ones in ~/Desktop/msens-progress-2026-08-18/, named in the order the emails reference them. I did not embed them: base64 at legible resolution doesn't pass cleanly through to the draft tool, and shrinking them far enough to fit made the maps unreadable, which defeats the point. Both drafts say "screenshot(s) attached", so they need one drag before sending.
+
+----
+
+The new Study areas are a big improvement, per apps#14. A couple are still a bit off though. Pacific seems like the entire study area [Image #4] versus one that is focused on Hawaii and Pacific territories [Image #5]. And Alaska is zoomed in too tightly [Image #6] versus the entirety of Alaska [Image #7]
+
+----
+
+
+
+## 2026-08-17 SDM workshop
+
+Evaluate @~/Desktop/Proposed workshop_ Advancing Species Distribution Models.docx and make suggestions for enhancing this document and goals, advances to highlight in a workshop. Will also use this to solicit BOEM to support it via Ocean Metrics LLC contract, which Tim White mentioned as possibility within the next 2 months (end of year when extra money can turn up).
+
+We had previously drafted a book outline for the SDM process at @~/Github/marinebon/MarineSDMs based on an MBON and BOEM sponsored workshop in New Orleans. It lacks a LOT of detail and is nowhere near up to date or authoritative.
+
+I have recently been playing the the H3 OBIS biodiverrsity analysis extension mentioned in the paper "Operationalizing Place-Based Ocean Indicators through Community-Driven Open-Source Software Development" (submitted as "Coding Ocean Indicators: Patterns and People": @~/Library/CloudStorage/GoogleDrive-ben@ecoquants.com/.shortcut-targets-by-id/1sppUmlMtZ-sXaBm72M1-8PnjVudXO91v/US MBON Public Folder/Working Groups/BioIndicators/manuscripts/indicators/coding-ocean-indicators_submitted-2026-06-30.docx). It is live at https://app.marinesensitivity.org/h3-db/ (~/Github/marinebon/obisindicators).
+
+And there is now a ~/Github/MarineSensitivity/stac-sdm.
+
+Want to move things forward and bring everyone aboard with sharing SDMs, and going deeper with monthly/seasonal approaches, plus depth-varying.
+
+Need to conduct a literature review of where we stand with the latest marine SDMs, but lost journal access recently via UCSB.
+
+----
+
+Done. Here's the evaluation, with the full brief published and the files saved beside the docx.
+
+Deliverables
+- Brief (readable): ⧉ https://claude.ai/code/artifact/85df9b04-1af1-4934-bc86-5efb20ef175e
+- Paste-able source + companion files: ~/Desktop/sdm-workshop-brief/ — sdm-workshop-evaluation.md, sdm-workshop-brief.html, openalex_marine_sdm_2023-2026.csv (346 works, 292 open access), scan.py (re-runnable OpenAlex scan, no journal access needed).
+
+Headline read of the draft
+
+The vision is right and timely — couple NOAA CEFI/MOM6 forecasts to next-gen SDMs (AquaX, DisMAP, MBON/ATN) and turn that into decision products — but as a workshop proposal it isn't fundable yet: the title on the file ("Advancing SDMs") and on page 1 ("Operational biodiversity forecasting…") disagree; objectives are one bullet ("perhaps a digital twin") plus a 14-product goal sentence; days/location/timeframe/participants are placeholders; there are no deliverables, agenda, budget, or host; BOEM is one bullet in a NOAA-facing narrative; and the assets you can already show (STAC-SDM extension, MST v8 atlas + cloud-native serving, live OBIS H3 indicators, dismapr, the published AquaX paper) aren't mentioned. Several references are undefined or unverifiable — I couldn't find any public "SDM-MIP" or "NEAP", CEFI is now the Changing Ecosystems and Fisheries Initiative, and "AquaMaps 2.0" should be cited as Reygondeau et al. 2026, PLOS ONE (0.05°, 10-algorithm ensemble, SSP scenarios — and still a static climatology, which is exactly your opening).
+
+What I recommend (all written out as drop-in text in the brief)
+
+1. Two-tier framing: a bounded workshop — Sharing and Advancing Marine SDMs: from static ranges to seasonal, depth-resolved, uncertainty-aware forecasts — nested inside the operational-forecasting vision.
+2. Four objectives with named deliverables: Share (endorse STAC-SDM, license/attribution matrix, demonstrator catalog); Advance (predictor stack + method roadmap for monthly/seasonal and 3-D; a pilot ingested into MST as monthly|seasonal products); Apply (short product/indicator spec + regional pilot tied to a BOEM decision); Operationalize (benchmark/"forecast challenge" on the EFI model — the constructive version of SDM-MIP — training via the MarineSDMs book, governance, funding map).
+3. Advances to highlight — three tables (sharing infrastructure, modeling advances, standards/forecasting practice) with OA citations: Karp et al. 2025 and Klaassen et al. 2025 as the framing reviews; sdmTMB/tinyVAST; Welch 2023/Brodie 2021–22 on predictability and uncertainty; Brodie 2018/Pasanisi 2024 for depth; MegaMove (Sequeira 2025); Bio-ORACLE v3; CEFI MOM6 domains (NWA12 covers the Gulf).
+4. Participant gaps: BOEM ESP beyond Tim, RWSC, Navy LMR/Duke MGEL, NCCOS/MDAT, the NOAA SDM community-of-practice authors, USGS/USFWS, OBIS/GBIF/GEO BON, EFI, Councils/states/tribes, and Esri with a purpose (EMUs/hexagons).
+5. Format: 2 virtual pre-sessions + 2.5 days in person, 40–50 people, Feb–Apr 2027; location options weighed for attendance (Silver Spring vs St. Pete vs Santa Cruz vs Miami); agenda skeleton.
+6. BOEM ask: a five-task SOW (planning, pre-workshop synthesis, workshop, ESP-format report/roadmap, prototype catalog + seasonal MST ingest), the BOEM value proposition (MST v1 → v2; lease screening, seasonal restrictions, ESA §7/MMPA, NEPA, marine minerals), and what Tim needs from you in order (1-pager → SOW → cost estimate) — plus the note that "next 2 months" is FY-end, 30 Sep 2026.
+7. MarineSDMs book: make it the workshop's product rather than fixing it first; outline changes; also _quarto.yml's repo-url still points at marinebon/sdm-book (breaks Edit this page).
+8. Literature review: for this topic paywalls are a smaller problem than they look — 84% of the scan is OA, including every review cited. The brief lays out how to finish it reproducibly as lit.qmd (openalexR + citation snowballing + Unpaywall) and how to handle the residual (co-authors at USF/NOAA, alumni in-library access, ILL).
+
+One caveat: cost figures in §7 are deliberately a structure, not numbers — replace with an estimate once Tim says which contract vehicle he has in mind. If you'd like, I can draft the 1-page concept + SOW email to Tim next, or generate BibTeX for the cited works from the scan.
+
+----
+
+Excellent! Now write a whole new workshop proposal with all of this in mind into
+  ~/Desktop/sdm-workshop-brief/. Use references and links. Keep it concise and punchy, worthy of
+  funding
+
+----
+
+The proposal is written and rendered in three formats in ~/Desktop/sdm-workshop-brief/:
+
+- sdm-workshop-proposal.md — the source (paste-able)
+- sdm-workshop-proposal.docx — for sending to Tim/BOEM (pandoc default styling; restyle in Word as needed)
+- sdm-workshop-proposal.html — styled page, also published: ⧉ https://claude.ai/code/artifact/a78187e0-d515-4dfd-823b-aa3305a7f418
+
+What it is — ~3,200 words including 29 numbered references (all with DOI/URL links, nearly all open access):
+
+1. One-paragraph pitch + at-a-glance table (format, when, where, who, deliverables, sponsor/vehicle).
+2. Why now — five bullets: Karp et al. 2025 calls for a community of practice; Klaassen et al. 2025 names the same three frontiers; CEFI MOM6 drivers exist (NWA12/NEP10 + portal); AquaX just published and is still static; MST/STAC-SDM/h3t make sharing an engineering-plus-agreement problem; BOEM's decisions consume distributions and MST v2 needs seasonal inputs.
+3. The vision — the operational biodiversity forecasting paragraph, kept, with EcoCast/Welch/Brodie and the entanglement case as evidence it works.
+4. Four limits → four responses table (static, surface-only, incompatible/unpublished, no uncertainty).
+5. Objectives O1–O4 (Share, Advance, Apply, Operationalize), each with named deliverables.
+6. Assets we bring — MST, STAC-SDM, h3t/OBIS, DisMAP/dismapr, MarineSDMs book, AquaX and CEFI as partners, the Coding Ocean Indicators paper — with links, to be demoed live on Day 1.
+7. Participants, Gulf pilot (Rice's whale, sperm whale, Kemp's ridley/loggerhead, giant manta, oceanic whitetip, red snapper, GoMMAPPS seabirds; NE shelf as reserve), agenda, schedule (award 30 Sep 2026 → in person Mar 2027 → final report + prototype 30 Sep 2027).
+8. SOW T1–T5 with an indicative budget of $170–240k, sized for a single simplified-acquisition award, and linkages to BOEM, NOAA, MBON/GEO BON, RWSC; a short beyond-the-workshop section that promises a digital-twin layer, not a digital twin.
+
+Two things to check before it goes out: the budget ranges are my indicative sizing (replace with your rates), and the author line reads "Ben Best (Ocean Metrics LLC), with MBON partners — draft v0.1" — add Frank or others as you see fit. Happy to produce a one-page cover email to Tim or a BibTeX file for the references next.
+
+----
+
+Let's ratchet the budget back to $100K or less. My rate is $200/hr, but my BOEM contract already covers me doing much of this work. What's new and still applicable to my rate is all the prep and synthesis related to the workshop and interactions, including follow-up peer-reviewed publication and community outreach (such as conference presentation). Let's break this down with more fidelity.
+
+We also want to seperately suggest a fund to encourage SDM providers to make their data publicly available, eg $50K, including all observations, SDM predictors, uncertainty variables, and model fit objects for full reproducibility.
+
+Search for email threads with Gabrielle Canonico (MBON/IOOS) and Gabriel Reygendeaux (AquaX) with subject "Coordinating on SDM for biodiversity and management uses". This proposal needs to read more collaboratively with them (and Frank Muller-Karger) with MBON (including MBON-USA), IOOS, OBIS, etc.
+
+We also want to address use of ERDDAP for existing SDM model sharing, particularly for raster data types. This works already, eg NOAA ERD [2026-01-26 CPO-Sanctuaries Task Force - Heather Welch on W Coast SDMs.pdf](https://drive.google.com/file/d/1oNoOhPS4HzdoFJBVsXNRKq_7D6zlhoWT/view?usp=sharing):
+* [oceanview.pfeg.noaa.gov/erddap/files/HMS\_habitat\_suitability](https://oceanview.pfeg.noaa.gov/erddap/files/HMS_habitat_suitability)  
+  (blue whale, humpback whale, California sea lion, swordfish, leatherback turtle, blue shark, thresher shark, shortfin mako)  
+* [oceanview.pfeg.noaa.gov/erddap/files/SeabirdsProjection](https://oceanview.pfeg.noaa.gov/erddap/files/SeabirdsProjection/)  
+  (Cassin's auklet, rhinoceros auklet, common murre, sooty shearwater)  
+* [oceanview.pfeg.noaa.gov/erddap/files/Krill\_projection](https://oceanview.pfeg.noaa.gov/erddap/files/Krill_projection/)  
+  (krill)  
+* [oceanview.pfeg.noaa.gov/erddap/files/Northern\_anchovy\_projection](https://oceanview.pfeg.noaa.gov/erddap/files/Northern_anchovy_projection/)   
+  (anchovy)  
+* [oceanview.pfeg.noaa.gov/erddap/files/Groundfish\_projection](https://oceanview.pfeg.noaa.gov/erddap/files/Groundfish_projection/)  
+  (petrale sole and lingcod)
+How can this interoperate with the STAC-SDM if folks prefer using ERDDAP? The positives for STAC-SDM are simple cheap file serving VS server-hosted software. And others...
+
+Create a new version of the 3 formats under the same folder.
+
+----
+
+Version 0.2 is written in all three formats in ~/Desktop/sdm-workshop-brief/ (v0.1 renamed and kept alongside):
+
+- sdm-workshop-proposal-v0.2.md / .docx / .html
+- Published page (same URL as before): ⧉ https://claude.ai/code/artifact/a78187e0-d515-4dfd-823b-aa3305a7f418
+
+What changed
+
+1. Collaborative framing from the thread. I read the full Coordinating on SDM for biodiversity and management uses thread (35 messages, 22 Jun–24 Jul). The proposal now opens with a "How this came about" section crediting Frank's initiation from the New Orleans MBON meeting, Gabriel's vision paragraph (AquaX ensembles, uncertainty, 3-D, cumulative impact), Steve Bograd's NOAA linkages and Ocean Decade Conference idea, and Gabrielle's call for a convening plus her offer of FY27 IOOS resources leveraged with NASA/Smithsonian. Author line lists five proposed co-conveners (Frank, Gabrielle, Gabriel, Steve, you) — get their OK before circulating. The calendar now uses the community's own touchpoints: the 1-hr SDM slot at the MBON all-hands (St. Pete, 14–16 Oct), WCMB in Bruges (Nov, you + Gabrielle), Ocean Decade Conference (Apr 2027), IOOS DMAC; OBIS, GEO BON EcoCode WG5 and Marine Life 2030 are woven in as the global sharing endpoints.
+2. Budget ≤ $100k with hours. Ocean Metrics at $200/h, scoped to only what the MST contract doesn't already cover: A convening & coordination 55 h · B pre-workshop synthesis 120 h · C workshop delivery 50 h · D report & roadmap 85 h · E peer-reviewed publication 60 h · F outreach 40 h = 410 h / $82,000 + $12,000 directs (workshop + one conference trip, OA APC, registrations, platform) = $94,000. STAC-SDM/catalog/MST ingest are explicitly in kind from the existing contract; venue and ~15 non-federal travelers are shown as IOOS/MBON FY27 cost share.
+3. SDM Open Data Fund ($50k, separate). Nine $5k fixed-price awards paid on verified publication + $5k verification; the "what published means" checklist (predictions + uncertainty, observations or persistent pointers, predictor recipe, fit objects + code + environment, STAC-SDM + ODMAP + RMMS, CC0/CC-BY, DOI); reproducibility check re-runs one interval.
+4. ERDDAP ↔ STAC-SDM ("both/and", §5). I checked the NOAA ERD holdings: the CCS projections are files-type ERDDAP datasets — 17 species × GFDL/HAD/IPSL monthly netCDFs (~193 MB each; groundfish annual), 1980–2100, ensemble spread as uncertainty — with no griddap subsetting, unlike sardine_habitat_* on the same server. The argument: STAC-SDM is an index, not a warehouse — Items link to ERDDAP files/griddap queries as-is and add the SDM semantics (taxon, method, response, interval, uncertainty asset); deliverables are an ERDDAP→STAC crosswalk (ACDD/CF attributes → sdm: fields), a live demo on the CCS projections, and a datasets.xml template for the reverse. Where object storage wins: no server to run, byte-range reads of COG/Zarr/GeoParquet, git-versionable static catalogs, cross-provider search, STAC/COG tooling. Recommendation: ERDDAP where an institution already runs one; cloud-native files where it doesn't; STAC-SDM over both.
+
+Two housekeeping notes: Word had sdm-workshop-proposal.docx open when I renamed it to -v0.1.docx (there's a ~$ lock file) — close and reopen from the new name; and the "NEAP" acronym from the thread is still unresolved, so I avoided it.
 
 ## 2026-08-15 auth for apps/docs
 
@@ -110,7 +433,30 @@ Cloudflare account + nameserver move at Squarespace (cloudflare/dns_before.txt i
 
 What do you mean it's been verified? I don't see new URLs working at all
 
+----
 
+Nothing was written down before — now it is: server/cloudflare/README.md (committed, ea64dfe), plus a working access.sh.
+
+What you do by hand (steps 1–5, ~1 h + propagation)
+
+1. Cloudflare account → open Zero Trust → team name (suggest marinesensitivity; it becomes https://marinesensitivity.cloudflareaccess.com and is awkward to change) → Free plan.
+2. Add the site marinesensitivity.org (Free), reconcile the scanned records against the Squarespace panel — Cloudflare's scan is a convenience, not proof — and set proxy status: preview orange, everything else grey, plus SSL/TLS Full (strict).
+3. Move the nameservers at Squarespace. dns_snapshot.sh before/after; the only line that should differ is preview. Squarespace keeps its records, so rollback = point NS back.
+4. Add the One-time PIN identity provider. This one changed since I first planned it: new Zero Trust orgs default to the Cloudflare IdP and no longer get OTP automatically — and Tim has no Cloudflare account, so without this step he cannot sign in.
+5. API token with four permissions (exact table in the README).
+
+What's scripted (steps 6–8)
+
+.env gets the token, IDs and the reviewer lists (PREVIEW_ADMINS, PREVIEW_REVIEWERS_V8) — never a repo. Then cloudflare/access.sh reads the published versions.json and converges: per restricted release an application for /{ver} and /docs/{ver} carrying that release's reviewer policy, a catch-all for the host, service tokens (one shared for CHECK_PREVIEW, one per version so cross-version isolation is provable), and a cache-bypass rule. It prints the CF_ACCESS_TEAM / CF_ACCESS_AUD lines for .env, then DEPLOY_CADDY=1. Also wired as DEPLOY_ACCESS=1 in the release notebook so it stays reproducible.
+
+I ran it --dry-run two ways — today's registry (catch-all only) and with v8 simulated as restricted (the full per-version set) — so the API calls in the README are the ones it actually makes, not sketches.
+
+Two things I checked rather than assumed
+
+- Cloudflare Free cuts requests at 100 s (524). Measured on the server: the preview Shiny worker answers a cold page in 14–19 s, warm ~1.4 s. Fine, with headroom.
+- Access application paths ignore query strings, and the most specific path wins while unmatched subpaths inherit the parent — which is exactly why the version is the path, and why the catch-all admits admins anywhere you forget to gate.
+
+The README also has the Phase 2 flip in the right order (registry → access.sh → AUDs + Caddy → docs CI → verify), reviewer management, rollback, and the gotchas. Ping me when the account exists and I'll drive steps 6–8.
 
 ## 2026-08-13 fix species app versions
 
