@@ -297,7 +297,7 @@ Prototype with `AX_TEST_N=50 AX_COG=1` end-to-end (Parquet → COG → merge fix
    `AX_SUPERSEDE=0` (ax ingested and registered, but `supersede` empty). `pra_score_delta(v9, v8,
    zone_set_key = "programarea_2026-01")` must show **cor = 1.000, max |Δ| = 0** — proving the bootstrap
    clone, the `suit_ds` generalization and the `ver_prev` fixes moved nothing. Then the real run.
-5. Real run: `pra_score_delta(v9, v8)` will **diverge by design** (10.5k of ~16k valid-US species change
+5. Real run — DONE 2026-08-27 19:50: **n 20 · mean |Δ| 3.63 · max |Δ| 8.2 (NOR +8.2, GAB −8.2) · RMSE 4.41 · r 0.924**; US surface 17,781 taxa / 784.1 M cells (v8 580.6 M — AquaX's wider US footprints); masking 17,124/17,124; 0 AquaMaps rows inside the mask for superseded taxa; registry 91,344 models, `ax` scored. *(original text:)* `pra_score_delta(v9, v8)` will **diverge by design** (10.5k of ~16k valid-US species change
    surface inside the mask). The gate is "explained": the per-component / per-region Δ tables from the
    ingest comparison are the explanation, and `validate_versions.qmd` (`render_versions("v8","v9")`)
    is committed with it. Expect fish/invertebrate/coral components to move, mammal slightly, turtles
