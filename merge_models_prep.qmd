@@ -42,7 +42,7 @@ flowchart LR
 #| label: setup
 
 librarian::shelf(
-  DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, purrr, readr, stringr,
+  arrow, DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, purrr, readr, stringr,
   tibble, MarineSensitivity/msens, quiet = T)
 source(here("libs/paths.R"))   # dir_big_v, spp_db, ver, ver_prev, dir_big
 source(here("libs/vars.R"))
@@ -89,6 +89,24 @@ ingested <- unlist(lapply(ds_dirs, \(d) tryCatch(
 dbDisconnect(con0, shutdown = TRUE)
 models <- lookup |> filter(mdl_key %in% ingested)
 
+# STABILITY: a model the previous version already crosswalked keeps its taxon by EXACT mdl_key.
+# Re-resolving every model by cleaned scientific name against ver_prev's taxon table re-keyed 12
+# models on the v9 control run (v8's table keeps ONE name per taxon where v7's kept one per model,
+# so a name can now land on a synonym id), moved one taxon's ER and broke the plumbing check by 3
+# taxa. Name / native-id resolution below is for models ver_prev never had (ax, new ranges).
+prev_tm_pq <- path.expand(glue("{dir_big}/{ver_prev}/marine-atlas/tables/taxon_model.parquet"))
+prev_tm <- if (file_exists(prev_tm_pq)) {
+  arrow::read_parquet(prev_tm_pq) |>
+    transmute(mdl_key, prev_authority = taxon_authority, prev_taxon_id = as.character(taxon_id))
+} else { log_warn("no ver_prev taxon_model at {prev_tm_pq} — every model resolves afresh"); tibble(mdl_key = character(), prev_authority = character(), prev_taxon_id = character()) }
+models <- models |> left_join(prev_tm, by = "mdl_key")
+log_info("crosswalk reuse: {sum(!is.na(models$prev_taxon_id))} models keep {ver_prev}'s taxon by mdl_key; {sum(is.na(models$prev_taxon_id))} resolve afresh")
+# the CONTROL run (AX_SUPERSEDE=0) merges EXACTLY ver_prev's model set, so its hash is binary
+if (!ax_supersede) {
+  n0 <- nrow(models); models <- models |> filter(!is.na(prev_taxon_id))
+  log_info("control run: {n0 - nrow(models)} model(s) {ver_prev} never crosswalked are EXCLUDED so the surface can reproduce its checkpoint")
+}
+
 # density datasets (gm, nc) are ingested + published natively, but are NOT yet folded into the merge:
 # merge treats every non-`am` dataset as a binary range (max-merge), which would misrepresent graded
 # density and silently change scoring (a composite change to validate with `pra_score_delta`). So
@@ -111,7 +129,7 @@ count(models, ds_key)
 ```{r}
 #| label: worms
 
-nonbird <- models |> filter(ds_key != "bl", is.na(worms_id)) |> distinct(scientific_name) |>
+nonbird <- models |> filter(ds_key != "bl", is.na(worms_id), is.na(prev_taxon_id)) |> distinct(scientific_name) |>
   mutate(sci_clean = clean_sci_name(scientific_name),                 # drop (=synonym), ssp. markers
          sci_binom = clean_sci_name(scientific_name, binomial = TRUE)) # Genus species fallback
 
@@ -181,13 +199,17 @@ tm_nonbl <- models |> filter(ds_key != "bl") |>
   left_join(sisid_by_binom, by = "sci_binom") |>
   mutate(bird_sisid = coalesce(s_cln, s_bin),                  # bird? (clean match, else binomial)
          taxon_authority = if_else(!is.na(bird_sisid), "botw", "worms"),
-         taxon_id        = if_else(!is.na(bird_sisid), bird_sisid, worms_id)) |>
+         taxon_id        = if_else(!is.na(bird_sisid), bird_sisid, worms_id),
+         # ver_prev's crosswalk wins for a model it already had (stability across versions)
+         taxon_authority = coalesce(prev_authority, taxon_authority),
+         taxon_id        = coalesce(prev_taxon_id, taxon_id)) |>
   filter(!is.na(taxon_id)) |>
   transmute(mdl_key, taxon_authority, taxon_id)
 
-# bl models -> botw taxon (native sisid)
-tm_botw <- models |> filter(ds_key == "bl", !is.na(sisid)) |>
-  transmute(mdl_key, taxon_authority = "botw", taxon_id = as.character(sisid))
+# bl models -> botw taxon (native sisid; ver_prev's key wins where it exists)
+tm_botw <- models |> filter(ds_key == "bl", !is.na(sisid) | !is.na(prev_taxon_id)) |>
+  transmute(mdl_key, taxon_authority = coalesce(prev_authority, "botw"),
+            taxon_id = coalesce(prev_taxon_id, as.character(sisid)))
 
 taxon_model <- bind_rows(tm_nonbl, tm_botw) |>
   mutate(ms_merge_key = mdl_key_merged(taxon_authority, taxon_id))

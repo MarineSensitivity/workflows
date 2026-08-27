@@ -48,7 +48,7 @@ writer (`grep -l merge.duckdb *.qmd`) when a target is added.
 | reader | what it assumed | what it does now |
 |---|---|---|
 | `score_zones.qmd` `v7_cat` | `v7.taxon.is_ok` | `is_ok` if present, else `is_valid_usa AND is_marine`; column still named `in_v7` (schema.qmd, `SCORE_V7COMMON`) |
-| `merge_models_prep.qmd` | `taxon.worms_id` | `worms_id` if present, else `taxon_id` where `taxon_authority='worms'`; a native `worms_id` column in `model_*.csv` skips name matching |
+| `merge_models_prep.qmd` | `taxon.worms_id`; re-resolved EVERY model by name | a model `ver_prev` already crosswalked keeps its taxon by exact `mdl_key` (its `taxon_model`); name / native-id resolution only for new models. Re-resolving by name against v8's one-name-per-taxon table re-keyed 12 models and failed the plumbing check by 3 taxa |
 | `build_zone_cells.qmd` gate | this version's released `zone_cell` | gates an unreleased version against `ver_prev`'s on the same grid instead of "skipped" |
 | `build_registry.qmd` | `ver_prev` dataset metadata for every ds_key | new datasets declare theirs in front-matter (`generate-sdm-metadata`) |
 | `release_marine-atlas.qmd` | a `titiler-{ver}` compose service | `TITILER_SERVICE` (default `titiler-v8` — the stock `/cog` tiler for every release) |
