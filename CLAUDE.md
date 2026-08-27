@@ -140,7 +140,29 @@ verifying the Access JWT at the origin). Enforcement in the apps is by **process
 Shiny Server OSS opens its own websocket to the R worker, so no proxy header reaches
 `session$request` — instead a second Shiny Server block (`:3839`, `server/rstudio/shiny-server.conf`)
 serves 3-line wrapper apps that set `MS_PREVIEW=1`, and `msens::atlas_allow_access()` lets that
-process resolve restricted versions while the public `:3838` process cannot. **On the preview host
+process resolve restricted versions while the public `:3838` process cannot.
+
+**On the preview host the version is the URL PATH** — `/v8/scores/`, `/v8/species/`, `/docs/v8/`
+(`msens::preview_app_url()`), because Cloudflare Access scopes a policy by path and never by query.
+Caddy strips the prefix and passes the version to the app as **`X-MS-Version`** (a header it SETS
+from the path, like `X-MS-User`); `ui(req)` prefers it and falls back to `?ver=` on the public host.
+Never force `?ver=` onto requests there: shiny-server's own client bundle
+(`<app>/__assets__/…`) 404s if the request carries ANY query string, and the symptom is an app that
+draws its sidebar and hangs on "Loading map…".
+
+**Who may see a restricted release** is `PREVIEW_REVIEWERS_<VER>` in the server `.env`
+(comma-separated emails; `PREVIEW_ADMINS` is the catch-all for the landing page and anything not
+separately gated). Defaults today: admins = `ben@oceanmetrics.io`; `PREVIEW_REVIEWERS_V8` =
+`ben@oceanmetrics.io,timothy.white@boem.gov`. Edit `.env`, then
+`ssh msens 'cd /share/github/MarineSensitivity/server && set -a && . ./.env && set +a && cloudflare/access.sh'`
+(or `DEPLOY_ACCESS=1`). Changing an existing version's list is a policy-only change — no new AUDs,
+so no `DEPLOY_CADDY`. A NEW restricted version mints applications, so it needs the new
+`CF_ACCESS_AUD` line pasted into `.env` and then `DEPLOY_CADDY=1`.
+
+**Deploy order for a coordinated routes+apps change: `DEPLOY_APPS=1` FIRST, then `DEPLOY_CADDY=1`.**
+`DEPLOY_CADDY` runs `server/caddy/test/run.sh`, which asserts end-to-end that `/v8/scores/` renders
+v8 — so if the routing half lands while the apps still expect the old contract, the test fails and
+the notebook stops before it reaches the app deploy. **On the preview host
 the version is the URL PATH** (`/v9/scores/`, `/v9/species/`, `/docs/v9/` —
 `msens::preview_app_url()`), never `?ver=`, because Cloudflare Access holds one reviewer policy per
 version and scopes it by path; `server/caddy/preview_routes.caddy` strips the prefix and forces
