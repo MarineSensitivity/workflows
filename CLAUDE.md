@@ -177,8 +177,11 @@ Shiny Server OSS opens its own websocket to the R worker, so no proxy header rea
 serves 3-line wrapper apps that set `MS_PREVIEW=1`, and `msens::atlas_allow_access()` lets that
 process resolve restricted versions while the public `:3838` process cannot.
 
-**On the preview host the version is the URL PATH** — `/v8/scores/`, `/v8/species/`, `/docs/v8/`
-(`msens::preview_app_url()`), because Cloudflare Access scopes a policy by path and never by query.
+**The version is the URL PATH on BOTH app hosts** — `/v7/scores/` publicly and `/v8/scores/` on the
+preview host (`msens::product_urls()`; `server/caddy/app_version_routes.caddy` is imported by both
+vhosts so they cannot drift). On the preview host it is also what makes per-version access possible
+at all, since Cloudflare Access scopes a policy by path and never by query. `?ver=` still resolves:
+Caddy 301s it to the canonical path, so every published deep link and report keeps working.
 Caddy strips the prefix and passes the version to the app as **`X-MS-Version`** (a header it SETS
 from the path, like `X-MS-User`); `ui(req)` prefers it and falls back to `?ver=` on the public host.
 Never force `?ver=` onto requests there: shiny-server's own client bundle
