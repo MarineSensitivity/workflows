@@ -58,17 +58,24 @@ dbExecute(con, glue("ATTACH '{merge_db}' AS m (READ_ONLY)"))
 # when already materialized AND row-count-identical to the merged parquet — i.e. an idempotent re-run
 # to refresh downstream taxon flags only, with the merged surface unchanged. A changed merge (row
 # count differs) forces the rebuild; REDO_SCORE_ZONES=1 forces it unconditionally.
-redo_mc <- nzchar(Sys.getenv("REDO_SCORE_ZONES"))
+# ...but a row count cannot see a merge that changed VALUES on the same footprint (v9.1: the DPS
+# species kept their range cells and only their ER-weighted values moved), so the resume key is
+# the merge's CONTENT hash (data/manifests/merge_models.json), remembered in sdm.duckdb.
+redo_mc  <- nzchar(Sys.getenv("REDO_SCORE_ZONES"))
+mrg_hash <- tryCatch(jsonlite::fromJSON(here("data/manifests/merge_models.json"))$content_hash, error = \(e) NA_character_)
+dbExecute(con, "CREATE TABLE IF NOT EXISTS pipeline_state (target VARCHAR PRIMARY KEY, content_hash VARCHAR)")
+have_hash <- dbGetQuery(con, "SELECT content_hash FROM pipeline_state WHERE target = 'model_cell'")$content_hash
 n_mc <- if ("model_cell" %in% dbListTables(con))
   dbGetQuery(con, "SELECT count(*) n FROM model_cell")$n else 0
 n_pq <- dbGetQuery(con, glue("SELECT count(*) n FROM read_parquet('{merged}/**/*.parquet')"))$n
-if (redo_mc || n_mc != n_pq) {
+if (redo_mc || n_mc != n_pq || is.na(mrg_hash) || !length(have_hash) || !identical(have_hash, mrg_hash)) {
   dbExecute(con, glue("CREATE OR REPLACE TABLE model_cell AS
     SELECT mdl_key, cell_id, val FROM read_parquet('{merged}/**/*.parquet')"))
   dbExecute(con, "CREATE INDEX IF NOT EXISTS mc_cell ON model_cell(cell_id)")
-  log_info("model_cell (re)built: {n_pq} rows")
+  dbExecute(con, glue("INSERT OR REPLACE INTO pipeline_state VALUES ('model_cell', '{mrg_hash}')"))
+  log_info("model_cell (re)built: {n_pq} rows (merge {mrg_hash})")
 } else log_info(
-  "model_cell up-to-date ({n_mc} rows == merged parquet) — skipping ~30-min rebuild (REDO_SCORE_ZONES=1 to force)")
+  "model_cell up-to-date ({n_mc} rows, merge {mrg_hash} unchanged) — skipping ~30-min rebuild (REDO_SCORE_ZONES=1 to force)")
 ```
 
 ## Taxon prep — sp_cat + is_er_spatial
