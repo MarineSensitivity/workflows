@@ -28,8 +28,8 @@ cell table calls land — tolerated, reported). Values = `CUR_NR/10` on AquaMaps
 (`msens::supersede_sql()`, applied where `mc_parts` is written): for a taxon in
 `data/ax_supersedes_am.csv` (`supersedes` = TRUE), its `am` cells inside `dist/ax_mask.parquet` are
 dropped — on BOTH surfaces — and `am` carries on everywhere else. `merge_sql(suit_ds = c("am","ax"))`
-then treats both as suitability. `AX_SUPERSEDE=0` is the control run (must reproduce v8's PRA scores,
-cor 1.000); `AX_ABSENT_SUPERSEDES=1` lets the 2,742 "modeled, absent in US" species supersede too
+then treats both as suitability. `AX_SUPERSEDE=0` is the control run — AquaX EXCLUDED from the merge, so `merge_models`' content
+hash must equal v8's checkpoint (`bd8b2931f17bb2b3`); leaving ax in but unsuperseded would still `max()` it; `AX_ABSENT_SUPERSEDES=1` lets the 2,742 "modeled, absent in US" species supersede too
 (default off — a review question, listed in the ingest HTML). The ingest also builds + uploads both
 COG representations — for an on-grid dataset these are **as delivered** (`native/ax_native`, Float32
 0–1000, bit-exact) vs **as ingested** (`native/ax`, INT1U 1–100, the ≥1 threshold applied = what the

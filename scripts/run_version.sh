@@ -57,14 +57,16 @@ for entry in "${STAGES[@]}"; do
   [ -n "$ONLY" ] && { [ "$name" = "$ONLY" ] && active=1 || active=0; }
   if [ "$active" = 1 ]; then
     extra=""
+    out=""
     if [ "$CONTROL" = 1 ]; then
-      # the control run: ax registered, nothing superseded; outputs must reproduce ver_prev's
-      # Program-Area scores (cor 1.000). Its rendered HTML is the evidence -- keep it apart.
-      extra="AX_SUPERSEDE=0"
+      # the control run: AquaX EXCLUDED from the merge (merge_models_prep), so the inputs are
+      # ver_prev's and merge_models' content hash must equal ver_prev's checkpoint. Its rendered
+      # HTML is the evidence -- written under a _control suffix so the real run cannot overwrite it.
+      extra="AX_SUPERSEDE=0"; out="--output ${name}_control.html"
     fi
-    echo "==> $name  ($(date +%H:%M))  $qmd $envs $extra"
+    echo "==> $name  ($(date +%H:%M))  $qmd $envs $extra $out"
     # shellcheck disable=SC2086
-    env $envs $extra quarto render "$qmd" > "_output/logs/$name.log" 2>&1 || {
+    env $envs $extra quarto render "$qmd" $out > "_output/logs/$name.log" 2>&1 || {
       echo "!! $name FAILED — see _output/logs/$name.log" >&2
       sed 's/\x1b\[[0-9;]*m//g' "_output/logs/$name.log" | grep -E "ERROR|Error|Quitting|^!" | tail -20 >&2
       exit 1

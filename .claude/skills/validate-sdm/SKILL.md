@@ -70,11 +70,13 @@ When a new dataset REPLACES part of an old one, the aggregate gate diverges *by 
 thirds of scored species change surface inside US waters), so "near-zero delta" is no longer the
 test. Two things are:
 
-1. **The control run** — render the merge/score chain with supersession switched off
-   (`AX_SUPERSEDE=0`: ax registered, `supersede` table empty). `pra_score_delta(v9, v8,
-   zone_set_key = "programarea_2026-01")` must be **cor 1.000 / max |Δ| 0**. That proves the version
+1. **The control run** — `scripts/run_version.sh --control --from merge_models_prep --to merge_models`
+   (`AX_SUPERSEDE=0`): AquaX is **excluded** from the merge, so the inputs are exactly `ver_prev`'s and
+   `merge_models`' content hash must **equal ver_prev's checkpoint** (v8: `bd8b2931f17bb2b3`). Scoring
+   is deterministic on that surface, so the hash is the whole proof — no need to re-score. (Leaving
+   ax in but unsuperseded is not a control: it still `max()`es with AquaMaps.) That proves the version
    bootstrap, the generalized `merge_sql(suit_ds)` and every `ver_prev` fix moved nothing, so any
-   drift in the real run is the supersession and nothing else.
+   drift in the real run is the supersession and nothing else. Evidence: `_output/*_control.html`.
 2. **The explained gate** — the real run's delta is explained by the ingest's per-component /
    per-region Δ tables (`data/ax_vs_am_summary.csv`), and the components the new dataset cannot
    touch (bird, primary_producer, every non-modeled taxon) stay cor ≥ 0.999. Commit
