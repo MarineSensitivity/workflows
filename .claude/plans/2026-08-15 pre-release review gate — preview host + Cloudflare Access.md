@@ -356,6 +356,21 @@ including public ones; the check now reads `versions.json` itself and degrades t
 the registry is unreachable. And `CF_ACCESS_AUD` (multi-AUD, space-separated) was unquoted in
 `.env`, so `set -a; . ./.env` exported only the first AUD and ran the rest as commands.
 
+**Bug found by Ben on first real use (2026-08-27, fixed):** the apps rendered their chrome and then
+hung — "Loading map…" on scores, blank map on species. Cause: shiny-server serves its client bundle
+at `<app>/__assets__/…` from a handler that **404s if the request carries any query string**, and the
+routes forced `?ver=` onto *every* request under the version prefix. Without that bundle
+`preShinyInit` is undefined, the SockJS wrapper never initialises, and the browser falls back to a
+raw `wss://…/websocket/` shiny-server does not answer. Now only the **page GET** gets `ver` forced
+(the signed session token carries the version from there on); subresources proxy with their original
+query. `caddy/test/run.sh` gained the assertion that would have caught it — the pre-existing
+`shared/shiny.min.js` check did not, because that path tolerates a query. Verified in Chrome: both
+apps load, map draws, PREVIEW badge names the reviewer.
+
+**Adding reviewers (the everyday operation):** `PREVIEW_REVIEWERS_<VER>` in the server `.env`
+(comma-separated emails), then `cloudflare/access.sh`. Editing an existing version's list changes
+only a policy — no new AUDs, so no `DEPLOY_CADDY` needed. `PREVIEW_ADMINS` is the catch-all.
+
 **Remaining, and deliberately not done unattended:** invite Tim (an outward-facing email — Ben's to
 send); Phase 3's optional items (Google IdP needs a GCP OAuth client; `@boem.gov`/`@noaa.gov` domain
 policies widen access and are a decision, not a chore; Microsoft IdP needs DOI; Cloudflare in front
