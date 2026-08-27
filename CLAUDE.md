@@ -62,15 +62,15 @@ requirements, both mandatory:
    by hand: a hand-`mv` leaves no record of what was rebuilt or why.
 
    Corollary — **the msens the container runs is now converged, not pinned by hand (2026-08-27).**
-  `server/rstudio/Dockerfile` tracks msens `main` (`rstudio/build.sh` resolves it to a SHA so the
-  build is recorded *and* cache-correct), and `rstudio/cont-init/03_msens_from_share` reinstalls
-  msens from the `/share` checkout at every container START when the two disagree. The old
-  hand-maintained `MSENS_MIN` floor rotted exactly as you would expect: it sat at 0.31.0 while
-  msens reached 0.36.0, and a recreate for unrelated packages took **both public apps down** with
-  `'study_areas' is not an exported object`. The exports assertion in the Dockerfile stays — it is
-  the check written in terms of what the apps actually call.
+   `server/rstudio/Dockerfile` tracks msens `main` (`rstudio/build.sh` resolves it to a SHA so the
+   build is recorded *and* cache-correct), and `rstudio/cont-init/03_msens_from_share` reinstalls
+   msens from the `/share` checkout at every container START when the two disagree. The old
+   hand-maintained `MSENS_MIN` floor rotted exactly as you would expect: it sat at 0.31.0 while
+   msens reached 0.36.0, and a recreate for unrelated packages took **both public apps down** with
+   `'study_areas' is not an exported object`. The exports assertion in the Dockerfile stays — it is
+   the check written in terms of what the apps actually call.
 
-  Historical corollary — **`MSENS_MIN` guarded the package, because the version number is not proof.** A
+   Historical corollary — **`MSENS_MIN` guarded the package, because the version number is not proof.** A
    notebook whose logic lives in `msens` is only as current as the *installed* package. The server
    once reported `msens 0.14.0` while running a `manifest_build()` that predated zone PMTiles, so
    all seven v1–v7 manifests regenerated there came out silently missing their zone tiles. Every
