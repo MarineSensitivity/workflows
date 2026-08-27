@@ -370,7 +370,10 @@ Server, all via `release_marine-atlas.qmd` flags: `DEPLOY_TABLES=1` (tables + lo
 - **Score drift magnitude is unknown until run**; the control run (Phase 4.4) isolates it from every
   incidental change, so any drift beyond the supersession is a bug, not a story.
 - **`ver_prev` readers assuming v7** (Phase 0.5–0.7): found three by reading; a fourth may surface in a
-  render — treat any `column not found` on a `v7`-attached table as this class.
+  render — treat any `column not found` on a `v7`-attached table as this class. *Found in the run:*
+  `listing` (from `ingest_listings`) lives in `merge.duckdb`, which a new version starts empty — the
+  first v9 merge prep warned and fell back to IUCN-only ER (no ESA/MBTA floors). Now a hard stop +
+  an `ingest_listings` stage in `scripts/run_version.sh`.
 - **Cloudflare**: minting two Access applications and pasting AUDs is manual (`.env` on the server);
   the runbook in `server/cloudflare/README.md` covers it. Reviewers get one-time-PIN e-mails.
 - **Laptop-only inputs**: the server can never re-render `ingest_aquax` — acceptable (D12) and recorded in

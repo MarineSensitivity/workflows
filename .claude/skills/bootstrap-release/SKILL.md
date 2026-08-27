@@ -34,6 +34,15 @@ Then `quarto render build_cell_grid.qmd`: with the shared cell-id COG present it
 this fix a fresh `sdm.duckdb` had no `cell` table and every downstream
 `stopifnot("run build_cell_grid first" = file_exists(sdm_db))` passed on an empty database.
 
+## 2b. Tables that live in `merge.duckdb`, which a new version starts EMPTY
+
+`merge.duckdb` is created by `merge_models_prep`; the clone in step 2 covers `dist/` only. Anything
+another target writes into it must be re-rendered for the new version **before** the merge:
+`ingest_listings` (`ingest_nmfs-fws-listings.qmd` → `listing`: US ESA / MBTA / BCC — without it the
+governing `er_score` silently lost every federal floor on v9's first merge; it is now a hard stop
+in `merge_models_prep`). `scripts/run_version.sh` runs it as a stage. Check the DAG for any new
+writer (`grep -l merge.duckdb *.qmd`) when a target is added.
+
 ## 3. Readers that assume `ver_prev`'s schema — now introspective, keep them so
 
 | reader | what it assumed | what it does now |

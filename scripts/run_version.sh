@@ -34,6 +34,7 @@ STAGES=(
   "bootstrap_version   bootstrap_version.qmd"
   "build_cell_grid     build_cell_grid.qmd"
   "ingest_aquax        ingest_aquax.qmd            AX_COG=1 AX_COG_S3=1"
+  "ingest_listings     ingest_nmfs-fws-listings.qmd"
   "merge_models_prep   merge_models_prep.qmd"
   "merge_models        merge_models.qmd            REDO_MC_PARTS=1 REDO_MERGE=1"
   "merge_taxon         merge_taxon.qmd"
