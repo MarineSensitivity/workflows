@@ -81,7 +81,10 @@ con <- dbConnect(duckdb(merge_db))
 mem_gb <- tryCatch(
   max(4, min(8, floor(as.numeric(system("sysctl -n hw.memsize", intern = TRUE)) / 1e9 * 0.3))),
   error = function(e) 6)
+mem_gb <- as.numeric(Sys.getenv("MERGE_MEM_GB", mem_gb))   # override when nothing else is running
 dbExecute(con, glue("PRAGMA memory_limit='{mem_gb}GB'"))
+# streaming COPY/aggregates need no insertion order; keeping it pins buffers the OOM guard then hits
+dbExecute(con, "SET preserve_insertion_order = false")
 dbExecute(con, glue("PRAGMA temp_directory='{dir_atlas}/duckdb_tmp'"))
 dbExecute(con, glue("PRAGMA max_temp_directory_size='400GB'"))
 dbExecute(con, glue("PRAGMA threads={min(4L, max(1L, parallel::detectCores() - 1L))}"))
@@ -143,10 +146,14 @@ if (!dir_exists(dir_parts) || nzchar(Sys.getenv("REDO_MC_PARTS"))) {
      WHERE {msens::supersede_sql(src = 'mc')}"),
     dir_parts, partition_by = "mkey_id")
 } else log_info("mc_parts exists — skipping repartition (REDO_MC_PARTS=1 to force)")
-# VIEW over the partitioned input — EVERY query below filters mkey_id (integer) so reads are pruned
+# VIEW over the partitioned input — used only for the per-partition COUNT below (metadata scan).
+# Every DATA read goes through parts_sql(): the partitions named by PATH, never the 150k-file glob
+# filtered by `mkey_id IN (...)` -- the reader buffered far beyond the 6 turtle partitions it needed
+# and hit the memory limit (v9 control run, 2026-08-27).
 dbExecute(con, glue("CREATE OR REPLACE VIEW mc_parts AS
   SELECT mkey_id, ms_merge_key, ds_key, cell_id, val
   FROM read_parquet('{dir_parts}/**/*.parquet', hive_partitioning = true)"))
+parts_sql <- function(ids) glue("read_parquet([{paste0(\"'\", dir_parts, \"/mkey_id=\", ids, \"/*.parquet'\", collapse = \", \")}], hive_partitioning = true)")
 all_ids <- dbGetQuery(con, "SELECT mkey_id FROM mkey_map ORDER BY mkey_id")$mkey_id
 log_info("partitioned merge input: {length(all_ids)} taxa by mkey_id; US trim {n_us} in_usa cells; memory_limit={mem_gb}GB")
 ```
@@ -166,7 +173,7 @@ log_info("{length(turtle_keys)} turtle taxa (multiplicative merge)")
 # whole-range (global) multiplicative turtle merge, reading ONLY the turtle taxa's partitions
 # (mkey_id IN (...) → partition-pruned, tiny). Rule = msens::turtle_sql() (unit-tested).
 dbExecute(con, glue("CREATE OR REPLACE TABLE turtle_src AS
-  SELECT ms_merge_key, ds_key, cell_id, val FROM mc_parts WHERE mkey_id IN ({tids_sql})"))
+  SELECT ms_merge_key, ds_key, cell_id, val FROM {parts_sql(turtle_ids)}"))
 dbExecute(con, paste("CREATE OR REPLACE TABLE mc_turtle AS",
   msens::turtle_sql(turtle_ds, suit_ds, ch_ds, src = "turtle_src")))
 log_info("mc_turtle (whole-range): {dbGetQuery(con, 'SELECT count(*) n FROM mc_turtle')$n} cells")
@@ -234,9 +241,8 @@ msq             <- msens::merge_sql(suit_ds)
 glob_global_sql <- msq$global
 us_sql          <- msq$us
 for (i in seq_along(batches)) {
-  bk <- paste(batches[[i]], collapse = ",")   # integer mkey_ids → partition-pruned
   dbExecute(con, glue("CREATE OR REPLACE TABLE b AS
-    SELECT ms_merge_key, ds_key, cell_id, val FROM mc_parts WHERE mkey_id IN ({bk})"))
+    SELECT ms_merge_key, ds_key, cell_id, val FROM {parts_sql(batches[[i]])}"))
   dbExecute(con, msq$b_range)    # range footprint (non-am) valued by governing er_score
   dbExecute(con, msq$b_am_rng)   # am AT range cells only → range-footprint max(er, am-at-range)
   # per-taxon range-cell tally, accumulated while b_range is in hand (free) — the masking check
@@ -293,12 +299,11 @@ if (dbExistsTable(con, "range_counts")) {
 # taxon, no am cell may survive inside ax_mask. The v8 behaviour fails this by construction.
 n_sup <- dbGetQuery(con, "SELECT count(*) n FROM supersede")$n
 if (n_sup > 0) {
-  leak <- dbGetQuery(con, "
+  sup_ids <- dbGetQuery(con, "SELECT mkey_id FROM mkey_map WHERE ms_merge_key IN (SELECT ms_merge_key FROM supersede)")$mkey_id
+  leak <- dbGetQuery(con, glue("
     SELECT count(*) AS n_rows, count(DISTINCT ms_merge_key) AS n_taxa
-    FROM mc_parts p
-    WHERE p.ds_key = 'am'
-      AND p.mkey_id IN (SELECT mkey_id FROM mkey_map WHERE ms_merge_key IN (SELECT ms_merge_key FROM supersede))
-      AND p.cell_id IN (SELECT cell_id FROM ax_mask)")
+    FROM {parts_sql(sup_ids)} p
+    WHERE p.ds_key = 'am' AND p.cell_id IN (SELECT cell_id FROM ax_mask)"))
   log_info("supersession check: {leak$n_rows} am rows inside ax_mask for {leak$n_taxa} superseded taxa (expect 0)")
   stopifnot("AquaMaps cells survive inside the AquaX mask for superseded taxa (supersede_sql not applied to mc_parts?)" =
               leak$n_rows == 0)
