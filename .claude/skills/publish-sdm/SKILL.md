@@ -26,6 +26,12 @@ to the apps and the docs:
 
 - **`PROMOTE_LATEST=1` is the only thing that changes what users see by default.** Publishing data
   does not. `latest.txt` names the newest `released` version — today **v7**, with v8 a `prerelease`.
+- **A suitability-only taxon gets a merged COG only if `publish_native` paints one.** The
+  `native/am` alias is sound for exactly one AquaMaps model and nothing else; multi-model taxa and,
+  from v9, any taxon with an AquaX model (AquaMaps outside the mask ∪ AquaX inside) are painted
+  from the post-supersession `mc_parts` partition. v9's first registry silently had 14,799 → 5,957
+  aliases and ~8,800 taxa with no merged surface — compare `native_asset` class counts against
+  `ver_prev`'s before releasing.
 - **`PUBLISH_MERGED_COG=1` is NOT optional when rebuilding the registry.** Without it `merged_reg`
   is an empty tibble and the bind is guarded on `nrow()`, so a re-render silently DROPS every real
   merged-COG row and leaves only the am-only aliases.
