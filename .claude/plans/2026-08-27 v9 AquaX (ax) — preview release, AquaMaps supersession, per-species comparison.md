@@ -157,7 +157,14 @@ Dockerfile pin moves; the exports assertion list is unaffected (apps call nothin
 6. `NEWS.md` 0.37.0 bullets: v9 grid; `merge_sql(suit_ds)`; `supersede_sql`; `sp_cat_from_taxonomy`;
    `cells_from_aligned_raster`; `cog_from_tif`. `devtools::test()` green → `devtools::install()`.
 
-## Phase 2 — `ingest_aquax.qmd` (the deliverable notebook) — IN PROGRESS (smoke tests on 50 models; bugs found: GDAL `~`, `str_starts` regex, named-list `bind_rows`, mask = union not one model)
+## Phase 2 — `ingest_aquax.qmd` (the deliverable notebook) — IN PROGRESS (full ingest done 14:27, 204 min for 10,536 models; COGs/S3/comparison rendering)
+
+**Measured on the full run (2026-08-27):** `ax_mask` = **641,651** cells = 634,181 of the 634,208 `in_usa`
+cells (**27 uncovered**) + 7,367 ocean cells just outside `in_usa` + **103 coastline pixels** (one model,
+Hawaiian/Mariana shores) that Bio-Oracle's depth layer calls land — a disagreement between two ocean
+masks, tolerated below 0.1% and reported. So the AquaX extent is, for practical purposes, the whole US
+study area; supersession inside `ax_mask` ≈ supersession inside US waters. Bugs found by the smoke
+tests: GDAL `~` paths, `str_starts` regex, named-list `bind_rows`, INT1U truncation, stale COGs under REDO.
 
 ```yaml
 title: "Ingest AquaX → global 0.05° cells (position-mapped) · supersedes AquaMaps in US waters"

@@ -22,7 +22,8 @@ score_zones → score_cell_metrics → score_zone_metrics → build_registry →
 `ingest_aquax.qmd` ingests 10,536 AquaX rasters that are *already on the `global05` grid* (cell_id =
 pixel index, asserted) and *masked to US waters* (AquaX's own mask = the UNION over models of their
 non-NA pixels — one model's NA area is its range crop, i.e. AquaX saying absent — measured against
-`in_usa` in the ingest; the `in_usa` cells no model reaches keep AquaMaps). Values = `CUR_NR/10` on AquaMaps'
+`in_usa` in the ingest: 641,651 cells covering all but 27 `in_usa` cells, plus 103 coastline pixels the
+cell table calls land — tolerated, reported). Values = `CUR_NR/10` on AquaMaps'
 [0,100] scale; TSS cutoff recorded, not applied. **Supersession is a filter on the merge input**
 (`msens::supersede_sql()`, applied where `mc_parts` is written): for a taxon in
 `data/ax_supersedes_am.csv` (`supersedes` = TRUE), its `am` cells inside `dist/ax_mask.parquet` are

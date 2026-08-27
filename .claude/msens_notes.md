@@ -41,6 +41,52 @@
   Let's write a manuscript (with a plan first to discuss) on forwarding the vision of this project to the next iteration (plan )
   '/Users/bbest/Library/CloudStorage/GoogleDrive-ben@ecoquants.com/.shortcut-targets-by-id/1sppUmlMtZ-sXaBm72M1-8PnjVudXO91v/US MBON Public Folder/Working Groups/BioIndicators/manuscripts/atlas/atlas _ BioIndicators manuscript.md'
 
+## 2026-08-27 mobile friendly apps
+
+Let's make the scores and species apps mobile friendly. At the moment the scores app only shows the sidebar and the map or other tabs are not visible at all
+
+The species app has a slightly visible map on scroll, but way too crowded up top
+
+Not sure how to best collapse and open with options, but did something similar for the CalCOFI hex app @../../CalCOFI/db-viz-station/
+
+----
+
+Everything is done and, as it turns out, already committed: the other Claude session working in apps/ swept all of my edits into its commits (8ed46d4, 80edf44, now on origin/main); the working tree is clean. Final recap below.
+
+What was wrong
+
+Both apps are bslib page_sidebar() pages, and two bslib defaults broke them on phones:
+
+1. fillable_mobile = FALSE adds .bslib-flow-mobile, which turns every fill item into flex: 0 0 auto — the map card kept its intrinsic height, which I measured at 0 px on the live scores app at 404 px wide.
+2. sidebar(open = NULL) resolves to mobile = "always" — the sidebar is stacked below the (empty) map, with no toggle.
+
+What I changed (apps/, all in HEAD)
+
+- Both apps: fillable_mobile = TRUE; scores gets open = list(desktop = "open", mobile = "closed") (species already had open = FALSE). That's bslib's own mobile mode — a toggle row above the map, sidebar as a full-width overlay — so nothing is hand-rolled. Plus a @media (max-width: 575.98px) block (bslib's own breakpoint) in each ui_impl: header becomes two compact rows (title · About · dark toggle / product nav), spacing via --bslib-spacer and --bslib-mb-spacer (a second variable — the 1.5 rem gap .bslib-gap-spacing puts between the main column's children, which is what your species screenshot's dead space was), card bodies 0.5 rem.
+- Scores: tab_title("Plot of Scores", "Plot") renders long+short labels and CSS picks one → the tab strip is one row (Map · Plot · Table · Report). value is untouched, so the tour and server keep working. Report tab's nested sidebar gets the same mobile mode.
+- Species: picker labels hidden on phones; the layer bar collapses its pills behind a "N layers ▾" toggle (client-side class flip, re-renders collapse it); "(maximum of N inputs)" hidden there; "Zoom to layer" moved under the geocoder box, which goes full-width on narrow maps.
+- README.md: a "Mobile layout" section documenting the above and the local-dev gotcha below.
+
+Verified locally in Chrome at 400 px and 360 px (sidebar overlay, Plot/Table tabs, layer toggle, welcome modal) and unchanged at desktop width.
+
+Your question: why no leatherback raster?
+
+Not the mobile change and not the live site. The app draws a v7 merged model from model_asset.cog_url via /cog — the server's v7 serve.duckdb has it (54241 → cog/usa05/9fe6f75498affae1.tif), and I confirmed /cog tiles return 200 at every zoom (z0–z3). My laptop run had to bypass the local serve.duckdb (it's the server's view DB, views over /share/…, so local runs of either app currently fail on it) and fell back to the June v7/sdm.duckdb, which has no model_asset — so the app took the model_cell → /msens/tiles branch, and that per-cell factory was retired on titiler-v8 on 2026-08-12 (MSENS_FACTORY=1 re-mounts it). The 404s in your live-site console are titiler's normal out-of-bounds tiles on /cog.
+
+Not done / for you
+
+- Not deployed. DEPLOY_APPS=1 restarts the live apps, and the other session's URL-canonicalisation change (/v7/scores/ on both hosts) is in the same commits and needs the coordinated DEPLOY_APPS → DEPLOY_CADDY order — so that deploy should be driven by whoever owns that change.
+- The local apps + a 360 px harness are still running if you want to look: http://127.0.0.1:3905/mobile.html (apps on ports 3901/3902). Stop with lsof -ti tcp:3901,3902,3905 | xargs kill.
+- Saved the local-dev/serve.duckdb trap, the bslib mobile knobs, and the iframe-harness trick to memory.
+
+---
+
+Can we have an info pill to immediate right of the sidebar expander on each app to alert user to its existence/purpose for selection/info without causing extra lines of visual real estate added?
+
+----
+
+I'll do that as pure CSS: a ::after pill on bslib's own collapse chevron, shown only while the sidebar is collapsed, so it sits in the chevron's existing line (no new row) and — since a pseudo-element is hit-tested as part of its button — tapping the pill opens the sidebar too. Scores says "Map options", species "Species info". Let me look at the exact current CSS anchor in HEAD (the other session's commits reflowed the files) before editing.
+
 ## 2026-08-27 AquaX v9 preview release ingest
 
 Setup a new preview release v9 to ingest AquaX, short dataset code `"ax"` from the TIFs and spreadsheets in `@/_big/msens/AquaX_2026-04/`, which are already keyed to WoRMS IDs already. All of the TIFs need to be converted into COGs and uploaded into the S3 atlas, but they should not need interpolation onto the study raster topology, since already on the 0.05 deg grid, clipped to the fullest extent (ie nearshore too) of all USA waters (including territorial Pacific/Atlantic). In the ingest workflow, identify all the AquaMaps species distributions that will be superseded by the newer AquaX. Provide summary statistics on the number of species by MST component, plus change in average suitability values within shared extents across regions per species and listing the 20 least and 20 most different overall in a table in the ingest notebook, so we can inspect differences per species in the app.
@@ -713,7 +759,7 @@ You can also edit the policy in the Cloudflare dashboard (Zero Trust → Access 
 
 Tim is already on the v8 policy, so he only needs the link: https://preview.marinesensitivity.org/v8/scores/ (his PIN goes to his .gov inbox; if it doesn't arrive, ask IT to allowlist noreply@notify.cloudflare.com).
 
-### Speed up with version routing
+### Speed up with version routing, and app warming
 
 Do your routes need to force `?ver=v8` onto every request, or could the Shiny apps simply extract the version from the URL directory (ie `/v8/`, not `?ver=v8`), since now all versions are prefixed. For instance, the default generated URL to the scores app has a `v8` redunancy:
 
@@ -866,6 +912,184 @@ One heads-up while I was measuring: data/versions.csv now has v9 as prerelease, 
 Yes, profile the cold start and evaluate caching the bundle (for instance on a per version basis for both scores and species apps)
 
 ---
+
+Profiled and evaluated. The headline: caching would work, and I still recommend against it — the numbers explain why.
+
+Where the ~15 s actually goes
+
+┌─────────────────────────────┬─────────┬─────────┐
+│            phase            │ scores  │ species │
+├─────────────────────────────┼─────────┼─────────┤
+│ attaching packages          │ 8.6 s   │ 8.3 s   │
+├─────────────────────────────┼─────────┼─────────┤
+│ other globals               │ 1.0 s   │ —       │
+├─────────────────────────────┼─────────┼─────────┤
+│ build_bundle(v8)            │ 3.2 s   │ 8.8 s   │
+├─────────────────────────────┼─────────┼─────────┤
+│ build_bundle(v7) afterwards │ 1.0 s   │ —       │
+├─────────────────────────────┼─────────┼─────────┤
+│ first page                  │ ~12.8 s │ ~17 s   │
+└─────────────────────────────┴─────────┴─────────┘
+
+Packages dominate — and they're irreducible. library(msens) measures 8.13 s loaded first but only 0.38 s loaded last: its weight is the shared sf/terra/mapgl/duckdb stack the apps attach anyway. So moving msens Imports to Suggests would buy ~0.4 s. That idea is dead, and I'm glad I measured instead of assuming.
+
+Caching a bundle per version: feasible, and it does pay
+
+A bundle is serialisable apart from the DuckDB connection (plus one lazy tbl in species):
+
+┌─────────┬─────────┬──────────────────────────────────────┬────────┐
+│         │ rebuild │             read cached              │ saves  │
+├─────────┼─────────┼──────────────────────────────────────┼────────┤
+│ scores  │ 3.27 s  │ 0.31 s (56 MB uncompressed)          │ ~3.0 s │
+├─────────┼─────────┼──────────────────────────────────────┼────────┤
+│ species │ 8.80 s  │ 3.03 s (11 MB gzip — compresses 14×) │ ~5.7 s │
+└─────────┴─────────┴──────────────────────────────────────┴────────┘
+
+Why I'd still not do it
+
+1. It doesn't change the experience. Cold start goes ~13 s → ~10 s (scores), ~17 s → ~11 s (species). Still "slow first hit", because packages are untouched.
+2. Cold starts are now rare. With workers warm, only the first visit after an idle hour or a deploy pays anything at all.
+3. It buys a cache that must be invalidated on three things — the release's data, the app code, and the msens version. Get that wrong and it silently serves stale metadata under a version label, which is precisely the failure class this project spends the most effort preventing. Trading a rare 5 s for that surface is a bad deal.
+
+Committed apps/tools/profile_cold_start.R so this is re-runnable after any dependency or bundle change, with the numbers and reasoning in apps/README.md.
+
+If you want to go further, in order of value
+
+1. app_idle_timeout 0 — removes the cold start entirely except after deploys, for ~2.2 GB standing (9.5 GB free). One line, no staleness risk. This is the honest "make it always fast" answer.
+2. Understand species' bundle — 8.8 s and 222 MB in memory, versus scores' 3.2 s / 9.6 MB. That outlier probably means a large table is being pulled into R that could stay in DuckDB. Fixing it would cut both the cold start and per-worker memory — and it's a genuine improvement rather than a cache papering over one.
+3. Caching, only if cold starts become common again (many versions evicting workers).
+
+I'd do 2 before 1 if you want real gains; 1 alone if you just want Tim's first click to be instant.
+
+----
+
+I wonder if we could have a cron visit links to apps so a “warm” version is always available, especially for current default and most recent preview versions?
+
+----
+
+Both questions answered — and the report probe caught a regression of mine in the process.
+
+Warming the report API: no, and here's why
+
+┌──────────────────┬────────────────────────────────────┐
+│                  │                time                │
+├──────────────────┼────────────────────────────────────┤
+│ fresh report     │ 24 s                               │
+├──────────────────┼────────────────────────────────────┤
+│ identical repeat │ 1.2 s (content-hash cache already) │
+└──────────────────┴────────────────────────────────────┘
+
+plumber is a long-running process, so unlike the Shiny apps it has no cold start to warm. Each report is a fresh quarto render whose cost is the render, and its cache key includes the title and the areas — so pre-rendering speculative reports would almost never be hit. Warming buys nothing.
+
+But probing it does. My link change broke every /report render (if (nzchar(q)) on a vector — the species table builds all rows' links at once), and it sat broken for ~3 hours because I verified the review gate afterwards instead of the feature I'd just touched. Fixed, deployed, verified with a real render. I've added /report to the heartbeat using a payload whose hash is already cached — ~1 s of server time per check, and it would have caught that within 20 minutes.
+
+Overload risk: comfortable, with named tripwires
+
+Measured just now (4 cores / 16 GB):
+
+┌────────────────────────────┬────────────────────────────────────────────────────────┐
+│                            │                                                        │
+├────────────────────────────┼────────────────────────────────────────────────────────┤
+│ load average               │ 0.37 — essentially idle                                │
+├────────────────────────────┼────────────────────────────────────────────────────────┤
+│ memory available           │ 7.6 GB                                                 │
+├────────────────────────────┼────────────────────────────────────────────────────────┤
+│ rstudio                    │ 3.8 GB (4 warm workers ≈ 550 MB each + RStudio Server) │
+├────────────────────────────┼────────────────────────────────────────────────────────┤
+│ titiler / titiler-v8 / h3t │ 1.2 / 0.9 / 0.7 GB                                     │
+├────────────────────────────┼────────────────────────────────────────────────────────┤
+│ the warm sidecar itself    │ ~5 MB                                                  │
+└────────────────────────────┴────────────────────────────────────────────────────────┘
+
+Warming costs 4 page renders per 20 minutes — under 1% of one core — and it requests them sequentially, so there's no thundering herd. Its real cost is pinning those four workers, which is already in the 3.8 GB above.
+
+How I'd manage it:
+1. Warm set stays small and data-driven — promoted + restricted only. Warming all nine versions would hold nine bundles per worker; everything else expires after an hour.
+2. The heartbeat now watches headroom, not just endpoints: it alerts if available memory drops below 1.5 GB or load hits 8 — so you hear it before users do.
+3. If it ever tightens, in order: warm fewer versions → lower app_idle_timeout → then fix the real outlier, species' 222 MB bundle (vs scores' 9.6 MB). That's a genuine fix rather than a budget cut, and it's the same thing I'd tackle before ever revisiting bundle caching.
+4. The other big transient consumer is a pipeline render inside rstudio — that's what the 7.6 GB headroom is for, and warming leaves it intact.
+
+All committed: server/warm/warm.sh + compose service, the DEPLOY_APPS re-warm hook, the resource budget in server/README.md, and the cold-start facts in the ops memory.
+
+----
+
+Both questions answered — and the report probe caught a regression of mine in the process.
+
+Warming the report API: no, and here's why
+
+┌──────────────────┬────────────────────────────────────┐
+│                  │                time                │
+├──────────────────┼────────────────────────────────────┤
+│ fresh report     │ 24 s                               │
+├──────────────────┼────────────────────────────────────┤
+│ identical repeat │ 1.2 s (content-hash cache already) │
+└──────────────────┴────────────────────────────────────┘
+
+plumber is a long-running process, so unlike the Shiny apps it has no cold start to warm. Each report is a fresh quarto render whose cost is the render, and its cache key includes the title and the areas — so pre-rendering speculative reports would almost never be hit. Warming buys nothing.
+
+But probing it does. My link change broke every /report render (if (nzchar(q)) on a vector — the species table builds all rows' links at once), and it sat broken for ~3 hours because I verified the review gate afterwards instead of the feature I'd just touched. Fixed, deployed, verified with a real render. I've added /report to the heartbeat using a payload whose hash is already cached — ~1 s of server time per check, and it would have caught that within 20 minutes.
+
+Overload risk: comfortable, with named tripwires
+
+Measured just now (4 cores / 16 GB):
+
+┌────────────────────────────┬────────────────────────────────────────────────────────┐
+│                            │                                                        │
+├────────────────────────────┼────────────────────────────────────────────────────────┤
+│ load average               │ 0.37 — essentially idle                                │
+├────────────────────────────┼────────────────────────────────────────────────────────┤
+│ memory available           │ 7.6 GB                                                 │
+├────────────────────────────┼────────────────────────────────────────────────────────┤
+│ rstudio                    │ 3.8 GB (4 warm workers ≈ 550 MB each + RStudio Server) │
+├────────────────────────────┼────────────────────────────────────────────────────────┤
+│ titiler / titiler-v8 / h3t │ 1.2 / 0.9 / 0.7 GB                                     │
+├────────────────────────────┼────────────────────────────────────────────────────────┤
+│ the warm sidecar itself    │ ~5 MB                                                  │
+└────────────────────────────┴────────────────────────────────────────────────────────┘
+
+Warming costs 4 page renders per 20 minutes — under 1% of one core — and it requests them sequentially, so there's no thundering herd. Its real cost is pinning those four workers, which is already in the 3.8 GB above.
+
+How I'd manage it:
+1. Warm set stays small and data-driven — promoted + restricted only. Warming all nine versions would hold nine bundles per worker; everything else expires after an hour.
+2. The heartbeat now watches headroom, not just endpoints: it alerts if available memory drops below 1.5 GB or load hits 8 — so you hear it before users do.
+3. If it ever tightens, in order: warm fewer versions → lower app_idle_timeout → then fix the real outlier, species' 222 MB bundle (vs scores' 9.6 MB). That's a genuine fix rather than a budget cut, and it's the same thing I'd tackle before ever revisiting bundle caching.
+4. The other big transient consumer is a pipeline render inside rstudio — that's what the 7.6 GB headroom is for, and warming leaves it intact.
+
+All committed: server/warm/warm.sh + compose service, the DEPLOY_APPS re-warm hook, the resource budget in server/README.md, and the cold-start facts in the ops memory.
+
+----
+
+Ok, please proceed with fixing thre real outlier. I suspect vestigial layers (polygons or rasters) getting loaded that are no longer needed, or should be reconsidered for loading:
+
+> then fix the real outlier, species' 222 MB bundle (vs scores' 9.6 MB)
+
+----
+
+native_by_key alone is 156 MB of the 222 — a list keyed by 47,034 model ids. That's the classic R trap: splitting a data frame into tens of thousands of tibbles costs far more than the data. Let me see how it's built and used:
+
+222 MB → 66 MB, with rows_for identical to split() on 3,004 keys (including missing/NA/empty) and pick_asset matching on 4,000 calls. Let me check the build time and one small duplicate index:
+
+has_asset is vectorised, so it keeps its key vector — but that vector is now the same one my index already computes, so it can just point at it:
+
+My reordering would break the calls at lines 528/532 (they run before 563). The saving was ~0.4 MB of pointers — not worth the risk, so I'm reverting that micro-optimisation:
+
+8.80 s → 3.77 s to build, and 222 MB → 66 MB. Committing and deploying, then verifying the affected UI in a browser:
+
+----
+
+
+Why is https://app.marinesensitivity.org/scores resolving now to https://app.marinesensitivity.org/scores/?ver=v7? It should be https://preview.marinesensitivity.org/v7/scores/ and the ?ver=v7 should be forwarded to this new standard
+
+And switching from https://preview.marinesensitivity.org/v8/scores/ (legitimately restricted preview) to https://preview.marinesensitivity.org/v7/scores/ does not have image working https://preview.marinesensitivity.org/docs/v7/figures/overview-methods.svg on modal [Image #9] and oddly shows PREVIEW • ben@oceanmetrics.io when v7 is NOT a preview version [Image #10]
+
+----
+
+Both symptoms share one root cause: the apps decide "restricted" from the instance (MS_PREVIEW=1) rather than from the version. So on preview/v7/ they badge a public release as PREVIEW and point its docs at the preview clone, which only holds restricted books — hence the broken image. Fixing at the source:
+
+Two legitimate instance-based uses remain (the ms-preview sentinel and analytics tagging), but the version picker has the same bug — on the preview host it links every row by path, including public releases:
+
+----
+
 
 ## 2026-08-13 fix species app versions
 
