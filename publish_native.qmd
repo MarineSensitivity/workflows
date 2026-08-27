@@ -799,66 +799,71 @@ if (nrow(alias_rows)) {
   log_info("am-only merged aliases: {nrow(alias_rows)} taxa now have a merged COG (0 new objects)")
 }
 
-# am-only taxa with MORE THAN ONE AquaMaps model cannot be aliased.
+# suitability-only taxa that CANNOT be aliased: more than one model, or any AquaX model.
 #
-# The alias above is a pass-through, and that is only sound when a taxon has
-# exactly one contributing model. 192 served taxa have two or more (387 models
-# between them), so their merged surface is a max across those models -- a
-# genuinely different raster from any single one of them. They are also absent
-# from dist_merged_global, because that holds RANGE-derived global surfaces.
-# The result was 192 served taxa with no merged COG at all: 14,799 of 14,991
-# am-only taxa were covered, and the remainder looked like a rounding error
-# rather than a category the alias could never handle.
+# The alias above is a pass-through, and that is only sound when a taxon has exactly one
+# contributing model and it is AquaMaps. Two classes fall outside it, and both are absent from
+# dist_merged_global (which holds RANGE-derived surfaces only):
+#   - am-only taxa with 2+ AquaMaps models (192 in v8): the merged surface is a max across them;
+#   - from v9, taxa with an AquaX model and no range (~8,800): inside the AquaX mask AquaMaps
+#     was superseded, so their whole-range merged surface is AquaMaps OUTSIDE the mask plus
+#     AquaX inside it -- a raster that exists nowhere else. Without this chunk the alias count
+#     fell 14,799 -> 5,957 and those taxa had NO merged COG (the app draws nothing).
 #
-# Build them properly: max over the taxon's am partitions, one COG each.
-amonly_multi <- dbGetQuery(con, "
-  SELECT ms_merge_key, list(mdl_key) AS mdl_keys FROM (
-    SELECT t.ms_merge_key, tm.mdl_key
-    FROM mrg.taxon t JOIN mrg.taxon_model tm USING (ms_merge_key)
-    WHERE t.is_marine AND t.ms_merge_key IS NOT NULL
-      AND t.sp_cat NOT IN ('reptile','amphibian'))
-  GROUP BY 1 HAVING count(*) > 1 AND bool_and(split_part(mdl_key,'|',1) = 'am')")
-amonly_multi <- amonly_multi |> filter(!ms_merge_key %in% native_asset$ms_merge_key[
+# The post-supersession merge INPUT (`mc_parts`, partitioned by mkey_id) is exactly that
+# surface, so paint one COG per taxon from its partition: max over the surviving models per cell.
+dir_parts <- glue("{dir_atlas}/mc_parts")
+suit_ds   <- c("am", "ax")
+suit_sql  <- paste(sprintf("'%s'", suit_ds), collapse = ", ")
+suitonly <- dbGetQuery(con, glue("
+  SELECT t.ms_merge_key, mm.mkey_id, count(*) AS n_models,
+         count(*) FILTER (WHERE split_part(tm.mdl_key,'|',1) = 'ax') AS n_ax
+  FROM mrg.taxon t JOIN mrg.taxon_model tm USING (ms_merge_key) JOIN mrg.mkey_map mm USING (ms_merge_key)
+  WHERE t.is_marine AND t.ms_merge_key IS NOT NULL AND t.sp_cat NOT IN ('reptile','amphibian')
+  GROUP BY 1, 2
+  HAVING bool_and(split_part(tm.mdl_key,'|',1) IN ({suit_sql}))
+     AND NOT (count(*) = 1 AND max(split_part(tm.mdl_key,'|',1)) = 'am')"))
+suitonly <- suitonly |> filter(!ms_merge_key %in% native_asset$ms_merge_key[
   native_asset$ds_key == "ms_merge" & native_asset$asset_type == "cog"])
+log_info("suitability-only taxa needing a painted merged COG: {nrow(suitonly)} ({sum(suitonly$n_ax > 0)} with AquaX, {sum(suitonly$n_ax == 0)} multi-AquaMaps)")
 
-if (nrow(amonly_multi) && dir_exists(am_parts)) {
+if (nrow(suitonly)) {
+  stopifnot("mc_parts (the partitioned merge input) is missing — run merge_models first" = dir_exists(dir_parts))
   dir_mm <- glue("{dir_native}/merged"); dir_create(dir_mm)
   grid_mm <- grid_spec(rast(cellid_tif))
-  built_mm <- 0L
-  mm_rows <- list()
-  for (i in seq_len(nrow(amonly_multi))) {
-    key  <- amonly_multi$ms_merge_key[i]
-    out  <- glue("{dir_mm}/{safe_key(key)}.tif")
-    # Read the am partitions ONLY to build a COG that isn't there. This used to run
-    # unconditionally and re-derive the bbox from the cells even when the raster already
-    # existed -- a max GROUP BY over each taxon's global am surfaces, 192 taxa, ~4 h on a
-    # render that painted nothing. The check that follows the work has to come before it.
-    if (!file_exists(out)) {
-      mids <- am_map$mid[am_map$mdl_key %in% amonly_multi$mdl_keys[[i]]]
-      if (!length(mids)) next
-      globs <- paste(sprintf("'%s/mid=%d/*.parquet'", am_parts, mids), collapse = ", ")
-      d <- dbGetQuery(con, glue("
-        SELECT cell_id, max(val) AS val FROM read_parquet([{globs}]) GROUP BY 1"))
-      if (!nrow(d)) next
-      msens::publish_cog(d$cell_id, d$val, out, grid_mm,
-                         datatype = "INT1U", nodata = 0, overview = FALSE)
-      built_mm <- built_mm + 1L
+  suitonly <- suitonly |> mutate(out = as.character(glue("{dir_mm}/{safe_key(ms_merge_key)}.tif")))
+  todo_mm <- suitonly |> filter(!file_exists(out))
+  log_info("suitability-only merged COGs: {nrow(suitonly)} target, {nrow(todo_mm)} to build")
+  paint_batch <- function(rows, dir_parts, grid) {
+    suppressMessages({library(DBI); library(duckdb); library(terra)})
+    cx <- dbConnect(duckdb()); on.exit(dbDisconnect(cx, shutdown = TRUE))
+    for (i in seq_len(nrow(rows))) {
+      d <- dbGetQuery(cx, sprintf("SELECT cell_id, max(val) AS val FROM read_parquet('%s/mkey_id=%d/*.parquet') GROUP BY 1",
+                                  dir_parts, rows$mkey_id[i]))
+      if (nrow(d)) msens::publish_cog(d$cell_id, round(d$val), rows$out[i], grid)
     }
-    # bbox off the PUBLISHED raster, so the registry describes the artifact a client will
-    # fetch rather than a parallel derivation of it (and matches the edge convention the
-    # am / vec_grid rows use). This is also what DEPLOY_TITILER compares the served bounds to.
-    e <- terra::ext(terra::rast(out))
-    mm_rows[[length(mm_rows) + 1]] <- tibble(
-      ms_merge_key = key, mdl_key = key, ds_key = "ms_merge",
-      asset_type = "cog", representation = "model",
-      asset_url = glue("{s3_http}/native/merged/{safe_key(key)}.tif"),
-      xmin = e$xmin, xmax = e$xmax, ymin = e$ymin, ymax = e$ymax,
-      rescale_min = 1L, rescale_max = 100L, colormap = "spectral_r")
+    nrow(rows)
   }
-  if (length(mm_rows)) {
-    native_asset <- bind_rows(native_asset, bind_rows(mm_rows))
-    log_info("am-only MULTI-model merged COGs: {length(mm_rows)} taxa, {built_mm} newly built")
+  if (nrow(todo_mm)) {
+    plan(multisession, workers = n_workers)
+    future_map(split(todo_mm, (seq_len(nrow(todo_mm)) - 1) %% n_workers), paint_batch,
+               dir_parts = dir_parts, grid = grid_mm,
+               .options = furrr_options(seed = TRUE, packages = c("msens", "terra", "DBI", "duckdb")))
+    plan(sequential)
   }
+  built <- suitonly |> filter(file_exists(out))
+  # bbox off the PUBLISHED raster, so the registry describes the artifact a client will fetch
+  bb <- do.call(rbind, lapply(built$out, function(f) { e <- terra::ext(terra::rast(f)); c(e$xmin, e$xmax, e$ymin, e$ymax) }))
+  mm_rows <- tibble(
+    ms_merge_key = built$ms_merge_key, mdl_key = built$ms_merge_key, ds_key = "ms_merge",
+    asset_type = "cog", representation = "model",
+    asset_url = glue("{s3_http}/native/merged/{safe_key(built$ms_merge_key)}.tif"),
+    xmin = bb[, 1], xmax = bb[, 2], ymin = bb[, 3], ymax = bb[, 4],
+    rescale_min = 1L, rescale_max = 100L, colormap = "spectral_r")
+  native_asset <- bind_rows(native_asset, mm_rows)
+  log_info("suitability-only merged COGs registered: {nrow(mm_rows)} taxa ({nrow(todo_mm)} newly built)")
+  # merged_reg drives the S3 sync of native/merged below; make sure these ride along
+  merged_reg <- if (exists("merged_reg") && nrow(merged_reg)) bind_rows(merged_reg, mm_rows |> select(any_of(names(merged_reg)))) else mm_rows
 }
 
 # the registry is CUMULATIVE: a run may not delete an asset class it did not rebuild ----
