@@ -331,6 +331,37 @@ identity provider (new orgs no longer get it automatically — verified in Cloud
 `CHECK_PREVIEW=1`. Also verified while writing it: Cloudflare Free cuts a request off at 100 s
 (524), and this server's preview Shiny worker answers a cold page in 14–19 s, warm ~1.4 s.
 
+**PHASE 2 DONE 2026-08-27 — v8 is restricted and reviewer-only.** Order kept (registry first,
+readers after): `versions.csv` v8 → `restricted` → `build_version_manifest` → `access.sh` (per-version
+applications `preview…/v8` and `preview…/docs/v8`, reviewer policy = ben + timothy.white@boem.gov,
+probe token) → `CF_ACCESS_AUD` (3 AUDs) → `DEPLOY_CADDY` + `DEPLOY_APPS` → docs CI (v8 left
+`gh-pages` for `gh-pages-preview`) → `DEPLOY_DOCS` → `publish_storage_index` (101,408 v8 objects
+unadvertised; `/marine-atlas/v8/` no longer resolves) → `CHECK_PREVIEW` **green: 1 restricted, 8
+public**.
+
+Proven live, not assumed: public `?ver=v8` falls back to v7 on both apps; preview `/v8/scores/` is
+302→login without a token, 401 origin-direct, and 200 with `ms-ver=v8 ms-preview=1` with one;
+`marinesensitivity.org/docs/v8/` → 404 while `preview…/docs/v8/` → 200; and **per-version isolation**
+— a v8-scoped token opens `/v8/scores/` + `/docs/v8/` but is refused on `/v7/scores/` and `/`. That
+last one is now a permanent `CHECK_PREVIEW` assertion.
+
+Phase 2 hardening done too: **`/report` refuses a restricted release** unless the caller carries
+`MSENS_PREVIEW_TOKEN` (the preview app does; public reports still render — verified end to end with
+a real v7 report). The data endpoints stay open on purpose: decision 3 keeps v8's data public on S3,
+so gating them would be theatre.
+
+Bugs this phase (all fixed): the gate's first version called `msens::atlas_*()` inside the **plumber
+image, which pins msens 0.13.1 on purpose** — it predates the registry, so every `/report` 400'd
+including public ones; the check now reads `versions.json` itself and degrades to pass-through if
+the registry is unreachable. And `CF_ACCESS_AUD` (multi-AUD, space-separated) was unquoted in
+`.env`, so `set -a; . ./.env` exported only the first AUD and ran the rest as commands.
+
+**Remaining, and deliberately not done unattended:** invite Tim (an outward-facing email — Ben's to
+send); Phase 3's optional items (Google IdP needs a GCP OAuth client; `@boem.gov`/`@noaa.gov` domain
+policies widen access and are a decision, not a chore; Microsoft IdP needs DOI; Cloudflare in front
+of the public hosts is a caching/perf decision; dataset-level restriction is the separate
+2026-07-15 plan).
+
 **Phase 1 DONE 2026-08-27 — the gate is live (v8 still public, so nothing is gated yet).**
 Ben did the dashboard half (account, Zero Trust team `marinesensitivity`, zone added Free with only
 `preview` proxied, SSL Full (strict), One-time PIN IdP, API token, nameservers → `chuck`/`tia`);
