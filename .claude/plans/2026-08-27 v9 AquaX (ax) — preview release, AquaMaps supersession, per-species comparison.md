@@ -308,7 +308,14 @@ Prototype with `AX_TEST_N=50 AX_COG=1` end-to-end (Parquet → COG → merge fix
 8. `CHECK_PREVIEW=1`: v9 restricted — public host falls back, preview `/v9/scores/` renders `ms-ver=v9`,
    the v8 probe token cannot open v9 and vice versa.
 
-## Phase 5 — release + preview deploy (order matters)
+## Phase 5 — release + preview deploy (order matters) — IN PROGRESS 2026-08-27 21:20
+
+Laptop chain DONE (`scripts/run_version.sh`): S3 holds `v9/{tables,serve,dist_merged,native,registry}`;
+`versions.json` lists v9 `prerelease/restricted`, `latest.txt` = v7, `v9/manifest.json` validates (102
+metrics, score COGs). Follow-ups running: `publish_native` re-render (merged COGs for ~8,800 AquaX
+suitability-only taxa + `NATIVE_VEC_COG=1`), then re-push tables; `DEPLOY_TABLES=1`; docs CI
+re-triggered for v9. Remaining: `DEPLOY_APPS` · `DEPLOY_ACCESS` → AUDs → `DEPLOY_CADDY` · `DEPLOY_DOCS` ·
+`CHECK_PREVIEW` · re-render manifest (cell_species_list) · `validate_versions` v8↔v9.
 
 Laptop (`quarto render` / `tar_make`, in DAG order): `bootstrap_version` → `build_cell_grid` → ingests
 (resume) → `ingest_aquax` (`AX_COG=1 AX_COG_S3=1`) → `merge_models_prep` → `merge_models` → `merge_taxon` →
