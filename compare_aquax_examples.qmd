@@ -1,0 +1,148 @@
+---
+title: "AquaX vs AquaMaps — side-by-side examples (v9 preview)"
+subtitle: "Habitat suitability in US waters: AquaMaps (v8 input), AquaX (v9 input), and the difference"
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+    lightbox: true
+editor_options:
+  chunk_output_type: console
+---
+
+> **Not a pipeline stage** — a standalone report rendered from the v9 ingest outputs
+> (`dist/dataset=ax`, `dist/dataset=am`) for review conversations. The systematic per-species
+> comparison (every superseded taxon × subregion, the 20 least / most different) is in
+> `ingest_aquax.html`; this page just draws a few species so the *kind* of difference is visible.
+
+**How to read a row.** Left: AquaMaps' 0.5° suitability bilinearly interpolated to the 0.05° grid
+(the v8 input). Middle: AquaX's ensemble suitability delivered on that grid (÷10 to the same 0–100
+scale; pixels below 1 dropped, as for AquaMaps). Right: AquaX − AquaMaps where both have a value
+(blue = AquaX lower, red = AquaX higher). Both models are shown only inside the AquaX mask (US
+waters); outside it AquaMaps continues unchanged in v9. Numbers under each species are computed on
+the shared cells.
+
+```{r}
+#| label: setup
+#| message: false
+
+librarian::shelf(arrow, DBI, dplyr, duckdb, fs, ggplot2, glue, here, knitr, patchwork, readr,
+                 rnaturalearth, sf, terra, tidyterra, tibble, quiet = TRUE)
+source(here("libs/paths.R"))
+dir_atlas <- path.expand(glue("{dir_big_v}/marine-atlas"))
+dir_ax <- glue("{dir_atlas}/dist/dataset=ax"); dir_am <- glue("{dir_atlas}/dist/dataset=am")
+stopifnot(dir_exists(dir_ax), dir_exists(dir_am), file_exists(glue("{dir_atlas}/dist/ax_mask.parquet")))
+
+# species to show (scientific names; resolved to AphiaID through the WoRMS snapshot)
+species <- c(
+  "Megaptera novaeangliae",     # humpback whale
+  "Caretta caretta",            # loggerhead turtle
+  "Gadus morhua",               # Atlantic cod
+  "Thunnus thynnus",            # Atlantic bluefin tuna
+  "Hippoglossus stenolepis",    # Pacific halibut
+  "Lutjanus campechanus",       # red snapper
+  "Homarus americanus",         # American lobster
+  "Acropora palmata",           # elkhorn coral
+  "Tmetonyx cicada",            # an amphipod: among the MOST changed in the 50-model smoke test
+  "Acanthostepheia malmgreni")  # an amphipod: among the LEAST changed in the smoke test
+
+con <- dbConnect(duckdb())
+dbExecute(con, glue("ATTACH '{path.expand(spp_db)}' AS spp (READ_ONLY)"))
+ax_ids <- read_csv(glue("{dir_atlas}/dist/model_ax_stats.csv"), show_col_types = FALSE, col_types = cols(sp_id = "c"))$sp_id
+duckdb_register(con, "want", tibble(scientific_name = species))
+duckdb_register(con, "ax_ids", tibble(sp_id = ax_ids))
+sp <- dbGetQuery(con, "
+  SELECT w.scientific_name, CAST(x.scientificNameID AS VARCHAR) AS sp_id, x.\"class\" AS cls
+  FROM want w JOIN spp.worms x ON x.scientificName = w.scientific_name
+  JOIN ax_ids a ON a.sp_id = CAST(x.scientificNameID AS VARCHAR)
+  WHERE x.taxonomicStatus = 'accepted'") |> distinct(scientific_name, .keep_all = TRUE)
+missing <- setdiff(species, sp$scientific_name)
+if (length(missing)) message("not in AquaX (or not an accepted WoRMS name): ", paste(missing, collapse = ", "))
+
+# AquaMaps models for the same taxa: v8's published taxon_model (mdl_key am|... -> WoRMS id)
+prev_tm <- read_parquet(glue("{dir_big}/{ver_prev}/marine-atlas/tables/taxon_model.parquet")) |>
+  filter(ds_key == "am", taxon_authority == "worms") |> transmute(sp_id = as.character(taxon_id), am_key = mdl_key)
+sp <- sp |> left_join(prev_tm |> group_by(sp_id) |> summarise(am_keys = list(am_key), .groups = "drop"), by = "sp_id")
+dbExecute(con, glue("CREATE TABLE ax_mask AS SELECT cell_id FROM read_parquet('{dir_atlas}/dist/ax_mask.parquet')"))
+land <- ne_countries(scale = "medium", returnclass = "sf")
+grid <- msens::grid_spec_for("global05")
+kable(sp |> mutate(n_am_models = lengths(am_keys)) |> select(scientific_name, sp_id, cls, n_am_models))
+```
+
+```{r}
+#| label: helpers
+
+# (cell_id, val) -> SpatRaster on the global grid, cropped to a bbox given as cell-id extents
+cells_to_rast <- function(d, bb) {
+  r <- rast(nrows = bb$r1 - bb$r0 + 1, ncols = bb$c1 - bb$c0 + 1,
+            xmin = grid$xmin + (bb$c0 - 1) * grid$resx, xmax = grid$xmin + bb$c1 * grid$resx,
+            ymin = grid$ymax - bb$r1 * grid$resy,       ymax = grid$ymax - (bb$r0 - 1) * grid$resy,
+            crs = "EPSG:4326")
+  row <- (d$cell_id - 1) %/% grid$nc + 1; col <- (d$cell_id - 1) %% grid$nc + 1
+  v <- rep(NA_real_, ncell(r)); v[(row - bb$r0) * ncol(r) + (col - bb$c0) + 1] <- d$val
+  r[] <- v; r
+}
+species_panels <- function(i) {
+  s <- sp[i, ]
+  ax <- dbGetQuery(con, glue("SELECT cell_id, val FROM read_parquet('{dir_ax}/{s$sp_id}.parquet')"))
+  am <- if (length(s$am_keys[[1]])) {
+    files <- paste0("'", dir_am, "/", sub("^am\\|", "", s$am_keys[[1]]), ".parquet'", collapse = ", ")
+    dbGetQuery(con, glue("SELECT a.cell_id, max(a.val) AS val FROM read_parquet([{files}]) a
+                          JOIN ax_mask m USING (cell_id) GROUP BY 1"))
+  } else tibble(cell_id = integer(), val = numeric())
+  both <- inner_join(ax, am, by = "cell_id", suffix = c("_ax", "_am"))
+  ids  <- c(ax$cell_id, am$cell_id)
+  row  <- (ids - 1) %/% grid$nc + 1; col <- (ids - 1) %% grid$nc + 1
+  pad  <- 10
+  bb <- list(r0 = max(1, min(row) - pad), r1 = min(grid$nr, max(row) + pad),
+             c0 = max(1, min(col) - pad), c1 = min(grid$nc, max(col) + pad))
+  r_am <- cells_to_rast(am, bb); r_ax <- cells_to_rast(ax, bb)
+  r_d  <- cells_to_rast(both |> transmute(cell_id, val = val_ax - val_am), bb)
+  stats <- tibble(species = s$scientific_name, n_am = nrow(am), n_ax = nrow(ax), n_shared = nrow(both),
+                  jaccard = round(nrow(both) / length(union(ax$cell_id, am$cell_id)), 2),
+                  mean_am = round(mean(both$val_am), 1), mean_ax = round(mean(both$val_ax), 1),
+                  delta = round(mean(both$val_ax - both$val_am), 1),
+                  cor = round(suppressWarnings(cor(both$val_am, both$val_ax)), 2))
+  e <- ext(r_ax)
+  base <- function(r, title, fill) ggplot() + geom_spatraster(data = r) + fill +
+    geom_sf(data = land, fill = "grey92", colour = "grey70", linewidth = 0.2) +
+    coord_sf(xlim = c(e$xmin, e$xmax), ylim = c(e$ymin, e$ymax), expand = FALSE) +
+    labs(title = title, x = NULL, y = NULL) +
+    theme_minimal(base_size = 9) + theme(legend.position = "bottom", legend.key.height = unit(3, "pt"),
+                                         panel.background = element_rect(fill = "#dfe9f3", colour = NA))
+  p1 <- base(r_am, "AquaMaps (v8 input, 0.05°)", scale_fill_viridis_c(limits = c(0, 100), na.value = NA, name = "suitability"))
+  p2 <- base(r_ax, "AquaX (v9 input, ÷10)",       scale_fill_viridis_c(limits = c(0, 100), na.value = NA, name = "suitability"))
+  p3 <- base(r_d,  "AquaX − AquaMaps (shared cells)",
+             scale_fill_gradient2(low = "#2166ac", mid = "white", high = "#b2182b", limits = c(-100, 100), na.value = NA, name = "Δ"))
+  list(plot = (p1 | p2 | p3) + plot_annotation(
+         title = glue("{s$scientific_name}  (WoRMS {s$sp_id})"),
+         subtitle = glue("shared cells {stats$n_shared} · Jaccard {stats$jaccard} · mean AquaMaps {stats$mean_am} → AquaX {stats$mean_ax} (Δ {stats$delta}) · r = {stats$cor}")),
+       stats = stats)
+}
+```
+
+## Examples
+
+```{r}
+#| label: maps
+#| results: asis
+#| fig-width: 13
+#| fig-height: 4.6
+
+all_stats <- list()
+for (i in seq_len(nrow(sp))) {
+  out <- species_panels(i)
+  cat("\n\n### ", sp$scientific_name[i], "\n\n", sep = "")
+  print(out$plot)
+  all_stats[[i]] <- out$stats
+}
+```
+
+## Summary of the examples
+
+```{r}
+#| label: stats
+kable(bind_rows(all_stats), caption = "Computed on the cells where both models have a value (inside the AquaX mask). delta = mean AquaX − mean AquaMaps on the [0,100] scale; Jaccard = footprint overlap.")
+dbDisconnect(con, shutdown = TRUE)
+```
