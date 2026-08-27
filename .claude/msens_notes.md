@@ -232,7 +232,32 @@ Resumed render is through verification (103 land-sliver cells warned, as intende
 
 Heartbeat (14:30): the notebook's COG stage is running at ~260 models/min (2,841 / 10,536 with both COGs; ~30 min to go), then S3 sync, supersession registry, comparison and manifest. No errors. Nothing else to advance until it completes.
 
----
+### TODO: Q for Gabriel - is `no_rows_in_mask` a confident absence in USA waters?
+
+I am finding the D4 AX_ABSENT_SUPERSEDES=1 aspect a bit hard to follow:
+
+  > | D4 | the 2,742 "modeled, no US presence" species | keep am for them in v9 (nothing to supersede), list them in the notebook by component; AX_ABSENT_SUPERSEDES=1 drops their am inside ax_mask | conservative for the first preview; it is exactly the question reviewers should answer (AquaX absent vs AquaMaps present) |
+
+  So if the ingested AquaX model has no presence in the USA, then the merged model falls back on the AquaMaps model? Or is there a subset? Is this written to a CSV somewhere?
+
+  Ran 1 shell command
+
+Yes — with the default, those species' merged models are exactly v8's. Here's the precise situation:
+
+What "modeled, no US presence" means. AquaX ran a model for all 13,278 species we sent. For 2,742 of them, after cropping the prediction to the species' biogeographic range, no pixel fell inside the US mask — so no TIF was delivered (ok:no_rows_in_mask). AquaX's verdict is "absent from US waters", but there is no AquaX surface to substitute.
+
+The subset that matters: 2,738 of the 2,742 have an AquaMaps model in v8 (2,761 models), and 2,724 of those actually have AquaMaps cells inside US waters. For example Clio pyramidata (a pteropod) has 357,564 AquaMaps cells in US waters at mean suitability 39; Macrouroides inflaticeps 162k cells at 57. Encouragingly, the 14 mammals are all Southern-Hemisphere species (Antarctic minke, southern right whale, leopard seal, vaquita, narwhal…) that v8 already scored as not valid in the US — AquaX's "absent" looks right for those.
+
+The two settings:
+- AX_ABSENT_SUPERSEDES=0 (v9 default): nothing changes for them — AquaMaps (plus any range dataset) carries on, so e.g. Clio pyramidata still contributes 357k cells to US scoring.
+- AX_ABSENT_SUPERSEDES=1: AquaX's absence wins — their AquaMaps cells inside the AquaX mask are dropped. An AquaMaps-only species then vanishes from US scoring; a species that also has a range dataset keeps its range cells at the extinction-risk value.
+
+Where it's written:
+- data/ax_supersedes_am.csv — one row per AquaMaps model: ax_status = absent_in_mask, ax_mdl_key = NA, supersedes = FALSE (flips to TRUE under the flag), plus sp_cat, n_am_models, is_valid_usa_prev.
+- data/ax_vs_am_summary.csv — the same taxa with n_am_only (AquaMaps cells inside the mask) and mean_am_all.
+- ingest_aquax.html → table "Species AquaX modeled but found ABSENT in US waters" (by component: coral 81, fish 1,790, invertebrate 857, mammal 14).
+
+This is the single most useful question to put to Gabriel: **is `no_rows_in_mask` a confident absence (in which case flip the flag) or an artefact of the range crop /  WoRMS ID not present in your set?**
 
 
 

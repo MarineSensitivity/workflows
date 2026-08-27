@@ -34,6 +34,12 @@ Then `quarto render build_cell_grid.qmd`: with the shared cell-id COG present it
 this fix a fresh `sdm.duckdb` had no `cell` table and every downstream
 `stopifnot("run build_cell_grid first" = file_exists(sdm_db))` passed on an empty database.
 
+`BOOTSTRAP_PUBLISH=1` also carries forward `ver_prev`'s unchanged **native assets**: a local
+copy-on-write clone of `native/{am,am_native,pmtiles,vec_grid,src,_am_parts}` (never `merged` —
+that is the new version's to repaint), a **server-side** `aws s3 sync` of each prefix from
+`{ver_prev}/native/` to `{ver}/native/`, and a hard-link copy of the PMTiles tree on the file
+host. Without it `publish_native` rebuilds 18,700 AquaMaps COGs and the 7 GB IUCN GeoPackage.
+
 ## 2b. Tables that live in `merge.duckdb`, which a new version starts EMPTY
 
 `merge.duckdb` is created by `merge_models_prep`; the clone in step 2 covers `dist/` only. Anything
@@ -54,6 +60,9 @@ is added.
 | `build_zone_cells.qmd` gate | this version's released `zone_cell` | gates an unreleased version against `ver_prev`'s on the same grid instead of "skipped" |
 | `build_registry.qmd` | `ver_prev` dataset metadata for every ds_key | new datasets declare theirs in front-matter (`generate-sdm-metadata`) |
 | `release_marine-atlas.qmd` | a `titiler-{ver}` compose service | `TITILER_SERVICE` (default `titiler-v8` — the stock `/cog` tiler for every release) |
+| `release_marine-atlas.qmd` granular `DEPLOY_TABLES` | `serve_mc`, `cell_mc`, `rel_tables` from the (skipped) staging chunk | defined in setup from the staged files |
+| `release_marine-atlas.qmd` `DEPLOY_TABLES` | the server already has `{ver}/serve.duckdb` | only `RELEASE_DEPLOY` rsyncs the view DB — a new version's first server deploy must be the full `RELEASE_DEPLOY=1` |
+| `server/caddy/test/run.sh` | only `preview_routes.caddy` needs mounting | every file it `import`s (`app_version_routes.caddy`) must be mounted too, or the throwaway caddy dies and `DEPLOY_CADDY` fails its own test |
 
 Treat any `column not found` on a `v7`-attached table as this class of bug: resolve by column
 introspection (`msens::sdm_cols()` style), never by version string.

@@ -330,6 +330,18 @@ Server, all via `release_marine-atlas.qmd` flags: `DEPLOY_TABLES=1` (tables + lo
 `docs` (CI → `gh-pages-preview`) → `DEPLOY_DOCS=1` → `CHECK_PREVIEW=1`. Commit every rendered
 `_output/*.html`.
 
+### Phase 5 findings (2026-08-27 evening)
+
+- `publish_native`: suitability-only taxa with AquaX lost the `native/am` alias → **9,080 merged COGs
+  painted** from post-supersession `mc_parts`; vector gridded COGs registered via `NATIVE_VEC_COG=1`.
+  `native_asset` now: am 18,700 × 2 · ax 10,527 × 2 · ms_merge 21,679 · vector PMTiles + model COGs.
+- `bootstrap_version` gained the native-asset clone + server-side S3/file-host copies (`BOOTSTRAP_PUBLISH=1`).
+- Granular `DEPLOY_TABLES` had never run alone: `serve_mc`/`cell_mc`/`rel_tables` lived in the skipped
+  staging chunk (fixed), and a first deploy needs `RELEASE_DEPLOY=1` for the view DB.
+- `DEPLOY_ACCESS` minted the v9 applications; 5 AUDs in `.env`; `DEPLOY_CADDY` passed after fixing the
+  test harness mount and restoring the preview host's unversioned-path 302 (server `64a1dad`, `b5cd647`).
+- Docs CI published `v9/` to `gh-pages-preview`.
+
 ## Phase 6 — skills (`.claude/skills/`)
 
 - **`ingest-sdm`**: add the *same-topology raster* recipe (`cells_from_aligned_raster`, multi-band scalar
