@@ -74,9 +74,13 @@ When a newer model of the *same quantity* arrives for a subset of taxa and an ex
    footprint Jaccard, correlation), the 20 least/most different with preview deep links, and the
    "modeled but absent" list — `data/ax_vs_am_summary.csv`. Reviewers inspect it in the species app.
 5. **COGs built in the ingest when native == model grid** (`AX_COG=1`, `AX_COG_S3=1`): native =
-   `msens::cog_from_tif()` (bit-exact, cropped, metadata), model = `publish_cog()` from the Parquet;
-   urls + bbox into `model_{ds}.csv`; `publish_native.qmd` *registers* them (both representations),
-   never repaints. A round-trip check MUST assert its sample is non-empty — the first smoke test
+   `msens::cog_from_tif()` (bit-exact, cropped, metadata), model = `publish_cog()` from the Parquet
+   (`round()` first — INT1U truncates); urls + bbox into `model_{ds}.csv`; `publish_native.qmd`
+   *registers* them (both representations), never repaints. **For an on-grid dataset the two
+   representations are "as delivered" vs "as ingested"** (scale, integer, the ≥1 threshold —
+   what the merge consumes), not original vs interpolated: declare `on_grid: true` in the
+   `dataset:` block so the app labels the toggle *Delivered / As ingested*. Keep both — the
+   threshold drops ~half of AquaX's pixels and reviewers should see that on the input. A round-trip check MUST assert its sample is non-empty — the first smoke test
    "verified 0 models" while every native COG was missing (GDAL does not expand `~`).
 
 ## Crosswalk by native id

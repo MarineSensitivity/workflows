@@ -30,7 +30,10 @@ dropped — on BOTH surfaces — and `am` carries on everywhere else. `merge_sql
 then treats both as suitability. `AX_SUPERSEDE=0` is the control run (must reproduce v8's PRA scores,
 cor 1.000); `AX_ABSENT_SUPERSEDES=1` lets the 2,742 "modeled, absent in US" species supersede too
 (default off — a review question, listed in the ingest HTML). The ingest also builds + uploads both
-COG representations (`native/ax_native` Float32 0–1000, `native/ax` INT1U 1–100) and records the
+COG representations — for an on-grid dataset these are **as delivered** (`native/ax_native`, Float32
+0–1000, bit-exact) vs **as ingested** (`native/ax`, INT1U 1–100, the ≥1 threshold applied = what the
+merge consumes), NOT original vs interpolated; `dataset.on_grid = TRUE` (front-matter `on_grid: true`)
+makes the species app label the toggle *Delivered / As ingested* — and records the
 per-species AquaX-vs-AquaMaps comparison (`data/ax_vs_am_summary.csv`; 20 least/most different
 with preview deep links). `publish_native.qmd` only *registers* the ax COGs from `model_ax.csv`.
 

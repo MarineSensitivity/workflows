@@ -34,6 +34,8 @@ Run it before release/STAC/apps. Do NOT re-add per-ingest `INSERT INTO dataset/m
 citation, links, `value_info`, `regions`, `is_mask`) from `ver_prev`'s table where the key matches;
 a dataset the previous release never had (v9 `ax`) must declare them in its `msens: dataset:`
 front-matter block — `fm_dataset()` reads the optional keys and they win over inherited ones.
+`on_grid: true` marks a raster delivered ON the analysis grid: `dataset.on_grid` drives the app's
+representation labels (*Delivered / As ingested* instead of *Original / Interpolated*).
 Without them the app labels the input by the glue fallback and the docs print no citation.
 
 **Partially superseded ≠ unused.** `am` stays `is_scored = TRUE` in v9 (it still feeds ~6,000 taxa
