@@ -40,8 +40,10 @@ this fix a fresh `sdm.duckdb` had no `cell` table and every downstream
 another target writes into it must be re-rendered for the new version **before** the merge:
 `ingest_listings` (`ingest_nmfs-fws-listings.qmd` → `listing`: US ESA / MBTA / BCC — without it the
 governing `er_score` silently lost every federal floor on v9's first merge; it is now a hard stop
-in `merge_models_prep`). `scripts/run_version.sh` runs it as a stage. Check the DAG for any new
-writer (`grep -l merge.duckdb *.qmd`) when a target is added.
+in `merge_models_prep`), and `build_common_names` (`taxon.common_name`, after `merge_taxon` —
+without it `score_zone_metrics`' `zone_taxon` fails on the missing column). `scripts/run_version.sh`
+runs both as stages. Check the DAG for any new writer (`grep -l merge.duckdb *.qmd`) when a target
+is added.
 
 ## 3. Readers that assume `ver_prev`'s schema — now introspective, keep them so
 
