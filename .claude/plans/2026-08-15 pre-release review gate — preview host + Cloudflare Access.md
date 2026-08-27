@@ -331,6 +331,39 @@ identity provider (new orgs no longer get it automatically — verified in Cloud
 `CHECK_PREVIEW=1`. Also verified while writing it: Cloudflare Free cuts a request off at 100 s
 (524), and this server's preview Shiny worker answers a cold page in 14–19 s, warm ~1.4 s.
 
+**Phase 1 DONE 2026-08-27 — the gate is live (v8 still public, so nothing is gated yet).**
+Ben did the dashboard half (account, Zero Trust team `marinesensitivity`, zone added Free with only
+`preview` proxied, SSL Full (strict), One-time PIN IdP, API token, nameservers → `chuck`/`tia`);
+this session did the server half: `.env` (`CF_API_TOKEN`, `CF_ACCOUNT_ID=af075785…`,
+`CF_ZONE_ID=774889ae…`, `PREVIEW_ADMINS`, `PREVIEW_REVIEWERS_V8`), `access.sh` → the catch-all
+application (aud `0d0c4679…`) + admin policy + `msens-preview-check` service token + cache-bypass
+rule, `CF_ACCESS_TEAM`/`CF_ACCESS_AUD` into `.env`, `DEPLOY_CADDY`. **Verified live:** no token →
+302 to `marinesensitivity.cloudflareaccess.com`; origin-direct → 401; with the service token →
+200 with `ms-ver=v8`, `ms-preview=1` and the identity in the PREVIEW badge; `/scores/?ver=v8` →
+302 `/v8/scores/`; `CHECK_PREVIEW` green (0 restricted, 9 public, token=TRUE).
+
+Four bugs found and fixed on the way (all committed):
+- `access.sh` printed new service-token secrets in a summary at the END, so a later failure
+  swallowed one Cloudflare only shows once. Secrets are now recorded at creation, and
+  `--rotate <name>` recovers a lost one.
+- A brand-new zone has **no cache-rules entrypoint ruleset** (API `10003`); that is an empty
+  state, not an error (`cf_try`, then the PUT creates it).
+- `CHECK_PREVIEW` would have passed with the host **not proxied at all** (grey cloud → every
+  request hits the origin, which 401s → "closed" for the wrong reason). It now asserts `cf-ray`
+  FIRST. This actually happened: the zone went active with `preview` still grey.
+- `jwtauth` was told `user_claims email`, but a **service token's JWT has `common_name`, not
+  `email`**, so Access admitted the check token and the ORIGIN 401'd it. Now
+  `user_claims email common_name sub`. Misleading detail worth remembering: Cloudflare rewrites
+  `server:` on proxied responses, so that 401 read as Cloudflare's until the body turned out to
+  be the vhost's own error page. (The fixing commit's message lost its backticked words to shell
+  substitution — `43ee155`; the server had already pulled it, so it was not rewritten.)
+
+Also fixed, unrelated but found by these checks: **both public apps were down (500)** because a
+container recreate for unrelated packages reset the R library to a hand-maintained msens pin
+(0.31.0) while the apps needed 0.36.0's `study_areas`. Builds now track msens `main`
+(`rstudio/build.sh` resolves it to a SHA) and the container reconciles with the `/share` checkout
+at every start (`rstudio/cont-init/03_msens_from_share`, proven in a throwaway container).
+
 **Status at end of 2026-08-15 — plainly.** Everything above is deployed but **DARK: no human can open
 any preview URL** (`preview.marinesensitivity.org/…` answers 401 — now with a page saying so — because
 the only door is Cloudflare Access and it is not in front yet). What "verified" meant: (a) the routes
