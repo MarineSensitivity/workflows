@@ -58,6 +58,14 @@ v8 is `z.val` key + `zone_metric.val`, `dataset=`… — parameterize the pull. 
 - a component ballooning (cor low) usually means a **sp_cat mislabel** — check taxonomy assignment
   (v7-crosswalk default → 'other' was the classic bug; now taxonomy-based, no 'other').
 
+## A flat merged surface is a symptom, not a style
+
+If a species' merged map is one colour across its whole range, its governing `er_score` exceeds
+its suitability everywhere (`max(er, suit)` at `NMFS:EN` = 100). Ask whether that ER is
+species-wide in fact: DPS/ESU-scoped listings must go through `dps_nmfs` (spatial ER × suitability),
+not the plain rule. `SELECT ms_merge_key FROM taxon WHERE er_score >= 50` ∩ taxa with a range and no
+`dps_nmfs`/turtle model is the list to review.
+
 ## Sanity
 
 Re-scoring the SAME inputs must reproduce (`cor = 1.000`). If not, a reserved-word (`value`/`val`,

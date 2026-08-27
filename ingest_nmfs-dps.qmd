@@ -1,0 +1,267 @@
+---
+title: "Ingest NMFS listed entities (DPS / ESU / subspecies) → per-cell extinction risk on the global 0.05° grid"
+subtitle: "From the authoritative NOAA Fisheries critical-habitat service, with the IUCN range as the baseline outside listed DPSs"
+msens:
+  target_name: ingest_dps_nmfs
+  workflow_type: ingest
+  dependency: [build_cell_grid, ingest_rng_iucn, ingest_worms]
+  output: data/manifests/ingest_dps_nmfs.json
+  dataset: {ds_key: dps_nmfs, response_type: range, source_authority: NOAA NMFS, temporal_interval: static,
+            native_format: vector, name_short: "NMFS listed entities (DPS)", name_display: "NMFS DPS extinction risk",
+            description: "Per-cell extinction risk for ESA listed entities that are Distinct Population Segments, ESUs or subspecies rather than whole species: each listed entity's designated critical habitat carries that entity's status (Endangered 100 / Threatened 50, with the MMPA floor), and the rest of the species' IUCN range carries the species' IUCN status plus the MMPA floor. Merged multiplicatively with suitability, like the sea turtles.",
+            value_info: "extinction-risk score per cell (NMFS:EN 100 / NMFS:TN 50 inside a listed entity's critical habitat; IUCN + MMPA floor elsewhere)",
+            regions: "US waters (critical habitat) + the species' global IUCN range (baseline)", is_mask: true,
+            citation: "NOAA Fisheries (2026) All NMFS Critical Habitat, ArcGIS MapServer (maps.fisheries.noaa.gov), All_critical_habitat_poly_20230502 and per-entity layers; species-range services with DPS-level ranges expected end of CY2026",
+            link_info: "https://www.fisheries.noaa.gov/resource/map/national-esa-critical-habitat-mapper",
+            link_download: "https://maps.fisheries.noaa.gov/server/rest/services/All_NMFS_Critical_Habitat/MapServer"}
+editor_options:
+  chunk_output_type: console
+---
+
+Under the ESA the *listed entity* can be a species, a subspecies or a Distinct Population Segment
+(DPS / ESU), and for several species NMFS lists only **some** populations: the humpback whale has
+six listed DPSs and eight that are Not at Risk, and the ones that breed in US waters are among the
+latter. Our federal `listing` table flattens NOAA's species page to one status — the highest
+domestic listing — so the humpback carried `NMFS:EN` species-wide, and the plain merge rule
+(`max(er, suitability)` over the range) painted it a flat 100 across 14.7 M cells.
+
+This ingest makes extinction risk **spatial** for those species, the way `ingest_turtles-swot-dps`
+already does for sea turtles:
+
+- **Source (authoritative, current):** NOAA Fisheries' national critical-habitat map service
+  (`All_NMFS_Critical_Habitat/MapServer`, shared by Jennifer Schultz, NMFS, 2026-04-16). Every
+  designated polygon carries `SCIENAME`, `LISTENTITY` (e.g. *Whale, humpback [Mexico DPS]*) and
+  `LISTSTATUS`. Only entities scoped below the species — `[… DPS]`, `[… ESU]`, a subspecies name —
+  are taken here; whole-species listings are already right in `listing`.
+- **Fallback (NOAA's own advice):** where no listed DPS is designated, the species' **IUCN range**
+  at its IUCN category (+ the MMPA floor for mammals) — "the IUCN data … should be exactly the same
+  [for most species]; the humpback whale … there are going to be large gaps in the range that we
+  don't have because we didn't list them" (Schultz). NOAA is publishing DPS-level **species
+  ranges** end of CY2026; when they land, this notebook's source swaps from critical habitat to
+  ranges with no change to the rule.
+- **Value = `compute_er_score()`**, never a magic number: `NMFS:EN` → 100, `NMFS:TN` → 50 inside a
+  listed entity's polygons; `IUCN:{category}` (+MMPA 20) elsewhere; overlaps take the max.
+- **Merge:** taxa with a `dps_nmfs` model join the sea turtles in the spatial-ER branch
+  (`msens::turtle_sql`): `val = max(1, round(er_cell × suitability / 100))`, scored with
+  `is_er_spatial` (the ER is already in the cell value). Critical-habitat datasets are not applied
+  as an override for these taxa — the same polygons are here, with their status.
+
+Regulatory note (from the call): NOAA's layers are the regulatory product; combining them with
+IUCN / AquaX for a non-regulatory sensitivity score is explicitly fine, and the fallback rule is
+BOEM's analytic decision — documented here and in the docs' data-sources page.
+
+Flags: `REDO_INGEST` (rebuild the Parquet), `DPS_FETCH=1` (re-download the service layers into
+`raw/fisheries.noaa.gov/All_NMFS_Critical_Habitat/` — otherwise the cached snapshot is used).
+
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "Listed entities below species level → their critical habitat at their status, the IUCN range at the baseline → one per-cell ER surface per species"
+flowchart LR
+  svc["NMFS All_NMFS_Critical_Habitat<br/>MapServer (leaf polygon layers)"] -->|"DPS_FETCH=1 → raw/ gpkg"| ent["listed entities scoped<br/>below species (DPS / ESU / ssp.)"]
+  ent --> ch["cells_from_ranges(value = compute_er_score(NMFS:status, is_mmpa))"]
+  iucn["dist/dataset=rng_iucn<br/>(species' IUCN range)"] --> base["baseline = compute_er_score(IUCN:cat, is_mmpa)"]
+  ch & base --> mx["max per cell"]
+  mx --> pq[("dist/dataset=dps_nmfs/{worms_id}.parquet<br/>(mdl_key, cell_id, val)")]
+  pq --> mf["hash_parquet → manifest"]
+```
+
+## Setup
+
+```{r}
+#| label: setup
+
+librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, httr2, jsonlite, knitr, logger, purrr, readr,
+                 sf, stringr, terra, tibble, tidyr, MarineSensitivity/msens, quiet = TRUE)
+source(here("libs/paths.R")); source(here("libs/vars.R"))
+options(readr.show_col_types = FALSE)
+
+ds_key   <- "dps_nmfs"
+svc      <- "https://maps.fisheries.noaa.gov/server/rest/services/All_NMFS_Critical_Habitat/MapServer"
+dir_raw_ch <- path.expand(glue("{dir_raw}/fisheries.noaa.gov/All_NMFS_Critical_Habitat")); dir_create(dir_raw_ch)
+dir_atlas  <- glue("{dir_big_v}/marine-atlas")
+dir_dist   <- glue("{dir_atlas}/dist/dataset={ds_key}"); dir_create(dir_dist)
+dir_iucn   <- glue("{dir_atlas}/dist/dataset=rng_iucn")
+mdl_csv    <- glue("{dir_atlas}/dist/model_{ds_key}.csv")
+manifest   <- here("data/manifests/ingest_dps_nmfs.json"); dir_create(path_dir(manifest))
+turtle_ds  <- "rng_turtle_swot_dps"
+dps_fetch  <- .flag("DPS_FETCH")
+stopifnot("run build_cell_grid first" = file_exists(cellid_tif),
+          "run ingest_rng_iucn first (the baseline footprint)" = dir_exists(dir_iucn),
+          "spp.duckdb (WoRMS) missing" = file_exists(spp_db))
+if (redo_ingest && dir_exists(dir_dist)) { dir_delete(dir_dist); dir_create(dir_dist) }
+```
+
+## Fetch the service (cached snapshot in `raw/`)
+
+Every leaf **polygon** layer under *Designated Critical Habitat* (lines and *Proposed* are
+skipped), paged through `resultOffset`, written once as GeoPackage with the service's layer
+name — which carries the designation date — so the snapshot is versioned by NOAA's own naming.
+
+```{r}
+#| label: fetch
+
+svc_json <- glue("{dir_raw_ch}/service.json")
+if (dps_fetch || !file_exists(svc_json))
+  request(glue("{svc}?f=json")) |> req_perform() |> resp_body_string() |> writeLines(svc_json)
+meta   <- fromJSON(svc_json, simplifyVector = FALSE)
+layers <- map_dfr(meta$layers, \(l) tibble(id = l$id, name = l$name, parent = l$parentLayerId %||% NA,
+                                            leaf = is.null(l$subLayerIds)))
+# leaf polygon layers under "Designated Critical Habitat" (id 0): walk parents up to 0, not 71 (Proposed)
+ancestors <- function(id) { out <- c(); while (!is.na(id) && id >= 0) { out <- c(out, id); id <- layers$parent[layers$id == id] }; out }
+layers <- layers |> filter(leaf) |>
+  mutate(designated = map_lgl(id, \(i) 0 %in% ancestors(i)), is_line = str_detect(name, "_line$")) |>
+  filter(designated, !is_line)
+log_info("{nrow(layers)} designated polygon layers on the service")
+
+fetch_layer <- function(id, name) {
+  f <- glue("{dir_raw_ch}/{name}.gpkg")
+  if (file_exists(f) && !dps_fetch) return(f)
+  feats <- list(); off <- 0
+  repeat {
+    r <- request(glue("{svc}/{id}/query")) |>
+      req_url_query(where = "1=1", outFields = "*", outSR = 4326, f = "geojson",
+                    resultOffset = off, resultRecordCount = 2000) |>
+      req_perform() |> resp_body_string()
+    g <- sf::st_read(r, quiet = TRUE)
+    if (!nrow(g)) break
+    feats[[length(feats) + 1]] <- g; off <- off + nrow(g)
+    if (nrow(g) < 2000) break
+  }
+  g <- do.call(rbind, feats)
+  sf::st_write(g, f, quiet = TRUE, delete_dsn = TRUE); f
+}
+layers$gpkg <- map2_chr(layers$id, layers$name, fetch_layer)
+ch <- map_dfr(layers$gpkg, \(f) sf::st_read(f, quiet = TRUE) |>
+                select(any_of(c("SCIENAME", "COMNAME", "LISTENTITY", "LISTSTATUS", "PUBDATE", "EFFECTDATE", "FR", "INPORTURL"))) |>
+                mutate(layer = path_ext_remove(path_file(f))))
+sf::st_geometry(ch) <- "geometry"
+log_info("{nrow(ch)} designated critical-habitat polygons, {n_distinct(ch$LISTENTITY)} listed entities, {n_distinct(ch$SCIENAME)} species")
+```
+
+## Listed entities scoped below the species
+
+```{r}
+#| label: entities
+
+# an entity is DPS/ESU-scoped when its LISTENTITY carries a bracketed segment, or its SCIENAME is a
+# trinomial (subspecies) -- the species-level `listing` already handles whole-species listings
+ent <- sf::st_drop_geometry(ch) |>
+  distinct(SCIENAME, LISTENTITY, LISTSTATUS) |>
+  # NOAA writes a synonym in parentheses -- "Phoca (=Pusa) hispida hispida" -- and WoRMS accepts the
+  # synonym (Pusa hispida); keep both spellings as candidates and match whichever is accepted
+  mutate(sci_clean = clean_sci_name(str_replace_all(SCIENAME, "\\(=[^)]*\\)\\s*", "")),
+         sci_syn   = if_else(str_detect(SCIENAME, "\\(="),
+                             clean_sci_name(str_replace(SCIENAME, "^\\S+\\s+\\(=([^)]+)\\)", "\\1")), NA_character_),
+         binomial  = clean_sci_name(sci_clean, binomial = TRUE),
+         binomial_syn = if_else(is.na(sci_syn), NA_character_, clean_sci_name(sci_syn, binomial = TRUE)),
+         segment   = str_match(LISTENTITY, "\\[(.+)\\]")[, 2],
+         sub_species = !is.na(segment) | str_count(sci_clean, "\\S+") >= 3,
+         status = case_when(LISTSTATUS == "Endangered" ~ "EN", LISTSTATUS == "Threatened" ~ "TN", TRUE ~ NA_character_)) |>
+  filter(sub_species, !is.na(status))
+# sea turtles already carry SWOT + DPS extinction risk (ingest_turtles-swot-dps); do not double up
+turtle_sci <- read_csv(glue("{dir_atlas}/dist/model_{turtle_ds}.csv")) |>
+  pull(any_of(c("scientific_name", "sci_name", "taxa"))) |> clean_sci_name(binomial = TRUE)
+ent <- ent |> filter(!binomial %in% turtle_sci)
+
+# species -> WoRMS AphiaID (binomial match on the accepted name), class for the MMPA floor
+con_spp <- dbConnect(duckdb(spp_db, read_only = TRUE))
+cands <- ent |> transmute(binomial, cand = binomial) |>
+  bind_rows(ent |> filter(!is.na(binomial_syn)) |> transmute(binomial, cand = binomial_syn)) |> distinct()
+duckdb_register(con_spp, "want", cands)
+wx <- dbGetQuery(con_spp, "
+  SELECT w.binomial, w.cand, CAST(x.scientificNameID AS VARCHAR) AS worms_id, x.\"class\" AS cls
+  FROM want w JOIN spp.worms x ON x.scientificName = w.cand
+  WHERE x.taxonomicStatus = 'accepted'") |>
+  arrange(binomial, cand != binomial) |> distinct(binomial, .keep_all = TRUE) |>
+  transmute(binomial, worms_id, cls, worms_name = cand)
+dbDisconnect(con_spp, shutdown = TRUE)
+ent <- ent |> left_join(wx, by = "binomial") |> mutate(is_mmpa = coalesce(cls == "Mammalia", FALSE))
+unres <- ent |> filter(is.na(worms_id)) |> distinct(SCIENAME)
+if (nrow(unres)) log_warn("no accepted WoRMS name for: {paste(unres$SCIENAME, collapse = '; ')}")
+ent <- ent |> filter(!is.na(worms_id))
+kable(ent |> count(binomial, worms_id, is_mmpa, name = "n_entities") |> arrange(binomial),
+      caption = "Species with listed entities below species level (sea turtles excluded — already spatial)")
+kable(ent |> transmute(species = binomial, entity = LISTENTITY, status) |> arrange(species, entity),
+      caption = "Listed entities taken from the service, with the status their polygons carry")
+```
+
+## Baseline: the species' IUCN range at its IUCN status (+ MMPA)
+
+```{r}
+#| label: baseline
+
+# IUCN range model per species: model_rng_iucn.csv keys models by IUCN id_no + sci_name
+iucn_m <- read_csv(glue("{dir_atlas}/dist/model_rng_iucn.csv")) |>
+  transmute(mdl_key, sci = clean_sci_name(sci_name, binomial = TRUE), category) |>
+  distinct(sci, .keep_all = TRUE)
+sp <- ent |> distinct(binomial, worms_id, is_mmpa, worms_name) |>
+  left_join(iucn_m, by = c("binomial" = "sci")) |>
+  left_join(iucn_m |> rename(mdl_key2 = mdl_key, category2 = category), by = c("worms_name" = "sci")) |>
+  mutate(mdl_key = coalesce(mdl_key, mdl_key2), category = coalesce(category, category2)) |> select(-mdl_key2, -category2) |>
+  mutate(iucn_code = if_else(!is.na(category) & category %in% c("CR","EN","VU","NT","LC","DD"),
+                             paste0("IUCN:", category), NA_character_),
+         er_base = if_else(!is.na(iucn_code), compute_er_score(iucn_code, is_mmpa = is_mmpa),
+                           if_else(is_mmpa, compute_er_score("IUCN:LC", is_mmpa = TRUE), 1L)),
+         iucn_file = if_else(!is.na(mdl_key), glue("{dir_iucn}/{str_remove(mdl_key, '^rng_iucn\\\\|')}.parquet"), NA_character_),
+         has_iucn = !is.na(iucn_file) & file_exists(coalesce(iucn_file, "")),
+         mdl_key_dps = msens::mdl_key_raw(ds_key, worms_id))
+kable(sp |> select(binomial, worms_id, iucn_code, is_mmpa, er_base, has_iucn),
+      caption = "Baseline extinction risk outside listed entities (IUCN category + MMPA floor); species without an IUCN range get the entity polygons only")
+```
+
+## Per-cell ER surface → one Parquet per species
+
+```{r}
+#| label: build
+
+for (i in seq_len(nrow(sp))) {
+  s <- sp[i, ]; out <- glue("{dir_dist}/{s$worms_id}.parquet")
+  if (file_exists(out) && !redo_ingest) next
+  # listed-entity polygons at their status (max where entities overlap)
+  e_sp <- ent |> filter(worms_id == s$worms_id)
+  cells_ent <- map_dfr(seq_len(nrow(e_sp)), \(j) {
+    g <- ch |> filter(SCIENAME == e_sp$SCIENAME[j], LISTENTITY == e_sp$LISTENTITY[j])
+    v <- compute_er_score(paste0("NMFS:", e_sp$status[j]), is_mmpa = s$is_mmpa)
+    msens::cells_from_ranges(g, cellid_tif, value = v) |> mutate(entity = e_sp$LISTENTITY[j])
+  })
+  # baseline over the IUCN range
+  cells_base <- if (s$has_iucn) arrow::read_parquet(s$iucn_file) |> transmute(cell_id, val = as.double(s$er_base)) else tibble(cell_id = integer(), val = double())
+  d <- bind_rows(cells_ent |> select(cell_id, val), cells_base) |>
+    group_by(cell_id) |> summarise(val = max(val), .groups = "drop")
+  msens::write_atlas_parquet(tibble(mdl_key = as.character(s$mdl_key_dps), cell_id = as.integer(d$cell_id), val = d$val), out)
+  log_info("{s$binomial}: {nrow(cells_ent)} entity cells over {nrow(e_sp)} entities + {nrow(cells_base)} baseline cells -> {nrow(d)} cells")
+}
+```
+
+## Model registry, verify, manifest
+
+```{r}
+#| label: registry
+
+con <- dbConnect(duckdb())
+smry <- dbGetQuery(con, glue("
+  SELECT mdl_key, count(*) n_cells, min(val) v_min, max(val) v_max,
+         count(*) FILTER (WHERE val >= 100) n_en, count(*) FILTER (WHERE val >= 50 AND val < 100) n_tn
+  FROM read_parquet('{dir_dist}/*.parquet') GROUP BY 1 ORDER BY 1"))
+model <- sp |>
+  transmute(mdl_key = mdl_key_dps, sp_id = worms_id, worms_id, scientific_name = binomial, is_mmpa, iucn_code, er_base,
+            er_code = "NMFS:DPS", er_score = NA_integer_,   # per-cell: see val; the merge multiplies it by suitability
+            entities = map_chr(worms_id, \(w) paste(ent$LISTENTITY[ent$worms_id == w], collapse = " | ")),
+            statuses = map_chr(worms_id, \(w) paste(ent$status[ent$worms_id == w], collapse = "|")),
+            has_iucn_baseline = has_iucn) |>
+  left_join(smry, by = "mdl_key")
+write_csv(model, mdl_csv)
+kable(model |> select(scientific_name, worms_id, statuses, er_base, n_cells, n_en, n_tn, v_min, v_max),
+      caption = "dps_nmfs models: per-cell ER surfaces (n_en / n_tn = cells at EN / TN)")
+stopifnot("every model must carry at least one listed-entity cell" = all(model$n_en + model$n_tn > 0),
+          "ER values must be compute_er_score() outputs in [1, 100]" = all(model$v_min >= 1 & model$v_max <= 100))
+h <- msens::hash_parquet(glue("{dir_dist}/*.parquet"), con)
+dbDisconnect(con, shutdown = TRUE)
+msens::write_manifest(
+  manifest, target = "ingest_dps_nmfs", content_hash = h,
+  stats = list(ds_key = ds_key, ver = ver, n_species = nrow(model), n_entities = nrow(ent),
+               n_cells = sum(model$n_cells), n_layers = nrow(layers), source = svc),
+  force = msens::force_target("ingest_dps_nmfs"))
+```

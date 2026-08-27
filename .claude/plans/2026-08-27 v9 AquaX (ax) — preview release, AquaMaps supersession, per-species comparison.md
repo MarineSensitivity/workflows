@@ -342,6 +342,27 @@ Server, all via `release_marine-atlas.qmd` flags: `DEPLOY_TABLES=1` (tables + lo
   test harness mount and restoring the preview host's unversioned-path 302 (server `64a1dad`, `b5cd647`).
 - Docs CI published `v9/` to `gh-pages-preview`.
 
+## v9.1 — spatial extinction risk for NMFS DPS-listed species (2026-08-27 23:00, Ben's review finding)
+
+The humpback rendered a flat 100: `listing` takes the highest domestic ESA status on NOAA's species
+page (`parse_noaa_status`), so DPSs listed *outside* US waters made the species `NMFS:EN`, and the
+plain rule `max(er, suit)` at 100 hides every gradient. 14 species get a species-wide status from
+DPS/ESU-scoped listings; ~50 US-valid EN taxa with a range are flat under the plain rule.
+
+Fix (this preview, not v10): **`dps_nmfs`** (`ingest_nmfs-dps.qmd`) from the authoritative NMFS
+`All_NMFS_Critical_Habitat` MapServer (Jennifer Schultz, NMFS, call of 2026-04-16 — DPS-level
+*range* services follow end of CY2026): for every listed entity below species level (18 species,
+68 layers; turtles excluded — they keep SWOT+DPS), its polygons at `NMFS:{status}` (+MMPA), the IUCN
+range at `IUCN:{cat}` (+MMPA) elsewhere; merged in the turtle branch (`turtle_sql(er_ds = c(turtle,
+dps_nmfs))`, msens 0.38.0), `ch_*` not applied as override for them, `is_er_spatial` at scoring.
+The fallback rule is BOEM's analytic decision per NOAA (transcript line 57) — documented in the
+docs' data-sources note. Chain re-run from `ingest_dps_nmfs` with `REDO_MERGED_COG` /
+`RELEASE_REDO_SERVE` / `RELEASE_REDO_CELL_MODEL`, then `RELEASE_DEPLOY` (titiler restart covers the
+repainted stable-URL COGs).
+
+Still open (design, v10): the plain rule's flat maximum for ~50 whole-species-EN taxa
+(`max(er, suit)`); candidate: ER × suitability for all taxa, gated by `pra_score_delta`.
+
 ## Phase 6 — skills (`.claude/skills/`)
 
 - **`ingest-sdm`**: add the *same-topology raster* recipe (`cells_from_aligned_raster`, multi-band scalar

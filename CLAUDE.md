@@ -38,6 +38,20 @@ makes the species app label the toggle *Delivered / As ingested* — and records
 per-species AquaX-vs-AquaMaps comparison (`data/ax_vs_am_summary.csv`; 20 least/most different
 with preview deep links). `publish_native.qmd` only *registers* the ax COGs from `model_ax.csv`.
 
+**v9.1: extinction risk is SPATIAL for NMFS DPS-listed species (`dps_nmfs`, `ingest_nmfs-dps.qmd`).**
+`listing` flattens NOAA's species page to its highest domestic ESA status, so the humpback carried
+`NMFS:EN` species-wide from DPSs that breed outside US waters and the plain rule `max(er, suit)` painted
+it a flat 100 over 14.7 M cells. Now every species with a listed entity below species level (18: humpback
++ Southern Resident orca, Cook Inlet beluga, MHI false killer whale, Western Steller sea lion, Beringia
+bearded / Arctic ringed seal, salmonid + steelhead ESUs, both sturgeons, sawfish, bocaccio, yelloweye,
+eulachon) gets a per-cell ER surface from the **authoritative NMFS critical-habitat service**
+(`maps.fisheries.noaa.gov/…/All_NMFS_Critical_Habitat/MapServer`, per Jennifer Schultz, NMFS,
+2026-04-16 — DPS-level *range* services follow end of CY2026 and become the source then): each listed
+entity's polygons at its status, the IUCN range at `IUCN:{cat}` + MMPA elsewhere; these taxa merge in the
+turtle branch (`turtle_sql(er_ds = c(turtle, dps_nmfs))`, ER × suitability, `is_er_spatial` at scoring), and
+`ch_*` is NOT applied as an override for them (it carries the species-level ER). Sea turtles keep
+`rng_turtle_swot_dps`. Cached snapshot in `raw/fisheries.noaa.gov/All_NMFS_Critical_Habitat/`; `DPS_FETCH=1` refreshes.
+
 **Bumping the version on the same grid (v8 → v9) is `bootstrap_version.qmd`**, not a re-ingest:
 it clones the unchanged `dist/dataset=*` from `ver_prev` copy-on-write (APFS `cp -c`; hardlinks on
 Linux) so the ingests *resume*, and `BOOTSTRAP_VERIFY=1` re-hashes them against their checkpoints.

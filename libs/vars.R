@@ -37,3 +37,6 @@ ax_supersede        <- .flag("AX_SUPERSEDE", default = TRUE)  # AX_SUPERSEDE=0 =
 # bootstrap_version.qmd
 bootstrap_verify    <- .flag("BOOTSTRAP_VERIFY")      # re-hash cloned datasets against their ingest manifests
 bootstrap_publish   <- .flag("BOOTSTRAP_PUBLISH")     # server-side copy of ver_prev's published native assets (S3 + file host)
+
+# ingest_nmfs-dps.qmd (v9.1 `dps_nmfs`)
+dps_fetch <- .flag("DPS_FETCH")   # re-download the NMFS critical-habitat service layers into raw/

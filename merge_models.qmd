@@ -71,6 +71,11 @@ stopifnot("run merge_models_prep first" = file_exists(merge_db),
 
 suit_ds   <- c("am", "ax")      # v9: AquaX joins AquaMaps as a suitability dataset (msens::merge_sql)
 turtle_ds <- "rng_turtle_swot_dps"
+# SPATIAL extinction risk (per-cell ER x suitability, msens::turtle_sql): the sea turtles since
+# v4b, and from v9.1 every species with an NMFS listed entity below species level (dps_nmfs:
+# humpback, Southern Resident killer whale, salmonid ESUs, ...). For these the plain rule's
+# `max(er, suit)` at a species-wide ER is exactly what painted the humpback a flat 100.
+er_ds     <- c(turtle_ds, "dps_nmfs")
 ch_ds     <- c("ch_nmfs", "ch_fws", "ca_nmfs")
 ch_sql    <- paste(sprintf("'%s'", ch_ds), collapse = ",")
 
@@ -163,19 +168,26 @@ log_info("partitioned merge input: {length(all_ids)} taxa by mkey_id; US trim {n
 ```{r}
 #| label: turtles
 
+er_like     <- paste(sprintf("mdl_key LIKE '%s|%%'", er_ds), collapse = " OR ")
 turtle_keys <- dbGetQuery(con, glue(
-  "SELECT DISTINCT ms_merge_key FROM taxon_model WHERE mdl_key LIKE '{turtle_ds}|%'"))$ms_merge_key
+  "SELECT DISTINCT ms_merge_key FROM taxon_model WHERE {er_like}"))$ms_merge_key
+dps_keys    <- dbGetQuery(con, "SELECT DISTINCT ms_merge_key FROM taxon_model WHERE mdl_key LIKE 'dps_nmfs|%'")$ms_merge_key
 tkeys_sql   <- paste(sprintf("'%s'", turtle_keys), collapse = ",")
 turtle_ids  <- dbGetQuery(con, glue("SELECT mkey_id FROM mkey_map WHERE ms_merge_key IN ({tkeys_sql})"))$mkey_id
 tids_sql    <- paste(turtle_ids, collapse = ",")
-log_info("{length(turtle_keys)} turtle taxa (multiplicative merge)")
+log_info("{length(turtle_keys)} spatial-ER taxa (multiplicative merge): {length(turtle_keys) - length(dps_keys)} turtles + {length(dps_keys)} NMFS-DPS species")
 
 # whole-range (global) multiplicative turtle merge, reading ONLY the turtle taxa's partitions
 # (mkey_id IN (...) → partition-pruned, tiny). Rule = msens::turtle_sql() (unit-tested).
+# the critical-habitat datasets are NOT an override for dps_nmfs taxa: dps_nmfs was built from the
+# same designations WITH each entity's status, while ch_* carries the species-level ER (100 for the
+# humpback) and would paint the Threatened Mexico-DPS habitat back to Endangered.
+dps_sql <- if (length(dps_keys)) paste(sprintf("'%s'", dps_keys), collapse = ",") else "''"
 dbExecute(con, glue("CREATE OR REPLACE TABLE turtle_src AS
-  SELECT ms_merge_key, ds_key, cell_id, val FROM {parts_sql(turtle_ids)}"))
+  SELECT ms_merge_key, ds_key, cell_id, val FROM {parts_sql(turtle_ids)}
+  WHERE NOT (ds_key IN ({ch_sql}) AND ms_merge_key IN ({dps_sql}))"))
 dbExecute(con, paste("CREATE OR REPLACE TABLE mc_turtle AS",
-  msens::turtle_sql(turtle_ds, suit_ds, ch_ds, src = "turtle_src")))
+  msens::turtle_sql(er_ds, suit_ds, ch_ds, src = "turtle_src")))
 log_info("mc_turtle (whole-range): {dbGetQuery(con, 'SELECT count(*) n FROM mc_turtle')$n} cells")
 ```
 

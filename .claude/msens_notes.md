@@ -259,6 +259,174 @@ Where it's written:
 
 This is the single most useful question to put to Gabriel: **is `no_rows_in_mask` a confident absence (in which case flip the flag) or an artefact of the range crop /  WoRMS ID not present in your set?**
 
+---
+
+The v9 AquaX preview release is done, and the heartbeat loop is stopped. Recap for whoever reads only this message:
+
+What's live
+
+- preview.marinesensitivity.org/v9/scores/ and /v9/species/ — restricted to you, Tim and Gabriel (PREVIEW_REVIEWERS_V9); Cloudflare Access applications minted, Caddy carries the 5 AUDs; CHECK_PREVIEW passed with tokens (public host falls back to v7, origin-direct 401, v8/v9 probes isolated both ways). Docs book at /docs/v9/ on the preview host.
+- marine-atlas/v9/ on S3: tables, serving surface (17,781 partitions), dist_merged, registry, STAC, and native COGs — 10,527 AquaX as-ingested + 10,536 as-delivered, 21,679 merged surfaces. versions.json lists v9 prerelease/restricted; latest.txt still says v7.
+
+The science
+
+- 10,536 AquaX models ingested by pixel position (÷10 to AquaMaps' scale); AquaX supersedes AquaMaps for 10,517 taxa (10,703 models) inside AquaX's mask (641,651 cells ≈ the whole US study area); 2,742 "modeled but absent in US" species keep AquaMaps pending Gabriel's answer (AX_ABSENT_SUPERSEDES=1 flips it).
+- Control merge with AquaX excluded reproduced v8 byte-for-byte — so the v9 change is entirely AquaX: Program-Area composite mean |Δ| 3.6, max 7.9 (NOR +8, GAB −8), r 0.92; bird and primary_producer components unchanged (Δ = 0), turtles move most (multiplicative rule).
+- Reports for review: ingest_aquax.html (fates, by-component/region Δ, 20 least/most different with app links), compare_aquax_examples.html (10 species side by side), validate_v8_v9.html.
+
+What it took (all committed across workflows, msens 0.37.0, apps, docs, server)
+
+Ten real bugs were caught by the checks along the way — GDAL/aws ~ paths, a str_starts regex, a named-list bind_rows, INT1U truncation, a fresh merge.duckdb missing listing (ESA/MBTA floors!) and common_name, a DuckDB OOM on hive globs, name re-resolution re-keying 12 models, 9,080 taxa losing their merged COG, and the granular-deploy path variables — each is now a hard stop, a test, or a documented step in the bootstrap-release skill.
+
+One manual check left for you: open a superseded species on the preview host (e.g. /v9/species/?mdl_key=ms_merge%7CWORMS:126436, Atlantic cod) and confirm the AquaX input offers Delivered / As ingested.
+
+### TODO: humpback whale = 100 everywhere!
+
+Although Atlantic cod looks good [Image #2], for some reason the Humpback whale is 100 everywhere! [Image #3] despite variation in AquaX [Image #4] What happened and how many other species could this bug have affected?
+
+---
+
+Good catch — but this one predates AquaX. Here is what's going on:
+
+What happened. The merged surface is built by the v7-faithful rule "range cells carry the governing extinction-risk score; merged value = max(er, suitability-at-range)". The humpback's governing ER is NMFS:EN → er_score = 100, so every cell of its IUCN range becomes max(100, AquaX) = 100. The AquaX layer itself (your 4th image) is exactly what was ingested and is fine; it simply can never show through a 100. I checked v8's surface: identical — 14,708,134 cells, all 100, in both v8 and v9. (It's the "humpback = 100!" TODO in my July notes.) Cod looks right because its ER is IUCN VU → 5, so suitability dominates.
+
+How many species. Taxa that have a range dataset (so the rule applies), by governing ER:
+
+┌─────────────────────────────────────────────────────────┬────────────────┬───────────────────┐
+│                        er_score                         │  taxa with a   │ of which valid in │
+│                                                         │     range      │         US        │
+├─────────────────────────────────────────────────────────┼────────────────┼───────────────────┤
+│ 100 (ESA Endangered, ± floors) — fully flat             │ 248            │ 50                │
+├─────────────────────────────────────────────────────────┼────────────────┼───────────────────┤
+│ 50–99 (ESA Threatened / derived) — flat wherever        │ 345            │ 67                │
+│ suitability < er                                        │                │                   │
+├─────────────────────────────────────────────────────────┼────────────────┼───────────────────┤
+│ 20–49 (MMPA/MBTA floors, IUCN CR) — low-suitability     │ 827            │ 209               │
+│ cells floored                                           │                │                   │
+├─────────────────────────────────────────────────────────┼────────────────┼───────────────────┤
+│ < 20                                                    │ 15,710         │ 1,792             │
+└─────────────────────────────────────────────────────────┴────────────────┴───────────────────┘
+
+The 50 fully-flat, US-valid, both-datasets taxa are 16 mammals, 10 fish, 6 turtles (turtles use the multiplicative rule so they still show gradients), 1 invertebrate, 1 coral, 1 reptile. So ~50 species look like the humpback, and a few hundred more are partially flattened at their ER floor.
+
+Why it's a design question, not a bug fix. The rule was written for scoring — the range footprint valued at ER is the "fitting point" the extinction-risk metrics sum over — and the v8→v9 gate proves it behaves identically to before. What it's bad at is display: for an Endangered species the merged layer shows "where + how protected", never "how suitable". Two ways out, both v10-scale because they move scores and need the equivalence gate:
+1. ER as a floor only where suitability is absent (val = coalesce(suit, er) inside the range): the map shows AquaX/AquaMaps gradients; ER still weights the score via er_score × val, but no longer squared through val.
+2. Keep scoring as is, change what the app draws: publish the merged suitability surface for display and keep the ER-valued surface for scoring only.
+
+My recommendation is (1) — it fixes both the picture and the implicit double counting — but it changes Program-Area scores for those ~250 listed species, so it's a decision for you, not something to slip into the v9 preview tonight. Want me to prototype (1) on the 50 US-valid EN taxa and report the score deltas before you decide?
+
+---
+
+Good catch — but this one predates AquaX. Here is what's going on:
+
+What happened. The merged surface is built by the v7-faithful rule "range cells carry the governing extinction-risk score; merged value = max(er, suitability-at-range)". The humpback's governing ER is NMFS:EN → er_score = 100, so every cell of its IUCN range becomes max(100, AquaX) = 100. The AquaX layer itself (your 4th image) is exactly what was ingested and is fine; it simply can never show through a 100. I checked v8's surface: identical — 14,708,134 cells, all 100, in both v8 and v9. (It's the "humpback = 100!" TODO in my July notes.) Cod looks right because its ER is IUCN VU → 5, so suitability dominates.
+
+How many species. Taxa that have a range dataset (so the rule applies), by governing ER:
+
+┌─────────────────────────────────────────────────────────┬────────────────┬───────────────────┐
+│                        er_score                         │  taxa with a   │ of which valid in │
+│                                                         │     range      │         US        │
+├─────────────────────────────────────────────────────────┼────────────────┼───────────────────┤
+│ 100 (ESA Endangered, ± floors) — fully flat             │ 248            │ 50                │
+├─────────────────────────────────────────────────────────┼────────────────┼───────────────────┤
+│ 50–99 (ESA Threatened / derived) — flat wherever        │ 345            │ 67                │
+│ suitability < er                                        │                │                   │
+├─────────────────────────────────────────────────────────┼────────────────┼───────────────────┤
+│ 20–49 (MMPA/MBTA floors, IUCN CR) — low-suitability     │ 827            │ 209               │
+│ cells floored                                           │                │                   │
+├─────────────────────────────────────────────────────────┼────────────────┼───────────────────┤
+│ < 20                                                    │ 15,710         │ 1,792             │
+└─────────────────────────────────────────────────────────┴────────────────┴───────────────────┘
+
+The 50 fully-flat, US-valid, both-datasets taxa are 16 mammals, 10 fish, 6 turtles (turtles use the multiplicative rule so they still show gradients), 1 invertebrate, 1 coral, 1 reptile. So ~50 species look like the humpback, and a few hundred more are partially flattened at their ER floor.
+
+Why it's a design question, not a bug fix. The rule was written for scoring — the range footprint valued at ER is the "fitting point" the extinction-risk metrics sum over — and the v8→v9 gate proves it behaves identically to before. What it's bad at is display: for an Endangered species the merged layer shows "where + how protected", never "how suitable". Two ways out, both v10-scale because they move scores and need the equivalence gate:
+1. ER as a floor only where suitability is absent (val = coalesce(suit, er) inside the range): the map shows AquaX/AquaMaps gradients; ER still weights the score via er_score × val, but no longer squared through val.
+2. Keep scoring as is, change what the app draws: publish the merged suitability surface for display and keep the ER-valued surface for scoring only.
+
+My recommendation is (1) — it fixes both the picture and the implicit double counting — but it changes Program-Area scores for those ~250 listed species, so it's a decision for you, not something to slip into the v9 preview tonight. Want me to prototype (1) on the 50 US-valid EN taxa and report the score deltas before you decide?
+
+✻ Cooked for 1m 14s · done 11:07 PM · 8 monitors still running
+
+❯ This is not accurately assigned. The humpback whale was actually downgraded globally by IUCN to LC since release of whaling pressure and general recovery. This assignment is too broadly gleaned from https://www.fisheries.noaa.gov/species/humpback-whale as the highest listed amongst its Distinct Population Segments (DPS) [Image #5], but none of the ones that are listed by NOAA/NMFS as Endangered (EN) or Threatened (TN) are actually within US waters [Image #6]
+[Image #5]
+[Image #6]
+
+https://www.fisheries.noaa.gov/s3/dam-migration-miss/md_1VIn4L2tdXPH_0.jpg
+
+---
+
+Confirmed — and you've found a real over-assignment. The mechanism: the NOAA species page is scraped to one status string ("ESA Endangered; ESA Endangered; ESA Endangered - Foreign; …; ESA Threatened; MMPA Protected…"), and parse_noaa_status() takes the highest domestic entry as the species' status. So the humpback becomes NMFS:EN species-wide from the Central America / Western North Pacific DPS listings, while IUCN says LC and the DPSs that breed in US waters (West Indies, Hawaii) are Not at Risk.
+
+14 species get a species-wide status from DPS/ESU-scoped listings. Three groups:
+
+pattern: Listed DPSs largely outside US waters
+species: Humpback (EN ← Central America/WNP), scalloped hammerhead (EN ← Eastern Pacific, Central/SW
+Atlantic; the US Atlantic/Gulf DPS is not listed)
+what's wrong: Over-assigned everywhere in the US
+────────────────────────────────────────
+pattern: Listed ESUs/DPSs inside US waters, but only regionally
+species: Chinook (17 ESUs), steelhead (12), coho, sockeye, chum, Atlantic sturgeon (5 DPS),
+ringed/bearded seal, smalltooth sawfish
+what's wrong: Right in the listed region (e.g. WA/OR/CA rivers, Florida), over-assigned elsewhere
+(e.g. Alaska salmon)
+────────────────────────────────────────
+pattern: Already handled spatially
+species: green, loggerhead, olive ridley turtles (rng_turtle_swot_dps: EN inside a DPS polygon, TN
+outside)
+what's wrong: correct model to copy
+
+One nuance on the humpback before we blanket-downgrade it: NOAA's DPS map links the Mexico (Threatened) and Central America (Endangered) DPSs to feeding areas off California–Oregon–Washington (that's why those stocks are "MMPA depleted"). So species-wide LC would under-represent the West Coast, just as species-wide EN over-represents Alaska, Hawaii, the Atlantic and Gulf. Only a spatial treatment gets both right.
+
+What I propose
+
+1. **v9.1 now (interim, explicit)**: a committed data/listing_overrides.csv — scientific_name, nmfs_esa, rationale, source_url — applied in ingest_nmfs-fws-listings.qmd with the override shown in the listing table, starting with humpback → LC (IUCN LC; US-waters DPSs Not at Risk; MMPA floor keeps it at 21). Its merged map then shows the AquaX gradients. Scalloped hammerhead looks like the same case, but I'd rather you confirm it than have me decide a listing. Rerunning the chain from ingest_listings is ~6 h (overnight).
+2. **v10 (right)**: extend the turtle pattern to the other 11 — a rng_nmfs_dps dataset from NOAA's DPS/ESU boundary polygons (humpback DPS from the 2016 rule, NWFSC salmonid ESU/DPS boundaries, sturgeon DPS, hammerhead DPS, Arctic seal DPS), valued per-DPS ER, so the West Coast feeding areas carry EN/TN and Alaska/Hawaii carry the LC + MMPA floor. That's a data-acquisition task (we only hold the turtle DPS polygons today).
+
+Which overrides do you want in v9.1 — humpback only, or humpback + scalloped hammerhead (+ any salmonid you'd rather see at LC in Alaska)? Once you say, I'll add the CSV, rerun the chain overnight and redeploy the preview.
+
+---
+
+We need the DPS for species where available, like https://noaa.hub.arcgis.com/datasets/9426731f9651463bac4eb9cfba6574bd/about downloaded temporarily to /Users/bbest/Downloads/WhaleHumpbackDPSs_20210421
+
+---
+
+Good — that's the right fix, and it slots into a pattern the pipeline already has (the turtles: per-cell ER from DPS polygons × suitability). Let me look at what the download contains before wiring it in.
+
+---
+
+See 219 results at https://noaa.hub.arcgis.com/search?q=DPS
+
+Here is the authoritative NOAA Esri server shared by Jennifer Schultz at NOAA that we should be using for latest Critical Habitat and DPS: https://maps.fisheries.noaa.gov/server/rest/services/All_NMFS_Critical_Habitat/MapServer
+
+---
+
+It looks like the NOAA conversation didn't come through — the message ends at "/". Could you paste it (or the file path)? I'd like to read it before locking the design, since it may say which layers are authoritative for DPS ranges versus critical habitat.
+
+What I confirmed meanwhile on the server you gave: the combined layer All_critical_habitat_poly_20230502 (2,117 polygons) carries SCIENAME, LISTENTITY and LISTSTATUS per feature — 46 distinct (species, DPS/ESU, status) entities, including the three humpback DPSs (Central America EN, Mexico TN, Western North Pacific EN), Southern Resident killer whale, Cook Inlet beluga, Beringia bearded seal, Arctic ringed seal, the salmon/steelhead ESUs, sturgeon DPSs, smalltooth sawfish US DPS, the green-turtle DPSs, and per-layer GeoJSON export works. So the ingest can be one authoritative query rather than a hand-curated manifest.
+
+One caveat I want the NOAA thread to settle: these are critical-habitat polygons, not DPS range boundaries. For the humpback that's the right proxy (the CH is where the listed DPSs are in US waters), but a species could be present as a listed DPS outside its designated CH.
+
+---
+
+And here is the conversation with NOAA/NMFS including Jenny Schultz '/Users/bbest/Downloads/2026-04-16 Marine Sensitivity Toolkit BOEM _ NMFS.txt'
+
+---
+
+The transcript confirms critical-habitat is the authoritative service, DPS-level ranges arrive in CY2026, and BOEM decides how to combine DPS listings with broader range using IUCN as fallback. I'll now build dps_nmfs: per-DPS ER from critical habitat within designated polygons, IUCN+MMPA baseline elsewhere, multiplied by suitability like the turtles, ready to swap sources once NOAA's range services are available.
+
+---
+
+But when I visit https://maps.fisheries.noaa.gov/server/rest/services/All_NMFS_Critical_Habitat/MapServer I see "DPS" clearly marked in layers, not just critical habitat:
+
+    WhaleHumpback_CentralAmericaDPS_20210421 (192)
+    WhaleHumpback_MexicoDPS_20210421 (193)
+    WhaleHumpback_WesternNorthPacificDPS_20210421 (194)
+
+---
+
+Confirmed each layer represents one listed DPS with its own status, and the polygon reflects designated critical habitat rather than full range—correct for now until NOAA's DPS-level range layers arrive later. Running the ingest now to see what it pulls.
+
 
 
 ## 2026-08-21 SDM workshop email to Gabrielle and Frank
