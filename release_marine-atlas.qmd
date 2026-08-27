@@ -926,6 +926,36 @@ if (!do_check_preview) {
     }
   }
 
+  # 2b. PER-VERSION isolation — the point of the whole path-based scheme. A
+  # credential scoped to one restricted version must open that version and be
+  # REFUSED elsewhere, which is what makes "reviewer of v9" different from
+  # "reviewer". access.sh mints a probe token per restricted version; if its
+  # pair is in the environment (CF_ACCESS_CLIENT_ID_PROBE_V9 / ..._SECRET_...),
+  # assert both halves. Skipped, loudly, when the pair is absent.
+  for (v in restricted) {
+    sfx <- toupper(gsub("[^A-Za-z0-9]", "_", v))
+    pid <- Sys.getenv(paste0("CF_ACCESS_CLIENT_ID_PROBE_", sfx))
+    psc <- Sys.getenv(paste0("CF_ACCESS_CLIENT_SECRET_PROBE_", sfx))
+    if (!nzchar(pid) || !nzchar(psc)) {
+      log_warn("no probe token for {v} in the environment — per-version isolation NOT asserted")
+      next
+    }
+    ph <- c("-H", shQuote(glue("CF-Access-Client-Id: {pid}")),
+            "-H", shQuote(glue("CF-Access-Client-Secret: {psc}")))
+    own <- probe(msens::preview_app_url("scores", v), ph)
+    if (!own$ok || !identical(own$code, 200L) || !identical(own$ms_ver, v))
+      bad(glue("probe token for {v} cannot open its OWN version: code={own$code %||% NA} ms-ver={own$ms_ver %||% NA}"))
+    else log_info("probe {v} opens /{v}/scores/ (ok)")
+    # ...and must NOT open another version, nor the landing page
+    for (other in c(setdiff(c(restricted, public), v)[1], NA)) {
+      u <- if (is.na(other)) prev_url else msens::preview_app_url("scores", other)
+      r <- probe(u, ph)
+      if (r$ok && identical(r$code, 200L))
+        bad(glue("ISOLATION BROKEN: the {v} probe token opened {u}"))
+      else log_info("probe {v} refused at {u} -> {r$code %||% 'unreachable'} (ok)")
+    }
+  }
+
   # 3. docs: restricted versions are NOT on GitHub Pages; with a token they are on the preview host
   for (v in restricted) {
     r <- probe(glue("https://marinesensitivity.org/docs/{v}/"))
