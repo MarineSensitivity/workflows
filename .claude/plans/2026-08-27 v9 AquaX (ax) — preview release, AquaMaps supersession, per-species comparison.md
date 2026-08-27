@@ -292,7 +292,8 @@ Prototype with `AX_TEST_N=50 AX_COG=1` end-to-end (Parquet → COG → merge fix
 1. `Rscript -e 'devtools::test("../msens")'` green (Phase 1) **before any render**.
 2. Ingest self-checks (Phase 2 chunks 2, 5, 6, 7): alignment, mask, COG round-trip, headline counts.
 3. Merge checks: the existing masking check + the new "no `am` inside `ax_mask` for superseded taxa".
-4. **Control run — the check that cannot pass by accident**: render the merge/score chain once with
+4. **Control run — DONE 2026-08-27 18:26: `merge_models_control.html` hash `bd8b2931f17bb2b3` == v8, 580,568,326 cells / 17,763 taxa / 3,131,364,202 global cells — byte-identical.** Three plumbing bugs it caught first: `listing` missing from a fresh `merge.duckdb` (ESA/MBTA floors silently dropped), an OOM reading 6 turtle partitions through a 150k-file glob, and name re-resolution re-keying 12 models (now: a model keeps `ver_prev`'s taxon by exact `mdl_key`).
+   *(original text:)* **the check that cannot pass by accident**: render the merge/score chain once with
    `AX_SUPERSEDE=0` (ax ingested and registered, but `supersede` empty). `pra_score_delta(v9, v8,
    zone_set_key = "programarea_2026-01")` must show **cor = 1.000, max |Δ| = 0** — proving the bootstrap
    clone, the `suit_ds` generalization and the `ver_prev` fixes moved nothing. Then the real run.
