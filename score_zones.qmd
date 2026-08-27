@@ -82,10 +82,19 @@ if (redo_mc || n_mc != n_pq) {
 # er_score=100 at scoring so it isn't double-counted). v7 taxon_id is DOUBLE, v8 VARCHAR
 # -> cast via BIGINT (R as.character gives scientific notation for large ids, won't match).
 dbExecute(con, glue("ATTACH '{dir_big}/{ver_prev}/sdm.duckdb' AS v7 (READ_ONLY)"))
-dbExecute(con, "CREATE OR REPLACE TABLE v7_cat AS
-  SELECT taxon_authority, CAST(CAST(taxon_id AS BIGINT) AS VARCHAR) AS taxon_id,
-         bool_or(is_ok) AS is_ok
-  FROM v7.taxon WHERE taxon_id IS NOT NULL GROUP BY 1, 2")
+# ver_prev's "scored set" column: v1-v7 `is_ok` (bakes in the marine + category cull);
+# v8+ `is_valid_usa AND is_marine` (the definition changed at v8). Resolved by introspecting
+# the column set, never by version string -- the column is still called `in_v7` downstream
+# (SCORE_V7COMMON, schema.qmd) and means "in ver_prev's scored set".
+prev_cols <- dbGetQuery(con, "SELECT column_name FROM duckdb_columns()
+  WHERE database_name = 'v7' AND table_name = 'taxon'")$column_name
+prev_ok <- if ("is_ok" %in% prev_cols) "is_ok" else
+  if ("is_valid_usa" %in% prev_cols) "(coalesce(is_valid_usa, FALSE) AND coalesce(is_marine, TRUE))" else
+  stop("ver_prev taxon has neither is_ok nor is_valid_usa")
+dbExecute(con, glue("CREATE OR REPLACE TABLE v7_cat AS
+  SELECT taxon_authority, CAST(TRY_CAST(taxon_id AS BIGINT) AS VARCHAR) AS taxon_id,
+         bool_or({prev_ok}) AS is_ok
+  FROM v7.taxon WHERE TRY_CAST(taxon_id AS BIGINT) IS NOT NULL GROUP BY 1, 2"))
 dbExecute(con, "CREATE OR REPLACE TABLE taxon AS
   SELECT t.*,
     coalesce(c.is_ok, FALSE)                                 AS in_v7,   -- in v7's scored set (same-species compare)

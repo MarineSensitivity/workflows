@@ -41,6 +41,103 @@
   Let's write a manuscript (with a plan first to discuss) on forwarding the vision of this project to the next iteration (plan )
   '/Users/bbest/Library/CloudStorage/GoogleDrive-ben@ecoquants.com/.shortcut-targets-by-id/1sppUmlMtZ-sXaBm72M1-8PnjVudXO91v/US MBON Public Folder/Working Groups/BioIndicators/manuscripts/atlas/atlas _ BioIndicators manuscript.md'
 
+## 2026-08-27 AquaX v9 preview release ingest
+
+Setup a new preview release v9 to ingest AquaX, short dataset code `"ax"` from the TIFs and spreadsheets in `@/_big/msens/AquaX_2026-04/`, which are already keyed to WoRMS IDs already. All of the TIFs need to be converted into COGs and uploaded into the S3 atlas, but they should not need interpolation onto the study raster topology, since already on the 0.05 deg grid, clipped to the fullest extent (ie nearshore too) of all USA waters (including territorial Pacific/Atlantic). In the ingest workflow, identify all the AquaMaps species distributions that will be superseded by the newer AquaX. Provide summary statistics on the number of species by MST component, plus change in average suitability values within shared extents across regions per species and listing the 20 least and 20 most different overall in a table in the ingest notebook, so we can inspect differences per species in the app.
+
+Reference and update all the necessary skills along the way under `@.claude/skills`. Write an exhaustive plan into `@.claude/plans/` for review first.
+
+----
+
+The plan is written and ready for review: .claude/plans/2026-08-27 v9 AquaX (ax) — preview release, AquaMaps supersession, per-species comparison.md (399 lines, uncommitted). Nothing else in the repo was changed; the skills/notebooks/msens edits are specified in the plan (Phases 1–6) and wait on your review.
+
+What I measured before writing it (this shapes the design)
+
+- AquaX is on the v8 grid exactly: 10,536 TIFs, 7200×3600 at 0.05°, and at every non-NA pixel cell_id == pixel index — so ingest is a position map, no resample. Bands: CUR_NR (Float32 0–1000), plus constant AUC/TSS/cutoff per model.
+- AquaX is US-only, masked to the very ply_boem-usa.gpkg we sent (md5-identical to derived/v1/). The most-covered model has 586,276 cells; 53,818 in_usa cells (8.5%) are never covered — deep Aleutian/NWHI water, not nearshore. So supersession has to be scoped to AquaX's own mask, not in_usa, or 10.5k species go blank there.
+- Overlap with v8: 10,517 of the 10,536 AquaX taxa have a v8 AquaMaps model → 10,703 am models superseded (182 taxa carry >1 AquaMaps model); 4 are range-only; 15 are new taxa. A further 2,742 species were modeled but had no US presence (no TIF) — 2,738 of them have an AquaMaps model. By v8 component: coral 603 · fish 4,520 · invertebrate 5,327 · mammal 65 · turtle 6.
+
+The design in one line
+
+ax supersedes am per taxon, only inside the AquaX mask, on both surfaces, via one filter on the merge input (msens::supersede_sql(), unit-tested) + merge_sql(suit_ds = c("am","ax")); values ÷10 to [0,100]; both COG representations (native 0–1000 / model 1–100) built in the ingest and registered like am's so the species app needs no change; no titiler-v9.
+
+Decisions I need from you (D-table in the plan, defaults proposed)
+
+1. D1/D2 — ÷10 scale, TSS cutoff recorded but not applied?
+2. D3 — supersede inside ax_mask (not in_usa)?
+3. D4 — the 2,742 "modeled, absent in US" species: keep AquaMaps for the first preview (proposed, flag to flip), or let AquaX's absence win?
+4. D11 — v9 reviewer e-mails (AquaX authors?).
+5. D13 — v9 title/date wording for versions.csv.
+
+Two things the plan adds beyond the ask, because the survey found them: a reusable Phase 0 "bootstrap a version" step (clone unchanged dist/ from v8 by APFS clonefile; fix four readers that still assume v7's schema — score_zones is_ok, merge_models_prep worms_id, build_cell_grid's cell-table resume, the build_zone_cells gate), and a control run (AX_SUPERSEDE=0 → pra_score_delta must be cor 1.000) so the v9-vs-v8 divergence is provably the supersession and nothing else.
+
+I also saved the measured facts and proposed decisions to memory (project_v9_aquax). Next step once you've answered the questions: Phase 0 + Phase 1 (msens 0.37.0 with the tests), then the ingest notebook prototyped on AX_TEST_N=50 end-to-end.
+
+----
+
+Per D11 the author's email is gabriel.reygondeau@miami.edu. Yes, we want to add him to the allowed reviewer list. Otherwise, the suggestions in the plan look great! Please proceed with all phases, committing to main and reporting back along the way. Also setup a 20 min heartbeat monitor to maintain progress. Also be sure to update `@../docs/` with this new dataset -- do we need to update skills to account for this?
+
+
+## 2026-08-21 SDM workshop email to Gabrielle and Frank
+
+So Tim got back to me: "Thank you, Ben. Let's discuss this further during our next meeting. I looked into the funding status for this fiscal year and it appears unlikely; however, I am more optimistic about the prospects in early next fiscal year." I want to next get back to Gabrielle and Frank with amendments to improve the existing proposal, especially with some of the literture review findings and organization of goals, opportunities and technology developed with this assessment. Can you create a new version of @~/Desktop/sdm-workshop-brief/Proposed workshop_ Advancing Species Distribution Models.docx with track changes to include and send back to them? Plus draft an email in thread "Coordinating on SDM for biodiversity and management uses" in which I will also share that I will be attending the WCMBD conference after all (registration, travel and accomodation lined up)
+
+----
+
+Both pieces are ready.
+
+1. The redline
+
+~/Desktop/sdm-workshop-brief/Proposed workshop_ Advancing Species Distribution Models (Best amendments 2026-08-21).docx
+
+A genuine Word track-changes document — 870 → 3,125 words, all of it additions (nothing of theirs deleted), attributed to "Ben Best" so they can accept/reject item by item. Pandoc can't emit tracked changes, so it's built by make_tracked_amendments.py (saved beside it, re-runnable, asserts the source is unchanged).
+
+What went in:
+
+- Lit-scan findings as a new "Where the science stands" section, with DOIs. The strongest one: Karp et al. 2025 (ICES JMS) is NOAA's own synthesis calling SDM development and use "often haphazard" and asking for a community of practice — so the note can say it answers a published NOAA recommendation rather than proposing a meeting. Klaassen et al. 2025 independently names your three frontiers.
+- Goals reorganized into Share / Advance / Apply / Operationalize with named outputs, plus a "four limits" framing (static, surface-only, incompatible-or-unpublished, no standard uncertainty) that maps one breakout and one deliverable to each.
+- Replies into all three open comment threads — Ryan on other platforms pulling products (answered by the catalog section), Frank on interoperable inputs (now Objective 2's predictor stack), Ryan/Gabrielle on machine learning (AquaX is already a ten-algorithm ML ensemble, so the live questions are ensemble design, transferability, uncertainty propagation and explainability).
+- "Sharing: ERDDAP and a catalog layer, not one or the other" — grounded on the Welch/SWFSC projections actually sitting on NOAA ERD as file directories, with the 190 MB-per-species-model pain point.
+- Logistics strawman, expanded participants, new references (STAC-SDM, MST Marine Atlas, OBIS h3 tiles, MarineSDMs book), and the $50K open-data fund.
+
+2. The email
+
+Draft (not sent) in the Coordinating on SDM… thread, replying to Frank's last message — To Frank + Gabrielle, cc Gabriel + Steve. It opens with Bruges: you're coming after all, booked, and picks up directly where the thread ended ("Fingers crossed!"). Then walks through the eight amendment areas and offers to paste them into Gabrielle's Google Doc as suggestions instead if that's easier.
+
+Three things to check before sending
+
+1. Attach the redline — the base64 was too large to push through the tool, so the draft references it but nothing is attached.
+2. The funding paragraph. Tim didn't actually answer your "OK to forward?" question, so I kept both the document and the email deliberately vague: "exploring BOEM support; nothing is committed; this fiscal year looks unlikely but early FY27 seems more plausible." Tim is never named. Cut or soften that paragraph if you'd rather wait until you've spoken with him — it's the one part that discloses anything of his.
+3. Cc scope — you said Gabrielle and Frank; I added Gabriel and Steve since the amendments touch AquaX and the NOAA linkages they each wrote. Easy to drop.
+
+## 2026-08-20 SDM workshop email to Tim
+
+Draft an email to Timothy.White@boem.gov introducing this proposal as the ask ($94K for my participation [$82K cost + $12K direct costs] + $50K open SDM fund):
+
+`@~/Desktop/sdm-workshop-brief/sdm-workshop-proposal-v0.2.md`
+
+And if OK to send to Gabrielle Canonico and Frank Muller-Karger as amendment to their `@~/Desktop/sdm-workshop-brief/Proposed workshop_ Advancing Species Distribution Models.docx`.
+
+This is a follow-up to our conversation last week: `@~/Downloads/2026-08-13 Marine sensitivity check-in.txt`
+
+
+## 2026-08-20 navigation 'core links' to 'interactive apps'
+
+Let's update the `@../docs` right navbar:
+
+OLD:
+
+**Core links**
+▶ Composite Scores
+▶ Species Distribution
+
+NEW:
+
+**Interactive apps**
+▶ Composite **scores**
+▶ Individual **species**
+
+
 ## 2026-08-17 emailed issues
 
 Here's the full list.
@@ -457,6 +554,270 @@ Two things I checked rather than assumed
 - Access application paths ignore query strings, and the most specific path wins while unmatched subpaths inherit the parent — which is exactly why the version is the path, and why the catch-all admits admins anywhere you forget to gate.
 
 The README also has the Phase 2 flip in the right order (registry → access.sh → AUDs + Caddy → docs CI → verify), reviewer management, rollback, and the gotchas. Ping me when the account exists and I'll drive steps 6–8.
+
+### Resume 2026-08-27 ...
+
+----
+
+Here are the outputs from feeding the PLAN `@.claude/plans/2026-08-15 pre-release review gate — preview host + Cloudflare Access.md` and `@../server/cloudflare/README.md` to Claude in Chrome browser and facilitating login as ben@oceanmetrics.io for cloudflare.com and bdbest@gmail.com for squarespace.com....
+
+Blank/loading. Let me wait and reload.Dismissing the dialog and adding the TXT record.That "email cannot reach @marinesensitivity.org" recommendation confirms there's no MX configured today — good, one less thing to worry about. The "origin IP partially exposed" note is expected and by design: the runbook deliberately keeps `app`/`api`/`file`/etc. pointing at the same IP in the clear, since Caddy's `jwtauth` 401s any request that bypasses Cloudflare — that's the whole point, so I'll leave it alone.
+
+Now adding the GitHub Pages verification TXT record.Selecting TXT type first, then filling name/content.I need to scroll down within this dropdown to find TXT.Now filling in the name and content fields.Name resolves correctly to `_github-pages-challenge-marinesensitivity.marinesensitivity.org`. Now the content value.Matches exactly the value from Squarespace. Saving.Now shows "9 of 200 available DNS records" — the TXT record saved. Let me press Enter/scroll to confirm it in the filtered list.TXT record confirmed saved correctly, DNS-only as expected. That closes the DNS reconciliation gap. Let me update the task list and check SSL/TLS mode before moving on.Current mode is "Full" — the README requires "Full (strict)" since the origin holds a real Let's Encrypt cert. Let me change it.Selecting "Full (Strict)" as specified in the runbook."Full (Strict)" is now selected. Let me scroll down to find a Save button.Clicking Save. The origin connection/post-quantum settings below aren't mentioned in the runbook, so I'll leave them at default.Saving. Let me verify it landed on Full (Strict).Page still loading.All zone-side values collected:
+
+- **CF_ACCESS_TEAM** = `marinesensitivity`
+- **CF_ACCOUNT_ID** = `af075785741eb60e6e4d482a71fa592d`
+- **CF_ZONE_ID** = `774889ae4653cf9a22425f77a3a0e6bc`
+- **New nameservers** (for Squarespace) = `chuck.ns.cloudflare.com`, `tia.ns.cloudflare.com`
+
+The zone itself is now correctly configured (only `preview` proxied, SSL Full Strict, the GitHub Pages TXT record preserved) and just waiting on the nameserver switch. While that's pending, let me set up the One-time PIN identity provider and the API token, since those don't depend on the nameserver cutover.Selecting "One-time PIN".One-time PIN now shows "ADDED" — no configuration required. Task 4 done. Now creating the scoped API token.Clicking "Create Token", then "Create Custom Token".Good, dropdown with permission options is visible. Selecting "Access: Apps and Policies".Selecting "Edit", then adding the next permission row.Row 1 is set correctly (Account / Access: Apps and Policies / Edit). Row 2 already defaults to "Account". Setting the middle dropdown to "Access: Service Tokens".I need to scroll within this dropdown to find "Access: Service Tokens".Selecting "Edit", then adding row 3 for "Access: Organizations, Identity Providers, and Groups" (Read).Row 2 correctly set. Now setting row 3's permission type to "Access: Organizations, Identity Providers, and Groups".Selecting the exact match "Access: Organizations, Identity Providers, and Groups".Selecting "Read" per the README, then adding row 4 for the Zone-level "Cache Rules" Edit permission.Row 3 correctly set to Read. Now row 4 needs the first dropdown changed from "Account" to "Zone".Selecting the "Cache Rules" match, then setting Edit level.Need to scope "Zone Resources" to just `marinesensitivity.org` rather than all zones, per the runbook.Zone resource correctly scoped. Account Resources is already "All accounts" (fine — README says "Account resources: your account", and there's only one account). Let's scroll up to verify Account Resources, then continue to summary.The zone-level Cache Rules permission is missing from the summary — only account permissions show. Let me go back and check.All permission rows are actually correctly configured (Zone / Cache Rules / Edit / marinesensitivity.org). The summary page just displayed it oddly. Let's scroll down and click "Continue to summary" again to double check.All fields confirmed correct. Clicking Continue to summary and then Create Token.Now it correctly shows both the account permissions and the zone-scoped `marinesensitivity.org - Cache Rules:Edit` line. Exactly matching the runbook's spec. Creating the token.**Important — copy that token now.** Cloudflare shows it exactly once; click the copy icon next to `cfut_HH3G...` on your screen before navigating away, since it can't be retrieved again (you'd have to make a new one). That's `CF_API_TOKEN` for the server `.env` in step 6 — I can't put it there myself since that lives on your server over SSH, outside this browser.
+
+Here's where things stand on the Cloudflare side:
+
+Done in the dashboard: Zero Trust team renamed to `marinesensitivity` (team domain `marinesensitivity.cloudflareaccess.com`), the `marinesensitivity.org` zone added on the Free plan with DNS fully reconciled — only `preview` is proxied, everything else (wildcard, apex GitHub Pages records, `www`, `_domainconnect`) is DNS-only, the GitHub Pages verification TXT record preserved, SSL/TLS set to Full (Strict), One-time PIN added as a login method, and the scoped API token created.
+
+Values you'll need for the server `.env`:
+- `CF_ACCOUNT_ID=af075785741eb60e6e4d482a71fa592d`
+- `CF_ZONE_ID=774889ae4653cf9a22425f77a3a0e6bc`
+- `CF_ACCESS_TEAM=marinesensitivity`
+- `CF_API_TOKEN=` contents of: `@~/My Drive/private.2026-08-27_msens-preview-access-token_ben@oceanmetrics.io.txt`
+
+What's left, and it's genuinely yours to do — I don't have access to your Squarespace account or your server:
+
+1. **Nameserver cutover** (README step 3): Squarespace → Domains → `marinesensitivity.org` → Nameservers → replace the four `*.squarespacedns.com` entries with `chuck.ns.cloudflare.com` and `tia.ns.cloudflare.com`. Squarespace keeps its records as the rollback path. Expect Cloudflare's "zone is active" email in anywhere from minutes to ~24 hours.
+2. Once active, run the diff the README describes (`dns_snapshot.sh` before/after) to confirm only `preview` changed, then the `curl -sI` sanity checks against `app`, the docs root, and `file`.
+3. Steps 6–9 (filling `.env`, running `cloudflare/access.sh`, deploying Caddy, and the sign-in verification with Tim) happen on your server over SSH — bring me back in there if you want help interpreting output or debugging.
+
+If you hit anything confusing on the Squarespace nameserver screen, paste a screenshot the way you did for the DNS panel and I'll walk through it with you.
+
+----
+
+Ok, copied API token, but unclear as to where to enter name servers. Switched tab to:  https://account.squarespace.com/domains/managed/marinesensitivity.org/dns/domain-nameservers
+
+----
+
+Nameservers are already updated — Squarespace shows `chuck.ns.cloudflare.com` and `tia.ns.cloudflare.com` in place, with a confirmation: "Nameservers updated on Aug 27, 2026, 1:42 AM." That's the big one done.Let me check whether Cloudflare has already picked up the change.Still waiting. Let me trigger the manual check.Nameserver propagation is now in progress — Cloudflare confirmed it's checking, and says to allow a few hours (Squarespace's own estimate was up to 48h, though the README's real-world experience was usually 1–2 hours). Nothing more to do on that front until it flips to active; Cloudflare will also email you.
+
+Full status of Phase 1 (this browser session):
+
+- Zero Trust org renamed to `marinesensitivity` — done
+- Zone added, DNS reconciled (only `preview` proxied, everything else DNS-only, GitHub Pages verification TXT preserved), SSL Full (Strict) — done
+- One-time PIN login method added — done
+- Scoped API token created — done, you copied it
+- Nameservers switched at Squarespace to `chuck.ns.cloudflare.com` / `tia.ns.cloudflare.com` — done, propagating now
+
+Once Cloudflare confirms the zone is active, the remaining README steps happen on your server over SSH, not in this browser: paste the four values into `/share/github/MarineSensitivity/server/.env` (`CF_API_TOKEN`, `CF_ACCOUNT_ID=af075785741eb60e6e4d482a71fa592d`, `CF_ZONE_ID=774889ae4653cf9a22425f77a3a0e6bc`), then run `cloudflare/access.sh --dry-run` followed by `cloudflare/access.sh`, paste the printed `CF_ACCESS_TEAM=marinesensitivity` / `CF_ACCESS_AUD=...` back into `.env`, and `DEPLOY_CADDY=1 quarto render release_marine-atlas.qmd`.
+
+Would you like me to check back on the nameserver status periodically and let you know when it's live, or would you rather check yourself and come back when you're ready for the server-side steps?
+
+----
+
+Here are the outputs from feeding the PLAN `@.claude/plans/2026-08-15 pre-release review gate — preview host + Cloudflare Access.md` and `@../server/cloudflare/README.md` to Claude in Chrome browser and facilitating login as ben@oceanmetrics.io for cloudflare.com and bdbest@gmail.com for squarespace.com....
+
+[[above]]
+
+----
+
+The browser half is done. Picking up the server half now — first, whether the zone is actually live (Access applications can only be created for an active zone), plus the before/after DNS diff the runbook calls for.
+
+Zone is active. But preview is not actually proxied yet — Cloudflare's own nameservers return the origin IP for it, which is what a grey-cloud record does. Confirming via headers:
+
+Confirmed: preview responses come straight from Caddy with no cf-ray — the record is grey (DNS-only), so Access can never see that traffic. My token has no DNS permission, so that flip is yours (30 seconds, below). Meanwhile I'll do every server step that doesn't depend on it.
+
+Credentials in place. Running access.sh — dry-run first, then for real.
+
+Two bugs surfaced, one of them mine and consequential: a brand-new zone has no cache-rules entrypoint ruleset (10003), and my script accumulates service-token secrets to print at the end — so that failure swallowed the token secret, which the API only returns once. Fixing both.
+
+Idempotency proven (created → updated), cache rule applied, and we have the team domain + AUD. Wiring them into .env and deploying the routing:
+
+----
+
+All phases of the plan are complete. Here's what happened while you slept.
+
+The gate is live, and v8 is now reviewer-only
+
+Sign in at https://preview.marinesensitivity.org/ (email code to ben@oceanmetrics.io). Tim's policy is already in place — but I did not email him; that's an outward-facing message for you to send.
+
+┌──────────────────────────────────────┬──────────────────────────────────────────────┐
+│               Surface                │                    State                     │
+├──────────────────────────────────────┼──────────────────────────────────────────────┤
+│ Public apps, docs, file/storage/API  │ 200 — unaffected                             │
+├──────────────────────────────────────┼──────────────────────────────────────────────┤
+│ app…/scores/?ver=v8                  │ falls back to v7 + modal pointing at preview │
+├──────────────────────────────────────┼──────────────────────────────────────────────┤
+│ marinesensitivity.org/docs/v8/       │ 404 (book moved to gh-pages-preview)         │
+├──────────────────────────────────────┼──────────────────────────────────────────────┤
+│ storage…/marine-atlas/v8/            │ 403 (101,408 objects unadvertised)           │
+├──────────────────────────────────────┼──────────────────────────────────────────────┤
+│ preview…/v8/scores/, /docs/v8/       │ 302 → Cloudflare login; 200 signed in        │
+├──────────────────────────────────────┼──────────────────────────────────────────────┤
+│ Origin-direct (bypassing Cloudflare) │ 401                                          │
+├──────────────────────────────────────┼──────────────────────────────────────────────┤
+│ CHECK_PREVIEW                        │ green — 1 restricted, 8 public               │
+└──────────────────────────────────────┴──────────────────────────────────────────────┘
+
+Your per-version question is now proven, not asserted: a credential scoped to v8 opens /v8/scores/ and /docs/v8/ but is bounced to the login on /v7/scores/ and /. That's a permanent check now, using a probe token access.sh mints per restricted version.
+
+Also hardened: /report refuses a restricted release unless the caller is the preview app (shared secret) — a citable PDF of unreviewed results is the one artifact that shouldn't circulate. Data endpoints stay open deliberately: decision 3 keeps v8's data public on S3, so gating them would be theatre.
+
+Bugs found and fixed (six)
+
+1. Both public apps were down (500) when I started — a container recreate had reset msens to a stale hand-maintained pin. Fixed at the root per your question: builds now track msens main (build.sh resolves it to a SHA so the layer cache can't serve stale), and the container reconciles with the /share checkout at every start. Proved both branches.
+2. cont-init's PATH lacks /usr/local/bin, so my first reconcile couldn't find R and mislabelled it an install failure.
+3. access.sh printed new service-token secrets at the end, so an earlier failure swallowed one Cloudflare shows only once → now recorded at creation, plus --rotate.
+4. A brand-new zone has no cache-rules ruleset (API 10003) — an empty state, not an error.
+5. I broke public /report by calling newer msens::atlas_*() inside the plumber image, which pins msens 0.13.1 on purpose → rewrote the check to read versions.json directly; verified a real v7 report renders (200 + URL).
+6. CF_ACCESS_AUD (3 space-separated AUDs) was unquoted in .env, so set -a; . ./.env exported only the first and ran the rest as commands.
+
+Two earlier ones you already know about: the checks could pass with the host un-proxied (now asserts cf-ray first), and service-token JWTs carry common_name, not email.
+
+Left for you
+
+- Invite Tim — his PIN reaching a .gov inbox is the real acceptance test (if it's filtered, ask IT to allowlist noreply@notify.cloudflare.com).
+- Phase 3 is decisions, not chores, so I left it: Google IdP (needs a GCP OAuth client), @boem.gov/@noaa.gov domain policies (widens access), Microsoft IdP (needs DOI), Cloudflare in front of the public hosts (caching/perf), and dataset-level restriction (the separate 2026-07-15 plan).
+
+Everything is committed and pushed across msens, apps, api, server, workflows, docs, with the plan file carrying the full record.
+
+----
+
+Ok, looks like it's working! But where do I add emails to access specific versions? And why does v8 scores and species apps not fully load -- Loading map spinner on v8 scores, blank map on v8 species [Image #3] [Image #4]
+
+----
+
+Both fixed. Verified in Chrome just now: scores draws the globe with Program Areas and score colours, species draws the leatherback distribution, and the PREVIEW badge names you.
+
+Why the maps hung
+
+shiny-server serves its own client bundle at <app>/__assets__/… from a handler that 404s if the request carries any query string — and my routes forced ?ver=v8 onto every request under the version prefix, not just the page. So shiny-server-client.min.js and sockjs.min.js 404'd → preShinyInit undefined → the SockJS wrapper never initialised → the browser fell back to a raw wss://…/websocket/ that shiny-server doesn't answer. Sidebar renders, map never arrives.
+
+Now only the page GET gets ver forced; from there the signed session token carries the version, so subresources proxy with their original query untouched. The routes test gained the assertion that would have caught it — the existing shared/shiny.min.js check didn't, because that path tolerates a query. (Worth noting: my earlier "PREVIEW_ROUTES_OK" was true but incomplete — it proved routing, not that the app actually became usable. Your screenshots caught what my checks couldn't.)
+
+### Where to add emails per version
+
+Everything lives in `/share/github/MarineSensitivity/server/.env`:
+
+```bash
+PREVIEW_ADMINS=ben@oceanmetrics.io                                   # catch-all: landing page + any ungated version
+PREVIEW_REVIEWERS_V8=ben@oceanmetrics.io,timothy.white@boem.gov      # v8 only  (V4B for v4b, V9 for v9…)
+```
+
+Then apply:
+
+```bash
+ssh msens 'cd /share/github/MarineSensitivity/server && set -a && . ./.env && set +a && cloudflare/access.sh'
+```
+
+Adding or removing someone on an existing version is a policy-only change — no new AUDs, so no `DEPLOY_CADDY` needed. A new restricted version (say v9) also mints new applications, so there you'd flip `versions.csv`, publish the registry, run `access.sh`, paste the printed `CF_ACCESS_AUD` line, then `DEPLOY_CADDY=1`. `DEPLOY_ACCESS=1` on the release notebook runs the same script if you prefer the notebook path.
+
+You can also edit the policy in the Cloudflare dashboard (Zero Trust → Access → Policies → "preview v8 reviewers"), but access.sh would overwrite it on its next run — .env is the source of truth.
+
+Tim is already on the v8 policy, so he only needs the link: https://preview.marinesensitivity.org/v8/scores/ (his PIN goes to his .gov inbox; if it doesn't arrive, ask IT to allowlist noreply@notify.cloudflare.com).
+
+### Speed up with version routing
+
+Do your routes need to force `?ver=v8` onto every request, or could the Shiny apps simply extract the version from the URL directory (ie `/v8/`, not `?ver=v8`), since now all versions are prefixed. For instance, the default generated URL to the scores app has a `v8` redunancy:
+
+https://preview.marinesensitivity.org/v8/species/?ver=v8&mdl_key=ms_merge|WORMS:137209
+
+I want to maintain clean sparse code as much as possible, plus fast response times (without extra routes and loops). I'm seeing some diagnostics suggesting slowness loading apps in the JS Console [Image #7] [Image #8]
+
+----
+
+Good catch — that redundancy is a symptom, not just cosmetics. Short answer: **no, they don't need to force it at all**. Since the fix, only the page GET carries `?ver=`, but even that is unnecessary — Caddy already knows the version from the path and can hand it to the app as a server-set header, which is strictly better than a query the client can see and edit. Let me check what the apps would need.
+
+----
+
+Done — and your instinct was right on both counts.
+
+The version now comes from the path, not a repeated query
+
+Caddy strips /v8/ (shiny-server serves the app at /scores) and hands the version over as X-MS-Version — a header the server sets from the path, exactly like X-MS-User. ui(req) prefers it and falls back to ?ver= on the public host, which has no prefix. So:
+
+- URLs are clean: /v8/species/?mdl_key=ms_merge|WORMS:137209 — verified in the browser just now.
+- A client's stray ?ver=v7 under /v8/ is inert (the routes test asserts this).
+- The code got smaller, not bigger: with no query to rewrite, the page-vs-subresource split I'd added collapsed back to one route block, and the deep-link builders stopped duplicating ver.
+
+That also removes the whole class of bug you hit — __assets__ 404s on any query, so not touching the query means it can't recur by construction rather than by careful exception.
+
+The console diagnostics
+
+I measured instead of guessing — the gate is faster than the public path, because Cloudflare terminates TLS near you:
+
+┌──────────────┬───────────────────────┬───────────────────┐
+│              │ preview (/v8/scores/) │ public (/scores/) │
+├──────────────┼───────────────────────┼───────────────────┤
+│ TTFB, warm   │ 1.25 s                │ 1.92 s            │
+├──────────────┼───────────────────────┼───────────────────┤
+│ static asset │ 0.38 s                │ 0.83 s            │
+└──────────────┴───────────────────────┴───────────────────┘
+
+(The 13.4 s I also recorded on public was a cold Shiny worker — same on either host, ~14–19 s.)
+
+Of the console lines: the [Violation] setTimeout 74 ms is the GA4 tag, load 151 ms is jQuery, and the repeated READ-usage buffer … discarded the shadow copy is MapLibre's WebGL readback drawing the globe — all pre-existing, none from the gate. The one worth fixing was real and yours: shiny.autoreload = TRUE was left on in species/app.R — a development option that ran a legacy file watcher in every worker and made each page open a wss://…/autoreload/ socket nothing answers. Removed; the browser now reports autoreload: false, and it was never preview-specific (the public app did it too).
+
+Docs updated as asked
+
+- server/cloudflare/README.md — now leads with operations: live state (v8 restricted; you admin, Tim on v8), Managing reviewers, What a reviewer does, with the one-time setup kept below as the record. Gotchas gained the three that bit in production.
+- workflows/CLAUDE.md — the URL scheme + X-MS-Version, reviewer management with the defaults, and the deploy order gotcha I hit: DEPLOY_APPS before DEPLOY_CADDY for coordinated changes, since the routes test asserts the app renders the path's version.
+- server/README.md — a Preview host section so it's discoverable from the repo root.
+- apps/README.md — the two instances, and where each gets its version.
+
+To add a reviewer: one line in .env (PREVIEW_REVIEWERS_V8=…), then access.sh — policy-only, nothing else to deploy. Final CHECK_PREVIEW: green (1 restricted, 8 public, per-version isolation asserted).
+
+----
+
+Both apps reference https://marinesensitivity.org/docs/figures/overview-methods.svg in the initial modal, but that URL too has changed. Can you fix it and any other URLs rendered or fixed that might need updating from old URL pre-versioning
+
+And is there anything that can be done to speed up this loading, such as handling GA4 asynchronously?
+
+> Of the console lines: the [Violation] setTimeout 74 ms is the GA4 tag, load 151 ms is jQuery, and the repeated READ-usage buffer … discarded the shadow copy is MapLibre's WebGL readback drawing the globe — all pre-existing, none from the gate.
+
+----
+
+Both fixes verified live. Here's the picture.
+
+The stale URLs — three, not one
+
+where: both app modals
+was: marinesensitivity.org/docs/figures/overview-methods.svg (404 since the docs CI pruned the flat
+root)
+now: the figure from that release's own book — verified it ships in v1–v8
+────────────────────────────────────────
+where: both app modals
+was: bare /docs/ and a relative ../species/
+now: msens::product_urls() — the release's docs, and the sibling app with its version
+────────────────────────────────────────
+where: api/report.qmd
+was: /species_v8 and /mapgl (retired spellings)
+now: version-explicit links: ?ver= publicly, the path on the preview host
+
+The report one mattered most: those retired URLs survive only as 301s, and now that v8 is restricted the public host refuses it and serves the promoted release instead — so a v8 report would have linked readers to v7 data under a v8 heading. It also picked mdl_key on == "v8" only, so a v9 report would have emitted the old mdl_seq spelling; that's now >= v8 (checked v1–v10). Confirmed in the browser: the modal image loads from preview…/docs/v8/figures/… and both links carry v8.
+
+The loading time — it isn't GA4
+
+GA4 is already async: true, so it never blocked anything; that 74 ms is its own main-thread work after load. I measured the actual timeline instead:
+
+- TTFB 14,952 ms of a 16,506 ms load. The whole client side is 79 requests / 148 KB (heaviest asset 48 KB). jQuery, MapLibre and GA together are noise.
+
+The cause: Shiny Server terminates an app's R process 5 seconds after its last session (app_idle_timeout default), so the next visitor rebuilds the version bundle from scratch. Set to 3600 in shiny-server.conf:
+
+┌──────────────────────┬──────────────┬─────────────────────────────────────────────────────────┐
+│                      │    before    │                          after                          │
+├──────────────────────┼──────────────┼─────────────────────────────────────────────────────────┤
+│ after a quiet gap    │ ~15 s        │ 0.64–0.96 s (proven after 150 s of silence; workers     │
+│                      │              │ still alive)                                            │
+├──────────────────────┼──────────────┼─────────────────────────────────────────────────────────┤
+│ public apps, second  │ 13.4 s → 1.8 │ same config, both benefit                               │
+│ hit                  │  s           │                                                         │
+└──────────────────────┴──────────────┴─────────────────────────────────────────────────────────┘
+
+Cost is ~550 MB per app process that has served a version, against 10.4 GB free, and an hour still releases it overnight. The remaining 15 s is only the first visit after a long idle or a restart — app_idle_timeout 0 would remove even that at the price of permanent residency; say the word and it's a one-line change.
+
+The READ-usage buffer … discarded the shadow copy lines are MapLibre's WebGL readback drawing the globe — pre-existing and not worth chasing given they cost nothing measurable.
+
+Everything is committed and pushed (apps, api, server), the gate re-verified green, and the perf finding recorded in the server-ops notes so it isn't rediscovered the hard way.
+
+----
 
 ## 2026-08-13 fix species app versions
 

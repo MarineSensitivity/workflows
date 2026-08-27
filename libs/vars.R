@@ -24,3 +24,15 @@ redo_am_ingest <- .flag("REDO_AM_INGEST")  # re-interpolate ALL species (else re
 # generic for the other ingest_*.qmd (vector ranges, raster SDMs): re-do this
 # dataset's models (delete + rebuild) instead of resuming from existing Parquet
 redo_ingest    <- .flag("REDO_INGEST")
+
+# ingest_aquax.qmd (v9 `ax`)
+ax_workers          <- as.integer(Sys.getenv("AX_WORKERS", "6"))   # furrr workers for TIF->Parquet / COGs
+ax_test_n           <- as.integer(Sys.getenv("AX_TEST_N", "0"))    # smoke test: only the first n models
+ax_cog              <- .flag("AX_COG")                # build the two COG representations
+ax_cog_s3           <- .flag("AX_COG_S3")             # ...and upload them to the marine-atlas
+ax_apply_cutoff     <- .flag("AX_APPLY_CUTOFF")       # zero CUR_NR below the model's TSS cutoff (D2; default off)
+ax_absent_supersedes<- .flag("AX_ABSENT_SUPERSEDES")  # AquaX "modeled, absent in US" also supersedes am (D4; default off)
+ax_supersede        <- .flag("AX_SUPERSEDE", default = TRUE)  # AX_SUPERSEDE=0 = control run (ax registered, nothing superseded)
+
+# bootstrap_version.qmd
+bootstrap_verify    <- .flag("BOOTSTRAP_VERIFY")      # re-hash cloned datasets against their ingest manifests

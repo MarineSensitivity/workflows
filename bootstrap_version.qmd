@@ -1,0 +1,161 @@
+---
+title: "Bootstrap a release version — clone the unchanged ingests from the previous version"
+msens:
+  target_name: bootstrap_version
+  workflow_type: grid
+  dependency: []
+  output: data/manifests/bootstrap_version.json
+editor_options:
+  chunk_output_type: console
+---
+
+`ver` in `libs/paths.R` has only ever moved once (v7 → v8), and that bump rewrote every ingest.
+A bump **on the same grid** (v8 → v9: same `global05` cells, same `r_cellid_global.tif`) must
+*reuse* the ingests nothing changed — AquaMaps alone is 50 GB and 40 min on the server, BirdLife
+and IUCN are hours — and it must do so **reproducibly**: which datasets were carried forward, from
+where, and whether they are the surfaces the content-addressed manifests checkpointed.
+
+This notebook clones `{dir_big}/{ver_prev}/marine-atlas/dist/dataset=*` (+ `model_*.csv`) into
+this version's `dist/`. On macOS/APFS that is `cp -c` (clonefile: instant, zero extra bytes,
+copy-on-write); on Linux it is a hardlink tree (`cp -al`). The ingest notebooks then **resume**
+against the clone — every Parquet already present — so their manifests do not change and nothing
+downstream re-runs for the wrong reason. Datasets this version re-ingests (v9: nothing; a future
+AquaMaps refresh would be `BOOTSTRAP_SKIP_DS=am`) are simply not cloned.
+
+Verification: by default file count + byte total per dataset must equal `ver_prev`'s;
+`BOOTSTRAP_VERIFY=1` re-hashes each cloned surface with `msens::hash_parquet()` and asserts
+equality with that ingest's `data/manifests/ingest_*.json` `content_hash` — proof that what was
+cloned is the checkpointed surface and not a stale directory.
+
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "Same-grid version bump: clone the unchanged ingests (copy-on-write) so they resume, verify against the ingest checkpoints"
+flowchart LR
+  prev[("{ver_prev}/marine-atlas/dist/<br/>dataset=* + model_*.csv")] -->|"cp -c (APFS clonefile)<br/>cp -al (Linux)"| cur[("{ver}/marine-atlas/dist/")]
+  cur --> chk["count + bytes == ver_prev<br/>BOOTSTRAP_VERIFY=1: hash_parquet == ingest manifest"]
+  chk --> mf["manifest: what was cloned,<br/>from where, how"]
+```
+
+## Setup
+
+```{r}
+#| label: setup
+
+librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, purrr, readr, tibble, quiet = TRUE)
+source(here("libs/paths.R"))   # ver, ver_prev, dir_big, dir_big_v
+source(here("libs/vars.R"))    # bootstrap_verify
+options(readr.show_col_types = FALSE)
+
+dist_prev <- path.expand(glue("{dir_big}/{ver_prev}/marine-atlas/dist"))
+dist_cur  <- path.expand(glue("{dir_big_v}/marine-atlas/dist"))
+manifest  <- here("data/manifests/bootstrap_version.json")
+skip_ds   <- trimws(strsplit(Sys.getenv("BOOTSTRAP_SKIP_DS", ""), ",")[[1]])
+skip_ds   <- skip_ds[nzchar(skip_ds)]
+dir_create(c(dist_cur, path_dir(manifest)))
+
+versions <- read_csv(here("data/versions.csv"))
+stopifnot(
+  "this version must have a row in data/versions.csv before anything is built for it" = ver %in% versions$ver,
+  "ver_prev has no marine-atlas dist/ to clone from" = dir_exists(dist_prev),
+  "ver and ver_prev must be on the same grid — a grid change is a re-ingest, not a clone" =
+    identical(msens::grid_for_ver(ver), msens::grid_for_ver(ver_prev)))
+log_info("bootstrap {ver} from {ver_prev}: {dist_prev} -> {dist_cur}; skip: {if (length(skip_ds)) paste(skip_ds, collapse=', ') else 'none'}")
+```
+
+## Clone the unchanged ingests (copy-on-write)
+
+```{r}
+#| label: clone
+
+# copy-on-write clone of one directory (or file). macOS: `cp -c` = clonefile(2) on APFS —
+# instant and zero extra bytes until either side is modified. Linux: hardlinks (`cp -al`),
+# which the ingests never break because they only ever ADD files (resume) or delete + rebuild
+# their whole dataset dir under REDO_*. rsync would COPY 60 GB; that is what this avoids.
+clone <- function(from, to) {
+  if (Sys.info()[["sysname"]] == "Darwin") system2("cp", c("-Rc", shQuote(from), shQuote(to)))
+  else                                     system2("cp", c("-al", shQuote(from), shQuote(to)))
+}
+tally <- function(d) {
+  f <- dir_ls(d, recurse = TRUE, type = "file")
+  tibble(n_files = length(f), bytes = sum(file_size(f)))
+}
+
+ds_dirs <- dir_ls(dist_prev, type = "directory", regexp = "dataset=")
+ds_keys <- sub("^dataset=", "", path_file(ds_dirs))
+todo    <- setdiff(ds_keys, skip_ds)
+
+rows <- map_dfr(todo, function(ds) {
+  from <- path(dist_prev, glue("dataset={ds}")); to <- path(dist_cur, glue("dataset={ds}"))
+  method <- if (dir_exists(to)) "exists" else {
+    st <- clone(from, to)
+    if (!identical(st, 0L)) stop(glue("clone of {ds} failed (exit {st})"))
+    if (Sys.info()[["sysname"]] == "Darwin") "clonefile" else "hardlink"
+  }
+  tp <- tally(from); tc <- tally(to)
+  tibble(ds_key = ds, method = method,
+         n_files_prev = tp$n_files, n_files = tc$n_files,
+         gb_prev = round(tp$bytes / 1e9, 2), gb = round(tc$bytes / 1e9, 2),
+         same = tp$n_files == tc$n_files && tp$bytes == tc$bytes)
+})
+# the per-dataset species crosswalks travel with their surfaces
+for (f in dir_ls(dist_prev, glob = "*model_*.csv")) {
+  to <- path(dist_cur, path_file(f))
+  if (!file_exists(to) && sub("^model_(.+)\\.csv$", "\\1", path_file(f)) %in% todo) file_copy(f, to)
+}
+# a dataset that was cloned earlier and has since diverged (an ingest ADDED models to it) is
+# legitimately different; a dataset that is SMALLER than its source is a truncated clone
+short <- rows |> filter(n_files < n_files_prev)
+stopifnot("cloned dataset(s) have FEWER files than ver_prev — truncated clone" = nrow(short) == 0)
+knitr::kable(rows)
+```
+
+## Verify against the ingest checkpoints (`BOOTSTRAP_VERIFY=1`)
+
+The count/bytes check above says the clone is complete; it cannot say the *source* was the
+surface the pipeline checkpointed. Re-hashing does — the ingest manifests are content-addressed
+(`msens::hash_parquet`, order-independent), so equality is proof, not suggestion. Off by default
+because hashing 60 GB takes a while; on when a version is being built for release.
+
+```{r}
+#| label: verify
+
+# ingest target -> ds_key, from each ingest notebook's msens: block (the same parser the DAG uses)
+wf <- msens::parse_qmd_frontmatter(dir_ls(here(), glob = "*.qmd"))
+ing <- wf |> filter(workflow_type == "ingest") |>
+  mutate(ds_key = map_chr(dataset, \(d) d$ds_key %||% NA_character_)) |>
+  filter(!is.na(ds_key)) |> select(target_name, ds_key, output)
+
+verified <- tibble()
+if (bootstrap_verify) {
+  con <- dbConnect(duckdb())
+  verified <- map_dfr(seq_len(nrow(ing)), function(i) {
+    ds <- ing$ds_key[i]; if (!ds %in% rows$ds_key) return(NULL)
+    mf <- here(ing$output[i])
+    expect <- if (file_exists(mf)) fromJSON(mf)$content_hash else NA_character_
+    got <- msens::hash_parquet(glue("{dist_cur}/dataset={ds}/*.parquet"), con)
+    tibble(ds_key = ds, target = ing$target_name[i], expected = expect, got = got,
+           ok = !is.na(expect) && identical(expect, got))
+  })
+  dbDisconnect(con, shutdown = TRUE)
+  knitr::kable(verified)
+  stopifnot("a cloned dataset does not hash to its ingest checkpoint" = all(verified$ok))
+} else log_info("BOOTSTRAP_VERIFY unset — clone checked by count + bytes only")
+```
+
+## Manifest
+
+```{r}
+#| label: manifest
+
+# content-addressed on WHAT was cloned (dataset set + sizes + method), not when
+h <- digest::digest(rows |> select(ds_key, n_files, gb, method), algo = "xxhash64")
+msens::write_manifest(
+  manifest, target = "bootstrap_version", content_hash = h,
+  stats = list(ver = ver, ver_prev = ver_prev, n_datasets = nrow(rows),
+               datasets = paste(rows$ds_key, collapse = ","), skipped = paste(skip_ds, collapse = ","),
+               gb_total = sum(rows$gb), method = paste(unique(rows$method), collapse = ","),
+               verified = if (nrow(verified)) all(verified$ok) else NA),
+  force = msens::force_target("bootstrap_version"))
+```

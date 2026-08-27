@@ -3,7 +3,7 @@ title: "Merge prep — taxon crosswalk (each model → WORMS / BOTW taxon)"
 msens:
   target_name: merge_models_prep
   workflow_type: merge
-  dependency: [ingest_worms, ingest_aquamaps, ingest_rng_iucn, ingest_birdlife_botw, ingest_rng_fws, ingest_ch_nmfs, ingest_ch_fws, ingest_turtles_swot_dps, ingest_ca_nmfs, ingest_listings]   # reads worms for the WORMS/BOTW taxon crosswalk; add ingest_sdm_nc/ingest_sdm_gm here when their density is folded into the merge
+  dependency: [ingest_worms, ingest_aquamaps, ingest_aquax, ingest_rng_iucn, ingest_birdlife_botw, ingest_rng_fws, ingest_ch_nmfs, ingest_ch_fws, ingest_turtles_swot_dps, ingest_ca_nmfs, ingest_listings]   # reads worms for the WORMS/BOTW taxon crosswalk; add ingest_sdm_nc/ingest_sdm_gm here when their density is folded into the merge
   output: data/manifests/merge_models_prep.json
 editor_options:
   chunk_output_type: console
@@ -69,7 +69,9 @@ lookup <- dir_ls(dir_dist, glob = "*model_*.csv") |>
       ds_key          = ds,
       scientific_name = m[[sci]],
       iucn_code       = if (is.na(iucn)) NA_character_ else as.character(m[[iucn]]),
-      sisid           = if ("sisid" %in% names(m)) as.character(m$sisid) else NA_character_) }) |>
+      sisid           = if ("sisid" %in% names(m)) as.character(m$sisid) else NA_character_,
+      # a dataset keyed by WoRMS AphiaID natively (AquaX `ax`) resolves by id, never by name
+      worms_id        = if ("worms_id" %in% names(m)) as.character(m$worms_id) else NA_character_) }) |>
   bind_rows() |> distinct(mdl_key, .keep_all = TRUE)
 
 # read ingested mdl_keys per dataset so a mid-transfer / corrupt dataset (e.g. am
@@ -101,14 +103,22 @@ count(models, ds_key)
 ```{r}
 #| label: worms
 
-nonbird <- models |> filter(ds_key != "bl") |> distinct(scientific_name) |>
+nonbird <- models |> filter(ds_key != "bl", is.na(worms_id)) |> distinct(scientific_name) |>
   mutate(sci_clean = clean_sci_name(scientific_name),                 # drop (=synonym), ssp. markers
          sci_binom = clean_sci_name(scientific_name, binomial = TRUE)) # Genus species fallback
 
 # reuse v7's taxon resolution, matched on the cleaned name
 con_v7  <- dbConnect(duckdb(v7_sdm_db, read_only = TRUE))
-v7_tax  <- tbl(con_v7, "taxon") |> filter(taxon_authority == "worms") |>
-  select(scientific_name, worms_id, worms_is_marine, worms_is_extinct) |> collect()
+# v1-v7 carried `worms_id`; v8+ carry the id as `taxon_id` under taxon_authority = 'worms'.
+# Resolved by introspecting the column set, never by version string.
+v7_tax  <- if ("worms_id" %in% dbListFields(con_v7, "taxon")) {
+  tbl(con_v7, "taxon") |> filter(taxon_authority == "worms") |>
+    select(scientific_name, worms_id, worms_is_marine, worms_is_extinct) |> collect()
+} else {
+  tbl(con_v7, "taxon") |> filter(taxon_authority == "worms") |>
+    select(scientific_name, worms_id = taxon_id, worms_is_marine, worms_is_extinct) |> collect() |>
+    mutate(worms_id = as.numeric(worms_id))
+}
 dbDisconnect(con_v7, shutdown = TRUE)
 v7_tax  <- v7_tax |> mutate(sci_clean = clean_sci_name(scientific_name)) |>
   distinct(sci_clean, .keep_all = TRUE) |> select(-scientific_name)
@@ -154,12 +164,16 @@ sisid_by_binom <- bird_xw |> distinct(sci_binom, .keep_all = TRUE) |> transmute(
 tm_nonbl <- models |> filter(ds_key != "bl") |>
   mutate(sci_clean = clean_sci_name(scientific_name),
          sci_binom = clean_sci_name(scientific_name, binomial = TRUE)) |>
-  left_join(resolved |> select(scientific_name, worms_id), by = "scientific_name") |>
+  left_join(resolved |> select(scientific_name, worms_id_name = worms_id), by = "scientific_name") |>
+  # a native WoRMS id (ax) wins over the name resolution; `format()` not `as.character()`, which
+  # renders 1e+06-style ids for large AphiaIDs
+  mutate(worms_id = coalesce(worms_id, ifelse(is.na(worms_id_name), NA_character_,
+                                              format(worms_id_name, scientific = FALSE, trim = TRUE)))) |>
   left_join(sisid_by_clean, by = "sci_clean") |>
   left_join(sisid_by_binom, by = "sci_binom") |>
   mutate(bird_sisid = coalesce(s_cln, s_bin),                  # bird? (clean match, else binomial)
          taxon_authority = if_else(!is.na(bird_sisid), "botw", "worms"),
-         taxon_id        = if_else(!is.na(bird_sisid), bird_sisid, as.character(worms_id))) |>
+         taxon_id        = if_else(!is.na(bird_sisid), bird_sisid, worms_id)) |>
   filter(!is.na(taxon_id)) |>
   transmute(mdl_key, taxon_authority, taxon_id)
 

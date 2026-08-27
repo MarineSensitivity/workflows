@@ -1,8 +1,9 @@
 # shared version and path configuration ----
 # sourced by all workflow notebooks and apps
 
-ver <- "v8" # version string; change on branches (e.g., "v3b")
-ver_prev <- "v7" # previous version (for copying inputs to new version)
+ver <- "v9" # version string; change on branches (e.g., "v3b")
+ver_prev <- "v8" # previous version (bootstrap_version.qmd clones its unchanged ingests; the
+                 # score gate compares against it)
 
 # v8 spatial sampling unit: GLOBAL 0.05 degree raster cell in [-180,180]
 # (rolled back from H3 hex; grid aligned to Bio-Oracle v3 + AquaX topology)
@@ -48,6 +49,14 @@ cellid_tif <- glue::glue("{dir_derived}/r_cellid_global.tif")
              if (dir.exists(path.expand(p))) p else glue::glue("{dir_derived}/aquamaps") }
 am_db  <- glue::glue("{.am_dir}/am.duckdb")
 w05_db <- glue::glue("{.am_dir}/am_w05.duckdb")
+
+# AquaX 2026-04 delivery (v9 `ax` dataset): per-species suitability TIFs ALREADY on the
+# global05 grid, masked to ply_boem-usa.gpkg (US waters only). Laptop-only input — the
+# server never needs the TIFs (COGs go to S3, Parquet stays with the pipeline).
+ax_dir         <- glue::glue("{dir_data}/AquaX_2026-04")
+ax_tif_dir     <- glue::glue("{ax_dir}/SDM/MBON_USA_BOEM_masked_emmean_matched_species_TIF_TIF")
+ax_summary_csv <- glue::glue("{ax_dir}/SDM/MBON_USA_BOEM_masked_emmean_matched_species_TIF_species_summary.csv")
+ax_xlsx        <- glue::glue("{ax_dir}/species_USA_2025-10-29_worms-only.xlsx")
 
 # study-area (to-shore US EEZ) + Program-Area polygons for in_usa / in_pra membership
 ply_usa_gpkg <- glue::glue("{dir_derived}/v1/ply_boem-usa.gpkg")            # shared

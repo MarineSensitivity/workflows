@@ -151,13 +151,25 @@ so a mismatch anywhere means the new path would move scores.
 # than hardcoding a key: correcting the key column collapsed programarea from two
 # vintages to one, and a hardcoded path would have silently pointed at nothing
 # and skipped the gate.
+# The gate needs a RELEASED zone_cell to compare against. A version that has not
+# shipped yet (v9 while it is being built) has none -- and "skipped" is exactly the
+# failure mode this notebook exists to prevent. The extraction is (geometry x grid),
+# so gate against ver_prev's released zone_cell on the same grid instead.
+released <- function(v)
+  file.exists(path.expand(glue("{dir_big}/{v}/marine-atlas/tables/zone_cell.parquet"))) ||
+  v %in% msens::atlas_versions()$ver
+gate_ver <- if (released(ver)) ver else
+  if (identical(msens::grid_for_ver(ver_prev), msens::grid_for_ver(ver)) && released(ver_prev)) ver_prev else
+  NA_character_
+stopifnot("no released zone_cell to gate against (neither this version nor ver_prev on the same grid)" =
+            !is.na(gate_ver))
 zs_pa <- zone_sets |>
   filter(zone_type == "programarea",
-         grepl(paste0("\\b", ver, "\\b"), dplyr::coalesce(versions, ""))) |>
+         grepl(paste0("\\b", gate_ver, "\\b"), dplyr::coalesce(versions, ""))) |>
   slice_head(n = 1)
-stopifnot("no programarea zone set records this version" = nrow(zs_pa) == 1)
-f_v8 <- glue("{dir_zc}/{zs_pa$zone_set_key}/{msens::grid_for_ver(ver)}/zone_cell.parquet")
-cat(glue("gate: {zs_pa$zone_set_key} x {msens::grid_for_ver(ver)}\n\n"))
+stopifnot("no programarea zone set records the gate version" = nrow(zs_pa) == 1)
+f_v8 <- glue("{dir_zc}/{zs_pa$zone_set_key}/{msens::grid_for_ver(gate_ver)}/zone_cell.parquet")
+cat(glue("gate: {zs_pa$zone_set_key} x {msens::grid_for_ver(gate_ver)} against released {gate_ver}\n\n"))
 
 # Read v8's zone/zone_cell from the RELEASED Parquet, not sdm.duckdb: the full
 # build database lives only on the laptop, so keying the gate on it would let it
@@ -165,8 +177,11 @@ cat(glue("gate: {zs_pa$zone_set_key} x {msens::grid_for_ver(ver)}\n\n"))
 # The released tables exist in both places (locally under {dir_big_v}/tables,
 # else over path-style HTTPS from the public bucket).
 tbl_src <- function(t) {
-  loc <- path.expand(glue("{dir_big_v}/tables/{t}.parquet"))
-  if (file.exists(loc)) loc else glue("{msens::atlas_base_url()}/{ver}/tables/{t}.parquet")
+  # the release stages tables under marine-atlas/tables/ (laptop); big/{ver}/tables/ is the server layout
+  loc <- path.expand(c(glue("{dir_big}/{gate_ver}/marine-atlas/tables/{t}.parquet"),
+                       glue("{dir_big}/{gate_ver}/tables/{t}.parquet")))
+  loc <- loc[file.exists(loc)]
+  if (length(loc)) loc[1] else glue("{msens::atlas_base_url()}/{gate_ver}/tables/{t}.parquet")
 }
 
 if (file.exists(f_v8)) {
@@ -181,7 +196,7 @@ if (file.exists(f_v8)) {
 
   new <- arrow::read_parquet(f_v8) |> arrange(zone_key, cell_id)
 
-  cat(glue("old (released {ver}): {nrow(old)} rows, {n_distinct(old$zone_key)} zones\n",
+  cat(glue("old (released {gate_ver}): {nrow(old)} rows, {n_distinct(old$zone_key)} zones\n",
            "new (zone set):      {nrow(new)} rows, {n_distinct(new$zone_key)} zones\n\n"))
 
   stopifnot(
@@ -189,7 +204,7 @@ if (file.exists(f_v8)) {
     "zone keys differ"   = identical(sort(unique(old$zone_key)), sort(unique(new$zone_key))),
     "cell ids differ"    = identical(old$cell_id, new$cell_id),
     "coverage differs"   = identical(as.integer(old$pct_covered), as.integer(new$pct_covered)))
-  cat("PASS — the relocated zone_cell reproduces v8's byte for byte\n")
+  cat(glue("PASS — the relocated zone_cell reproduces {gate_ver}'s byte for byte\n"))
 } else {
   cat("skipped: the programarea_2026-03 x global05 extract is not built yet\n")
 }

@@ -4,7 +4,7 @@ subtitle: "Global ocean 0.05° raster cells in [-180,180] with env covariates + 
 msens:
   target_name: build_cell_grid
   workflow_type: grid
-  dependency: []
+  dependency: [bootstrap_version]   # a same-grid version bump clones the unchanged ingests first
   output: data/manifests/build_cell_grid.json
 format: html
 editor_options:
@@ -53,8 +53,24 @@ dir.create(dirname(cell_db), recursive = TRUE, showWarnings = FALSE)
 dir.create(here("data/manifests"), recursive = TRUE, showWarnings = FALSE)
 
 # skip the expensive global build if the cell-id COG already exists (resume),
-# unless forced; a bbox prototype always rebuilds into its own CELL_DB
-need_build <- redo_cell_grid || nzchar(cell_bbox) || !file.exists(cellid_tif)
+# unless forced; a bbox prototype always rebuilds into its own CELL_DB.
+#
+# The cell-id COG is SHARED across versions, but the `cell` TABLE lives in this
+# version's sdm.duckdb. A fresh version directory therefore has the COG and no
+# table -- and every downstream `stopifnot("run build_cell_grid first" =
+# file_exists(sdm_db))` passes on an empty database. Resume path for that case:
+# copy `cell` from ver_prev's build DB (seconds) and assert it hashes to the
+# checkpoint; rebuild only when there is nothing to copy.
+has_cell <- function(db) {
+  db <- path.expand(db)
+  if (!file.exists(db)) return(FALSE)
+  c0 <- dbConnect(duckdb(db, read_only = TRUE)); on.exit(dbDisconnect(c0, shutdown = TRUE))
+  "cell" %in% dbListTables(c0)
+}
+prev_db    <- glue("{dir_big}/{ver_prev}/sdm.duckdb")
+need_build <- redo_cell_grid || nzchar(cell_bbox) || !file.exists(cellid_tif) ||
+              (!has_cell(cell_db) && !has_cell(prev_db))
+copy_cell  <- !need_build && !has_cell(cell_db) && has_cell(prev_db)
 ```
 
 ## Read Bio-Oracle, assign global cell_id, membership + area
@@ -101,8 +117,24 @@ if (need_build) {
   # global cell-id COG in [-180,180] for titiler (uint32; no overviews to keep ids intact)
   writeRaster(r$cell_id, cellid_tif, filetype = "COG", datatype = "INT4U", overwrite = TRUE,
               gdal = c("COMPRESS=LZW", "OVERVIEWS=NONE"))
+} else if (copy_cell) {
+  # same grid, new version: the table is a straight copy of ver_prev's, verified
+  # against the content-addressed checkpoint rather than trusted
+  con <- dbConnect(duckdb(cell_db))
+  dbExecute(con, glue("ATTACH '{path.expand(prev_db)}' AS prev (READ_ONLY)"))
+  dbExecute(con, "CREATE TABLE cell AS SELECT * FROM prev.cell")
+  dbExecute(con, "ALTER TABLE cell ADD PRIMARY KEY (cell_id)")
+  dbExecute(con, "DETACH prev")
+  h_copy <- msens::hash_query(con, "cell")
+  dbDisconnect(con, shutdown = TRUE)
+  mf <- here("data/manifests/build_cell_grid.json")
+  if (file.exists(mf)) {
+    h_ckpt <- jsonlite::fromJSON(mf)$content_hash
+    stopifnot("copied cell table does not hash to the build_cell_grid checkpoint" = identical(h_copy, h_ckpt))
+  }
+  message(glue("cell table copied from {ver_prev} ({h_copy}) -> {cell_db}"))
 } else {
-  message(glue("cell grid up to date (cellid_tif exists); set REDO_CELL_GRID=1 to rebuild"))
+  message(glue("cell grid up to date (cellid_tif + cell table exist); set REDO_CELL_GRID=1 to rebuild"))
 }
 ```
 
