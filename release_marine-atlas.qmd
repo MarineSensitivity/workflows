@@ -820,6 +820,11 @@ asserts on it, so a misrouted host or a leaked release fails the render. The app
 
 - **public host, restricted version → NOT that version** (`ms-ver` = the promoted release,
   `ms-preview` = 0); public versions render as themselves.
+- **the preview host is actually PROXIED through Cloudflare** — asserted first, because every
+  other check below passes trivially when it is not: a grey-cloud DNS record sends visitors
+  straight to the origin, which 401s everything, so the gate reads as "closed" while Access is
+  not in the request path at all and no reviewer can ever get in. A Cloudflare-proxied response
+  carries `cf-ray`; the origin's does not.
 - **preview host without a token → never 200** (Cloudflare Access 302s to its login; the
   origin's `jwtauth` 401s). With a Cloudflare Access **service token**
   (`CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` in the environment) → 200,
@@ -866,6 +871,17 @@ if (!do_check_preview) {
   }
   fail <- character()
   bad  <- function(msg) { fail <<- c(fail, msg); log_error(msg) }
+
+  # 0. IS CLOUDFLARE EVEN IN THE PATH? Without this the whole check suite is
+  # vacuous: a DNS-only (grey-cloud) `preview` record means every request goes
+  # straight to the origin, which 401s -- "closed" for the wrong reason, and
+  # closed for the reviewers too. A proxied response carries `cf-ray`.
+  hdr <- suppressWarnings(system2("curl", c("-sS", "-m", "30", "-o", "/dev/null", "-D", "-",
+                                            shQuote(prev_url)), stdout = TRUE, stderr = TRUE))
+  if (!any(grepl("^cf-ray:", hdr, ignore.case = TRUE)))
+    bad(glue("{prev_host} is NOT proxied through Cloudflare (no cf-ray): set its DNS record to ",
+             "Proxied, or Access can never see -- or admit -- a request"))
+  else log_info("{prev_host} is proxied through Cloudflare (cf-ray present)")
 
   # 1. the PUBLIC host never renders a restricted version; public ones render as themselves
   for (a in c("scores", "species")) {
