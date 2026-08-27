@@ -111,6 +111,57 @@ stopifnot("cloned dataset(s) have FEWER files than ver_prev — truncated clone"
 knitr::kable(rows)
 ```
 
+## Clone the unchanged NATIVE assets (+ their published copies, `BOOTSTRAP_PUBLISH=1`)
+
+`publish_native.qmd` builds per-model COGs / PMTiles for every served input and is resumable by
+file existence — so a version directory without `native/` rebuilds all 18,710 AquaMaps COGs, the
+0.5° originals, the vector PMTiles and the 7 GB IUCN GeoPackage (hours), for inputs that did not
+change. Clone them from `ver_prev` the same way as `dist/`. The **merged** COGs (`merged`,
+`_merged_parts`) are deliberately NOT cloned: they are what a new version repaints.
+
+Published copies are per version on S3 (`{ver}/native/…`) and on the file host
+(`/share/data/derived/pmtiles/{ver}`), so with `BOOTSTRAP_PUBLISH=1` they are copied
+**server-side** (`aws s3 sync s3://…/{ver_prev}/native/x s3://…/{ver}/native/x`, and a hard-link
+copy on the file host) — no bytes leave the laptop, and `publish_native`'s own sync then finds
+every key present.
+
+```{r}
+#| label: native
+
+nat_prev <- path.expand(glue("{dir_big}/{ver_prev}/marine-atlas/native"))
+nat_cur  <- path.expand(glue("{dir_big_v}/marine-atlas/native")); dir_create(nat_cur)
+# unchanged INPUT assets only; merged/_merged_parts are this version's to repaint
+nat_items <- c("am", "am_native", "pmtiles", "vec_grid", "src", "gm", "gm_cog_registry.csv",
+               "_am_parts", "_am_parts.map.csv")
+nat_rows <- map_dfr(nat_items, function(it) {
+  from <- path(nat_prev, it); to <- path(nat_cur, it)
+  if (!file_exists(from)) return(tibble(item = it, method = "absent in ver_prev", n_files = 0L, gb = 0))
+  method <- if (file_exists(to)) "exists" else {
+    st <- clone(from, to); if (!identical(st, 0L)) stop(glue("clone of native/{it} failed (exit {st})"))
+    if (Sys.info()[["sysname"]] == "Darwin") "clonefile" else "hardlink" }
+  t <- if (is_dir(to)) tally(to) else tibble(n_files = 1L, bytes = file_size(to))
+  tibble(item = it, method = method, n_files = t$n_files, gb = round(t$bytes / 1e9, 2))
+})
+knitr::kable(nat_rows, caption = "native assets carried forward from ver_prev (copy-on-write)")
+
+if (.flag("BOOTSTRAP_PUBLISH")) {
+  s3_prev <- glue("{s3_atlas}/{ver_prev}"); s3_cur <- glue("{s3_atlas}/{ver}")
+  for (p in c("am", "am_native", "pmtiles", "vec_grid")) {
+    st <- system2("aws", c("s3", "sync", shQuote(glue("{s3_prev}/native/{p}")), shQuote(glue("{s3_cur}/native/{p}")),
+                           "--only-show-errors", "--no-progress"), stdout = TRUE, stderr = TRUE)
+    if (!is.null(attr(st, "status")) && attr(st, "status") != 0) stop(paste(st, collapse = "\n"))
+    n <- length(system2("aws", c("s3", "ls", shQuote(glue("{s3_cur}/native/{p}/")), "--recursive"), stdout = TRUE))
+    log_info("S3 native/{p}: {ver_prev} -> {ver} server-side copy, {n} objects")
+  }
+  # PMTiles on the file host: hard-link copy of ver_prev's tree (instant, no transfer)
+  out <- system2("ssh", c("msens", shQuote(glue(
+    "set -e; cd /share/data/derived/pmtiles && if [ ! -d {ver} ]; then cp -al {ver_prev} {ver}; fi; ",
+    "echo PMTILES_OK $(find {ver} -type f | wc -l)"))), stdout = TRUE, stderr = TRUE)
+  stopifnot("file-host PMTiles copy failed" = any(grepl("PMTILES_OK", out)))
+  log_info("file host pmtiles/{ver}: {grep('PMTILES_OK', out, value = TRUE)}")
+} else log_info("BOOTSTRAP_PUBLISH unset — published native copies (S3, file host) not made")
+```
+
 ## Verify against the ingest checkpoints (`BOOTSTRAP_VERIFY=1`)
 
 The count/bytes check above says the clone is complete; it cannot say the *source* was the
@@ -157,7 +208,7 @@ if (bootstrap_verify) {
 h <- digest::digest(rows |> select(ds_key, n_files, gb, method), algo = "xxhash64")
 msens::write_manifest(
   manifest, target = "bootstrap_version", content_hash = h,
-  stats = list(ver = ver, ver_prev = ver_prev, n_datasets = nrow(rows),
+  stats = list(ver = ver, ver_prev = ver_prev, n_datasets = nrow(rows), n_native = sum(nat_rows$n_files),
                datasets = paste(rows$ds_key, collapse = ","), skipped = paste(skip_ds, collapse = ","),
                gb_total = sum(rows$gb), method = paste(unique(rows$method), collapse = ","),
                verified = if (nrow(verified)) all(verified$ok) else NA),

@@ -133,8 +133,9 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
   <li><a href="#design" id="toc-design" class="nav-link active" data-scroll-target="#design"><span class="header-section-number">1</span> Design</a></li>
   <li><a href="#setup" id="toc-setup" class="nav-link" data-scroll-target="#setup"><span class="header-section-number">2</span> Setup</a></li>
   <li><a href="#clone-the-unchanged-ingests-copy-on-write" id="toc-clone-the-unchanged-ingests-copy-on-write" class="nav-link" data-scroll-target="#clone-the-unchanged-ingests-copy-on-write"><span class="header-section-number">3</span> Clone the unchanged ingests (copy-on-write)</a></li>
-  <li><a href="#verify-against-the-ingest-checkpoints-bootstrap_verify1" id="toc-verify-against-the-ingest-checkpoints-bootstrap_verify1" class="nav-link" data-scroll-target="#verify-against-the-ingest-checkpoints-bootstrap_verify1"><span class="header-section-number">4</span> Verify against the ingest checkpoints (<code>BOOTSTRAP_VERIFY=1</code>)</a></li>
-  <li><a href="#manifest" id="toc-manifest" class="nav-link" data-scroll-target="#manifest"><span class="header-section-number">5</span> Manifest</a></li>
+  <li><a href="#clone-the-unchanged-native-assets-their-published-copies-bootstrap_publish1" id="toc-clone-the-unchanged-native-assets-their-published-copies-bootstrap_publish1" class="nav-link" data-scroll-target="#clone-the-unchanged-native-assets-their-published-copies-bootstrap_publish1"><span class="header-section-number">4</span> Clone the unchanged NATIVE assets (+ their published copies, <code>BOOTSTRAP_PUBLISH=1</code>)</a></li>
+  <li><a href="#verify-against-the-ingest-checkpoints-bootstrap_verify1" id="toc-verify-against-the-ingest-checkpoints-bootstrap_verify1" class="nav-link" data-scroll-target="#verify-against-the-ingest-checkpoints-bootstrap_verify1"><span class="header-section-number">5</span> Verify against the ingest checkpoints (<code>BOOTSTRAP_VERIFY=1</code>)</a></li>
+  <li><a href="#manifest" id="toc-manifest" class="nav-link" data-scroll-target="#manifest"><span class="header-section-number">6</span> Manifest</a></li>
   </ul>
 </nav>
 </div>
@@ -389,54 +390,167 @@ Figure&nbsp;1: Same-grid version bump: clone the unchanged ingests (copy-on-writ
 </div>
 </div>
 </section>
-<section id="verify-against-the-ingest-checkpoints-bootstrap_verify1" class="level2" data-number="4">
-<h2 data-number="4" class="anchored" data-anchor-id="verify-against-the-ingest-checkpoints-bootstrap_verify1"><span class="header-section-number">4</span> Verify against the ingest checkpoints (<code>BOOTSTRAP_VERIFY=1</code>)</h2>
+<section id="clone-the-unchanged-native-assets-their-published-copies-bootstrap_publish1" class="level2" data-number="4">
+<h2 data-number="4" class="anchored" data-anchor-id="clone-the-unchanged-native-assets-their-published-copies-bootstrap_publish1"><span class="header-section-number">4</span> Clone the unchanged NATIVE assets (+ their published copies, <code>BOOTSTRAP_PUBLISH=1</code>)</h2>
+<p><code>publish_native.qmd</code> builds per-model COGs / PMTiles for every served input and is resumable by file existence — so a version directory without <code>native/</code> rebuilds all 18,710 AquaMaps COGs, the 0.5° originals, the vector PMTiles and the 7 GB IUCN GeoPackage (hours), for inputs that did not change. Clone them from <code>ver_prev</code> the same way as <code>dist/</code>. The <strong>merged</strong> COGs (<code>merged</code>, <code>_merged_parts</code>) are deliberately NOT cloned: they are what a new version repaints.</p>
+<p>Published copies are per version on S3 (<code>{ver}/native/…</code>) and on the file host (<code>/share/data/derived/pmtiles/{ver}</code>), so with <code>BOOTSTRAP_PUBLISH=1</code> they are copied <strong>server-side</strong> (<code>aws s3 sync s3://…/{ver_prev}/native/x s3://…/{ver}/native/x</code>, and a hard-link copy on the file host) — no bytes leave the laptop, and <code>publish_native</code>’s own sync then finds every key present.</p>
+<div class="cell">
+<details class="code-fold">
+<summary>Code</summary>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb4"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a>nat_prev <span class="ot">&lt;-</span> <span class="fu">path.expand</span>(<span class="fu">glue</span>(<span class="st">"{dir_big}/{ver_prev}/marine-atlas/native"</span>))</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>nat_cur  <span class="ot">&lt;-</span> <span class="fu">path.expand</span>(<span class="fu">glue</span>(<span class="st">"{dir_big_v}/marine-atlas/native"</span>)); <span class="fu">dir_create</span>(nat_cur)</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="co"># unchanged INPUT assets only; merged/_merged_parts are this version's to repaint</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>nat_items <span class="ot">&lt;-</span> <span class="fu">c</span>(<span class="st">"am"</span>, <span class="st">"am_native"</span>, <span class="st">"pmtiles"</span>, <span class="st">"vec_grid"</span>, <span class="st">"src"</span>, <span class="st">"gm"</span>, <span class="st">"gm_cog_registry.csv"</span>,</span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>               <span class="st">"_am_parts"</span>, <span class="st">"_am_parts.map.csv"</span>)</span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>nat_rows <span class="ot">&lt;-</span> <span class="fu">map_dfr</span>(nat_items, <span class="cf">function</span>(it) {</span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>  from <span class="ot">&lt;-</span> <span class="fu">path</span>(nat_prev, it); to <span class="ot">&lt;-</span> <span class="fu">path</span>(nat_cur, it)</span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">file_exists</span>(from)) <span class="fu">return</span>(<span class="fu">tibble</span>(<span class="at">item =</span> it, <span class="at">method =</span> <span class="st">"absent in ver_prev"</span>, <span class="at">n_files =</span> <span class="dv">0</span>L, <span class="at">gb =</span> <span class="dv">0</span>))</span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>  method <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="fu">file_exists</span>(to)) <span class="st">"exists"</span> <span class="cf">else</span> {</span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    st <span class="ot">&lt;-</span> <span class="fu">clone</span>(from, to); <span class="cf">if</span> (<span class="sc">!</span><span class="fu">identical</span>(st, <span class="dv">0</span>L)) <span class="fu">stop</span>(<span class="fu">glue</span>(<span class="st">"clone of native/{it} failed (exit {st})"</span>))</span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="fu">Sys.info</span>()[[<span class="st">"sysname"</span>]] <span class="sc">==</span> <span class="st">"Darwin"</span>) <span class="st">"clonefile"</span> <span class="cf">else</span> <span class="st">"hardlink"</span> }</span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>  t <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="fu">is_dir</span>(to)) <span class="fu">tally</span>(to) <span class="cf">else</span> <span class="fu">tibble</span>(<span class="at">n_files =</span> <span class="dv">1</span>L, <span class="at">bytes =</span> <span class="fu">file_size</span>(to))</span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>  <span class="fu">tibble</span>(<span class="at">item =</span> it, <span class="at">method =</span> method, <span class="at">n_files =</span> t<span class="sc">$</span>n_files, <span class="at">gb =</span> <span class="fu">round</span>(t<span class="sc">$</span>bytes <span class="sc">/</span> <span class="fl">1e9</span>, <span class="dv">2</span>))</span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>})</span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>knitr<span class="sc">::</span><span class="fu">kable</span>(nat_rows, <span class="at">caption =</span> <span class="st">"native assets carried forward from ver_prev (copy-on-write)"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</details>
+<div class="cell-output-display">
+<table class="caption-top table table-sm table-striped small">
+<caption>native assets carried forward from ver_prev (copy-on-write)</caption>
+<thead>
+<tr class="header">
+<th style="text-align: left;">item</th>
+<th style="text-align: left;">method</th>
+<th style="text-align: right;">n_files</th>
+<th style="text-align: right;">gb</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;">am</td>
+<td style="text-align: left;">clonefile</td>
+<td style="text-align: right;">18710</td>
+<td style="text-align: right;">5.85</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">am_native</td>
+<td style="text-align: left;">clonefile</td>
+<td style="text-align: right;">18703</td>
+<td style="text-align: right;">153.6B</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">pmtiles</td>
+<td style="text-align: left;">clonefile</td>
+<td style="text-align: right;">6753</td>
+<td style="text-align: right;">7.09</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">vec_grid</td>
+<td style="text-align: left;">clonefile</td>
+<td style="text-align: right;">6753</td>
+<td style="text-align: right;">153.6NA</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">src</td>
+<td style="text-align: left;">clonefile</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">9.07</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">gm</td>
+<td style="text-align: left;">clonefile</td>
+<td style="text-align: right;">17</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">gm_cog_registry.csv</td>
+<td style="text-align: left;">clonefile</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">_am_parts</td>
+<td style="text-align: left;">clonefile</td>
+<td style="text-align: right;">28601</td>
+<td style="text-align: right;">49.83</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">_am_parts.map.csv</td>
+<td style="text-align: left;">clonefile</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">0</td>
+</tr>
+</tbody>
+</table>
+</div>
+<details class="code-fold">
+<summary>Code</summary>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb5"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (<span class="fu">.flag</span>(<span class="st">"BOOTSTRAP_PUBLISH"</span>)) {</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>  s3_prev <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{s3_atlas}/{ver_prev}"</span>); s3_cur <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{s3_atlas}/{ver}"</span>)</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>  <span class="cf">for</span> (p <span class="cf">in</span> <span class="fu">c</span>(<span class="st">"am"</span>, <span class="st">"am_native"</span>, <span class="st">"pmtiles"</span>, <span class="st">"vec_grid"</span>)) {</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    st <span class="ot">&lt;-</span> <span class="fu">system2</span>(<span class="st">"aws"</span>, <span class="fu">c</span>(<span class="st">"s3"</span>, <span class="st">"sync"</span>, <span class="fu">shQuote</span>(<span class="fu">glue</span>(<span class="st">"{s3_prev}/native/{p}"</span>)), <span class="fu">shQuote</span>(<span class="fu">glue</span>(<span class="st">"{s3_cur}/native/{p}"</span>)),</span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>                           <span class="st">"--only-show-errors"</span>, <span class="st">"--no-progress"</span>), <span class="at">stdout =</span> <span class="cn">TRUE</span>, <span class="at">stderr =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="sc">!</span><span class="fu">is.null</span>(<span class="fu">attr</span>(st, <span class="st">"status"</span>)) <span class="sc">&amp;&amp;</span> <span class="fu">attr</span>(st, <span class="st">"status"</span>) <span class="sc">!=</span> <span class="dv">0</span>) <span class="fu">stop</span>(<span class="fu">paste</span>(st, <span class="at">collapse =</span> <span class="st">"</span><span class="sc">\n</span><span class="st">"</span>))</span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    n <span class="ot">&lt;-</span> <span class="fu">length</span>(<span class="fu">system2</span>(<span class="st">"aws"</span>, <span class="fu">c</span>(<span class="st">"s3"</span>, <span class="st">"ls"</span>, <span class="fu">shQuote</span>(<span class="fu">glue</span>(<span class="st">"{s3_cur}/native/{p}/"</span>)), <span class="st">"--recursive"</span>), <span class="at">stdout =</span> <span class="cn">TRUE</span>))</span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    <span class="fu">log_info</span>(<span class="st">"S3 native/{p}: {ver_prev} -&gt; {ver} server-side copy, {n} objects"</span>)</span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>  }</span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>  <span class="co"># PMTiles on the file host: hard-link copy of ver_prev's tree (instant, no transfer)</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>  out <span class="ot">&lt;-</span> <span class="fu">system2</span>(<span class="st">"ssh"</span>, <span class="fu">c</span>(<span class="st">"msens"</span>, <span class="fu">shQuote</span>(<span class="fu">glue</span>(</span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>    <span class="st">"set -e; cd /share/data/derived/pmtiles &amp;&amp; if [ ! -d {ver} ]; then cp -al {ver_prev} {ver}; fi; "</span>,</span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>    <span class="st">"echo PMTILES_OK $(find {ver} -type f | wc -l)"</span>))), <span class="at">stdout =</span> <span class="cn">TRUE</span>, <span class="at">stderr =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a>  <span class="fu">stopifnot</span>(<span class="st">"file-host PMTiles copy failed"</span> <span class="ot">=</span> <span class="fu">any</span>(<span class="fu">grepl</span>(<span class="st">"PMTILES_OK"</span>, out)))</span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"file host pmtiles/{ver}: {grep('PMTILES_OK', out, value = TRUE)}"</span>)</span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>} <span class="cf">else</span> <span class="fu">log_info</span>(<span class="st">"BOOTSTRAP_PUBLISH unset — published native copies (S3, file host) not made"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</details>
+</div>
+</section>
+<section id="verify-against-the-ingest-checkpoints-bootstrap_verify1" class="level2" data-number="5">
+<h2 data-number="5" class="anchored" data-anchor-id="verify-against-the-ingest-checkpoints-bootstrap_verify1"><span class="header-section-number">5</span> Verify against the ingest checkpoints (<code>BOOTSTRAP_VERIFY=1</code>)</h2>
 <p>The count/bytes check above says the clone is complete; it cannot say the <em>source</em> was the surface the pipeline checkpointed. Re-hashing does — the ingest manifests are content-addressed (<code>msens::hash_parquet</code>, order-independent), so equality is proof, not suggestion. Off by default because hashing 60 GB takes a while; on when a version is being built for release.</p>
 <div class="cell">
 <details class="code-fold">
 <summary>Code</summary>
-<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb4"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># ingest target -&gt; ds_key, from each ingest notebook's msens: block (the DAG parser keeps only</span></span>
-<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="co"># target/type/deps/output, so read the dataset block the way build_registry.qmd does)</span></span>
-<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>ing <span class="ot">&lt;-</span> <span class="fu">map_dfr</span>(<span class="fu">dir_ls</span>(<span class="fu">here</span>(), <span class="at">glob =</span> <span class="st">"*.qmd"</span>), \(f) {</span>
-<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>  txt <span class="ot">&lt;-</span> <span class="fu">readLines</span>(f, <span class="at">warn =</span> <span class="cn">FALSE</span>); d <span class="ot">&lt;-</span> <span class="fu">which</span>(txt <span class="sc">==</span> <span class="st">"---"</span>)</span>
-<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="fu">length</span>(d) <span class="sc">&lt;</span> <span class="dv">2</span>) <span class="fu">return</span>(<span class="cn">NULL</span>)</span>
-<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>  m <span class="ot">&lt;-</span> <span class="fu">tryCatch</span>(yaml<span class="sc">::</span><span class="fu">yaml.load</span>(<span class="fu">paste</span>(txt[(d[<span class="dv">1</span>] <span class="sc">+</span> <span class="dv">1</span>)<span class="sc">:</span>(d[<span class="dv">2</span>] <span class="sc">-</span> <span class="dv">1</span>)], <span class="at">collapse =</span> <span class="st">"</span><span class="sc">\n</span><span class="st">"</span>)), <span class="at">error =</span> \(e) <span class="cn">NULL</span>)<span class="sc">$</span>msens</span>
-<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="fu">is.null</span>(m) <span class="sc">||</span> <span class="sc">!</span><span class="fu">identical</span>(m<span class="sc">$</span>workflow_type, <span class="st">"ingest"</span>) <span class="sc">||</span> <span class="fu">is.null</span>(m<span class="sc">$</span>dataset<span class="sc">$</span>ds_key)) <span class="fu">return</span>(<span class="cn">NULL</span>)</span>
-<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>  <span class="fu">tibble</span>(<span class="at">target_name =</span> m<span class="sc">$</span>target_name, <span class="at">ds_key =</span> m<span class="sc">$</span>dataset<span class="sc">$</span>ds_key, <span class="at">output =</span> m<span class="sc">$</span>output)</span>
-<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>})</span>
-<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>verified <span class="ot">&lt;-</span> <span class="fu">tibble</span>()</span>
-<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (bootstrap_verify) {</span>
-<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>  con <span class="ot">&lt;-</span> <span class="fu">dbConnect</span>(<span class="fu">duckdb</span>())</span>
-<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>  verified <span class="ot">&lt;-</span> <span class="fu">map_dfr</span>(<span class="fu">seq_len</span>(<span class="fu">nrow</span>(ing)), <span class="cf">function</span>(i) {</span>
-<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>    ds <span class="ot">&lt;-</span> ing<span class="sc">$</span>ds_key[i]; <span class="cf">if</span> (<span class="sc">!</span>ds <span class="sc">%in%</span> rows<span class="sc">$</span>ds_key) <span class="fu">return</span>(<span class="cn">NULL</span>)</span>
-<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>    mf <span class="ot">&lt;-</span> <span class="fu">here</span>(ing<span class="sc">$</span>output[i])</span>
-<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>    expect <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="fu">file_exists</span>(mf)) <span class="fu">fromJSON</span>(mf)<span class="sc">$</span>content_hash <span class="cf">else</span> <span class="cn">NA_character_</span></span>
-<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>    got <span class="ot">&lt;-</span> msens<span class="sc">::</span><span class="fu">hash_parquet</span>(<span class="fu">glue</span>(<span class="st">"{dist_cur}/dataset={ds}/*.parquet"</span>), con)</span>
-<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>    <span class="fu">tibble</span>(<span class="at">ds_key =</span> ds, <span class="at">target =</span> ing<span class="sc">$</span>target_name[i], <span class="at">expected =</span> expect, <span class="at">got =</span> got,</span>
-<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a>           <span class="at">ok =</span> <span class="sc">!</span><span class="fu">is.na</span>(expect) <span class="sc">&amp;&amp;</span> <span class="fu">identical</span>(expect, got))</span>
-<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a>  })</span>
-<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a>  <span class="fu">dbDisconnect</span>(con, <span class="at">shutdown =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a>  knitr<span class="sc">::</span><span class="fu">kable</span>(verified)</span>
-<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a>  <span class="fu">stopifnot</span>(<span class="st">"a cloned dataset does not hash to its ingest checkpoint"</span> <span class="ot">=</span> <span class="fu">all</span>(verified<span class="sc">$</span>ok))</span>
-<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a>} <span class="cf">else</span> <span class="fu">log_info</span>(<span class="st">"BOOTSTRAP_VERIFY unset — clone checked by count + bytes only"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb6"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># ingest target -&gt; ds_key, from each ingest notebook's msens: block (the DAG parser keeps only</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="co"># target/type/deps/output, so read the dataset block the way build_registry.qmd does)</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>ing <span class="ot">&lt;-</span> <span class="fu">map_dfr</span>(<span class="fu">dir_ls</span>(<span class="fu">here</span>(), <span class="at">glob =</span> <span class="st">"*.qmd"</span>), \(f) {</span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>  txt <span class="ot">&lt;-</span> <span class="fu">readLines</span>(f, <span class="at">warn =</span> <span class="cn">FALSE</span>); d <span class="ot">&lt;-</span> <span class="fu">which</span>(txt <span class="sc">==</span> <span class="st">"---"</span>)</span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="fu">length</span>(d) <span class="sc">&lt;</span> <span class="dv">2</span>) <span class="fu">return</span>(<span class="cn">NULL</span>)</span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>  m <span class="ot">&lt;-</span> <span class="fu">tryCatch</span>(yaml<span class="sc">::</span><span class="fu">yaml.load</span>(<span class="fu">paste</span>(txt[(d[<span class="dv">1</span>] <span class="sc">+</span> <span class="dv">1</span>)<span class="sc">:</span>(d[<span class="dv">2</span>] <span class="sc">-</span> <span class="dv">1</span>)], <span class="at">collapse =</span> <span class="st">"</span><span class="sc">\n</span><span class="st">"</span>)), <span class="at">error =</span> \(e) <span class="cn">NULL</span>)<span class="sc">$</span>msens</span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="fu">is.null</span>(m) <span class="sc">||</span> <span class="sc">!</span><span class="fu">identical</span>(m<span class="sc">$</span>workflow_type, <span class="st">"ingest"</span>) <span class="sc">||</span> <span class="fu">is.null</span>(m<span class="sc">$</span>dataset<span class="sc">$</span>ds_key)) <span class="fu">return</span>(<span class="cn">NULL</span>)</span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>  <span class="fu">tibble</span>(<span class="at">target_name =</span> m<span class="sc">$</span>target_name, <span class="at">ds_key =</span> m<span class="sc">$</span>dataset<span class="sc">$</span>ds_key, <span class="at">output =</span> m<span class="sc">$</span>output)</span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>})</span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>verified <span class="ot">&lt;-</span> <span class="fu">tibble</span>()</span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (bootstrap_verify) {</span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>  con <span class="ot">&lt;-</span> <span class="fu">dbConnect</span>(<span class="fu">duckdb</span>())</span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>  verified <span class="ot">&lt;-</span> <span class="fu">map_dfr</span>(<span class="fu">seq_len</span>(<span class="fu">nrow</span>(ing)), <span class="cf">function</span>(i) {</span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>    ds <span class="ot">&lt;-</span> ing<span class="sc">$</span>ds_key[i]; <span class="cf">if</span> (<span class="sc">!</span>ds <span class="sc">%in%</span> rows<span class="sc">$</span>ds_key) <span class="fu">return</span>(<span class="cn">NULL</span>)</span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>    mf <span class="ot">&lt;-</span> <span class="fu">here</span>(ing<span class="sc">$</span>output[i])</span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>    expect <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="fu">file_exists</span>(mf)) <span class="fu">fromJSON</span>(mf)<span class="sc">$</span>content_hash <span class="cf">else</span> <span class="cn">NA_character_</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>    got <span class="ot">&lt;-</span> msens<span class="sc">::</span><span class="fu">hash_parquet</span>(<span class="fu">glue</span>(<span class="st">"{dist_cur}/dataset={ds}/*.parquet"</span>), con)</span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>    <span class="fu">tibble</span>(<span class="at">ds_key =</span> ds, <span class="at">target =</span> ing<span class="sc">$</span>target_name[i], <span class="at">expected =</span> expect, <span class="at">got =</span> got,</span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>           <span class="at">ok =</span> <span class="sc">!</span><span class="fu">is.na</span>(expect) <span class="sc">&amp;&amp;</span> <span class="fu">identical</span>(expect, got))</span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a>  })</span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a>  <span class="fu">dbDisconnect</span>(con, <span class="at">shutdown =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a>  knitr<span class="sc">::</span><span class="fu">kable</span>(verified)</span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a>  <span class="fu">stopifnot</span>(<span class="st">"a cloned dataset does not hash to its ingest checkpoint"</span> <span class="ot">=</span> <span class="fu">all</span>(verified<span class="sc">$</span>ok))</span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a>} <span class="cf">else</span> <span class="fu">log_info</span>(<span class="st">"BOOTSTRAP_VERIFY unset — clone checked by count + bytes only"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </details>
 </div>
 </section>
-<section id="manifest" class="level2" data-number="5">
-<h2 data-number="5" class="anchored" data-anchor-id="manifest"><span class="header-section-number">5</span> Manifest</h2>
+<section id="manifest" class="level2" data-number="6">
+<h2 data-number="6" class="anchored" data-anchor-id="manifest"><span class="header-section-number">6</span> Manifest</h2>
 <div class="cell">
 <details class="code-fold">
 <summary>Code</summary>
-<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb5"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># content-addressed on WHAT was cloned (dataset set + sizes + method), not when</span></span>
-<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>h <span class="ot">&lt;-</span> digest<span class="sc">::</span><span class="fu">digest</span>(rows <span class="sc">|&gt;</span> <span class="fu">select</span>(ds_key, n_files, gb, method), <span class="at">algo =</span> <span class="st">"xxhash64"</span>)</span>
-<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>msens<span class="sc">::</span><span class="fu">write_manifest</span>(</span>
-<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>  manifest, <span class="at">target =</span> <span class="st">"bootstrap_version"</span>, <span class="at">content_hash =</span> h,</span>
-<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">stats =</span> <span class="fu">list</span>(<span class="at">ver =</span> ver, <span class="at">ver_prev =</span> ver_prev, <span class="at">n_datasets =</span> <span class="fu">nrow</span>(rows),</span>
-<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>               <span class="at">datasets =</span> <span class="fu">paste</span>(rows<span class="sc">$</span>ds_key, <span class="at">collapse =</span> <span class="st">","</span>), <span class="at">skipped =</span> <span class="fu">paste</span>(skip_ds, <span class="at">collapse =</span> <span class="st">","</span>),</span>
-<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>               <span class="at">gb_total =</span> <span class="fu">sum</span>(rows<span class="sc">$</span>gb), <span class="at">method =</span> <span class="fu">paste</span>(<span class="fu">unique</span>(rows<span class="sc">$</span>method), <span class="at">collapse =</span> <span class="st">","</span>),</span>
-<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>               <span class="at">verified =</span> <span class="cf">if</span> (<span class="fu">nrow</span>(verified)) <span class="fu">all</span>(verified<span class="sc">$</span>ok) <span class="cf">else</span> <span class="cn">NA</span>),</span>
-<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">force =</span> msens<span class="sc">::</span><span class="fu">force_target</span>(<span class="st">"bootstrap_version"</span>))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb7"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># content-addressed on WHAT was cloned (dataset set + sizes + method), not when</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>h <span class="ot">&lt;-</span> digest<span class="sc">::</span><span class="fu">digest</span>(rows <span class="sc">|&gt;</span> <span class="fu">select</span>(ds_key, n_files, gb, method), <span class="at">algo =</span> <span class="st">"xxhash64"</span>)</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>msens<span class="sc">::</span><span class="fu">write_manifest</span>(</span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>  manifest, <span class="at">target =</span> <span class="st">"bootstrap_version"</span>, <span class="at">content_hash =</span> h,</span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">stats =</span> <span class="fu">list</span>(<span class="at">ver =</span> ver, <span class="at">ver_prev =</span> ver_prev, <span class="at">n_datasets =</span> <span class="fu">nrow</span>(rows), <span class="at">n_native =</span> <span class="fu">sum</span>(nat_rows<span class="sc">$</span>n_files),</span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>               <span class="at">datasets =</span> <span class="fu">paste</span>(rows<span class="sc">$</span>ds_key, <span class="at">collapse =</span> <span class="st">","</span>), <span class="at">skipped =</span> <span class="fu">paste</span>(skip_ds, <span class="at">collapse =</span> <span class="st">","</span>),</span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>               <span class="at">gb_total =</span> <span class="fu">sum</span>(rows<span class="sc">$</span>gb), <span class="at">method =</span> <span class="fu">paste</span>(<span class="fu">unique</span>(rows<span class="sc">$</span>method), <span class="at">collapse =</span> <span class="st">","</span>),</span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>               <span class="at">verified =</span> <span class="cf">if</span> (<span class="fu">nrow</span>(verified)) <span class="fu">all</span>(verified<span class="sc">$</span>ok) <span class="cf">else</span> <span class="cn">NA</span>),</span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">force =</span> msens<span class="sc">::</span><span class="fu">force_target</span>(<span class="st">"bootstrap_version"</span>))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </details>
 </div>
 <!-- -->
@@ -896,171 +1010,222 @@ Figure&nbsp;1: Same-grid version bump: clone the unchanged ingests (copy-on-writ
     }
   });
   </script><div class="modal fade" id="quarto-embedded-source-code-modal" tabindex="-1" aria-labelledby="quarto-embedded-source-code-modal-label" aria-hidden="true"><div class="modal-dialog modal-dialog-scrollable"><div class="modal-content"><div class="modal-header"><h5 class="modal-title" id="quarto-embedded-source-code-modal-label">Source Code</h5><button class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><div class="">
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb6" data-shortcodes="false"><pre class="sourceCode markdown code-with-copy"><code class="sourceCode markdown"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
-<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="an">title:</span><span class="co"> "Bootstrap a release version — clone the unchanged ingests from the previous version"</span></span>
-<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="an">msens:</span></span>
-<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="co">  target_name: bootstrap_version</span></span>
-<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="co">  workflow_type: grid</span></span>
-<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="co">  dependency: []</span></span>
-<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="co">  output: data/manifests/bootstrap_version.json</span></span>
-<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="an">editor_options:</span></span>
-<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="co">  chunk_output_type: console</span></span>
-<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
-<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a><span class="in">`ver`</span> in <span class="in">`libs/paths.R`</span> has only ever moved once (v7 → v8), and that bump rewrote every ingest.</span>
-<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>A bump **on the same grid** (v8 → v9: same <span class="in">`global05`</span> cells, same <span class="in">`r_cellid_global.tif`</span>) must</span>
-<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>*reuse* the ingests nothing changed — AquaMaps alone is 50 GB and 40 min on the server, BirdLife</span>
-<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>and IUCN are hours — and it must do so **reproducibly**: which datasets were carried forward, from</span>
-<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>where, and whether they are the surfaces the content-addressed manifests checkpointed.</span>
-<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>This notebook clones <span class="in">`{dir_big}/{ver_prev}/marine-atlas/dist/dataset=*`</span> (+ <span class="in">`model_*.csv`</span>) into</span>
-<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>this version's <span class="in">`dist/`</span>. On macOS/APFS that is <span class="in">`cp -c`</span> (clonefile: instant, zero extra bytes,</span>
-<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>copy-on-write); on Linux it is a hardlink tree (<span class="in">`cp -al`</span>). The ingest notebooks then **resume**</span>
-<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a>against the clone — every Parquet already present — so their manifests do not change and nothing</span>
-<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a>downstream re-runs for the wrong reason. Datasets this version re-ingests (v9: nothing; a future</span>
-<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a>AquaMaps refresh would be <span class="in">`BOOTSTRAP_SKIP_DS=am`</span>) are simply not cloned.</span>
-<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a>Verification: by default file count + byte total per dataset must equal <span class="in">`ver_prev`</span>'s;</span>
-<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a><span class="in">`BOOTSTRAP_VERIFY=1`</span> re-hashes each cloned surface with <span class="in">`msens::hash_parquet()`</span> and asserts</span>
-<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a>equality with that ingest's <span class="in">`data/manifests/ingest_*.json`</span> <span class="in">`content_hash`</span> — proof that what was</span>
-<span id="cb6-28"><a href="#cb6-28" aria-hidden="true" tabindex="-1"></a>cloned is the checkpointed surface and not a stale directory.</span>
-<span id="cb6-29"><a href="#cb6-29" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb6-30"><a href="#cb6-30" aria-hidden="true" tabindex="-1"></a><span class="fu">## Design</span></span>
-<span id="cb6-31"><a href="#cb6-31" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb6-34"><a href="#cb6-34" aria-hidden="true" tabindex="-1"></a><span class="in">```{mermaid}</span></span>
-<span id="cb6-35"><a href="#cb6-35" aria-hidden="true" tabindex="-1"></a>%%| label: fig-design</span>
-<span id="cb6-36"><a href="#cb6-36" aria-hidden="true" tabindex="-1"></a>%%| fig-cap: <span class="ot">"</span><span class="st">Same-grid version bump: clone the unchanged ingests (copy-on-write) so they resume, verify against the ingest checkpoints</span><span class="ot">"</span></span>
-<span id="cb6-37"><a href="#cb6-37" aria-hidden="true" tabindex="-1"></a>flowchart LR</span>
-<span id="cb6-38"><a href="#cb6-38" aria-hidden="true" tabindex="-1"></a>  prev[(<span class="ot">"</span><span class="st">{ver_prev}/marine-atlas/dist/&lt;br/&gt;dataset=* + model_*.csv</span><span class="ot">"</span>)] --&gt;|<span class="ot">"</span><span class="st">cp -c (APFS clonefile)&lt;br/&gt;cp -al (Linux)</span><span class="ot">"</span>| cur[(<span class="ot">"</span><span class="st">{ver}/marine-atlas/dist/</span><span class="ot">"</span>)]</span>
-<span id="cb6-39"><a href="#cb6-39" aria-hidden="true" tabindex="-1"></a>  cur --&gt; chk[<span class="ot">"</span><span class="st">count + bytes == ver_prev&lt;br/&gt;BOOTSTRAP_VERIFY=1: hash_parquet == ingest manifest</span><span class="ot">"</span>]</span>
-<span id="cb6-40"><a href="#cb6-40" aria-hidden="true" tabindex="-1"></a>  chk --&gt; mf[<span class="ot">"</span><span class="st">manifest: what was cloned,&lt;br/&gt;from where, how</span><span class="ot">"</span>]</span>
-<span id="cb6-41"><a href="#cb6-41" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb6-42"><a href="#cb6-42" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb6-43"><a href="#cb6-43" aria-hidden="true" tabindex="-1"></a><span class="fu">## Setup</span></span>
-<span id="cb6-44"><a href="#cb6-44" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb6-47"><a href="#cb6-47" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb6-48"><a href="#cb6-48" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: setup</span></span>
-<span id="cb6-49"><a href="#cb6-49" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb6-50"><a href="#cb6-50" aria-hidden="true" tabindex="-1"></a>librarian<span class="sc">::</span><span class="fu">shelf</span>(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, purrr, readr, tibble, yaml, <span class="at">quiet =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb6-51"><a href="#cb6-51" aria-hidden="true" tabindex="-1"></a><span class="fu">source</span>(<span class="fu">here</span>(<span class="st">"libs/paths.R"</span>))   <span class="co"># ver, ver_prev, dir_big, dir_big_v</span></span>
-<span id="cb6-52"><a href="#cb6-52" aria-hidden="true" tabindex="-1"></a><span class="fu">source</span>(<span class="fu">here</span>(<span class="st">"libs/vars.R"</span>))    <span class="co"># bootstrap_verify</span></span>
-<span id="cb6-53"><a href="#cb6-53" aria-hidden="true" tabindex="-1"></a><span class="fu">options</span>(<span class="at">readr.show_col_types =</span> <span class="cn">FALSE</span>)</span>
-<span id="cb6-54"><a href="#cb6-54" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb6-55"><a href="#cb6-55" aria-hidden="true" tabindex="-1"></a>dist_prev <span class="ot">&lt;-</span> <span class="fu">path.expand</span>(<span class="fu">glue</span>(<span class="st">"{dir_big}/{ver_prev}/marine-atlas/dist"</span>))</span>
-<span id="cb6-56"><a href="#cb6-56" aria-hidden="true" tabindex="-1"></a>dist_cur  <span class="ot">&lt;-</span> <span class="fu">path.expand</span>(<span class="fu">glue</span>(<span class="st">"{dir_big_v}/marine-atlas/dist"</span>))</span>
-<span id="cb6-57"><a href="#cb6-57" aria-hidden="true" tabindex="-1"></a>manifest  <span class="ot">&lt;-</span> <span class="fu">here</span>(<span class="st">"data/manifests/bootstrap_version.json"</span>)</span>
-<span id="cb6-58"><a href="#cb6-58" aria-hidden="true" tabindex="-1"></a>skip_ds   <span class="ot">&lt;-</span> <span class="fu">trimws</span>(<span class="fu">strsplit</span>(<span class="fu">Sys.getenv</span>(<span class="st">"BOOTSTRAP_SKIP_DS"</span>, <span class="st">""</span>), <span class="st">","</span>)[[<span class="dv">1</span>]])</span>
-<span id="cb6-59"><a href="#cb6-59" aria-hidden="true" tabindex="-1"></a>skip_ds   <span class="ot">&lt;-</span> skip_ds[<span class="fu">nzchar</span>(skip_ds)]</span>
-<span id="cb6-60"><a href="#cb6-60" aria-hidden="true" tabindex="-1"></a><span class="fu">dir_create</span>(<span class="fu">c</span>(dist_cur, <span class="fu">path_dir</span>(manifest)))</span>
-<span id="cb6-61"><a href="#cb6-61" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb6-62"><a href="#cb6-62" aria-hidden="true" tabindex="-1"></a>versions <span class="ot">&lt;-</span> <span class="fu">read_csv</span>(<span class="fu">here</span>(<span class="st">"data/versions.csv"</span>))</span>
-<span id="cb6-63"><a href="#cb6-63" aria-hidden="true" tabindex="-1"></a><span class="fu">stopifnot</span>(</span>
-<span id="cb6-64"><a href="#cb6-64" aria-hidden="true" tabindex="-1"></a>  <span class="st">"this version must have a row in data/versions.csv before anything is built for it"</span> <span class="ot">=</span> ver <span class="sc">%in%</span> versions<span class="sc">$</span>ver,</span>
-<span id="cb6-65"><a href="#cb6-65" aria-hidden="true" tabindex="-1"></a>  <span class="st">"ver_prev has no marine-atlas dist/ to clone from"</span> <span class="ot">=</span> <span class="fu">dir_exists</span>(dist_prev),</span>
-<span id="cb6-66"><a href="#cb6-66" aria-hidden="true" tabindex="-1"></a>  <span class="st">"ver and ver_prev must be on the same grid — a grid change is a re-ingest, not a clone"</span> <span class="ot">=</span></span>
-<span id="cb6-67"><a href="#cb6-67" aria-hidden="true" tabindex="-1"></a>    <span class="fu">identical</span>(msens<span class="sc">::</span><span class="fu">grid_for_ver</span>(ver), msens<span class="sc">::</span><span class="fu">grid_for_ver</span>(ver_prev)))</span>
-<span id="cb6-68"><a href="#cb6-68" aria-hidden="true" tabindex="-1"></a><span class="fu">log_info</span>(<span class="st">"bootstrap {ver} from {ver_prev}: {dist_prev} -&gt; {dist_cur}; skip: {if (length(skip_ds)) paste(skip_ds, collapse=', ') else 'none'}"</span>)</span>
-<span id="cb6-69"><a href="#cb6-69" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb6-70"><a href="#cb6-70" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb6-71"><a href="#cb6-71" aria-hidden="true" tabindex="-1"></a><span class="fu">## Clone the unchanged ingests (copy-on-write)</span></span>
-<span id="cb6-72"><a href="#cb6-72" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb6-75"><a href="#cb6-75" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb6-76"><a href="#cb6-76" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: clone</span></span>
-<span id="cb6-77"><a href="#cb6-77" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb6-78"><a href="#cb6-78" aria-hidden="true" tabindex="-1"></a><span class="co"># copy-on-write clone of one directory (or file). macOS: `cp -c` = clonefile(2) on APFS —</span></span>
-<span id="cb6-79"><a href="#cb6-79" aria-hidden="true" tabindex="-1"></a><span class="co"># instant and zero extra bytes until either side is modified. Linux: hardlinks (`cp -al`),</span></span>
-<span id="cb6-80"><a href="#cb6-80" aria-hidden="true" tabindex="-1"></a><span class="co"># which the ingests never break because they only ever ADD files (resume) or delete + rebuild</span></span>
-<span id="cb6-81"><a href="#cb6-81" aria-hidden="true" tabindex="-1"></a><span class="co"># their whole dataset dir under REDO_*. rsync would COPY 60 GB; that is what this avoids.</span></span>
-<span id="cb6-82"><a href="#cb6-82" aria-hidden="true" tabindex="-1"></a>clone <span class="ot">&lt;-</span> <span class="cf">function</span>(from, to) {</span>
-<span id="cb6-83"><a href="#cb6-83" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="fu">Sys.info</span>()[[<span class="st">"sysname"</span>]] <span class="sc">==</span> <span class="st">"Darwin"</span>) <span class="fu">system2</span>(<span class="st">"cp"</span>, <span class="fu">c</span>(<span class="st">"-Rc"</span>, <span class="fu">shQuote</span>(from), <span class="fu">shQuote</span>(to)))</span>
-<span id="cb6-84"><a href="#cb6-84" aria-hidden="true" tabindex="-1"></a>  <span class="cf">else</span>                                     <span class="fu">system2</span>(<span class="st">"cp"</span>, <span class="fu">c</span>(<span class="st">"-al"</span>, <span class="fu">shQuote</span>(from), <span class="fu">shQuote</span>(to)))</span>
-<span id="cb6-85"><a href="#cb6-85" aria-hidden="true" tabindex="-1"></a>}</span>
-<span id="cb6-86"><a href="#cb6-86" aria-hidden="true" tabindex="-1"></a>tally <span class="ot">&lt;-</span> <span class="cf">function</span>(d) {</span>
-<span id="cb6-87"><a href="#cb6-87" aria-hidden="true" tabindex="-1"></a>  f <span class="ot">&lt;-</span> <span class="fu">dir_ls</span>(d, <span class="at">recurse =</span> <span class="cn">TRUE</span>, <span class="at">type =</span> <span class="st">"file"</span>)</span>
-<span id="cb6-88"><a href="#cb6-88" aria-hidden="true" tabindex="-1"></a>  <span class="fu">tibble</span>(<span class="at">n_files =</span> <span class="fu">length</span>(f), <span class="at">bytes =</span> <span class="fu">sum</span>(<span class="fu">file_size</span>(f)))</span>
-<span id="cb6-89"><a href="#cb6-89" aria-hidden="true" tabindex="-1"></a>}</span>
-<span id="cb6-90"><a href="#cb6-90" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb6-91"><a href="#cb6-91" aria-hidden="true" tabindex="-1"></a>ds_dirs <span class="ot">&lt;-</span> <span class="fu">dir_ls</span>(dist_prev, <span class="at">type =</span> <span class="st">"directory"</span>, <span class="at">regexp =</span> <span class="st">"dataset="</span>)</span>
-<span id="cb6-92"><a href="#cb6-92" aria-hidden="true" tabindex="-1"></a>ds_keys <span class="ot">&lt;-</span> <span class="fu">sub</span>(<span class="st">"^dataset="</span>, <span class="st">""</span>, <span class="fu">path_file</span>(ds_dirs))</span>
-<span id="cb6-93"><a href="#cb6-93" aria-hidden="true" tabindex="-1"></a>todo    <span class="ot">&lt;-</span> <span class="fu">setdiff</span>(ds_keys, skip_ds)</span>
-<span id="cb6-94"><a href="#cb6-94" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb6-95"><a href="#cb6-95" aria-hidden="true" tabindex="-1"></a>rows <span class="ot">&lt;-</span> <span class="fu">map_dfr</span>(todo, <span class="cf">function</span>(ds) {</span>
-<span id="cb6-96"><a href="#cb6-96" aria-hidden="true" tabindex="-1"></a>  from <span class="ot">&lt;-</span> <span class="fu">path</span>(dist_prev, <span class="fu">glue</span>(<span class="st">"dataset={ds}"</span>)); to <span class="ot">&lt;-</span> <span class="fu">path</span>(dist_cur, <span class="fu">glue</span>(<span class="st">"dataset={ds}"</span>))</span>
-<span id="cb6-97"><a href="#cb6-97" aria-hidden="true" tabindex="-1"></a>  method <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="fu">dir_exists</span>(to)) <span class="st">"exists"</span> <span class="cf">else</span> {</span>
-<span id="cb6-98"><a href="#cb6-98" aria-hidden="true" tabindex="-1"></a>    st <span class="ot">&lt;-</span> <span class="fu">clone</span>(from, to)</span>
-<span id="cb6-99"><a href="#cb6-99" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="sc">!</span><span class="fu">identical</span>(st, <span class="dv">0</span>L)) <span class="fu">stop</span>(<span class="fu">glue</span>(<span class="st">"clone of {ds} failed (exit {st})"</span>))</span>
-<span id="cb6-100"><a href="#cb6-100" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="fu">Sys.info</span>()[[<span class="st">"sysname"</span>]] <span class="sc">==</span> <span class="st">"Darwin"</span>) <span class="st">"clonefile"</span> <span class="cf">else</span> <span class="st">"hardlink"</span></span>
-<span id="cb6-101"><a href="#cb6-101" aria-hidden="true" tabindex="-1"></a>  }</span>
-<span id="cb6-102"><a href="#cb6-102" aria-hidden="true" tabindex="-1"></a>  tp <span class="ot">&lt;-</span> <span class="fu">tally</span>(from); tc <span class="ot">&lt;-</span> <span class="fu">tally</span>(to)</span>
-<span id="cb6-103"><a href="#cb6-103" aria-hidden="true" tabindex="-1"></a>  <span class="fu">tibble</span>(<span class="at">ds_key =</span> ds, <span class="at">method =</span> method,</span>
-<span id="cb6-104"><a href="#cb6-104" aria-hidden="true" tabindex="-1"></a>         <span class="at">n_files_prev =</span> tp<span class="sc">$</span>n_files, <span class="at">n_files =</span> tc<span class="sc">$</span>n_files,</span>
-<span id="cb6-105"><a href="#cb6-105" aria-hidden="true" tabindex="-1"></a>         <span class="at">gb_prev =</span> <span class="fu">round</span>(tp<span class="sc">$</span>bytes <span class="sc">/</span> <span class="fl">1e9</span>, <span class="dv">2</span>), <span class="at">gb =</span> <span class="fu">round</span>(tc<span class="sc">$</span>bytes <span class="sc">/</span> <span class="fl">1e9</span>, <span class="dv">2</span>),</span>
-<span id="cb6-106"><a href="#cb6-106" aria-hidden="true" tabindex="-1"></a>         <span class="at">same =</span> tp<span class="sc">$</span>n_files <span class="sc">==</span> tc<span class="sc">$</span>n_files <span class="sc">&amp;&amp;</span> tp<span class="sc">$</span>bytes <span class="sc">==</span> tc<span class="sc">$</span>bytes)</span>
-<span id="cb6-107"><a href="#cb6-107" aria-hidden="true" tabindex="-1"></a>})</span>
-<span id="cb6-108"><a href="#cb6-108" aria-hidden="true" tabindex="-1"></a><span class="co"># the per-dataset species crosswalks travel with their surfaces</span></span>
-<span id="cb6-109"><a href="#cb6-109" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> (f <span class="cf">in</span> <span class="fu">dir_ls</span>(dist_prev, <span class="at">glob =</span> <span class="st">"*model_*.csv"</span>)) {</span>
-<span id="cb6-110"><a href="#cb6-110" aria-hidden="true" tabindex="-1"></a>  to <span class="ot">&lt;-</span> <span class="fu">path</span>(dist_cur, <span class="fu">path_file</span>(f))</span>
-<span id="cb6-111"><a href="#cb6-111" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">file_exists</span>(to) <span class="sc">&amp;&amp;</span> <span class="fu">sub</span>(<span class="st">"^model_(.+)</span><span class="sc">\\</span><span class="st">.csv$"</span>, <span class="st">"</span><span class="sc">\\</span><span class="st">1"</span>, <span class="fu">path_file</span>(f)) <span class="sc">%in%</span> todo) <span class="fu">file_copy</span>(f, to)</span>
-<span id="cb6-112"><a href="#cb6-112" aria-hidden="true" tabindex="-1"></a>}</span>
-<span id="cb6-113"><a href="#cb6-113" aria-hidden="true" tabindex="-1"></a><span class="co"># a dataset that was cloned earlier and has since diverged (an ingest ADDED models to it) is</span></span>
-<span id="cb6-114"><a href="#cb6-114" aria-hidden="true" tabindex="-1"></a><span class="co"># legitimately different; a dataset that is SMALLER than its source is a truncated clone</span></span>
-<span id="cb6-115"><a href="#cb6-115" aria-hidden="true" tabindex="-1"></a>short <span class="ot">&lt;-</span> rows <span class="sc">|&gt;</span> <span class="fu">filter</span>(n_files <span class="sc">&lt;</span> n_files_prev)</span>
-<span id="cb6-116"><a href="#cb6-116" aria-hidden="true" tabindex="-1"></a><span class="fu">stopifnot</span>(<span class="st">"cloned dataset(s) have FEWER files than ver_prev — truncated clone"</span> <span class="ot">=</span> <span class="fu">nrow</span>(short) <span class="sc">==</span> <span class="dv">0</span>)</span>
-<span id="cb6-117"><a href="#cb6-117" aria-hidden="true" tabindex="-1"></a>knitr<span class="sc">::</span><span class="fu">kable</span>(rows)</span>
-<span id="cb6-118"><a href="#cb6-118" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb6-119"><a href="#cb6-119" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb6-120"><a href="#cb6-120" aria-hidden="true" tabindex="-1"></a><span class="fu">## Verify against the ingest checkpoints (`BOOTSTRAP_VERIFY=1`)</span></span>
-<span id="cb6-121"><a href="#cb6-121" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb6-122"><a href="#cb6-122" aria-hidden="true" tabindex="-1"></a>The count/bytes check above says the clone is complete; it cannot say the *source* was the</span>
-<span id="cb6-123"><a href="#cb6-123" aria-hidden="true" tabindex="-1"></a>surface the pipeline checkpointed. Re-hashing does — the ingest manifests are content-addressed</span>
-<span id="cb6-124"><a href="#cb6-124" aria-hidden="true" tabindex="-1"></a>(<span class="in">`msens::hash_parquet`</span>, order-independent), so equality is proof, not suggestion. Off by default</span>
-<span id="cb6-125"><a href="#cb6-125" aria-hidden="true" tabindex="-1"></a>because hashing 60 GB takes a while; on when a version is being built for release.</span>
-<span id="cb6-126"><a href="#cb6-126" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb6-129"><a href="#cb6-129" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb6-130"><a href="#cb6-130" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: verify</span></span>
-<span id="cb6-131"><a href="#cb6-131" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb6-132"><a href="#cb6-132" aria-hidden="true" tabindex="-1"></a><span class="co"># ingest target -&gt; ds_key, from each ingest notebook's msens: block (the DAG parser keeps only</span></span>
-<span id="cb6-133"><a href="#cb6-133" aria-hidden="true" tabindex="-1"></a><span class="co"># target/type/deps/output, so read the dataset block the way build_registry.qmd does)</span></span>
-<span id="cb6-134"><a href="#cb6-134" aria-hidden="true" tabindex="-1"></a>ing <span class="ot">&lt;-</span> <span class="fu">map_dfr</span>(<span class="fu">dir_ls</span>(<span class="fu">here</span>(), <span class="at">glob =</span> <span class="st">"*.qmd"</span>), \(f) {</span>
-<span id="cb6-135"><a href="#cb6-135" aria-hidden="true" tabindex="-1"></a>  txt <span class="ot">&lt;-</span> <span class="fu">readLines</span>(f, <span class="at">warn =</span> <span class="cn">FALSE</span>); d <span class="ot">&lt;-</span> <span class="fu">which</span>(txt <span class="sc">==</span> <span class="st">"---"</span>)</span>
-<span id="cb6-136"><a href="#cb6-136" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="fu">length</span>(d) <span class="sc">&lt;</span> <span class="dv">2</span>) <span class="fu">return</span>(<span class="cn">NULL</span>)</span>
-<span id="cb6-137"><a href="#cb6-137" aria-hidden="true" tabindex="-1"></a>  m <span class="ot">&lt;-</span> <span class="fu">tryCatch</span>(yaml<span class="sc">::</span><span class="fu">yaml.load</span>(<span class="fu">paste</span>(txt[(d[<span class="dv">1</span>] <span class="sc">+</span> <span class="dv">1</span>)<span class="sc">:</span>(d[<span class="dv">2</span>] <span class="sc">-</span> <span class="dv">1</span>)], <span class="at">collapse =</span> <span class="st">"</span><span class="sc">\n</span><span class="st">"</span>)), <span class="at">error =</span> \(e) <span class="cn">NULL</span>)<span class="sc">$</span>msens</span>
-<span id="cb6-138"><a href="#cb6-138" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="fu">is.null</span>(m) <span class="sc">||</span> <span class="sc">!</span><span class="fu">identical</span>(m<span class="sc">$</span>workflow_type, <span class="st">"ingest"</span>) <span class="sc">||</span> <span class="fu">is.null</span>(m<span class="sc">$</span>dataset<span class="sc">$</span>ds_key)) <span class="fu">return</span>(<span class="cn">NULL</span>)</span>
-<span id="cb6-139"><a href="#cb6-139" aria-hidden="true" tabindex="-1"></a>  <span class="fu">tibble</span>(<span class="at">target_name =</span> m<span class="sc">$</span>target_name, <span class="at">ds_key =</span> m<span class="sc">$</span>dataset<span class="sc">$</span>ds_key, <span class="at">output =</span> m<span class="sc">$</span>output)</span>
-<span id="cb6-140"><a href="#cb6-140" aria-hidden="true" tabindex="-1"></a>})</span>
-<span id="cb6-141"><a href="#cb6-141" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb6-142"><a href="#cb6-142" aria-hidden="true" tabindex="-1"></a>verified <span class="ot">&lt;-</span> <span class="fu">tibble</span>()</span>
-<span id="cb6-143"><a href="#cb6-143" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (bootstrap_verify) {</span>
-<span id="cb6-144"><a href="#cb6-144" aria-hidden="true" tabindex="-1"></a>  con <span class="ot">&lt;-</span> <span class="fu">dbConnect</span>(<span class="fu">duckdb</span>())</span>
-<span id="cb6-145"><a href="#cb6-145" aria-hidden="true" tabindex="-1"></a>  verified <span class="ot">&lt;-</span> <span class="fu">map_dfr</span>(<span class="fu">seq_len</span>(<span class="fu">nrow</span>(ing)), <span class="cf">function</span>(i) {</span>
-<span id="cb6-146"><a href="#cb6-146" aria-hidden="true" tabindex="-1"></a>    ds <span class="ot">&lt;-</span> ing<span class="sc">$</span>ds_key[i]; <span class="cf">if</span> (<span class="sc">!</span>ds <span class="sc">%in%</span> rows<span class="sc">$</span>ds_key) <span class="fu">return</span>(<span class="cn">NULL</span>)</span>
-<span id="cb6-147"><a href="#cb6-147" aria-hidden="true" tabindex="-1"></a>    mf <span class="ot">&lt;-</span> <span class="fu">here</span>(ing<span class="sc">$</span>output[i])</span>
-<span id="cb6-148"><a href="#cb6-148" aria-hidden="true" tabindex="-1"></a>    expect <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="fu">file_exists</span>(mf)) <span class="fu">fromJSON</span>(mf)<span class="sc">$</span>content_hash <span class="cf">else</span> <span class="cn">NA_character_</span></span>
-<span id="cb6-149"><a href="#cb6-149" aria-hidden="true" tabindex="-1"></a>    got <span class="ot">&lt;-</span> msens<span class="sc">::</span><span class="fu">hash_parquet</span>(<span class="fu">glue</span>(<span class="st">"{dist_cur}/dataset={ds}/*.parquet"</span>), con)</span>
-<span id="cb6-150"><a href="#cb6-150" aria-hidden="true" tabindex="-1"></a>    <span class="fu">tibble</span>(<span class="at">ds_key =</span> ds, <span class="at">target =</span> ing<span class="sc">$</span>target_name[i], <span class="at">expected =</span> expect, <span class="at">got =</span> got,</span>
-<span id="cb6-151"><a href="#cb6-151" aria-hidden="true" tabindex="-1"></a>           <span class="at">ok =</span> <span class="sc">!</span><span class="fu">is.na</span>(expect) <span class="sc">&amp;&amp;</span> <span class="fu">identical</span>(expect, got))</span>
-<span id="cb6-152"><a href="#cb6-152" aria-hidden="true" tabindex="-1"></a>  })</span>
-<span id="cb6-153"><a href="#cb6-153" aria-hidden="true" tabindex="-1"></a>  <span class="fu">dbDisconnect</span>(con, <span class="at">shutdown =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb6-154"><a href="#cb6-154" aria-hidden="true" tabindex="-1"></a>  knitr<span class="sc">::</span><span class="fu">kable</span>(verified)</span>
-<span id="cb6-155"><a href="#cb6-155" aria-hidden="true" tabindex="-1"></a>  <span class="fu">stopifnot</span>(<span class="st">"a cloned dataset does not hash to its ingest checkpoint"</span> <span class="ot">=</span> <span class="fu">all</span>(verified<span class="sc">$</span>ok))</span>
-<span id="cb6-156"><a href="#cb6-156" aria-hidden="true" tabindex="-1"></a>} <span class="cf">else</span> <span class="fu">log_info</span>(<span class="st">"BOOTSTRAP_VERIFY unset — clone checked by count + bytes only"</span>)</span>
-<span id="cb6-157"><a href="#cb6-157" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb6-158"><a href="#cb6-158" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb6-159"><a href="#cb6-159" aria-hidden="true" tabindex="-1"></a><span class="fu">## Manifest</span></span>
-<span id="cb6-160"><a href="#cb6-160" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb6-163"><a href="#cb6-163" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb6-164"><a href="#cb6-164" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: manifest</span></span>
-<span id="cb6-165"><a href="#cb6-165" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb6-166"><a href="#cb6-166" aria-hidden="true" tabindex="-1"></a><span class="co"># content-addressed on WHAT was cloned (dataset set + sizes + method), not when</span></span>
-<span id="cb6-167"><a href="#cb6-167" aria-hidden="true" tabindex="-1"></a>h <span class="ot">&lt;-</span> digest<span class="sc">::</span><span class="fu">digest</span>(rows <span class="sc">|&gt;</span> <span class="fu">select</span>(ds_key, n_files, gb, method), <span class="at">algo =</span> <span class="st">"xxhash64"</span>)</span>
-<span id="cb6-168"><a href="#cb6-168" aria-hidden="true" tabindex="-1"></a>msens<span class="sc">::</span><span class="fu">write_manifest</span>(</span>
-<span id="cb6-169"><a href="#cb6-169" aria-hidden="true" tabindex="-1"></a>  manifest, <span class="at">target =</span> <span class="st">"bootstrap_version"</span>, <span class="at">content_hash =</span> h,</span>
-<span id="cb6-170"><a href="#cb6-170" aria-hidden="true" tabindex="-1"></a>  <span class="at">stats =</span> <span class="fu">list</span>(<span class="at">ver =</span> ver, <span class="at">ver_prev =</span> ver_prev, <span class="at">n_datasets =</span> <span class="fu">nrow</span>(rows),</span>
-<span id="cb6-171"><a href="#cb6-171" aria-hidden="true" tabindex="-1"></a>               <span class="at">datasets =</span> <span class="fu">paste</span>(rows<span class="sc">$</span>ds_key, <span class="at">collapse =</span> <span class="st">","</span>), <span class="at">skipped =</span> <span class="fu">paste</span>(skip_ds, <span class="at">collapse =</span> <span class="st">","</span>),</span>
-<span id="cb6-172"><a href="#cb6-172" aria-hidden="true" tabindex="-1"></a>               <span class="at">gb_total =</span> <span class="fu">sum</span>(rows<span class="sc">$</span>gb), <span class="at">method =</span> <span class="fu">paste</span>(<span class="fu">unique</span>(rows<span class="sc">$</span>method), <span class="at">collapse =</span> <span class="st">","</span>),</span>
-<span id="cb6-173"><a href="#cb6-173" aria-hidden="true" tabindex="-1"></a>               <span class="at">verified =</span> <span class="cf">if</span> (<span class="fu">nrow</span>(verified)) <span class="fu">all</span>(verified<span class="sc">$</span>ok) <span class="cf">else</span> <span class="cn">NA</span>),</span>
-<span id="cb6-174"><a href="#cb6-174" aria-hidden="true" tabindex="-1"></a>  <span class="at">force =</span> msens<span class="sc">::</span><span class="fu">force_target</span>(<span class="st">"bootstrap_version"</span>))</span>
-<span id="cb6-175"><a href="#cb6-175" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb8" data-shortcodes="false"><pre class="sourceCode markdown code-with-copy"><code class="sourceCode markdown"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="an">title:</span><span class="co"> "Bootstrap a release version — clone the unchanged ingests from the previous version"</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="an">msens:</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="co">  target_name: bootstrap_version</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="co">  workflow_type: grid</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="co">  dependency: []</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="co">  output: data/manifests/bootstrap_version.json</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="an">editor_options:</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a><span class="co">  chunk_output_type: console</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a><span class="in">`ver`</span> in <span class="in">`libs/paths.R`</span> has only ever moved once (v7 → v8), and that bump rewrote every ingest.</span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>A bump **on the same grid** (v8 → v9: same <span class="in">`global05`</span> cells, same <span class="in">`r_cellid_global.tif`</span>) must</span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>*reuse* the ingests nothing changed — AquaMaps alone is 50 GB and 40 min on the server, BirdLife</span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>and IUCN are hours — and it must do so **reproducibly**: which datasets were carried forward, from</span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>where, and whether they are the surfaces the content-addressed manifests checkpointed.</span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a>This notebook clones <span class="in">`{dir_big}/{ver_prev}/marine-atlas/dist/dataset=*`</span> (+ <span class="in">`model_*.csv`</span>) into</span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a>this version's <span class="in">`dist/`</span>. On macOS/APFS that is <span class="in">`cp -c`</span> (clonefile: instant, zero extra bytes,</span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a>copy-on-write); on Linux it is a hardlink tree (<span class="in">`cp -al`</span>). The ingest notebooks then **resume**</span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a>against the clone — every Parquet already present — so their manifests do not change and nothing</span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a>downstream re-runs for the wrong reason. Datasets this version re-ingests (v9: nothing; a future</span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a>AquaMaps refresh would be <span class="in">`BOOTSTRAP_SKIP_DS=am`</span>) are simply not cloned.</span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a>Verification: by default file count + byte total per dataset must equal <span class="in">`ver_prev`</span>'s;</span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a><span class="in">`BOOTSTRAP_VERIFY=1`</span> re-hashes each cloned surface with <span class="in">`msens::hash_parquet()`</span> and asserts</span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a>equality with that ingest's <span class="in">`data/manifests/ingest_*.json`</span> <span class="in">`content_hash`</span> — proof that what was</span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a>cloned is the checkpointed surface and not a stale directory.</span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-30"><a href="#cb8-30" aria-hidden="true" tabindex="-1"></a><span class="fu">## Design</span></span>
+<span id="cb8-31"><a href="#cb8-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-34"><a href="#cb8-34" aria-hidden="true" tabindex="-1"></a><span class="in">```{mermaid}</span></span>
+<span id="cb8-35"><a href="#cb8-35" aria-hidden="true" tabindex="-1"></a>%%| label: fig-design</span>
+<span id="cb8-36"><a href="#cb8-36" aria-hidden="true" tabindex="-1"></a>%%| fig-cap: <span class="ot">"</span><span class="st">Same-grid version bump: clone the unchanged ingests (copy-on-write) so they resume, verify against the ingest checkpoints</span><span class="ot">"</span></span>
+<span id="cb8-37"><a href="#cb8-37" aria-hidden="true" tabindex="-1"></a>flowchart LR</span>
+<span id="cb8-38"><a href="#cb8-38" aria-hidden="true" tabindex="-1"></a>  prev[(<span class="ot">"</span><span class="st">{ver_prev}/marine-atlas/dist/&lt;br/&gt;dataset=* + model_*.csv</span><span class="ot">"</span>)] --&gt;|<span class="ot">"</span><span class="st">cp -c (APFS clonefile)&lt;br/&gt;cp -al (Linux)</span><span class="ot">"</span>| cur[(<span class="ot">"</span><span class="st">{ver}/marine-atlas/dist/</span><span class="ot">"</span>)]</span>
+<span id="cb8-39"><a href="#cb8-39" aria-hidden="true" tabindex="-1"></a>  cur --&gt; chk[<span class="ot">"</span><span class="st">count + bytes == ver_prev&lt;br/&gt;BOOTSTRAP_VERIFY=1: hash_parquet == ingest manifest</span><span class="ot">"</span>]</span>
+<span id="cb8-40"><a href="#cb8-40" aria-hidden="true" tabindex="-1"></a>  chk --&gt; mf[<span class="ot">"</span><span class="st">manifest: what was cloned,&lt;br/&gt;from where, how</span><span class="ot">"</span>]</span>
+<span id="cb8-41"><a href="#cb8-41" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb8-42"><a href="#cb8-42" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-43"><a href="#cb8-43" aria-hidden="true" tabindex="-1"></a><span class="fu">## Setup</span></span>
+<span id="cb8-44"><a href="#cb8-44" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-47"><a href="#cb8-47" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb8-48"><a href="#cb8-48" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: setup</span></span>
+<span id="cb8-49"><a href="#cb8-49" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-50"><a href="#cb8-50" aria-hidden="true" tabindex="-1"></a>librarian<span class="sc">::</span><span class="fu">shelf</span>(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, purrr, readr, tibble, yaml, <span class="at">quiet =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb8-51"><a href="#cb8-51" aria-hidden="true" tabindex="-1"></a><span class="fu">source</span>(<span class="fu">here</span>(<span class="st">"libs/paths.R"</span>))   <span class="co"># ver, ver_prev, dir_big, dir_big_v</span></span>
+<span id="cb8-52"><a href="#cb8-52" aria-hidden="true" tabindex="-1"></a><span class="fu">source</span>(<span class="fu">here</span>(<span class="st">"libs/vars.R"</span>))    <span class="co"># bootstrap_verify</span></span>
+<span id="cb8-53"><a href="#cb8-53" aria-hidden="true" tabindex="-1"></a><span class="fu">options</span>(<span class="at">readr.show_col_types =</span> <span class="cn">FALSE</span>)</span>
+<span id="cb8-54"><a href="#cb8-54" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-55"><a href="#cb8-55" aria-hidden="true" tabindex="-1"></a>dist_prev <span class="ot">&lt;-</span> <span class="fu">path.expand</span>(<span class="fu">glue</span>(<span class="st">"{dir_big}/{ver_prev}/marine-atlas/dist"</span>))</span>
+<span id="cb8-56"><a href="#cb8-56" aria-hidden="true" tabindex="-1"></a>dist_cur  <span class="ot">&lt;-</span> <span class="fu">path.expand</span>(<span class="fu">glue</span>(<span class="st">"{dir_big_v}/marine-atlas/dist"</span>))</span>
+<span id="cb8-57"><a href="#cb8-57" aria-hidden="true" tabindex="-1"></a>manifest  <span class="ot">&lt;-</span> <span class="fu">here</span>(<span class="st">"data/manifests/bootstrap_version.json"</span>)</span>
+<span id="cb8-58"><a href="#cb8-58" aria-hidden="true" tabindex="-1"></a>skip_ds   <span class="ot">&lt;-</span> <span class="fu">trimws</span>(<span class="fu">strsplit</span>(<span class="fu">Sys.getenv</span>(<span class="st">"BOOTSTRAP_SKIP_DS"</span>, <span class="st">""</span>), <span class="st">","</span>)[[<span class="dv">1</span>]])</span>
+<span id="cb8-59"><a href="#cb8-59" aria-hidden="true" tabindex="-1"></a>skip_ds   <span class="ot">&lt;-</span> skip_ds[<span class="fu">nzchar</span>(skip_ds)]</span>
+<span id="cb8-60"><a href="#cb8-60" aria-hidden="true" tabindex="-1"></a><span class="fu">dir_create</span>(<span class="fu">c</span>(dist_cur, <span class="fu">path_dir</span>(manifest)))</span>
+<span id="cb8-61"><a href="#cb8-61" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-62"><a href="#cb8-62" aria-hidden="true" tabindex="-1"></a>versions <span class="ot">&lt;-</span> <span class="fu">read_csv</span>(<span class="fu">here</span>(<span class="st">"data/versions.csv"</span>))</span>
+<span id="cb8-63"><a href="#cb8-63" aria-hidden="true" tabindex="-1"></a><span class="fu">stopifnot</span>(</span>
+<span id="cb8-64"><a href="#cb8-64" aria-hidden="true" tabindex="-1"></a>  <span class="st">"this version must have a row in data/versions.csv before anything is built for it"</span> <span class="ot">=</span> ver <span class="sc">%in%</span> versions<span class="sc">$</span>ver,</span>
+<span id="cb8-65"><a href="#cb8-65" aria-hidden="true" tabindex="-1"></a>  <span class="st">"ver_prev has no marine-atlas dist/ to clone from"</span> <span class="ot">=</span> <span class="fu">dir_exists</span>(dist_prev),</span>
+<span id="cb8-66"><a href="#cb8-66" aria-hidden="true" tabindex="-1"></a>  <span class="st">"ver and ver_prev must be on the same grid — a grid change is a re-ingest, not a clone"</span> <span class="ot">=</span></span>
+<span id="cb8-67"><a href="#cb8-67" aria-hidden="true" tabindex="-1"></a>    <span class="fu">identical</span>(msens<span class="sc">::</span><span class="fu">grid_for_ver</span>(ver), msens<span class="sc">::</span><span class="fu">grid_for_ver</span>(ver_prev)))</span>
+<span id="cb8-68"><a href="#cb8-68" aria-hidden="true" tabindex="-1"></a><span class="fu">log_info</span>(<span class="st">"bootstrap {ver} from {ver_prev}: {dist_prev} -&gt; {dist_cur}; skip: {if (length(skip_ds)) paste(skip_ds, collapse=', ') else 'none'}"</span>)</span>
+<span id="cb8-69"><a href="#cb8-69" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb8-70"><a href="#cb8-70" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-71"><a href="#cb8-71" aria-hidden="true" tabindex="-1"></a><span class="fu">## Clone the unchanged ingests (copy-on-write)</span></span>
+<span id="cb8-72"><a href="#cb8-72" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-75"><a href="#cb8-75" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb8-76"><a href="#cb8-76" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: clone</span></span>
+<span id="cb8-77"><a href="#cb8-77" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-78"><a href="#cb8-78" aria-hidden="true" tabindex="-1"></a><span class="co"># copy-on-write clone of one directory (or file). macOS: `cp -c` = clonefile(2) on APFS —</span></span>
+<span id="cb8-79"><a href="#cb8-79" aria-hidden="true" tabindex="-1"></a><span class="co"># instant and zero extra bytes until either side is modified. Linux: hardlinks (`cp -al`),</span></span>
+<span id="cb8-80"><a href="#cb8-80" aria-hidden="true" tabindex="-1"></a><span class="co"># which the ingests never break because they only ever ADD files (resume) or delete + rebuild</span></span>
+<span id="cb8-81"><a href="#cb8-81" aria-hidden="true" tabindex="-1"></a><span class="co"># their whole dataset dir under REDO_*. rsync would COPY 60 GB; that is what this avoids.</span></span>
+<span id="cb8-82"><a href="#cb8-82" aria-hidden="true" tabindex="-1"></a>clone <span class="ot">&lt;-</span> <span class="cf">function</span>(from, to) {</span>
+<span id="cb8-83"><a href="#cb8-83" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="fu">Sys.info</span>()[[<span class="st">"sysname"</span>]] <span class="sc">==</span> <span class="st">"Darwin"</span>) <span class="fu">system2</span>(<span class="st">"cp"</span>, <span class="fu">c</span>(<span class="st">"-Rc"</span>, <span class="fu">shQuote</span>(from), <span class="fu">shQuote</span>(to)))</span>
+<span id="cb8-84"><a href="#cb8-84" aria-hidden="true" tabindex="-1"></a>  <span class="cf">else</span>                                     <span class="fu">system2</span>(<span class="st">"cp"</span>, <span class="fu">c</span>(<span class="st">"-al"</span>, <span class="fu">shQuote</span>(from), <span class="fu">shQuote</span>(to)))</span>
+<span id="cb8-85"><a href="#cb8-85" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb8-86"><a href="#cb8-86" aria-hidden="true" tabindex="-1"></a>tally <span class="ot">&lt;-</span> <span class="cf">function</span>(d) {</span>
+<span id="cb8-87"><a href="#cb8-87" aria-hidden="true" tabindex="-1"></a>  f <span class="ot">&lt;-</span> <span class="fu">dir_ls</span>(d, <span class="at">recurse =</span> <span class="cn">TRUE</span>, <span class="at">type =</span> <span class="st">"file"</span>)</span>
+<span id="cb8-88"><a href="#cb8-88" aria-hidden="true" tabindex="-1"></a>  <span class="fu">tibble</span>(<span class="at">n_files =</span> <span class="fu">length</span>(f), <span class="at">bytes =</span> <span class="fu">sum</span>(<span class="fu">file_size</span>(f)))</span>
+<span id="cb8-89"><a href="#cb8-89" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb8-90"><a href="#cb8-90" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-91"><a href="#cb8-91" aria-hidden="true" tabindex="-1"></a>ds_dirs <span class="ot">&lt;-</span> <span class="fu">dir_ls</span>(dist_prev, <span class="at">type =</span> <span class="st">"directory"</span>, <span class="at">regexp =</span> <span class="st">"dataset="</span>)</span>
+<span id="cb8-92"><a href="#cb8-92" aria-hidden="true" tabindex="-1"></a>ds_keys <span class="ot">&lt;-</span> <span class="fu">sub</span>(<span class="st">"^dataset="</span>, <span class="st">""</span>, <span class="fu">path_file</span>(ds_dirs))</span>
+<span id="cb8-93"><a href="#cb8-93" aria-hidden="true" tabindex="-1"></a>todo    <span class="ot">&lt;-</span> <span class="fu">setdiff</span>(ds_keys, skip_ds)</span>
+<span id="cb8-94"><a href="#cb8-94" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-95"><a href="#cb8-95" aria-hidden="true" tabindex="-1"></a>rows <span class="ot">&lt;-</span> <span class="fu">map_dfr</span>(todo, <span class="cf">function</span>(ds) {</span>
+<span id="cb8-96"><a href="#cb8-96" aria-hidden="true" tabindex="-1"></a>  from <span class="ot">&lt;-</span> <span class="fu">path</span>(dist_prev, <span class="fu">glue</span>(<span class="st">"dataset={ds}"</span>)); to <span class="ot">&lt;-</span> <span class="fu">path</span>(dist_cur, <span class="fu">glue</span>(<span class="st">"dataset={ds}"</span>))</span>
+<span id="cb8-97"><a href="#cb8-97" aria-hidden="true" tabindex="-1"></a>  method <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="fu">dir_exists</span>(to)) <span class="st">"exists"</span> <span class="cf">else</span> {</span>
+<span id="cb8-98"><a href="#cb8-98" aria-hidden="true" tabindex="-1"></a>    st <span class="ot">&lt;-</span> <span class="fu">clone</span>(from, to)</span>
+<span id="cb8-99"><a href="#cb8-99" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="sc">!</span><span class="fu">identical</span>(st, <span class="dv">0</span>L)) <span class="fu">stop</span>(<span class="fu">glue</span>(<span class="st">"clone of {ds} failed (exit {st})"</span>))</span>
+<span id="cb8-100"><a href="#cb8-100" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="fu">Sys.info</span>()[[<span class="st">"sysname"</span>]] <span class="sc">==</span> <span class="st">"Darwin"</span>) <span class="st">"clonefile"</span> <span class="cf">else</span> <span class="st">"hardlink"</span></span>
+<span id="cb8-101"><a href="#cb8-101" aria-hidden="true" tabindex="-1"></a>  }</span>
+<span id="cb8-102"><a href="#cb8-102" aria-hidden="true" tabindex="-1"></a>  tp <span class="ot">&lt;-</span> <span class="fu">tally</span>(from); tc <span class="ot">&lt;-</span> <span class="fu">tally</span>(to)</span>
+<span id="cb8-103"><a href="#cb8-103" aria-hidden="true" tabindex="-1"></a>  <span class="fu">tibble</span>(<span class="at">ds_key =</span> ds, <span class="at">method =</span> method,</span>
+<span id="cb8-104"><a href="#cb8-104" aria-hidden="true" tabindex="-1"></a>         <span class="at">n_files_prev =</span> tp<span class="sc">$</span>n_files, <span class="at">n_files =</span> tc<span class="sc">$</span>n_files,</span>
+<span id="cb8-105"><a href="#cb8-105" aria-hidden="true" tabindex="-1"></a>         <span class="at">gb_prev =</span> <span class="fu">round</span>(tp<span class="sc">$</span>bytes <span class="sc">/</span> <span class="fl">1e9</span>, <span class="dv">2</span>), <span class="at">gb =</span> <span class="fu">round</span>(tc<span class="sc">$</span>bytes <span class="sc">/</span> <span class="fl">1e9</span>, <span class="dv">2</span>),</span>
+<span id="cb8-106"><a href="#cb8-106" aria-hidden="true" tabindex="-1"></a>         <span class="at">same =</span> tp<span class="sc">$</span>n_files <span class="sc">==</span> tc<span class="sc">$</span>n_files <span class="sc">&amp;&amp;</span> tp<span class="sc">$</span>bytes <span class="sc">==</span> tc<span class="sc">$</span>bytes)</span>
+<span id="cb8-107"><a href="#cb8-107" aria-hidden="true" tabindex="-1"></a>})</span>
+<span id="cb8-108"><a href="#cb8-108" aria-hidden="true" tabindex="-1"></a><span class="co"># the per-dataset species crosswalks travel with their surfaces</span></span>
+<span id="cb8-109"><a href="#cb8-109" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> (f <span class="cf">in</span> <span class="fu">dir_ls</span>(dist_prev, <span class="at">glob =</span> <span class="st">"*model_*.csv"</span>)) {</span>
+<span id="cb8-110"><a href="#cb8-110" aria-hidden="true" tabindex="-1"></a>  to <span class="ot">&lt;-</span> <span class="fu">path</span>(dist_cur, <span class="fu">path_file</span>(f))</span>
+<span id="cb8-111"><a href="#cb8-111" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">file_exists</span>(to) <span class="sc">&amp;&amp;</span> <span class="fu">sub</span>(<span class="st">"^model_(.+)</span><span class="sc">\\</span><span class="st">.csv$"</span>, <span class="st">"</span><span class="sc">\\</span><span class="st">1"</span>, <span class="fu">path_file</span>(f)) <span class="sc">%in%</span> todo) <span class="fu">file_copy</span>(f, to)</span>
+<span id="cb8-112"><a href="#cb8-112" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb8-113"><a href="#cb8-113" aria-hidden="true" tabindex="-1"></a><span class="co"># a dataset that was cloned earlier and has since diverged (an ingest ADDED models to it) is</span></span>
+<span id="cb8-114"><a href="#cb8-114" aria-hidden="true" tabindex="-1"></a><span class="co"># legitimately different; a dataset that is SMALLER than its source is a truncated clone</span></span>
+<span id="cb8-115"><a href="#cb8-115" aria-hidden="true" tabindex="-1"></a>short <span class="ot">&lt;-</span> rows <span class="sc">|&gt;</span> <span class="fu">filter</span>(n_files <span class="sc">&lt;</span> n_files_prev)</span>
+<span id="cb8-116"><a href="#cb8-116" aria-hidden="true" tabindex="-1"></a><span class="fu">stopifnot</span>(<span class="st">"cloned dataset(s) have FEWER files than ver_prev — truncated clone"</span> <span class="ot">=</span> <span class="fu">nrow</span>(short) <span class="sc">==</span> <span class="dv">0</span>)</span>
+<span id="cb8-117"><a href="#cb8-117" aria-hidden="true" tabindex="-1"></a>knitr<span class="sc">::</span><span class="fu">kable</span>(rows)</span>
+<span id="cb8-118"><a href="#cb8-118" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb8-119"><a href="#cb8-119" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-120"><a href="#cb8-120" aria-hidden="true" tabindex="-1"></a><span class="fu">## Clone the unchanged NATIVE assets (+ their published copies, `BOOTSTRAP_PUBLISH=1`)</span></span>
+<span id="cb8-121"><a href="#cb8-121" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-122"><a href="#cb8-122" aria-hidden="true" tabindex="-1"></a><span class="in">`publish_native.qmd`</span> builds per-model COGs / PMTiles for every served input and is resumable by</span>
+<span id="cb8-123"><a href="#cb8-123" aria-hidden="true" tabindex="-1"></a>file existence — so a version directory without <span class="in">`native/`</span> rebuilds all 18,710 AquaMaps COGs, the</span>
+<span id="cb8-124"><a href="#cb8-124" aria-hidden="true" tabindex="-1"></a>0.5° originals, the vector PMTiles and the 7 GB IUCN GeoPackage (hours), for inputs that did not</span>
+<span id="cb8-125"><a href="#cb8-125" aria-hidden="true" tabindex="-1"></a>change. Clone them from <span class="in">`ver_prev`</span> the same way as <span class="in">`dist/`</span>. The **merged** COGs (<span class="in">`merged`</span>,</span>
+<span id="cb8-126"><a href="#cb8-126" aria-hidden="true" tabindex="-1"></a><span class="in">`_merged_parts`</span>) are deliberately NOT cloned: they are what a new version repaints.</span>
+<span id="cb8-127"><a href="#cb8-127" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-128"><a href="#cb8-128" aria-hidden="true" tabindex="-1"></a>Published copies are per version on S3 (<span class="in">`{ver}/native/…`</span>) and on the file host</span>
+<span id="cb8-129"><a href="#cb8-129" aria-hidden="true" tabindex="-1"></a>(<span class="in">`/share/data/derived/pmtiles/{ver}`</span>), so with <span class="in">`BOOTSTRAP_PUBLISH=1`</span> they are copied</span>
+<span id="cb8-130"><a href="#cb8-130" aria-hidden="true" tabindex="-1"></a>**server-side** (<span class="in">`aws s3 sync s3://…/{ver_prev}/native/x s3://…/{ver}/native/x`</span>, and a hard-link</span>
+<span id="cb8-131"><a href="#cb8-131" aria-hidden="true" tabindex="-1"></a>copy on the file host) — no bytes leave the laptop, and <span class="in">`publish_native`</span>'s own sync then finds</span>
+<span id="cb8-132"><a href="#cb8-132" aria-hidden="true" tabindex="-1"></a>every key present.</span>
+<span id="cb8-133"><a href="#cb8-133" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-136"><a href="#cb8-136" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb8-137"><a href="#cb8-137" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: native</span></span>
+<span id="cb8-138"><a href="#cb8-138" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-139"><a href="#cb8-139" aria-hidden="true" tabindex="-1"></a>nat_prev <span class="ot">&lt;-</span> <span class="fu">path.expand</span>(<span class="fu">glue</span>(<span class="st">"{dir_big}/{ver_prev}/marine-atlas/native"</span>))</span>
+<span id="cb8-140"><a href="#cb8-140" aria-hidden="true" tabindex="-1"></a>nat_cur  <span class="ot">&lt;-</span> <span class="fu">path.expand</span>(<span class="fu">glue</span>(<span class="st">"{dir_big_v}/marine-atlas/native"</span>)); <span class="fu">dir_create</span>(nat_cur)</span>
+<span id="cb8-141"><a href="#cb8-141" aria-hidden="true" tabindex="-1"></a><span class="co"># unchanged INPUT assets only; merged/_merged_parts are this version's to repaint</span></span>
+<span id="cb8-142"><a href="#cb8-142" aria-hidden="true" tabindex="-1"></a>nat_items <span class="ot">&lt;-</span> <span class="fu">c</span>(<span class="st">"am"</span>, <span class="st">"am_native"</span>, <span class="st">"pmtiles"</span>, <span class="st">"vec_grid"</span>, <span class="st">"src"</span>, <span class="st">"gm"</span>, <span class="st">"gm_cog_registry.csv"</span>,</span>
+<span id="cb8-143"><a href="#cb8-143" aria-hidden="true" tabindex="-1"></a>               <span class="st">"_am_parts"</span>, <span class="st">"_am_parts.map.csv"</span>)</span>
+<span id="cb8-144"><a href="#cb8-144" aria-hidden="true" tabindex="-1"></a>nat_rows <span class="ot">&lt;-</span> <span class="fu">map_dfr</span>(nat_items, <span class="cf">function</span>(it) {</span>
+<span id="cb8-145"><a href="#cb8-145" aria-hidden="true" tabindex="-1"></a>  from <span class="ot">&lt;-</span> <span class="fu">path</span>(nat_prev, it); to <span class="ot">&lt;-</span> <span class="fu">path</span>(nat_cur, it)</span>
+<span id="cb8-146"><a href="#cb8-146" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">file_exists</span>(from)) <span class="fu">return</span>(<span class="fu">tibble</span>(<span class="at">item =</span> it, <span class="at">method =</span> <span class="st">"absent in ver_prev"</span>, <span class="at">n_files =</span> <span class="dv">0</span>L, <span class="at">gb =</span> <span class="dv">0</span>))</span>
+<span id="cb8-147"><a href="#cb8-147" aria-hidden="true" tabindex="-1"></a>  method <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="fu">file_exists</span>(to)) <span class="st">"exists"</span> <span class="cf">else</span> {</span>
+<span id="cb8-148"><a href="#cb8-148" aria-hidden="true" tabindex="-1"></a>    st <span class="ot">&lt;-</span> <span class="fu">clone</span>(from, to); <span class="cf">if</span> (<span class="sc">!</span><span class="fu">identical</span>(st, <span class="dv">0</span>L)) <span class="fu">stop</span>(<span class="fu">glue</span>(<span class="st">"clone of native/{it} failed (exit {st})"</span>))</span>
+<span id="cb8-149"><a href="#cb8-149" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="fu">Sys.info</span>()[[<span class="st">"sysname"</span>]] <span class="sc">==</span> <span class="st">"Darwin"</span>) <span class="st">"clonefile"</span> <span class="cf">else</span> <span class="st">"hardlink"</span> }</span>
+<span id="cb8-150"><a href="#cb8-150" aria-hidden="true" tabindex="-1"></a>  t <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="fu">is_dir</span>(to)) <span class="fu">tally</span>(to) <span class="cf">else</span> <span class="fu">tibble</span>(<span class="at">n_files =</span> <span class="dv">1</span>L, <span class="at">bytes =</span> <span class="fu">file_size</span>(to))</span>
+<span id="cb8-151"><a href="#cb8-151" aria-hidden="true" tabindex="-1"></a>  <span class="fu">tibble</span>(<span class="at">item =</span> it, <span class="at">method =</span> method, <span class="at">n_files =</span> t<span class="sc">$</span>n_files, <span class="at">gb =</span> <span class="fu">round</span>(t<span class="sc">$</span>bytes <span class="sc">/</span> <span class="fl">1e9</span>, <span class="dv">2</span>))</span>
+<span id="cb8-152"><a href="#cb8-152" aria-hidden="true" tabindex="-1"></a>})</span>
+<span id="cb8-153"><a href="#cb8-153" aria-hidden="true" tabindex="-1"></a>knitr<span class="sc">::</span><span class="fu">kable</span>(nat_rows, <span class="at">caption =</span> <span class="st">"native assets carried forward from ver_prev (copy-on-write)"</span>)</span>
+<span id="cb8-154"><a href="#cb8-154" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-155"><a href="#cb8-155" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (<span class="fu">.flag</span>(<span class="st">"BOOTSTRAP_PUBLISH"</span>)) {</span>
+<span id="cb8-156"><a href="#cb8-156" aria-hidden="true" tabindex="-1"></a>  s3_prev <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{s3_atlas}/{ver_prev}"</span>); s3_cur <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{s3_atlas}/{ver}"</span>)</span>
+<span id="cb8-157"><a href="#cb8-157" aria-hidden="true" tabindex="-1"></a>  <span class="cf">for</span> (p <span class="cf">in</span> <span class="fu">c</span>(<span class="st">"am"</span>, <span class="st">"am_native"</span>, <span class="st">"pmtiles"</span>, <span class="st">"vec_grid"</span>)) {</span>
+<span id="cb8-158"><a href="#cb8-158" aria-hidden="true" tabindex="-1"></a>    st <span class="ot">&lt;-</span> <span class="fu">system2</span>(<span class="st">"aws"</span>, <span class="fu">c</span>(<span class="st">"s3"</span>, <span class="st">"sync"</span>, <span class="fu">shQuote</span>(<span class="fu">glue</span>(<span class="st">"{s3_prev}/native/{p}"</span>)), <span class="fu">shQuote</span>(<span class="fu">glue</span>(<span class="st">"{s3_cur}/native/{p}"</span>)),</span>
+<span id="cb8-159"><a href="#cb8-159" aria-hidden="true" tabindex="-1"></a>                           <span class="st">"--only-show-errors"</span>, <span class="st">"--no-progress"</span>), <span class="at">stdout =</span> <span class="cn">TRUE</span>, <span class="at">stderr =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb8-160"><a href="#cb8-160" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="sc">!</span><span class="fu">is.null</span>(<span class="fu">attr</span>(st, <span class="st">"status"</span>)) <span class="sc">&amp;&amp;</span> <span class="fu">attr</span>(st, <span class="st">"status"</span>) <span class="sc">!=</span> <span class="dv">0</span>) <span class="fu">stop</span>(<span class="fu">paste</span>(st, <span class="at">collapse =</span> <span class="st">"</span><span class="sc">\n</span><span class="st">"</span>))</span>
+<span id="cb8-161"><a href="#cb8-161" aria-hidden="true" tabindex="-1"></a>    n <span class="ot">&lt;-</span> <span class="fu">length</span>(<span class="fu">system2</span>(<span class="st">"aws"</span>, <span class="fu">c</span>(<span class="st">"s3"</span>, <span class="st">"ls"</span>, <span class="fu">shQuote</span>(<span class="fu">glue</span>(<span class="st">"{s3_cur}/native/{p}/"</span>)), <span class="st">"--recursive"</span>), <span class="at">stdout =</span> <span class="cn">TRUE</span>))</span>
+<span id="cb8-162"><a href="#cb8-162" aria-hidden="true" tabindex="-1"></a>    <span class="fu">log_info</span>(<span class="st">"S3 native/{p}: {ver_prev} -&gt; {ver} server-side copy, {n} objects"</span>)</span>
+<span id="cb8-163"><a href="#cb8-163" aria-hidden="true" tabindex="-1"></a>  }</span>
+<span id="cb8-164"><a href="#cb8-164" aria-hidden="true" tabindex="-1"></a>  <span class="co"># PMTiles on the file host: hard-link copy of ver_prev's tree (instant, no transfer)</span></span>
+<span id="cb8-165"><a href="#cb8-165" aria-hidden="true" tabindex="-1"></a>  out <span class="ot">&lt;-</span> <span class="fu">system2</span>(<span class="st">"ssh"</span>, <span class="fu">c</span>(<span class="st">"msens"</span>, <span class="fu">shQuote</span>(<span class="fu">glue</span>(</span>
+<span id="cb8-166"><a href="#cb8-166" aria-hidden="true" tabindex="-1"></a>    <span class="st">"set -e; cd /share/data/derived/pmtiles &amp;&amp; if [ ! -d {ver} ]; then cp -al {ver_prev} {ver}; fi; "</span>,</span>
+<span id="cb8-167"><a href="#cb8-167" aria-hidden="true" tabindex="-1"></a>    <span class="st">"echo PMTILES_OK $(find {ver} -type f | wc -l)"</span>))), <span class="at">stdout =</span> <span class="cn">TRUE</span>, <span class="at">stderr =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb8-168"><a href="#cb8-168" aria-hidden="true" tabindex="-1"></a>  <span class="fu">stopifnot</span>(<span class="st">"file-host PMTiles copy failed"</span> <span class="ot">=</span> <span class="fu">any</span>(<span class="fu">grepl</span>(<span class="st">"PMTILES_OK"</span>, out)))</span>
+<span id="cb8-169"><a href="#cb8-169" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"file host pmtiles/{ver}: {grep('PMTILES_OK', out, value = TRUE)}"</span>)</span>
+<span id="cb8-170"><a href="#cb8-170" aria-hidden="true" tabindex="-1"></a>} <span class="cf">else</span> <span class="fu">log_info</span>(<span class="st">"BOOTSTRAP_PUBLISH unset — published native copies (S3, file host) not made"</span>)</span>
+<span id="cb8-171"><a href="#cb8-171" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb8-172"><a href="#cb8-172" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-173"><a href="#cb8-173" aria-hidden="true" tabindex="-1"></a><span class="fu">## Verify against the ingest checkpoints (`BOOTSTRAP_VERIFY=1`)</span></span>
+<span id="cb8-174"><a href="#cb8-174" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-175"><a href="#cb8-175" aria-hidden="true" tabindex="-1"></a>The count/bytes check above says the clone is complete; it cannot say the *source* was the</span>
+<span id="cb8-176"><a href="#cb8-176" aria-hidden="true" tabindex="-1"></a>surface the pipeline checkpointed. Re-hashing does — the ingest manifests are content-addressed</span>
+<span id="cb8-177"><a href="#cb8-177" aria-hidden="true" tabindex="-1"></a>(<span class="in">`msens::hash_parquet`</span>, order-independent), so equality is proof, not suggestion. Off by default</span>
+<span id="cb8-178"><a href="#cb8-178" aria-hidden="true" tabindex="-1"></a>because hashing 60 GB takes a while; on when a version is being built for release.</span>
+<span id="cb8-179"><a href="#cb8-179" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-182"><a href="#cb8-182" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb8-183"><a href="#cb8-183" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: verify</span></span>
+<span id="cb8-184"><a href="#cb8-184" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-185"><a href="#cb8-185" aria-hidden="true" tabindex="-1"></a><span class="co"># ingest target -&gt; ds_key, from each ingest notebook's msens: block (the DAG parser keeps only</span></span>
+<span id="cb8-186"><a href="#cb8-186" aria-hidden="true" tabindex="-1"></a><span class="co"># target/type/deps/output, so read the dataset block the way build_registry.qmd does)</span></span>
+<span id="cb8-187"><a href="#cb8-187" aria-hidden="true" tabindex="-1"></a>ing <span class="ot">&lt;-</span> <span class="fu">map_dfr</span>(<span class="fu">dir_ls</span>(<span class="fu">here</span>(), <span class="at">glob =</span> <span class="st">"*.qmd"</span>), \(f) {</span>
+<span id="cb8-188"><a href="#cb8-188" aria-hidden="true" tabindex="-1"></a>  txt <span class="ot">&lt;-</span> <span class="fu">readLines</span>(f, <span class="at">warn =</span> <span class="cn">FALSE</span>); d <span class="ot">&lt;-</span> <span class="fu">which</span>(txt <span class="sc">==</span> <span class="st">"---"</span>)</span>
+<span id="cb8-189"><a href="#cb8-189" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="fu">length</span>(d) <span class="sc">&lt;</span> <span class="dv">2</span>) <span class="fu">return</span>(<span class="cn">NULL</span>)</span>
+<span id="cb8-190"><a href="#cb8-190" aria-hidden="true" tabindex="-1"></a>  m <span class="ot">&lt;-</span> <span class="fu">tryCatch</span>(yaml<span class="sc">::</span><span class="fu">yaml.load</span>(<span class="fu">paste</span>(txt[(d[<span class="dv">1</span>] <span class="sc">+</span> <span class="dv">1</span>)<span class="sc">:</span>(d[<span class="dv">2</span>] <span class="sc">-</span> <span class="dv">1</span>)], <span class="at">collapse =</span> <span class="st">"</span><span class="sc">\n</span><span class="st">"</span>)), <span class="at">error =</span> \(e) <span class="cn">NULL</span>)<span class="sc">$</span>msens</span>
+<span id="cb8-191"><a href="#cb8-191" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="fu">is.null</span>(m) <span class="sc">||</span> <span class="sc">!</span><span class="fu">identical</span>(m<span class="sc">$</span>workflow_type, <span class="st">"ingest"</span>) <span class="sc">||</span> <span class="fu">is.null</span>(m<span class="sc">$</span>dataset<span class="sc">$</span>ds_key)) <span class="fu">return</span>(<span class="cn">NULL</span>)</span>
+<span id="cb8-192"><a href="#cb8-192" aria-hidden="true" tabindex="-1"></a>  <span class="fu">tibble</span>(<span class="at">target_name =</span> m<span class="sc">$</span>target_name, <span class="at">ds_key =</span> m<span class="sc">$</span>dataset<span class="sc">$</span>ds_key, <span class="at">output =</span> m<span class="sc">$</span>output)</span>
+<span id="cb8-193"><a href="#cb8-193" aria-hidden="true" tabindex="-1"></a>})</span>
+<span id="cb8-194"><a href="#cb8-194" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-195"><a href="#cb8-195" aria-hidden="true" tabindex="-1"></a>verified <span class="ot">&lt;-</span> <span class="fu">tibble</span>()</span>
+<span id="cb8-196"><a href="#cb8-196" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (bootstrap_verify) {</span>
+<span id="cb8-197"><a href="#cb8-197" aria-hidden="true" tabindex="-1"></a>  con <span class="ot">&lt;-</span> <span class="fu">dbConnect</span>(<span class="fu">duckdb</span>())</span>
+<span id="cb8-198"><a href="#cb8-198" aria-hidden="true" tabindex="-1"></a>  verified <span class="ot">&lt;-</span> <span class="fu">map_dfr</span>(<span class="fu">seq_len</span>(<span class="fu">nrow</span>(ing)), <span class="cf">function</span>(i) {</span>
+<span id="cb8-199"><a href="#cb8-199" aria-hidden="true" tabindex="-1"></a>    ds <span class="ot">&lt;-</span> ing<span class="sc">$</span>ds_key[i]; <span class="cf">if</span> (<span class="sc">!</span>ds <span class="sc">%in%</span> rows<span class="sc">$</span>ds_key) <span class="fu">return</span>(<span class="cn">NULL</span>)</span>
+<span id="cb8-200"><a href="#cb8-200" aria-hidden="true" tabindex="-1"></a>    mf <span class="ot">&lt;-</span> <span class="fu">here</span>(ing<span class="sc">$</span>output[i])</span>
+<span id="cb8-201"><a href="#cb8-201" aria-hidden="true" tabindex="-1"></a>    expect <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="fu">file_exists</span>(mf)) <span class="fu">fromJSON</span>(mf)<span class="sc">$</span>content_hash <span class="cf">else</span> <span class="cn">NA_character_</span></span>
+<span id="cb8-202"><a href="#cb8-202" aria-hidden="true" tabindex="-1"></a>    got <span class="ot">&lt;-</span> msens<span class="sc">::</span><span class="fu">hash_parquet</span>(<span class="fu">glue</span>(<span class="st">"{dist_cur}/dataset={ds}/*.parquet"</span>), con)</span>
+<span id="cb8-203"><a href="#cb8-203" aria-hidden="true" tabindex="-1"></a>    <span class="fu">tibble</span>(<span class="at">ds_key =</span> ds, <span class="at">target =</span> ing<span class="sc">$</span>target_name[i], <span class="at">expected =</span> expect, <span class="at">got =</span> got,</span>
+<span id="cb8-204"><a href="#cb8-204" aria-hidden="true" tabindex="-1"></a>           <span class="at">ok =</span> <span class="sc">!</span><span class="fu">is.na</span>(expect) <span class="sc">&amp;&amp;</span> <span class="fu">identical</span>(expect, got))</span>
+<span id="cb8-205"><a href="#cb8-205" aria-hidden="true" tabindex="-1"></a>  })</span>
+<span id="cb8-206"><a href="#cb8-206" aria-hidden="true" tabindex="-1"></a>  <span class="fu">dbDisconnect</span>(con, <span class="at">shutdown =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb8-207"><a href="#cb8-207" aria-hidden="true" tabindex="-1"></a>  knitr<span class="sc">::</span><span class="fu">kable</span>(verified)</span>
+<span id="cb8-208"><a href="#cb8-208" aria-hidden="true" tabindex="-1"></a>  <span class="fu">stopifnot</span>(<span class="st">"a cloned dataset does not hash to its ingest checkpoint"</span> <span class="ot">=</span> <span class="fu">all</span>(verified<span class="sc">$</span>ok))</span>
+<span id="cb8-209"><a href="#cb8-209" aria-hidden="true" tabindex="-1"></a>} <span class="cf">else</span> <span class="fu">log_info</span>(<span class="st">"BOOTSTRAP_VERIFY unset — clone checked by count + bytes only"</span>)</span>
+<span id="cb8-210"><a href="#cb8-210" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb8-211"><a href="#cb8-211" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-212"><a href="#cb8-212" aria-hidden="true" tabindex="-1"></a><span class="fu">## Manifest</span></span>
+<span id="cb8-213"><a href="#cb8-213" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-216"><a href="#cb8-216" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb8-217"><a href="#cb8-217" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: manifest</span></span>
+<span id="cb8-218"><a href="#cb8-218" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-219"><a href="#cb8-219" aria-hidden="true" tabindex="-1"></a><span class="co"># content-addressed on WHAT was cloned (dataset set + sizes + method), not when</span></span>
+<span id="cb8-220"><a href="#cb8-220" aria-hidden="true" tabindex="-1"></a>h <span class="ot">&lt;-</span> digest<span class="sc">::</span><span class="fu">digest</span>(rows <span class="sc">|&gt;</span> <span class="fu">select</span>(ds_key, n_files, gb, method), <span class="at">algo =</span> <span class="st">"xxhash64"</span>)</span>
+<span id="cb8-221"><a href="#cb8-221" aria-hidden="true" tabindex="-1"></a>msens<span class="sc">::</span><span class="fu">write_manifest</span>(</span>
+<span id="cb8-222"><a href="#cb8-222" aria-hidden="true" tabindex="-1"></a>  manifest, <span class="at">target =</span> <span class="st">"bootstrap_version"</span>, <span class="at">content_hash =</span> h,</span>
+<span id="cb8-223"><a href="#cb8-223" aria-hidden="true" tabindex="-1"></a>  <span class="at">stats =</span> <span class="fu">list</span>(<span class="at">ver =</span> ver, <span class="at">ver_prev =</span> ver_prev, <span class="at">n_datasets =</span> <span class="fu">nrow</span>(rows), <span class="at">n_native =</span> <span class="fu">sum</span>(nat_rows<span class="sc">$</span>n_files),</span>
+<span id="cb8-224"><a href="#cb8-224" aria-hidden="true" tabindex="-1"></a>               <span class="at">datasets =</span> <span class="fu">paste</span>(rows<span class="sc">$</span>ds_key, <span class="at">collapse =</span> <span class="st">","</span>), <span class="at">skipped =</span> <span class="fu">paste</span>(skip_ds, <span class="at">collapse =</span> <span class="st">","</span>),</span>
+<span id="cb8-225"><a href="#cb8-225" aria-hidden="true" tabindex="-1"></a>               <span class="at">gb_total =</span> <span class="fu">sum</span>(rows<span class="sc">$</span>gb), <span class="at">method =</span> <span class="fu">paste</span>(<span class="fu">unique</span>(rows<span class="sc">$</span>method), <span class="at">collapse =</span> <span class="st">","</span>),</span>
+<span id="cb8-226"><a href="#cb8-226" aria-hidden="true" tabindex="-1"></a>               <span class="at">verified =</span> <span class="cf">if</span> (<span class="fu">nrow</span>(verified)) <span class="fu">all</span>(verified<span class="sc">$</span>ok) <span class="cf">else</span> <span class="cn">NA</span>),</span>
+<span id="cb8-227"><a href="#cb8-227" aria-hidden="true" tabindex="-1"></a>  <span class="at">force =</span> msens<span class="sc">::</span><span class="fu">force_target</span>(<span class="st">"bootstrap_version"</span>))</span>
+<span id="cb8-228"><a href="#cb8-228" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
 </code></pre></div><button title="Copy to Clipboard" class="code-copy-button" data-in-quarto-modal=""><i class="bi"></i></button></div>
 </div></div></div></div></div>
 </div> <!-- /content -->
