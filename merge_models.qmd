@@ -22,6 +22,14 @@ scale (~13B am cell-rows), so it must stream + spill rather than materialize:
 - **Turtles = multiplicative.** `val = pmax(1, round(er × suit / 100))` with
   critical-habitat max-override — computed from **only the 6 turtle taxa's files**
   (never a full am scan, which is what OOM'd the naive version).
+- **v9: AquaX (`ax`) supersedes AquaMaps (`am`) per taxon, inside the AquaX mask only.** Before
+  the merge input is partitioned, `msens::supersede_sql()` drops a superseded taxon's `am` cells
+  that fall inside `ax_mask` (AquaX's own extent: the union over models of their modeled pixels,
+  measured against `in_usa` in `ingest_aquax.qmd`). Outside the mask — the rest of the world and any
+  `in_usa` cell no AquaX model reaches — `am` carries on. Which taxa supersede is `data/ax_supersedes_am.csv`
+  (`supersedes` column, itself driven by `AX_ABSENT_SUPERSEDES`); `AX_SUPERSEDE=0` is the control
+  run (ax registered, nothing superseded) whose `pra_score_delta` against v8 must be cor 1.000.
+  Both suitability datasets then feed `merge_sql(suit_ds = c("am", "ax"))` unchanged.
 
 ## Design
 
@@ -29,7 +37,7 @@ scale (~13B am cell-rows), so it must stream + spill rather than materialize:
 %%| label: fig-design
 %%| fig-cap: "ONE batched merge → TWO surfaces from the same data, BOTH masked to the range footprint. GLOBAL viz = the whole range, max(er, am-at-range) → COGs. US scoring = v7-faithful US-boundary-aware rule (range∩US max(er,am-at-range) UNION am∩US for taxa with no US range) — NOT a trim of global. Turtles multiplicative."
 flowchart LR
-  raw["dist/*/*.parquet<br/>(raw model_cell)"] --> mcp[("mc_parts<br/>partitioned by mkey_id (int)")]
+  raw["dist/*/*.parquet<br/>(raw model_cell)"] --> sup["v9: supersede_sql()<br/>drop am ∩ ax_mask<br/>for AquaX taxa"] --> mcp[("mc_parts<br/>partitioned by mkey_id (int)")]
   mcp --> gm["GLOBAL: whole range,<br/>max(er, am-at-range)<br/>(am beyond range MASKED)"]
   mcp --> um["US: range∩US max(er,am@range)<br/>∪ am∩US for taxa w/ no US range"]
   mcp --> tt["turtles ×<br/>greatest(1, er·suit/100)"]
@@ -60,7 +68,7 @@ dir_create(path_dir(manifest))
 stopifnot("run merge_models_prep first" = file_exists(merge_db),
           "run build_cell_grid first"   = file_exists(sdm_db))
 
-suit_ds   <- "am"
+suit_ds   <- c("am", "ax")      # v9: AquaX joins AquaMaps as a suitability dataset (msens::merge_sql)
 turtle_ds <- "rng_turtle_swot_dps"
 ch_ds     <- c("ch_nmfs", "ch_fws", "ca_nmfs")
 ch_sql    <- paste(sprintf("'%s'", ch_ds), collapse = ",")
@@ -97,15 +105,41 @@ try(dbExecute(con, "DROP TABLE IF EXISTS mc_range"),       silent = TRUE)
 dbExecute(con, "CREATE OR REPLACE TABLE mkey_map AS
   SELECT ms_merge_key, CAST(dense_rank() OVER (ORDER BY ms_merge_key) AS INTEGER) AS mkey_id
   FROM (SELECT DISTINCT ms_merge_key FROM taxon_model)")
+
+# v9 SUPERSESSION inputs (see msens::supersede_sql): the AquaX mask + the taxa whose AquaMaps
+# cells are dropped inside it. Both come from ingest_aquax.qmd; `supersedes` already encodes the
+# AX_ABSENT_SUPERSEDES policy. AX_SUPERSEDE=0 empties the table -> the control run.
+ax_mask_pq <- glue("{dir_dist}/ax_mask.parquet")
+sup_csv    <- here("data/ax_supersedes_am.csv")
+has_ax     <- dir_exists(glue("{dir_dist}/dataset=ax")) && file_exists(ax_mask_pq) && file_exists(sup_csv)
+if (has_ax) {
+  dbExecute(con, glue("CREATE OR REPLACE TABLE ax_mask AS SELECT cell_id FROM read_parquet('{ax_mask_pq}')"))
+  sup <- readr::read_csv(sup_csv, show_col_types = FALSE)
+  sup_keys <- if (ax_supersede) unique(sup$ms_merge_key[sup$supersedes]) else character(0)
+  dbWriteTable(con, "supersede", data.frame(ms_merge_key = sup_keys), overwrite = TRUE)
+  # every superseded taxon must be a taxon of THIS merge, or the registry and the crosswalk disagree
+  n_unknown <- dbGetQuery(con, "SELECT count(*) n FROM supersede WHERE ms_merge_key NOT IN (SELECT ms_merge_key FROM taxon_model)")$n
+  stopifnot("ax_supersedes_am.csv names taxa absent from taxon_model" = n_unknown == 0)
+  log_info("supersession: {length(sup_keys)} taxa lose am inside ax_mask ({dbGetQuery(con, 'SELECT count(*) n FROM ax_mask')$n} cells)",
+           if (!ax_supersede) " -- AX_SUPERSEDE=0: CONTROL RUN, nothing superseded" else "")
+} else {
+  dbExecute(con, "CREATE OR REPLACE TABLE ax_mask (cell_id INTEGER)")
+  dbExecute(con, "CREATE OR REPLACE TABLE supersede (ms_merge_key VARCHAR)")
+  log_info("no ax ingest found — no supersession (v8-style merge)")
+}
 dir_parts <- glue("{dir_atlas}/mc_parts")
 # the partition write is the ~40-min step; skip it if the input already exists (REDO_MC_PARTS=1 forces)
 if (!dir_exists(dir_parts) || nzchar(Sys.getenv("REDO_MC_PARTS"))) {
   if (dir_exists(dir_parts)) dir_delete(dir_parts)
   dbExecute(con, "SET partitioned_write_max_open_files=512")
+  # the supersession filter is applied HERE, on the partitioned merge input, so every consumer
+  # downstream (both surfaces, turtles, the masking check) sees the same input
   msens::copy_atlas_parquet(con, glue(
-    "SELECT mm.mkey_id, tm.ms_merge_key, split_part(mc.mdl_key,'|',1) AS ds_key, mc.cell_id, mc.val
-     FROM read_parquet('{dir_dist}/*/*.parquet') mc JOIN taxon_model tm USING (mdl_key)
-     JOIN mkey_map mm USING (ms_merge_key)"),
+    "SELECT mkey_id, ms_merge_key, ds_key, cell_id, val FROM (
+       SELECT mm.mkey_id, tm.ms_merge_key, split_part(mc.mdl_key,'|',1) AS ds_key, mc.cell_id, mc.val
+       FROM read_parquet('{dir_dist}/*/*.parquet') mc JOIN taxon_model tm USING (mdl_key)
+       JOIN mkey_map mm USING (ms_merge_key)) mc
+     WHERE {msens::supersede_sql(src = 'mc')}"),
     dir_parts, partition_by = "mkey_id")
 } else log_info("mc_parts exists — skipping repartition (REDO_MC_PARTS=1 to force)")
 # VIEW over the partitioned input — EVERY query below filters mkey_id (integer) so reads are pruned
@@ -143,11 +177,12 @@ log_info("mc_turtle (whole-range): {dbGetQuery(con, 'SELECT count(*) n FROM mc_t
 #| label: merge_write
 
 # taxon flags from the crosswalk (no cell scan)
-dbExecute(con, "CREATE OR REPLACE TABLE taxon_flags AS
+suit_sql <- paste(sprintf("'%s'", suit_ds), collapse = ",")
+dbExecute(con, glue("CREATE OR REPLACE TABLE taxon_flags AS
   SELECT ms_merge_key,
-         bool_or(split_part(mdl_key,'|',1)='am')  AS has_am,
-         bool_or(split_part(mdl_key,'|',1)<>'am') AS has_range
-  FROM taxon_model GROUP BY ms_merge_key")
+         bool_or(split_part(mdl_key,'|',1) IN ({suit_sql}))     AS has_suit,
+         bool_or(split_part(mdl_key,'|',1) NOT IN ({suit_sql})) AS has_range
+  FROM taxon_model GROUP BY ms_merge_key"))
 
 # skip the ~2h merge write when the surfaces already exist — re-renders (e.g. to refresh the HTML)
 # reuse them; the summaries + hash below read the on-disk parquet either way. REDO_MERGE=1 forces.
@@ -194,7 +229,7 @@ log_info("merging {length(nonturtle)} non-turtle taxa in {length(batches)} cell-
 #    range is MASKED] UNION raw am∩US for TRUE am-only taxa (global has_range=FALSE). A species whose
 #    IUCN range lies WHOLLY outside the US gets NO US presence — the iucn_range_outside_us_eez
 #    exclusion (e.g. Sotalia guianensis). See ?msens::merge_sql for the full rationale.
-msq             <- msens::merge_sql()
+msq             <- msens::merge_sql(suit_ds)
 glob_global_sql <- msq$global
 us_sql          <- msq$us
 for (i in seq_along(batches)) {
@@ -252,6 +287,24 @@ if (dbExistsTable(con, "range_counts")) {
   log_info("masking check: {n_ck - nrow(bad)}/{n_ck} taxa masked to their range footprint")
   stopifnot("global surface has cells beyond the range footprint (apps#8)" = nrow(bad) == 0)
 } else log_info("range_counts absent (merge skipped by a prior run) — REDO_MERGE=1 to re-check")
+
+# v9 supersession check, on the partitioned INPUT (what both surfaces read): for every superseded
+# taxon, no am cell may survive inside ax_mask. The v8 behaviour fails this by construction.
+n_sup <- dbGetQuery(con, "SELECT count(*) n FROM supersede")$n
+if (n_sup > 0) {
+  leak <- dbGetQuery(con, "
+    SELECT count(*) AS n_rows, count(DISTINCT ms_merge_key) AS n_taxa
+    FROM mc_parts p
+    WHERE p.ds_key = 'am'
+      AND p.mkey_id IN (SELECT mkey_id FROM mkey_map WHERE ms_merge_key IN (SELECT ms_merge_key FROM supersede))
+      AND p.cell_id IN (SELECT cell_id FROM ax_mask)")
+  log_info("supersession check: {leak$n_rows} am rows inside ax_mask for {leak$n_taxa} superseded taxa (expect 0)")
+  stopifnot("AquaMaps cells survive inside the AquaX mask for superseded taxa (supersede_sql not applied to mc_parts?)" =
+              leak$n_rows == 0)
+  # ...and the converse: those taxa DO carry ax inside the mask (the ingest reached the merge)
+  n_ax <- dbGetQuery(con, "SELECT count(DISTINCT ms_merge_key) n FROM mc_parts WHERE ds_key = 'ax'")$n
+  log_info("ax feeds {n_ax} taxa in the merge input")
+}
 dbDisconnect(con, shutdown = TRUE)
 ```
 

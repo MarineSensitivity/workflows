@@ -64,7 +64,7 @@ manifest  <- here("data/manifests/build_registry.json"); dir_create(path_dir(man
 stopifnot("run ingests first" = dir_exists(dir_dist), "run build_cell_grid first" = file_exists(sdm_db))
 
 # canonical dataset order (merged first, then contributing datasets)
-ds_order <- c("ms_merge","am","ca_nmfs","ch_nmfs","ch_fws","rng_fws","bl","rng_iucn",
+ds_order <- c("ms_merge","ax","am","ca_nmfs","ch_nmfs","ch_fws","rng_fws","bl","rng_iucn",
               "rng_turtle_swot_dps","gm","nc")
 ```
 
@@ -81,9 +81,20 @@ fm_dataset <- function(f) {
   m <- tryCatch(yaml.load(paste(txt[(d[1] + 1):(d[2] - 1)], collapse = "\n")), error = \(e) NULL)
   ds <- m$msens$dataset
   if (is.null(ds$ds_key)) return(NULL)
+  # the rich metadata (name/description/citation/links/value_info/...) is OPTIONAL in the block:
+  # a dataset that v7 also had inherits it below; a NEW dataset (ax) has nowhere else to declare
+  # it, and without it the docs would print a glue'd fallback label and no citation
+  opt <- function(k) { v <- ds[[k]]; if (is.null(v)) NA else v }
   tibble(ds_key = ds$ds_key, response_type = ds$response_type %||% NA,
          source_broad = ds$source_authority %||% NA, temporal_res = ds$temporal_interval %||% "static",
-         native_format = ds$native_format %||% NA, qmd = path_file(f))
+         native_format = ds$native_format %||% NA, qmd = path_file(f),
+         fm_name_short = opt("name_short"), fm_name_display = opt("name_display"),
+         fm_description = opt("description"), fm_citation = opt("citation"),
+         fm_link_info = opt("link_info"), fm_link_download = opt("link_download"),
+         fm_link_metadata = opt("link_metadata"), fm_value_info = opt("value_info"),
+         fm_regions = opt("regions"), fm_taxa_groups = opt("taxa_groups"),
+         fm_is_mask = as.logical(opt("is_mask")), fm_env_start = as.character(opt("env_start")),
+         fm_env_end = as.character(opt("env_end")))
 }
 ds_fm <- map_dfr(dir_ls(".", glob = "ingest_*.qmd"), fm_dataset)
 
@@ -99,11 +110,24 @@ d_v7 <- dbGetQuery(v7, "SELECT * FROM dataset") |>
   mutate(ds_key = if_else(ds_key == "am_0.05", "am", ds_key))
 dbDisconnect(v7, shutdown = TRUE)
 
+# front-matter values win over inherited ones where declared; a column the inherited table
+# lacks is created from the front-matter alone
+take <- function(d, col, fm) {
+  have <- if (col %in% names(d)) d[[col]] else rep(NA, nrow(d))
+  v <- coalesce(as.character(d[[fm]]), as.character(have))
+  if (is.logical(have) || col == "is_mask") as.logical(v) else v
+}
 dataset <- ds_fm |>
-  left_join(d_v7 |> select(-response_type, -source_broad, -temporal_res, -sort_order), by = "ds_key") |>
+  left_join(d_v7 |> select(-response_type, -source_broad, -temporal_res, -sort_order), by = "ds_key")
+for (col in c("name_short","name_display","description","citation","link_info","link_download",
+              "link_metadata","value_info","regions","taxa_groups","is_mask","env_start","env_end"))
+  dataset[[col]] <- take(dataset, col, paste0("fm_", col))
+dataset <- dataset |>
+  select(-starts_with("fm_")) |>
   mutate(
     name_short  = coalesce(name_short, glue("{source_broad} ({response_type})")),
     description = coalesce(description, name_short),
+    is_mask     = coalesce(is_mask, FALSE),
     spatial_res_deg = 0.05,
     sort_order  = match(ds_key, ds_order)) |>
   arrange(sort_order) |>

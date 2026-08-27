@@ -18,6 +18,8 @@ far too large (up to ~19M cells) for the dense per-cell SQL tiler:
   (client filters by it), served from the file host `/pmtiles`.
 - **AquaMaps** (`am`, raster) → **one COG per model** (bbox-cropped, overviews), served
   from S3 by titiler-v8 `/cog`.
+- **AquaX** (`ax`, raster, v9) → COGs are built + uploaded by `ingest_aquax.qmd` (native ==
+  model grid); this notebook only **registers** them (both representations) from `model_ax.csv`.
 
 Both drive a `native_asset` registry (`mdl_key → asset_type + url`) that STAC + the app read.
 We publish inputs for every taxon the toolkit considers valid in EITHER surface
@@ -651,7 +653,32 @@ if (do_merged_cog && dir_exists(dir_gmerged)) {
 pmt_model_rows <- if (nrow(pmt_reg)) pmt_reg else tibble()
 vec_cog_rows   <- if (exists("vec_cog_reg") && nrow(vec_cog_reg)) vec_cog_reg else tibble()
 
-asset_info <- bind_rows(am_reg, am_native_reg, pmt_model_rows, vec_cog_rows) |>
+# AquaX (v9, `ax`): the COGs are built and uploaded by ingest_aquax.qmd (the native IS the model
+# grid, so there is nothing to repaint here) and recorded in model_ax.csv with their bbox. This
+# chunk only REGISTERS them, in both representations, mirroring am/am_native so the species
+# app's Original/Interpolated toggle needs no change. Scoped to the served set like every other
+# class. Rows are skipped (not the whole class) when a model's COG url is missing.
+ax_csv <- glue("{dir_atlas}/dist/model_ax.csv")
+ax_reg <- if (file_exists(ax_csv) && length(served_by_ds[["ax"]])) {
+  ax_m <- readr::read_csv(ax_csv, show_col_types = FALSE, col_types = readr::cols(.default = "c")) |>
+    filter(mdl_key %in% served_by_ds[["ax"]]) |>
+    mutate(across(any_of(c("xmin","xmax","ymin","ymax")), as.numeric))
+  bind_rows(
+    ax_m |> filter(!is.na(cog_url)) |>
+      transmute(mdl_key, ds_key = "ax", asset_type = "cog", representation = "model",
+                asset_url = cog_url, rescale_min = 1L, rescale_max = 100L, colormap = "spectral_r",
+                xmin, xmax, ymin, ymax),
+    ax_m |> filter(!is.na(cog_native_url)) |>
+      transmute(mdl_key, ds_key = "ax", asset_type = "cog", representation = "native",
+                asset_url = cog_native_url, rescale_min = 0L, rescale_max = 1000L, colormap = "spectral_r",
+                xmin, xmax, ymin, ymax))
+} else tibble()
+if (nrow(ax_reg)) log_info("ax COG registry rows: {nrow(ax_reg)} ({n_distinct(ax_reg$mdl_key)} models, ",
+                           "{sum(ax_reg$representation=='model')} model / {sum(ax_reg$representation=='native')} native)")
+if (length(served_by_ds[["ax"]]) && nrow(ax_reg) < 2 * length(served_by_ds[["ax"]]))
+  log_warn("ax: {length(served_by_ds[['ax']])} served models but only {nrow(ax_reg)} registry rows — run ingest_aquax with AX_COG=1 AX_COG_S3=1")
+
+asset_info <- bind_rows(am_reg, am_native_reg, pmt_model_rows, vec_cog_rows, ax_reg) |>
   mutate(across(everything(), ~ if (is.factor(.)) as.character(.) else .))
 
 # per-model geographic bbox (cell_id row/col arithmetic on the global grid) so the app fits
@@ -687,7 +714,14 @@ if (length(vec_ds)) {
   dbDisconnect(con, shutdown = TRUE)
 }
 bb_all <- bind_rows(bb_am, bb_vec)
-if (nrow(bb_all) && "mdl_key" %in% names(asset_info)) asset_info <- asset_info |> left_join(bb_all, by = "mdl_key")
+if (nrow(bb_all) && "mdl_key" %in% names(asset_info)) {
+  # ax rows already carry their bbox (from model_ax.csv); keep it where the join has none
+  asset_info <- asset_info |> left_join(bb_all, by = "mdl_key", suffix = c("", ".j"))
+  for (b in bbox_cols) if (paste0(b, ".j") %in% names(asset_info)) {
+    asset_info[[b]] <- if (b %in% names(asset_info)) coalesce(asset_info[[b]], asset_info[[paste0(b, ".j")]]) else asset_info[[paste0(b, ".j")]]
+    asset_info[[paste0(b, ".j")]] <- NULL
+  }
+}
 
 # attach ms_merge_key (the merged taxon key) so the species app can join a taxon
 # directly to its input surfaces. A raw model may feed >1 merged taxon -> one row each.

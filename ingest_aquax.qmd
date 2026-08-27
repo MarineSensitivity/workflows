@@ -1,0 +1,691 @@
+---
+title: "Ingest AquaX → global 0.05° cells (position-mapped) · supersedes AquaMaps in US waters"
+subtitle: "v9: 10,536 AquaX ensemble suitability rasters, delivered on the v8 grid and masked to US waters, as dataset `ax`"
+msens:
+  target_name: ingest_aquax
+  workflow_type: ingest
+  dependency: [build_cell_grid, ingest_aquamaps]   # the comparison reads AquaMaps' dist/
+  output: data/manifests/ingest_aquax.json
+  dataset: {ds_key: ax, response_type: suitability, source_authority: AquaX, temporal_interval: static,
+            native_format: raster, name_short: "AquaX (suitability)", name_display: "AquaX",
+            description: "Ensemble habitat suitability (present day, cropped to the species' biogeographic range) from the AquaX framework — an enhanced and revised AquaMaps — delivered on the 0.05° grid masked to US waters. Supersedes AquaMaps for the same taxon wherever AquaX was modeled.",
+            value_info: "habitat suitability 0–100 (delivered 0–1000 ensemble mean ÷ 10)",
+            regions: "US waters (BOEM study-area mask)", is_mask: false,
+            citation: "Reygondeau G, Egorova Y, Boerder K, Tittensor DP, Kaschner K, Kesner-Reyes K, Bailly N, Cheung WWL (2026) AquaX: An enhanced and revised AquaMaps framework to model marine species distributions and biodiversity. PLOS One 21(2): e0335823. https://doi.org/10.1371/journal.pone.0335823",
+            link_info: "https://doi.org/10.1371/journal.pone.0335823", env_end: "2025-02"}
+editor_options:
+  chunk_output_type: console
+---
+
+**AquaX** [@reygondeau2026] is "an enhanced and revised AquaMaps framework": a ten-algorithm
+ensemble of habitat suitability per species, cropped to the species' biogeographic range. The
+2026-04 delivery (`~/_big/msens/AquaX_2026-04/`) is **10,536 per-species GeoTIFFs already on the
+v8 `global05` grid** (7200 × 3600, 0.05°, [-180,180]) and **masked to `ply_boem-usa.gpkg`** — the
+US study-area polygon we sent with the species list. Values are the present-day ensemble mean
+`CUR_NR` on a **0–1000** scale, with the model's `AUC`, `TSS` and TSS-derived `cutoff` as
+constant bands.
+
+This notebook is the v9 `ax` ingest and, because AquaX is a newer model of the same thing as
+AquaMaps, also the place where **what it replaces is decided and measured**:
+
+1. **Position map, no resample.** `cell_id` is the pixel index (asserted, not assumed);
+   `val = CUR_NR / 10` puts it on AquaMaps' [0,100] scale (decision D1 of the plan). The TSS
+   cutoff is recorded, not applied (`AX_APPLY_CUTOFF=1` to apply — D2).
+2. **The AquaX mask is AquaX's own extent** (`dist/ax_mask.parquet`): the union over every model
+   of its non-NA pixels. A single model's NA area is its biogeographic-range (`NR`) crop — AquaX
+   saying *absent* — so the mask is the union, not any one model; it is measured below against
+   `cell.in_usa` (634,208), and the `in_usa` cells no model reaches are where AquaMaps continues.
+   Supersession (`merge_models.qmd`, `msens::supersede_sql()`) drops a taxon's AquaMaps cells
+   **inside this mask only** (D3), on both merged surfaces (D5).
+3. **COGs are built here** (`AX_COG=1`, uploaded with `AX_COG_S3=1`): the delivered band
+   bit-exact as the *native* representation (`native/ax_native/`, Float32 0–1000, AUC/TSS/cutoff as
+   metadata) and the ingested surface as the *model* representation (`native/ax/`, 1–100) — the same
+   two representations AquaMaps has, so the species app's Original/Interpolated toggle needs no
+   change (D6/D7). `publish_native.qmd` registers them from `model_ax.csv`; it never repaints.
+4. **Supersession registry** → `data/ax_supersedes_am.csv`: every v8 AquaMaps model whose WoRMS
+   taxon AquaX modeled. Species AquaX modeled but found **absent** in US waters (`ok:no_rows_in_mask`,
+   2,742) keep AquaMaps in v9 unless `AX_ABSENT_SUPERSEDES=1` (D4) — listed, not hidden.
+5. **What changed, per species** → `data/ax_vs_am_summary.csv` + the tables below: mean suitability
+   on the cells both models share, per subregion (AK / AT / GA / PA) and overall, footprint overlap,
+   the 20 least and 20 most different species, each linking to the species app on the preview host.
+
+Flags (`libs/vars.R`): `REDO_INGEST`, `AX_WORKERS` (6), `AX_TEST_N` (smoke test on the first *n*
+models: nothing is written to `data/`, no manifest), `AX_COG`, `AX_COG_S3`, `AX_APPLY_CUTOFF`,
+`AX_ABSENT_SUPERSEDES`. Runs on the **laptop** (the only host with the TIFs); the server needs
+nothing from them.
+
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "AquaX TIFs (already on the grid) → per-model Parquet by pixel position + the AquaX mask; two COG representations; the AquaMaps models it supersedes, and how different they are"
+flowchart LR
+  tif["10,536 TIFs<br/>CUR_NR 0–1000 · AUC · TSS · cutoff"] --> pos["cells_from_aligned_raster(÷10)<br/>cell_id = pixel index (asserted)"]
+  pos --> pq[("dist/dataset=ax/{id}.parquet<br/>(mdl_key, cell_id, val)")]
+  pq --> mask[("dist/ax_mask.parquet<br/>every AquaX-modeled cell")]
+  tif -->|"cog_from_tif (bit-exact)"| cogn["native/ax_native/"]
+  pq -->|"publish_cog (1–100)"| cogm["native/ax/"]
+  cogn & cogm -.->|"AX_COG_S3"| s3[["s3://…/marine-atlas/v9/native/"]]
+  xw["summary.csv + xlsx + WoRMS"] --> csv["model_ax.csv<br/>ax|{AphiaID} · sp_cat · AUC/TSS/cutoff · COG urls"]
+  v8[("v8 taxon_model / taxon")] --> sup["data/ax_supersedes_am.csv"]
+  pq & am[("dist/dataset=am")] & sup --> cmp["ax vs am on shared cells<br/>× subregion → data/ax_vs_am_summary.csv"]
+  pq --> mf["hash_parquet → content-addressed manifest"]
+```
+
+## Setup
+
+```{r}
+#| label: setup
+
+librarian::shelf(
+  arrow, DBI, dplyr, duckdb, fs, furrr, future, ggplot2, glue, here, jsonlite, knitr, logger,
+  purrr, readr, readxl, stringr, terra, tibble, tidyr, MarineSensitivity/msens, quiet = TRUE)
+source(here("libs/paths.R"))   # ver, ver_prev, dir_big, dir_big_v, cellid_tif, spp_db, ax_* paths, s3_atlas
+source(here("libs/vars.R"))    # redo_ingest, ax_* flags
+options(readr.show_col_types = FALSE)
+
+ds_key    <- "ax"
+val_scale <- 0.1      # CUR_NR 0-1000 -> [0,100], AquaMaps' scale (D1)
+threshold <- 1        # drop scaled values < 1, as the AquaMaps ingest does
+dir_atlas <- glue("{dir_big_v}/marine-atlas")
+dir_dist  <- glue("{dir_atlas}/dist/dataset={ds_key}")
+dir_am    <- glue("{dir_atlas}/dist/dataset=am")
+mdl_csv   <- glue("{dir_atlas}/dist/model_{ds_key}.csv")
+stats_csv <- glue("{dir_atlas}/dist/model_{ds_key}_stats.csv")   # per-model stats, appended across resumed runs
+mask_pq   <- glue("{dir_atlas}/dist/ax_mask.parquet")
+cmp_pq    <- glue("{dir_atlas}/dist/ax_vs_am.parquet")
+dir_native     <- glue("{dir_atlas}/native")
+dir_cog_model  <- glue("{dir_native}/ax");        # model representation  (INT1U 1-100)
+dir_cog_native <- glue("{dir_native}/ax_native")  # native representation (Float32 0-1000)
+sup_csv   <- here("data/ax_supersedes_am.csv")
+cmp_csv   <- here("data/ax_vs_am_summary.csv")
+manifest  <- here("data/manifests/ingest_aquax.json")
+s3_ver    <- glue("{s3_atlas}/{ver}")
+s3_http   <- glue("https://s3.us-east-1.amazonaws.com/{sub('^s3://', '', s3_ver)}")
+dir_create(c(dir_dist, path_dir(manifest)))
+if (ax_cog) dir_create(c(dir_cog_model, dir_cog_native))
+
+stopifnot(
+  "AquaX TIF directory missing (laptop-only input)" = dir_exists(ax_tif_dir),
+  "AquaX species summary CSV missing"               = file_exists(ax_summary_csv),
+  "AquaX species xlsx (the list we sent) missing"   = file_exists(ax_xlsx),
+  "run build_cell_grid.qmd first (need cellid_tif)" = file_exists(cellid_tif),
+  "spp.duckdb (WoRMS) missing"                      = file_exists(spp_db),
+  "run ingest_aquamaps first (the comparison reads am's dist/)" = dir_exists(dir_am))
+if (redo_ingest && dir_exists(dir_dist)) {
+  dir_delete(dir_dist); dir_create(dir_dist)
+  if (file_exists(stats_csv)) file_delete(stats_csv)
+  # a redo must also drop this dataset's staged COGs: they are painted FROM the Parquet, and the
+  # round-trip check would otherwise "verify" rasters built from the previous surface
+  for (d in c(dir_cog_model, dir_cog_native)) if (dir_exists(d)) { dir_delete(d); dir_create(d) }
+}
+is_test <- ax_test_n > 0
+if (is_test) log_warn("AX_TEST_N={ax_test_n}: smoke test — nothing written to data/, no manifest")
+safe_key <- function(k) gsub("[^A-Za-z0-9._-]", "_", k)   # mdl_key -> filesystem/URL-safe (as publish_native)
+log_info("ax ingest: workers={ax_workers} cog={ax_cog} s3={ax_cog_s3} cutoff={ax_apply_cutoff} absent_supersedes={ax_absent_supersedes} supersede={ax_supersede}")
+```
+
+## Source inventory + the position-map premise
+
+```{r}
+#| label: inventory
+
+smry <- read_csv(ax_summary_csv) |>
+  mutate(AphiaID = as.character(AphiaID),
+         tif = if_else(status == "ok", as.character(glue("{ax_tif_dir}/BOEM_MASKED_EMMEAN_SP_{AphiaID}.tif")), NA_character_))
+xl   <- read_excel(ax_xlsx, sheet = 1) |> mutate(taxon_id = as.character(taxon_id))
+n_tif <- length(dir_ls(ax_tif_dir, glob = "*.tif"))
+stopifnot(
+  "every `ok` species must have its TIF on disk" = all(file_exists(smry$tif[smry$status == "ok"])),
+  "TIF count differs from the summary's `ok` count" = n_tif == sum(smry$status == "ok"),
+  "an AphiaID appears twice in the summary"      = !any(duplicated(smry$AphiaID)))
+kable(smry |> count(status, name = "n_species"), caption = "AquaX run status (species_summary.csv)")
+kable(read_excel(ax_xlsx, sheet = 2), caption = "The list we sent (species_USA_2025-10-29, worms-only), by v7 component")
+
+# the mask is OUR study-area polygon, byte for byte
+stopifnot("AquaX mask polygon differs from ply_boem-usa.gpkg" = identical(
+  unname(tools::md5sum(path.expand(glue("{ax_dir}/ply_boem-usa.gpkg")))),
+  unname(tools::md5sum(path.expand(ply_usa_gpkg)))))
+
+# the position-map premise, asserted on one TIF: same shape, same extent (to float drift), and
+# the cell id AT every modeled pixel equals the pixel's index
+rc <- rast(cellid_tif)
+r0 <- rast(smry$tif[which(smry$status == "ok")[1]])
+stopifnot(
+  "TIF is not 7200 x 3600"           = identical(as.integer(dim(r0)[1:2]), as.integer(dim(rc)[1:2])),
+  "TIF extent differs from the grid" = max(abs(as.vector(ext(r0)) - as.vector(ext(rc)))) < 1e-4,
+  "TIF must carry CUR_NR, AUC, TSS, cutoff" = identical(names(r0), c("CUR_NR", "AUC", "TSS", "cutoff")))
+cell_ids <- values(rc, mat = FALSE)                       # read ONCE (100 MB); reused by every worker
+v0  <- values(r0[[1]], mat = FALSE); i0 <- which(!is.na(v0))
+stopifnot("cell_id != pixel index on this grid — the position map does not hold" = all(cell_ids[i0] == i0))
+log_info("position map holds: {length(i0)} modeled pixels, cell_id == index; grid {ncol(rc)}x{nrow(rc)}")
+rm(v0, i0)
+```
+
+## Species crosswalk → `model_ax.csv`
+
+AquaX keys every model by WoRMS AphiaID, so the crosswalk is a lookup, not a name match:
+`mdl_key = ax|{AphiaID}`, `worms_id = AphiaID` (which `merge_models_prep` uses directly — no
+`match_taxa`). Taxonomy comes from the WoRMS snapshot (+ the AlgaeBase supplement), `sp_cat`
+from `msens::sp_cat_from_taxonomy()` — the same rule `merge_taxon` applies — so the by-component
+tables here agree with the merge. The `component` column from the list we sent (v7's
+keyword-based categories, incl. `other`) is kept for cross-checking only.
+
+```{r}
+#| label: crosswalk
+
+con_spp <- dbConnect(duckdb(spp_db, read_only = TRUE))
+duckdb_register(con_spp, "ax_ids", tibble(worms_id = smry$AphiaID))
+worms_tax <- dbGetQuery(con_spp, "
+  SELECT CAST(w.scientificNameID AS VARCHAR) AS worms_id, w.scientificName AS scientific_name_worms,
+         w.kingdom, w.phylum, w.\"class\" AS cls, w.family, w.isExtinct
+  FROM worms w JOIN ax_ids a ON CAST(w.scientificNameID AS VARCHAR) = a.worms_id")
+dbDisconnect(con_spp, shutdown = TRUE)
+supp_csv <- here("data/worms_taxonomy_supplement.csv")
+if (file_exists(supp_csv)) {
+  supp <- read_csv(supp_csv, col_types = cols(taxon_id = "c")) |>
+    transmute(worms_id = taxon_id, s_name = scientificName, s_kingdom = kingdom, s_phylum = phylum, s_class = class)
+  worms_tax <- smry |> select(worms_id = AphiaID) |> left_join(worms_tax, by = "worms_id") |> left_join(supp, by = "worms_id") |>
+    mutate(scientific_name_worms = coalesce(scientific_name_worms, s_name), kingdom = coalesce(kingdom, s_kingdom),
+           phylum = coalesce(phylum, s_phylum), cls = coalesce(cls, s_class)) |> select(-starts_with("s_"))
+}
+
+# ver_prev's published relations: which AquaMaps models exist per taxon, and the SWOT turtle set
+prev_tables <- path.expand(glue("{dir_big}/{ver_prev}/marine-atlas/tables"))
+prev_tbl <- function(t) {
+  loc <- glue("{prev_tables}/{t}.parquet")
+  if (file_exists(loc)) return(read_parquet(loc))
+  # not staged locally: read the PUBLISHED table (path-style HTTPS, anonymous single-file read)
+  cx <- dbConnect(duckdb()); on.exit(dbDisconnect(cx, shutdown = TRUE))
+  dbExecute(cx, "INSTALL httpfs; LOAD httpfs; SET s3_url_style='path';")
+  dbGetQuery(cx, glue("SELECT * FROM read_parquet('{msens::atlas_base_url()}/{ver_prev}/tables/{t}.parquet')"))
+}
+prev_tm    <- prev_tbl("taxon_model") |> mutate(taxon_id = as.character(taxon_id))
+prev_taxon <- prev_tbl("taxon")       |> mutate(taxon_id = as.character(taxon_id))
+# startsWith, not str_starts(): "rng_turtle_swot_dps|" is a regex alternation with an EMPTY branch
+# and matched every model, which labelled all 10,536 AquaX species `turtle` in the first smoke test
+turtle_ids <- prev_tm |> filter(startsWith(mdl_key, "rng_turtle_swot_dps|"), taxon_authority == "worms") |> pull(taxon_id) |> unique()
+stopifnot("expected the 6 SWOT turtle taxa" = length(turtle_ids) == 6)
+
+model_ax <- smry |>
+  transmute(sp_id = AphiaID, worms_id = AphiaID,
+            ax_status = if_else(status == "ok", "ok", "absent_in_mask"),
+            rows_in_mask, tif) |>
+  mutate(mdl_key = if_else(ax_status == "ok", msens::mdl_key_raw(ds_key, sp_id), NA_character_)) |>
+  left_join(worms_tax, by = "worms_id") |>
+  left_join(xl |> transmute(worms_id = taxon_id, scientific_xlsx = scientific, common_name = common,
+                            component_xlsx = component, mdl_seq_v7 = model_id), by = "worms_id") |>
+  mutate(scientific_name = coalesce(scientific_name_worms, scientific_xlsx),
+         sp_cat = msens::sp_cat_from_taxonomy(cls, kingdom, is_botw = FALSE, is_turtle = worms_id %in% turtle_ids)) |>
+  select(mdl_key, sp_id, worms_id, scientific_name, common_name, sp_cat, ax_status, rows_in_mask,
+         kingdom, phylum, cls, family, component_xlsx, mdl_seq_v7, tif)
+stopifnot("no birds expected (the list was worms-only)" = !any(model_ax$sp_cat == "bird"))
+kable(model_ax |> count(ax_status, sp_cat) |> pivot_wider(names_from = ax_status, values_from = n, values_fill = 0),
+      caption = "AquaX species by component (taxonomy-based sp_cat) × run status")
+kable(table(v7_component = model_ax$component_xlsx, v9_sp_cat = model_ax$sp_cat, useNA = "ifany"),
+      caption = "v7 keyword component (list we sent) vs v9 taxonomy sp_cat — `other` resolves to invertebrate")
+```
+
+## TIF → Parquet (position map, ÷10, resumable, parallel)
+
+```{r}
+#| label: ingest
+
+todo <- model_ax |> filter(ax_status == "ok")
+if (is_test) todo <- head(todo, ax_test_n)
+pq_of <- function(sp) glue("{dir_dist}/{sp}.parquet")
+prev_stats <- if (file_exists(stats_csv)) read_csv(stats_csv, col_types = cols(sp_id = "c")) else tibble()
+done <- file_exists(pq_of(todo$sp_id)) & todo$sp_id %in% prev_stats$sp_id
+log_info("ax: {sum(done)} done; ingesting {sum(!done)} of {nrow(todo)} models ...")
+
+# one worker = one batch of models. Reads the cell-id raster once, then per model: band 1
+# (100 MB deflate) -> (cell_id, val) by position; AUC/TSS/cutoff from one modeled pixel of
+# bands 2-4 (a windowed read, not three more full reads).
+ingest_batch <- function(rows, cellid_tif, dir_dist, val_scale, threshold, apply_cutoff) {
+  suppressMessages({library(terra); library(tibble)})
+  ids <- terra::values(terra::rast(cellid_tif), mat = FALSE)
+  # the AquaX MASK is where AquaX MODELED (the union over models of non-NA source pixels), not
+  # where it predicted presence above the threshold: half of a typical model's pixels are
+  # near-zero suitability (CUR_NR < 10) and are dropped from the Parquet, yet AquaX did say
+  # "absent" there -- and that absence must supersede AquaMaps too. One model's NA area is its
+  # own range crop, so only the union is the study mask. Accumulate it over the batch.
+  modeled <- logical(length(ids))
+  out <- vector("list", nrow(rows))
+  for (i in seq_len(nrow(rows))) {
+    sp <- rows$sp_id[i]; r <- terra::rast(rows$tif[i])
+    r1 <- r[[1]]
+    first_px <- NA_integer_
+    # the model's scalars: one modeled pixel of each constant band
+    v1 <- terra::values(r1, mat = FALSE); px <- which(!is.na(v1)); first_px <- px[1]
+    modeled[px] <- TRUE
+    auc <- r[[2]][first_px][[1]]; tss <- r[[3]][first_px][[1]]; cutoff <- r[[4]][first_px][[1]]
+    n_src <- length(px)
+    if (apply_cutoff && is.finite(cutoff)) v1[!is.na(v1) & v1 < cutoff] <- NA
+    terra::values(r1) <- v1; rm(v1)          # in memory: the position map below reads it once more, cheaply
+    d <- msens::cells_from_aligned_raster(r1, ids, scale = val_scale, min_value = threshold)
+    msens::write_atlas_parquet(
+      tibble(mdl_key = as.character(rows$mdl_key[i]), cell_id = d$cell_id, val = d$val),
+      sprintf("%s/%s.parquet", dir_dist, sp))
+    out[[i]] <- tibble(sp_id = sp, n_src_px = n_src, n_cells = nrow(d),
+                       val_min = if (nrow(d)) min(d$val) else NA_real_, val_max = if (nrow(d)) max(d$val) else NA_real_,
+                       auc = auc, tss = tss, cutoff = cutoff)
+  }
+  list(stats = do.call(rbind, out), modeled = which(modeled))
+}
+
+t0 <- Sys.time()
+if (any(!done)) {
+  work <- todo[!done, ]
+  plan(multisession, workers = ax_workers)
+  batches <- split(work, (seq_len(nrow(work)) - 1) %% ax_workers)
+  res <- future_map(batches, ingest_batch,
+    cellid_tif = cellid_tif, dir_dist = dir_dist, val_scale = val_scale, threshold = threshold,
+    apply_cutoff = ax_apply_cutoff,
+    .options = furrr_options(seed = TRUE, packages = c("msens", "terra", "tibble")))
+  plan(sequential)
+  # map_dfr, not bind_rows(prev, map(...)): a NAMED list of data frames (batch names "0".."5") is
+  # taken by bind_rows as a data-frame spec, and batches of 9 and 8 rows cannot recycle
+  stats <- bind_rows(prev_stats, map_dfr(res, "stats")) |> distinct(sp_id, .keep_all = TRUE)
+  write_csv(stats, stats_csv)
+  # the mask grows monotonically across resumed runs (a model ingested earlier already
+  # contributed its pixels) and is complete once every model has been ingested once
+  modeled_now <- sort(unique(unlist(map(res, "modeled"))))
+  prev_mask   <- if (file_exists(mask_pq)) read_parquet(mask_pq)$cell_id else integer(0)
+  ax_mask_ids <- sort(unique(c(prev_mask, cell_ids[modeled_now])))
+  if (!is_test) msens::write_atlas_parquet(tibble(cell_id = as.integer(ax_mask_ids)), mask_pq)
+} else {
+  stats <- prev_stats
+  ax_mask_ids <- if (file_exists(mask_pq)) read_parquet(mask_pq)$cell_id else integer(0)
+}
+stopifnot("ax_mask is empty — the ingest loop produced no modeled pixels" = length(ax_mask_ids) > 0)
+log_info("ingest done in {round(as.numeric(Sys.time() - t0, units = 'mins'), 1)} min; {nrow(stats)} models with stats")
+model_ax <- model_ax |> select(-any_of(c("n_src_px","n_cells","val_min","val_max","auc","tss","cutoff"))) |>
+  left_join(stats, by = "sp_id")
+```
+
+## Verify the surface + the AquaX mask
+
+```{r}
+#| label: verify
+
+con <- dbConnect(duckdb(), config = list(threads = as.character(ax_workers), memory_limit = "8GB"))
+dbExecute(con, glue("SET temp_directory = '{dir_atlas}/duckdb_tmp'"))
+# the cell table: this version's build DB, else ver_prev's on the same grid (build_cell_grid copies it)
+has_cell <- function(db) {
+  if (!file_exists(db)) return(FALSE)
+  c0 <- dbConnect(duckdb(db, read_only = TRUE)); on.exit(dbDisconnect(c0, shutdown = TRUE))
+  "cell" %in% dbListTables(c0)
+}
+cell_db <- if (has_cell(sdm_db)) sdm_db else glue("{dir_big}/{ver_prev}/sdm.duckdb")
+dbExecute(con, glue("ATTACH '{path.expand(cell_db)}' AS grid (READ_ONLY)"))
+log_info("cell table from {cell_db}")
+
+smry_pq <- dbGetQuery(con, glue("
+  SELECT count(DISTINCT mdl_key) n_models, count(*) n_cells, min(val) v_min, max(val) v_max,
+         min(cell_id) id_min, max(cell_id) id_max
+  FROM read_parquet('{dir_dist}/*.parquet')"))
+stopifnot(
+  "val must be within (0, 100]" = smry_pq$v_min >= threshold && smry_pq$v_max <= 100,
+  "cell_id outside the global05 grid" = smry_pq$id_min >= 1 && smry_pq$id_max <= 25920000)
+msens::report_table(smry_pq, caption = glue("ax model_cell surface ({if (is_test) 'TEST subset' else 'all models'})"))
+
+# the AquaX MASK = every cell any model MODELED (non-NA source pixel, incl. near-zero
+# suitability that the threshold drops from the Parquet). This is AquaX's own ocean mask, and it
+# is the extent inside which AquaMaps is superseded (msens::supersede_sql). Every Parquet cell is
+# inside it by construction; the converse is deliberately false.
+duckdb_register(con, "ax_mask_r", tibble(cell_id = as.integer(ax_mask_ids)))
+dbExecute(con, "CREATE OR REPLACE TABLE ax_mask AS SELECT cell_id FROM ax_mask_r")
+n_outside <- dbGetQuery(con, glue("SELECT count(*) n FROM read_parquet('{dir_dist}/*.parquet')
+  WHERE cell_id NOT IN (SELECT cell_id FROM ax_mask)"))$n
+stopifnot("Parquet cells outside the AquaX mask" = n_outside == 0)
+cov <- dbGetQuery(con, "
+  SELECT count(*) AS n_mask,
+         count(c.cell_id) AS n_ocean,
+         count(*) FILTER (WHERE c.in_usa) AS n_in_usa,
+         count(*) FILTER (WHERE c.cell_id IS NOT NULL AND NOT c.in_usa) AS n_ocean_not_usa,
+         count(*) FILTER (WHERE c.cell_id IS NULL) AS n_land,
+         (SELECT count(*) FROM grid.cell WHERE in_usa) AS n_usa_total,
+         (SELECT count(*) FROM grid.cell WHERE in_usa AND cell_id NOT IN (SELECT cell_id FROM ax_mask)) AS n_usa_uncovered
+  FROM ax_mask m LEFT JOIN grid.cell c USING (cell_id)")
+stopifnot("AquaX modeled land cells (not in the ocean cell table)" = cov$n_land == 0)
+msens::report_table(cov, caption = "AquaX mask vs the cell grid: every modeled cell is ocean; the uncovered in_usa cells are where AquaMaps continues to apply")
+```
+
+The **uncovered `in_usa` cells** are what decision D3 is about: no AquaX model reaches them, so
+AquaMaps keeps supplying suitability there. Where are they, and are they nearshore (which would
+be a problem) or offshore (AquaX's own ocean mask being tighter than ours)? (A single model's
+NA area is its range crop — 53,818 `in_usa` cells for the most-covered model — which is why the
+mask is the union over all models, not any one of them.)
+
+```{r}
+#| label: mask-gap
+#| fig-width: 10
+#| fig-height: 5
+
+gap <- dbGetQuery(con, "
+  SELECT c.cell_id, c.lon, c.lat, c.depth_mean
+  FROM grid.cell c WHERE c.in_usa AND c.cell_id NOT IN (SELECT cell_id FROM ax_mask)")
+if (nrow(gap)) {
+  kable(gap |> summarise(n = n(), depth_median_m = round(median(depth_mean, na.rm = TRUE)),
+                         depth_min_m = round(min(depth_mean, na.rm = TRUE)), depth_max_m = round(max(depth_mean, na.rm = TRUE)),
+                         pct_deeper_200m = round(100 * mean(depth_mean > 200, na.rm = TRUE), 1)),
+        caption = "Uncovered in_usa cells: depth profile (Bio-Oracle depth_mean, m)")
+  kable(gap |> mutate(sector = case_when(lon < -140 & lat > 45 ~ "Alaska", lon < -140 ~ "Hawaii / Pacific islands",
+                                          lon > 100 ~ "W Pacific islands", lat < 30 & lon > -100 ~ "Gulf / Caribbean", TRUE ~ "other")) |>
+          count(sector) |> arrange(desc(n)), caption = "Uncovered in_usa cells by sector")
+  ggplot(gap, aes(lon, lat)) + geom_point(size = 0.2, colour = "firebrick") +
+    coord_quickmap() + theme_minimal() +
+    labs(title = glue("{nrow(gap)} in_usa cells AquaX never modeled (AquaMaps continues here)"), x = NULL, y = NULL)
+}
+```
+
+## COGs — native (bit-exact) + model (1–100) representations (`AX_COG=1`)
+
+```{r}
+#| label: cogs
+
+cog_rows <- tibble()
+if (ax_cog) {
+  grid <- msens::grid_spec_for("global05", cellid_tif)
+  todo_cog <- model_ax |> filter(ax_status == "ok", sp_id %in% todo$sp_id) |>
+    mutate(f_native = glue("{dir_cog_native}/{safe_key(mdl_key)}.tif"),
+           f_model  = glue("{dir_cog_model}/{safe_key(mdl_key)}.tif"))
+  need <- todo_cog |> filter(!file_exists(f_native) | !file_exists(f_model))
+  log_info("ax COGs: {nrow(todo_cog)} models, {nrow(need)} to build")
+  cog_batch <- function(rows, grid, dir_dist) {
+    suppressMessages({library(terra); library(DBI); library(duckdb)})
+    con <- dbConnect(duckdb()); on.exit(dbDisconnect(con, shutdown = TRUE))
+    for (i in seq_len(nrow(rows))) {
+      if (!file.exists(rows$f_native[i]))
+        msens::cog_from_tif(rows$tif[i], rows$f_native[i], band = 1,
+          metadata = list(mdl_key = rows$mdl_key[i], AUC = rows$auc[i], TSS = rows$tss[i], cutoff = rows$cutoff[i],
+                          source = "AquaX 2026-04 CUR_NR (0-1000)"))
+      if (!file.exists(rows$f_model[i])) {
+        d <- dbGetQuery(con, sprintf("SELECT cell_id, val FROM read_parquet('%s/%s.parquet')", dir_dist, rows$sp_id[i]))
+        # INT1U storage TRUNCATES (70.6 -> 70); round first so the raster holds the nearest integer
+        if (nrow(d)) msens::publish_cog(d$cell_id, round(d$val), rows$f_model[i], grid)
+      }
+    }
+    nrow(rows)
+  }
+  if (nrow(need)) {
+    plan(multisession, workers = ax_workers)
+    future_map(split(need, (seq_len(nrow(need)) - 1) %% ax_workers), cog_batch, grid = grid, dir_dist = dir_dist,
+               .options = furrr_options(seed = TRUE, packages = c("msens", "terra", "DBI", "duckdb")))
+    plan(sequential)
+  }
+  # per-model bbox from the Parquet (row/col arithmetic on the global grid), for the registry
+  bb <- dbGetQuery(con, glue("
+    WITH rc AS (SELECT mdl_key, (cell_id-1) % 7200 AS col, (cell_id-1) // 7200 AS row
+                FROM read_parquet('{dir_dist}/*.parquet'))
+    SELECT mdl_key, -180 + min(col)*0.05 AS xmin, -180 + (max(col)+1)*0.05 AS xmax,
+           90 - (max(row)+1)*0.05 AS ymin, 90 - min(row)*0.05 AS ymax
+    FROM rc GROUP BY mdl_key"))
+  cog_rows <- todo_cog |>
+    mutate(cog_native_url = if_else(file_exists(f_native), as.character(glue("{s3_http}/native/ax_native/{safe_key(mdl_key)}.tif")), NA_character_),
+           cog_url        = if_else(file_exists(f_model),  as.character(glue("{s3_http}/native/ax/{safe_key(mdl_key)}.tif")), NA_character_)) |>
+    select(mdl_key, cog_url, cog_native_url) |> left_join(bb, by = "mdl_key")
+  log_info("ax COGs on disk: native {sum(!is.na(cog_rows$cog_native_url))}, model {sum(!is.na(cog_rows$cog_url))}")
+
+  # ROUND TRIP: 20 random (model, cell) pairs — the model COG must give the Parquet value (INT1U
+  # rounding), the native COG the source TIF's value. A COG painted from the wrong partition is
+  # internally valid and looks fine on a map; this is the only cheap moment to catch it.
+  set.seed(9)
+  smp <- todo_cog |> filter(file_exists(f_native), file_exists(f_model)) |> slice_sample(n = min(20, nrow(todo_cog)))
+  # a check that samples nothing proves nothing: the first smoke test "verified 0 models" while
+  # every native COG was missing (a tilde path GDAL could not open)
+  stopifnot("COG round trip has nothing to sample — were the COGs built?" = nrow(smp) == min(20, nrow(todo_cog)))
+  bad <- 0L
+  for (i in seq_len(nrow(smp))) {
+    d  <- dbGetQuery(con, glue("SELECT cell_id, val FROM read_parquet('{dir_dist}/{smp$sp_id[i]}.parquet') USING SAMPLE 1"))
+    ll <- msens::cell_lonlat(d$cell_id, grid)
+    vm <- as.numeric(terra::extract(rast(smp$f_model[i]), cbind(ll$lon, ll$lat))[1, 1])
+    vn <- as.numeric(terra::extract(rast(smp$f_native[i]), cbind(ll$lon, ll$lat))[1, 1])
+    vs <- rast(smp$tif[i])[[1]][d$cell_id][[1]]
+    if (!isTRUE(all.equal(vm, round(d$val))) || !isTRUE(all.equal(vn, vs))) {
+      bad <- bad + 1L; log_error("{smp$mdl_key[i]} cell {d$cell_id}: parquet {d$val} model-COG {vm}; TIF {vs} native-COG {vn}")
+    }
+  }
+  stopifnot("COG round-trip mismatch (see log)" = bad == 0)
+  log_info("COG round trip verified on {nrow(smp)} models")
+
+  if (ax_cog_s3) {
+    aws_sync <- function(local, prefix) {
+      st <- system2("aws", c("s3", "sync", shQuote(local), shQuote(glue("{s3_ver}/{prefix}")),
+                             "--only-show-errors", "--no-progress"), stdout = TRUE, stderr = TRUE)
+      if (!is.null(attr(st, "status")) && attr(st, "status") != 0) stop(paste(st, collapse = "\n"))
+      log_info("synced {path_file(local)} -> {s3_ver}/{prefix}")
+    }
+    aws_sync(dir_cog_native, "native/ax_native")
+    aws_sync(dir_cog_model,  "native/ax")
+    # read one back through the public URL: a zero exit is not proof the objects are there
+    u <- cog_rows$cog_url[!is.na(cog_rows$cog_url)][1]
+    code <- system2("curl", c("-s", "-o", "/dev/null", "-w", "%{http_code}", "-r", "0-1023", shQuote(u)), stdout = TRUE)
+    stopifnot("published ax COG not readable over HTTPS" = code %in% c("200", "206"))
+    log_info("S3 read-back {u}: HTTP {code}")
+  } else log_info("AX_COG_S3 unset — COGs staged locally only")
+} else log_info("AX_COG unset — no COGs built (set AX_COG=1; AX_COG_S3=1 to upload)")
+model_ax <- model_ax |> select(-any_of(c("cog_url", "cog_native_url", "xmin", "xmax", "ymin", "ymax"))) |>
+  left_join(cog_rows, by = "mdl_key")
+if (!is_test) write_csv(model_ax |> select(-tif), mdl_csv)
+```
+
+## Which AquaMaps models AquaX supersedes
+
+From `r ver_prev`'s published `taxon_model`: every `am|…` model whose WoRMS taxon AquaX modeled.
+The merge (`merge_models.qmd`) reads this registry and `ax_mask` and drops those AquaMaps cells
+inside the mask (`msens::supersede_sql()`). Species AquaX **modeled but found absent** in the mask
+are listed with `ax_status = absent_in_mask`; they supersede only under `AX_ABSENT_SUPERSEDES=1`.
+
+```{r}
+#| label: supersede
+
+am_prev <- prev_tm |> filter(ds_key == "am", taxon_authority == "worms") |>
+  select(am_mdl_key = mdl_key, taxon_id, ms_merge_key) |>
+  left_join(prev_taxon |> select(ms_merge_key, scientific_name_prev = scientific_name, sp_cat_prev = sp_cat,
+                                 is_valid_usa_prev = is_valid_usa), by = "ms_merge_key") |>
+  add_count(taxon_id, name = "n_am_models")
+sup <- am_prev |>
+  inner_join(model_ax |> transmute(taxon_id = worms_id, ax_mdl_key = mdl_key, ax_status, sp_cat, scientific_name),
+             by = "taxon_id") |>
+  mutate(supersedes = ax_status == "ok" | (ax_status == "absent_in_mask" & ax_absent_supersedes)) |>
+  select(am_mdl_key, ax_mdl_key, taxon_id, ms_merge_key, scientific_name, sp_cat, ax_status, supersedes,
+         n_am_models, is_valid_usa_prev) |>
+  arrange(sp_cat, scientific_name, am_mdl_key)
+if (!is_test) write_csv(sup, sup_csv)
+
+# the four fates of a taxon, by component
+ax_tax <- model_ax |> distinct(worms_id, sp_cat, ax_status)
+prev_am_tax <- am_prev |> distinct(taxon_id, sp_cat_prev)
+fates <- bind_rows(
+  ax_tax |> filter(ax_status == "ok",             worms_id %in% prev_am_tax$taxon_id)  |> transmute(sp_cat, fate = "AquaX modeled → supersedes AquaMaps"),
+  ax_tax |> filter(ax_status == "ok",            !worms_id %in% prev_am_tax$taxon_id)  |> transmute(sp_cat, fate = "AquaX modeled, no AquaMaps model (range-only or new)"),
+  ax_tax |> filter(ax_status == "absent_in_mask")                                       |> transmute(sp_cat, fate = glue("AquaX modeled, absent in US → {if (ax_absent_supersedes) 'supersedes' else 'AquaMaps kept'}")),
+  prev_am_tax |> filter(!taxon_id %in% ax_tax$worms_id) |> transmute(sp_cat = sp_cat_prev, fate = "not modeled by AquaX → AquaMaps kept")) |>
+  count(fate, sp_cat) |> pivot_wider(names_from = sp_cat, values_from = n, values_fill = 0) |>
+  mutate(total = rowSums(across(where(is.numeric))))
+kable(fates, caption = glue("Taxa by fate and component ({ver_prev} AquaMaps taxa vs AquaX)"))
+multi <- sup |> filter(supersedes, n_am_models > 1) |> distinct(taxon_id, scientific_name, sp_cat, n_am_models)
+kable(multi |> count(sp_cat, n_am_models), caption = glue("{nrow(multi)} taxa with more than one AquaMaps model, all superseded"))
+log_info("supersession: {sum(sup$supersedes)} am models over {n_distinct(sup$taxon_id[sup$supersedes])} taxa ({nrow(multi)} multi-model); ",
+         "absent-in-mask: {sum(sup$ax_status == 'absent_in_mask')} am models")
+if (!is_test) stopifnot(   # measured 2026-08-27 against v8's published registry; a drift here is a bug, not news
+  "expected 10,703 superseded AquaMaps models"  = sum(sup$ax_status == "ok") == 10703,
+  "expected 10,517 superseded taxa"             = n_distinct(sup$taxon_id[sup$ax_status == "ok"]) == 10517,
+  "expected 182 multi-AquaMaps-model taxa"      = nrow(multi) == 182)
+```
+
+## How different is AquaX from AquaMaps, per species?
+
+For every superseded taxon, AquaMaps (`max` over its AquaMaps models per cell — the surface the
+merge would have used) and AquaX are compared **inside the comparison extent** `ax_mask ∩ in_usa`,
+per subregion (AK / AT / GA / PA, `subregion_2025-06` on `global05`) and overall:
+
+- `n_shared` cells where both have a value; `n_am_only` / `n_ax_only`; footprint **Jaccard**;
+- `mean_am`, `mean_ax` and **`delta = mean_ax − mean_am` on the shared cells** (the like-for-like
+  change in suitability; both on the [0,100] scale), and their correlation;
+- for absent-in-mask species, what AquaMaps said where AquaX says absent (`mean_am_all`, `n_am_only`).
+
+```{r}
+#| label: compare
+
+# comparison extent + one subregion per cell (largest coverage wins where a cell straddles two)
+zc_pq <- path.expand(glue("{dir_derived}/zones/subregion_2025-06/global05/zone_cell.parquet"))
+stopifnot("subregion zone_cell missing (build_zone_cells.qmd)" = file_exists(zc_pq))
+dbExecute(con, glue("CREATE OR REPLACE TABLE cmp_cells AS
+  SELECT m.cell_id, coalesce(z.zone_key, 'other') AS region
+  FROM ax_mask m JOIN grid.cell c USING (cell_id)
+  LEFT JOIN (SELECT cell_id, arg_max(zone_key, pct_covered) AS zone_key
+             FROM read_parquet('{zc_pq}') GROUP BY cell_id) z USING (cell_id)
+  WHERE c.in_usa"))
+n_cmp <- dbGetQuery(con, "SELECT region, count(*) n FROM cmp_cells GROUP BY 1 ORDER BY 1")
+kable(n_cmp, caption = "Comparison extent (ax_mask ∩ in_usa) by subregion")
+
+pairs <- sup |> filter(ax_status == "ok" | ax_status == "absent_in_mask") |>
+  mutate(am_sp = str_remove(am_mdl_key, "^am\\|"), am_file = glue("{dir_am}/{am_sp}.parquet"),
+         ax_file = if_else(is.na(ax_mdl_key), NA_character_, as.character(glue("{dir_dist}/{taxon_id}.parquet"))))
+if (is_test) pairs <- pairs |> filter(taxon_id %in% todo$sp_id)
+miss_am <- pairs |> filter(!file_exists(am_file))
+if (nrow(miss_am)) log_warn("{nrow(miss_am)} superseded am models have no Parquet in dist/dataset=am — skipped")
+pairs <- pairs |> filter(file_exists(am_file), is.na(ax_file) | file_exists(ax_file))
+duckdb_register(con, "pairs", pairs |> select(taxon_id, am_mdl_key, ax_mdl_key, ax_status))
+
+cmp_batch <- function(tx) {
+  p  <- pairs |> filter(taxon_id %in% tx)
+  fa <- paste0("'", unique(p$am_file), "'", collapse = ", ")
+  fx <- unique(na.omit(p$ax_file))
+  ax_src <- if (length(fx)) glue("read_parquet([{paste0(\"'\", fx, \"'\", collapse = ', ')}])") else
+    "(SELECT NULL::VARCHAR AS mdl_key, NULL::INTEGER AS cell_id, NULL::DOUBLE AS val WHERE FALSE)"
+  dbGetQuery(con, glue("
+    WITH am AS (   -- AquaMaps per taxon = max over its models at a cell (what the merge would use)
+      SELECT p.taxon_id, a.cell_id, max(a.val) AS am
+      FROM read_parquet([{fa}]) a JOIN pairs p ON a.mdl_key = p.am_mdl_key
+      JOIN cmp_cells c ON a.cell_id = c.cell_id GROUP BY 1, 2),
+    ax AS (
+      SELECT p.taxon_id, x.cell_id, max(x.val) AS ax
+      FROM {ax_src} x JOIN pairs p ON x.mdl_key = p.ax_mdl_key
+      JOIN cmp_cells c ON x.cell_id = c.cell_id GROUP BY 1, 2),
+    j AS (
+      SELECT coalesce(am.taxon_id, ax.taxon_id) AS taxon_id, coalesce(am.cell_id, ax.cell_id) AS cell_id, am.am, ax.ax
+      FROM am FULL OUTER JOIN ax ON am.taxon_id = ax.taxon_id AND am.cell_id = ax.cell_id)
+    SELECT j.taxon_id, coalesce(c.region, 'ALL') AS region,
+           count(*) FILTER (WHERE am IS NOT NULL AND ax IS NOT NULL) AS n_shared,
+           count(*) FILTER (WHERE am IS NOT NULL AND ax IS NULL)     AS n_am_only,
+           count(*) FILTER (WHERE ax IS NOT NULL AND am IS NULL)     AS n_ax_only,
+           avg(am) FILTER (WHERE am IS NOT NULL AND ax IS NOT NULL)  AS mean_am,
+           avg(ax) FILTER (WHERE am IS NOT NULL AND ax IS NOT NULL)  AS mean_ax,
+           corr(am, ax) FILTER (WHERE am IS NOT NULL AND ax IS NOT NULL) AS cor,
+           avg(am) AS mean_am_all, avg(ax) AS mean_ax_all
+    FROM j JOIN cmp_cells c ON j.cell_id = c.cell_id
+    GROUP BY GROUPING SETS ((j.taxon_id, c.region), (j.taxon_id))"))
+}
+tx_all  <- unique(pairs$taxon_id)
+batches <- split(tx_all, ceiling(seq_along(tx_all) / 400))
+t0 <- Sys.time(); cmp <- vector("list", length(batches))
+for (i in seq_along(batches)) {
+  cmp[[i]] <- cmp_batch(batches[[i]])
+  if (i %% 5 == 0) log_info("  compare batch {i}/{length(batches)} ({round(as.numeric(Sys.time() - t0, units = 'mins'), 1)} min)")
+}
+cmp <- bind_rows(cmp) |>
+  mutate(region = if_else(is.na(region), "ALL", region),
+         delta = mean_ax - mean_am,
+         jaccard = n_shared / pmax(1, n_shared + n_am_only + n_ax_only)) |>
+  left_join(model_ax |> transmute(taxon_id = worms_id, scientific_name, sp_cat, ax_status), by = "taxon_id")
+log_info("compared {n_distinct(cmp$taxon_id)} taxa in {round(as.numeric(Sys.time() - t0, units = 'mins'), 1)} min")
+if (!is_test) {
+  msens::write_atlas_parquet(cmp, cmp_pq)
+  wide <- cmp |> filter(region != "ALL") |> select(taxon_id, region, delta, n_shared) |>
+    pivot_wider(names_from = region, values_from = c(delta, n_shared), names_glue = "{.value}_{region}")
+  cmp |> filter(region == "ALL") |> select(-region) |> left_join(wide, by = "taxon_id") |>
+    mutate(across(where(is.numeric), ~ round(., 3))) |>
+    relocate(taxon_id, scientific_name, sp_cat, ax_status) |>
+    write_csv(cmp_csv)
+}
+```
+
+```{r}
+#| label: compare-tables
+
+all_ok <- cmp |> filter(region == "ALL", ax_status == "ok")
+kable(all_ok |> group_by(sp_cat) |>
+        summarise(n_species = n(), median_delta = round(median(delta, na.rm = TRUE), 1),
+                  mean_abs_delta = round(mean(abs(delta), na.rm = TRUE), 1),
+                  pct_aquax_lower = round(100 * mean(delta < 0, na.rm = TRUE)),
+                  median_jaccard = round(median(jaccard, na.rm = TRUE), 2),
+                  median_cor = round(median(cor, na.rm = TRUE), 2), .groups = "drop"),
+      caption = "AquaX vs AquaMaps on shared cells, by component (delta = mean AquaX − mean AquaMaps, [0,100] scale)")
+kable(cmp |> filter(region != "ALL", ax_status == "ok", n_shared > 0) |> group_by(region) |>
+        summarise(n_species = n(), median_delta = round(median(delta, na.rm = TRUE), 1),
+                  mean_abs_delta = round(mean(abs(delta), na.rm = TRUE), 1),
+                  pct_aquax_lower = round(100 * mean(delta < 0, na.rm = TRUE)),
+                  median_jaccard = round(median(jaccard, na.rm = TRUE), 2), .groups = "drop"),
+      caption = "…by subregion (AK Alaska · AT Atlantic · GA Gulf · PA Pacific)")
+absent <- cmp |> filter(region == "ALL", ax_status == "absent_in_mask")
+if (nrow(absent)) kable(absent |> group_by(sp_cat) |>
+    summarise(n_species = n(), median_am_cells = median(n_am_only), median_mean_am = round(median(mean_am_all, na.rm = TRUE), 1), .groups = "drop"),
+  caption = "Species AquaX modeled but found ABSENT in US waters: what AquaMaps says there (kept in v9 unless AX_ABSENT_SUPERSEDES=1)")
+```
+
+```{r}
+#| label: fig-scatter
+#| fig-cap: "Mean suitability on shared cells: AquaMaps (x) vs AquaX (y), one point per superseded taxon; the diagonal is no change"
+#| fig-width: 7
+#| fig-height: 6
+
+ggplot(all_ok |> filter(n_shared >= 100), aes(mean_am, mean_ax, colour = sp_cat)) +
+  geom_abline(slope = 1, intercept = 0, colour = "grey60", linetype = 2) +
+  geom_point(alpha = 0.35, size = 0.8) +
+  coord_equal(xlim = c(0, 100), ylim = c(0, 100)) + theme_minimal() +
+  labs(x = "AquaMaps mean suitability (shared cells)", y = "AquaX mean suitability (shared cells)", colour = "component")
+```
+
+### The 20 least and 20 most different species
+
+Ranked by |Δ mean suitability| on shared cells, among taxa sharing ≥ 100 cells (so a handful of
+edge cells cannot top the list). Each name opens the species on the **preview host**, where the
+merged surface and the AquaMaps / AquaX inputs (Original / Interpolated) sit side by side.
+
+```{r}
+#| label: extremes
+
+app_url <- function(taxon_id) glue("{msens::preview_app_url('species', ver)}?mdl_key=ms_merge%7CWORMS:{taxon_id}")
+fmt <- function(d, caption) d |>
+  transmute(species = glue('<a href="{app_url(taxon_id)}" target="_blank">{scientific_name}</a>'),
+            sp_cat, n_shared, jaccard = round(jaccard, 2), mean_am = round(mean_am, 1), mean_ax = round(mean_ax, 1),
+            delta = round(delta, 1), cor = round(cor, 2),
+            AK = round(delta_AK, 1), AT = round(delta_AT, 1), GA = round(delta_GA, 1), PA = round(delta_PA, 1)) |>
+  kable(caption = caption, escape = FALSE)
+reg_w <- cmp |> filter(region %in% c("AK","AT","GA","PA")) |> select(taxon_id, region, delta) |>
+  pivot_wider(names_from = region, values_from = delta, names_prefix = "delta_")
+ranked <- all_ok |> filter(n_shared >= 100) |> left_join(reg_w, by = "taxon_id") |>
+  mutate(abs_delta = abs(delta))
+# every region column exists even when a region had no species in the (test) subset
+for (r in c("delta_AK","delta_AT","delta_GA","delta_PA")) if (!r %in% names(ranked)) ranked[[r]] <- NA_real_
+fmt(ranked |> arrange(abs_delta, desc(jaccard)) |> head(20), "20 LEAST different (smallest |Δ| on shared cells)")
+fmt(ranked |> arrange(desc(abs_delta)) |> head(20), "20 MOST different (largest |Δ| on shared cells)")
+dbDisconnect(con, shutdown = TRUE)
+```
+
+## Manifest
+
+```{r}
+#| label: manifest
+
+if (is_test) {
+  log_warn("AX_TEST_N set — manifest NOT written (a partial surface must not checkpoint)")
+} else {
+  con <- dbConnect(duckdb())
+  h <- msens::hash_parquet(glue("{dir_dist}/*.parquet"), con)
+  dbDisconnect(con, shutdown = TRUE)
+  msens::write_manifest(
+    manifest, target = "ingest_aquax", content_hash = h,
+    stats = list(ds_key = ds_key, ver = ver, n_models = smry_pq$n_models, n_cells = smry_pq$n_cells,
+                 v_min = smry_pq$v_min, v_max = smry_pq$v_max, val_scale = val_scale, cutoff_applied = ax_apply_cutoff,
+                 n_mask = cov$n_mask, n_mask_in_usa = cov$n_in_usa, n_usa_uncovered = cov$n_usa_uncovered,
+                 n_superseded_am = sum(sup$supersedes), n_superseded_taxa = n_distinct(sup$taxon_id[sup$supersedes]),
+                 n_absent_in_mask = sum(model_ax$ax_status == "absent_in_mask"),
+                 median_delta = round(median(all_ok$delta, na.rm = TRUE), 2),
+                 n_cog = sum(!is.na(model_ax$cog_url))),
+    force = msens::force_target("ingest_aquax"))
+}
+```

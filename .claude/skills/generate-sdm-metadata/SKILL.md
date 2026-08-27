@@ -30,10 +30,27 @@ Two derived facts are stamped here, both **introspected rather than declared**:
 if an ingested dataset lacks a metadata block; **warns** on declared-but-not-ingested (gm/nc).
 Run it before release/STAC/apps. Do NOT re-add per-ingest `INSERT INTO dataset/model`.
 
+**A NEW dataset inherits nothing.** `dataset` rows get their rich metadata (name, description,
+citation, links, `value_info`, `regions`, `is_mask`) from `ver_prev`'s table where the key matches;
+a dataset the previous release never had (v9 `ax`) must declare them in its `msens: dataset:`
+front-matter block — `fm_dataset()` reads the optional keys and they win over inherited ones.
+Without them the app labels the input by the glue fallback and the docs print no citation.
+
+**Partially superseded ≠ unused.** `am` stays `is_scored = TRUE` in v9 (it still feeds ~6,000 taxa
+and every cell outside the AquaX mask); `ax` is TRUE via its `taxon_model` edges. The "registered but
+unscored" case is only gm/nc. Which taxa lost AquaMaps *inside the mask* is `data/ax_supersedes_am.csv`.
+
+**The docs are part of the metadata.** A new dataset needs, in `../docs`: a `data/release_notes.yml`
+entry for the version (datasets/methods/scope/technology/zones), a hand-written interpretive note in
+`data-sources.qmd` under "Notes on individual sources" (guard it with `if ("ax" %in% ds$ds_key)` in an
+`output: asis` chunk so older books don't describe it), and the citation in `references.bib`. The
+table/counts on that page come from the registry; the *why* does not.
+
 ## `sp_cat` by taxonomy — `merge_taxon.qmd`
 
 Assigned from **WoRMS class/phylum/kingdom + BirdLife→bird**, NOT a v7 crosswalk (that dumped every
-new taxon into a catch-all `other`). Rule: bird (botw|Aves), mammal (Mammalia), turtle (SWOT set),
+new taxon into a catch-all `other`). The rule is **`msens::sp_cat_from_taxonomy()`** (one test row
+per branch); `merge_taxon.qmd` and `ingest_aquax.qmd` both call it — never copy the `case_when`. Rule: bird (botw|Aves), mammal (Mammalia), turtle (SWOT set),
 fish (Teleostei/Elasmobranchii/Holocephali/Myxini/…), coral (Hexa/Octocorallia), primary_producer
 (Plantae/Chromista/Bacteria), else invertebrate; **reptile/amphibian categorized but EXCLUDED** from
 scoring (not in the `sp_cats` list). No `other`. If a component balloons, suspect a sp_cat mislabel.

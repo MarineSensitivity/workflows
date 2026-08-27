@@ -15,8 +15,37 @@ via **titiler** + a **STAC** catalog. The reusable logic lives in the sibling R 
 **`msens`** (`../msens`); the notebooks here orchestrate it.
 
 Each source is one `ingest_{provider}_{dataset}.qmd`; the pipeline then runs
-`merge_models_prep → merge_models → merge_taxon → score_zones → score_cell_metrics →
-score_zone_metrics → build_registry → release_marine-atlas`.
+`bootstrap_version → build_cell_grid → ingest_* → merge_models_prep → merge_models → merge_taxon →
+score_zones → score_cell_metrics → score_zone_metrics → build_registry → release_marine-atlas`.
+
+**v9 (2026-08, `prerelease`/`restricted`) = AquaX (`ax`) supersedes AquaMaps in US waters.**
+`ingest_aquax.qmd` ingests 10,536 AquaX rasters that are *already on the `global05` grid* (cell_id =
+pixel index, asserted) and *masked to US waters* (AquaX's own mask = the UNION over models of their
+non-NA pixels — one model's NA area is its range crop, i.e. AquaX saying absent — measured against
+`in_usa` in the ingest; the `in_usa` cells no model reaches keep AquaMaps). Values = `CUR_NR/10` on AquaMaps'
+[0,100] scale; TSS cutoff recorded, not applied. **Supersession is a filter on the merge input**
+(`msens::supersede_sql()`, applied where `mc_parts` is written): for a taxon in
+`data/ax_supersedes_am.csv` (`supersedes` = TRUE), its `am` cells inside `dist/ax_mask.parquet` are
+dropped — on BOTH surfaces — and `am` carries on everywhere else. `merge_sql(suit_ds = c("am","ax"))`
+then treats both as suitability. `AX_SUPERSEDE=0` is the control run (must reproduce v8's PRA scores,
+cor 1.000); `AX_ABSENT_SUPERSEDES=1` lets the 2,742 "modeled, absent in US" species supersede too
+(default off — a review question, listed in the ingest HTML). The ingest also builds + uploads both
+COG representations (`native/ax_native` Float32 0–1000, `native/ax` INT1U 1–100) and records the
+per-species AquaX-vs-AquaMaps comparison (`data/ax_vs_am_summary.csv`; 20 least/most different
+with preview deep links). `publish_native.qmd` only *registers* the ax COGs from `model_ax.csv`.
+
+**Bumping the version on the same grid (v8 → v9) is `bootstrap_version.qmd`**, not a re-ingest:
+it clones the unchanged `dist/dataset=*` from `ver_prev` copy-on-write (APFS `cp -c`; hardlinks on
+Linux) so the ingests *resume*, and `BOOTSTRAP_VERIFY=1` re-hashes them against their checkpoints.
+Four readers used to assume `ver_prev` had v7's schema or a pre-built version dir — all now
+introspect: `build_cell_grid` copies the `cell` table from `ver_prev` when only the shared COG exists
+(a fresh `sdm.duckdb` otherwise passes every "run build_cell_grid first" check while empty),
+`score_zones` resolves `is_ok`/`is_valid_usa`, `merge_models_prep` resolves `worms_id`/`taxon_id`
+(and honours a native `worms_id` column in `model_*.csv`), `build_zone_cells` gates an unreleased
+version against `ver_prev`. `titiler-v8` is the stock `/cog` tiler for EVERY release (the apps
+hardcode it) — a new version gets no `titiler-v{n}`; `TITILER_SERVICE` names the compose service the
+release notebook rebuilds. A new dataset also needs the docs: `data/release_notes.yml` entry, a
+hand-written note in `data-sources.qmd` (guarded by `"ax" %in% ds$ds_key`), and `references.bib`.
 
 ## Commands
 
@@ -130,7 +159,10 @@ token and open with one, origin-direct is 401, restricted docs are off GitHub Pa
 under a URL whose header GDAL's `/vsicurl` has cached in-process; a shrunken COG then reads past
 EOF and z2–z4 return HTTP 500 while z5+ look fine),
 `REDO_MERGED_COG=1` (repaint just the merged whole-range COGs — what a re-merge invalidates,
-without `REDO_NATIVE`'s 7 GB IUCN gpkg rebuild and am re-sort).
+without `REDO_NATIVE`'s 7 GB IUCN gpkg rebuild and am re-sort), `AX_COG=1`/`AX_COG_S3=1` (build/upload
+the AquaX COGs in `ingest_aquax`), `AX_TEST_N=<n>` (ingest smoke test: nothing written to `data/`),
+`AX_SUPERSEDE=0` (control merge), `AX_ABSENT_SUPERSEDES=1`, `AX_APPLY_CUTOFF=1`,
+`BOOTSTRAP_VERIFY=1` / `BOOTSTRAP_SKIP_DS=a,b` (`bootstrap_version`), `TITILER_SERVICE=titiler-v8`.
 
 **The pre-release review gate (`preview.marinesensitivity.org`, 2026-08-15).** A release has
 `access` (`public` | `restricted`) beside `status` in `data/versions.csv` → `versions.json`; a

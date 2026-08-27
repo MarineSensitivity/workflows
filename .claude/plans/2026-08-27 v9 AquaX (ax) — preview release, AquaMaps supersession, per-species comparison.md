@@ -37,7 +37,7 @@ cells), not `in_usa` (634k), so supersession must be scoped to where AquaX actua
 |---|---|---|---|
 | D1 | value scale | `val = CUR_NR / 10` → **[0,100]**, 1 decimal, like `am` (`probability × 100`) | the merge is `max(er, suit)` and turtles are `er × suit / 100`; a 0–1000 surface would dominate both. Original 0–1000 is preserved in the native COG |
 | D2 | TSS `cutoff` | **not applied** by default (continuous, like `am`); recorded in `model_ax.csv` + COG metadata; `AX_APPLY_CUTOFF=1` zeroes `CUR_NR < cutoff` | AquaMaps was never thresholded in MST; AquaX's own richness product IS (`CUR_NR_gt_cutoff`). Ask the AquaX team during review |
-| D3 | supersession extent | **`ax_mask`** = union of every AquaX-modeled cell (586,276), persisted as `dist/ax_mask.parquet`; `am` is dropped for an ax taxon **only inside `ax_mask`** and continues outside (incl. the 53,818 uncovered US cells and the whole non-US range) | "AquaX supersedes AquaMaps where AquaX was modeled." Using `in_usa` would silently blank 8.5% of US cells for 10.5k species |
+| D3 | supersession extent | **`ax_mask`** = union over ALL models of their modeled (non-NA) pixels, persisted as `dist/ax_mask.parquet`; `am` is dropped for an ax taxon **only inside `ax_mask`** and continues outside (the whole non-US range + any `in_usa` cell no model reaches). *Correction 2026-08-27 (smoke test):* the 586,276 / 53,818 figures were ONE model's range-cropped extent; the union of just 50 models already covers 633,142 of 634,208 `in_usa` cells — the mask is essentially the US study area | "AquaX supersedes AquaMaps where AquaX was modeled." A single model's NA is its range crop (AquaX saying absent), so the union — not `in_usa`, not one model — is the extent |
 | D4 | the 2,742 "modeled, no US presence" species | **keep `am`** for them in v9 (nothing to supersede), list them in the notebook by component; `AX_ABSENT_SUPERSEDES=1` drops their `am` inside `ax_mask` | conservative for the first preview; it is exactly the question reviewers should answer (AquaX absent vs AquaMaps present) |
 | D5 | which surfaces | supersession applies to **both** the global viz surface and the US scoring surface | so the merged COG a reviewer sees inside US waters is what was scored; outside the mask the global COG stays `am` |
 | D6 | COG representations | mirror `am`: **`native/ax_native/{id}.tif`** = band 1 as delivered (Float32 0–1000, cropped to data bbox, AUC/TSS/cutoff as GDAL metadata) and **`native/ax/{id}.tif`** = the model surface (INT1U 1–100 from the Parquet) | zero app change: the species app's Original/Interpolated toggle already keys on `representation` |
@@ -78,7 +78,7 @@ and unit-tested, not a new branch in `merge_sql()`.
 
 ---
 
-## Phase 0 — bootstrap v9 (the "new version" checklist, made reproducible)
+## Phase 0 — bootstrap v9 (the "new version" checklist, made reproducible) — DONE 2026-08-27 (`28269cf6`)
 
 `ver` has only ever moved once (v7→v8) and that rewrite rebuilt everything. A version bump on the
 same grid must **reuse** the unchanged ingests, and several readers of `ver_prev` still assume
@@ -122,7 +122,7 @@ v7's schema. Files: `libs/paths.R`, `data/versions.csv`, new `bootstrap_version.
 on the clone finishes in seconds with the same `content_hash`; v9 `sdm.duckdb` has `cell` with
 `n_usa = 634,208`.
 
-## Phase 1 — `msens` 0.37.0 (rules first, tests in the same change)
+## Phase 1 — `msens` 0.37.0 (rules first, tests in the same change) — DONE 2026-08-27 (msens `29428f5`, `b90affa`, `ab72267`; 1,124 tests green)
 
 Files: `../msens/R/{grid,merge,taxa,ingest,publish}.R`, `tests/testthat/test-{grid,merge,taxa,ingest,publish}.R`,
 `DESCRIPTION`, `NEWS.md`. The server converges on msens `main` at container start (2026-08-27), so no
@@ -157,7 +157,7 @@ Dockerfile pin moves; the exports assertion list is unaffected (apps call nothin
 6. `NEWS.md` 0.37.0 bullets: v9 grid; `merge_sql(suit_ds)`; `supersede_sql`; `sp_cat_from_taxonomy`;
    `cells_from_aligned_raster`; `cog_from_tif`. `devtools::test()` green → `devtools::install()`.
 
-## Phase 2 — `ingest_aquax.qmd` (the deliverable notebook)
+## Phase 2 — `ingest_aquax.qmd` (the deliverable notebook) — IN PROGRESS (smoke tests on 50 models; bugs found: GDAL `~`, `str_starts` regex, named-list `bind_rows`, mask = union not one model)
 
 ```yaml
 title: "Ingest AquaX → global 0.05° cells (position-mapped) · supersedes AquaMaps in US waters"

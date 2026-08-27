@@ -101,7 +101,11 @@ srv_cellmodel <- glue("/share/data/big/{ver}/cell_model")
 srv_tables    <- glue("/share/data/big/{ver}/tables")
 srv_modelcell <- glue("/share/data/big/{ver}/model_cell")
 srv_stac  <- glue("/share/data/derived/stac/{ver}")
-titiler_v8<- glue("https://titiler-{ver}.marinesensitivity.org/msens")
+# ONE stock titiler serves every release's COGs (`titiler-v8`, hardcoded in the apps as the
+# /cog tiler for all versions since the factory was retired). A new version therefore does NOT
+# get a titiler-{ver} service; TITILER_SERVICE names the compose service to (re)build.
+titiler_svc <- Sys.getenv("TITILER_SERVICE", "titiler-v8")
+titiler_v8  <- glue("https://{titiler_svc}.marinesensitivity.org")
 # Guards the PUBLISHING path only. It opens sdm_db -- the multi-GB source DB,
 # which exists only where the pipeline runs -- so on a granular deploy it was
 # both unnecessary and fatal: it is why `scripts/srv_render.sh release-marine-
@@ -381,19 +385,22 @@ system2("ssh", c("msens", shQuote(glue(
 # (a silent `git pull --quiet` once left the mdl_key factory undeployed for days).
 deploy_out <- system2("ssh", c("msens", shQuote(glue(
   "set -e; cd {srv_repo} && git fetch --quiet origin && git merge --ff-only origin/main && ",
-  "docker compose up -d --build --force-recreate titiler-{ver} && docker compose restart caddy && ",
+  "docker compose up -d --build --force-recreate {titiler_svc} && docker compose restart caddy && ",
   "echo DEPLOY_OK $(git rev-parse --short HEAD)"))), stdout = TRUE, stderr = TRUE)
-log_info("titiler-{ver} deploy: {paste(tail(deploy_out, 2), collapse=' | ')}")
+log_info("{titiler_svc} deploy: {paste(tail(deploy_out, 2), collapse=' | ')}")
 if (!any(grepl("DEPLOY_OK", deploy_out))) stop(paste(tail(deploy_out, 15), collapse = "\n"))
-# 3. smoke test — the stable-mdl_key fast-path (factory resolves mdl_key->mdl_id, reads one
-# partition). Hit tilejson.json (not /statistics, which requires a geometry) → expect 200.
+# 3. smoke test — the stock /cog route on one of THIS release's published merged COGs (the
+# factory is retired; every app layer reads a COG). /cog/info → expect 200.
 c0 <- dbConnect(duckdb(sdm_db, read_only = TRUE))
-mk <- dbGetQuery(c0, "SELECT mdl_key FROM model WHERE ds_key='ms_merge' ORDER BY mdl_id LIMIT 1")$mdl_key
+cog_u <- if ("native_asset" %in% dbListTables(c0)) dbGetQuery(c0,
+  "SELECT asset_url FROM native_asset WHERE asset_type = 'cog' AND ds_key = 'ms_merge' ORDER BY mdl_key LIMIT 1")$asset_url else character(0)
 dbDisconnect(c0, shutdown = TRUE)
-code <- system2("curl", c("-s","-o","/dev/null","-w","%{http_code}","--retry","3",
-  glue("{titiler_v8}/tilejson.json?mdl_key={URLencode(mk, reserved = TRUE)}")), stdout = TRUE)
-log_info("titiler-{ver} /tilejson.json?mdl_key={mk} smoke test: HTTP {code} (expect 200)")
-if (!identical(code, "200")) log_warn("titiler-{ver} merged-surface smoke test != 200 — check the factory")
+if (length(cog_u)) {
+  code <- system2("curl", c("-s","-o","/dev/null","-w","%{http_code}","--retry","3",
+    shQuote(glue("{titiler_v8}/cog/info?url={URLencode(cog_u, reserved = TRUE)}"))), stdout = TRUE)
+  log_info("{titiler_svc} /cog/info on {basename(cog_u)}: HTTP {code} (expect 200)")
+  if (!identical(code, "200")) log_warn("{titiler_svc} cannot read this release's merged COG — check S3 + the service")
+} else log_warn("no merged COG in native_asset to smoke-test (run publish_native with PUBLISH_MERGED_COG=1)")
 }
 ```
 

@@ -34,6 +34,17 @@ to the apps and the docs:
 - **Measure coverage against `is_valid_global`**, the filter the species app actually uses; using
   `is_marine` alone overstates gaps badly.
 
+## Starting a new version (v9 was the first same-grid bump) — see `bootstrap-release`
+
+`ver` in `libs/paths.R`, a `data/versions.csv` row (`prerelease`,`restricted`), `grid_for_ver()` in
+msens, then `bootstrap_version.qmd` clones the unchanged ingests copy-on-write from `ver_prev`. **No
+`titiler-v{n}`**: `titiler-v8` is the stock `/cog` tiler for every release (the apps hardcode it);
+`TITILER_SERVICE` names what the release notebook rebuilds. `mdl_id` is assigned fresh for a version
+that never shipped. A restricted version mints two Cloudflare Access applications
+(`DEPLOY_ACCESS=1` → paste the AUDs into the server `.env` → `DEPLOY_CADDY=1`) and needs
+`PREVIEW_REVIEWERS_V{N}`. `latest.txt` is untouched. The docs CI picks the version up from
+`versions.json`; the dataset note + release entry are yours to write (see `generate-sdm-metadata`).
+
 ## Release (data → S3)
 
 ```r

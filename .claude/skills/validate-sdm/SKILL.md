@@ -64,6 +64,27 @@ Re-scoring the SAME inputs must reproduce (`cor = 1.000`). If not, a reserved-wo
 `class`) or stale-table (CREATE IF NOT EXISTS keeping an old schema) bug is likely.
 
 
+## A dataset that supersedes another (v9 AquaX) — the control run
+
+When a new dataset REPLACES part of an old one, the aggregate gate diverges *by design* (v9: two
+thirds of scored species change surface inside US waters), so "near-zero delta" is no longer the
+test. Two things are:
+
+1. **The control run** — render the merge/score chain with supersession switched off
+   (`AX_SUPERSEDE=0`: ax registered, `supersede` table empty). `pra_score_delta(v9, v8,
+   zone_set_key = "programarea_2026-01")` must be **cor 1.000 / max |Δ| 0**. That proves the version
+   bootstrap, the generalized `merge_sql(suit_ds)` and every `ver_prev` fix moved nothing, so any
+   drift in the real run is the supersession and nothing else.
+2. **The explained gate** — the real run's delta is explained by the ingest's per-component /
+   per-region Δ tables (`data/ax_vs_am_summary.csv`), and the components the new dataset cannot
+   touch (bird, primary_producer, every non-modeled taxon) stay cor ≥ 0.999. Commit
+   `validate_v8_v9.html` beside it.
+
+Rule-level guards for the same change, all of which the v8 behaviour fails: `test-merge.R`
+`T_ax_*` fixtures + the control fixture; `merge_models.qmd`'s check that no `am` row survives inside
+`ax_mask` for a superseded taxon (on `mc_parts`, what both surfaces read); the ingest's
+non-empty COG round trip and its asserted headline counts (10,703 / 10,517 / 182).
+
 ## Gates added with the multi-version work (2026-08)
 
 - **`pra_score_delta(..., zone_set_key=)`** pins the comparison to ONE spatial unit rather than

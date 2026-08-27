@@ -32,7 +32,10 @@ Parquet per model to `dist/dataset=<ds_key>/`. The merge (`merge_models_prep` �
 
 4. **Clean runnable notebook** (all chunks `eval:true`, no awk-extraction), **resumable**
    (skip models whose Parquet exists), gated by a `libs/vars.R` flag (`REDO_INGEST`, etc.).
-   `msens:` YAML block drives the `targets` DAG.
+   `msens:` YAML block drives the `targets` DAG — and for a NEW dataset the `dataset:` block must
+   also carry `name_short`, `name_display`, `description`, `citation`, `link_info`, `value_info`,
+   `regions`, `is_mask` (there is no `ver_prev` row to inherit them from; `build_registry.qmd` reads
+   them). A smoke-test flag (`AX_TEST_N`) must write nothing to `data/` and no manifest.
 
 ## Per-format recipe
 
@@ -44,6 +47,43 @@ Parquet per model to `dist/dataset=<ds_key>/`. The merge (`merge_models_prep` �
   — zero-fill + bilinear resample; source values define coverage.
 - **AquaMaps 0.5°**: a precomputed **bilinear-weight JOIN in DuckDB** (`ingest_aquamaps.qmd`),
   ocean-only `w05` weight table — NOT terra (I/O-bound). ~50× faster.
+- **Raster ALREADY on the cell grid** (AquaX, Bio-Oracle): `msens::cells_from_aligned_raster(tif,
+  cell_ids, scale=)` — reads the cell ids at the source's non-NA pixels (on `global05` the id IS the
+  pixel index; assert it once per run, never assume it), scales (`0.1` for AquaX's 0–1000), applies
+  the same `≥ 1` threshold as AquaMaps, drops land. Read the 100 MB id raster ONCE per worker and pass
+  the vector. Constant per-model bands (AUC/TSS/cutoff) come from one modeled pixel (`r[[2]][px][[1]]`),
+  not three more full reads. Pattern: `ingest_aquax.qmd`.
+
+## A dataset that REPLACES part of another (AquaX ⊃ AquaMaps, v9)
+
+When a newer model of the *same quantity* arrives for a subset of taxa and an extent:
+
+1. **Its extent is its own mask, persisted** — `dist/{ds}_mask.parquet` = the union of every
+   *modeled* pixel (non-NA in the source), **not** the thresholded Parquet cells (half of AquaX's
+   pixels are near-zero suitability and are dropped from the Parquet, yet "modeled absent" must
+   supersede too) and **not** `in_usa` (AquaX's ocean mask is its own) and **not any one model**
+   (a model's NA area is its biogeographic-range crop: 53,818 `in_usa` cells for the most-covered
+   model, ~1k for the union). Accumulate it in the worker loop and OR it across resumed runs.
+2. **Which taxa supersede is a committed registry**, `data/{new}_supersedes_{old}.csv`, built from
+   `ver_prev`'s published `taxon_model` (never by name — by the native id), with a `supersedes`
+   column that encodes the policy flags (`AX_ABSENT_SUPERSEDES`). Assert the headline counts.
+3. **Supersession is a filter on the merge INPUT**, `msens::supersede_sql()` where `mc_parts` is
+   written (`merge_models.qmd`), never a per-cell coalesce inside `merge_sql()` — a coalesce keeps the
+   old model wherever the new one says absent. Then `merge_sql(suit_ds = c("am","ax"))`.
+4. **Measure what changed, in the ingest** — per species × subregion on the shared cells (`delta`,
+   footprint Jaccard, correlation), the 20 least/most different with preview deep links, and the
+   "modeled but absent" list — `data/ax_vs_am_summary.csv`. Reviewers inspect it in the species app.
+5. **COGs built in the ingest when native == model grid** (`AX_COG=1`, `AX_COG_S3=1`): native =
+   `msens::cog_from_tif()` (bit-exact, cropped, metadata), model = `publish_cog()` from the Parquet;
+   urls + bbox into `model_{ds}.csv`; `publish_native.qmd` *registers* them (both representations),
+   never repaints. A round-trip check MUST assert its sample is non-empty — the first smoke test
+   "verified 0 models" while every native COG was missing (GDAL does not expand `~`).
+
+## Crosswalk by native id
+
+A dataset keyed by WoRMS AphiaID declares `worms_id` in `model_{ds}.csv`; `merge_models_prep`
+short-circuits name matching for those rows (`is.na(worms_id)` only goes to `match_taxa`). `sp_cat`
+for by-component tables *before* a merge exists: `msens::sp_cat_from_taxonomy()`.
 
 ## Notebook skeleton
 

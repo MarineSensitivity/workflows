@@ -43,7 +43,7 @@ flowchart LR
 ```{r}
 #| label: setup
 
-librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, purrr, readr, tibble, quiet = TRUE)
+librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, purrr, readr, tibble, yaml, quiet = TRUE)
 source(here("libs/paths.R"))   # ver, ver_prev, dir_big, dir_big_v
 source(here("libs/vars.R"))    # bootstrap_verify
 options(readr.show_col_types = FALSE)
@@ -121,11 +121,15 @@ because hashing 60 GB takes a while; on when a version is being built for releas
 ```{r}
 #| label: verify
 
-# ingest target -> ds_key, from each ingest notebook's msens: block (the same parser the DAG uses)
-wf <- msens::parse_qmd_frontmatter(dir_ls(here(), glob = "*.qmd"))
-ing <- wf |> filter(workflow_type == "ingest") |>
-  mutate(ds_key = map_chr(dataset, \(d) d$ds_key %||% NA_character_)) |>
-  filter(!is.na(ds_key)) |> select(target_name, ds_key, output)
+# ingest target -> ds_key, from each ingest notebook's msens: block (the DAG parser keeps only
+# target/type/deps/output, so read the dataset block the way build_registry.qmd does)
+ing <- map_dfr(dir_ls(here(), glob = "*.qmd"), \(f) {
+  txt <- readLines(f, warn = FALSE); d <- which(txt == "---")
+  if (length(d) < 2) return(NULL)
+  m <- tryCatch(yaml::yaml.load(paste(txt[(d[1] + 1):(d[2] - 1)], collapse = "\n")), error = \(e) NULL)$msens
+  if (is.null(m) || !identical(m$workflow_type, "ingest") || is.null(m$dataset$ds_key)) return(NULL)
+  tibble(target_name = m$target_name, ds_key = m$dataset$ds_key, output = m$output)
+})
 
 verified <- tibble()
 if (bootstrap_verify) {

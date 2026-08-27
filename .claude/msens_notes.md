@@ -819,6 +819,54 @@ Everything is committed and pushed (apps, api, server), the gate re-verified gre
 
 ----
 
+Help me understand what else needs approval for performance gains -- I don't understand what you're suggesting/asking here:
+> app_idle_timeout 0 would remove even that at the price of permanent residency; say the word and it's a one-line change.
+
+----
+
+Nothing needs your approval — the speed fix is already deployed and working. I offered a further option badly. Here it is plainly.
+
+What the setting is
+
+app_idle_timeout = how long an app's R process stays alive after the last browser tab disconnects.
+
+┌───────────────────────────┬────────────────────────────────────┬──────────────────────────────┐
+│           value           │  first visit after a quiet spell   │            memory            │
+├───────────────────────────┼────────────────────────────────────┼──────────────────────────────┤
+│ 5 s (the default — what   │ ~15 s, every time                  │ none held                    │
+│ caused your 15 s loads)   │                                    │                              │
+├───────────────────────────┼────────────────────────────────────┼──────────────────────────────┤
+│ 3600 s = 1 h (what I set, │ ~0.7 s within the hour; ~15 s only │ ~550 MB per app process,     │
+│  and recommend)           │  if nobody visited for over an     │ released after an idle hour  │
+│                           │ hour                               │                              │
+├───────────────────────────┼────────────────────────────────────┼──────────────────────────────┤
+│ 0 = never expire          │ ~15 s only after a container       │ ~550 MB per app process,     │
+│                           │ restart or deploy                  │ held permanently             │
+└───────────────────────────┴────────────────────────────────────┴──────────────────────────────┘
+
+Just measured, so the trade-off is real rather than hand-waved: a worker sits at 532–573 MB, and serving a second version through the same process added only +22 MB (v7 alongside v8 — the per-version bundle is small; the R packages dominate). Four workers at 0 would hold ~2.2 GB standing. The server currently has 9.5 GB available.
+
+Why I asked instead of just doing it
+
+It's a standing claim on a shared box that also runs titiler, plumber, STAC, h3t and the pipeline renders — and rendering a release is memory-hungry. That's your call about your server, not a correctness question. My honest read: stay at 1 hour. It removes essentially all the pain you actually felt (a reviewer clicking around, or a colleague opening the link minutes later), and the residual 15 s hits only the first person after a long silence. Going to 0 buys that one case for permanent memory — worth it only if Tim's first-thing-in-the-morning click needs to be instant.
+
+If you want more speed than that
+
+The remaining 15 s is R starting up and building the version bundle. Two real options, both actual work rather than a config flip, so I'd want your go-ahead:
+
+1. Profile the cold start (~30 min) to see how much is package loading vs. bundle building — cheap to learn, and it tells us whether anything is worth optimising at all.
+2. Cache the bundle to disk so a fresh process reloads it instead of recomputing — only sensible if step 1 says the bundle, not package loading, dominates.
+
+Neither is needed for the review workflow as it stands.
+
+One heads-up while I was measuring: data/versions.csv now has v9 as prerelease, restricted (AquaX). Nothing has broken, because that's only the local file — but when it's published via build_version_manifest, v9 becomes reviewer-only, and it will need PREVIEW_REVIEWERS_V9 in .env plus a run of access.sh (then the new AUD line and DEPLOY_CADDY), or nobody — including you — will be able to open /v9/. Say when you're ready and I'll run that sequence.
+
+----
+
+Yes, profile the cold start and evaluate caching the bundle (for instance on a per version basis for both scores and species apps)
+
+---
+
 ## 2026-08-13 fix species app versions
 
 Why is the species app `@../apps/species` not showing earlier versions? I thought everything was already loaded.
