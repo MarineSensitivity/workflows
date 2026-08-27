@@ -1,6 +1,6 @@
 # v9 — AquaX (`ax`) preview release: ingest, AquaMaps supersession, per-species comparison
 
-**Status:** APPROVED 2026-08-27 (all decisions as proposed; D11 reviewer = gabriel.reygondeau@miami.edu) — in progress · **Owner:** Ben · **Release:** v9 = `prerelease` /
+**Status:** DONE 2026-08-27 22:40 — v9 published (S3, registry, STAC), served, and reviewable at `preview.marinesensitivity.org/v9/…`; all gates green. Remaining manual check: open the species app on the preview host and confirm the AquaX input shows *Delivered / As ingested* · **Owner:** Ben · **Release:** v9 = `prerelease` /
 `restricted` (reviewer-only on `preview.marinesensitivity.org/v9/…`) · **New dataset:** `ax` — AquaX
 2026-04 delivery (Reygondeau et al. 2026, PLOS One, doi:10.1371/journal.pone.0335823)
 
@@ -308,7 +308,7 @@ Prototype with `AX_TEST_N=50 AX_COG=1` end-to-end (Parquet → COG → merge fix
 8. `CHECK_PREVIEW=1`: v9 restricted — public host falls back, preview `/v9/scores/` renders `ms-ver=v9`,
    the v8 probe token cannot open v9 and vice versa.
 
-## Phase 5 — release + preview deploy (order matters) — IN PROGRESS 2026-08-27 21:20
+## Phase 5 — release + preview deploy (order matters) — DONE 2026-08-27 22:40 (RELEASE_DEPLOY `ffac60e0`; CHECK_PREVIEW passed with tokens: 2 restricted, 8 public, per-version isolation both ways; manifest `cell_species_list: true`)
 
 Laptop chain DONE (`scripts/run_version.sh`): S3 holds `v9/{tables,serve,dist_merged,native,registry}`;
 `versions.json` lists v9 `prerelease/restricted`, `latest.txt` = v7, `v9/manifest.json` validates (102
@@ -401,21 +401,16 @@ Server, all via `release_marine-atlas.qmd` flags: `DEPLOY_TABLES=1` (tables + lo
 - **`registry_merge` shrink guard**: a partial `publish_native` run on v9 (e.g. without
   `PUBLISH_MERGED_COG`) has no prior registry to carry forward — the first run must be complete.
 
-## End-to-end verification (what "done" means)
+## End-to-end verification (what "done" means) — 2026-08-27 22:40
 
-- [ ] `devtools::test("../msens")` green; msens 0.37.0 installed laptop + converged on the server.
-- [ ] `_output/ingest_aquax.html` shows: 10,536 models; mask 586,276 cells / 53,818 uncovered US cells
-      mapped; 10,703 `am` models superseded over 10,517 taxa (182 multi); by-component tables; the
-      per-region Δ tables; the 20 least / 20 most different with working preview deep links.
-- [ ] S3 `marine-atlas/v9/native/ax/` and `ax_native/` hold 10,536 COGs each; `/cog/info` answers on
-      titiler-v8 for both; `native_asset` has both representations for every served ax model.
-- [ ] Control run cor = 1.000 / max |Δ| = 0; real run's `validate_v8_v9.html` committed with the
-      explanation tables; non-AquaX components unmoved.
-- [ ] `versions.json` lists v9 `prerelease`/`restricted`; `latest.txt` still v7; the manifest validates.
-- [ ] Preview host: `/v9/species/?mdl_key=ms_merge|WORMS:137092` renders Merged + AquaMaps + AquaX with
-      the Original/Interpolated toggle; `/v9/scores/` renders v9; `CHECK_PREVIEW` green incl. isolation.
-- [ ] docs v9 book on the preview host with the AquaX source note and release entry.
-- [ ] Skills updated (Phase 6), CLAUDE.md updated, plan status updated, all rendered HTML committed.
+- [x] `devtools::test("../msens")` green (1,124 + new); msens 0.37.0 installed on the laptop and reinstalled on the server by the deploy.
+- [x] `_output/ingest_aquax.html`: 10,536 models (10,527 with cells); mask 641,651 cells, 27 `in_usa` uncovered, 103 coastline pixels tolerated; 10,703 `am` models superseded over 10,517 taxa (182 multi); by-component / by-region Δ tables; 20 least / most different (≥1,000 shared cells, ≥10% overlap) with preview deep links.
+- [x] S3 `v9/native/ax/` 10,527 and `ax_native/` 10,536 COGs; titiler-v8 `/cog/info` 200; `native_asset` carries both representations for every served ax model (+ 21,679 merged COGs).
+- [x] Control merge (ax excluded) hash == v8 `bd8b2931f17bb2b3` — byte-identical; real run `validate_v8_v9.html`: mean |Δ| 3.59, max 7.87, within tolerance; bird + primary_producer Δ = 0.000.
+- [x] `versions.json` v9 `prerelease`/`restricted`; `latest.txt` = v7; manifest validates, `cell_species_list: true`.
+- [x] Preview host: `/v9/scores/` and `/v9/species/` render v9 with a token (`ms-ver=v9, ms-preview=1`); probes isolated both ways; public host falls back to v7; origin-direct 401; restricted docs off GitHub Pages. **Manual:** confirm the AquaX input's *Delivered / As ingested* toggle in the species app.
+- [x] docs `v9/` book on `gh-pages-preview`, pulled to the preview host (`DOCS_OK v8 v9`).
+- [x] Skills (5 + `bootstrap-release`), CLAUDE.md, plan; every rendered HTML committed.
 
 ## Open questions for Ben (answer in the table above or here)
 
