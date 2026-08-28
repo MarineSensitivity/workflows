@@ -62,6 +62,8 @@ is added.
 | `release_marine-atlas.qmd` | a `titiler-{ver}` compose service | `TITILER_SERVICE` (default `titiler-v8` — the stock `/cog` tiler for every release) |
 | `release_marine-atlas.qmd` granular `DEPLOY_TABLES` | `serve_mc`, `cell_mc`, `rel_tables` from the (skipped) staging chunk | defined in setup from the staged files |
 | `release_marine-atlas.qmd` `DEPLOY_TABLES` | the server already has `{ver}/serve.duckdb` | only `RELEASE_DEPLOY` rsyncs the view DB — a new version's first server deploy must be the full `RELEASE_DEPLOY=1` |
+| `build_registry.qmd` | every `model_*.csv` row is a model | a crosswalk row with `mdl_key = NA` (model_ax.csv keeps the absent-in-US species) published an NA id; `assign_mdl_id()` now ignores such a published row and `build_registry` drops keyless rows |
+| `score_zones.qmd` | a same-row-count `model_cell` is current | resumes on the merge's content hash (`pipeline_state`), not the row count |
 | `server/caddy/test/run.sh` | only `preview_routes.caddy` needs mounting | every file it `import`s (`app_version_routes.caddy`) must be mounted too, or the throwaway caddy dies and `DEPLOY_CADDY` fails its own test |
 
 Treat any `column not found` on a `v7`-attached table as this class of bug: resolve by column
