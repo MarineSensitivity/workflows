@@ -627,6 +627,26 @@ if (!do_caddy) {
   # PROVE THE REDIRECT KEEPS THE QUERY. `curl -sf` on a 301 is not a check — it follows
   # nothing and reports success on exactly the failure being fixed. Read the Location back
   # and assert the model id survived it.
+  # the restricted-version redirect: Caddy's PREVIEW_RESTRICTED_VERSIONS (server .env) must be
+  # the registry's restricted set, or a version that flips public/restricted keeps (or stops)
+  # sending the public host's visitors to the review host. Assert BEFORE trusting the routes.
+  env_re <- trimws(paste(system2("ssh", c("msens", shQuote(glue(
+    "cd {srv_repo} && grep -E '^PREVIEW_RESTRICTED_VERSIONS=' .env | cut -d= -f2- | tr -d '\"'"))),
+    stdout = TRUE, stderr = TRUE), collapse = ""))
+  vers_now  <- msens::atlas_versions(refresh = TRUE)
+  restr_now <- sort(vers_now$ver[!is.na(vers_now$access) & vers_now$access == "restricted"])
+  env_set   <- sort(setdiff(trimws(strsplit(env_re, "|", fixed = TRUE)[[1]]), ""))
+  if (!identical(env_set, restr_now))
+    stop(glue("server .env PREVIEW_RESTRICTED_VERSIONS='{env_re}' != versions.json restricted ",
+              "'{paste(restr_now, collapse = '|')}' — edit .env on msens, then DEPLOY_CADDY again"))
+  log_info("PREVIEW_RESTRICTED_VERSIONS='{env_re}' matches versions.json")
+  for (v in restr_now) {
+    r302 <- system2("curl", c("-s", "-o", "/dev/null", "-w", "%{http_code} %{redirect_url}",
+                              shQuote(glue("https://app.marinesensitivity.org/{v}/scores/?mdl_key=abc"))), stdout = TRUE)
+    if (!identical(r302, glue("302 https://preview.marinesensitivity.org/{v}/scores/?mdl_key=abc")))
+      stop(glue("public /{v}/scores/ should 302 to the review host with its query: got '{r302}'"))
+    log_info("public /{v}/scores/ -> {r302}")
+  }
   for (u in c("mapsp/?mdl_seq=1434", "species_v8/?ver=v8&mdl_key=abc")) {
     # shQuote is NOT optional: system2() runs through a shell, so a bare `&` in the URL
     # ends the command there. The unquoted form asked for `?ver=v8` alone and this check
@@ -904,15 +924,23 @@ if (!do_check_preview) {
              "Proxied, or Access can never see -- or admit -- a request"))
   else log_info("{prev_host} is proxied through Cloudflare (cf-ray present)")
 
-  # 1. the PUBLIC host never renders a restricted version; public ones render as themselves
+  # 1. the PUBLIC host never renders a restricted version: since 2026-08-28 it 302s the path
+  #    form to the review host (Caddy @restricted_app, PREVIEW_RESTRICTED_VERSIONS in .env),
+  #    carrying the query; public ones render as themselves
   for (a in c("scores", "species")) {
     for (v in restricted) {
-      # the path form on the PUBLIC host: it must fall back, not serve the release
-      r <- probe(glue("https://app.marinesensitivity.org/{v}/{a}/"))
+      r <- probe(glue("https://app.marinesensitivity.org/{v}/{a}/?probe=1"))
       if (!r$ok) { bad(glue("public {a} ?ver={v}: unreachable ({r$err})")); next }
-      if (!identical(r$code, 200L) || !identical(r$ms_preview, "0") || identical(r$ms_ver, v))
+      want <- glue("{prev_url}/{v}/{a}/?probe=1")
+      if (identical(r$code, 200L) && identical(r$ms_ver, v))
         bad(glue("LEAK: public /{v}/{a}/ -> code={r$code} ms-ver={r$ms_ver} ms-preview={r$ms_preview}"))
-      else log_info("public /{v}/{a}/ -> falls back to {r$ms_ver} (ok)")
+      else if (!identical(r$code, 302L) || !identical(r$location, as.character(want)))
+        bad(glue("public /{v}/{a}/ does not send a restricted version to the review host: code={r$code} -> {r$location} (want 302 {want}; is PREVIEW_RESTRICTED_VERSIONS in the server .env current?)"))
+      else log_info("public /{v}/{a}/ -> 302 {r$location} (review host, query kept; ok)")
+      # ...and the old spellings still get there, two hops, with their query intact
+      rq <- probe(glue("https://app.marinesensitivity.org/{a}/?ver={v}&probe=1"))
+      if (!rq$ok || !identical(rq$code, 301L) || !grepl(glue("/{v}/{a}/"), rq$location))
+        bad(glue("public {a} ?ver={v} no longer 301s to the path: code={rq$code %||% NA} -> {rq$location %||% NA}"))
     }
     for (v in public) {
       # canonical since 2026-08-27: the version is the PATH on this host too

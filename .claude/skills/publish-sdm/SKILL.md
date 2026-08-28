@@ -127,4 +127,8 @@ key includes the **encoding** (`content_hash_encoded()`) — rewriting bytes at 
 - `native/dps_nmfs/` (the DPS per-cell ER surfaces) is painted by `publish_native` and registered as
   `representation = "model"`; `REDO_DPS_COG=1` repaints. `native/*` keys are stable, so repainted bytes
   still need `DEPLOY_TITILER` / the `RELEASE_DEPLOY` titiler recreate.
+- **Restricted versions on the PUBLIC host 302 to the review host** (Caddy `@restricted_app`, driven by
+  `PREVIEW_RESTRICTED_VERSIONS=v8|v9` in the server `.env`). Flipping a version between `restricted`
+  and `public` in `versions.csv` therefore has THREE `.env` companions (reviewers, AUD, this list);
+  `DEPLOY_CADDY` stops if the list and `versions.json` disagree.
 

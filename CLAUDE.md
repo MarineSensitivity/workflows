@@ -227,7 +227,12 @@ separately gated). Defaults today: admins = `ben@oceanmetrics.io`; `PREVIEW_REVI
 `ssh msens 'cd /share/github/MarineSensitivity/server && set -a && . ./.env && set +a && cloudflare/access.sh'`
 (or `DEPLOY_ACCESS=1`). Changing an existing version's list is a policy-only change — no new AUDs,
 so no `DEPLOY_CADDY`. A NEW restricted version mints applications, so it needs the new
-`CF_ACCESS_AUD` line pasted into `.env` and then `DEPLOY_CADDY=1`.
+`CF_ACCESS_AUD` line pasted into `.env` and then `DEPLOY_CADDY=1`. **`PREVIEW_RESTRICTED_VERSIONS`
+(same `.env`, a regex alternation `v8|v9`) is the third per-version entry:** the PUBLIC app host 302s
+`/v{n}/scores|species` for those versions to the review host, query intact (2026-08-28) — before that
+the public app could not resolve a restricted version and silently rendered v7, so the homepage's v8
+links "oddly ended up on v7". `DEPLOY_CADDY` refuses to restart Caddy if the list disagrees with
+`versions.json`, and `CHECK_PREVIEW` asserts the 302; a version flipping to `public` must be removed.
 
 **Deploy order for a coordinated routes+apps change: `DEPLOY_APPS=1` FIRST, then `DEPLOY_CADDY=1`.**
 `DEPLOY_CADDY` runs `server/caddy/test/run.sh`, which asserts end-to-end that `/v8/scores/` renders
