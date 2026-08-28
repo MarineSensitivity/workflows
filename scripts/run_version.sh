@@ -8,6 +8,7 @@
 #   scripts/run_version.sh --to score_zone_metrics
 #   scripts/run_version.sh --control             # AX_SUPERSEDE=0: the control merge/score (validate-sdm)
 #   scripts/run_version.sh --stage merge_models  # exactly one stage
+#   scripts/run_version.sh --spatial --from ingest_dps_nmfs   # spatial-ER taxa only (see below)
 #
 # Each stage is `quarto render <qmd>` (the tracked _output/*.html + content-hash checkpoint), never
 # purl+source. Flags per stage are explicit below; a stage that fails stops the run. Logs go to
@@ -17,13 +18,14 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p _output/logs
 
-FROM=""; TO=""; ONLY=""; CONTROL=0
+FROM=""; TO=""; ONLY=""; CONTROL=0; SPATIAL=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --from)    FROM="$2"; shift 2 ;;
     --to)      TO="$2";   shift 2 ;;
     --stage)   ONLY="$2"; shift 2 ;;
     --control) CONTROL=1; shift ;;
+    --spatial) SPATIAL=1; shift ;;
     -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -61,6 +63,17 @@ for entry in "${STAGES[@]}"; do
   if [ "$active" = 1 ]; then
     extra=""
     out=""
+    if [ "$SPATIAL" = 1 ]; then
+      # a change confined to the spatial-ER taxa (sea turtles + NMFS DPS species: a re-ingested ER
+      # surface or a merge-rule change for them): re-ingest dps_nmfs, refresh only their merge-input
+      # partitions + merged surfaces, repaint only their merged COGs. Scoring and release stages run
+      # in full (they are cheap and read whatever changed).
+      case "$name" in
+        ingest_dps_nmfs) envs="REDO_INGEST=1" ;;
+        merge_models)    envs="REDO_MC_PARTS_SPATIAL=1 REDO_MERGE_SPATIAL=1" ;;
+        publish_native)  envs="PUBLISH_MERGED_COG=1 REDO_MERGED_COG_SPATIAL=1 NATIVE_SKIP_PMTILES=1" ;;
+      esac
+    fi
     if [ "$CONTROL" = 1 ]; then
       # the control run: AquaX EXCLUDED from the merge (merge_models_prep), so the inputs are
       # ver_prev's and merge_models' content hash must equal ver_prev's checkpoint. Its rendered

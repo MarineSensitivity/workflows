@@ -126,3 +126,20 @@ assert its exact merged output (US + global), so the behavior can't silently bre
 added. If the merge needs new logic, put it in `msens::merge_sql()`/`turtle_sql()` (the notebook calls
 them) rather than inline SQL. Run `devtools::test("../msens")` before rendering. See the `validate-sdm`
 skill for why rule-level tests catch what the aggregate `pra_score_delta` gate hides.
+
+## Spatial extinction risk (sea turtles, NMFS DPS species) — two rules, pick the right one
+
+- **Sea turtles** (`rng_turtle_swot_dps`): `msens::turtle_sql()` — ER × suitability IS the merged
+  value; scoring passes 100 through (`taxon.er_mode = 'premultiplied'`).
+- **NMFS DPS-listed species** (`dps_nmfs`, `ingest_nmfs-dps.qmd`): `msens::dps_sql()` — the merged
+  value is the **suitability** masked to the ER footprint (the distribution), and the per-cell ER is
+  written beside it (`dist_merged_er/`) for `score_cell_metrics` to multiply in (`er_mode = 'cell'`).
+  Putting such a taxon through the turtle rule collapses its merged surface to ~1 wherever its ER is
+  the baseline (the humpback: 99.8 % of its range) — the app then draws the weight, not the species.
+- The baseline outside listed entities follows `merge_models_prep`'s convention: a marine mammal is
+  `NMFS:LC` + MMPA = 20 (`compute_er_score()` ignores `is_mmpa` for IUCN codes — `IUCN:LC` + MMPA is
+  silently 1), anything else its IUCN category.
+- A gridded-from-the-start ER dataset needs its COGs painted in `publish_native` (`native/dps_nmfs/`)
+  or the species app lists the input struck through (no published surface).
+- Re-running only these taxa: `scripts/run_version.sh --spatial --from ingest_dps_nmfs`.
+

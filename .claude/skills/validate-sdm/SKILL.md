@@ -115,3 +115,14 @@ non-empty COG round trip and its asserted headline counts (10,703 / 10,517 / 182
   dataset count in the docs overstates the inputs.
 - **After any scoring change, re-check Program-Area scores are unmoved.** The zone_cell relocation
   and the zone-set generalization were both verified at max |delta| == 0 across all 20 areas.
+
+## Spatial-ER gates (v9)
+
+- `score_zones` asserts every `er_mode = 'cell'` taxon has its per-cell ER (`model_cell_er`) at every
+  scored cell — a missing row would weight the species NULL and silently drop it from `extrisk_*`.
+- `test-merge.R` asserts `dps_sql()`'s value (suitability, ER as the fitting point where unmodeled,
+  nothing beyond the ER footprint), its `er`, the scoring identity `er × val / 100`, AND the turtle-rule
+  regression on the same fixture (the humpback collapse) so the two rules cannot be swapped unnoticed.
+- The merge manifest's `content_hash` fingerprints `dist_merged` (val) alone; `er_hash` fingerprints
+  `dist_merged_er`, and `score_zones` resumes on both — an ER-only change leaves the val surface intact.
+

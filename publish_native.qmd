@@ -561,6 +561,41 @@ if (do_vec_cog && nrow(pmt_reg)) {
 }
 ```
 
+## NMFS DPS extinction-risk surfaces → per-species COGs
+
+The `dps_nmfs` surfaces (per-cell extinction risk: each listed entity's habitat at its status, the
+species' baseline elsewhere) are *gridded from the start* — built by `ingest_nmfs-dps.qmd` from the
+NMFS critical-habitat service + the IUCN range — so their one representation is the model grid
+itself, painted as a COG per species. Without these rows the species app listed the input as
+*NMFS DPS extinction risk* but struck it through: an input with no published surface is disabled.
+Resumable by file existence; `REDO_DPS_COG=1` (or `REDO_NATIVE`) repaints.
+
+```{r}
+#| label: dps-cogs
+
+dps_reg  <- tibble()
+dps_keys <- if (length(served_by_ds[["dps_nmfs"]])) sort(served_by_ds[["dps_nmfs"]]) else character(0)
+if (length(dps_keys)) {
+  dir_dps <- glue("{dir_native}/dps_nmfs")
+  if ((redo || nzchar(Sys.getenv("REDO_DPS_COG"))) && dir_exists(dir_dps)) dir_delete(dir_dps)
+  dir_create(dir_dps)
+  grid <- grid_spec(rast(cellid_tif))
+  con  <- dbConnect(duckdb())
+  for (k in dps_keys) {
+    f <- glue("{dir_dps}/{safe_key(k)}.tif"); if (file_exists(f)) next
+    d <- dbGetQuery(con, glue("SELECT cell_id, val FROM read_parquet('{dir_atlas}/dist/dataset=dps_nmfs/*.parquet') WHERE mdl_key = '{k}'"))
+    if (nrow(d)) msens::publish_cog(d$cell_id, d$val, f, grid)
+  }
+  dbDisconnect(con, shutdown = TRUE)
+  dps_reg <- tibble(
+    mdl_key = dps_keys, ds_key = "dps_nmfs", asset_type = "cog", representation = "model",
+    asset_url = glue("{s3_http}/native/dps_nmfs/{safe_key(dps_keys)}.tif"),
+    rescale_min = 1L, rescale_max = 100L, colormap = "spectral_r")
+  dps_reg <- dps_reg[file_exists(glue("{dir_dps}/{safe_key(dps_reg$mdl_key)}.tif")), ]
+  log_info("dps_nmfs COGs on disk: {nrow(dps_reg)} / {length(dps_keys)}")
+}
+```
+
 ## Merged taxon surface → per-taxon whole-range COGs
 
 Publish the **merged model itself** (`ds_key = "ms_merge"`, `representation = "model"`) as a
@@ -579,6 +614,19 @@ do_merged_cog <- nzchar(Sys.getenv("PUBLISH_MERGED_COG"))
 # below is resumable by file existence, so repainting means clearing the outputs -- as a FLAG, never
 # a hand-`mv`, so the HTML records which run rebuilt them (apps#8 masking fix).
 redo_mcog   <- redo || nzchar(Sys.getenv("REDO_MERGED_COG"))
+# REDO_MERGED_COG_KEYS="ms_merge|WORMS:137092,..." repaints ONLY those taxa (a rule change for the
+# ~25 spatial-ER taxa need not repaint 21,000 COGs); their partitions are refreshed from the global
+# surface and their tifs cleared, everything else is kept
+redo_keys   <- trimws(strsplit(Sys.getenv("REDO_MERGED_COG_KEYS"), ",")[[1]]); redo_keys <- redo_keys[nzchar(redo_keys)]
+# REDO_MERGED_COG_SPATIAL=1 names them for you: every taxon merged through the spatial-ER branches
+# (sea turtles + NMFS DPS species), resolved from the crosswalk so no key list is pasted by hand
+if (nzchar(Sys.getenv("REDO_MERGED_COG_SPATIAL"))) {
+  conk <- dbConnect(duckdb(), config = list(threads = "2")); dbExecute(conk, glue("ATTACH '{merge_db}' AS m (READ_ONLY)"))
+  redo_keys <- union(redo_keys, dbGetQuery(conk, "SELECT DISTINCT ms_merge_key FROM m.taxon_model
+    WHERE mdl_key LIKE 'rng_turtle_swot_dps|%' OR mdl_key LIKE 'dps_nmfs|%'")$ms_merge_key)
+  dbDisconnect(conk, shutdown = TRUE)
+  log_info("REDO_MERGED_COG_SPATIAL: {length(redo_keys)} spatial-ER taxa to repaint")
+}
 merged_reg  <- tibble()
 merged_map  <- tibble()
 mparts      <- glue("{dir_native}/_merged_parts{if (test_n > 0) '_test' else ''}")
@@ -590,6 +638,11 @@ if (do_merged_cog && dir_exists(dir_gmerged)) {
     dir_delete(dir_mcog)
   }
   dir_create(dir_mcog)
+  if (length(redo_keys)) {
+    rm_tif <- glue("{dir_mcog}/{safe_key(redo_keys)}.tif"); rm_tif <- rm_tif[file_exists(rm_tif)]
+    if (length(rm_tif)) file_delete(rm_tif)
+    log_info("REDO_MERGED_COG_KEYS: cleared {length(rm_tif)} of {length(redo_keys)} named merged COGs")
+  }
   con <- dbConnect(duckdb(), config = list(threads = "6", memory_limit = "10GB"))
   dbExecute(con, glue("SET temp_directory='{dir_atlas}/duckdb_tmp'"))
   dbExecute(con, glue("ATTACH '{merge_db}' AS m (READ_ONLY)"))
@@ -610,6 +663,19 @@ if (do_merged_cog && dir_exists(dir_gmerged)) {
       FROM read_parquet('{dir_gmerged}/**/*.parquet') g JOIN merged_map mm ON g.mdl_key = mm.mdl_key"),
       mparts, partition_by = "mmid")
     log_info("_merged_parts: {length(dir_ls(mparts))} partitions")
+  } else if (length(redo_keys) && dir_exists(mparts)) {
+    # mmid is POSITIONAL in the served set (see the am `mid` lesson above): refreshing a few
+    # partitions in place is only valid while the set -- and so every position -- is unchanged
+    stopifnot("_merged_parts partition count != served merged taxa: the map moved, REDO_MERGED_COG=1" =
+                length(dir_ls(mparts)) == nrow(merged_map))
+    rk <- merged_map[merged_map$mdl_key %in% redo_keys, ]
+    for (id in rk$mmid) { pd <- glue("{mparts}/mmid={id}"); if (dir_exists(pd)) dir_delete(pd) }
+    dbWriteTable(con, "merged_map_redo", rk, overwrite = TRUE)
+    msens::copy_atlas_parquet(con, glue("
+      SELECT mm.mmid, g.cell_id, g.val
+      FROM read_parquet('{dir_gmerged}/**/*.parquet') g JOIN merged_map_redo mm ON g.mdl_key = mm.mdl_key"),
+      mparts, partition_by = "mmid")
+    log_info("REDO_MERGED_COG_KEYS: re-partitioned {nrow(rk)} taxa from the global surface")
   }
   dbDisconnect(con, shutdown = TRUE)
 
@@ -682,7 +748,7 @@ if (nrow(ax_reg)) log_info("ax COG registry rows: {nrow(ax_reg)} ({n_distinct(ax
 if (length(served_by_ds[["ax"]]) && nrow(ax_reg) < 2 * length(served_by_ds[["ax"]]))
   log_warn("ax: {length(served_by_ds[['ax']])} served models but only {nrow(ax_reg)} registry rows — run ingest_aquax with AX_COG=1 AX_COG_S3=1")
 
-asset_info <- bind_rows(am_reg, am_native_reg, pmt_model_rows, vec_cog_rows, ax_reg) |>
+asset_info <- bind_rows(am_reg, am_native_reg, pmt_model_rows, vec_cog_rows, ax_reg, dps_rows) |>
   mutate(across(everything(), ~ if (is.factor(.)) as.character(.) else .))
 
 # per-model geographic bbox (cell_id row/col arithmetic on the global grid) so the app fits
@@ -703,11 +769,12 @@ if (nrow(am_reg) && exists("am_parts") && dir_exists(am_parts)) {
   dbDisconnect(con, shutdown = TRUE)
 }
 bb_vec <- tibble()
-vec_ds <- unique(pmt_model_rows$ds_key)                          # the pmtiles datasets
+dps_rows <- if (exists("dps_reg") && nrow(dps_reg)) dps_reg else tibble()
+vec_ds <- unique(c(pmt_model_rows$ds_key, dps_rows$ds_key))     # the pmtiles datasets + the gridded dps surfaces
 if (length(vec_ds)) {
   con   <- dbConnect(duckdb(), config = list(threads = "6"))
   globs <- paste0("'", dir_atlas, "/dist/dataset=", vec_ds, "/*.parquet'", collapse = ", ")
-  dbWriteTable(con, "vk", tibble(mdl_key = unique(pmt_model_rows$mdl_key)), overwrite = TRUE)
+  dbWriteTable(con, "vk", tibble(mdl_key = unique(c(pmt_model_rows$mdl_key, dps_rows$mdl_key))), overwrite = TRUE)
   bb_vec <- dbGetQuery(con, glue("
     WITH rc AS (SELECT p.mdl_key, (p.cell_id-1) % 7200 AS col, (p.cell_id-1) // 7200 AS row
                 FROM read_parquet([{globs}]) p SEMI JOIN vk USING(mdl_key))
@@ -912,6 +979,8 @@ if (do_s3) {
                            aws_sync(glue("{dir_native}/vec_grid"), "native/vec_grid")  # vector model grid
   if (exists("merged_reg") && nrow(merged_reg))
                            aws_sync(glue("{dir_native}/merged"),   "native/merged")    # merged whole-range COGs
+  if (exists("dps_reg") && nrow(dps_reg))
+                           aws_sync(glue("{dir_native}/dps_nmfs"), "native/dps_nmfs")  # NMFS DPS per-cell ER surfaces
   # PMTiles -> server file host (/share/data/derived/pmtiles/{ver}); also keep on S3
   if (nrow(pmt_reg)) {
     system2("ssh", c("msens", glue("mkdir -p /share/data/derived/pmtiles/{ver}")))

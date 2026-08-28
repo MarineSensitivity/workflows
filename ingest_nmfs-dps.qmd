@@ -9,7 +9,7 @@ msens:
   dataset: {ds_key: dps_nmfs, response_type: range, source_authority: NOAA NMFS, temporal_interval: static,
             native_format: vector, name_short: "NMFS listed entities (DPS)", name_display: "NMFS DPS extinction risk",
             description: "Per-cell extinction risk for ESA listed entities that are Distinct Population Segments, ESUs or subspecies rather than whole species: each listed entity's designated critical habitat carries that entity's status (Endangered 100 / Threatened 50, with the MMPA floor), and the rest of the species' IUCN range carries the species' IUCN status plus the MMPA floor. Merged multiplicatively with suitability, like the sea turtles.",
-            value_info: "extinction-risk score per cell (NMFS:EN 100 / NMFS:TN 50 inside a listed entity's critical habitat; IUCN + MMPA floor elsewhere)",
+            value_info: "extinction-risk score per cell (NMFS:EN 100 / NMFS:TN 50 inside a listed entity's critical habitat; IUCN category elsewhere, the MMPA floor of 20 for mammals)",
             regions: "US waters (critical habitat) + the species' global IUCN range (baseline)", is_mask: true,
             citation: "NOAA Fisheries (2026) All NMFS Critical Habitat, ArcGIS MapServer (maps.fisheries.noaa.gov), All_critical_habitat_poly_20230502 and per-entity layers; species-range services with DPS-level ranges expected end of CY2026",
             link_info: "https://www.fisheries.noaa.gov/resource/map/national-esa-critical-habitat-mapper",
@@ -40,11 +40,14 @@ already does for sea turtles:
   ranges** end of CY2026; when they land, this notebook's source swaps from critical habitat to
   ranges with no change to the rule.
 - **Value = `compute_er_score()`**, never a magic number: `NMFS:EN` → 100, `NMFS:TN` → 50 inside a
-  listed entity's polygons; `IUCN:{category}` (+MMPA 20) elsewhere; overlaps take the max.
-- **Merge:** taxa with a `dps_nmfs` model join the sea turtles in the spatial-ER branch
-  (`msens::turtle_sql`): `val = max(1, round(er_cell × suitability / 100))`, scored with
-  `is_er_spatial` (the ER is already in the cell value). Critical-habitat datasets are not applied
-  as an override for these taxa — the same polygons are here, with their status.
+  listed entity's polygons; elsewhere the baseline every unlisted species of its kind carries —
+  `NMFS:LC` + the MMPA floor = 20 for a marine mammal (the convention `merge_models_prep` uses for
+  the governing score), `IUCN:{category}` otherwise; overlaps take the max.
+- **Merge:** taxa with a `dps_nmfs` model take their own branch (`msens::dps_sql`): the merged
+  value is the **suitability** (AquaX / AquaMaps) masked to this ER footprint — the distribution,
+  not a risk-weighted one — and the per-cell ER is written beside it (`dist_merged_er`) for
+  `score_cell_metrics` to multiply in (`taxon.er_mode = 'cell'`). Critical-habitat datasets are not
+  an input for these taxa — the same polygons are here, with their entity's status.
 
 Regulatory note (from the call): NOAA's layers are the regulatory product; combining them with
 IUCN / AquaX for a non-regulatory sensitivity score is explicitly fine, and the fallback rule is
@@ -202,13 +205,19 @@ sp <- ent |> distinct(binomial, worms_id, is_mmpa, worms_name) |>
   mutate(mdl_key = coalesce(mdl_key, mdl_key2), category = coalesce(category, category2)) |> select(-mdl_key2, -category2) |>
   mutate(iucn_code = if_else(!is.na(category) & category %in% c("CR","EN","VU","NT","LC","DD"),
                              paste0("IUCN:", category), NA_character_),
-         er_base = if_else(!is.na(iucn_code), compute_er_score(iucn_code, is_mmpa = is_mmpa),
-                           if_else(is_mmpa, compute_er_score("IUCN:LC", is_mmpa = TRUE), 1L)),
+         # baseline outside the listed entities, on the SAME convention merge_models_prep uses for
+         # the governing er_score: a marine mammal is `NMFS:LC` + the MMPA floor = 20 (US national
+         # status overrides IUCN for mammals; compute_er_score() ignores is_mmpa for IUCN codes, so
+         # `IUCN:LC` + MMPA was silently 1 -- the humpback carried 1 where every other unlisted
+         # marine mammal carries 20); everything else is its IUCN category (1 when unlisted)
+         er_base = case_when(is_mmpa           ~ compute_er_score("NMFS:LC", is_mmpa = TRUE),
+                             !is.na(iucn_code) ~ compute_er_score(iucn_code),
+                             TRUE              ~ 1L),
          iucn_file = if_else(!is.na(mdl_key), glue("{dir_iucn}/{str_remove(mdl_key, '^rng_iucn\\\\|')}.parquet"), NA_character_),
          has_iucn = !is.na(iucn_file) & file_exists(coalesce(iucn_file, "")),
          mdl_key_dps = msens::mdl_key_raw(ds_key, worms_id))
 kable(sp |> select(binomial, worms_id, iucn_code, is_mmpa, er_base, has_iucn),
-      caption = "Baseline extinction risk outside listed entities (IUCN category + MMPA floor); species without an IUCN range get the entity polygons only")
+      caption = "Baseline extinction risk outside listed entities (mammals: NMFS:LC + MMPA floor = 20; others: IUCN category); species without an IUCN range get the entity polygons only")
 ```
 
 ## Per-cell ER surface → one Parquet per species
@@ -247,7 +256,7 @@ smry <- dbGetQuery(con, glue("
   FROM read_parquet('{dir_dist}/*.parquet') GROUP BY 1 ORDER BY 1"))
 model <- sp |>
   transmute(mdl_key = mdl_key_dps, sp_id = worms_id, worms_id, scientific_name = binomial, is_mmpa, iucn_code, er_base,
-            er_code = "NMFS:DPS", er_score = NA_integer_,   # per-cell: see val; the merge multiplies it by suitability
+            er_code = "NMFS:DPS", er_score = NA_integer_,   # per-cell: see val; scoring multiplies it by the merged suitability
             entities = map_chr(worms_id, \(w) paste(ent$LISTENTITY[ent$worms_id == w], collapse = " | ")),
             statuses = map_chr(worms_id, \(w) paste(ent$status[ent$worms_id == w], collapse = "|")),
             has_iucn_baseline = has_iucn) |>

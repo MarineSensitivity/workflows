@@ -38,19 +38,34 @@ makes the species app label the toggle *Delivered / As ingested* — and records
 per-species AquaX-vs-AquaMaps comparison (`data/ax_vs_am_summary.csv`; 20 least/most different
 with preview deep links). `publish_native.qmd` only *registers* the ax COGs from `model_ax.csv`.
 
-**v9.1: extinction risk is SPATIAL for NMFS DPS-listed species (`dps_nmfs`, `ingest_nmfs-dps.qmd`).**
-`listing` flattens NOAA's species page to its highest domestic ESA status, so the humpback carried
-`NMFS:EN` species-wide from DPSs that breed outside US waters and the plain rule `max(er, suit)` painted
-it a flat 100 over 14.7 M cells. Now every species with a listed entity below species level (18: humpback
-+ Southern Resident orca, Cook Inlet beluga, MHI false killer whale, Western Steller sea lion, Beringia
-bearded / Arctic ringed seal, salmonid + steelhead ESUs, both sturgeons, sawfish, bocaccio, yelloweye,
-eulachon) gets a per-cell ER surface from the **authoritative NMFS critical-habitat service**
-(`maps.fisheries.noaa.gov/…/All_NMFS_Critical_Habitat/MapServer`, per Jennifer Schultz, NMFS,
-2026-04-16 — DPS-level *range* services follow end of CY2026 and become the source then): each listed
-entity's polygons at its status, the IUCN range at `IUCN:{cat}` + MMPA elsewhere; these taxa merge in the
-turtle branch (`turtle_sql(er_ds = c(turtle, dps_nmfs))`, ER × suitability, `is_er_spatial` at scoring), and
-`ch_*` is NOT applied as an override for them (it carries the species-level ER). Sea turtles keep
-`rng_turtle_swot_dps`. Cached snapshot in `raw/fisheries.noaa.gov/All_NMFS_Critical_Habitat/`; `DPS_FETCH=1` refreshes.
+**v9: extinction risk is SPATIAL for NMFS DPS-listed species (`dps_nmfs`, `ingest_nmfs-dps.qmd`) — and
+their merged model is the DISTRIBUTION, not the risk.** `listing` flattens NOAA's species page to its highest
+domestic ESA status, so the humpback carried `NMFS:EN` species-wide from DPSs that breed outside US waters and
+the plain rule `max(er, suit)` painted it a flat 100 over 14.7 M cells. Every species with a listed entity
+below species level (19: humpback + Southern Resident orca, Cook Inlet beluga, MHI false killer whale,
+Western Steller sea lion, Beringia bearded / Arctic ringed seal, salmonid + steelhead ESUs, both sturgeons,
+sawfish, bocaccio, yelloweye, eulachon) gets a per-cell ER surface from the **authoritative NMFS
+critical-habitat service** (`maps.fisheries.noaa.gov/…/All_NMFS_Critical_Habitat/MapServer`, per Jennifer
+Schultz, NMFS, 2026-04-16 — DPS-level *range* services follow end of CY2026 and become the source then): each
+listed entity's polygons at its status, the IUCN range at the species' BASELINE elsewhere — `NMFS:LC` + MMPA
+= 20 for a marine mammal (the same convention `merge_models_prep` uses; `compute_er_score()` IGNORES
+`is_mmpa` for IUCN codes, so `IUCN:LC + MMPA` was silently 1), the IUCN category otherwise. These taxa merge
+through **`msens::dps_sql()`** (NOT the turtle rule): `val` = suitability (ax/am) masked to the ER footprint,
+valued at the ER where nothing models the cell, and the per-cell ER is written BESIDE it —
+`dist_merged_er/dataset=ms_merge/` → `sdm.duckdb` `model_cell_er` → `score_cell_metrics` multiplies it in
+where `taxon.er_mode = 'cell'` (`'premultiplied'` = sea turtles, whose `val` is already ER × suit via
+`turtle_sql()`; `'taxon'` = the scalar `er_score`). The turtle rule on the humpback (ER 1 over 99.8 % of its
+range) had collapsed the merged surface to 1 outside critical habitat: the app drew the weight, not the
+whale. `ch_*` is NOT an input for dps taxa (it carries the species-level ER). `publish_native` paints
+`native/dps_nmfs/*.tif` so the species app can draw the ER layer (an input with no published surface renders
+as a struck-through pill). Cached snapshot in `raw/fisheries.noaa.gov/All_NMFS_Critical_Habitat/`;
+`DPS_FETCH=1` refreshes. **Spatial-only reruns:** `scripts/run_version.sh --spatial --from ingest_dps_nmfs`
+= `REDO_INGEST` on the dps ingest, `REDO_MC_PARTS_SPATIAL=1 REDO_MERGE_SPATIAL=1` (refresh only the ~25
+spatial-ER taxa's merge-input partitions + surfaces; the batched surfaces of the other ~17,750 are kept),
+`REDO_MERGED_COG_SPATIAL=1` (repaint only their merged COGs; `REDO_MERGED_COG_KEYS=a,b` names taxa by hand)
+— minutes instead of the ~3 h a full re-merge + repaint costs. Both keyed refreshes assert the positional
+maps (`mkey_id`, `mmid`) have not moved before touching a partition. There is no "v9.1": the DPS work is
+part of v9.
 
 **Bumping the version on the same grid (v8 → v9) is `bootstrap_version.qmd`**, not a re-ingest:
 it clones the unchanged `dist/dataset=*` from `ver_prev` copy-on-write (APFS `cp -c`; hardlinks on
@@ -177,7 +192,9 @@ token and open with one, origin-direct is 401, restricted docs are off GitHub Pa
 under a URL whose header GDAL's `/vsicurl` has cached in-process; a shrunken COG then reads past
 EOF and z2–z4 return HTTP 500 while z5+ look fine),
 `REDO_MERGED_COG=1` (repaint just the merged whole-range COGs — what a re-merge invalidates,
-without `REDO_NATIVE`'s 7 GB IUCN gpkg rebuild and am re-sort), `AX_COG=1`/`AX_COG_S3=1` (build/upload
+without `REDO_NATIVE`'s 7 GB IUCN gpkg rebuild and am re-sort), `REDO_MERGED_COG_SPATIAL=1` /
+`REDO_MERGED_COG_KEYS=k1,k2` (repaint only the spatial-ER taxa / named taxa), `REDO_MC_PARTS_SPATIAL=1` /
+`REDO_MERGE_SPATIAL=1` (`merge_models`: refresh only the spatial-ER taxa), `REDO_DPS_COG=1`, `AX_COG=1`/`AX_COG_S3=1` (build/upload
 the AquaX COGs in `ingest_aquax`), `AX_TEST_N=<n>` (ingest smoke test: nothing written to `data/`),
 `AX_SUPERSEDE=0` (control merge), `AX_ABSENT_SUPERSEDES=1`, `AX_APPLY_CUTOFF=1`,
 `BOOTSTRAP_VERIFY=1` / `BOOTSTRAP_SKIP_DS=a,b` (`bootstrap_version`), `TITILER_SERVICE=titiler-v8`.

@@ -42,10 +42,13 @@ flowchart LR
   mcp --> gm["GLOBAL: whole range,<br/>max(er, am-at-range)<br/>(am beyond range MASKED)"]
   mcp --> um["US: range∩US max(er,am@range)<br/>∪ am∩US for taxa w/ no US range"]
   mcp --> tt["turtles ×<br/>greatest(1, er·suit/100)"]
+  mcp --> dd["NMFS DPS species<br/>val = suitability, er per cell<br/>(dist_merged_er)"]
   gm --> g[("dist_merged_global/**<br/>whole-range → viz COGs")]
   tt --> g
+  dd --> g
   um --> us[("dist_merged/**<br/>US model_cell → scoring")]
   tt --> us
+  dd --> us
   us --> mf["hash_parquet → 392cb9…<br/>content-addressed manifest"]
 ```
 
@@ -71,11 +74,15 @@ stopifnot("run merge_models_prep first" = file_exists(merge_db),
 
 suit_ds   <- c("am", "ax")      # v9: AquaX joins AquaMaps as a suitability dataset (msens::merge_sql)
 turtle_ds <- "rng_turtle_swot_dps"
-# SPATIAL extinction risk (per-cell ER x suitability, msens::turtle_sql): the sea turtles since
-# v4b, and from v9.1 every species with an NMFS listed entity below species level (dps_nmfs:
-# humpback, Southern Resident killer whale, salmonid ESUs, ...). For these the plain rule's
-# `max(er, suit)` at a species-wide ER is exactly what painted the humpback a flat 100.
-er_ds     <- c(turtle_ds, "dps_nmfs")
+# SPATIAL extinction risk, two rules (both msens, both unit-tested in test-merge.R):
+#  * sea turtles (v4b, msens::turtle_sql): val = greatest(1, round(er x suit / 100)), critical
+#    habitat overriding with a max -- ER is BAKED INTO the merged value.
+#  * NMFS DPS species (v9, msens::dps_sql; dps_nmfs = humpback, Southern Resident killer whale,
+#    salmonid ESUs, ...): the merged value STAYS the distribution (suitability masked to the ER
+#    footprint) and the per-cell ER is written beside it (dist_merged_er) for scoring to multiply
+#    in. The plain rule's species-wide `max(er, suit)` painted the humpback a flat 100; the turtle
+#    rule then painted it 1 everywhere its ER is 1 -- the weight, not the whale.
+dps_ds    <- "dps_nmfs"
 ch_ds     <- c("ch_nmfs", "ch_fws", "ca_nmfs")
 ch_sql    <- paste(sprintf("'%s'", ch_ds), collapse = ",")
 
@@ -150,7 +157,27 @@ if (!dir_exists(dir_parts) || nzchar(Sys.getenv("REDO_MC_PARTS"))) {
        JOIN mkey_map mm USING (ms_merge_key)) mc
      WHERE {msens::supersede_sql(src = 'mc')}"),
     dir_parts, partition_by = "mkey_id")
-} else log_info("mc_parts exists — skipping repartition (REDO_MC_PARTS=1 to force)")
+} else if (nzchar(Sys.getenv("REDO_MC_PARTS_SPATIAL"))) {
+  # refresh ONLY the spatial-ER taxa's partitions (a re-ingested dps_nmfs / turtle surface): mkey_id
+  # is dense_rank over the taxon set, so refreshing in place is valid only while the set -- and
+  # every position -- is unchanged; assert it against the partition count before touching anything
+  n_map <- dbGetQuery(con, "SELECT count(*) n FROM mkey_map")$n
+  stopifnot("mc_parts partition count != taxa in mkey_map: the map moved, REDO_MC_PARTS=1" =
+              length(dir_ls(dir_parts)) == n_map)
+  sp_ids <- dbGetQuery(con, "SELECT DISTINCT mm.mkey_id FROM taxon_model tm JOIN mkey_map mm USING (ms_merge_key)
+    WHERE tm.mdl_key LIKE 'rng_turtle_swot_dps|%' OR tm.mdl_key LIKE 'dps_nmfs|%'")$mkey_id
+  for (id in sp_ids) { pd <- glue("{dir_parts}/mkey_id={id}"); if (dir_exists(pd)) dir_delete(pd) }
+  dbExecute(con, "SET partitioned_write_max_open_files=512")
+  msens::copy_atlas_parquet(con, glue(
+    "SELECT mkey_id, ms_merge_key, ds_key, cell_id, val FROM (
+       SELECT mm.mkey_id, tm.ms_merge_key, split_part(mc.mdl_key,'|',1) AS ds_key, mc.cell_id, mc.val
+       FROM read_parquet('{dir_dist}/*/*.parquet') mc JOIN taxon_model tm USING (mdl_key)
+       JOIN mkey_map mm USING (ms_merge_key)
+       WHERE mm.mkey_id IN ({paste(sp_ids, collapse = ',')})) mc
+     WHERE {msens::supersede_sql(src = 'mc')}"),
+    dir_parts, partition_by = "mkey_id")
+  log_info("REDO_MC_PARTS_SPATIAL: re-partitioned {length(sp_ids)} spatial-ER taxa; the other partitions are kept")
+} else log_info("mc_parts exists — skipping repartition (REDO_MC_PARTS=1 to force, REDO_MC_PARTS_SPATIAL=1 for the spatial-ER taxa only)")
 # VIEW over the partitioned input — used only for the per-partition COUNT below (metadata scan).
 # Every DATA read goes through parts_sql(): the partitions named by PATH, never the 150k-file glob
 # filtered by `mkey_id IN (...)` -- the reader buffered far beyond the 6 turtle partitions it needed
@@ -163,35 +190,40 @@ all_ids <- dbGetQuery(con, "SELECT mkey_id FROM mkey_map ORDER BY mkey_id")$mkey
 log_info("partitioned merge input: {length(all_ids)} taxa by mkey_id; US trim {n_us} in_usa cells; memory_limit={mem_gb}GB")
 ```
 
-## Turtle taxa (multiplicative, from only their files)
+## Spatial extinction risk — sea turtles (×) and NMFS DPS species (suitability + ER per cell)
 
 ```{r}
 #| label: turtles
 
-er_like     <- paste(sprintf("mdl_key LIKE '%s|%%'", er_ds), collapse = " OR ")
-turtle_keys <- dbGetQuery(con, glue(
-  "SELECT DISTINCT ms_merge_key FROM taxon_model WHERE {er_like}"))$ms_merge_key
-dps_keys    <- dbGetQuery(con, "SELECT DISTINCT ms_merge_key FROM taxon_model WHERE mdl_key LIKE 'dps_nmfs|%'")$ms_merge_key
-tkeys_sql   <- paste(sprintf("'%s'", turtle_keys), collapse = ",")
-turtle_ids  <- dbGetQuery(con, glue("SELECT mkey_id FROM mkey_map WHERE ms_merge_key IN ({tkeys_sql})"))$mkey_id
-tids_sql    <- paste(turtle_ids, collapse = ",")
-log_info("{length(turtle_keys)} spatial-ER taxa (multiplicative merge): {length(turtle_keys) - length(dps_keys)} turtles + {length(dps_keys)} NMFS-DPS species")
+turtle_keys <- dbGetQuery(con, "SELECT DISTINCT ms_merge_key FROM taxon_model WHERE mdl_key LIKE 'rng_turtle_swot_dps|%'")$ms_merge_key
+dps_keys    <- dbGetQuery(con, glue("SELECT DISTINCT ms_merge_key FROM taxon_model WHERE mdl_key LIKE '{dps_ds}|%'"))$ms_merge_key
+stopifnot("a taxon cannot carry both a turtle and a dps_nmfs ER surface" = !any(dps_keys %in% turtle_keys))
+ids_of <- function(keys) if (length(keys))
+  dbGetQuery(con, glue("SELECT mkey_id FROM mkey_map WHERE ms_merge_key IN ({paste(sprintf(\"'%s'\", keys), collapse = ',')})"))$mkey_id else integer(0)
+turtle_ids <- ids_of(turtle_keys); dps_ids <- ids_of(dps_keys)
+log_info("spatial-ER taxa: {length(turtle_keys)} turtles (multiplicative) + {length(dps_keys)} NMFS-DPS species (suitability + per-cell ER)")
 
-# whole-range (global) multiplicative turtle merge, reading ONLY the turtle taxa's partitions
+# turtles: whole-range multiplicative merge, reading ONLY the turtle taxa's partitions
 # (mkey_id IN (...) → partition-pruned, tiny). Rule = msens::turtle_sql() (unit-tested).
-# the critical-habitat datasets are NOT an override for dps_nmfs taxa: dps_nmfs was built from the
-# same designations WITH each entity's status, while ch_* carries the species-level ER (100 for the
-# humpback) and would paint the Threatened Mexico-DPS habitat back to Endangered.
-dps_sql <- if (length(dps_keys)) paste(sprintf("'%s'", dps_keys), collapse = ",") else "''"
 dbExecute(con, glue("CREATE OR REPLACE TABLE turtle_src AS
-  SELECT ms_merge_key, ds_key, cell_id, val FROM {parts_sql(turtle_ids)}
-  WHERE NOT (ds_key IN ({ch_sql}) AND ms_merge_key IN ({dps_sql}))"))
+  SELECT ms_merge_key, ds_key, cell_id, val FROM {parts_sql(turtle_ids)}"))
 dbExecute(con, paste("CREATE OR REPLACE TABLE mc_turtle AS",
-  msens::turtle_sql(er_ds, suit_ds, ch_ds, src = "turtle_src")))
+  msens::turtle_sql(turtle_ds, suit_ds, ch_ds, src = "turtle_src")))
 log_info("mc_turtle (whole-range): {dbGetQuery(con, 'SELECT count(*) n FROM mc_turtle')$n} cells")
+
+# NMFS DPS species: msens::dps_sql() -- (mdl_key, cell_id, val = suitability, er = per-cell ER).
+# The critical-habitat datasets are NOT an input: dps_nmfs was built from the same designations
+# WITH each entity's status, while ch_* carries the species-level ER (100 for the humpback) and
+# would paint the Threatened Mexico-DPS habitat back to Endangered.
+if (length(dps_ids)) {
+  dbExecute(con, glue("CREATE OR REPLACE TABLE dps_src AS
+    SELECT ms_merge_key, ds_key, cell_id, val FROM {parts_sql(dps_ids)} WHERE ds_key NOT IN ({ch_sql})"))
+  dbExecute(con, paste("CREATE OR REPLACE TABLE mc_dps AS", msens::dps_sql(dps_ds, suit_ds, src = "dps_src")))
+} else dbExecute(con, "CREATE OR REPLACE TABLE mc_dps (mdl_key VARCHAR, cell_id INTEGER, val DOUBLE, er DOUBLE)")
+log_info("mc_dps (whole-range): {dbGetQuery(con, 'SELECT count(*) n FROM mc_dps')$n} cells")
 ```
 
-## Max-merge (masked) + turtles → streamed to Parquet
+## Max-merge (masked) + spatial-ER taxa → streamed to Parquet
 
 ```{r}
 #| label: merge_write
@@ -205,22 +237,45 @@ dbExecute(con, glue("CREATE OR REPLACE TABLE taxon_flags AS
   FROM taxon_model GROUP BY ms_merge_key"))
 
 # skip the ~2h merge write when the surfaces already exist — re-renders (e.g. to refresh the HTML)
-# reuse them; the summaries + hash below read the on-disk parquet either way. REDO_MERGE=1 forces.
-redo_merge  <- nzchar(Sys.getenv("REDO_MERGE"))
+# reuse them; the summaries + hash below read the on-disk parquet either way. REDO_MERGE=1 forces
+# everything; REDO_MERGE_SPATIAL=1 rewrites ONLY the turtle + dps outputs (a rule or ER-surface
+# change for the ~25 spatial-ER taxa) and keeps the batched surfaces of the other ~17,750 taxa.
+redo_merge    <- nzchar(Sys.getenv("REDO_MERGE"))
+redo_spatial  <- nzchar(Sys.getenv("REDO_MERGE_SPATIAL"))
+# per-cell ER of the dps taxa, US-trimmed, beside the scoring surface: score_zones materializes it as
+# model_cell_er and score_cell_metrics multiplies it in (er_mode = 'cell')
+dir_merged_er <- glue("{dir_atlas}/dist_merged_er/dataset=ms_merge")
 have_merged <- dir_exists(dir_merged) && dir_exists(dir_global) &&
   length(dir_ls(dir_merged, glob = "*.parquet", recurse = TRUE)) > 0
+write_spatial <- function() {
+  for (d in c(glue("{dir_global}/turtle"), glue("{dir_merged}/turtle"),
+              glue("{dir_global}/dps"),    glue("{dir_merged}/dps"), glue("{dir_merged_er}/dps")))
+    if (dir_exists(d)) dir_delete(d)
+  dir_create(dir_merged_er)
+  # turtles → whole-range global + US-trim (ER baked in)
+  msens::copy_atlas_parquet(con, "SELECT mdl_key, cell_id, val FROM mc_turtle",
+    glue("{dir_global}/turtle"), per_thread = TRUE)
+  msens::copy_atlas_parquet(con,
+    "SELECT mt.mdl_key, mt.cell_id, mt.val FROM mc_turtle mt JOIN us_cells u ON mt.cell_id = u.cell_id",
+    glue("{dir_merged}/turtle"), per_thread = TRUE)
+  # dps → whole-range global + US-trim (the distribution) + US-trim ER beside it
+  msens::copy_atlas_parquet(con, "SELECT mdl_key, cell_id, val FROM mc_dps",
+    glue("{dir_global}/dps"), per_thread = TRUE)
+  msens::copy_atlas_parquet(con,
+    "SELECT d.mdl_key, d.cell_id, d.val FROM mc_dps d JOIN us_cells u ON d.cell_id = u.cell_id",
+    glue("{dir_merged}/dps"), per_thread = TRUE)
+  msens::copy_atlas_parquet(con,
+    "SELECT d.mdl_key, d.cell_id, d.er FROM mc_dps d JOIN us_cells u ON d.cell_id = u.cell_id",
+    glue("{dir_merged_er}/dps"), per_thread = TRUE)
+}
 if (redo_merge || !have_merged) {
-if (dir_exists(dir_global)) dir_delete(dir_global); dir_create(dir_global)
-if (dir_exists(dir_merged)) dir_delete(dir_merged); dir_create(dir_merged)
+if (dir_exists(dir_global))    dir_delete(dir_global);    dir_create(dir_global)
+if (dir_exists(dir_merged))    dir_delete(dir_merged);    dir_create(dir_merged)
+if (dir_exists(dir_merged_er)) dir_delete(dir_merged_er); dir_create(dir_merged_er)
 # survives the run so the masking check can re-run on a skipped re-render (see @sec-masking)
 dbExecute(con, "CREATE OR REPLACE TABLE range_counts (ms_merge_key VARCHAR, n_range BIGINT)")
 
-# turtles (done) → whole-range global + US-trim
-msens::copy_atlas_parquet(con, "SELECT mdl_key, cell_id, val FROM mc_turtle",
-  glue("{dir_global}/turtle"), per_thread = TRUE)
-msens::copy_atlas_parquet(con,
-  "SELECT mt.mdl_key, mt.cell_id, mt.val FROM mc_turtle mt JOIN us_cells u ON mt.cell_id = u.cell_id",
-  glue("{dir_merged}/turtle"), per_thread = TRUE)
+write_spatial()
 
 # BATCH the rest so each merge reads ONLY its taxa's pruned partitions (bounded memory). Two surfaces
 # come off the same batch (see glob_global_sql / us_sql below): the GLOBAL viz surface = am ∪ range
@@ -234,7 +289,7 @@ msens::copy_atlas_parquet(con,
 # Batch by CELL COUNT, not taxa count: a few taxa have global ranges (10-25M cells each), so a
 # fixed 150-taxa batch OOMs. Pack taxa until ~40M cells/batch (a single taxon maxes at the 25.9M
 # grid, so it always fits one batch). Counts come from parquet metadata (fast, no data scan).
-nonturtle <- setdiff(all_ids, turtle_ids)
+nonturtle <- setdiff(all_ids, c(turtle_ids, dps_ids))
 cnt <- dbGetQuery(con, "SELECT mkey_id, count(*) AS n FROM mc_parts GROUP BY mkey_id")
 cnt <- cnt[cnt$mkey_id %in% nonturtle, ]; cnt <- cnt[order(cnt$mkey_id), ]
 batches <- unname(split(cnt$mkey_id, cumsum(as.numeric(cnt$n)) %/% 40e6))
@@ -266,7 +321,10 @@ for (i in seq_along(batches)) {
 }
 dbExecute(con, "DROP TABLE IF EXISTS b; DROP TABLE IF EXISTS b_range;
   DROP TABLE IF EXISTS b_am_rng")
-} else log_info("dist_merged + dist_merged_global exist — skipping merge write (REDO_MERGE=1 to force)")
+} else if (redo_spatial) {
+  write_spatial()
+  log_info("REDO_MERGE_SPATIAL: rewrote the turtle + dps surfaces; the batched surfaces of the other taxa are kept")
+} else log_info("dist_merged + dist_merged_global exist — skipping merge write (REDO_MERGE=1 to force, REDO_MERGE_SPATIAL=1 for the spatial-ER taxa only)")
 
 # summaries: global (viz) + US (scoring); fingerprint the US scoring surface (the tracked output)
 smry_g <- dbGetQuery(con, glue("SELECT count(DISTINCT mdl_key) n_taxa, count(*) n_cells,
@@ -274,8 +332,16 @@ smry_g <- dbGetQuery(con, glue("SELECT count(DISTINCT mdl_key) n_taxa, count(*) 
 smry   <- dbGetQuery(con, glue("SELECT count(DISTINCT mdl_key) n_taxa, count(*) n_cells,
   min(val) v_min, max(val) v_max FROM read_parquet('{dir_merged}/**/*.parquet')"))
 h <- msens::hash_parquet(glue("{dir_merged}/**/*.parquet"), con)
-msens::report_table(smry_g, caption = "GLOBAL whole-range merged surface (ms_merge) → viz COGs")
-msens::report_table(smry,   caption = "US-trimmed merged model_cell (ms_merge) → scoring")
+# the per-cell ER beside the scoring surface (dps taxa) — scored, so fingerprinted too (er_hash);
+# score_zones resumes on content_hash + er_hash, since a changed ER leaves the val surface intact
+have_er <- dir_exists(dir_merged_er) && length(dir_ls(dir_merged_er, glob = "*.parquet", recurse = TRUE)) > 0
+smry_er <- if (have_er) dbGetQuery(con, glue("SELECT count(DISTINCT mdl_key) n_taxa, count(*) n_cells,
+  min(er) er_min, max(er) er_max FROM read_parquet('{dir_merged_er}/**/*.parquet')")) else
+  data.frame(n_taxa = 0L, n_cells = 0L, er_min = NA_real_, er_max = NA_real_)
+h_er <- if (have_er) msens::hash_parquet(glue("{dir_merged_er}/**/*.parquet"), con) else "none"
+msens::report_table(smry_g,  caption = "GLOBAL whole-range merged surface (ms_merge) → viz COGs")
+msens::report_table(smry,    caption = "US-trimmed merged model_cell (ms_merge) → scoring")
+msens::report_table(smry_er, caption = "US-trimmed per-cell extinction risk beside it (dps taxa; dist_merged_er) → scoring weight")
 ```
 
 ## Masking check {#sec-masking}
@@ -287,9 +353,9 @@ one cell per range cell**, because `$global` is `b_range LEFT JOIN b_am_rng` and
 `DISTINCT`. Any surplus is AquaMaps painted beyond the expert range — the apps#8 regression, which
 had 3,461 taxa carrying it (the walrus alone 743,749 surplus cells, reaching 9.75°N).
 
-Turtles are excluded: their footprint is the DPS extinction-risk surface, not the union of every
-non-am dataset, so the identity doesn't apply — `msens::turtle_sql()` masks them by construction and
-`test-merge.R` asserts it.
+Turtles and the NMFS DPS species are excluded: their footprint is the extinction-risk surface, not
+the union of every non-am dataset, so the identity doesn't apply — `msens::turtle_sql()` and
+`msens::dps_sql()` mask them by construction and `test-merge.R` asserts it.
 
 ```{r}
 #| label: masking_check
@@ -337,6 +403,7 @@ msens::write_manifest(
   manifest, target = "merge_models", content_hash = h,
   stats = list(ver = ver, n_taxa = smry$n_taxa, n_cells = smry$n_cells,
                v_min = smry$v_min, v_max = smry$v_max,
-               n_taxa_global = smry_g$n_taxa, n_cells_global = smry_g$n_cells),
+               n_taxa_global = smry_g$n_taxa, n_cells_global = smry_g$n_cells,
+               er_hash = h_er, n_taxa_er = smry_er$n_taxa, n_cells_er = smry_er$n_cells),
   force = msens::force_target("merge_models"))
 ```

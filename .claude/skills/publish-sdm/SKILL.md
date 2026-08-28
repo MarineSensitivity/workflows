@@ -117,3 +117,14 @@ key includes the **encoding** (`content_hash_encoded()`) — rewriting bytes at 
 `msens::stac_build(version="v8", cfg=…)` (override `cfg$titiler_base` → titiler-v8). Deploy the
 `{ver}/` subtree to `/share/data/derived/stac/{ver}/` and add a child link to the root
 `catalog.json` (keep other versions). Source `../msens/R/stac.R` — the installed pkg may be stale.
+
+## Targeted repaints (2026-08-28)
+
+- `REDO_MERGED_COG_SPATIAL=1` repaints only the sea turtles' + NMFS DPS species' merged COGs
+  (`REDO_MERGED_COG_KEYS=k1,k2` names taxa by hand) — a rule change for ~25 taxa need not repaint
+  21,000 COGs. Their `_merged_parts` partitions are refreshed in place, guarded by a partition-count
+  assertion because `mmid` is positional in the served set.
+- `native/dps_nmfs/` (the DPS per-cell ER surfaces) is painted by `publish_native` and registered as
+  `representation = "model"`; `REDO_DPS_COG=1` repaints. `native/*` keys are stable, so repainted bytes
+  still need `DEPLOY_TITILER` / the `RELEASE_DEPLOY` titiler recreate.
+

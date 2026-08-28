@@ -11,8 +11,11 @@ editor_options:
 
 Per-cell scoring (replicates v7 `calc_scores.qmd` exactly):
 
-1. **`extrisk_{spcat}`** = `SUM(er_score × val / 100)` over valid species in the category
-   (`is_er_spatial`/turtles → er_score = 100; MMPA floor already baked into `er_score`).
+1. **`extrisk_{spcat}`** = `SUM(er × val / 100)` over valid species in the category, where the
+   weight `er` depends on the taxon's `er_mode` (score_zones): the governing `er_score` (scalar,
+   MMPA/MBTA floors baked in) for ordinary taxa; `100` for the sea turtles, whose merged `val` is
+   already ER × suitability (`premultiplied`); the **per-cell** ER from `model_cell_er` for the
+   NMFS DPS species (`cell`), whose merged `val` is the suitability alone.
 2. **ecoregion min/max** of that metric per ecoregion; **`_ecoregion_rescaled`** per cell =
    `(x − eco_min)/(eco_max − eco_min) × 100`, coverage-normalized across ecoregions.
 3. **`primprod`** = VGPM `npp_avg` bilinear→cells; same ecoregion min/max + rescale.
@@ -25,7 +28,7 @@ Per-cell scoring (replicates v7 `calc_scores.qmd` exactly):
 %%| label: fig-design
 %%| fig-cap: "Per-cell scoring: extrisk_{spcat} → ecoregion rescale, + primprod → equal-weight composite"
 flowchart LR
-  mt["model_cell × taxon<br/>(er_score, sp_cat, is_marine)"] --> ex["extrisk_{spcat}<br/>Σ er·val/100"]
+  mt["model_cell × taxon<br/>(er_score | 100 | model_cell_er by er_mode; sp_cat, is_marine)"] --> ex["extrisk_{spcat}<br/>Σ er·val/100"]
   ex --> rs["ecoregion min/max<br/>→ _ecoregion_rescaled"]
   vg["VGPM npp_avg → cells"] --> pp["primprod → rescaled"]
   rs --> cm[("cell_metric<br/>sdm.duckdb")]
@@ -82,12 +85,21 @@ log_info("scoring taxa filter: {taxa_where}")
 ```{r}
 #| label: extrisk
 
+# the ER weight per (taxon, cell) by er_mode -- see score_zones; a 'cell' taxon without its per-cell
+# ER would be weighted NULL (dropped from the sum), so the join is asserted complete first
+stopifnot("run score_zones first (taxon.er_mode / model_cell_er missing)" =
+            "er_mode" %in% dbListFields(con, "taxon") && "model_cell_er" %in% dbListTables(con))
+n_gap <- dbGetQuery(con, "SELECT count(*) n FROM model_cell mc JOIN taxon t ON mc.mdl_key = t.ms_merge_key
+  LEFT JOIN model_cell_er e ON e.mdl_key = mc.mdl_key AND e.cell_id = mc.cell_id
+  WHERE t.er_mode = 'cell' AND e.er IS NULL")$n
+stopifnot("er_mode = 'cell' taxa have scored cells without a per-cell ER" = n_gap == 0)
+er_sql <- "(CASE t.er_mode WHEN 'premultiplied' THEN 100 WHEN 'cell' THEN e.er ELSE t.er_score END)"
 for (cat in sp_cats) {
   s <- mseq(glue("extrisk_{cat}"), glue("Extinction-risk-weighted suitability, {cat}"))
   dbExecute(con, glue("INSERT INTO cell_metric (cell_id, metric_seq, val)
-    SELECT mc.cell_id, {s}, ROUND(SUM(
-        (CASE WHEN t.is_er_spatial THEN 100 ELSE t.er_score END) * mc.val) / 100.0, 2) AS val
+    SELECT mc.cell_id, {s}, ROUND(SUM({er_sql} * mc.val) / 100.0, 2) AS val
     FROM model_cell mc JOIN taxon t ON mc.mdl_key = t.ms_merge_key
+    LEFT JOIN model_cell_er e ON e.mdl_key = mc.mdl_key AND e.cell_id = mc.cell_id
     WHERE {taxa_where} AND t.sp_cat = '{cat}'
     GROUP BY mc.cell_id"))
 }
