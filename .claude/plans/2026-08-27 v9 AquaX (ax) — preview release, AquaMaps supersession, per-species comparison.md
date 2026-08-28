@@ -157,7 +157,7 @@ Dockerfile pin moves; the exports assertion list is unaffected (apps call nothin
 6. `NEWS.md` 0.37.0 bullets: v9 grid; `merge_sql(suit_ds)`; `supersede_sql`; `sp_cat_from_taxonomy`;
    `cells_from_aligned_raster`; `cog_from_tif`. `devtools::test()` green → `devtools::install()`.
 
-## Phase 2 — `ingest_aquax.qmd` (the deliverable notebook) — IN PROGRESS (full ingest done 14:27, 204 min for 10,536 models; COGs/S3/comparison rendering)
+## Phase 2 — `ingest_aquax.qmd` (the deliverable notebook) — DONE 2026-08-27 (full ingest 204 min for 10,536 models; COGs on S3; comparison rendered)
 
 **Measured on the full run (2026-08-27):** `ax_mask` = **641,651** cells = 634,181 of the 634,208 `in_usa`
 cells (**27 uncovered**) + 7,367 ocean cells just outside `in_usa` + **103 coastline pixels** (one model,
@@ -342,7 +342,7 @@ Server, all via `release_marine-atlas.qmd` flags: `DEPLOY_TABLES=1` (tables + lo
   test harness mount and restoring the preview host's unversioned-path 302 (server `64a1dad`, `b5cd647`).
 - Docs CI published `v9/` to `gh-pages-preview`.
 
-## v9.1 — spatial extinction risk for NMFS DPS-listed species (2026-08-27 23:00, Ben's review finding)
+## v9.1 — spatial extinction risk for NMFS DPS-listed species — DONE 2026-08-28 04:35 (Ben's review finding of 2026-08-27 23:00)
 
 The humpback rendered a flat 100: `listing` takes the highest domestic ESA status on NOAA's species
 page (`parse_noaa_status`), so DPSs listed *outside* US waters made the species `NMFS:EN`, and the
@@ -359,6 +359,19 @@ The fallback rule is BOEM's analytic decision per NOAA (transcript line 57) — 
 docs' data-sources note. Chain re-run from `ingest_dps_nmfs` with `REDO_MERGED_COG` /
 `RELEASE_REDO_SERVE` / `RELEASE_REDO_CELL_MODEL`, then `RELEASE_DEPLOY` (titiler restart covers the
 repainted stable-URL COGs).
+
+**Done 2026-08-28 (`d81e3b01`):** 25 spatial-ER taxa merged (19 dps + 6 turtle); humpback merged surface
+1–100 (served 1–93 in titiler-v8's decimated stats, US mean 4.1), orca max 93, ringed seal max 50; PA gate
+v9.1 vs v8 n 20, mean |Δ| 3.21, max |Δ| 7.34, RMSE 3.80, r 0.916 — within tolerance; turtle (22.8) and
+mammal (15.5) categories move most, bird and primary_producer 0.000 (`validate_v8_v9.html` `f1c65e66`).
+Registry 91,362 models (dps ids 91,344–91,362, nothing renumbered); merged + score COGs repainted;
+`release_stage` (REDO_SERVE/REDO_CELL_MODEL) → `release_s3` → manifest → STAC API → storage index →
+`RELEASE_DEPLOY=1 DEPLOY_TABLES=1` (titiler-v8 recreated, `model_cell` synced in 13 min, apps + docs
+reloaded) → `CHECK_PREVIEW=1` passed with tokens (2 restricted, 8 public). Docs CI `33134408753` green;
+the v9 data-sources page on the preview host carries the DPS note. Ops note: a laptop network drop mid
+`release_s3` (HTTP 000 to every host) plus a `pkill` that killed only the wrapper left an orphaned R render
+holding the `serve.duckdb` lock — it finished its chunks but lost its HTML; check `pgrep -f rmd.R` before
+relaunching a stage.
 
 Still open (design, v10): the plain rule's flat maximum for ~50 whole-species-EN taxa
 (`max(er, suit)`); candidate: ER × suitability for all taxa, gated by `pra_score_delta`.
