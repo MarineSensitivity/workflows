@@ -6,7 +6,7 @@
 
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
 
-<meta name="dcterms.date" content="2026-08-27">
+<meta name="dcterms.date" content="2026-08-28">
 
 <title>Ingest NMFS listed entities (DPS / ESU / subspecies) → per-cell extinction risk on the global 0.05° grid</title>
 <style>
@@ -156,7 +156,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
     <div>
     <div class="quarto-title-meta-heading">Published</div>
     <div class="quarto-title-meta-contents">
-      <p class="date">2026-08-27</p>
+      <p class="date">2026-08-28</p>
     </div>
   </div>
   
@@ -173,8 +173,8 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <ul>
 <li><strong>Source (authoritative, current):</strong> NOAA Fisheries’ national critical-habitat map service (<code>All_NMFS_Critical_Habitat/MapServer</code>, shared by Jennifer Schultz, NMFS, 2026-04-16). Every designated polygon carries <code>SCIENAME</code>, <code>LISTENTITY</code> (e.g.&nbsp;<em>Whale, humpback [Mexico DPS]</em>) and <code>LISTSTATUS</code>. Only entities scoped below the species — <code>[… DPS]</code>, <code>[… ESU]</code>, a subspecies name — are taken here; whole-species listings are already right in <code>listing</code>.</li>
 <li><strong>Fallback (NOAA’s own advice):</strong> where no listed DPS is designated, the species’ <strong>IUCN range</strong> at its IUCN category (+ the MMPA floor for mammals) — “the IUCN data … should be exactly the same [for most species]; the humpback whale … there are going to be large gaps in the range that we don’t have because we didn’t list them” (Schultz). NOAA is publishing DPS-level <strong>species ranges</strong> end of CY2026; when they land, this notebook’s source swaps from critical habitat to ranges with no change to the rule.</li>
-<li><strong>Value = <code>compute_er_score()</code></strong>, never a magic number: <code>NMFS:EN</code> → 100, <code>NMFS:TN</code> → 50 inside a listed entity’s polygons; <code>IUCN:{category}</code> (+MMPA 20) elsewhere; overlaps take the max.</li>
-<li><strong>Merge:</strong> taxa with a <code>dps_nmfs</code> model join the sea turtles in the spatial-ER branch (<code>msens::turtle_sql</code>): <code>val = max(1, round(er_cell × suitability / 100))</code>, scored with <code>is_er_spatial</code> (the ER is already in the cell value). Critical-habitat datasets are not applied as an override for these taxa — the same polygons are here, with their status.</li>
+<li><strong>Value = <code>compute_er_score()</code></strong>, never a magic number: <code>NMFS:EN</code> → 100, <code>NMFS:TN</code> → 50 inside a listed entity’s polygons; elsewhere the baseline every unlisted species of its kind carries — <code>NMFS:LC</code> + the MMPA floor = 20 for a marine mammal (the convention <code>merge_models_prep</code> uses for the governing score), <code>IUCN:{category}</code> otherwise; overlaps take the max.</li>
+<li><strong>Merge:</strong> taxa with a <code>dps_nmfs</code> model take their own branch (<code>msens::dps_sql</code>): the merged value is the <strong>suitability</strong> (AquaX / AquaMaps) masked to this ER footprint — the distribution, not a risk-weighted one — and the per-cell ER is written beside it (<code>dist_merged_er</code>) for <code>score_cell_metrics</code> to multiply in (<code>taxon.er_mode = 'cell'</code>). Critical-habitat datasets are not an input for these taxa — the same polygons are here, with their entity’s status.</li>
 </ul>
 <p>Regulatory note (from the call): NOAA’s layers are the regulatory product; combining them with IUCN / AquaX for a non-regulatory sensitivity score is explicitly fine, and the fallback rule is BOEM’s analytic decision — documented here and in the docs’ data-sources page.</p>
 <p>Flags: <code>REDO_INGEST</code> (rebuild the Parquet), <code>DPS_FETCH=1</code> (re-download the service layers into <code>raw/fisheries.noaa.gov/All_NMFS_Critical_Habitat/</code> — otherwise the cached snapshot is used).</p>
@@ -735,17 +735,23 @@ Figure&nbsp;1: Listed entities below species level → their critical habitat at
 <span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="at">mdl_key =</span> <span class="fu">coalesce</span>(mdl_key, mdl_key2), <span class="at">category =</span> <span class="fu">coalesce</span>(category, category2)) <span class="sc">|&gt;</span> <span class="fu">select</span>(<span class="sc">-</span>mdl_key2, <span class="sc">-</span>category2) <span class="sc">|&gt;</span></span>
 <span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="at">iucn_code =</span> <span class="fu">if_else</span>(<span class="sc">!</span><span class="fu">is.na</span>(category) <span class="sc">&amp;</span> category <span class="sc">%in%</span> <span class="fu">c</span>(<span class="st">"CR"</span>,<span class="st">"EN"</span>,<span class="st">"VU"</span>,<span class="st">"NT"</span>,<span class="st">"LC"</span>,<span class="st">"DD"</span>),</span>
 <span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>                             <span class="fu">paste0</span>(<span class="st">"IUCN:"</span>, category), <span class="cn">NA_character_</span>),</span>
-<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>         <span class="at">er_base =</span> <span class="fu">if_else</span>(<span class="sc">!</span><span class="fu">is.na</span>(iucn_code), <span class="fu">compute_er_score</span>(iucn_code, <span class="at">is_mmpa =</span> is_mmpa),</span>
-<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>                           <span class="fu">if_else</span>(is_mmpa, <span class="fu">compute_er_score</span>(<span class="st">"IUCN:LC"</span>, <span class="at">is_mmpa =</span> <span class="cn">TRUE</span>), <span class="dv">1</span>L)),</span>
-<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>         <span class="at">iucn_file =</span> <span class="fu">if_else</span>(<span class="sc">!</span><span class="fu">is.na</span>(mdl_key), <span class="fu">glue</span>(<span class="st">"{dir_iucn}/{str_remove(mdl_key, '^rng_iucn</span><span class="sc">\\\\</span><span class="st">|')}.parquet"</span>), <span class="cn">NA_character_</span>),</span>
-<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>         <span class="at">has_iucn =</span> <span class="sc">!</span><span class="fu">is.na</span>(iucn_file) <span class="sc">&amp;</span> <span class="fu">file_exists</span>(<span class="fu">coalesce</span>(iucn_file, <span class="st">""</span>)),</span>
-<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>         <span class="at">mdl_key_dps =</span> msens<span class="sc">::</span><span class="fu">mdl_key_raw</span>(ds_key, worms_id))</span>
-<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a><span class="fu">kable</span>(sp <span class="sc">|&gt;</span> <span class="fu">select</span>(binomial, worms_id, iucn_code, is_mmpa, er_base, has_iucn),</span>
-<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>      <span class="at">caption =</span> <span class="st">"Baseline extinction risk outside listed entities (IUCN category + MMPA floor); species without an IUCN range get the entity polygons only"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>         <span class="co"># baseline outside the listed entities, on the SAME convention merge_models_prep uses for</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>         <span class="co"># the governing er_score: a marine mammal is `NMFS:LC` + the MMPA floor = 20 (US national</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>         <span class="co"># status overrides IUCN for mammals; compute_er_score() ignores is_mmpa for IUCN codes, so</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>         <span class="co"># `IUCN:LC` + MMPA was silently 1 -- the humpback carried 1 where every other unlisted</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>         <span class="co"># marine mammal carries 20); everything else is its IUCN category (1 when unlisted)</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>         <span class="at">er_base =</span> <span class="fu">case_when</span>(is_mmpa           <span class="sc">~</span> <span class="fu">compute_er_score</span>(<span class="st">"NMFS:LC"</span>, <span class="at">is_mmpa =</span> <span class="cn">TRUE</span>),</span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>                             <span class="sc">!</span><span class="fu">is.na</span>(iucn_code) <span class="sc">~</span> <span class="fu">compute_er_score</span>(iucn_code),</span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>                             <span class="cn">TRUE</span>              <span class="sc">~</span> <span class="dv">1</span>L),</span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>         <span class="at">iucn_file =</span> <span class="fu">if_else</span>(<span class="sc">!</span><span class="fu">is.na</span>(mdl_key), <span class="fu">glue</span>(<span class="st">"{dir_iucn}/{str_remove(mdl_key, '^rng_iucn</span><span class="sc">\\\\</span><span class="st">|')}.parquet"</span>), <span class="cn">NA_character_</span>),</span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>         <span class="at">has_iucn =</span> <span class="sc">!</span><span class="fu">is.na</span>(iucn_file) <span class="sc">&amp;</span> <span class="fu">file_exists</span>(<span class="fu">coalesce</span>(iucn_file, <span class="st">""</span>)),</span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a>         <span class="at">mdl_key_dps =</span> msens<span class="sc">::</span><span class="fu">mdl_key_raw</span>(ds_key, worms_id))</span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a><span class="fu">kable</span>(sp <span class="sc">|&gt;</span> <span class="fu">select</span>(binomial, worms_id, iucn_code, is_mmpa, er_base, has_iucn),</span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a>      <span class="at">caption =</span> <span class="st">"Baseline extinction risk outside listed entities (mammals: NMFS:LC + MMPA floor = 20; others: IUCN category); species without an IUCN range get the entity polygons only"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </details>
 <div class="cell-output-display">
 <table class="caption-top table table-sm table-striped small">
-<caption>Baseline extinction risk outside listed entities (IUCN category + MMPA floor); species without an IUCN range get the entity polygons only</caption>
+<caption>Baseline extinction risk outside listed entities (mammals: NMFS:LC + MMPA floor = 20; others: IUCN category); species without an IUCN range get the entity polygons only</caption>
 <colgroup>
 <col style="width: 36%">
 <col style="width: 13%">
@@ -866,7 +872,7 @@ Figure&nbsp;1: Listed entities below species level → their critical habitat at
 <td style="text-align: left;">137079</td>
 <td style="text-align: left;">IUCN:NT</td>
 <td style="text-align: left;">TRUE</td>
-<td style="text-align: right;">2</td>
+<td style="text-align: right;">20</td>
 <td style="text-align: left;">TRUE</td>
 </tr>
 <tr class="even">
@@ -874,7 +880,7 @@ Figure&nbsp;1: Listed entities below species level → their critical habitat at
 <td style="text-align: left;">254999</td>
 <td style="text-align: left;">IUCN:NT</td>
 <td style="text-align: left;">TRUE</td>
-<td style="text-align: right;">2</td>
+<td style="text-align: right;">20</td>
 <td style="text-align: left;">TRUE</td>
 </tr>
 <tr class="odd">
@@ -882,7 +888,7 @@ Figure&nbsp;1: Listed entities below species level → their critical habitat at
 <td style="text-align: left;">159021</td>
 <td style="text-align: left;">IUCN:LC</td>
 <td style="text-align: left;">TRUE</td>
-<td style="text-align: right;">1</td>
+<td style="text-align: right;">20</td>
 <td style="text-align: left;">TRUE</td>
 </tr>
 <tr class="even">
@@ -890,7 +896,7 @@ Figure&nbsp;1: Listed entities below species level → their critical habitat at
 <td style="text-align: left;">137115</td>
 <td style="text-align: left;">IUCN:LC</td>
 <td style="text-align: left;">TRUE</td>
-<td style="text-align: right;">1</td>
+<td style="text-align: right;">20</td>
 <td style="text-align: left;">TRUE</td>
 </tr>
 <tr class="odd">
@@ -898,7 +904,7 @@ Figure&nbsp;1: Listed entities below species level → their critical habitat at
 <td style="text-align: left;">137104</td>
 <td style="text-align: left;">IUCN:NT</td>
 <td style="text-align: left;">TRUE</td>
-<td style="text-align: right;">2</td>
+<td style="text-align: right;">20</td>
 <td style="text-align: left;">TRUE</td>
 </tr>
 <tr class="even">
@@ -906,7 +912,7 @@ Figure&nbsp;1: Listed entities below species level → their critical habitat at
 <td style="text-align: left;">137092</td>
 <td style="text-align: left;">IUCN:LC</td>
 <td style="text-align: left;">TRUE</td>
-<td style="text-align: right;">1</td>
+<td style="text-align: right;">20</td>
 <td style="text-align: left;">TRUE</td>
 </tr>
 <tr class="odd">
@@ -914,7 +920,7 @@ Figure&nbsp;1: Listed entities below species level → their critical habitat at
 <td style="text-align: left;">137102</td>
 <td style="text-align: left;">IUCN:DD</td>
 <td style="text-align: left;">TRUE</td>
-<td style="text-align: right;">1</td>
+<td style="text-align: right;">20</td>
 <td style="text-align: left;">TRUE</td>
 </tr>
 </tbody>
@@ -959,7 +965,7 @@ Figure&nbsp;1: Listed entities below species level → their critical habitat at
 <span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="st">  FROM read_parquet('{dir_dist}/*.parquet') GROUP BY 1 ORDER BY 1"</span>))</span>
 <span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>model <span class="ot">&lt;-</span> sp <span class="sc">|&gt;</span></span>
 <span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>  <span class="fu">transmute</span>(<span class="at">mdl_key =</span> mdl_key_dps, <span class="at">sp_id =</span> worms_id, worms_id, <span class="at">scientific_name =</span> binomial, is_mmpa, iucn_code, er_base,</span>
-<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>            <span class="at">er_code =</span> <span class="st">"NMFS:DPS"</span>, <span class="at">er_score =</span> <span class="cn">NA_integer_</span>,   <span class="co"># per-cell: see val; the merge multiplies it by suitability</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>            <span class="at">er_code =</span> <span class="st">"NMFS:DPS"</span>, <span class="at">er_score =</span> <span class="cn">NA_integer_</span>,   <span class="co"># per-cell: see val; scoring multiplies it by the merged suitability</span></span>
 <span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>            <span class="at">entities =</span> <span class="fu">map_chr</span>(worms_id, \(w) <span class="fu">paste</span>(ent<span class="sc">$</span>LISTENTITY[ent<span class="sc">$</span>worms_id <span class="sc">==</span> w], <span class="at">collapse =</span> <span class="st">" | "</span>)),</span>
 <span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>            <span class="at">statuses =</span> <span class="fu">map_chr</span>(worms_id, \(w) <span class="fu">paste</span>(ent<span class="sc">$</span>status[ent<span class="sc">$</span>worms_id <span class="sc">==</span> w], <span class="at">collapse =</span> <span class="st">"|"</span>)),</span>
 <span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>            <span class="at">has_iucn_baseline =</span> has_iucn) <span class="sc">|&gt;</span></span>
@@ -1132,77 +1138,77 @@ Figure&nbsp;1: Listed entities below species level → their critical habitat at
 <td style="text-align: left;">Erignathus barbatus</td>
 <td style="text-align: left;">137079</td>
 <td style="text-align: left;">TN</td>
-<td style="text-align: right;">2</td>
+<td style="text-align: right;">20</td>
 <td style="text-align: right;">1393598</td>
 <td style="text-align: right;">0</td>
 <td style="text-align: right;">54279</td>
-<td style="text-align: right;">2</td>
+<td style="text-align: right;">20</td>
 <td style="text-align: right;">50</td>
 </tr>
 <tr class="even">
 <td style="text-align: left;">Eumetopias jubatus</td>
 <td style="text-align: left;">254999</td>
 <td style="text-align: left;">EN</td>
-<td style="text-align: right;">2</td>
+<td style="text-align: right;">20</td>
 <td style="text-align: right;">375211</td>
 <td style="text-align: right;">23134</td>
 <td style="text-align: right;">0</td>
-<td style="text-align: right;">2</td>
+<td style="text-align: right;">20</td>
 <td style="text-align: right;">100</td>
 </tr>
 <tr class="odd">
 <td style="text-align: left;">Phoca hispida</td>
 <td style="text-align: left;">159021</td>
 <td style="text-align: left;">TN</td>
-<td style="text-align: right;">1</td>
+<td style="text-align: right;">20</td>
 <td style="text-align: right;">2890123</td>
 <td style="text-align: right;">0</td>
 <td style="text-align: right;">54756</td>
-<td style="text-align: right;">1</td>
+<td style="text-align: right;">20</td>
 <td style="text-align: right;">50</td>
 </tr>
 <tr class="even">
 <td style="text-align: left;">Delphinapterus leucas</td>
 <td style="text-align: left;">137115</td>
 <td style="text-align: left;">EN</td>
-<td style="text-align: right;">1</td>
+<td style="text-align: right;">20</td>
 <td style="text-align: right;">1054591</td>
 <td style="text-align: right;">901</td>
 <td style="text-align: right;">0</td>
-<td style="text-align: right;">1</td>
+<td style="text-align: right;">20</td>
 <td style="text-align: right;">100</td>
 </tr>
 <tr class="odd">
 <td style="text-align: left;">Pseudorca crassidens</td>
 <td style="text-align: left;">137104</td>
 <td style="text-align: left;">EN</td>
-<td style="text-align: right;">2</td>
+<td style="text-align: right;">20</td>
 <td style="text-align: right;">6846077</td>
 <td style="text-align: right;">2086</td>
 <td style="text-align: right;">0</td>
-<td style="text-align: right;">2</td>
+<td style="text-align: right;">20</td>
 <td style="text-align: right;">100</td>
 </tr>
 <tr class="even">
 <td style="text-align: left;">Megaptera novaeangliae</td>
 <td style="text-align: left;">137092</td>
 <td style="text-align: left;">EN|TN|EN</td>
-<td style="text-align: right;">1</td>
+<td style="text-align: right;">20</td>
 <td style="text-align: right;">14708134</td>
 <td style="text-align: right;">20601</td>
 <td style="text-align: right;">2084</td>
-<td style="text-align: right;">1</td>
+<td style="text-align: right;">20</td>
 <td style="text-align: right;">100</td>
 </tr>
 <tr class="odd">
 <td style="text-align: left;">Orcinus orca</td>
 <td style="text-align: left;">137102</td>
 <td style="text-align: left;">EN</td>
-<td style="text-align: right;">1</td>
+<td style="text-align: right;">20</td>
 <td style="text-align: right;">15368888</td>
 <td style="text-align: right;">2852</td>
 <td style="text-align: right;">0</td>
-<td style="text-align: right;">1</td>
+<td style="text-align: right;">20</td>
 <td style="text-align: right;">100</td>
 </tr>
 </tbody>
@@ -1689,7 +1695,7 @@ Figure&nbsp;1: Listed entities below species level → their critical habitat at
 <span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="co">  dataset: {ds_key: dps_nmfs, response_type: range, source_authority: NOAA NMFS, temporal_interval: static,</span></span>
 <span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a><span class="co">            native_format: vector, name_short: "NMFS listed entities (DPS)", name_display: "NMFS DPS extinction risk",</span></span>
 <span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a><span class="co">            description: "Per-cell extinction risk for ESA listed entities that are Distinct Population Segments, ESUs or subspecies rather than whole species: each listed entity's designated critical habitat carries that entity's status (Endangered 100 / Threatened 50, with the MMPA floor), and the rest of the species' IUCN range carries the species' IUCN status plus the MMPA floor. Merged multiplicatively with suitability, like the sea turtles.",</span></span>
-<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a><span class="co">            value_info: "extinction-risk score per cell (NMFS:EN 100 / NMFS:TN 50 inside a listed entity's critical habitat; IUCN + MMPA floor elsewhere)",</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a><span class="co">            value_info: "extinction-risk score per cell (NMFS:EN 100 / NMFS:TN 50 inside a listed entity's critical habitat; IUCN category elsewhere, the MMPA floor of 20 for mammals)",</span></span>
 <span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a><span class="co">            regions: "US waters (critical habitat) + the species' global IUCN range (baseline)", is_mask: true,</span></span>
 <span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a><span class="co">            citation: "NOAA Fisheries (2026) All NMFS Critical Habitat, ArcGIS MapServer (maps.fisheries.noaa.gov), All_critical_habitat_poly_20230502 and per-entity layers; species-range services with DPS-level ranges expected end of CY2026",</span></span>
 <span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a><span class="co">            link_info: "https://www.fisheries.noaa.gov/resource/map/national-esa-critical-habitat-mapper",</span></span>
@@ -1720,231 +1726,240 @@ Figure&nbsp;1: Listed entities below species level → their critical habitat at
 <span id="cb10-40"><a href="#cb10-40" aria-hidden="true" tabindex="-1"></a>  ranges** end of CY2026; when they land, this notebook's source swaps from critical habitat to</span>
 <span id="cb10-41"><a href="#cb10-41" aria-hidden="true" tabindex="-1"></a>  ranges with no change to the rule.</span>
 <span id="cb10-42"><a href="#cb10-42" aria-hidden="true" tabindex="-1"></a><span class="ss">- </span>**Value = `compute_er_score()`**, never a magic number: <span class="in">`NMFS:EN`</span> → 100, <span class="in">`NMFS:TN`</span> → 50 inside a</span>
-<span id="cb10-43"><a href="#cb10-43" aria-hidden="true" tabindex="-1"></a>  listed entity's polygons; <span class="in">`IUCN:{category}`</span> (+MMPA 20) elsewhere; overlaps take the max.</span>
-<span id="cb10-44"><a href="#cb10-44" aria-hidden="true" tabindex="-1"></a><span class="ss">- </span>**Merge:** taxa with a <span class="in">`dps_nmfs`</span> model join the sea turtles in the spatial-ER branch</span>
-<span id="cb10-45"><a href="#cb10-45" aria-hidden="true" tabindex="-1"></a>  (<span class="in">`msens::turtle_sql`</span>): <span class="in">`val = max(1, round(er_cell × suitability / 100))`</span>, scored with</span>
-<span id="cb10-46"><a href="#cb10-46" aria-hidden="true" tabindex="-1"></a>  <span class="in">`is_er_spatial`</span> (the ER is already in the cell value). Critical-habitat datasets are not applied</span>
-<span id="cb10-47"><a href="#cb10-47" aria-hidden="true" tabindex="-1"></a>  as an override for these taxa — the same polygons are here, with their status.</span>
-<span id="cb10-48"><a href="#cb10-48" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb10-49"><a href="#cb10-49" aria-hidden="true" tabindex="-1"></a>Regulatory note (from the call): NOAA's layers are the regulatory product; combining them with</span>
-<span id="cb10-50"><a href="#cb10-50" aria-hidden="true" tabindex="-1"></a>IUCN / AquaX for a non-regulatory sensitivity score is explicitly fine, and the fallback rule is</span>
-<span id="cb10-51"><a href="#cb10-51" aria-hidden="true" tabindex="-1"></a>BOEM's analytic decision — documented here and in the docs' data-sources page.</span>
-<span id="cb10-52"><a href="#cb10-52" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb10-53"><a href="#cb10-53" aria-hidden="true" tabindex="-1"></a>Flags: <span class="in">`REDO_INGEST`</span> (rebuild the Parquet), <span class="in">`DPS_FETCH=1`</span> (re-download the service layers into</span>
-<span id="cb10-54"><a href="#cb10-54" aria-hidden="true" tabindex="-1"></a><span class="in">`raw/fisheries.noaa.gov/All_NMFS_Critical_Habitat/`</span> — otherwise the cached snapshot is used).</span>
+<span id="cb10-43"><a href="#cb10-43" aria-hidden="true" tabindex="-1"></a>  listed entity's polygons; elsewhere the baseline every unlisted species of its kind carries —</span>
+<span id="cb10-44"><a href="#cb10-44" aria-hidden="true" tabindex="-1"></a>  <span class="in">`NMFS:LC`</span> + the MMPA floor = 20 for a marine mammal (the convention <span class="in">`merge_models_prep`</span> uses for</span>
+<span id="cb10-45"><a href="#cb10-45" aria-hidden="true" tabindex="-1"></a>  the governing score), <span class="in">`IUCN:{category}`</span> otherwise; overlaps take the max.</span>
+<span id="cb10-46"><a href="#cb10-46" aria-hidden="true" tabindex="-1"></a><span class="ss">- </span>**Merge:** taxa with a <span class="in">`dps_nmfs`</span> model take their own branch (<span class="in">`msens::dps_sql`</span>): the merged</span>
+<span id="cb10-47"><a href="#cb10-47" aria-hidden="true" tabindex="-1"></a>  value is the **suitability** (AquaX / AquaMaps) masked to this ER footprint — the distribution,</span>
+<span id="cb10-48"><a href="#cb10-48" aria-hidden="true" tabindex="-1"></a>  not a risk-weighted one — and the per-cell ER is written beside it (<span class="in">`dist_merged_er`</span>) for</span>
+<span id="cb10-49"><a href="#cb10-49" aria-hidden="true" tabindex="-1"></a>  <span class="in">`score_cell_metrics`</span> to multiply in (<span class="in">`taxon.er_mode = 'cell'`</span>). Critical-habitat datasets are not</span>
+<span id="cb10-50"><a href="#cb10-50" aria-hidden="true" tabindex="-1"></a>  an input for these taxa — the same polygons are here, with their entity's status.</span>
+<span id="cb10-51"><a href="#cb10-51" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-52"><a href="#cb10-52" aria-hidden="true" tabindex="-1"></a>Regulatory note (from the call): NOAA's layers are the regulatory product; combining them with</span>
+<span id="cb10-53"><a href="#cb10-53" aria-hidden="true" tabindex="-1"></a>IUCN / AquaX for a non-regulatory sensitivity score is explicitly fine, and the fallback rule is</span>
+<span id="cb10-54"><a href="#cb10-54" aria-hidden="true" tabindex="-1"></a>BOEM's analytic decision — documented here and in the docs' data-sources page.</span>
 <span id="cb10-55"><a href="#cb10-55" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb10-56"><a href="#cb10-56" aria-hidden="true" tabindex="-1"></a><span class="fu">## Design</span></span>
-<span id="cb10-57"><a href="#cb10-57" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb10-60"><a href="#cb10-60" aria-hidden="true" tabindex="-1"></a><span class="in">```{mermaid}</span></span>
-<span id="cb10-61"><a href="#cb10-61" aria-hidden="true" tabindex="-1"></a>%%| label: fig-design</span>
-<span id="cb10-62"><a href="#cb10-62" aria-hidden="true" tabindex="-1"></a>%%| fig-cap: <span class="ot">"</span><span class="st">Listed entities below species level → their critical habitat at their status, the IUCN range at the baseline → one per-cell ER surface per species</span><span class="ot">"</span></span>
-<span id="cb10-63"><a href="#cb10-63" aria-hidden="true" tabindex="-1"></a>flowchart LR</span>
-<span id="cb10-64"><a href="#cb10-64" aria-hidden="true" tabindex="-1"></a>  svc[<span class="ot">"</span><span class="st">NMFS All_NMFS_Critical_Habitat&lt;br/&gt;MapServer (leaf polygon layers)</span><span class="ot">"</span>] --&gt;|<span class="ot">"</span><span class="st">DPS_FETCH=1 → raw/ gpkg</span><span class="ot">"</span>| ent[<span class="ot">"</span><span class="st">listed entities scoped&lt;br/&gt;below species (DPS / ESU / ssp.)</span><span class="ot">"</span>]</span>
-<span id="cb10-65"><a href="#cb10-65" aria-hidden="true" tabindex="-1"></a>  ent --&gt; ch[<span class="ot">"</span><span class="st">cells_from_ranges(value = compute_er_score(NMFS:status, is_mmpa))</span><span class="ot">"</span>]</span>
-<span id="cb10-66"><a href="#cb10-66" aria-hidden="true" tabindex="-1"></a>  iucn[<span class="ot">"</span><span class="st">dist/dataset=rng_iucn&lt;br/&gt;(species' IUCN range)</span><span class="ot">"</span>] --&gt; base[<span class="ot">"</span><span class="st">baseline = compute_er_score(IUCN:cat, is_mmpa)</span><span class="ot">"</span>]</span>
-<span id="cb10-67"><a href="#cb10-67" aria-hidden="true" tabindex="-1"></a>  ch &amp; base --&gt; mx[<span class="ot">"</span><span class="st">max per cell</span><span class="ot">"</span>]</span>
-<span id="cb10-68"><a href="#cb10-68" aria-hidden="true" tabindex="-1"></a>  mx --&gt; pq[(<span class="ot">"</span><span class="st">dist/dataset=dps_nmfs/{worms_id}.parquet&lt;br/&gt;(mdl_key, cell_id, val)</span><span class="ot">"</span>)]</span>
-<span id="cb10-69"><a href="#cb10-69" aria-hidden="true" tabindex="-1"></a>  pq --&gt; mf[<span class="ot">"</span><span class="st">hash_parquet → manifest</span><span class="ot">"</span>]</span>
-<span id="cb10-70"><a href="#cb10-70" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb10-71"><a href="#cb10-71" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb10-72"><a href="#cb10-72" aria-hidden="true" tabindex="-1"></a><span class="fu">## Setup</span></span>
-<span id="cb10-73"><a href="#cb10-73" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb10-76"><a href="#cb10-76" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb10-77"><a href="#cb10-77" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: setup</span></span>
-<span id="cb10-78"><a href="#cb10-78" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb10-79"><a href="#cb10-79" aria-hidden="true" tabindex="-1"></a>librarian<span class="sc">::</span><span class="fu">shelf</span>(DBI, dplyr, duckdb, fs, glue, here, httr2, jsonlite, knitr, logger, purrr, readr,</span>
-<span id="cb10-80"><a href="#cb10-80" aria-hidden="true" tabindex="-1"></a>                 sf, stringr, terra, tibble, tidyr, MarineSensitivity<span class="sc">/</span>msens, <span class="at">quiet =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb10-81"><a href="#cb10-81" aria-hidden="true" tabindex="-1"></a><span class="fu">source</span>(<span class="fu">here</span>(<span class="st">"libs/paths.R"</span>)); <span class="fu">source</span>(<span class="fu">here</span>(<span class="st">"libs/vars.R"</span>))</span>
-<span id="cb10-82"><a href="#cb10-82" aria-hidden="true" tabindex="-1"></a><span class="fu">options</span>(<span class="at">readr.show_col_types =</span> <span class="cn">FALSE</span>)</span>
-<span id="cb10-83"><a href="#cb10-83" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb10-84"><a href="#cb10-84" aria-hidden="true" tabindex="-1"></a>ds_key   <span class="ot">&lt;-</span> <span class="st">"dps_nmfs"</span></span>
-<span id="cb10-85"><a href="#cb10-85" aria-hidden="true" tabindex="-1"></a>svc      <span class="ot">&lt;-</span> <span class="st">"https://maps.fisheries.noaa.gov/server/rest/services/All_NMFS_Critical_Habitat/MapServer"</span></span>
-<span id="cb10-86"><a href="#cb10-86" aria-hidden="true" tabindex="-1"></a>dir_raw_ch <span class="ot">&lt;-</span> <span class="fu">path.expand</span>(<span class="fu">glue</span>(<span class="st">"{dir_raw}/fisheries.noaa.gov/All_NMFS_Critical_Habitat"</span>)); <span class="fu">dir_create</span>(dir_raw_ch)</span>
-<span id="cb10-87"><a href="#cb10-87" aria-hidden="true" tabindex="-1"></a>dir_atlas  <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{dir_big_v}/marine-atlas"</span>)</span>
-<span id="cb10-88"><a href="#cb10-88" aria-hidden="true" tabindex="-1"></a>dir_dist   <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{dir_atlas}/dist/dataset={ds_key}"</span>); <span class="fu">dir_create</span>(dir_dist)</span>
-<span id="cb10-89"><a href="#cb10-89" aria-hidden="true" tabindex="-1"></a>dir_iucn   <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{dir_atlas}/dist/dataset=rng_iucn"</span>)</span>
-<span id="cb10-90"><a href="#cb10-90" aria-hidden="true" tabindex="-1"></a>mdl_csv    <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{dir_atlas}/dist/model_{ds_key}.csv"</span>)</span>
-<span id="cb10-91"><a href="#cb10-91" aria-hidden="true" tabindex="-1"></a>manifest   <span class="ot">&lt;-</span> <span class="fu">here</span>(<span class="st">"data/manifests/ingest_dps_nmfs.json"</span>); <span class="fu">dir_create</span>(<span class="fu">path_dir</span>(manifest))</span>
-<span id="cb10-92"><a href="#cb10-92" aria-hidden="true" tabindex="-1"></a>turtle_ds  <span class="ot">&lt;-</span> <span class="st">"rng_turtle_swot_dps"</span></span>
-<span id="cb10-93"><a href="#cb10-93" aria-hidden="true" tabindex="-1"></a>dps_fetch  <span class="ot">&lt;-</span> <span class="fu">.flag</span>(<span class="st">"DPS_FETCH"</span>)</span>
-<span id="cb10-94"><a href="#cb10-94" aria-hidden="true" tabindex="-1"></a><span class="fu">stopifnot</span>(<span class="st">"run build_cell_grid first"</span> <span class="ot">=</span> <span class="fu">file_exists</span>(cellid_tif),</span>
-<span id="cb10-95"><a href="#cb10-95" aria-hidden="true" tabindex="-1"></a>          <span class="st">"run ingest_rng_iucn first (the baseline footprint)"</span> <span class="ot">=</span> <span class="fu">dir_exists</span>(dir_iucn),</span>
-<span id="cb10-96"><a href="#cb10-96" aria-hidden="true" tabindex="-1"></a>          <span class="st">"spp.duckdb (WoRMS) missing"</span> <span class="ot">=</span> <span class="fu">file_exists</span>(spp_db))</span>
-<span id="cb10-97"><a href="#cb10-97" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (redo_ingest <span class="sc">&amp;&amp;</span> <span class="fu">dir_exists</span>(dir_dist)) { <span class="fu">dir_delete</span>(dir_dist); <span class="fu">dir_create</span>(dir_dist) }</span>
-<span id="cb10-98"><a href="#cb10-98" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb10-99"><a href="#cb10-99" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb10-100"><a href="#cb10-100" aria-hidden="true" tabindex="-1"></a><span class="fu">## Fetch the service (cached snapshot in `raw/`)</span></span>
-<span id="cb10-101"><a href="#cb10-101" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb10-102"><a href="#cb10-102" aria-hidden="true" tabindex="-1"></a>Every leaf **polygon** layer under *Designated Critical Habitat* (lines and *Proposed* are</span>
-<span id="cb10-103"><a href="#cb10-103" aria-hidden="true" tabindex="-1"></a>skipped), paged through <span class="in">`resultOffset`</span>, written once as GeoPackage with the service's layer</span>
-<span id="cb10-104"><a href="#cb10-104" aria-hidden="true" tabindex="-1"></a>name — which carries the designation date — so the snapshot is versioned by NOAA's own naming.</span>
-<span id="cb10-105"><a href="#cb10-105" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb10-108"><a href="#cb10-108" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb10-109"><a href="#cb10-109" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: fetch</span></span>
-<span id="cb10-110"><a href="#cb10-110" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb10-111"><a href="#cb10-111" aria-hidden="true" tabindex="-1"></a>svc_json <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{dir_raw_ch}/service.json"</span>)</span>
-<span id="cb10-112"><a href="#cb10-112" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (dps_fetch <span class="sc">||</span> <span class="sc">!</span><span class="fu">file_exists</span>(svc_json))</span>
-<span id="cb10-113"><a href="#cb10-113" aria-hidden="true" tabindex="-1"></a>  <span class="fu">request</span>(<span class="fu">glue</span>(<span class="st">"{svc}?f=json"</span>)) <span class="sc">|&gt;</span> <span class="fu">req_perform</span>() <span class="sc">|&gt;</span> <span class="fu">resp_body_string</span>() <span class="sc">|&gt;</span> <span class="fu">writeLines</span>(svc_json)</span>
-<span id="cb10-114"><a href="#cb10-114" aria-hidden="true" tabindex="-1"></a>meta   <span class="ot">&lt;-</span> <span class="fu">fromJSON</span>(svc_json, <span class="at">simplifyVector =</span> <span class="cn">FALSE</span>)</span>
-<span id="cb10-115"><a href="#cb10-115" aria-hidden="true" tabindex="-1"></a>layers <span class="ot">&lt;-</span> <span class="fu">map_dfr</span>(meta<span class="sc">$</span>layers, \(l) <span class="fu">tibble</span>(<span class="at">id =</span> l<span class="sc">$</span>id, <span class="at">name =</span> l<span class="sc">$</span>name, <span class="at">parent =</span> l<span class="sc">$</span>parentLayerId <span class="sc">%||%</span> <span class="cn">NA</span>,</span>
-<span id="cb10-116"><a href="#cb10-116" aria-hidden="true" tabindex="-1"></a>                                            <span class="at">leaf =</span> <span class="fu">is.null</span>(l<span class="sc">$</span>subLayerIds)))</span>
-<span id="cb10-117"><a href="#cb10-117" aria-hidden="true" tabindex="-1"></a><span class="co"># leaf polygon layers under "Designated Critical Habitat" (id 0): walk parents up to 0, not 71 (Proposed)</span></span>
-<span id="cb10-118"><a href="#cb10-118" aria-hidden="true" tabindex="-1"></a>ancestors <span class="ot">&lt;-</span> <span class="cf">function</span>(id) { out <span class="ot">&lt;-</span> <span class="fu">c</span>(); <span class="cf">while</span> (<span class="sc">!</span><span class="fu">is.na</span>(id) <span class="sc">&amp;&amp;</span> id <span class="sc">&gt;=</span> <span class="dv">0</span>) { out <span class="ot">&lt;-</span> <span class="fu">c</span>(out, id); id <span class="ot">&lt;-</span> layers<span class="sc">$</span>parent[layers<span class="sc">$</span>id <span class="sc">==</span> id] }; out }</span>
-<span id="cb10-119"><a href="#cb10-119" aria-hidden="true" tabindex="-1"></a>layers <span class="ot">&lt;-</span> layers <span class="sc">|&gt;</span> <span class="fu">filter</span>(leaf) <span class="sc">|&gt;</span></span>
-<span id="cb10-120"><a href="#cb10-120" aria-hidden="true" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="at">designated =</span> <span class="fu">map_lgl</span>(id, \(i) <span class="dv">0</span> <span class="sc">%in%</span> <span class="fu">ancestors</span>(i)), <span class="at">is_line =</span> <span class="fu">str_detect</span>(name, <span class="st">"_line$"</span>)) <span class="sc">|&gt;</span></span>
-<span id="cb10-121"><a href="#cb10-121" aria-hidden="true" tabindex="-1"></a>  <span class="fu">filter</span>(designated, <span class="sc">!</span>is_line)</span>
-<span id="cb10-122"><a href="#cb10-122" aria-hidden="true" tabindex="-1"></a><span class="fu">log_info</span>(<span class="st">"{nrow(layers)} designated polygon layers on the service"</span>)</span>
-<span id="cb10-123"><a href="#cb10-123" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb10-124"><a href="#cb10-124" aria-hidden="true" tabindex="-1"></a>fetch_layer <span class="ot">&lt;-</span> <span class="cf">function</span>(id, name) {</span>
-<span id="cb10-125"><a href="#cb10-125" aria-hidden="true" tabindex="-1"></a>  f <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{dir_raw_ch}/{name}.gpkg"</span>)</span>
-<span id="cb10-126"><a href="#cb10-126" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="fu">file_exists</span>(f) <span class="sc">&amp;&amp;</span> <span class="sc">!</span>dps_fetch) <span class="fu">return</span>(f)</span>
-<span id="cb10-127"><a href="#cb10-127" aria-hidden="true" tabindex="-1"></a>  feats <span class="ot">&lt;-</span> <span class="fu">list</span>(); off <span class="ot">&lt;-</span> <span class="dv">0</span></span>
-<span id="cb10-128"><a href="#cb10-128" aria-hidden="true" tabindex="-1"></a>  <span class="cf">repeat</span> {</span>
-<span id="cb10-129"><a href="#cb10-129" aria-hidden="true" tabindex="-1"></a>    r <span class="ot">&lt;-</span> <span class="fu">request</span>(<span class="fu">glue</span>(<span class="st">"{svc}/{id}/query"</span>)) <span class="sc">|&gt;</span></span>
-<span id="cb10-130"><a href="#cb10-130" aria-hidden="true" tabindex="-1"></a>      <span class="fu">req_url_query</span>(<span class="at">where =</span> <span class="st">"1=1"</span>, <span class="at">outFields =</span> <span class="st">"*"</span>, <span class="at">outSR =</span> <span class="dv">4326</span>, <span class="at">f =</span> <span class="st">"geojson"</span>,</span>
-<span id="cb10-131"><a href="#cb10-131" aria-hidden="true" tabindex="-1"></a>                    <span class="at">resultOffset =</span> off, <span class="at">resultRecordCount =</span> <span class="dv">2000</span>) <span class="sc">|&gt;</span></span>
-<span id="cb10-132"><a href="#cb10-132" aria-hidden="true" tabindex="-1"></a>      <span class="fu">req_perform</span>() <span class="sc">|&gt;</span> <span class="fu">resp_body_string</span>()</span>
-<span id="cb10-133"><a href="#cb10-133" aria-hidden="true" tabindex="-1"></a>    g <span class="ot">&lt;-</span> sf<span class="sc">::</span><span class="fu">st_read</span>(r, <span class="at">quiet =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb10-134"><a href="#cb10-134" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="sc">!</span><span class="fu">nrow</span>(g)) <span class="cf">break</span></span>
-<span id="cb10-135"><a href="#cb10-135" aria-hidden="true" tabindex="-1"></a>    feats[[<span class="fu">length</span>(feats) <span class="sc">+</span> <span class="dv">1</span>]] <span class="ot">&lt;-</span> g; off <span class="ot">&lt;-</span> off <span class="sc">+</span> <span class="fu">nrow</span>(g)</span>
-<span id="cb10-136"><a href="#cb10-136" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="fu">nrow</span>(g) <span class="sc">&lt;</span> <span class="dv">2000</span>) <span class="cf">break</span></span>
-<span id="cb10-137"><a href="#cb10-137" aria-hidden="true" tabindex="-1"></a>  }</span>
-<span id="cb10-138"><a href="#cb10-138" aria-hidden="true" tabindex="-1"></a>  g <span class="ot">&lt;-</span> <span class="fu">do.call</span>(rbind, feats)</span>
-<span id="cb10-139"><a href="#cb10-139" aria-hidden="true" tabindex="-1"></a>  sf<span class="sc">::</span><span class="fu">st_write</span>(g, f, <span class="at">quiet =</span> <span class="cn">TRUE</span>, <span class="at">delete_dsn =</span> <span class="cn">TRUE</span>); f</span>
-<span id="cb10-140"><a href="#cb10-140" aria-hidden="true" tabindex="-1"></a>}</span>
-<span id="cb10-141"><a href="#cb10-141" aria-hidden="true" tabindex="-1"></a>layers<span class="sc">$</span>gpkg <span class="ot">&lt;-</span> <span class="fu">map2_chr</span>(layers<span class="sc">$</span>id, layers<span class="sc">$</span>name, fetch_layer)</span>
-<span id="cb10-142"><a href="#cb10-142" aria-hidden="true" tabindex="-1"></a>ch <span class="ot">&lt;-</span> <span class="fu">map_dfr</span>(layers<span class="sc">$</span>gpkg, \(f) sf<span class="sc">::</span><span class="fu">st_read</span>(f, <span class="at">quiet =</span> <span class="cn">TRUE</span>) <span class="sc">|&gt;</span></span>
-<span id="cb10-143"><a href="#cb10-143" aria-hidden="true" tabindex="-1"></a>                <span class="fu">select</span>(<span class="fu">any_of</span>(<span class="fu">c</span>(<span class="st">"SCIENAME"</span>, <span class="st">"COMNAME"</span>, <span class="st">"LISTENTITY"</span>, <span class="st">"LISTSTATUS"</span>, <span class="st">"PUBDATE"</span>, <span class="st">"EFFECTDATE"</span>, <span class="st">"FR"</span>, <span class="st">"INPORTURL"</span>))) <span class="sc">|&gt;</span></span>
-<span id="cb10-144"><a href="#cb10-144" aria-hidden="true" tabindex="-1"></a>                <span class="fu">mutate</span>(<span class="at">layer =</span> <span class="fu">path_ext_remove</span>(<span class="fu">path_file</span>(f))))</span>
-<span id="cb10-145"><a href="#cb10-145" aria-hidden="true" tabindex="-1"></a>sf<span class="sc">::</span><span class="fu">st_geometry</span>(ch) <span class="ot">&lt;-</span> <span class="st">"geometry"</span></span>
-<span id="cb10-146"><a href="#cb10-146" aria-hidden="true" tabindex="-1"></a><span class="fu">log_info</span>(<span class="st">"{nrow(ch)} designated critical-habitat polygons, {n_distinct(ch$LISTENTITY)} listed entities, {n_distinct(ch$SCIENAME)} species"</span>)</span>
-<span id="cb10-147"><a href="#cb10-147" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb10-148"><a href="#cb10-148" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb10-149"><a href="#cb10-149" aria-hidden="true" tabindex="-1"></a><span class="fu">## Listed entities scoped below the species</span></span>
-<span id="cb10-150"><a href="#cb10-150" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb10-153"><a href="#cb10-153" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb10-154"><a href="#cb10-154" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: entities</span></span>
-<span id="cb10-155"><a href="#cb10-155" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb10-156"><a href="#cb10-156" aria-hidden="true" tabindex="-1"></a><span class="co"># an entity is DPS/ESU-scoped when its LISTENTITY carries a bracketed segment, or its SCIENAME is a</span></span>
-<span id="cb10-157"><a href="#cb10-157" aria-hidden="true" tabindex="-1"></a><span class="co"># trinomial (subspecies) -- the species-level `listing` already handles whole-species listings</span></span>
-<span id="cb10-158"><a href="#cb10-158" aria-hidden="true" tabindex="-1"></a>ent <span class="ot">&lt;-</span> sf<span class="sc">::</span><span class="fu">st_drop_geometry</span>(ch) <span class="sc">|&gt;</span></span>
-<span id="cb10-159"><a href="#cb10-159" aria-hidden="true" tabindex="-1"></a>  <span class="fu">distinct</span>(SCIENAME, LISTENTITY, LISTSTATUS) <span class="sc">|&gt;</span></span>
-<span id="cb10-160"><a href="#cb10-160" aria-hidden="true" tabindex="-1"></a>  <span class="co"># NOAA writes a synonym in parentheses -- "Phoca (=Pusa) hispida hispida" -- and WoRMS accepts the</span></span>
-<span id="cb10-161"><a href="#cb10-161" aria-hidden="true" tabindex="-1"></a>  <span class="co"># synonym (Pusa hispida); keep both spellings as candidates and match whichever is accepted</span></span>
-<span id="cb10-162"><a href="#cb10-162" aria-hidden="true" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="at">sci_clean =</span> <span class="fu">clean_sci_name</span>(<span class="fu">str_replace_all</span>(SCIENAME, <span class="st">"</span><span class="sc">\\</span><span class="st">(=[^)]*</span><span class="sc">\\</span><span class="st">)</span><span class="sc">\\</span><span class="st">s*"</span>, <span class="st">""</span>)),</span>
-<span id="cb10-163"><a href="#cb10-163" aria-hidden="true" tabindex="-1"></a>         <span class="at">sci_syn   =</span> <span class="fu">if_else</span>(<span class="fu">str_detect</span>(SCIENAME, <span class="st">"</span><span class="sc">\\</span><span class="st">(="</span>),</span>
-<span id="cb10-164"><a href="#cb10-164" aria-hidden="true" tabindex="-1"></a>                             <span class="fu">clean_sci_name</span>(<span class="fu">str_replace</span>(SCIENAME, <span class="st">"^</span><span class="sc">\\</span><span class="st">S+</span><span class="sc">\\</span><span class="st">s+</span><span class="sc">\\</span><span class="st">(=([^)]+)</span><span class="sc">\\</span><span class="st">)"</span>, <span class="st">"</span><span class="sc">\\</span><span class="st">1"</span>)), <span class="cn">NA_character_</span>),</span>
-<span id="cb10-165"><a href="#cb10-165" aria-hidden="true" tabindex="-1"></a>         <span class="at">binomial  =</span> <span class="fu">clean_sci_name</span>(sci_clean, <span class="at">binomial =</span> <span class="cn">TRUE</span>),</span>
-<span id="cb10-166"><a href="#cb10-166" aria-hidden="true" tabindex="-1"></a>         <span class="at">binomial_syn =</span> <span class="fu">if_else</span>(<span class="fu">is.na</span>(sci_syn), <span class="cn">NA_character_</span>, <span class="fu">clean_sci_name</span>(sci_syn, <span class="at">binomial =</span> <span class="cn">TRUE</span>)),</span>
-<span id="cb10-167"><a href="#cb10-167" aria-hidden="true" tabindex="-1"></a>         <span class="at">segment   =</span> <span class="fu">str_match</span>(LISTENTITY, <span class="st">"</span><span class="sc">\\</span><span class="st">[(.+)</span><span class="sc">\\</span><span class="st">]"</span>)[, <span class="dv">2</span>],</span>
-<span id="cb10-168"><a href="#cb10-168" aria-hidden="true" tabindex="-1"></a>         <span class="at">sub_species =</span> <span class="sc">!</span><span class="fu">is.na</span>(segment) <span class="sc">|</span> <span class="fu">str_count</span>(sci_clean, <span class="st">"</span><span class="sc">\\</span><span class="st">S+"</span>) <span class="sc">&gt;=</span> <span class="dv">3</span>,</span>
-<span id="cb10-169"><a href="#cb10-169" aria-hidden="true" tabindex="-1"></a>         <span class="at">status =</span> <span class="fu">case_when</span>(LISTSTATUS <span class="sc">==</span> <span class="st">"Endangered"</span> <span class="sc">~</span> <span class="st">"EN"</span>, LISTSTATUS <span class="sc">==</span> <span class="st">"Threatened"</span> <span class="sc">~</span> <span class="st">"TN"</span>, <span class="cn">TRUE</span> <span class="sc">~</span> <span class="cn">NA_character_</span>)) <span class="sc">|&gt;</span></span>
-<span id="cb10-170"><a href="#cb10-170" aria-hidden="true" tabindex="-1"></a>  <span class="fu">filter</span>(sub_species, <span class="sc">!</span><span class="fu">is.na</span>(status))</span>
-<span id="cb10-171"><a href="#cb10-171" aria-hidden="true" tabindex="-1"></a><span class="co"># sea turtles already carry SWOT + DPS extinction risk (ingest_turtles-swot-dps); do not double up</span></span>
-<span id="cb10-172"><a href="#cb10-172" aria-hidden="true" tabindex="-1"></a>turtle_sci <span class="ot">&lt;-</span> <span class="fu">read_csv</span>(<span class="fu">glue</span>(<span class="st">"{dir_atlas}/dist/model_{turtle_ds}.csv"</span>)) <span class="sc">|&gt;</span></span>
-<span id="cb10-173"><a href="#cb10-173" aria-hidden="true" tabindex="-1"></a>  <span class="fu">pull</span>(<span class="fu">any_of</span>(<span class="fu">c</span>(<span class="st">"scientific_name"</span>, <span class="st">"sci_name"</span>, <span class="st">"taxa"</span>))) <span class="sc">|&gt;</span> <span class="fu">clean_sci_name</span>(<span class="at">binomial =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb10-174"><a href="#cb10-174" aria-hidden="true" tabindex="-1"></a>ent <span class="ot">&lt;-</span> ent <span class="sc">|&gt;</span> <span class="fu">filter</span>(<span class="sc">!</span>binomial <span class="sc">%in%</span> turtle_sci)</span>
-<span id="cb10-175"><a href="#cb10-175" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb10-176"><a href="#cb10-176" aria-hidden="true" tabindex="-1"></a><span class="co"># species -&gt; WoRMS AphiaID (binomial match on the accepted name), class for the MMPA floor</span></span>
-<span id="cb10-177"><a href="#cb10-177" aria-hidden="true" tabindex="-1"></a>con_spp <span class="ot">&lt;-</span> <span class="fu">dbConnect</span>(<span class="fu">duckdb</span>(spp_db, <span class="at">read_only =</span> <span class="cn">TRUE</span>))</span>
-<span id="cb10-178"><a href="#cb10-178" aria-hidden="true" tabindex="-1"></a>cands <span class="ot">&lt;-</span> ent <span class="sc">|&gt;</span> <span class="fu">transmute</span>(binomial, <span class="at">cand =</span> binomial) <span class="sc">|&gt;</span></span>
-<span id="cb10-179"><a href="#cb10-179" aria-hidden="true" tabindex="-1"></a>  <span class="fu">bind_rows</span>(ent <span class="sc">|&gt;</span> <span class="fu">filter</span>(<span class="sc">!</span><span class="fu">is.na</span>(binomial_syn)) <span class="sc">|&gt;</span> <span class="fu">transmute</span>(binomial, <span class="at">cand =</span> binomial_syn)) <span class="sc">|&gt;</span> <span class="fu">distinct</span>()</span>
-<span id="cb10-180"><a href="#cb10-180" aria-hidden="true" tabindex="-1"></a><span class="fu">duckdb_register</span>(con_spp, <span class="st">"want"</span>, cands)</span>
-<span id="cb10-181"><a href="#cb10-181" aria-hidden="true" tabindex="-1"></a>wx <span class="ot">&lt;-</span> <span class="fu">dbGetQuery</span>(con_spp, <span class="st">"</span></span>
-<span id="cb10-182"><a href="#cb10-182" aria-hidden="true" tabindex="-1"></a><span class="st">  SELECT w.binomial, w.cand, CAST(x.scientificNameID AS VARCHAR) AS worms_id, x.</span><span class="sc">\"</span><span class="st">class</span><span class="sc">\"</span><span class="st"> AS cls</span></span>
-<span id="cb10-183"><a href="#cb10-183" aria-hidden="true" tabindex="-1"></a><span class="st">  FROM want w JOIN spp.worms x ON x.scientificName = w.cand</span></span>
-<span id="cb10-184"><a href="#cb10-184" aria-hidden="true" tabindex="-1"></a><span class="st">  WHERE x.taxonomicStatus = 'accepted'"</span>) <span class="sc">|&gt;</span></span>
-<span id="cb10-185"><a href="#cb10-185" aria-hidden="true" tabindex="-1"></a>  <span class="fu">arrange</span>(binomial, cand <span class="sc">!=</span> binomial) <span class="sc">|&gt;</span> <span class="fu">distinct</span>(binomial, <span class="at">.keep_all =</span> <span class="cn">TRUE</span>) <span class="sc">|&gt;</span></span>
-<span id="cb10-186"><a href="#cb10-186" aria-hidden="true" tabindex="-1"></a>  <span class="fu">transmute</span>(binomial, worms_id, cls, <span class="at">worms_name =</span> cand)</span>
-<span id="cb10-187"><a href="#cb10-187" aria-hidden="true" tabindex="-1"></a><span class="fu">dbDisconnect</span>(con_spp, <span class="at">shutdown =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb10-188"><a href="#cb10-188" aria-hidden="true" tabindex="-1"></a>ent <span class="ot">&lt;-</span> ent <span class="sc">|&gt;</span> <span class="fu">left_join</span>(wx, <span class="at">by =</span> <span class="st">"binomial"</span>) <span class="sc">|&gt;</span> <span class="fu">mutate</span>(<span class="at">is_mmpa =</span> <span class="fu">coalesce</span>(cls <span class="sc">==</span> <span class="st">"Mammalia"</span>, <span class="cn">FALSE</span>))</span>
-<span id="cb10-189"><a href="#cb10-189" aria-hidden="true" tabindex="-1"></a>unres <span class="ot">&lt;-</span> ent <span class="sc">|&gt;</span> <span class="fu">filter</span>(<span class="fu">is.na</span>(worms_id)) <span class="sc">|&gt;</span> <span class="fu">distinct</span>(SCIENAME)</span>
-<span id="cb10-190"><a href="#cb10-190" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (<span class="fu">nrow</span>(unres)) <span class="fu">log_warn</span>(<span class="st">"no accepted WoRMS name for: {paste(unres$SCIENAME, collapse = '; ')}"</span>)</span>
-<span id="cb10-191"><a href="#cb10-191" aria-hidden="true" tabindex="-1"></a>ent <span class="ot">&lt;-</span> ent <span class="sc">|&gt;</span> <span class="fu">filter</span>(<span class="sc">!</span><span class="fu">is.na</span>(worms_id))</span>
-<span id="cb10-192"><a href="#cb10-192" aria-hidden="true" tabindex="-1"></a><span class="fu">kable</span>(ent <span class="sc">|&gt;</span> <span class="fu">count</span>(binomial, worms_id, is_mmpa, <span class="at">name =</span> <span class="st">"n_entities"</span>) <span class="sc">|&gt;</span> <span class="fu">arrange</span>(binomial),</span>
-<span id="cb10-193"><a href="#cb10-193" aria-hidden="true" tabindex="-1"></a>      <span class="at">caption =</span> <span class="st">"Species with listed entities below species level (sea turtles excluded — already spatial)"</span>)</span>
-<span id="cb10-194"><a href="#cb10-194" aria-hidden="true" tabindex="-1"></a><span class="fu">kable</span>(ent <span class="sc">|&gt;</span> <span class="fu">transmute</span>(<span class="at">species =</span> binomial, <span class="at">entity =</span> LISTENTITY, status) <span class="sc">|&gt;</span> <span class="fu">arrange</span>(species, entity),</span>
-<span id="cb10-195"><a href="#cb10-195" aria-hidden="true" tabindex="-1"></a>      <span class="at">caption =</span> <span class="st">"Listed entities taken from the service, with the status their polygons carry"</span>)</span>
-<span id="cb10-196"><a href="#cb10-196" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb10-197"><a href="#cb10-197" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb10-198"><a href="#cb10-198" aria-hidden="true" tabindex="-1"></a><span class="fu">## Baseline: the species' IUCN range at its IUCN status (+ MMPA)</span></span>
-<span id="cb10-199"><a href="#cb10-199" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb10-202"><a href="#cb10-202" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb10-203"><a href="#cb10-203" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: baseline</span></span>
-<span id="cb10-204"><a href="#cb10-204" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb10-205"><a href="#cb10-205" aria-hidden="true" tabindex="-1"></a><span class="co"># IUCN range model per species: model_rng_iucn.csv keys models by IUCN id_no + sci_name</span></span>
-<span id="cb10-206"><a href="#cb10-206" aria-hidden="true" tabindex="-1"></a>iucn_m <span class="ot">&lt;-</span> <span class="fu">read_csv</span>(<span class="fu">glue</span>(<span class="st">"{dir_atlas}/dist/model_rng_iucn.csv"</span>)) <span class="sc">|&gt;</span></span>
-<span id="cb10-207"><a href="#cb10-207" aria-hidden="true" tabindex="-1"></a>  <span class="fu">transmute</span>(mdl_key, <span class="at">sci =</span> <span class="fu">clean_sci_name</span>(sci_name, <span class="at">binomial =</span> <span class="cn">TRUE</span>), category) <span class="sc">|&gt;</span></span>
-<span id="cb10-208"><a href="#cb10-208" aria-hidden="true" tabindex="-1"></a>  <span class="fu">distinct</span>(sci, <span class="at">.keep_all =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb10-209"><a href="#cb10-209" aria-hidden="true" tabindex="-1"></a>sp <span class="ot">&lt;-</span> ent <span class="sc">|&gt;</span> <span class="fu">distinct</span>(binomial, worms_id, is_mmpa, worms_name) <span class="sc">|&gt;</span></span>
-<span id="cb10-210"><a href="#cb10-210" aria-hidden="true" tabindex="-1"></a>  <span class="fu">left_join</span>(iucn_m, <span class="at">by =</span> <span class="fu">c</span>(<span class="st">"binomial"</span> <span class="ot">=</span> <span class="st">"sci"</span>)) <span class="sc">|&gt;</span></span>
-<span id="cb10-211"><a href="#cb10-211" aria-hidden="true" tabindex="-1"></a>  <span class="fu">left_join</span>(iucn_m <span class="sc">|&gt;</span> <span class="fu">rename</span>(<span class="at">mdl_key2 =</span> mdl_key, <span class="at">category2 =</span> category), <span class="at">by =</span> <span class="fu">c</span>(<span class="st">"worms_name"</span> <span class="ot">=</span> <span class="st">"sci"</span>)) <span class="sc">|&gt;</span></span>
-<span id="cb10-212"><a href="#cb10-212" aria-hidden="true" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="at">mdl_key =</span> <span class="fu">coalesce</span>(mdl_key, mdl_key2), <span class="at">category =</span> <span class="fu">coalesce</span>(category, category2)) <span class="sc">|&gt;</span> <span class="fu">select</span>(<span class="sc">-</span>mdl_key2, <span class="sc">-</span>category2) <span class="sc">|&gt;</span></span>
-<span id="cb10-213"><a href="#cb10-213" aria-hidden="true" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="at">iucn_code =</span> <span class="fu">if_else</span>(<span class="sc">!</span><span class="fu">is.na</span>(category) <span class="sc">&amp;</span> category <span class="sc">%in%</span> <span class="fu">c</span>(<span class="st">"CR"</span>,<span class="st">"EN"</span>,<span class="st">"VU"</span>,<span class="st">"NT"</span>,<span class="st">"LC"</span>,<span class="st">"DD"</span>),</span>
-<span id="cb10-214"><a href="#cb10-214" aria-hidden="true" tabindex="-1"></a>                             <span class="fu">paste0</span>(<span class="st">"IUCN:"</span>, category), <span class="cn">NA_character_</span>),</span>
-<span id="cb10-215"><a href="#cb10-215" aria-hidden="true" tabindex="-1"></a>         <span class="at">er_base =</span> <span class="fu">if_else</span>(<span class="sc">!</span><span class="fu">is.na</span>(iucn_code), <span class="fu">compute_er_score</span>(iucn_code, <span class="at">is_mmpa =</span> is_mmpa),</span>
-<span id="cb10-216"><a href="#cb10-216" aria-hidden="true" tabindex="-1"></a>                           <span class="fu">if_else</span>(is_mmpa, <span class="fu">compute_er_score</span>(<span class="st">"IUCN:LC"</span>, <span class="at">is_mmpa =</span> <span class="cn">TRUE</span>), <span class="dv">1</span>L)),</span>
-<span id="cb10-217"><a href="#cb10-217" aria-hidden="true" tabindex="-1"></a>         <span class="at">iucn_file =</span> <span class="fu">if_else</span>(<span class="sc">!</span><span class="fu">is.na</span>(mdl_key), <span class="fu">glue</span>(<span class="st">"{dir_iucn}/{str_remove(mdl_key, '^rng_iucn</span><span class="sc">\\\\</span><span class="st">|')}.parquet"</span>), <span class="cn">NA_character_</span>),</span>
-<span id="cb10-218"><a href="#cb10-218" aria-hidden="true" tabindex="-1"></a>         <span class="at">has_iucn =</span> <span class="sc">!</span><span class="fu">is.na</span>(iucn_file) <span class="sc">&amp;</span> <span class="fu">file_exists</span>(<span class="fu">coalesce</span>(iucn_file, <span class="st">""</span>)),</span>
-<span id="cb10-219"><a href="#cb10-219" aria-hidden="true" tabindex="-1"></a>         <span class="at">mdl_key_dps =</span> msens<span class="sc">::</span><span class="fu">mdl_key_raw</span>(ds_key, worms_id))</span>
-<span id="cb10-220"><a href="#cb10-220" aria-hidden="true" tabindex="-1"></a><span class="fu">kable</span>(sp <span class="sc">|&gt;</span> <span class="fu">select</span>(binomial, worms_id, iucn_code, is_mmpa, er_base, has_iucn),</span>
-<span id="cb10-221"><a href="#cb10-221" aria-hidden="true" tabindex="-1"></a>      <span class="at">caption =</span> <span class="st">"Baseline extinction risk outside listed entities (IUCN category + MMPA floor); species without an IUCN range get the entity polygons only"</span>)</span>
-<span id="cb10-222"><a href="#cb10-222" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb10-223"><a href="#cb10-223" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb10-224"><a href="#cb10-224" aria-hidden="true" tabindex="-1"></a><span class="fu">## Per-cell ER surface → one Parquet per species</span></span>
-<span id="cb10-225"><a href="#cb10-225" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb10-228"><a href="#cb10-228" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb10-229"><a href="#cb10-229" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: build</span></span>
-<span id="cb10-230"><a href="#cb10-230" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb10-231"><a href="#cb10-231" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> (i <span class="cf">in</span> <span class="fu">seq_len</span>(<span class="fu">nrow</span>(sp))) {</span>
-<span id="cb10-232"><a href="#cb10-232" aria-hidden="true" tabindex="-1"></a>  s <span class="ot">&lt;-</span> sp[i, ]; out <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{dir_dist}/{s$worms_id}.parquet"</span>)</span>
-<span id="cb10-233"><a href="#cb10-233" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="fu">file_exists</span>(out) <span class="sc">&amp;&amp;</span> <span class="sc">!</span>redo_ingest) <span class="cf">next</span></span>
-<span id="cb10-234"><a href="#cb10-234" aria-hidden="true" tabindex="-1"></a>  <span class="co"># listed-entity polygons at their status (max where entities overlap)</span></span>
-<span id="cb10-235"><a href="#cb10-235" aria-hidden="true" tabindex="-1"></a>  e_sp <span class="ot">&lt;-</span> ent <span class="sc">|&gt;</span> <span class="fu">filter</span>(worms_id <span class="sc">==</span> s<span class="sc">$</span>worms_id)</span>
-<span id="cb10-236"><a href="#cb10-236" aria-hidden="true" tabindex="-1"></a>  cells_ent <span class="ot">&lt;-</span> <span class="fu">map_dfr</span>(<span class="fu">seq_len</span>(<span class="fu">nrow</span>(e_sp)), \(j) {</span>
-<span id="cb10-237"><a href="#cb10-237" aria-hidden="true" tabindex="-1"></a>    g <span class="ot">&lt;-</span> ch <span class="sc">|&gt;</span> <span class="fu">filter</span>(SCIENAME <span class="sc">==</span> e_sp<span class="sc">$</span>SCIENAME[j], LISTENTITY <span class="sc">==</span> e_sp<span class="sc">$</span>LISTENTITY[j])</span>
-<span id="cb10-238"><a href="#cb10-238" aria-hidden="true" tabindex="-1"></a>    v <span class="ot">&lt;-</span> <span class="fu">compute_er_score</span>(<span class="fu">paste0</span>(<span class="st">"NMFS:"</span>, e_sp<span class="sc">$</span>status[j]), <span class="at">is_mmpa =</span> s<span class="sc">$</span>is_mmpa)</span>
-<span id="cb10-239"><a href="#cb10-239" aria-hidden="true" tabindex="-1"></a>    msens<span class="sc">::</span><span class="fu">cells_from_ranges</span>(g, cellid_tif, <span class="at">value =</span> v) <span class="sc">|&gt;</span> <span class="fu">mutate</span>(<span class="at">entity =</span> e_sp<span class="sc">$</span>LISTENTITY[j])</span>
-<span id="cb10-240"><a href="#cb10-240" aria-hidden="true" tabindex="-1"></a>  })</span>
-<span id="cb10-241"><a href="#cb10-241" aria-hidden="true" tabindex="-1"></a>  <span class="co"># baseline over the IUCN range</span></span>
-<span id="cb10-242"><a href="#cb10-242" aria-hidden="true" tabindex="-1"></a>  cells_base <span class="ot">&lt;-</span> <span class="cf">if</span> (s<span class="sc">$</span>has_iucn) arrow<span class="sc">::</span><span class="fu">read_parquet</span>(s<span class="sc">$</span>iucn_file) <span class="sc">|&gt;</span> <span class="fu">transmute</span>(cell_id, <span class="at">val =</span> <span class="fu">as.double</span>(s<span class="sc">$</span>er_base)) <span class="cf">else</span> <span class="fu">tibble</span>(<span class="at">cell_id =</span> <span class="fu">integer</span>(), <span class="at">val =</span> <span class="fu">double</span>())</span>
-<span id="cb10-243"><a href="#cb10-243" aria-hidden="true" tabindex="-1"></a>  d <span class="ot">&lt;-</span> <span class="fu">bind_rows</span>(cells_ent <span class="sc">|&gt;</span> <span class="fu">select</span>(cell_id, val), cells_base) <span class="sc">|&gt;</span></span>
-<span id="cb10-244"><a href="#cb10-244" aria-hidden="true" tabindex="-1"></a>    <span class="fu">group_by</span>(cell_id) <span class="sc">|&gt;</span> <span class="fu">summarise</span>(<span class="at">val =</span> <span class="fu">max</span>(val), <span class="at">.groups =</span> <span class="st">"drop"</span>)</span>
-<span id="cb10-245"><a href="#cb10-245" aria-hidden="true" tabindex="-1"></a>  msens<span class="sc">::</span><span class="fu">write_atlas_parquet</span>(<span class="fu">tibble</span>(<span class="at">mdl_key =</span> <span class="fu">as.character</span>(s<span class="sc">$</span>mdl_key_dps), <span class="at">cell_id =</span> <span class="fu">as.integer</span>(d<span class="sc">$</span>cell_id), <span class="at">val =</span> d<span class="sc">$</span>val), out)</span>
-<span id="cb10-246"><a href="#cb10-246" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"{s$binomial}: {nrow(cells_ent)} entity cells over {nrow(e_sp)} entities + {nrow(cells_base)} baseline cells -&gt; {nrow(d)} cells"</span>)</span>
-<span id="cb10-247"><a href="#cb10-247" aria-hidden="true" tabindex="-1"></a>}</span>
-<span id="cb10-248"><a href="#cb10-248" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb10-249"><a href="#cb10-249" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb10-250"><a href="#cb10-250" aria-hidden="true" tabindex="-1"></a><span class="fu">## Model registry, verify, manifest</span></span>
-<span id="cb10-251"><a href="#cb10-251" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb10-254"><a href="#cb10-254" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb10-255"><a href="#cb10-255" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: registry</span></span>
-<span id="cb10-256"><a href="#cb10-256" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb10-257"><a href="#cb10-257" aria-hidden="true" tabindex="-1"></a>con <span class="ot">&lt;-</span> <span class="fu">dbConnect</span>(<span class="fu">duckdb</span>())</span>
-<span id="cb10-258"><a href="#cb10-258" aria-hidden="true" tabindex="-1"></a>smry <span class="ot">&lt;-</span> <span class="fu">dbGetQuery</span>(con, <span class="fu">glue</span>(<span class="st">"</span></span>
-<span id="cb10-259"><a href="#cb10-259" aria-hidden="true" tabindex="-1"></a><span class="st">  SELECT mdl_key, count(*) n_cells, min(val) v_min, max(val) v_max,</span></span>
-<span id="cb10-260"><a href="#cb10-260" aria-hidden="true" tabindex="-1"></a><span class="st">         count(*) FILTER (WHERE val &gt;= 100) n_en, count(*) FILTER (WHERE val &gt;= 50 AND val &lt; 100) n_tn</span></span>
-<span id="cb10-261"><a href="#cb10-261" aria-hidden="true" tabindex="-1"></a><span class="st">  FROM read_parquet('{dir_dist}/*.parquet') GROUP BY 1 ORDER BY 1"</span>))</span>
-<span id="cb10-262"><a href="#cb10-262" aria-hidden="true" tabindex="-1"></a>model <span class="ot">&lt;-</span> sp <span class="sc">|&gt;</span></span>
-<span id="cb10-263"><a href="#cb10-263" aria-hidden="true" tabindex="-1"></a>  <span class="fu">transmute</span>(<span class="at">mdl_key =</span> mdl_key_dps, <span class="at">sp_id =</span> worms_id, worms_id, <span class="at">scientific_name =</span> binomial, is_mmpa, iucn_code, er_base,</span>
-<span id="cb10-264"><a href="#cb10-264" aria-hidden="true" tabindex="-1"></a>            <span class="at">er_code =</span> <span class="st">"NMFS:DPS"</span>, <span class="at">er_score =</span> <span class="cn">NA_integer_</span>,   <span class="co"># per-cell: see val; the merge multiplies it by suitability</span></span>
-<span id="cb10-265"><a href="#cb10-265" aria-hidden="true" tabindex="-1"></a>            <span class="at">entities =</span> <span class="fu">map_chr</span>(worms_id, \(w) <span class="fu">paste</span>(ent<span class="sc">$</span>LISTENTITY[ent<span class="sc">$</span>worms_id <span class="sc">==</span> w], <span class="at">collapse =</span> <span class="st">" | "</span>)),</span>
-<span id="cb10-266"><a href="#cb10-266" aria-hidden="true" tabindex="-1"></a>            <span class="at">statuses =</span> <span class="fu">map_chr</span>(worms_id, \(w) <span class="fu">paste</span>(ent<span class="sc">$</span>status[ent<span class="sc">$</span>worms_id <span class="sc">==</span> w], <span class="at">collapse =</span> <span class="st">"|"</span>)),</span>
-<span id="cb10-267"><a href="#cb10-267" aria-hidden="true" tabindex="-1"></a>            <span class="at">has_iucn_baseline =</span> has_iucn) <span class="sc">|&gt;</span></span>
-<span id="cb10-268"><a href="#cb10-268" aria-hidden="true" tabindex="-1"></a>  <span class="fu">left_join</span>(smry, <span class="at">by =</span> <span class="st">"mdl_key"</span>)</span>
-<span id="cb10-269"><a href="#cb10-269" aria-hidden="true" tabindex="-1"></a><span class="fu">write_csv</span>(model, mdl_csv)</span>
-<span id="cb10-270"><a href="#cb10-270" aria-hidden="true" tabindex="-1"></a><span class="fu">kable</span>(model <span class="sc">|&gt;</span> <span class="fu">select</span>(scientific_name, worms_id, statuses, er_base, n_cells, n_en, n_tn, v_min, v_max),</span>
-<span id="cb10-271"><a href="#cb10-271" aria-hidden="true" tabindex="-1"></a>      <span class="at">caption =</span> <span class="st">"dps_nmfs models: per-cell ER surfaces (n_en / n_tn = cells at EN / TN)"</span>)</span>
-<span id="cb10-272"><a href="#cb10-272" aria-hidden="true" tabindex="-1"></a><span class="fu">stopifnot</span>(<span class="st">"every model must carry at least one listed-entity cell"</span> <span class="ot">=</span> <span class="fu">all</span>(model<span class="sc">$</span>n_en <span class="sc">+</span> model<span class="sc">$</span>n_tn <span class="sc">&gt;</span> <span class="dv">0</span>),</span>
-<span id="cb10-273"><a href="#cb10-273" aria-hidden="true" tabindex="-1"></a>          <span class="st">"ER values must be compute_er_score() outputs in [1, 100]"</span> <span class="ot">=</span> <span class="fu">all</span>(model<span class="sc">$</span>v_min <span class="sc">&gt;=</span> <span class="dv">1</span> <span class="sc">&amp;</span> model<span class="sc">$</span>v_max <span class="sc">&lt;=</span> <span class="dv">100</span>))</span>
-<span id="cb10-274"><a href="#cb10-274" aria-hidden="true" tabindex="-1"></a>h <span class="ot">&lt;-</span> msens<span class="sc">::</span><span class="fu">hash_parquet</span>(<span class="fu">glue</span>(<span class="st">"{dir_dist}/*.parquet"</span>), con)</span>
-<span id="cb10-275"><a href="#cb10-275" aria-hidden="true" tabindex="-1"></a><span class="fu">dbDisconnect</span>(con, <span class="at">shutdown =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb10-276"><a href="#cb10-276" aria-hidden="true" tabindex="-1"></a>msens<span class="sc">::</span><span class="fu">write_manifest</span>(</span>
-<span id="cb10-277"><a href="#cb10-277" aria-hidden="true" tabindex="-1"></a>  manifest, <span class="at">target =</span> <span class="st">"ingest_dps_nmfs"</span>, <span class="at">content_hash =</span> h,</span>
-<span id="cb10-278"><a href="#cb10-278" aria-hidden="true" tabindex="-1"></a>  <span class="at">stats =</span> <span class="fu">list</span>(<span class="at">ds_key =</span> ds_key, <span class="at">ver =</span> ver, <span class="at">n_species =</span> <span class="fu">nrow</span>(model), <span class="at">n_entities =</span> <span class="fu">nrow</span>(ent),</span>
-<span id="cb10-279"><a href="#cb10-279" aria-hidden="true" tabindex="-1"></a>               <span class="at">n_cells =</span> <span class="fu">sum</span>(model<span class="sc">$</span>n_cells), <span class="at">n_layers =</span> <span class="fu">nrow</span>(layers), <span class="at">source =</span> svc),</span>
-<span id="cb10-280"><a href="#cb10-280" aria-hidden="true" tabindex="-1"></a>  <span class="at">force =</span> msens<span class="sc">::</span><span class="fu">force_target</span>(<span class="st">"ingest_dps_nmfs"</span>))</span>
-<span id="cb10-281"><a href="#cb10-281" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb10-56"><a href="#cb10-56" aria-hidden="true" tabindex="-1"></a>Flags: <span class="in">`REDO_INGEST`</span> (rebuild the Parquet), <span class="in">`DPS_FETCH=1`</span> (re-download the service layers into</span>
+<span id="cb10-57"><a href="#cb10-57" aria-hidden="true" tabindex="-1"></a><span class="in">`raw/fisheries.noaa.gov/All_NMFS_Critical_Habitat/`</span> — otherwise the cached snapshot is used).</span>
+<span id="cb10-58"><a href="#cb10-58" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-59"><a href="#cb10-59" aria-hidden="true" tabindex="-1"></a><span class="fu">## Design</span></span>
+<span id="cb10-60"><a href="#cb10-60" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-63"><a href="#cb10-63" aria-hidden="true" tabindex="-1"></a><span class="in">```{mermaid}</span></span>
+<span id="cb10-64"><a href="#cb10-64" aria-hidden="true" tabindex="-1"></a>%%| label: fig-design</span>
+<span id="cb10-65"><a href="#cb10-65" aria-hidden="true" tabindex="-1"></a>%%| fig-cap: <span class="ot">"</span><span class="st">Listed entities below species level → their critical habitat at their status, the IUCN range at the baseline → one per-cell ER surface per species</span><span class="ot">"</span></span>
+<span id="cb10-66"><a href="#cb10-66" aria-hidden="true" tabindex="-1"></a>flowchart LR</span>
+<span id="cb10-67"><a href="#cb10-67" aria-hidden="true" tabindex="-1"></a>  svc[<span class="ot">"</span><span class="st">NMFS All_NMFS_Critical_Habitat&lt;br/&gt;MapServer (leaf polygon layers)</span><span class="ot">"</span>] --&gt;|<span class="ot">"</span><span class="st">DPS_FETCH=1 → raw/ gpkg</span><span class="ot">"</span>| ent[<span class="ot">"</span><span class="st">listed entities scoped&lt;br/&gt;below species (DPS / ESU / ssp.)</span><span class="ot">"</span>]</span>
+<span id="cb10-68"><a href="#cb10-68" aria-hidden="true" tabindex="-1"></a>  ent --&gt; ch[<span class="ot">"</span><span class="st">cells_from_ranges(value = compute_er_score(NMFS:status, is_mmpa))</span><span class="ot">"</span>]</span>
+<span id="cb10-69"><a href="#cb10-69" aria-hidden="true" tabindex="-1"></a>  iucn[<span class="ot">"</span><span class="st">dist/dataset=rng_iucn&lt;br/&gt;(species' IUCN range)</span><span class="ot">"</span>] --&gt; base[<span class="ot">"</span><span class="st">baseline = compute_er_score(IUCN:cat, is_mmpa)</span><span class="ot">"</span>]</span>
+<span id="cb10-70"><a href="#cb10-70" aria-hidden="true" tabindex="-1"></a>  ch &amp; base --&gt; mx[<span class="ot">"</span><span class="st">max per cell</span><span class="ot">"</span>]</span>
+<span id="cb10-71"><a href="#cb10-71" aria-hidden="true" tabindex="-1"></a>  mx --&gt; pq[(<span class="ot">"</span><span class="st">dist/dataset=dps_nmfs/{worms_id}.parquet&lt;br/&gt;(mdl_key, cell_id, val)</span><span class="ot">"</span>)]</span>
+<span id="cb10-72"><a href="#cb10-72" aria-hidden="true" tabindex="-1"></a>  pq --&gt; mf[<span class="ot">"</span><span class="st">hash_parquet → manifest</span><span class="ot">"</span>]</span>
+<span id="cb10-73"><a href="#cb10-73" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb10-74"><a href="#cb10-74" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-75"><a href="#cb10-75" aria-hidden="true" tabindex="-1"></a><span class="fu">## Setup</span></span>
+<span id="cb10-76"><a href="#cb10-76" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-79"><a href="#cb10-79" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb10-80"><a href="#cb10-80" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: setup</span></span>
+<span id="cb10-81"><a href="#cb10-81" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-82"><a href="#cb10-82" aria-hidden="true" tabindex="-1"></a>librarian<span class="sc">::</span><span class="fu">shelf</span>(DBI, dplyr, duckdb, fs, glue, here, httr2, jsonlite, knitr, logger, purrr, readr,</span>
+<span id="cb10-83"><a href="#cb10-83" aria-hidden="true" tabindex="-1"></a>                 sf, stringr, terra, tibble, tidyr, MarineSensitivity<span class="sc">/</span>msens, <span class="at">quiet =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb10-84"><a href="#cb10-84" aria-hidden="true" tabindex="-1"></a><span class="fu">source</span>(<span class="fu">here</span>(<span class="st">"libs/paths.R"</span>)); <span class="fu">source</span>(<span class="fu">here</span>(<span class="st">"libs/vars.R"</span>))</span>
+<span id="cb10-85"><a href="#cb10-85" aria-hidden="true" tabindex="-1"></a><span class="fu">options</span>(<span class="at">readr.show_col_types =</span> <span class="cn">FALSE</span>)</span>
+<span id="cb10-86"><a href="#cb10-86" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-87"><a href="#cb10-87" aria-hidden="true" tabindex="-1"></a>ds_key   <span class="ot">&lt;-</span> <span class="st">"dps_nmfs"</span></span>
+<span id="cb10-88"><a href="#cb10-88" aria-hidden="true" tabindex="-1"></a>svc      <span class="ot">&lt;-</span> <span class="st">"https://maps.fisheries.noaa.gov/server/rest/services/All_NMFS_Critical_Habitat/MapServer"</span></span>
+<span id="cb10-89"><a href="#cb10-89" aria-hidden="true" tabindex="-1"></a>dir_raw_ch <span class="ot">&lt;-</span> <span class="fu">path.expand</span>(<span class="fu">glue</span>(<span class="st">"{dir_raw}/fisheries.noaa.gov/All_NMFS_Critical_Habitat"</span>)); <span class="fu">dir_create</span>(dir_raw_ch)</span>
+<span id="cb10-90"><a href="#cb10-90" aria-hidden="true" tabindex="-1"></a>dir_atlas  <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{dir_big_v}/marine-atlas"</span>)</span>
+<span id="cb10-91"><a href="#cb10-91" aria-hidden="true" tabindex="-1"></a>dir_dist   <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{dir_atlas}/dist/dataset={ds_key}"</span>); <span class="fu">dir_create</span>(dir_dist)</span>
+<span id="cb10-92"><a href="#cb10-92" aria-hidden="true" tabindex="-1"></a>dir_iucn   <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{dir_atlas}/dist/dataset=rng_iucn"</span>)</span>
+<span id="cb10-93"><a href="#cb10-93" aria-hidden="true" tabindex="-1"></a>mdl_csv    <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{dir_atlas}/dist/model_{ds_key}.csv"</span>)</span>
+<span id="cb10-94"><a href="#cb10-94" aria-hidden="true" tabindex="-1"></a>manifest   <span class="ot">&lt;-</span> <span class="fu">here</span>(<span class="st">"data/manifests/ingest_dps_nmfs.json"</span>); <span class="fu">dir_create</span>(<span class="fu">path_dir</span>(manifest))</span>
+<span id="cb10-95"><a href="#cb10-95" aria-hidden="true" tabindex="-1"></a>turtle_ds  <span class="ot">&lt;-</span> <span class="st">"rng_turtle_swot_dps"</span></span>
+<span id="cb10-96"><a href="#cb10-96" aria-hidden="true" tabindex="-1"></a>dps_fetch  <span class="ot">&lt;-</span> <span class="fu">.flag</span>(<span class="st">"DPS_FETCH"</span>)</span>
+<span id="cb10-97"><a href="#cb10-97" aria-hidden="true" tabindex="-1"></a><span class="fu">stopifnot</span>(<span class="st">"run build_cell_grid first"</span> <span class="ot">=</span> <span class="fu">file_exists</span>(cellid_tif),</span>
+<span id="cb10-98"><a href="#cb10-98" aria-hidden="true" tabindex="-1"></a>          <span class="st">"run ingest_rng_iucn first (the baseline footprint)"</span> <span class="ot">=</span> <span class="fu">dir_exists</span>(dir_iucn),</span>
+<span id="cb10-99"><a href="#cb10-99" aria-hidden="true" tabindex="-1"></a>          <span class="st">"spp.duckdb (WoRMS) missing"</span> <span class="ot">=</span> <span class="fu">file_exists</span>(spp_db))</span>
+<span id="cb10-100"><a href="#cb10-100" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (redo_ingest <span class="sc">&amp;&amp;</span> <span class="fu">dir_exists</span>(dir_dist)) { <span class="fu">dir_delete</span>(dir_dist); <span class="fu">dir_create</span>(dir_dist) }</span>
+<span id="cb10-101"><a href="#cb10-101" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb10-102"><a href="#cb10-102" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-103"><a href="#cb10-103" aria-hidden="true" tabindex="-1"></a><span class="fu">## Fetch the service (cached snapshot in `raw/`)</span></span>
+<span id="cb10-104"><a href="#cb10-104" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-105"><a href="#cb10-105" aria-hidden="true" tabindex="-1"></a>Every leaf **polygon** layer under *Designated Critical Habitat* (lines and *Proposed* are</span>
+<span id="cb10-106"><a href="#cb10-106" aria-hidden="true" tabindex="-1"></a>skipped), paged through <span class="in">`resultOffset`</span>, written once as GeoPackage with the service's layer</span>
+<span id="cb10-107"><a href="#cb10-107" aria-hidden="true" tabindex="-1"></a>name — which carries the designation date — so the snapshot is versioned by NOAA's own naming.</span>
+<span id="cb10-108"><a href="#cb10-108" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-111"><a href="#cb10-111" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb10-112"><a href="#cb10-112" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: fetch</span></span>
+<span id="cb10-113"><a href="#cb10-113" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-114"><a href="#cb10-114" aria-hidden="true" tabindex="-1"></a>svc_json <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{dir_raw_ch}/service.json"</span>)</span>
+<span id="cb10-115"><a href="#cb10-115" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (dps_fetch <span class="sc">||</span> <span class="sc">!</span><span class="fu">file_exists</span>(svc_json))</span>
+<span id="cb10-116"><a href="#cb10-116" aria-hidden="true" tabindex="-1"></a>  <span class="fu">request</span>(<span class="fu">glue</span>(<span class="st">"{svc}?f=json"</span>)) <span class="sc">|&gt;</span> <span class="fu">req_perform</span>() <span class="sc">|&gt;</span> <span class="fu">resp_body_string</span>() <span class="sc">|&gt;</span> <span class="fu">writeLines</span>(svc_json)</span>
+<span id="cb10-117"><a href="#cb10-117" aria-hidden="true" tabindex="-1"></a>meta   <span class="ot">&lt;-</span> <span class="fu">fromJSON</span>(svc_json, <span class="at">simplifyVector =</span> <span class="cn">FALSE</span>)</span>
+<span id="cb10-118"><a href="#cb10-118" aria-hidden="true" tabindex="-1"></a>layers <span class="ot">&lt;-</span> <span class="fu">map_dfr</span>(meta<span class="sc">$</span>layers, \(l) <span class="fu">tibble</span>(<span class="at">id =</span> l<span class="sc">$</span>id, <span class="at">name =</span> l<span class="sc">$</span>name, <span class="at">parent =</span> l<span class="sc">$</span>parentLayerId <span class="sc">%||%</span> <span class="cn">NA</span>,</span>
+<span id="cb10-119"><a href="#cb10-119" aria-hidden="true" tabindex="-1"></a>                                            <span class="at">leaf =</span> <span class="fu">is.null</span>(l<span class="sc">$</span>subLayerIds)))</span>
+<span id="cb10-120"><a href="#cb10-120" aria-hidden="true" tabindex="-1"></a><span class="co"># leaf polygon layers under "Designated Critical Habitat" (id 0): walk parents up to 0, not 71 (Proposed)</span></span>
+<span id="cb10-121"><a href="#cb10-121" aria-hidden="true" tabindex="-1"></a>ancestors <span class="ot">&lt;-</span> <span class="cf">function</span>(id) { out <span class="ot">&lt;-</span> <span class="fu">c</span>(); <span class="cf">while</span> (<span class="sc">!</span><span class="fu">is.na</span>(id) <span class="sc">&amp;&amp;</span> id <span class="sc">&gt;=</span> <span class="dv">0</span>) { out <span class="ot">&lt;-</span> <span class="fu">c</span>(out, id); id <span class="ot">&lt;-</span> layers<span class="sc">$</span>parent[layers<span class="sc">$</span>id <span class="sc">==</span> id] }; out }</span>
+<span id="cb10-122"><a href="#cb10-122" aria-hidden="true" tabindex="-1"></a>layers <span class="ot">&lt;-</span> layers <span class="sc">|&gt;</span> <span class="fu">filter</span>(leaf) <span class="sc">|&gt;</span></span>
+<span id="cb10-123"><a href="#cb10-123" aria-hidden="true" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="at">designated =</span> <span class="fu">map_lgl</span>(id, \(i) <span class="dv">0</span> <span class="sc">%in%</span> <span class="fu">ancestors</span>(i)), <span class="at">is_line =</span> <span class="fu">str_detect</span>(name, <span class="st">"_line$"</span>)) <span class="sc">|&gt;</span></span>
+<span id="cb10-124"><a href="#cb10-124" aria-hidden="true" tabindex="-1"></a>  <span class="fu">filter</span>(designated, <span class="sc">!</span>is_line)</span>
+<span id="cb10-125"><a href="#cb10-125" aria-hidden="true" tabindex="-1"></a><span class="fu">log_info</span>(<span class="st">"{nrow(layers)} designated polygon layers on the service"</span>)</span>
+<span id="cb10-126"><a href="#cb10-126" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-127"><a href="#cb10-127" aria-hidden="true" tabindex="-1"></a>fetch_layer <span class="ot">&lt;-</span> <span class="cf">function</span>(id, name) {</span>
+<span id="cb10-128"><a href="#cb10-128" aria-hidden="true" tabindex="-1"></a>  f <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{dir_raw_ch}/{name}.gpkg"</span>)</span>
+<span id="cb10-129"><a href="#cb10-129" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="fu">file_exists</span>(f) <span class="sc">&amp;&amp;</span> <span class="sc">!</span>dps_fetch) <span class="fu">return</span>(f)</span>
+<span id="cb10-130"><a href="#cb10-130" aria-hidden="true" tabindex="-1"></a>  feats <span class="ot">&lt;-</span> <span class="fu">list</span>(); off <span class="ot">&lt;-</span> <span class="dv">0</span></span>
+<span id="cb10-131"><a href="#cb10-131" aria-hidden="true" tabindex="-1"></a>  <span class="cf">repeat</span> {</span>
+<span id="cb10-132"><a href="#cb10-132" aria-hidden="true" tabindex="-1"></a>    r <span class="ot">&lt;-</span> <span class="fu">request</span>(<span class="fu">glue</span>(<span class="st">"{svc}/{id}/query"</span>)) <span class="sc">|&gt;</span></span>
+<span id="cb10-133"><a href="#cb10-133" aria-hidden="true" tabindex="-1"></a>      <span class="fu">req_url_query</span>(<span class="at">where =</span> <span class="st">"1=1"</span>, <span class="at">outFields =</span> <span class="st">"*"</span>, <span class="at">outSR =</span> <span class="dv">4326</span>, <span class="at">f =</span> <span class="st">"geojson"</span>,</span>
+<span id="cb10-134"><a href="#cb10-134" aria-hidden="true" tabindex="-1"></a>                    <span class="at">resultOffset =</span> off, <span class="at">resultRecordCount =</span> <span class="dv">2000</span>) <span class="sc">|&gt;</span></span>
+<span id="cb10-135"><a href="#cb10-135" aria-hidden="true" tabindex="-1"></a>      <span class="fu">req_perform</span>() <span class="sc">|&gt;</span> <span class="fu">resp_body_string</span>()</span>
+<span id="cb10-136"><a href="#cb10-136" aria-hidden="true" tabindex="-1"></a>    g <span class="ot">&lt;-</span> sf<span class="sc">::</span><span class="fu">st_read</span>(r, <span class="at">quiet =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb10-137"><a href="#cb10-137" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="sc">!</span><span class="fu">nrow</span>(g)) <span class="cf">break</span></span>
+<span id="cb10-138"><a href="#cb10-138" aria-hidden="true" tabindex="-1"></a>    feats[[<span class="fu">length</span>(feats) <span class="sc">+</span> <span class="dv">1</span>]] <span class="ot">&lt;-</span> g; off <span class="ot">&lt;-</span> off <span class="sc">+</span> <span class="fu">nrow</span>(g)</span>
+<span id="cb10-139"><a href="#cb10-139" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="fu">nrow</span>(g) <span class="sc">&lt;</span> <span class="dv">2000</span>) <span class="cf">break</span></span>
+<span id="cb10-140"><a href="#cb10-140" aria-hidden="true" tabindex="-1"></a>  }</span>
+<span id="cb10-141"><a href="#cb10-141" aria-hidden="true" tabindex="-1"></a>  g <span class="ot">&lt;-</span> <span class="fu">do.call</span>(rbind, feats)</span>
+<span id="cb10-142"><a href="#cb10-142" aria-hidden="true" tabindex="-1"></a>  sf<span class="sc">::</span><span class="fu">st_write</span>(g, f, <span class="at">quiet =</span> <span class="cn">TRUE</span>, <span class="at">delete_dsn =</span> <span class="cn">TRUE</span>); f</span>
+<span id="cb10-143"><a href="#cb10-143" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb10-144"><a href="#cb10-144" aria-hidden="true" tabindex="-1"></a>layers<span class="sc">$</span>gpkg <span class="ot">&lt;-</span> <span class="fu">map2_chr</span>(layers<span class="sc">$</span>id, layers<span class="sc">$</span>name, fetch_layer)</span>
+<span id="cb10-145"><a href="#cb10-145" aria-hidden="true" tabindex="-1"></a>ch <span class="ot">&lt;-</span> <span class="fu">map_dfr</span>(layers<span class="sc">$</span>gpkg, \(f) sf<span class="sc">::</span><span class="fu">st_read</span>(f, <span class="at">quiet =</span> <span class="cn">TRUE</span>) <span class="sc">|&gt;</span></span>
+<span id="cb10-146"><a href="#cb10-146" aria-hidden="true" tabindex="-1"></a>                <span class="fu">select</span>(<span class="fu">any_of</span>(<span class="fu">c</span>(<span class="st">"SCIENAME"</span>, <span class="st">"COMNAME"</span>, <span class="st">"LISTENTITY"</span>, <span class="st">"LISTSTATUS"</span>, <span class="st">"PUBDATE"</span>, <span class="st">"EFFECTDATE"</span>, <span class="st">"FR"</span>, <span class="st">"INPORTURL"</span>))) <span class="sc">|&gt;</span></span>
+<span id="cb10-147"><a href="#cb10-147" aria-hidden="true" tabindex="-1"></a>                <span class="fu">mutate</span>(<span class="at">layer =</span> <span class="fu">path_ext_remove</span>(<span class="fu">path_file</span>(f))))</span>
+<span id="cb10-148"><a href="#cb10-148" aria-hidden="true" tabindex="-1"></a>sf<span class="sc">::</span><span class="fu">st_geometry</span>(ch) <span class="ot">&lt;-</span> <span class="st">"geometry"</span></span>
+<span id="cb10-149"><a href="#cb10-149" aria-hidden="true" tabindex="-1"></a><span class="fu">log_info</span>(<span class="st">"{nrow(ch)} designated critical-habitat polygons, {n_distinct(ch$LISTENTITY)} listed entities, {n_distinct(ch$SCIENAME)} species"</span>)</span>
+<span id="cb10-150"><a href="#cb10-150" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb10-151"><a href="#cb10-151" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-152"><a href="#cb10-152" aria-hidden="true" tabindex="-1"></a><span class="fu">## Listed entities scoped below the species</span></span>
+<span id="cb10-153"><a href="#cb10-153" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-156"><a href="#cb10-156" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb10-157"><a href="#cb10-157" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: entities</span></span>
+<span id="cb10-158"><a href="#cb10-158" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-159"><a href="#cb10-159" aria-hidden="true" tabindex="-1"></a><span class="co"># an entity is DPS/ESU-scoped when its LISTENTITY carries a bracketed segment, or its SCIENAME is a</span></span>
+<span id="cb10-160"><a href="#cb10-160" aria-hidden="true" tabindex="-1"></a><span class="co"># trinomial (subspecies) -- the species-level `listing` already handles whole-species listings</span></span>
+<span id="cb10-161"><a href="#cb10-161" aria-hidden="true" tabindex="-1"></a>ent <span class="ot">&lt;-</span> sf<span class="sc">::</span><span class="fu">st_drop_geometry</span>(ch) <span class="sc">|&gt;</span></span>
+<span id="cb10-162"><a href="#cb10-162" aria-hidden="true" tabindex="-1"></a>  <span class="fu">distinct</span>(SCIENAME, LISTENTITY, LISTSTATUS) <span class="sc">|&gt;</span></span>
+<span id="cb10-163"><a href="#cb10-163" aria-hidden="true" tabindex="-1"></a>  <span class="co"># NOAA writes a synonym in parentheses -- "Phoca (=Pusa) hispida hispida" -- and WoRMS accepts the</span></span>
+<span id="cb10-164"><a href="#cb10-164" aria-hidden="true" tabindex="-1"></a>  <span class="co"># synonym (Pusa hispida); keep both spellings as candidates and match whichever is accepted</span></span>
+<span id="cb10-165"><a href="#cb10-165" aria-hidden="true" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="at">sci_clean =</span> <span class="fu">clean_sci_name</span>(<span class="fu">str_replace_all</span>(SCIENAME, <span class="st">"</span><span class="sc">\\</span><span class="st">(=[^)]*</span><span class="sc">\\</span><span class="st">)</span><span class="sc">\\</span><span class="st">s*"</span>, <span class="st">""</span>)),</span>
+<span id="cb10-166"><a href="#cb10-166" aria-hidden="true" tabindex="-1"></a>         <span class="at">sci_syn   =</span> <span class="fu">if_else</span>(<span class="fu">str_detect</span>(SCIENAME, <span class="st">"</span><span class="sc">\\</span><span class="st">(="</span>),</span>
+<span id="cb10-167"><a href="#cb10-167" aria-hidden="true" tabindex="-1"></a>                             <span class="fu">clean_sci_name</span>(<span class="fu">str_replace</span>(SCIENAME, <span class="st">"^</span><span class="sc">\\</span><span class="st">S+</span><span class="sc">\\</span><span class="st">s+</span><span class="sc">\\</span><span class="st">(=([^)]+)</span><span class="sc">\\</span><span class="st">)"</span>, <span class="st">"</span><span class="sc">\\</span><span class="st">1"</span>)), <span class="cn">NA_character_</span>),</span>
+<span id="cb10-168"><a href="#cb10-168" aria-hidden="true" tabindex="-1"></a>         <span class="at">binomial  =</span> <span class="fu">clean_sci_name</span>(sci_clean, <span class="at">binomial =</span> <span class="cn">TRUE</span>),</span>
+<span id="cb10-169"><a href="#cb10-169" aria-hidden="true" tabindex="-1"></a>         <span class="at">binomial_syn =</span> <span class="fu">if_else</span>(<span class="fu">is.na</span>(sci_syn), <span class="cn">NA_character_</span>, <span class="fu">clean_sci_name</span>(sci_syn, <span class="at">binomial =</span> <span class="cn">TRUE</span>)),</span>
+<span id="cb10-170"><a href="#cb10-170" aria-hidden="true" tabindex="-1"></a>         <span class="at">segment   =</span> <span class="fu">str_match</span>(LISTENTITY, <span class="st">"</span><span class="sc">\\</span><span class="st">[(.+)</span><span class="sc">\\</span><span class="st">]"</span>)[, <span class="dv">2</span>],</span>
+<span id="cb10-171"><a href="#cb10-171" aria-hidden="true" tabindex="-1"></a>         <span class="at">sub_species =</span> <span class="sc">!</span><span class="fu">is.na</span>(segment) <span class="sc">|</span> <span class="fu">str_count</span>(sci_clean, <span class="st">"</span><span class="sc">\\</span><span class="st">S+"</span>) <span class="sc">&gt;=</span> <span class="dv">3</span>,</span>
+<span id="cb10-172"><a href="#cb10-172" aria-hidden="true" tabindex="-1"></a>         <span class="at">status =</span> <span class="fu">case_when</span>(LISTSTATUS <span class="sc">==</span> <span class="st">"Endangered"</span> <span class="sc">~</span> <span class="st">"EN"</span>, LISTSTATUS <span class="sc">==</span> <span class="st">"Threatened"</span> <span class="sc">~</span> <span class="st">"TN"</span>, <span class="cn">TRUE</span> <span class="sc">~</span> <span class="cn">NA_character_</span>)) <span class="sc">|&gt;</span></span>
+<span id="cb10-173"><a href="#cb10-173" aria-hidden="true" tabindex="-1"></a>  <span class="fu">filter</span>(sub_species, <span class="sc">!</span><span class="fu">is.na</span>(status))</span>
+<span id="cb10-174"><a href="#cb10-174" aria-hidden="true" tabindex="-1"></a><span class="co"># sea turtles already carry SWOT + DPS extinction risk (ingest_turtles-swot-dps); do not double up</span></span>
+<span id="cb10-175"><a href="#cb10-175" aria-hidden="true" tabindex="-1"></a>turtle_sci <span class="ot">&lt;-</span> <span class="fu">read_csv</span>(<span class="fu">glue</span>(<span class="st">"{dir_atlas}/dist/model_{turtle_ds}.csv"</span>)) <span class="sc">|&gt;</span></span>
+<span id="cb10-176"><a href="#cb10-176" aria-hidden="true" tabindex="-1"></a>  <span class="fu">pull</span>(<span class="fu">any_of</span>(<span class="fu">c</span>(<span class="st">"scientific_name"</span>, <span class="st">"sci_name"</span>, <span class="st">"taxa"</span>))) <span class="sc">|&gt;</span> <span class="fu">clean_sci_name</span>(<span class="at">binomial =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb10-177"><a href="#cb10-177" aria-hidden="true" tabindex="-1"></a>ent <span class="ot">&lt;-</span> ent <span class="sc">|&gt;</span> <span class="fu">filter</span>(<span class="sc">!</span>binomial <span class="sc">%in%</span> turtle_sci)</span>
+<span id="cb10-178"><a href="#cb10-178" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-179"><a href="#cb10-179" aria-hidden="true" tabindex="-1"></a><span class="co"># species -&gt; WoRMS AphiaID (binomial match on the accepted name), class for the MMPA floor</span></span>
+<span id="cb10-180"><a href="#cb10-180" aria-hidden="true" tabindex="-1"></a>con_spp <span class="ot">&lt;-</span> <span class="fu">dbConnect</span>(<span class="fu">duckdb</span>(spp_db, <span class="at">read_only =</span> <span class="cn">TRUE</span>))</span>
+<span id="cb10-181"><a href="#cb10-181" aria-hidden="true" tabindex="-1"></a>cands <span class="ot">&lt;-</span> ent <span class="sc">|&gt;</span> <span class="fu">transmute</span>(binomial, <span class="at">cand =</span> binomial) <span class="sc">|&gt;</span></span>
+<span id="cb10-182"><a href="#cb10-182" aria-hidden="true" tabindex="-1"></a>  <span class="fu">bind_rows</span>(ent <span class="sc">|&gt;</span> <span class="fu">filter</span>(<span class="sc">!</span><span class="fu">is.na</span>(binomial_syn)) <span class="sc">|&gt;</span> <span class="fu">transmute</span>(binomial, <span class="at">cand =</span> binomial_syn)) <span class="sc">|&gt;</span> <span class="fu">distinct</span>()</span>
+<span id="cb10-183"><a href="#cb10-183" aria-hidden="true" tabindex="-1"></a><span class="fu">duckdb_register</span>(con_spp, <span class="st">"want"</span>, cands)</span>
+<span id="cb10-184"><a href="#cb10-184" aria-hidden="true" tabindex="-1"></a>wx <span class="ot">&lt;-</span> <span class="fu">dbGetQuery</span>(con_spp, <span class="st">"</span></span>
+<span id="cb10-185"><a href="#cb10-185" aria-hidden="true" tabindex="-1"></a><span class="st">  SELECT w.binomial, w.cand, CAST(x.scientificNameID AS VARCHAR) AS worms_id, x.</span><span class="sc">\"</span><span class="st">class</span><span class="sc">\"</span><span class="st"> AS cls</span></span>
+<span id="cb10-186"><a href="#cb10-186" aria-hidden="true" tabindex="-1"></a><span class="st">  FROM want w JOIN spp.worms x ON x.scientificName = w.cand</span></span>
+<span id="cb10-187"><a href="#cb10-187" aria-hidden="true" tabindex="-1"></a><span class="st">  WHERE x.taxonomicStatus = 'accepted'"</span>) <span class="sc">|&gt;</span></span>
+<span id="cb10-188"><a href="#cb10-188" aria-hidden="true" tabindex="-1"></a>  <span class="fu">arrange</span>(binomial, cand <span class="sc">!=</span> binomial) <span class="sc">|&gt;</span> <span class="fu">distinct</span>(binomial, <span class="at">.keep_all =</span> <span class="cn">TRUE</span>) <span class="sc">|&gt;</span></span>
+<span id="cb10-189"><a href="#cb10-189" aria-hidden="true" tabindex="-1"></a>  <span class="fu">transmute</span>(binomial, worms_id, cls, <span class="at">worms_name =</span> cand)</span>
+<span id="cb10-190"><a href="#cb10-190" aria-hidden="true" tabindex="-1"></a><span class="fu">dbDisconnect</span>(con_spp, <span class="at">shutdown =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb10-191"><a href="#cb10-191" aria-hidden="true" tabindex="-1"></a>ent <span class="ot">&lt;-</span> ent <span class="sc">|&gt;</span> <span class="fu">left_join</span>(wx, <span class="at">by =</span> <span class="st">"binomial"</span>) <span class="sc">|&gt;</span> <span class="fu">mutate</span>(<span class="at">is_mmpa =</span> <span class="fu">coalesce</span>(cls <span class="sc">==</span> <span class="st">"Mammalia"</span>, <span class="cn">FALSE</span>))</span>
+<span id="cb10-192"><a href="#cb10-192" aria-hidden="true" tabindex="-1"></a>unres <span class="ot">&lt;-</span> ent <span class="sc">|&gt;</span> <span class="fu">filter</span>(<span class="fu">is.na</span>(worms_id)) <span class="sc">|&gt;</span> <span class="fu">distinct</span>(SCIENAME)</span>
+<span id="cb10-193"><a href="#cb10-193" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (<span class="fu">nrow</span>(unres)) <span class="fu">log_warn</span>(<span class="st">"no accepted WoRMS name for: {paste(unres$SCIENAME, collapse = '; ')}"</span>)</span>
+<span id="cb10-194"><a href="#cb10-194" aria-hidden="true" tabindex="-1"></a>ent <span class="ot">&lt;-</span> ent <span class="sc">|&gt;</span> <span class="fu">filter</span>(<span class="sc">!</span><span class="fu">is.na</span>(worms_id))</span>
+<span id="cb10-195"><a href="#cb10-195" aria-hidden="true" tabindex="-1"></a><span class="fu">kable</span>(ent <span class="sc">|&gt;</span> <span class="fu">count</span>(binomial, worms_id, is_mmpa, <span class="at">name =</span> <span class="st">"n_entities"</span>) <span class="sc">|&gt;</span> <span class="fu">arrange</span>(binomial),</span>
+<span id="cb10-196"><a href="#cb10-196" aria-hidden="true" tabindex="-1"></a>      <span class="at">caption =</span> <span class="st">"Species with listed entities below species level (sea turtles excluded — already spatial)"</span>)</span>
+<span id="cb10-197"><a href="#cb10-197" aria-hidden="true" tabindex="-1"></a><span class="fu">kable</span>(ent <span class="sc">|&gt;</span> <span class="fu">transmute</span>(<span class="at">species =</span> binomial, <span class="at">entity =</span> LISTENTITY, status) <span class="sc">|&gt;</span> <span class="fu">arrange</span>(species, entity),</span>
+<span id="cb10-198"><a href="#cb10-198" aria-hidden="true" tabindex="-1"></a>      <span class="at">caption =</span> <span class="st">"Listed entities taken from the service, with the status their polygons carry"</span>)</span>
+<span id="cb10-199"><a href="#cb10-199" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb10-200"><a href="#cb10-200" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-201"><a href="#cb10-201" aria-hidden="true" tabindex="-1"></a><span class="fu">## Baseline: the species' IUCN range at its IUCN status (+ MMPA)</span></span>
+<span id="cb10-202"><a href="#cb10-202" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-205"><a href="#cb10-205" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb10-206"><a href="#cb10-206" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: baseline</span></span>
+<span id="cb10-207"><a href="#cb10-207" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-208"><a href="#cb10-208" aria-hidden="true" tabindex="-1"></a><span class="co"># IUCN range model per species: model_rng_iucn.csv keys models by IUCN id_no + sci_name</span></span>
+<span id="cb10-209"><a href="#cb10-209" aria-hidden="true" tabindex="-1"></a>iucn_m <span class="ot">&lt;-</span> <span class="fu">read_csv</span>(<span class="fu">glue</span>(<span class="st">"{dir_atlas}/dist/model_rng_iucn.csv"</span>)) <span class="sc">|&gt;</span></span>
+<span id="cb10-210"><a href="#cb10-210" aria-hidden="true" tabindex="-1"></a>  <span class="fu">transmute</span>(mdl_key, <span class="at">sci =</span> <span class="fu">clean_sci_name</span>(sci_name, <span class="at">binomial =</span> <span class="cn">TRUE</span>), category) <span class="sc">|&gt;</span></span>
+<span id="cb10-211"><a href="#cb10-211" aria-hidden="true" tabindex="-1"></a>  <span class="fu">distinct</span>(sci, <span class="at">.keep_all =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb10-212"><a href="#cb10-212" aria-hidden="true" tabindex="-1"></a>sp <span class="ot">&lt;-</span> ent <span class="sc">|&gt;</span> <span class="fu">distinct</span>(binomial, worms_id, is_mmpa, worms_name) <span class="sc">|&gt;</span></span>
+<span id="cb10-213"><a href="#cb10-213" aria-hidden="true" tabindex="-1"></a>  <span class="fu">left_join</span>(iucn_m, <span class="at">by =</span> <span class="fu">c</span>(<span class="st">"binomial"</span> <span class="ot">=</span> <span class="st">"sci"</span>)) <span class="sc">|&gt;</span></span>
+<span id="cb10-214"><a href="#cb10-214" aria-hidden="true" tabindex="-1"></a>  <span class="fu">left_join</span>(iucn_m <span class="sc">|&gt;</span> <span class="fu">rename</span>(<span class="at">mdl_key2 =</span> mdl_key, <span class="at">category2 =</span> category), <span class="at">by =</span> <span class="fu">c</span>(<span class="st">"worms_name"</span> <span class="ot">=</span> <span class="st">"sci"</span>)) <span class="sc">|&gt;</span></span>
+<span id="cb10-215"><a href="#cb10-215" aria-hidden="true" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="at">mdl_key =</span> <span class="fu">coalesce</span>(mdl_key, mdl_key2), <span class="at">category =</span> <span class="fu">coalesce</span>(category, category2)) <span class="sc">|&gt;</span> <span class="fu">select</span>(<span class="sc">-</span>mdl_key2, <span class="sc">-</span>category2) <span class="sc">|&gt;</span></span>
+<span id="cb10-216"><a href="#cb10-216" aria-hidden="true" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="at">iucn_code =</span> <span class="fu">if_else</span>(<span class="sc">!</span><span class="fu">is.na</span>(category) <span class="sc">&amp;</span> category <span class="sc">%in%</span> <span class="fu">c</span>(<span class="st">"CR"</span>,<span class="st">"EN"</span>,<span class="st">"VU"</span>,<span class="st">"NT"</span>,<span class="st">"LC"</span>,<span class="st">"DD"</span>),</span>
+<span id="cb10-217"><a href="#cb10-217" aria-hidden="true" tabindex="-1"></a>                             <span class="fu">paste0</span>(<span class="st">"IUCN:"</span>, category), <span class="cn">NA_character_</span>),</span>
+<span id="cb10-218"><a href="#cb10-218" aria-hidden="true" tabindex="-1"></a>         <span class="co"># baseline outside the listed entities, on the SAME convention merge_models_prep uses for</span></span>
+<span id="cb10-219"><a href="#cb10-219" aria-hidden="true" tabindex="-1"></a>         <span class="co"># the governing er_score: a marine mammal is `NMFS:LC` + the MMPA floor = 20 (US national</span></span>
+<span id="cb10-220"><a href="#cb10-220" aria-hidden="true" tabindex="-1"></a>         <span class="co"># status overrides IUCN for mammals; compute_er_score() ignores is_mmpa for IUCN codes, so</span></span>
+<span id="cb10-221"><a href="#cb10-221" aria-hidden="true" tabindex="-1"></a>         <span class="co"># `IUCN:LC` + MMPA was silently 1 -- the humpback carried 1 where every other unlisted</span></span>
+<span id="cb10-222"><a href="#cb10-222" aria-hidden="true" tabindex="-1"></a>         <span class="co"># marine mammal carries 20); everything else is its IUCN category (1 when unlisted)</span></span>
+<span id="cb10-223"><a href="#cb10-223" aria-hidden="true" tabindex="-1"></a>         <span class="at">er_base =</span> <span class="fu">case_when</span>(is_mmpa           <span class="sc">~</span> <span class="fu">compute_er_score</span>(<span class="st">"NMFS:LC"</span>, <span class="at">is_mmpa =</span> <span class="cn">TRUE</span>),</span>
+<span id="cb10-224"><a href="#cb10-224" aria-hidden="true" tabindex="-1"></a>                             <span class="sc">!</span><span class="fu">is.na</span>(iucn_code) <span class="sc">~</span> <span class="fu">compute_er_score</span>(iucn_code),</span>
+<span id="cb10-225"><a href="#cb10-225" aria-hidden="true" tabindex="-1"></a>                             <span class="cn">TRUE</span>              <span class="sc">~</span> <span class="dv">1</span>L),</span>
+<span id="cb10-226"><a href="#cb10-226" aria-hidden="true" tabindex="-1"></a>         <span class="at">iucn_file =</span> <span class="fu">if_else</span>(<span class="sc">!</span><span class="fu">is.na</span>(mdl_key), <span class="fu">glue</span>(<span class="st">"{dir_iucn}/{str_remove(mdl_key, '^rng_iucn</span><span class="sc">\\\\</span><span class="st">|')}.parquet"</span>), <span class="cn">NA_character_</span>),</span>
+<span id="cb10-227"><a href="#cb10-227" aria-hidden="true" tabindex="-1"></a>         <span class="at">has_iucn =</span> <span class="sc">!</span><span class="fu">is.na</span>(iucn_file) <span class="sc">&amp;</span> <span class="fu">file_exists</span>(<span class="fu">coalesce</span>(iucn_file, <span class="st">""</span>)),</span>
+<span id="cb10-228"><a href="#cb10-228" aria-hidden="true" tabindex="-1"></a>         <span class="at">mdl_key_dps =</span> msens<span class="sc">::</span><span class="fu">mdl_key_raw</span>(ds_key, worms_id))</span>
+<span id="cb10-229"><a href="#cb10-229" aria-hidden="true" tabindex="-1"></a><span class="fu">kable</span>(sp <span class="sc">|&gt;</span> <span class="fu">select</span>(binomial, worms_id, iucn_code, is_mmpa, er_base, has_iucn),</span>
+<span id="cb10-230"><a href="#cb10-230" aria-hidden="true" tabindex="-1"></a>      <span class="at">caption =</span> <span class="st">"Baseline extinction risk outside listed entities (mammals: NMFS:LC + MMPA floor = 20; others: IUCN category); species without an IUCN range get the entity polygons only"</span>)</span>
+<span id="cb10-231"><a href="#cb10-231" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb10-232"><a href="#cb10-232" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-233"><a href="#cb10-233" aria-hidden="true" tabindex="-1"></a><span class="fu">## Per-cell ER surface → one Parquet per species</span></span>
+<span id="cb10-234"><a href="#cb10-234" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-237"><a href="#cb10-237" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb10-238"><a href="#cb10-238" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: build</span></span>
+<span id="cb10-239"><a href="#cb10-239" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-240"><a href="#cb10-240" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> (i <span class="cf">in</span> <span class="fu">seq_len</span>(<span class="fu">nrow</span>(sp))) {</span>
+<span id="cb10-241"><a href="#cb10-241" aria-hidden="true" tabindex="-1"></a>  s <span class="ot">&lt;-</span> sp[i, ]; out <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{dir_dist}/{s$worms_id}.parquet"</span>)</span>
+<span id="cb10-242"><a href="#cb10-242" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="fu">file_exists</span>(out) <span class="sc">&amp;&amp;</span> <span class="sc">!</span>redo_ingest) <span class="cf">next</span></span>
+<span id="cb10-243"><a href="#cb10-243" aria-hidden="true" tabindex="-1"></a>  <span class="co"># listed-entity polygons at their status (max where entities overlap)</span></span>
+<span id="cb10-244"><a href="#cb10-244" aria-hidden="true" tabindex="-1"></a>  e_sp <span class="ot">&lt;-</span> ent <span class="sc">|&gt;</span> <span class="fu">filter</span>(worms_id <span class="sc">==</span> s<span class="sc">$</span>worms_id)</span>
+<span id="cb10-245"><a href="#cb10-245" aria-hidden="true" tabindex="-1"></a>  cells_ent <span class="ot">&lt;-</span> <span class="fu">map_dfr</span>(<span class="fu">seq_len</span>(<span class="fu">nrow</span>(e_sp)), \(j) {</span>
+<span id="cb10-246"><a href="#cb10-246" aria-hidden="true" tabindex="-1"></a>    g <span class="ot">&lt;-</span> ch <span class="sc">|&gt;</span> <span class="fu">filter</span>(SCIENAME <span class="sc">==</span> e_sp<span class="sc">$</span>SCIENAME[j], LISTENTITY <span class="sc">==</span> e_sp<span class="sc">$</span>LISTENTITY[j])</span>
+<span id="cb10-247"><a href="#cb10-247" aria-hidden="true" tabindex="-1"></a>    v <span class="ot">&lt;-</span> <span class="fu">compute_er_score</span>(<span class="fu">paste0</span>(<span class="st">"NMFS:"</span>, e_sp<span class="sc">$</span>status[j]), <span class="at">is_mmpa =</span> s<span class="sc">$</span>is_mmpa)</span>
+<span id="cb10-248"><a href="#cb10-248" aria-hidden="true" tabindex="-1"></a>    msens<span class="sc">::</span><span class="fu">cells_from_ranges</span>(g, cellid_tif, <span class="at">value =</span> v) <span class="sc">|&gt;</span> <span class="fu">mutate</span>(<span class="at">entity =</span> e_sp<span class="sc">$</span>LISTENTITY[j])</span>
+<span id="cb10-249"><a href="#cb10-249" aria-hidden="true" tabindex="-1"></a>  })</span>
+<span id="cb10-250"><a href="#cb10-250" aria-hidden="true" tabindex="-1"></a>  <span class="co"># baseline over the IUCN range</span></span>
+<span id="cb10-251"><a href="#cb10-251" aria-hidden="true" tabindex="-1"></a>  cells_base <span class="ot">&lt;-</span> <span class="cf">if</span> (s<span class="sc">$</span>has_iucn) arrow<span class="sc">::</span><span class="fu">read_parquet</span>(s<span class="sc">$</span>iucn_file) <span class="sc">|&gt;</span> <span class="fu">transmute</span>(cell_id, <span class="at">val =</span> <span class="fu">as.double</span>(s<span class="sc">$</span>er_base)) <span class="cf">else</span> <span class="fu">tibble</span>(<span class="at">cell_id =</span> <span class="fu">integer</span>(), <span class="at">val =</span> <span class="fu">double</span>())</span>
+<span id="cb10-252"><a href="#cb10-252" aria-hidden="true" tabindex="-1"></a>  d <span class="ot">&lt;-</span> <span class="fu">bind_rows</span>(cells_ent <span class="sc">|&gt;</span> <span class="fu">select</span>(cell_id, val), cells_base) <span class="sc">|&gt;</span></span>
+<span id="cb10-253"><a href="#cb10-253" aria-hidden="true" tabindex="-1"></a>    <span class="fu">group_by</span>(cell_id) <span class="sc">|&gt;</span> <span class="fu">summarise</span>(<span class="at">val =</span> <span class="fu">max</span>(val), <span class="at">.groups =</span> <span class="st">"drop"</span>)</span>
+<span id="cb10-254"><a href="#cb10-254" aria-hidden="true" tabindex="-1"></a>  msens<span class="sc">::</span><span class="fu">write_atlas_parquet</span>(<span class="fu">tibble</span>(<span class="at">mdl_key =</span> <span class="fu">as.character</span>(s<span class="sc">$</span>mdl_key_dps), <span class="at">cell_id =</span> <span class="fu">as.integer</span>(d<span class="sc">$</span>cell_id), <span class="at">val =</span> d<span class="sc">$</span>val), out)</span>
+<span id="cb10-255"><a href="#cb10-255" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"{s$binomial}: {nrow(cells_ent)} entity cells over {nrow(e_sp)} entities + {nrow(cells_base)} baseline cells -&gt; {nrow(d)} cells"</span>)</span>
+<span id="cb10-256"><a href="#cb10-256" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb10-257"><a href="#cb10-257" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb10-258"><a href="#cb10-258" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-259"><a href="#cb10-259" aria-hidden="true" tabindex="-1"></a><span class="fu">## Model registry, verify, manifest</span></span>
+<span id="cb10-260"><a href="#cb10-260" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-263"><a href="#cb10-263" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb10-264"><a href="#cb10-264" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: registry</span></span>
+<span id="cb10-265"><a href="#cb10-265" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-266"><a href="#cb10-266" aria-hidden="true" tabindex="-1"></a>con <span class="ot">&lt;-</span> <span class="fu">dbConnect</span>(<span class="fu">duckdb</span>())</span>
+<span id="cb10-267"><a href="#cb10-267" aria-hidden="true" tabindex="-1"></a>smry <span class="ot">&lt;-</span> <span class="fu">dbGetQuery</span>(con, <span class="fu">glue</span>(<span class="st">"</span></span>
+<span id="cb10-268"><a href="#cb10-268" aria-hidden="true" tabindex="-1"></a><span class="st">  SELECT mdl_key, count(*) n_cells, min(val) v_min, max(val) v_max,</span></span>
+<span id="cb10-269"><a href="#cb10-269" aria-hidden="true" tabindex="-1"></a><span class="st">         count(*) FILTER (WHERE val &gt;= 100) n_en, count(*) FILTER (WHERE val &gt;= 50 AND val &lt; 100) n_tn</span></span>
+<span id="cb10-270"><a href="#cb10-270" aria-hidden="true" tabindex="-1"></a><span class="st">  FROM read_parquet('{dir_dist}/*.parquet') GROUP BY 1 ORDER BY 1"</span>))</span>
+<span id="cb10-271"><a href="#cb10-271" aria-hidden="true" tabindex="-1"></a>model <span class="ot">&lt;-</span> sp <span class="sc">|&gt;</span></span>
+<span id="cb10-272"><a href="#cb10-272" aria-hidden="true" tabindex="-1"></a>  <span class="fu">transmute</span>(<span class="at">mdl_key =</span> mdl_key_dps, <span class="at">sp_id =</span> worms_id, worms_id, <span class="at">scientific_name =</span> binomial, is_mmpa, iucn_code, er_base,</span>
+<span id="cb10-273"><a href="#cb10-273" aria-hidden="true" tabindex="-1"></a>            <span class="at">er_code =</span> <span class="st">"NMFS:DPS"</span>, <span class="at">er_score =</span> <span class="cn">NA_integer_</span>,   <span class="co"># per-cell: see val; scoring multiplies it by the merged suitability</span></span>
+<span id="cb10-274"><a href="#cb10-274" aria-hidden="true" tabindex="-1"></a>            <span class="at">entities =</span> <span class="fu">map_chr</span>(worms_id, \(w) <span class="fu">paste</span>(ent<span class="sc">$</span>LISTENTITY[ent<span class="sc">$</span>worms_id <span class="sc">==</span> w], <span class="at">collapse =</span> <span class="st">" | "</span>)),</span>
+<span id="cb10-275"><a href="#cb10-275" aria-hidden="true" tabindex="-1"></a>            <span class="at">statuses =</span> <span class="fu">map_chr</span>(worms_id, \(w) <span class="fu">paste</span>(ent<span class="sc">$</span>status[ent<span class="sc">$</span>worms_id <span class="sc">==</span> w], <span class="at">collapse =</span> <span class="st">"|"</span>)),</span>
+<span id="cb10-276"><a href="#cb10-276" aria-hidden="true" tabindex="-1"></a>            <span class="at">has_iucn_baseline =</span> has_iucn) <span class="sc">|&gt;</span></span>
+<span id="cb10-277"><a href="#cb10-277" aria-hidden="true" tabindex="-1"></a>  <span class="fu">left_join</span>(smry, <span class="at">by =</span> <span class="st">"mdl_key"</span>)</span>
+<span id="cb10-278"><a href="#cb10-278" aria-hidden="true" tabindex="-1"></a><span class="fu">write_csv</span>(model, mdl_csv)</span>
+<span id="cb10-279"><a href="#cb10-279" aria-hidden="true" tabindex="-1"></a><span class="fu">kable</span>(model <span class="sc">|&gt;</span> <span class="fu">select</span>(scientific_name, worms_id, statuses, er_base, n_cells, n_en, n_tn, v_min, v_max),</span>
+<span id="cb10-280"><a href="#cb10-280" aria-hidden="true" tabindex="-1"></a>      <span class="at">caption =</span> <span class="st">"dps_nmfs models: per-cell ER surfaces (n_en / n_tn = cells at EN / TN)"</span>)</span>
+<span id="cb10-281"><a href="#cb10-281" aria-hidden="true" tabindex="-1"></a><span class="fu">stopifnot</span>(<span class="st">"every model must carry at least one listed-entity cell"</span> <span class="ot">=</span> <span class="fu">all</span>(model<span class="sc">$</span>n_en <span class="sc">+</span> model<span class="sc">$</span>n_tn <span class="sc">&gt;</span> <span class="dv">0</span>),</span>
+<span id="cb10-282"><a href="#cb10-282" aria-hidden="true" tabindex="-1"></a>          <span class="st">"ER values must be compute_er_score() outputs in [1, 100]"</span> <span class="ot">=</span> <span class="fu">all</span>(model<span class="sc">$</span>v_min <span class="sc">&gt;=</span> <span class="dv">1</span> <span class="sc">&amp;</span> model<span class="sc">$</span>v_max <span class="sc">&lt;=</span> <span class="dv">100</span>))</span>
+<span id="cb10-283"><a href="#cb10-283" aria-hidden="true" tabindex="-1"></a>h <span class="ot">&lt;-</span> msens<span class="sc">::</span><span class="fu">hash_parquet</span>(<span class="fu">glue</span>(<span class="st">"{dir_dist}/*.parquet"</span>), con)</span>
+<span id="cb10-284"><a href="#cb10-284" aria-hidden="true" tabindex="-1"></a><span class="fu">dbDisconnect</span>(con, <span class="at">shutdown =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb10-285"><a href="#cb10-285" aria-hidden="true" tabindex="-1"></a>msens<span class="sc">::</span><span class="fu">write_manifest</span>(</span>
+<span id="cb10-286"><a href="#cb10-286" aria-hidden="true" tabindex="-1"></a>  manifest, <span class="at">target =</span> <span class="st">"ingest_dps_nmfs"</span>, <span class="at">content_hash =</span> h,</span>
+<span id="cb10-287"><a href="#cb10-287" aria-hidden="true" tabindex="-1"></a>  <span class="at">stats =</span> <span class="fu">list</span>(<span class="at">ds_key =</span> ds_key, <span class="at">ver =</span> ver, <span class="at">n_species =</span> <span class="fu">nrow</span>(model), <span class="at">n_entities =</span> <span class="fu">nrow</span>(ent),</span>
+<span id="cb10-288"><a href="#cb10-288" aria-hidden="true" tabindex="-1"></a>               <span class="at">n_cells =</span> <span class="fu">sum</span>(model<span class="sc">$</span>n_cells), <span class="at">n_layers =</span> <span class="fu">nrow</span>(layers), <span class="at">source =</span> svc),</span>
+<span id="cb10-289"><a href="#cb10-289" aria-hidden="true" tabindex="-1"></a>  <span class="at">force =</span> msens<span class="sc">::</span><span class="fu">force_target</span>(<span class="st">"ingest_dps_nmfs"</span>))</span>
+<span id="cb10-290"><a href="#cb10-290" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
 </code></pre></div><button title="Copy to Clipboard" class="code-copy-button" data-in-quarto-modal=""><i class="bi"></i></button></div>
 </div></div></div></div></div>
 </div> <!-- /content -->

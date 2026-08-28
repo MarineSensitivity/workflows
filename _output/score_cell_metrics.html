@@ -168,7 +168,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 
 <p>Per-cell scoring (replicates v7 <code>calc_scores.qmd</code> exactly):</p>
 <ol type="1">
-<li><strong><code>extrisk_{spcat}</code></strong> = <code>SUM(er_score × val / 100)</code> over valid species in the category (<code>is_er_spatial</code>/turtles → er_score = 100; MMPA floor already baked into <code>er_score</code>).</li>
+<li><strong><code>extrisk_{spcat}</code></strong> = <code>SUM(er × val / 100)</code> over valid species in the category, where the weight <code>er</code> depends on the taxon’s <code>er_mode</code> (score_zones): the governing <code>er_score</code> (scalar, MMPA/MBTA floors baked in) for ordinary taxa; <code>100</code> for the sea turtles, whose merged <code>val</code> is already ER × suitability (<code>premultiplied</code>); the <strong>per-cell</strong> ER from <code>model_cell_er</code> for the NMFS DPS species (<code>cell</code>), whose merged <code>val</code> is the suitability alone.</li>
 <li><strong>ecoregion min/max</strong> of that metric per ecoregion; <strong><code>_ecoregion_rescaled</code></strong> per cell = <code>(x − eco_min)/(eco_max − eco_min) × 100</code>, coverage-normalized across ecoregions.</li>
 <li><strong><code>primprod</code></strong> = VGPM <code>npp_avg</code> bilinear→cells; same ecoregion min/max + rescale.</li>
 <li><strong>composite</strong> <code>score_extriskspcat_primprod_ecoregionrescaled_equalweights</code> = <code>ROUND(AVG(present rescaled components))</code> (7 extrisk + primprod, equal weight).</li>
@@ -179,7 +179,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <details class="code-fold">
 <summary>Code</summary>
 <div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb1"><pre class="sourceCode default code-with-copy"><code class="sourceCode default"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a>flowchart LR</span>
-<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>  mt["model_cell × taxon&lt;br/&gt;(er_score, sp_cat, is_marine)"] --&gt; ex["extrisk_{spcat}&lt;br/&gt;Σ er·val/100"]</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>  mt["model_cell × taxon&lt;br/&gt;(er_score | 100 | model_cell_er by er_mode; sp_cat, is_marine)"] --&gt; ex["extrisk_{spcat}&lt;br/&gt;Σ er·val/100"]</span>
 <span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>  ex --&gt; rs["ecoregion min/max&lt;br/&gt;→ _ecoregion_rescaled"]</span>
 <span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>  vg["VGPM npp_avg → cells"] --&gt; pp["primprod → rescaled"]</span>
 <span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>  rs --&gt; cm[("cell_metric&lt;br/&gt;sdm.duckdb")]</span>
@@ -193,7 +193,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <div aria-describedby="fig-design-caption-0ceaefa1-69ba-4598-a22c-09a6ac19f8ca">
 <div>
 <pre class="mermaid mermaid-js" data-label="fig-design">flowchart LR
-  mt["model_cell × taxon&lt;br/&gt;(er_score, sp_cat, is_marine)"] --&gt; ex["extrisk_{spcat}&lt;br/&gt;Σ er·val/100"]
+  mt["model_cell × taxon&lt;br/&gt;(er_score | 100 | model_cell_er by er_mode; sp_cat, is_marine)"] --&gt; ex["extrisk_{spcat}&lt;br/&gt;Σ er·val/100"]
   ex --&gt; rs["ecoregion min/max&lt;br/&gt;→ _ecoregion_rescaled"]
   vg["VGPM npp_avg → cells"] --&gt; pp["primprod → rescaled"]
   rs --&gt; cm[("cell_metric&lt;br/&gt;sdm.duckdb")]
@@ -277,16 +277,25 @@ Figure&nbsp;1: Per-cell scoring: extrisk_{spcat} → ecoregion rescale, + primpr
 <div class="cell">
 <details class="code-fold">
 <summary>Code</summary>
-<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb9"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> (cat <span class="cf">in</span> sp_cats) {</span>
-<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>  s <span class="ot">&lt;-</span> <span class="fu">mseq</span>(<span class="fu">glue</span>(<span class="st">"extrisk_{cat}"</span>), <span class="fu">glue</span>(<span class="st">"Extinction-risk-weighted suitability, {cat}"</span>))</span>
-<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>  <span class="fu">dbExecute</span>(con, <span class="fu">glue</span>(<span class="st">"INSERT INTO cell_metric (cell_id, metric_seq, val)</span></span>
-<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="st">    SELECT mc.cell_id, {s}, ROUND(SUM(</span></span>
-<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="st">        (CASE WHEN t.is_er_spatial THEN 100 ELSE t.er_score END) * mc.val) / 100.0, 2) AS val</span></span>
-<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="st">    FROM model_cell mc JOIN taxon t ON mc.mdl_key = t.ms_merge_key</span></span>
-<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span class="st">    WHERE {taxa_where} AND t.sp_cat = '{cat}'</span></span>
-<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="st">    GROUP BY mc.cell_id"</span>))</span>
-<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>}</span>
-<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a><span class="fu">log_info</span>(<span class="st">"stage 1a extrisk: {dbGetQuery(con,'SELECT count(*) n FROM cell_metric')$n} cell-metric rows"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb9"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co"># the ER weight per (taxon, cell) by er_mode -- see score_zones; a 'cell' taxon without its per-cell</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="co"># ER would be weighted NULL (dropped from the sum), so the join is asserted complete first</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="fu">stopifnot</span>(<span class="st">"run score_zones first (taxon.er_mode / model_cell_er missing)"</span> <span class="ot">=</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>            <span class="st">"er_mode"</span> <span class="sc">%in%</span> <span class="fu">dbListFields</span>(con, <span class="st">"taxon"</span>) <span class="sc">&amp;&amp;</span> <span class="st">"model_cell_er"</span> <span class="sc">%in%</span> <span class="fu">dbListTables</span>(con))</span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>n_gap <span class="ot">&lt;-</span> <span class="fu">dbGetQuery</span>(con, <span class="st">"SELECT count(*) n FROM model_cell mc JOIN taxon t ON mc.mdl_key = t.ms_merge_key</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="st">  LEFT JOIN model_cell_er e ON e.mdl_key = mc.mdl_key AND e.cell_id = mc.cell_id</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span class="st">  WHERE t.er_mode = 'cell' AND e.er IS NULL"</span>)<span class="sc">$</span>n</span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="fu">stopifnot</span>(<span class="st">"er_mode = 'cell' taxa have scored cells without a per-cell ER"</span> <span class="ot">=</span> n_gap <span class="sc">==</span> <span class="dv">0</span>)</span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>er_sql <span class="ot">&lt;-</span> <span class="st">"(CASE t.er_mode WHEN 'premultiplied' THEN 100 WHEN 'cell' THEN e.er ELSE t.er_score END)"</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> (cat <span class="cf">in</span> sp_cats) {</span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>  s <span class="ot">&lt;-</span> <span class="fu">mseq</span>(<span class="fu">glue</span>(<span class="st">"extrisk_{cat}"</span>), <span class="fu">glue</span>(<span class="st">"Extinction-risk-weighted suitability, {cat}"</span>))</span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>  <span class="fu">dbExecute</span>(con, <span class="fu">glue</span>(<span class="st">"INSERT INTO cell_metric (cell_id, metric_seq, val)</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a><span class="st">    SELECT mc.cell_id, {s}, ROUND(SUM({er_sql} * mc.val) / 100.0, 2) AS val</span></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a><span class="st">    FROM model_cell mc JOIN taxon t ON mc.mdl_key = t.ms_merge_key</span></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a><span class="st">    LEFT JOIN model_cell_er e ON e.mdl_key = mc.mdl_key AND e.cell_id = mc.cell_id</span></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a><span class="st">    WHERE {taxa_where} AND t.sp_cat = '{cat}'</span></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a><span class="st">    GROUP BY mc.cell_id"</span>))</span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a><span class="fu">log_info</span>(<span class="st">"stage 1a extrisk: {dbGetQuery(con,'SELECT count(*) n FROM cell_metric')$n} cell-metric rows"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </details>
 </div>
 </section>
@@ -384,7 +393,7 @@ Figure&nbsp;1: Per-cell scoring: extrisk_{spcat} → ecoregion rescale, + primpr
 <td style="text-align: right;">623212</td>
 <td style="text-align: right;">0</td>
 <td style="text-align: right;">90</td>
-<td style="text-align: right;">23</td>
+<td style="text-align: right;">23.2</td>
 </tr>
 </tbody>
 </table>
@@ -880,165 +889,177 @@ Figure&nbsp;1: Per-cell scoring: extrisk_{spcat} → ecoregion rescale, + primpr
 <span id="cb20-11"><a href="#cb20-11" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb20-12"><a href="#cb20-12" aria-hidden="true" tabindex="-1"></a>Per-cell scoring (replicates v7 <span class="in">`calc_scores.qmd`</span> exactly):</span>
 <span id="cb20-13"><a href="#cb20-13" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb20-14"><a href="#cb20-14" aria-hidden="true" tabindex="-1"></a><span class="ss">1. </span>**`extrisk_{spcat}`** = <span class="in">`SUM(er_score × val / 100)`</span> over valid species in the category</span>
-<span id="cb20-15"><a href="#cb20-15" aria-hidden="true" tabindex="-1"></a>   (<span class="in">`is_er_spatial`</span>/turtles → er_score = 100; MMPA floor already baked into <span class="in">`er_score`</span>).</span>
-<span id="cb20-16"><a href="#cb20-16" aria-hidden="true" tabindex="-1"></a><span class="ss">2. </span>**ecoregion min/max** of that metric per ecoregion; **`_ecoregion_rescaled`** per cell =</span>
-<span id="cb20-17"><a href="#cb20-17" aria-hidden="true" tabindex="-1"></a>   <span class="in">`(x − eco_min)/(eco_max − eco_min) × 100`</span>, coverage-normalized across ecoregions.</span>
-<span id="cb20-18"><a href="#cb20-18" aria-hidden="true" tabindex="-1"></a><span class="ss">3. </span>**`primprod`** = VGPM <span class="in">`npp_avg`</span> bilinear→cells; same ecoregion min/max + rescale.</span>
-<span id="cb20-19"><a href="#cb20-19" aria-hidden="true" tabindex="-1"></a><span class="ss">4. </span>**composite** <span class="in">`score_extriskspcat_primprod_ecoregionrescaled_equalweights`</span> =</span>
-<span id="cb20-20"><a href="#cb20-20" aria-hidden="true" tabindex="-1"></a>   <span class="in">`ROUND(AVG(present rescaled components))`</span> (7 extrisk + primprod, equal weight).</span>
-<span id="cb20-21"><a href="#cb20-21" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb20-22"><a href="#cb20-22" aria-hidden="true" tabindex="-1"></a><span class="fu">## Design</span></span>
-<span id="cb20-23"><a href="#cb20-23" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb20-26"><a href="#cb20-26" aria-hidden="true" tabindex="-1"></a><span class="in">```{mermaid}</span></span>
-<span id="cb20-27"><a href="#cb20-27" aria-hidden="true" tabindex="-1"></a>%%| label: fig-design</span>
-<span id="cb20-28"><a href="#cb20-28" aria-hidden="true" tabindex="-1"></a>%%| fig-cap: <span class="ot">"</span><span class="st">Per-cell scoring: extrisk_{spcat} → ecoregion rescale, + primprod → equal-weight composite</span><span class="ot">"</span></span>
-<span id="cb20-29"><a href="#cb20-29" aria-hidden="true" tabindex="-1"></a>flowchart LR</span>
-<span id="cb20-30"><a href="#cb20-30" aria-hidden="true" tabindex="-1"></a>  mt[<span class="ot">"</span><span class="st">model_cell × taxon&lt;br/&gt;(er_score, sp_cat, is_marine)</span><span class="ot">"</span>] --&gt; ex[<span class="ot">"</span><span class="st">extrisk_{spcat}&lt;br/&gt;Σ er·val/100</span><span class="ot">"</span>]</span>
-<span id="cb20-31"><a href="#cb20-31" aria-hidden="true" tabindex="-1"></a>  ex --&gt; rs[<span class="ot">"</span><span class="st">ecoregion min/max&lt;br/&gt;→ _ecoregion_rescaled</span><span class="ot">"</span>]</span>
-<span id="cb20-32"><a href="#cb20-32" aria-hidden="true" tabindex="-1"></a>  vg[<span class="ot">"</span><span class="st">VGPM npp_avg → cells</span><span class="ot">"</span>] --&gt; pp[<span class="ot">"</span><span class="st">primprod → rescaled</span><span class="ot">"</span>]</span>
-<span id="cb20-33"><a href="#cb20-33" aria-hidden="true" tabindex="-1"></a>  rs --&gt; cm[(<span class="ot">"</span><span class="st">cell_metric&lt;br/&gt;sdm.duckdb</span><span class="ot">"</span>)]</span>
-<span id="cb20-34"><a href="#cb20-34" aria-hidden="true" tabindex="-1"></a>  pp --&gt; cm</span>
-<span id="cb20-35"><a href="#cb20-35" aria-hidden="true" tabindex="-1"></a>  cm --&gt; co[<span class="ot">"</span><span class="st">equal-weight composite</span><span class="ot">"</span>] --&gt; cm</span>
-<span id="cb20-36"><a href="#cb20-36" aria-hidden="true" tabindex="-1"></a>  cm --&gt; mf[<span class="ot">"</span><span class="st">hash_query(cell_metric)&lt;br/&gt;→ content-addressed manifest</span><span class="ot">"</span>]</span>
-<span id="cb20-37"><a href="#cb20-37" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb20-38"><a href="#cb20-38" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb20-39"><a href="#cb20-39" aria-hidden="true" tabindex="-1"></a><span class="fu">## Setup + metric registry</span></span>
-<span id="cb20-40"><a href="#cb20-40" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb20-43"><a href="#cb20-43" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb20-44"><a href="#cb20-44" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: setup</span></span>
-<span id="cb20-45"><a href="#cb20-45" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb20-46"><a href="#cb20-46" aria-hidden="true" tabindex="-1"></a>librarian<span class="sc">::</span><span class="fu">shelf</span>(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, terra,</span>
-<span id="cb20-47"><a href="#cb20-47" aria-hidden="true" tabindex="-1"></a>                 MarineSensitivity<span class="sc">/</span>msens, <span class="at">quiet =</span> T)</span>
-<span id="cb20-48"><a href="#cb20-48" aria-hidden="true" tabindex="-1"></a><span class="fu">source</span>(<span class="fu">here</span>(<span class="st">"libs/paths.R"</span>)); <span class="fu">source</span>(<span class="fu">here</span>(<span class="st">"libs/vars.R"</span>))</span>
-<span id="cb20-49"><a href="#cb20-49" aria-hidden="true" tabindex="-1"></a>manifest <span class="ot">&lt;-</span> <span class="fu">here</span>(<span class="st">"data/manifests/score_cell_metrics.json"</span>); <span class="fu">dir_create</span>(<span class="fu">path_dir</span>(manifest))</span>
-<span id="cb20-50"><a href="#cb20-50" aria-hidden="true" tabindex="-1"></a>vgpm_tif <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{dir_data}/raw/oregonstate.edu/vgpm.r2022.v.chl.v.sst.2160x4320_2014-2023.avg.sd.tif"</span>)</span>
-<span id="cb20-51"><a href="#cb20-51" aria-hidden="true" tabindex="-1"></a><span class="fu">stopifnot</span>(<span class="fu">all</span>(<span class="fu">file_exists</span>(<span class="fu">c</span>(sdm_db, cellid_tif, vgpm_tif))))</span>
-<span id="cb20-52"><a href="#cb20-52" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb20-53"><a href="#cb20-53" aria-hidden="true" tabindex="-1"></a>con <span class="ot">&lt;-</span> <span class="fu">dbConnect</span>(<span class="fu">duckdb</span>(sdm_db))</span>
-<span id="cb20-54"><a href="#cb20-54" aria-hidden="true" tabindex="-1"></a><span class="co"># fresh recreate (a prior run may have left these with a `value` column, not `val`)</span></span>
-<span id="cb20-55"><a href="#cb20-55" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> (t <span class="cf">in</span> <span class="fu">c</span>(<span class="st">"cell_metric"</span>, <span class="st">"zone_metric"</span>, <span class="st">"metric"</span>)) <span class="fu">dbExecute</span>(con, <span class="fu">paste</span>(<span class="st">"DROP TABLE IF EXISTS"</span>, t))</span>
-<span id="cb20-56"><a href="#cb20-56" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="st">"CREATE TABLE metric (metric_seq INTEGER PRIMARY KEY, metric_key VARCHAR, description VARCHAR)"</span>)</span>
-<span id="cb20-57"><a href="#cb20-57" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="st">"CREATE TABLE cell_metric (cell_id INTEGER, metric_seq INTEGER, val DOUBLE)"</span>)</span>
-<span id="cb20-58"><a href="#cb20-58" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="st">"CREATE TABLE zone_metric (zone_seq INTEGER, metric_seq INTEGER, val DOUBLE)"</span>)</span>
-<span id="cb20-59"><a href="#cb20-59" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb20-60"><a href="#cb20-60" aria-hidden="true" tabindex="-1"></a><span class="co"># idempotent metric_seq: fetch or insert, wiping any prior values for a clean rebuild</span></span>
-<span id="cb20-61"><a href="#cb20-61" aria-hidden="true" tabindex="-1"></a>mseq <span class="ot">&lt;-</span> <span class="cf">function</span>(key, <span class="at">desc =</span> <span class="st">""</span>) {</span>
-<span id="cb20-62"><a href="#cb20-62" aria-hidden="true" tabindex="-1"></a>  ex <span class="ot">&lt;-</span> <span class="fu">dbGetQuery</span>(con, <span class="fu">glue</span>(<span class="st">"SELECT metric_seq FROM metric WHERE metric_key = '{key}'"</span>))</span>
-<span id="cb20-63"><a href="#cb20-63" aria-hidden="true" tabindex="-1"></a>  s  <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="fu">nrow</span>(ex)) ex<span class="sc">$</span>metric_seq[<span class="dv">1</span>] <span class="cf">else</span> {</span>
-<span id="cb20-64"><a href="#cb20-64" aria-hidden="true" tabindex="-1"></a>    s0 <span class="ot">&lt;-</span> <span class="fu">dbGetQuery</span>(con, <span class="st">"SELECT coalesce(max(metric_seq),0)+1 s FROM metric"</span>)<span class="sc">$</span>s</span>
-<span id="cb20-65"><a href="#cb20-65" aria-hidden="true" tabindex="-1"></a>    <span class="fu">dbExecute</span>(con, <span class="fu">glue</span>(<span class="st">"INSERT INTO metric VALUES ({s0}, '{key}', '{gsub(</span><span class="sc">\"</span><span class="st">'</span><span class="sc">\"</span><span class="st">,</span><span class="sc">\"\"</span><span class="st">,desc)}')"</span>)); s0 }</span>
-<span id="cb20-66"><a href="#cb20-66" aria-hidden="true" tabindex="-1"></a>  <span class="fu">dbExecute</span>(con, <span class="fu">glue</span>(<span class="st">"DELETE FROM cell_metric WHERE metric_seq = {s}"</span>))</span>
-<span id="cb20-67"><a href="#cb20-67" aria-hidden="true" tabindex="-1"></a>  <span class="fu">dbExecute</span>(con, <span class="fu">glue</span>(<span class="st">"DELETE FROM zone_metric WHERE metric_seq = {s}"</span>))</span>
-<span id="cb20-68"><a href="#cb20-68" aria-hidden="true" tabindex="-1"></a>  s</span>
-<span id="cb20-69"><a href="#cb20-69" aria-hidden="true" tabindex="-1"></a>}</span>
-<span id="cb20-70"><a href="#cb20-70" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb20-71"><a href="#cb20-71" aria-hidden="true" tabindex="-1"></a><span class="co"># 7 scoring categories (taxonomy-based sp_cat from merge_taxon). primary_producer replaces</span></span>
-<span id="cb20-72"><a href="#cb20-72" aria-hidden="true" tabindex="-1"></a><span class="co"># the old catch-all 'other'; reptiles/amphibians are NOT in this list, so they're excluded.</span></span>
-<span id="cb20-73"><a href="#cb20-73" aria-hidden="true" tabindex="-1"></a>sp_cats <span class="ot">&lt;-</span> <span class="fu">c</span>(<span class="st">"bird"</span>,<span class="st">"coral"</span>,<span class="st">"fish"</span>,<span class="st">"invertebrate"</span>,<span class="st">"mammal"</span>,<span class="st">"primary_producer"</span>,<span class="st">"turtle"</span>)</span>
-<span id="cb20-74"><a href="#cb20-74" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb20-75"><a href="#cb20-75" aria-hidden="true" tabindex="-1"></a><span class="co"># species set: default = US-valid AND marine-relevant (is_marine culls terrestrial birds;</span></span>
-<span id="cb20-76"><a href="#cb20-76" aria-hidden="true" tabindex="-1"></a><span class="co"># non-birds are TRUE). SCORE_V7COMMON=1 -&gt; restrict to v7's scored set (in_v7) for an</span></span>
-<span id="cb20-77"><a href="#cb20-77" aria-hidden="true" tabindex="-1"></a><span class="co"># apples-to-apples v7 comparison that isolates grid/algorithm from the v8 species-set change.</span></span>
-<span id="cb20-78"><a href="#cb20-78" aria-hidden="true" tabindex="-1"></a><span class="co"># SCORE_ALLBIRDS=1 -&gt; drop the marine filter (keep every bird) for diagnostics.</span></span>
-<span id="cb20-79"><a href="#cb20-79" aria-hidden="true" tabindex="-1"></a>taxa_where <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="fu">nzchar</span>(<span class="fu">Sys.getenv</span>(<span class="st">"SCORE_V7COMMON"</span>))) <span class="st">"t.is_valid_usa AND t.in_v7"</span> <span class="cf">else</span> <span class="st">"t.is_valid_usa"</span></span>
-<span id="cb20-80"><a href="#cb20-80" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (<span class="sc">!</span><span class="fu">nzchar</span>(<span class="fu">Sys.getenv</span>(<span class="st">"SCORE_ALLBIRDS"</span>))) taxa_where <span class="ot">&lt;-</span> <span class="fu">paste</span>(taxa_where, <span class="st">"AND t.is_marine"</span>)</span>
-<span id="cb20-81"><a href="#cb20-81" aria-hidden="true" tabindex="-1"></a><span class="fu">log_info</span>(<span class="st">"scoring taxa filter: {taxa_where}"</span>)</span>
-<span id="cb20-82"><a href="#cb20-82" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb20-83"><a href="#cb20-83" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb20-84"><a href="#cb20-84" aria-hidden="true" tabindex="-1"></a><span class="fu">## Stage 1a — extrisk_{spcat} per cell</span></span>
-<span id="cb20-85"><a href="#cb20-85" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb20-88"><a href="#cb20-88" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb20-89"><a href="#cb20-89" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: extrisk</span></span>
-<span id="cb20-90"><a href="#cb20-90" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb20-91"><a href="#cb20-91" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> (cat <span class="cf">in</span> sp_cats) {</span>
-<span id="cb20-92"><a href="#cb20-92" aria-hidden="true" tabindex="-1"></a>  s <span class="ot">&lt;-</span> <span class="fu">mseq</span>(<span class="fu">glue</span>(<span class="st">"extrisk_{cat}"</span>), <span class="fu">glue</span>(<span class="st">"Extinction-risk-weighted suitability, {cat}"</span>))</span>
-<span id="cb20-93"><a href="#cb20-93" aria-hidden="true" tabindex="-1"></a>  <span class="fu">dbExecute</span>(con, <span class="fu">glue</span>(<span class="st">"INSERT INTO cell_metric (cell_id, metric_seq, val)</span></span>
-<span id="cb20-94"><a href="#cb20-94" aria-hidden="true" tabindex="-1"></a><span class="st">    SELECT mc.cell_id, {s}, ROUND(SUM(</span></span>
-<span id="cb20-95"><a href="#cb20-95" aria-hidden="true" tabindex="-1"></a><span class="st">        (CASE WHEN t.is_er_spatial THEN 100 ELSE t.er_score END) * mc.val) / 100.0, 2) AS val</span></span>
-<span id="cb20-96"><a href="#cb20-96" aria-hidden="true" tabindex="-1"></a><span class="st">    FROM model_cell mc JOIN taxon t ON mc.mdl_key = t.ms_merge_key</span></span>
-<span id="cb20-97"><a href="#cb20-97" aria-hidden="true" tabindex="-1"></a><span class="st">    WHERE {taxa_where} AND t.sp_cat = '{cat}'</span></span>
-<span id="cb20-98"><a href="#cb20-98" aria-hidden="true" tabindex="-1"></a><span class="st">    GROUP BY mc.cell_id"</span>))</span>
-<span id="cb20-99"><a href="#cb20-99" aria-hidden="true" tabindex="-1"></a>}</span>
-<span id="cb20-100"><a href="#cb20-100" aria-hidden="true" tabindex="-1"></a><span class="fu">log_info</span>(<span class="st">"stage 1a extrisk: {dbGetQuery(con,'SELECT count(*) n FROM cell_metric')$n} cell-metric rows"</span>)</span>
-<span id="cb20-101"><a href="#cb20-101" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb20-102"><a href="#cb20-102" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb20-103"><a href="#cb20-103" aria-hidden="true" tabindex="-1"></a><span class="fu">## Stage 1b/1c + primprod — ecoregion min/max + rescale</span></span>
-<span id="cb20-104"><a href="#cb20-104" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb20-107"><a href="#cb20-107" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb20-108"><a href="#cb20-108" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: rescale</span></span>
-<span id="cb20-109"><a href="#cb20-109" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb20-110"><a href="#cb20-110" aria-hidden="true" tabindex="-1"></a><span class="co"># ecoregion min/max of a base metric -&gt; zone_metric; then per-cell rescale -&gt; cell_metric</span></span>
-<span id="cb20-111"><a href="#cb20-111" aria-hidden="true" tabindex="-1"></a>rescale_ecoregion <span class="ot">&lt;-</span> <span class="cf">function</span>(base_key) {</span>
-<span id="cb20-112"><a href="#cb20-112" aria-hidden="true" tabindex="-1"></a>  bs   <span class="ot">&lt;-</span> <span class="fu">dbGetQuery</span>(con, <span class="fu">glue</span>(<span class="st">"SELECT metric_seq FROM metric WHERE metric_key='{base_key}'"</span>))<span class="sc">$</span>metric_seq[<span class="dv">1</span>]</span>
-<span id="cb20-113"><a href="#cb20-113" aria-hidden="true" tabindex="-1"></a>  smin <span class="ot">&lt;-</span> <span class="fu">mseq</span>(<span class="fu">glue</span>(<span class="st">"{base_key}_ecoregion_min"</span>)); smax <span class="ot">&lt;-</span> <span class="fu">mseq</span>(<span class="fu">glue</span>(<span class="st">"{base_key}_ecoregion_max"</span>))</span>
-<span id="cb20-114"><a href="#cb20-114" aria-hidden="true" tabindex="-1"></a>  srs  <span class="ot">&lt;-</span> <span class="fu">mseq</span>(<span class="fu">glue</span>(<span class="st">"{base_key}_ecoregion_rescaled"</span>))</span>
-<span id="cb20-115"><a href="#cb20-115" aria-hidden="true" tabindex="-1"></a>  <span class="cf">for</span> (fx <span class="cf">in</span> <span class="fu">list</span>(<span class="fu">c</span>(smin,<span class="st">"min"</span>), <span class="fu">c</span>(smax,<span class="st">"max"</span>)))</span>
-<span id="cb20-116"><a href="#cb20-116" aria-hidden="true" tabindex="-1"></a>    <span class="fu">dbExecute</span>(con, <span class="fu">glue</span>(<span class="st">"INSERT INTO zone_metric (zone_seq, metric_seq, val)</span></span>
-<span id="cb20-117"><a href="#cb20-117" aria-hidden="true" tabindex="-1"></a><span class="st">      SELECT z.zone_seq, {fx[1]}, {fx[2]}(cm.val)</span></span>
-<span id="cb20-118"><a href="#cb20-118" aria-hidden="true" tabindex="-1"></a><span class="st">      FROM zone z JOIN zone_cell zc USING(zone_seq) JOIN cell_metric cm ON zc.cell_id=cm.cell_id</span></span>
-<span id="cb20-119"><a href="#cb20-119" aria-hidden="true" tabindex="-1"></a><span class="st">      WHERE z.fld='ecoregion_key' AND cm.metric_seq={bs} GROUP BY z.zone_seq"</span>))</span>
-<span id="cb20-120"><a href="#cb20-120" aria-hidden="true" tabindex="-1"></a>  <span class="fu">dbExecute</span>(con, <span class="fu">glue</span>(<span class="st">"INSERT INTO cell_metric (cell_id, metric_seq, val)</span></span>
-<span id="cb20-121"><a href="#cb20-121" aria-hidden="true" tabindex="-1"></a><span class="st">    WITH cell_ecoregion AS (</span></span>
-<span id="cb20-122"><a href="#cb20-122" aria-hidden="true" tabindex="-1"></a><span class="st">      SELECT zc.cell_id, zc.zone_seq,</span></span>
-<span id="cb20-123"><a href="#cb20-123" aria-hidden="true" tabindex="-1"></a><span class="st">             zc.pct_covered * 100.0 / SUM(zc.pct_covered) OVER (PARTITION BY zc.cell_id) AS norm_pct</span></span>
-<span id="cb20-124"><a href="#cb20-124" aria-hidden="true" tabindex="-1"></a><span class="st">      FROM zone_cell zc JOIN zone z USING(zone_seq) WHERE z.fld='ecoregion_key'),</span></span>
-<span id="cb20-125"><a href="#cb20-125" aria-hidden="true" tabindex="-1"></a><span class="st">    mm AS (SELECT mn.zone_seq, mn.val min_v, mx.val max_v</span></span>
-<span id="cb20-126"><a href="#cb20-126" aria-hidden="true" tabindex="-1"></a><span class="st">           FROM (SELECT zone_seq,val FROM zone_metric WHERE metric_seq={smin}) mn</span></span>
-<span id="cb20-127"><a href="#cb20-127" aria-hidden="true" tabindex="-1"></a><span class="st">           JOIN (SELECT zone_seq,val FROM zone_metric WHERE metric_seq={smax}) mx USING(zone_seq))</span></span>
-<span id="cb20-128"><a href="#cb20-128" aria-hidden="true" tabindex="-1"></a><span class="st">    SELECT cm.cell_id, {srs},</span></span>
-<span id="cb20-129"><a href="#cb20-129" aria-hidden="true" tabindex="-1"></a><span class="st">      SUM((cm.val - mm.min_v)/(mm.max_v - mm.min_v) * (ce.norm_pct/100.0)) * 100 AS val</span></span>
-<span id="cb20-130"><a href="#cb20-130" aria-hidden="true" tabindex="-1"></a><span class="st">    FROM cell_metric cm JOIN cell_ecoregion ce ON cm.cell_id=ce.cell_id JOIN mm ON ce.zone_seq=mm.zone_seq</span></span>
-<span id="cb20-131"><a href="#cb20-131" aria-hidden="true" tabindex="-1"></a><span class="st">    WHERE cm.metric_seq={bs} AND mm.min_v &lt; mm.max_v</span></span>
-<span id="cb20-132"><a href="#cb20-132" aria-hidden="true" tabindex="-1"></a><span class="st">    GROUP BY cm.cell_id"</span>))</span>
-<span id="cb20-133"><a href="#cb20-133" aria-hidden="true" tabindex="-1"></a>}</span>
-<span id="cb20-134"><a href="#cb20-134" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> (cat <span class="cf">in</span> sp_cats) <span class="fu">rescale_ecoregion</span>(<span class="fu">glue</span>(<span class="st">"extrisk_{cat}"</span>))</span>
-<span id="cb20-135"><a href="#cb20-135" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb20-136"><a href="#cb20-136" aria-hidden="true" tabindex="-1"></a><span class="co"># primprod: VGPM npp_avg bilinear -&gt; cells (restricted to US cells) -&gt; cell_metric, then rescale</span></span>
-<span id="cb20-137"><a href="#cb20-137" aria-hidden="true" tabindex="-1"></a>sp <span class="ot">&lt;-</span> <span class="fu">mseq</span>(<span class="st">"primprod"</span>, <span class="st">"Primary productivity VGPM/VIIRS npp_avg (mg C/m2/day)"</span>)</span>
-<span id="cb20-138"><a href="#cb20-138" aria-hidden="true" tabindex="-1"></a>pp <span class="ot">&lt;-</span> <span class="fu">cells_from_raster</span>(<span class="fu">subset</span>(<span class="fu">rast</span>(vgpm_tif), <span class="st">"npp_avg"</span>), cellid_tif,</span>
-<span id="cb20-139"><a href="#cb20-139" aria-hidden="true" tabindex="-1"></a>                        <span class="at">method =</span> <span class="st">"bilinear"</span>, <span class="at">min_value =</span> <span class="dv">0</span>, <span class="at">zero_fill =</span> <span class="cn">FALSE</span>)</span>
-<span id="cb20-140"><a href="#cb20-140" aria-hidden="true" tabindex="-1"></a><span class="fu">duckdb_register</span>(con, <span class="st">"tmp_pp_df"</span>, pp)</span>
-<span id="cb20-141"><a href="#cb20-141" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="fu">glue</span>(<span class="st">"INSERT INTO cell_metric (cell_id, metric_seq, val)</span></span>
-<span id="cb20-142"><a href="#cb20-142" aria-hidden="true" tabindex="-1"></a><span class="st">  SELECT p.cell_id, {sp}, p.val FROM tmp_pp_df p JOIN cell c ON p.cell_id = c.cell_id WHERE c.in_usa"</span>))</span>
-<span id="cb20-143"><a href="#cb20-143" aria-hidden="true" tabindex="-1"></a><span class="fu">duckdb_unregister</span>(con, <span class="st">"tmp_pp_df"</span>)</span>
-<span id="cb20-144"><a href="#cb20-144" aria-hidden="true" tabindex="-1"></a><span class="fu">rescale_ecoregion</span>(<span class="st">"primprod"</span>)</span>
-<span id="cb20-145"><a href="#cb20-145" aria-hidden="true" tabindex="-1"></a><span class="fu">log_info</span>(<span class="st">"stage 1b/1c + primprod done"</span>)</span>
-<span id="cb20-146"><a href="#cb20-146" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb20-14"><a href="#cb20-14" aria-hidden="true" tabindex="-1"></a><span class="ss">1. </span>**`extrisk_{spcat}`** = <span class="in">`SUM(er × val / 100)`</span> over valid species in the category, where the</span>
+<span id="cb20-15"><a href="#cb20-15" aria-hidden="true" tabindex="-1"></a>   weight <span class="in">`er`</span> depends on the taxon's <span class="in">`er_mode`</span> (score_zones): the governing <span class="in">`er_score`</span> (scalar,</span>
+<span id="cb20-16"><a href="#cb20-16" aria-hidden="true" tabindex="-1"></a>   MMPA/MBTA floors baked in) for ordinary taxa; <span class="in">`100`</span> for the sea turtles, whose merged <span class="in">`val`</span> is</span>
+<span id="cb20-17"><a href="#cb20-17" aria-hidden="true" tabindex="-1"></a>   already ER × suitability (<span class="in">`premultiplied`</span>); the **per-cell** ER from <span class="in">`model_cell_er`</span> for the</span>
+<span id="cb20-18"><a href="#cb20-18" aria-hidden="true" tabindex="-1"></a>   NMFS DPS species (<span class="in">`cell`</span>), whose merged <span class="in">`val`</span> is the suitability alone.</span>
+<span id="cb20-19"><a href="#cb20-19" aria-hidden="true" tabindex="-1"></a><span class="ss">2. </span>**ecoregion min/max** of that metric per ecoregion; **`_ecoregion_rescaled`** per cell =</span>
+<span id="cb20-20"><a href="#cb20-20" aria-hidden="true" tabindex="-1"></a>   <span class="in">`(x − eco_min)/(eco_max − eco_min) × 100`</span>, coverage-normalized across ecoregions.</span>
+<span id="cb20-21"><a href="#cb20-21" aria-hidden="true" tabindex="-1"></a><span class="ss">3. </span>**`primprod`** = VGPM <span class="in">`npp_avg`</span> bilinear→cells; same ecoregion min/max + rescale.</span>
+<span id="cb20-22"><a href="#cb20-22" aria-hidden="true" tabindex="-1"></a><span class="ss">4. </span>**composite** <span class="in">`score_extriskspcat_primprod_ecoregionrescaled_equalweights`</span> =</span>
+<span id="cb20-23"><a href="#cb20-23" aria-hidden="true" tabindex="-1"></a>   <span class="in">`ROUND(AVG(present rescaled components))`</span> (7 extrisk + primprod, equal weight).</span>
+<span id="cb20-24"><a href="#cb20-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-25"><a href="#cb20-25" aria-hidden="true" tabindex="-1"></a><span class="fu">## Design</span></span>
+<span id="cb20-26"><a href="#cb20-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-29"><a href="#cb20-29" aria-hidden="true" tabindex="-1"></a><span class="in">```{mermaid}</span></span>
+<span id="cb20-30"><a href="#cb20-30" aria-hidden="true" tabindex="-1"></a>%%| label: fig-design</span>
+<span id="cb20-31"><a href="#cb20-31" aria-hidden="true" tabindex="-1"></a>%%| fig-cap: <span class="ot">"</span><span class="st">Per-cell scoring: extrisk_{spcat} → ecoregion rescale, + primprod → equal-weight composite</span><span class="ot">"</span></span>
+<span id="cb20-32"><a href="#cb20-32" aria-hidden="true" tabindex="-1"></a>flowchart LR</span>
+<span id="cb20-33"><a href="#cb20-33" aria-hidden="true" tabindex="-1"></a>  mt[<span class="ot">"</span><span class="st">model_cell × taxon&lt;br/&gt;(er_score | 100 | model_cell_er by er_mode; sp_cat, is_marine)</span><span class="ot">"</span>] --&gt; ex[<span class="ot">"</span><span class="st">extrisk_{spcat}&lt;br/&gt;Σ er·val/100</span><span class="ot">"</span>]</span>
+<span id="cb20-34"><a href="#cb20-34" aria-hidden="true" tabindex="-1"></a>  ex --&gt; rs[<span class="ot">"</span><span class="st">ecoregion min/max&lt;br/&gt;→ _ecoregion_rescaled</span><span class="ot">"</span>]</span>
+<span id="cb20-35"><a href="#cb20-35" aria-hidden="true" tabindex="-1"></a>  vg[<span class="ot">"</span><span class="st">VGPM npp_avg → cells</span><span class="ot">"</span>] --&gt; pp[<span class="ot">"</span><span class="st">primprod → rescaled</span><span class="ot">"</span>]</span>
+<span id="cb20-36"><a href="#cb20-36" aria-hidden="true" tabindex="-1"></a>  rs --&gt; cm[(<span class="ot">"</span><span class="st">cell_metric&lt;br/&gt;sdm.duckdb</span><span class="ot">"</span>)]</span>
+<span id="cb20-37"><a href="#cb20-37" aria-hidden="true" tabindex="-1"></a>  pp --&gt; cm</span>
+<span id="cb20-38"><a href="#cb20-38" aria-hidden="true" tabindex="-1"></a>  cm --&gt; co[<span class="ot">"</span><span class="st">equal-weight composite</span><span class="ot">"</span>] --&gt; cm</span>
+<span id="cb20-39"><a href="#cb20-39" aria-hidden="true" tabindex="-1"></a>  cm --&gt; mf[<span class="ot">"</span><span class="st">hash_query(cell_metric)&lt;br/&gt;→ content-addressed manifest</span><span class="ot">"</span>]</span>
+<span id="cb20-40"><a href="#cb20-40" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb20-41"><a href="#cb20-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-42"><a href="#cb20-42" aria-hidden="true" tabindex="-1"></a><span class="fu">## Setup + metric registry</span></span>
+<span id="cb20-43"><a href="#cb20-43" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-46"><a href="#cb20-46" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb20-47"><a href="#cb20-47" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: setup</span></span>
+<span id="cb20-48"><a href="#cb20-48" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-49"><a href="#cb20-49" aria-hidden="true" tabindex="-1"></a>librarian<span class="sc">::</span><span class="fu">shelf</span>(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, terra,</span>
+<span id="cb20-50"><a href="#cb20-50" aria-hidden="true" tabindex="-1"></a>                 MarineSensitivity<span class="sc">/</span>msens, <span class="at">quiet =</span> T)</span>
+<span id="cb20-51"><a href="#cb20-51" aria-hidden="true" tabindex="-1"></a><span class="fu">source</span>(<span class="fu">here</span>(<span class="st">"libs/paths.R"</span>)); <span class="fu">source</span>(<span class="fu">here</span>(<span class="st">"libs/vars.R"</span>))</span>
+<span id="cb20-52"><a href="#cb20-52" aria-hidden="true" tabindex="-1"></a>manifest <span class="ot">&lt;-</span> <span class="fu">here</span>(<span class="st">"data/manifests/score_cell_metrics.json"</span>); <span class="fu">dir_create</span>(<span class="fu">path_dir</span>(manifest))</span>
+<span id="cb20-53"><a href="#cb20-53" aria-hidden="true" tabindex="-1"></a>vgpm_tif <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{dir_data}/raw/oregonstate.edu/vgpm.r2022.v.chl.v.sst.2160x4320_2014-2023.avg.sd.tif"</span>)</span>
+<span id="cb20-54"><a href="#cb20-54" aria-hidden="true" tabindex="-1"></a><span class="fu">stopifnot</span>(<span class="fu">all</span>(<span class="fu">file_exists</span>(<span class="fu">c</span>(sdm_db, cellid_tif, vgpm_tif))))</span>
+<span id="cb20-55"><a href="#cb20-55" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-56"><a href="#cb20-56" aria-hidden="true" tabindex="-1"></a>con <span class="ot">&lt;-</span> <span class="fu">dbConnect</span>(<span class="fu">duckdb</span>(sdm_db))</span>
+<span id="cb20-57"><a href="#cb20-57" aria-hidden="true" tabindex="-1"></a><span class="co"># fresh recreate (a prior run may have left these with a `value` column, not `val`)</span></span>
+<span id="cb20-58"><a href="#cb20-58" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> (t <span class="cf">in</span> <span class="fu">c</span>(<span class="st">"cell_metric"</span>, <span class="st">"zone_metric"</span>, <span class="st">"metric"</span>)) <span class="fu">dbExecute</span>(con, <span class="fu">paste</span>(<span class="st">"DROP TABLE IF EXISTS"</span>, t))</span>
+<span id="cb20-59"><a href="#cb20-59" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="st">"CREATE TABLE metric (metric_seq INTEGER PRIMARY KEY, metric_key VARCHAR, description VARCHAR)"</span>)</span>
+<span id="cb20-60"><a href="#cb20-60" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="st">"CREATE TABLE cell_metric (cell_id INTEGER, metric_seq INTEGER, val DOUBLE)"</span>)</span>
+<span id="cb20-61"><a href="#cb20-61" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="st">"CREATE TABLE zone_metric (zone_seq INTEGER, metric_seq INTEGER, val DOUBLE)"</span>)</span>
+<span id="cb20-62"><a href="#cb20-62" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-63"><a href="#cb20-63" aria-hidden="true" tabindex="-1"></a><span class="co"># idempotent metric_seq: fetch or insert, wiping any prior values for a clean rebuild</span></span>
+<span id="cb20-64"><a href="#cb20-64" aria-hidden="true" tabindex="-1"></a>mseq <span class="ot">&lt;-</span> <span class="cf">function</span>(key, <span class="at">desc =</span> <span class="st">""</span>) {</span>
+<span id="cb20-65"><a href="#cb20-65" aria-hidden="true" tabindex="-1"></a>  ex <span class="ot">&lt;-</span> <span class="fu">dbGetQuery</span>(con, <span class="fu">glue</span>(<span class="st">"SELECT metric_seq FROM metric WHERE metric_key = '{key}'"</span>))</span>
+<span id="cb20-66"><a href="#cb20-66" aria-hidden="true" tabindex="-1"></a>  s  <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="fu">nrow</span>(ex)) ex<span class="sc">$</span>metric_seq[<span class="dv">1</span>] <span class="cf">else</span> {</span>
+<span id="cb20-67"><a href="#cb20-67" aria-hidden="true" tabindex="-1"></a>    s0 <span class="ot">&lt;-</span> <span class="fu">dbGetQuery</span>(con, <span class="st">"SELECT coalesce(max(metric_seq),0)+1 s FROM metric"</span>)<span class="sc">$</span>s</span>
+<span id="cb20-68"><a href="#cb20-68" aria-hidden="true" tabindex="-1"></a>    <span class="fu">dbExecute</span>(con, <span class="fu">glue</span>(<span class="st">"INSERT INTO metric VALUES ({s0}, '{key}', '{gsub(</span><span class="sc">\"</span><span class="st">'</span><span class="sc">\"</span><span class="st">,</span><span class="sc">\"\"</span><span class="st">,desc)}')"</span>)); s0 }</span>
+<span id="cb20-69"><a href="#cb20-69" aria-hidden="true" tabindex="-1"></a>  <span class="fu">dbExecute</span>(con, <span class="fu">glue</span>(<span class="st">"DELETE FROM cell_metric WHERE metric_seq = {s}"</span>))</span>
+<span id="cb20-70"><a href="#cb20-70" aria-hidden="true" tabindex="-1"></a>  <span class="fu">dbExecute</span>(con, <span class="fu">glue</span>(<span class="st">"DELETE FROM zone_metric WHERE metric_seq = {s}"</span>))</span>
+<span id="cb20-71"><a href="#cb20-71" aria-hidden="true" tabindex="-1"></a>  s</span>
+<span id="cb20-72"><a href="#cb20-72" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb20-73"><a href="#cb20-73" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-74"><a href="#cb20-74" aria-hidden="true" tabindex="-1"></a><span class="co"># 7 scoring categories (taxonomy-based sp_cat from merge_taxon). primary_producer replaces</span></span>
+<span id="cb20-75"><a href="#cb20-75" aria-hidden="true" tabindex="-1"></a><span class="co"># the old catch-all 'other'; reptiles/amphibians are NOT in this list, so they're excluded.</span></span>
+<span id="cb20-76"><a href="#cb20-76" aria-hidden="true" tabindex="-1"></a>sp_cats <span class="ot">&lt;-</span> <span class="fu">c</span>(<span class="st">"bird"</span>,<span class="st">"coral"</span>,<span class="st">"fish"</span>,<span class="st">"invertebrate"</span>,<span class="st">"mammal"</span>,<span class="st">"primary_producer"</span>,<span class="st">"turtle"</span>)</span>
+<span id="cb20-77"><a href="#cb20-77" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-78"><a href="#cb20-78" aria-hidden="true" tabindex="-1"></a><span class="co"># species set: default = US-valid AND marine-relevant (is_marine culls terrestrial birds;</span></span>
+<span id="cb20-79"><a href="#cb20-79" aria-hidden="true" tabindex="-1"></a><span class="co"># non-birds are TRUE). SCORE_V7COMMON=1 -&gt; restrict to v7's scored set (in_v7) for an</span></span>
+<span id="cb20-80"><a href="#cb20-80" aria-hidden="true" tabindex="-1"></a><span class="co"># apples-to-apples v7 comparison that isolates grid/algorithm from the v8 species-set change.</span></span>
+<span id="cb20-81"><a href="#cb20-81" aria-hidden="true" tabindex="-1"></a><span class="co"># SCORE_ALLBIRDS=1 -&gt; drop the marine filter (keep every bird) for diagnostics.</span></span>
+<span id="cb20-82"><a href="#cb20-82" aria-hidden="true" tabindex="-1"></a>taxa_where <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="fu">nzchar</span>(<span class="fu">Sys.getenv</span>(<span class="st">"SCORE_V7COMMON"</span>))) <span class="st">"t.is_valid_usa AND t.in_v7"</span> <span class="cf">else</span> <span class="st">"t.is_valid_usa"</span></span>
+<span id="cb20-83"><a href="#cb20-83" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> (<span class="sc">!</span><span class="fu">nzchar</span>(<span class="fu">Sys.getenv</span>(<span class="st">"SCORE_ALLBIRDS"</span>))) taxa_where <span class="ot">&lt;-</span> <span class="fu">paste</span>(taxa_where, <span class="st">"AND t.is_marine"</span>)</span>
+<span id="cb20-84"><a href="#cb20-84" aria-hidden="true" tabindex="-1"></a><span class="fu">log_info</span>(<span class="st">"scoring taxa filter: {taxa_where}"</span>)</span>
+<span id="cb20-85"><a href="#cb20-85" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb20-86"><a href="#cb20-86" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-87"><a href="#cb20-87" aria-hidden="true" tabindex="-1"></a><span class="fu">## Stage 1a — extrisk_{spcat} per cell</span></span>
+<span id="cb20-88"><a href="#cb20-88" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-91"><a href="#cb20-91" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb20-92"><a href="#cb20-92" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: extrisk</span></span>
+<span id="cb20-93"><a href="#cb20-93" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-94"><a href="#cb20-94" aria-hidden="true" tabindex="-1"></a><span class="co"># the ER weight per (taxon, cell) by er_mode -- see score_zones; a 'cell' taxon without its per-cell</span></span>
+<span id="cb20-95"><a href="#cb20-95" aria-hidden="true" tabindex="-1"></a><span class="co"># ER would be weighted NULL (dropped from the sum), so the join is asserted complete first</span></span>
+<span id="cb20-96"><a href="#cb20-96" aria-hidden="true" tabindex="-1"></a><span class="fu">stopifnot</span>(<span class="st">"run score_zones first (taxon.er_mode / model_cell_er missing)"</span> <span class="ot">=</span></span>
+<span id="cb20-97"><a href="#cb20-97" aria-hidden="true" tabindex="-1"></a>            <span class="st">"er_mode"</span> <span class="sc">%in%</span> <span class="fu">dbListFields</span>(con, <span class="st">"taxon"</span>) <span class="sc">&amp;&amp;</span> <span class="st">"model_cell_er"</span> <span class="sc">%in%</span> <span class="fu">dbListTables</span>(con))</span>
+<span id="cb20-98"><a href="#cb20-98" aria-hidden="true" tabindex="-1"></a>n_gap <span class="ot">&lt;-</span> <span class="fu">dbGetQuery</span>(con, <span class="st">"SELECT count(*) n FROM model_cell mc JOIN taxon t ON mc.mdl_key = t.ms_merge_key</span></span>
+<span id="cb20-99"><a href="#cb20-99" aria-hidden="true" tabindex="-1"></a><span class="st">  LEFT JOIN model_cell_er e ON e.mdl_key = mc.mdl_key AND e.cell_id = mc.cell_id</span></span>
+<span id="cb20-100"><a href="#cb20-100" aria-hidden="true" tabindex="-1"></a><span class="st">  WHERE t.er_mode = 'cell' AND e.er IS NULL"</span>)<span class="sc">$</span>n</span>
+<span id="cb20-101"><a href="#cb20-101" aria-hidden="true" tabindex="-1"></a><span class="fu">stopifnot</span>(<span class="st">"er_mode = 'cell' taxa have scored cells without a per-cell ER"</span> <span class="ot">=</span> n_gap <span class="sc">==</span> <span class="dv">0</span>)</span>
+<span id="cb20-102"><a href="#cb20-102" aria-hidden="true" tabindex="-1"></a>er_sql <span class="ot">&lt;-</span> <span class="st">"(CASE t.er_mode WHEN 'premultiplied' THEN 100 WHEN 'cell' THEN e.er ELSE t.er_score END)"</span></span>
+<span id="cb20-103"><a href="#cb20-103" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> (cat <span class="cf">in</span> sp_cats) {</span>
+<span id="cb20-104"><a href="#cb20-104" aria-hidden="true" tabindex="-1"></a>  s <span class="ot">&lt;-</span> <span class="fu">mseq</span>(<span class="fu">glue</span>(<span class="st">"extrisk_{cat}"</span>), <span class="fu">glue</span>(<span class="st">"Extinction-risk-weighted suitability, {cat}"</span>))</span>
+<span id="cb20-105"><a href="#cb20-105" aria-hidden="true" tabindex="-1"></a>  <span class="fu">dbExecute</span>(con, <span class="fu">glue</span>(<span class="st">"INSERT INTO cell_metric (cell_id, metric_seq, val)</span></span>
+<span id="cb20-106"><a href="#cb20-106" aria-hidden="true" tabindex="-1"></a><span class="st">    SELECT mc.cell_id, {s}, ROUND(SUM({er_sql} * mc.val) / 100.0, 2) AS val</span></span>
+<span id="cb20-107"><a href="#cb20-107" aria-hidden="true" tabindex="-1"></a><span class="st">    FROM model_cell mc JOIN taxon t ON mc.mdl_key = t.ms_merge_key</span></span>
+<span id="cb20-108"><a href="#cb20-108" aria-hidden="true" tabindex="-1"></a><span class="st">    LEFT JOIN model_cell_er e ON e.mdl_key = mc.mdl_key AND e.cell_id = mc.cell_id</span></span>
+<span id="cb20-109"><a href="#cb20-109" aria-hidden="true" tabindex="-1"></a><span class="st">    WHERE {taxa_where} AND t.sp_cat = '{cat}'</span></span>
+<span id="cb20-110"><a href="#cb20-110" aria-hidden="true" tabindex="-1"></a><span class="st">    GROUP BY mc.cell_id"</span>))</span>
+<span id="cb20-111"><a href="#cb20-111" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb20-112"><a href="#cb20-112" aria-hidden="true" tabindex="-1"></a><span class="fu">log_info</span>(<span class="st">"stage 1a extrisk: {dbGetQuery(con,'SELECT count(*) n FROM cell_metric')$n} cell-metric rows"</span>)</span>
+<span id="cb20-113"><a href="#cb20-113" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb20-114"><a href="#cb20-114" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-115"><a href="#cb20-115" aria-hidden="true" tabindex="-1"></a><span class="fu">## Stage 1b/1c + primprod — ecoregion min/max + rescale</span></span>
+<span id="cb20-116"><a href="#cb20-116" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-119"><a href="#cb20-119" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb20-120"><a href="#cb20-120" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: rescale</span></span>
+<span id="cb20-121"><a href="#cb20-121" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-122"><a href="#cb20-122" aria-hidden="true" tabindex="-1"></a><span class="co"># ecoregion min/max of a base metric -&gt; zone_metric; then per-cell rescale -&gt; cell_metric</span></span>
+<span id="cb20-123"><a href="#cb20-123" aria-hidden="true" tabindex="-1"></a>rescale_ecoregion <span class="ot">&lt;-</span> <span class="cf">function</span>(base_key) {</span>
+<span id="cb20-124"><a href="#cb20-124" aria-hidden="true" tabindex="-1"></a>  bs   <span class="ot">&lt;-</span> <span class="fu">dbGetQuery</span>(con, <span class="fu">glue</span>(<span class="st">"SELECT metric_seq FROM metric WHERE metric_key='{base_key}'"</span>))<span class="sc">$</span>metric_seq[<span class="dv">1</span>]</span>
+<span id="cb20-125"><a href="#cb20-125" aria-hidden="true" tabindex="-1"></a>  smin <span class="ot">&lt;-</span> <span class="fu">mseq</span>(<span class="fu">glue</span>(<span class="st">"{base_key}_ecoregion_min"</span>)); smax <span class="ot">&lt;-</span> <span class="fu">mseq</span>(<span class="fu">glue</span>(<span class="st">"{base_key}_ecoregion_max"</span>))</span>
+<span id="cb20-126"><a href="#cb20-126" aria-hidden="true" tabindex="-1"></a>  srs  <span class="ot">&lt;-</span> <span class="fu">mseq</span>(<span class="fu">glue</span>(<span class="st">"{base_key}_ecoregion_rescaled"</span>))</span>
+<span id="cb20-127"><a href="#cb20-127" aria-hidden="true" tabindex="-1"></a>  <span class="cf">for</span> (fx <span class="cf">in</span> <span class="fu">list</span>(<span class="fu">c</span>(smin,<span class="st">"min"</span>), <span class="fu">c</span>(smax,<span class="st">"max"</span>)))</span>
+<span id="cb20-128"><a href="#cb20-128" aria-hidden="true" tabindex="-1"></a>    <span class="fu">dbExecute</span>(con, <span class="fu">glue</span>(<span class="st">"INSERT INTO zone_metric (zone_seq, metric_seq, val)</span></span>
+<span id="cb20-129"><a href="#cb20-129" aria-hidden="true" tabindex="-1"></a><span class="st">      SELECT z.zone_seq, {fx[1]}, {fx[2]}(cm.val)</span></span>
+<span id="cb20-130"><a href="#cb20-130" aria-hidden="true" tabindex="-1"></a><span class="st">      FROM zone z JOIN zone_cell zc USING(zone_seq) JOIN cell_metric cm ON zc.cell_id=cm.cell_id</span></span>
+<span id="cb20-131"><a href="#cb20-131" aria-hidden="true" tabindex="-1"></a><span class="st">      WHERE z.fld='ecoregion_key' AND cm.metric_seq={bs} GROUP BY z.zone_seq"</span>))</span>
+<span id="cb20-132"><a href="#cb20-132" aria-hidden="true" tabindex="-1"></a>  <span class="fu">dbExecute</span>(con, <span class="fu">glue</span>(<span class="st">"INSERT INTO cell_metric (cell_id, metric_seq, val)</span></span>
+<span id="cb20-133"><a href="#cb20-133" aria-hidden="true" tabindex="-1"></a><span class="st">    WITH cell_ecoregion AS (</span></span>
+<span id="cb20-134"><a href="#cb20-134" aria-hidden="true" tabindex="-1"></a><span class="st">      SELECT zc.cell_id, zc.zone_seq,</span></span>
+<span id="cb20-135"><a href="#cb20-135" aria-hidden="true" tabindex="-1"></a><span class="st">             zc.pct_covered * 100.0 / SUM(zc.pct_covered) OVER (PARTITION BY zc.cell_id) AS norm_pct</span></span>
+<span id="cb20-136"><a href="#cb20-136" aria-hidden="true" tabindex="-1"></a><span class="st">      FROM zone_cell zc JOIN zone z USING(zone_seq) WHERE z.fld='ecoregion_key'),</span></span>
+<span id="cb20-137"><a href="#cb20-137" aria-hidden="true" tabindex="-1"></a><span class="st">    mm AS (SELECT mn.zone_seq, mn.val min_v, mx.val max_v</span></span>
+<span id="cb20-138"><a href="#cb20-138" aria-hidden="true" tabindex="-1"></a><span class="st">           FROM (SELECT zone_seq,val FROM zone_metric WHERE metric_seq={smin}) mn</span></span>
+<span id="cb20-139"><a href="#cb20-139" aria-hidden="true" tabindex="-1"></a><span class="st">           JOIN (SELECT zone_seq,val FROM zone_metric WHERE metric_seq={smax}) mx USING(zone_seq))</span></span>
+<span id="cb20-140"><a href="#cb20-140" aria-hidden="true" tabindex="-1"></a><span class="st">    SELECT cm.cell_id, {srs},</span></span>
+<span id="cb20-141"><a href="#cb20-141" aria-hidden="true" tabindex="-1"></a><span class="st">      SUM((cm.val - mm.min_v)/(mm.max_v - mm.min_v) * (ce.norm_pct/100.0)) * 100 AS val</span></span>
+<span id="cb20-142"><a href="#cb20-142" aria-hidden="true" tabindex="-1"></a><span class="st">    FROM cell_metric cm JOIN cell_ecoregion ce ON cm.cell_id=ce.cell_id JOIN mm ON ce.zone_seq=mm.zone_seq</span></span>
+<span id="cb20-143"><a href="#cb20-143" aria-hidden="true" tabindex="-1"></a><span class="st">    WHERE cm.metric_seq={bs} AND mm.min_v &lt; mm.max_v</span></span>
+<span id="cb20-144"><a href="#cb20-144" aria-hidden="true" tabindex="-1"></a><span class="st">    GROUP BY cm.cell_id"</span>))</span>
+<span id="cb20-145"><a href="#cb20-145" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb20-146"><a href="#cb20-146" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> (cat <span class="cf">in</span> sp_cats) <span class="fu">rescale_ecoregion</span>(<span class="fu">glue</span>(<span class="st">"extrisk_{cat}"</span>))</span>
 <span id="cb20-147"><a href="#cb20-147" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb20-148"><a href="#cb20-148" aria-hidden="true" tabindex="-1"></a><span class="fu">## Stage 3 — equal-weight composite per cell</span></span>
-<span id="cb20-149"><a href="#cb20-149" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb20-152"><a href="#cb20-152" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb20-153"><a href="#cb20-153" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: composite</span></span>
-<span id="cb20-154"><a href="#cb20-154" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb20-155"><a href="#cb20-155" aria-hidden="true" tabindex="-1"></a>comp_keys <span class="ot">&lt;-</span> <span class="fu">c</span>(<span class="fu">glue</span>(<span class="st">"extrisk_{sp_cats}_ecoregion_rescaled"</span>), <span class="st">"primprod_ecoregion_rescaled"</span>)</span>
-<span id="cb20-156"><a href="#cb20-156" aria-hidden="true" tabindex="-1"></a>sc <span class="ot">&lt;-</span> <span class="fu">mseq</span>(<span class="st">"score_extriskspcat_primprod_ecoregionrescaled_equalweights"</span>, <span class="st">"Equal-weight composite"</span>)</span>
-<span id="cb20-157"><a href="#cb20-157" aria-hidden="true" tabindex="-1"></a>in_list <span class="ot">&lt;-</span> <span class="fu">paste</span>(<span class="fu">sprintf</span>(<span class="st">"'%s'"</span>, comp_keys), <span class="at">collapse=</span><span class="st">","</span>)</span>
-<span id="cb20-158"><a href="#cb20-158" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="fu">glue</span>(<span class="st">"INSERT INTO cell_metric (cell_id, metric_seq, val)</span></span>
-<span id="cb20-159"><a href="#cb20-159" aria-hidden="true" tabindex="-1"></a><span class="st">  SELECT cm.cell_id, {sc}, ROUND(AVG(cm.val))</span></span>
-<span id="cb20-160"><a href="#cb20-160" aria-hidden="true" tabindex="-1"></a><span class="st">  FROM cell_metric cm JOIN metric m USING(metric_seq)</span></span>
-<span id="cb20-161"><a href="#cb20-161" aria-hidden="true" tabindex="-1"></a><span class="st">  WHERE m.metric_key IN ({in_list}) GROUP BY cm.cell_id"</span>))</span>
-<span id="cb20-162"><a href="#cb20-162" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb20-163"><a href="#cb20-163" aria-hidden="true" tabindex="-1"></a>smry <span class="ot">&lt;-</span> <span class="fu">dbGetQuery</span>(con, <span class="fu">glue</span>(<span class="st">"SELECT count(*) n_cells, round(min(val),1) v_min, round(max(val),1) v_max,</span></span>
-<span id="cb20-164"><a href="#cb20-164" aria-hidden="true" tabindex="-1"></a><span class="st">  round(avg(val),1) v_avg FROM cell_metric WHERE metric_seq={sc}"</span>))</span>
-<span id="cb20-165"><a href="#cb20-165" aria-hidden="true" tabindex="-1"></a>msens<span class="sc">::</span><span class="fu">report_table</span>(smry, <span class="at">caption =</span> <span class="st">"composite score per cell"</span>)</span>
-<span id="cb20-166"><a href="#cb20-166" aria-hidden="true" tabindex="-1"></a><span class="co"># content fingerprint of the full cell_metric output table (before disconnect)</span></span>
-<span id="cb20-167"><a href="#cb20-167" aria-hidden="true" tabindex="-1"></a>cm_hash <span class="ot">&lt;-</span> msens<span class="sc">::</span><span class="fu">hash_query</span>(con, <span class="st">"cell_metric"</span>)</span>
-<span id="cb20-168"><a href="#cb20-168" aria-hidden="true" tabindex="-1"></a><span class="fu">dbDisconnect</span>(con, <span class="at">shutdown=</span><span class="cn">TRUE</span>)</span>
-<span id="cb20-169"><a href="#cb20-169" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb20-170"><a href="#cb20-170" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb20-171"><a href="#cb20-171" aria-hidden="true" tabindex="-1"></a><span class="fu">## Manifest</span></span>
-<span id="cb20-172"><a href="#cb20-172" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb20-175"><a href="#cb20-175" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
-<span id="cb20-176"><a href="#cb20-176" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: manifest</span></span>
-<span id="cb20-177"><a href="#cb20-177" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb20-178"><a href="#cb20-178" aria-hidden="true" tabindex="-1"></a><span class="co"># content-addressed: fingerprint of the cell_metric output table (no wall-clock)</span></span>
-<span id="cb20-179"><a href="#cb20-179" aria-hidden="true" tabindex="-1"></a>msens<span class="sc">::</span><span class="fu">write_manifest</span>(</span>
-<span id="cb20-180"><a href="#cb20-180" aria-hidden="true" tabindex="-1"></a>  manifest, <span class="at">target =</span> <span class="st">"score_cell_metrics"</span>, <span class="at">content_hash =</span> cm_hash,</span>
-<span id="cb20-181"><a href="#cb20-181" aria-hidden="true" tabindex="-1"></a>  <span class="at">stats =</span> <span class="fu">list</span>(<span class="at">ver =</span> ver, <span class="at">composite_cells =</span> smry<span class="sc">$</span>n_cells,</span>
-<span id="cb20-182"><a href="#cb20-182" aria-hidden="true" tabindex="-1"></a>               <span class="at">v_min =</span> smry<span class="sc">$</span>v_min, <span class="at">v_max =</span> smry<span class="sc">$</span>v_max),</span>
-<span id="cb20-183"><a href="#cb20-183" aria-hidden="true" tabindex="-1"></a>  <span class="at">force =</span> msens<span class="sc">::</span><span class="fu">force_target</span>(<span class="st">"score_cell_metrics"</span>))</span>
-<span id="cb20-184"><a href="#cb20-184" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb20-148"><a href="#cb20-148" aria-hidden="true" tabindex="-1"></a><span class="co"># primprod: VGPM npp_avg bilinear -&gt; cells (restricted to US cells) -&gt; cell_metric, then rescale</span></span>
+<span id="cb20-149"><a href="#cb20-149" aria-hidden="true" tabindex="-1"></a>sp <span class="ot">&lt;-</span> <span class="fu">mseq</span>(<span class="st">"primprod"</span>, <span class="st">"Primary productivity VGPM/VIIRS npp_avg (mg C/m2/day)"</span>)</span>
+<span id="cb20-150"><a href="#cb20-150" aria-hidden="true" tabindex="-1"></a>pp <span class="ot">&lt;-</span> <span class="fu">cells_from_raster</span>(<span class="fu">subset</span>(<span class="fu">rast</span>(vgpm_tif), <span class="st">"npp_avg"</span>), cellid_tif,</span>
+<span id="cb20-151"><a href="#cb20-151" aria-hidden="true" tabindex="-1"></a>                        <span class="at">method =</span> <span class="st">"bilinear"</span>, <span class="at">min_value =</span> <span class="dv">0</span>, <span class="at">zero_fill =</span> <span class="cn">FALSE</span>)</span>
+<span id="cb20-152"><a href="#cb20-152" aria-hidden="true" tabindex="-1"></a><span class="fu">duckdb_register</span>(con, <span class="st">"tmp_pp_df"</span>, pp)</span>
+<span id="cb20-153"><a href="#cb20-153" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="fu">glue</span>(<span class="st">"INSERT INTO cell_metric (cell_id, metric_seq, val)</span></span>
+<span id="cb20-154"><a href="#cb20-154" aria-hidden="true" tabindex="-1"></a><span class="st">  SELECT p.cell_id, {sp}, p.val FROM tmp_pp_df p JOIN cell c ON p.cell_id = c.cell_id WHERE c.in_usa"</span>))</span>
+<span id="cb20-155"><a href="#cb20-155" aria-hidden="true" tabindex="-1"></a><span class="fu">duckdb_unregister</span>(con, <span class="st">"tmp_pp_df"</span>)</span>
+<span id="cb20-156"><a href="#cb20-156" aria-hidden="true" tabindex="-1"></a><span class="fu">rescale_ecoregion</span>(<span class="st">"primprod"</span>)</span>
+<span id="cb20-157"><a href="#cb20-157" aria-hidden="true" tabindex="-1"></a><span class="fu">log_info</span>(<span class="st">"stage 1b/1c + primprod done"</span>)</span>
+<span id="cb20-158"><a href="#cb20-158" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb20-159"><a href="#cb20-159" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-160"><a href="#cb20-160" aria-hidden="true" tabindex="-1"></a><span class="fu">## Stage 3 — equal-weight composite per cell</span></span>
+<span id="cb20-161"><a href="#cb20-161" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-164"><a href="#cb20-164" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb20-165"><a href="#cb20-165" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: composite</span></span>
+<span id="cb20-166"><a href="#cb20-166" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-167"><a href="#cb20-167" aria-hidden="true" tabindex="-1"></a>comp_keys <span class="ot">&lt;-</span> <span class="fu">c</span>(<span class="fu">glue</span>(<span class="st">"extrisk_{sp_cats}_ecoregion_rescaled"</span>), <span class="st">"primprod_ecoregion_rescaled"</span>)</span>
+<span id="cb20-168"><a href="#cb20-168" aria-hidden="true" tabindex="-1"></a>sc <span class="ot">&lt;-</span> <span class="fu">mseq</span>(<span class="st">"score_extriskspcat_primprod_ecoregionrescaled_equalweights"</span>, <span class="st">"Equal-weight composite"</span>)</span>
+<span id="cb20-169"><a href="#cb20-169" aria-hidden="true" tabindex="-1"></a>in_list <span class="ot">&lt;-</span> <span class="fu">paste</span>(<span class="fu">sprintf</span>(<span class="st">"'%s'"</span>, comp_keys), <span class="at">collapse=</span><span class="st">","</span>)</span>
+<span id="cb20-170"><a href="#cb20-170" aria-hidden="true" tabindex="-1"></a><span class="fu">dbExecute</span>(con, <span class="fu">glue</span>(<span class="st">"INSERT INTO cell_metric (cell_id, metric_seq, val)</span></span>
+<span id="cb20-171"><a href="#cb20-171" aria-hidden="true" tabindex="-1"></a><span class="st">  SELECT cm.cell_id, {sc}, ROUND(AVG(cm.val))</span></span>
+<span id="cb20-172"><a href="#cb20-172" aria-hidden="true" tabindex="-1"></a><span class="st">  FROM cell_metric cm JOIN metric m USING(metric_seq)</span></span>
+<span id="cb20-173"><a href="#cb20-173" aria-hidden="true" tabindex="-1"></a><span class="st">  WHERE m.metric_key IN ({in_list}) GROUP BY cm.cell_id"</span>))</span>
+<span id="cb20-174"><a href="#cb20-174" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-175"><a href="#cb20-175" aria-hidden="true" tabindex="-1"></a>smry <span class="ot">&lt;-</span> <span class="fu">dbGetQuery</span>(con, <span class="fu">glue</span>(<span class="st">"SELECT count(*) n_cells, round(min(val),1) v_min, round(max(val),1) v_max,</span></span>
+<span id="cb20-176"><a href="#cb20-176" aria-hidden="true" tabindex="-1"></a><span class="st">  round(avg(val),1) v_avg FROM cell_metric WHERE metric_seq={sc}"</span>))</span>
+<span id="cb20-177"><a href="#cb20-177" aria-hidden="true" tabindex="-1"></a>msens<span class="sc">::</span><span class="fu">report_table</span>(smry, <span class="at">caption =</span> <span class="st">"composite score per cell"</span>)</span>
+<span id="cb20-178"><a href="#cb20-178" aria-hidden="true" tabindex="-1"></a><span class="co"># content fingerprint of the full cell_metric output table (before disconnect)</span></span>
+<span id="cb20-179"><a href="#cb20-179" aria-hidden="true" tabindex="-1"></a>cm_hash <span class="ot">&lt;-</span> msens<span class="sc">::</span><span class="fu">hash_query</span>(con, <span class="st">"cell_metric"</span>)</span>
+<span id="cb20-180"><a href="#cb20-180" aria-hidden="true" tabindex="-1"></a><span class="fu">dbDisconnect</span>(con, <span class="at">shutdown=</span><span class="cn">TRUE</span>)</span>
+<span id="cb20-181"><a href="#cb20-181" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb20-182"><a href="#cb20-182" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-183"><a href="#cb20-183" aria-hidden="true" tabindex="-1"></a><span class="fu">## Manifest</span></span>
+<span id="cb20-184"><a href="#cb20-184" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-187"><a href="#cb20-187" aria-hidden="true" tabindex="-1"></a><span class="in">```{r}</span></span>
+<span id="cb20-188"><a href="#cb20-188" aria-hidden="true" tabindex="-1"></a><span class="co">#| label: manifest</span></span>
+<span id="cb20-189"><a href="#cb20-189" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-190"><a href="#cb20-190" aria-hidden="true" tabindex="-1"></a><span class="co"># content-addressed: fingerprint of the cell_metric output table (no wall-clock)</span></span>
+<span id="cb20-191"><a href="#cb20-191" aria-hidden="true" tabindex="-1"></a>msens<span class="sc">::</span><span class="fu">write_manifest</span>(</span>
+<span id="cb20-192"><a href="#cb20-192" aria-hidden="true" tabindex="-1"></a>  manifest, <span class="at">target =</span> <span class="st">"score_cell_metrics"</span>, <span class="at">content_hash =</span> cm_hash,</span>
+<span id="cb20-193"><a href="#cb20-193" aria-hidden="true" tabindex="-1"></a>  <span class="at">stats =</span> <span class="fu">list</span>(<span class="at">ver =</span> ver, <span class="at">composite_cells =</span> smry<span class="sc">$</span>n_cells,</span>
+<span id="cb20-194"><a href="#cb20-194" aria-hidden="true" tabindex="-1"></a>               <span class="at">v_min =</span> smry<span class="sc">$</span>v_min, <span class="at">v_max =</span> smry<span class="sc">$</span>v_max),</span>
+<span id="cb20-195"><a href="#cb20-195" aria-hidden="true" tabindex="-1"></a>  <span class="at">force =</span> msens<span class="sc">::</span><span class="fu">force_target</span>(<span class="st">"score_cell_metrics"</span>))</span>
+<span id="cb20-196"><a href="#cb20-196" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
 </code></pre></div><button title="Copy to Clipboard" class="code-copy-button" data-in-quarto-modal=""><i class="bi"></i></button></div>
 </div></div></div></div></div>
 </div> <!-- /content -->

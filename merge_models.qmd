@@ -215,12 +215,17 @@ log_info("mc_turtle (whole-range): {dbGetQuery(con, 'SELECT count(*) n FROM mc_t
 # The critical-habitat datasets are NOT an input: dps_nmfs was built from the same designations
 # WITH each entity's status, while ch_* carries the species-level ER (100 for the humpback) and
 # would paint the Threatened Mexico-DPS habitat back to Endangered.
-if (length(dps_ids)) {
-  dbExecute(con, glue("CREATE OR REPLACE TABLE dps_src AS
-    SELECT ms_merge_key, ds_key, cell_id, val FROM {parts_sql(dps_ids)} WHERE ds_key NOT IN ({ch_sql})"))
-  dbExecute(con, paste("CREATE OR REPLACE TABLE mc_dps AS", msens::dps_sql(dps_ds, suit_ds, src = "dps_src")))
-} else dbExecute(con, "CREATE OR REPLACE TABLE mc_dps (mdl_key VARCHAR, cell_id INTEGER, val DOUBLE, er DOUBLE)")
-log_info("mc_dps (whole-range): {dbGetQuery(con, 'SELECT count(*) n FROM mc_dps')$n} cells")
+# one taxon at a time over a VIEW of its partition: materializing all 19 as one table (the humpback
+# alone is 15 M range cells against global AquaMaps) blew the DuckDB memory budget; per taxon each
+# join is small and mc_dps just accumulates
+dbExecute(con, "CREATE OR REPLACE TABLE mc_dps (mdl_key VARCHAR, cell_id INTEGER, val DOUBLE, er DOUBLE)")
+for (id in dps_ids) {
+  dbExecute(con, glue("CREATE OR REPLACE VIEW dps_src AS
+    SELECT ms_merge_key, ds_key, cell_id, val FROM {parts_sql(id)} WHERE ds_key NOT IN ({ch_sql})"))
+  dbExecute(con, paste("INSERT INTO mc_dps", msens::dps_sql(dps_ds, suit_ds, src = "dps_src")))
+}
+if (length(dps_ids)) dbExecute(con, "DROP VIEW IF EXISTS dps_src")
+log_info("mc_dps (whole-range): {dbGetQuery(con, 'SELECT count(*) n FROM mc_dps')$n} cells over {length(dps_ids)} taxa")
 ```
 
 ## Max-merge (masked) + spatial-ER taxa → streamed to Parquet
