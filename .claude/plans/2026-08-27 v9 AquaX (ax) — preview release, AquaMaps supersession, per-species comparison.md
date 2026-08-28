@@ -373,6 +373,30 @@ the v9 data-sources page on the preview host carries the DPS note. Ops note: a l
 holding the `serve.duckdb` lock — it finished its chunks but lost its HTML; check `pgrep -f rmd.R` before
 relaunching a stage.
 
+**Ben's review 2026-08-28 09:40 — "1 everywhere except critical habitat; NMFS DPS extinction risk struck
+through; expected AquaX values throughout US waters."** Root cause: the turtle rule bakes ER × suit into
+`val`; with the humpback's ER at the baseline over 99.8 % of its range, `round(1 × 90 / 100)` = 1 — the
+app drew the weight, not the whale. Two more defects surfaced: the dps baseline for mammals was 1
+(`compute_er_score("IUCN:LC", is_mmpa = TRUE)` ignores MMPA for IUCN codes) where every other unlisted
+marine mammal carries 20 (`NMFS:LC` + MMPA); and `native_asset` had no `dps_nmfs` rows, so the input pill
+was disabled. **Decision (Ben): DPS taxa only — turtles untouched; fold everything into v9 (no "v9.1"
+anywhere user-facing); publish the DPS layers; explain it in the docs.**
+
+Fix (msens 0.39.0 `14bec5e`, workflows `d4edab46`, docs `999809c`): `msens::dps_sql()` — merged `val` =
+suitability masked to the ER footprint (ER as the fitting point where nothing models the cell), per-cell
+ER written BESIDE it (`dist_merged_er/`) → `model_cell_er` → `score_cell_metrics` multiplies it in where
+`taxon.er_mode = 'cell'` (`'premultiplied'` turtles, `'taxon'` everyone else); dps ingest baseline = 20
+for mammals; `publish_native` paints `native/dps_nmfs/` (19 COGs, `representation = "model"`). Spatial-only
+reruns: `run_version.sh --spatial` (`REDO_MC_PARTS_SPATIAL`, `REDO_MERGE_SPATIAL`, `REDO_MERGED_COG_SPATIAL`)
+— the whole re-merge took 3 min instead of 70 and the repaint 25 COGs instead of 21,000. Results: humpback
+merged US 517,126 cells, mean 62.9, max 100 (AquaX), ER beside it 20 / 50 / 100; global COG mean 68.7; PA
+gate vs v8 max |Δ| 8.95 (GOA), mean ≈ 4.0, within tolerance; `er_mode` 19 cell / 6 premultiplied /
+37,042 taxon; registry ids unchanged (91,362). Traps: materializing all 19 dps taxa as one table OOM'd
+DuckDB at 7 GB (per-taxon loop over a view); a plain `quarto render release_marine-atlas.qmd` from
+outside the chain (no flags → every chunk gated off; VS Code Render?) at 10:59 clobbered the chain's
+concurrent render of the same file at its pandoc step (twice today: `cannot open file '….qmd'`) — the
+work was done both times, only the HTML was lost; never render a notebook the chain is rendering.
+
 Still open (design, v10): the plain rule's flat maximum for ~50 whole-species-EN taxa
 (`max(er, suit)`); candidate: ER × suitability for all taxa, gated by `pra_score_delta`.
 
