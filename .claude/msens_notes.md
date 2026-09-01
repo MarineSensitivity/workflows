@@ -41,6 +41,77 @@
   Let's write a manuscript (with a plan first to discuss) on forwarding the vision of this project to the next iteration (plan )
   '/Users/bbest/Library/CloudStorage/GoogleDrive-ben@ecoquants.com/.shortcut-targets-by-id/1sppUmlMtZ-sXaBm72M1-8PnjVudXO91v/US MBON Public Folder/Working Groups/BioIndicators/manuscripts/atlas/atlas _ BioIndicators manuscript.md'
 
+## 2026-08-28 Cloudflare branding, invalid email login, logout 
+
+So when trying to log into Cloudflare with an email other than ones explicitly whitelisted, I get the same prompt about sending a code to my email, but it never arrives:
+[Image #11]
+
+You would hope that if access is gated and disallowed from the entered email, it would state as much rather than saying the code is sent when it never was. Can I customize these messages for different situations like this and even brand them with BOEM / MST look?
+[Image #11]
+
+And how can I log out? I don't see option in apps or docs
+
+---
+
+Two separate things there — and one detail in your screenshot I want to check first: the login page says steep-bonus-bf70.cloudflareaccess.com, not the marinesensitivity team domain I recorded.
+
+Mystery solved: the org's auth_domain is marinesensitivity (what the JWT and gate use), but its display name is still the auto-generated steep-bonus-bf70 — and the login page shows the name. Also login_design is empty, so nothing is branded yet. Let me confirm what's customisable:
+
+Logout works — preview.marinesensitivity.org/cdn-cgi/access/logout (Cloudflare handles /cdn-cgi/* at the edge, so it never hits our Caddy). But you shouldn't have to know that URL. Adding it to the UI, and scripting the branding:
+
+---
+
+Three answers, and two of them are now shipped.
+
+1. Why it says "a code has been emailed" when it didn't
+
+That's deliberate on Cloudflare's side, and documented: "By design, blocked users will not receive an email. The login page will always say a code has been emailed to you, regardless of whether or not an email was sent." If it said "that address isn't allowed", anyone could probe your reviewer list one address at a time. So the message itself can't be made honest per-address — that's the point of it.
+
+What can change is the page around it, which is where the real confusion was.
+
+2. Branding — yes, and I found a bug while checking
+
+Your screenshot shows steep-bonus-bf70.cloudflareaccess.com. The auth_domain was renamed to marinesensitivity (that's what the JWT and gate use, so the plumbing is right), but the org's display name was never changed — and the login page shows the name. Hence the gibberish greeting.
+
+access.sh now sets, in one idempotent step:
+- name → "BOEM Marine Sensitivity Toolkit"
+- footer → says a code is emailed only to invited addresses, that the page reads the same either way, and who to ask — the honest explanation Cloudflare's own wording can't give
+- background/text colours, and a logo if you give me a URL
+
+It needs one more permission on your API token — Access: Organizations, Identity Providers, and Groups: Edit (currently Read). I ran it just now and it skipped cleanly with those instructions rather than failing. Add the permission and I'll apply it, or you can do it in Zero Trust → Settings → Custom Pages → Access login page.
+
+Two caveats worth knowing: the only public image we have is a favicon.ico, so for a proper logo I'd need a PNG/SVG published somewhere public — point me at one and I'll wire it. And the block page (a real "you don't have access" page) only appears to someone who authenticates and then fails policy — with email PIN they never get that far, so it matters only once you add Google/Microsoft sign-in. On the free plan you can redirect it to a URL of ours; a custom HTML template is paid.
+
+3. Signing out — there genuinely was no way, now there is
+
+The mechanism is /cdn-cgi/access/logout, answered at Cloudflare's edge (it never reaches Caddy, so the gate doesn't block it). Deployed and verified:
+
+- apps: a Sign out link at the end of the header nav — Scores · Species · Docs · Home · Sign out — on the preview instance only (the public host has no session to end; confirmed absent there)
+- landing page: "Signed in through Cloudflare Access · Sign out"
+- direct URL if you need it: https://preview.marinesensitivity.org/cdn-cgi/access/logout
+
+That last one is what you want right now to get out of the ben@ecoquants.com attempt and back in as ben@oceanmetrics.io.
+
+---
+
+Recorded, so a future session inherits the whole set rather than redrawing it.
+
+Where the branding stands: all committed in server/branding/ and live at file.marinesensitivity.org/branding/ — mark (plain, for 16 px), padded badge (small inline placements), lockup light/dark, hero light/dark, and a regenerated favicon.ico. One generator, so the BOEM→MMA rebrand is AGENCY=MMA python3 make_branding.py plus a commit.
+
+Three things still open from today, in the order I'd do them:
+
+1. Invite Tim — his policy is in place; he just needs the link https://preview.marinesensitivity.org/v8/scores/. That's your email to send.
+2. v9 — it's restricted in your local versions.csv but not yet published. When you publish it: add PREVIEW_REVIEWERS_V9 to .env, run access.sh, paste the new CF_ACCESS_AUD, then DEPLOY_CADDY. Without that nobody — including you — can open /v9/.
+3. Optional polish: swap the sharper favicon.ico into the two apps and the docs, and use the hero on the docs cover / landing page. Both are small; say the word.
+
+And if you want the login-page settings under version control rather than in the dashboard, adding Access: Organizations, Identity Providers, and Groups: Edit to the API token lets access.sh set them — it already has the code and currently skips with instructions.
+
+---
+
+swap the sharper favicon.ico into the two apps and the docs, and use the hero on the docs cover / landing page
+
+
+
 ## 2026-08-27 storage/STAC/S3/COG for v8/v9 preview?
 
 Where is https://storage.marinesensitivity.org/marine-atlas/ for v8 and v9 (COG uploading now in other Claude session)? It should be preview and behind cloudflare, but surprised to not even see links to other versions
@@ -427,7 +498,96 @@ But when I visit https://maps.fisheries.noaa.gov/server/rest/services/All_NMFS_C
 
 Confirmed each layer represents one listed DPS with its own status, and the polygon reflects designated critical habitat rather than full range—correct for now until NOAA's DPS-level range layers arrive later. Running the ingest now to see what it pulls.
 
+---
 
+v9.1 is fully released and verified. Recap for a reader who only sees this message:
+
+What happened this stretch
+- The laptop dropped off the internet mid-release_s3 (HTTP 000 to Google/GitHub/S3 — not an AWS problem). It came back within a minute, but my pkill had killed only the wrapper script: the underlying R render survived, finished the S3 push (tables landed 02:36) and the view DB/STAC chunks, then died at the final pandoc step because the second attempt's cleanup pulled the .qmd from under it — and meanwhile it held the serve.duckdb lock, which is why the second relaunch failed with Conflicting lock is held … rmd.R. Waited for it to exit, then re-ran the stage cleanly for the tracked HTML.
+- Stages completed: release_s3 → build_version_manifest → publish_stac_api → publish_storage_index → RELEASE_DEPLOY=1 DEPLOY_TABLES=1 (titiler-v8 recreated for the repainted stable-URL COGs, /cog/info 200, tables/ + model_cell synced to the server in 13 min, views repointed, apps deployed on public + preview, caddy validated) → CHECK_PREVIEW=1 with the server-held service tokens: passed (2 restricted, 8 public; v7/v8/v9 each closed without a token, open with one, origin-direct 401, ?ver= 301s to the path, docs v8/v9 200).
+- Docs CI run 33134408753 succeeded; the v9 data-sources page on the preview host carries the DPS note (the sidecar will pick up today's number refresh on its 5-min poll).
+
+Results
+- Humpback merged COG served through titiler-v8: min 1 / max 93 (decimated stats) / mean 1.1 — a gradient, not the flat 100.
+- Re-rendered v8→v9 gate: mean |Δ| 3.21, max |Δ| 7.34, RMSE 3.80 — ✅ within tolerance (5/15); turtle (22.8) and mammal (15.5) move most, bird and primary producer 0.000.
+- Manifest live: v9 prerelease/restricted, cell_species_list: true; latest.txt still v7.
+
+Committed (workflows main, tree clean): f1c65e66 validate render, ef3ce9d4 release-stage renders + manifests, d81e3b01 deploy/check render + the DEPLOY_TITILER log now naming the service instead of titiler-{ver}, e9649fc1 plan marked v9.1 DONE. Memory updated with the outcome and the orphan-render lesson.
+
+Left open (design, v10): the plain max(er, suit) rule still flattens ~50 whole-species-EN taxa, and the spatial-ER merged layer (ER × suitability) draws faint outside listed critical habitat — both noted in the plan. The one manual check remaining is eyeballing the humpback in the preview species app under your own Cloudflare login (preview.marinesensitivity.org/v9/species/), since the browser path can't use the service token.
+
+----
+
+So I suppose I am now seeing v9.1 in v9 (since v9.1 not listed), but humpback whale is very strange -- 1 everywhere except critical habitats and strikethrough of NMFS DPS extinction risk [Image #7] What is going on? This is clearly wrong. I was expecting to see AquaX values throughout US waters [Image #8]
+
+---
+
+Diagnosis is complete — here's what's going on, then one decision I need from you before re-running the chain.
+
+What you're seeing is the merge rule, not bad data. The AquaX humpback surface is fine (511,040 US cells, mean 64, max 93 — your second screenshot). The DPS extinction-risk surface is also what was designed: 14.69 M cells at ER 1 (IUCN LC), 20,601 at 100 (EN critical habitat), 2,084 at 50 (TN). The problem is that DPS taxa go through the turtle branch, whose merged value is round(ER × suitability / 100) (msens::turtle_sql). For turtles ER is 50–100 everywhere in their DPS range, so that product looks like a scaled suitability. For the humpback ER is 1 across 99.8 % of its range, so 1 × 90 / 100 rounds to 1 — the merged model collapses to 1 everywhere except critical habitat, where 100 × 90 / 100 gives AquaX back. Scoring is internally consistent (extrisk = 100 × val / 100 for spatial-ER taxa, so the humpback contributes ER-weighted suitability as intended), but the displayed "Merged Model" is the extinction-risk weight, not the distribution. I flagged this as "faint" yesterday; it is worse than faint — it is wrong as a distribution.
+
+Two further defects found while tracing it, which I'll fix regardless:
+- MMPA floor missing from the DPS baseline. merge_models_prep gives every mammal NMFS:LC → compute_er_score(…, is_mmpa) = 20 (102 mammals carry 20). My ingest computed the humpback's baseline as compute_er_score("IUCN:LC", is_mmpa = TRUE), and the function ignores MMPA for IUCN codes → 1. Outside listed habitat the humpback (and orca, beluga, false killer whale, Steller sea lion, both seals) should carry 20, consistent with every other mammal.
+- The struck-through "NMFS DPS extinction risk" pill = no published surface: native_asset has 0 dps_nmfs rows because publish_native never paints that dataset. Nineteen small COGs + registry rows fixes it, and lets reviewers actually see the DPS weighting as its own layer.
+
+The fix for the merged surface is to stop baking ER into val for these taxa: merged val = suitability (AquaX in US waters, AquaMaps elsewhere) masked to the species' range as for every other taxon, with the per-cell ER applied at scoring (extrisk = ER_cell × val / 100) instead of at merge. Scores are algebraically the same thing computed one step later (differences are rounding only), so the PA gate should barely move — the question is scope:
+
+---
+
+Proceed with DPS taxa only and update the @../docs/ to explain this clearly. Be sure to publish the DPS layers. I am also unclear as to where/how v9 vs v9.1 appears in selection of apps & docs. It is fine (actually preferred for simplicity) for everything from v9.1 to be folded into v9
+
+---
+
+Done — v9 is redeployed with the DPS species treated the way you expected. Recap:
+
+What was wrong (three defects, all fixed)
+1. The merge rule. DPS species went through the sea-turtle rule, which bakes ER × suitability into the merged value. With the humpback's ER at the baseline over 99.8 % of its range, round(1 × 90 / 100) = 1 — the "Merged Model" was drawing the extinction-risk weight, not the whale. Now msens::dps_sql() (0.39.0): merged value = suitability (AquaX in US waters, AquaMaps elsewhere) masked to the ER footprint, and the per-cell ER is carried beside it (dist_merged_er/ → model_cell_er) and multiplied in at scoring (taxon.er_mode = 'cell'; turtles stay 'premultiplied', everyone else 'taxon'). Scores are the same product taken one step later.
+2. The MMPA baseline. Outside listed habitat the humpback carried 1 where every other unlisted marine mammal carries 20 — compute_er_score() ignores is_mmpa for IUCN codes. The DPS ingest now uses merge_models_prep's convention (NMFS:LC + MMPA = 20 for mammals, IUCN category otherwise).
+3. The struck-through pill. native_asset had no dps_nmfs rows. publish_native now paints 19 native/dps_nmfs/ COGs and registers them, so NMFS DPS extinction risk is a drawable layer.
+
+Verified live (through the recreated titiler-v8): humpback merged COG 1–100, mean 68.7; US scoring surface 517,126 cells, mean 62.9, max 100 (AquaX), ER beside it 20 / 50 / 100; DPS layer 20 / 50 / 100. PA gate vs v8: max |Δ| 8.95 (GOA), mean ≈ 4.0 — within tolerance. Registry ids unchanged (91,362). CHECK_PREVIEW passed (2 restricted, 8 public). Sea turtles untouched, per your choice.
+
+v9 vs "v9.1": nothing user-facing ever said v9.1 — it was only my label in the plan/commit messages. Apps and docs show one version, v9, and the release notes describe the DPS treatment as part of it. I've dropped the label from CLAUDE.md and the skills too.
+
+Docs (999809c, CI green, pulled to the preview host): merging Step 5 + updated flowchart and "three strategies" callout, the scoring exception (per-cell weight, er_mode), a new "spatial extinction risk" section in Extinction Risk, the data-sources DPS note, and the v9 release notes.
+
+Process gains: scripts/run_version.sh --spatial re-runs only the ~25 spatial-ER taxa — the merge took 3 min instead of 70 and repainted 25 COGs instead of 21,000; both keyed refreshes assert the positional partition maps haven't moved.
+
+One thing to know: at 10:59 a plain quarto render release_marine-atlas.qmd (no flags — probably a Render click in VS Code) ran while my chain was rendering the same file; its cleanup killed my render at the pandoc step, so I re-ran that stage. If you render a notebook while the chain has it open, it'll happen again.
+
+Commits: msens 14bec5e, docs 999809c, workflows d4edab46 … 2275c3ec (tree clean). Preview: preview.marinesensitivity.org/v9/species/ — humpback should now show AquaX throughout US waters with the DPS layer selectable.
+
+---
+
+We're missing the version notes at https://marinesensitivity.org
+
+---
+
+Live: the homepage CI (33170893826) published successfully, and marinesensitivity.org now shows the v9 — AquaX + spatial extinction risk entry at the top of Version History, with both v8 and v9 pre-release links pointing at the review host (preview.marinesensitivity.org/v8/…, /v9/…) instead of the public app that was falling back to v7.
+
+Recap of this thread:
+- Missing notes — the homepage timeline is hand-written in MarineSensitivity.github.io/index.qmd; v9 added (AquaX supersession, DPS-level spatial risk, score equivalence), commit abadbeb.
+- v8 links landing on v7 — expected fail-closed behaviour of the review gate on the public host (a restricted version resolves to the promoted release); fixed by linking pre-releases to the preview host, with a one-line note that they require a reviewer sign-in.
+- Not done, available if wanted: make the Caddy retirement redirects send ?ver= for a restricted version to the preview host rather than silently showing v7 (a server change via DEPLOY_CADDY).
+
+---
+
+Yes, make the Caddy retirement redirects send ?ver= for a restricted version to the preview host rather than silently showing v7 (a server change via DEPLOY_CADDY).
+
+---
+
+Done and live. Recap:
+
+What changed — on the public app host, a restricted version's path form (/v8/…, /v9/… for scores/species) now 302s to the same path on preview.marinesensitivity.org, query intact, instead of the app silently rendering the promoted v7. Every other spelling already funnels through that path form (the retirement 301s for scores_v8/, mapsp/, …, and the ?ver= 301s), so one Caddy matcher covers them all. Verified live:
+- /v8/scores/?mdl_key=abc → 302 preview…/v8/scores/?mdl_key=abc
+- species_v8/?ver=v8&mdl_key=abc → 301 → 302 → Cloudflare sign-in carrying redirect_url=/v8/species/?ver=v8&mdl_key=abc (the deep link survives the login)
+- /v7/scores/ → 200, unchanged
+
+How it's driven — PREVIEW_RESTRICTED_VERSIONS=v8|v9 in the server .env (a regex alternation, beside PREVIEW_REVIEWERS_<VER> and CF_ACCESS_AUD), passed to the caddy container via compose. It's a 302 rather than a 301 deliberately: when a version is released, a cached 301 would keep sending people to the review host.
+
+Checks that can't pass on a stale list — DEPLOY_CADDY now stops before restarting if .env disagrees with the restricted set in versions.json, and curls the 302 (with query) for every restricted version; CHECK_PREVIEW asserts the 302 to the review host and treats the old "falls back to v7" render as a failure. Both passed (CADDY_OK 2e97fef, routes harness OK, gate 2 restricted / 8 public).
+
+Commits — server 2e97fef (Caddyfile, compose, runbook step for a new restricted version), workflows fa2c1489 + 33ec51e3 (assertions, CLAUDE.md, publish-sdm skill, render). Memory updated. One operational note for the future: flipping a version between restricted and public now has three .env companions (reviewers, AUD, this list) — DEPLOY_CADDY will tell you if you forget the third.
 
 ## 2026-08-21 SDM workshop email to Gabrielle and Frank
 
