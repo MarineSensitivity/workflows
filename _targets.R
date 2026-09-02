@@ -7,7 +7,7 @@
 #
 #   targets::tar_make()                      # run the pipeline
 #   targets::tar_make("calc_scores")         # run one target (+ its upstream)
-#   targets::tar_make("validate_v7_v8")      # is the v8 migration still faithful?
+#   Rscript scripts/render_compare.R v8 v9   # version comparison report (not a target)
 #   targets::tar_visnetwork()                # dependency graph
 #   targets::tar_manifest()                  # inspect targets as a data frame
 #   targets::tar_outdated()                  # what would re-run

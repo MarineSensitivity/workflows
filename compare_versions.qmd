@@ -1,0 +1,425 @@
+---
+title: "Version comparison: Program-Area scores"
+subtitle: "Parameterized report — overall composite and every component score, two releases side by side"
+params:
+  version_a: v8
+  version_b: v9
+  metric_key: score_extriskspcat_primprod_ecoregionrescaled_equalweights
+  zone_set_key: programarea_2026-01
+  mean_tol: 5
+  max_tol: 15
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    embed-resources: true    # self-contained: no sidecar _files dir (browsable standalone from the nav)
+    lightbox: false          # override the project default: lightbox keeps an external href to the plot PNG
+editor_options:
+  chunk_output_type: console
+---
+
+> **Not a pipeline stage** — a standalone, parameterized *report* (no `msens:` target block, so
+> `tar_make()` never runs it). Render it on demand for any two release versions whose `sdm.duckdb`
+> are on disk. The reusable comparison **core lives in `msens`** (`pra_score_delta`, `zone_scores`,
+> `zone_score_delta`, `score_delta`, `score_delta_summary`, `assert_within_tolerance`) so this
+> notebook only *orchestrates* — the math is unit-tested in `msens/tests/testthat/test-validate.R`
+> and can't drift from what's reported here.
+>
+> ```r
+> # render with version suffixes in the output filename (see scripts/render_compare.R):
+> source("scripts/render_compare.R"); render_compare("v6", "v9")   # -> _output/compare_versions_v6_vs_v9.html
+> # or from the shell:
+> Rscript scripts/render_compare.R v6 v9
+> ```
+>
+> **What is compared.** Scores per BOEM **Program Area** (the `zone_set_key` parameter pins the
+> polygon vintage; a release predating that column falls back to `fld = 'programarea_key'`), for the
+> overall composite and for each **component** the composite averages: the per-species-category
+> ecoregion-rescaled extinction-risk metrics (`extrisk_{category}_ecoregion_rescaled`) plus rescaled
+> primary productivity (`primprod_ecoregion_rescaled`). Only Program Areas and metrics present in
+> **both** releases are compared; what one side has and the other lacks (e.g. v6's `other` category
+> vs v8+'s `primary_producer`) is listed, never compared against nothing. `Δ = B − A`.
+
+## Setup
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+
+librarian::shelf(DBI, duckdb, dplyr, DT, ggplot2, glue, htmltools, knitr, leaflet, purrr,
+                 rmapshaper, scales, sf, tidyr, MarineSensitivity/msens, quiet = TRUE)
+source(here::here("libs/paths.R"))
+
+va  <- params$version_a
+vb  <- params$version_b
+mk  <- params$metric_key
+zsk <- params$zone_set_key
+stopifnot(va != vb)
+
+# resolve each version's sdm.duckdb by swapping the version segment of the configured path
+sdm_for <- function(v) sub(glue("/{ver}/"), glue("/{v}/"), path.expand(sdm_db))
+db_a <- sdm_for(va); db_b <- sdm_for(vb)
+stopifnot(file.exists(db_a), file.exists(db_b))
+
+con_a <- dbConnect(duckdb(), db_a, read_only = TRUE)
+con_b <- dbConnect(duckdb(), db_b, read_only = TRUE)
+
+va_col <- glue("score_{va}"); vb_col <- glue("score_{vb}")
+
+cat(glue("Comparing **{va}** (A) ← → **{vb}** (B)  \n",
+         "- A ({va}): `{db_a}`  \n",
+         "- B ({vb}): `{db_b}`  \n",
+         "- composite metric: `{mk}`  \n",
+         "- spatial unit: `{zsk}`\n"))
+```
+
+### Program-Area polygons
+
+The choropleths need the Program-Area geometry. It is resolved from the derived tree by **content**,
+not by filename: every `ply_programareas_*.gpkg` under `dir_derived` is fingerprinted with
+`msens::zone_geom_hash()` and the first whose hash equals the `zone_set_key`'s entry in
+`data/zone_sets.csv` is used — so the map can never silently draw a different vintage than the
+scores were computed on.
+
+```{r}
+#| label: geometry
+
+zone_sets <- readr::read_csv(here::here("data/zone_sets.csv"), show_col_types = FALSE)
+zs <- zone_sets |> filter(zone_set_key == zsk)
+stopifnot(nrow(zs) == 1)
+
+cands <- Sys.glob(c(path.expand(glue("{dir_derived}/ply_programareas_*.gpkg")),
+                    path.expand(glue("{dir_derived}/*/ply_programareas_*.gpkg"))))
+ply <- NULL
+for (f in cands) {
+  x <- sf::st_read(f, quiet = TRUE)
+  h <- tryCatch(msens::zone_geom_hash(x, zone_type = zs$zone_type)$geom_hash, error = function(e) NA)
+  if (identical(h, zs$geom_hash)) { ply <- x; ply_src <- f; break }
+}
+if (is.null(ply))
+  stop(glue("no ply_programareas_*.gpkg under {dir_derived} matches geom_hash {zs$geom_hash} ",
+            "for {zsk}; candidates: {paste(cands, collapse = ', ')}"))
+
+ply <- ply |>
+  select(programarea_key, programarea_name, region_key, region_name) |>
+  st_make_valid()
+# ~450k vertices are far more than a 20-polygon choropleth needs; keep the shapes, drop the detail
+ply_s <- rmapshaper::ms_simplify(ply, keep = 0.02, keep_shapes = TRUE) |> st_make_valid()
+# Leaflet: shift to 0–360 so the Aleutian polygons that straddle the antimeridian draw as one
+ply_l <- st_shift_longitude(ply_s)
+bb_l  <- st_bbox(ply_l)
+
+pa_names <- st_drop_geometry(ply) |> select(programarea_key, programarea_name, region_key)
+
+cat(glue("geometry: `{sub(path.expand(dir_derived), '', ply_src)}` (geom_hash {zs$geom_hash}, ",
+         "{nrow(ply)} Program Areas; simplified {nrow(st_coordinates(ply))} → ",
+         "{nrow(st_coordinates(ply_s))} vertices for drawing)"))
+```
+
+### Report helpers
+
+Presentation only — every number comes from the `msens` core.
+
+```{r}
+#| label: helpers
+
+# choropleth: three base layers (A score, B score, Δ) on one map, hover shows all three
+pa_map <- function(d, title) {
+  x <- ply_l |> left_join(d, by = "programarea_key")
+  a <- x[[va_col]]; b <- x[[vb_col]]
+  rng  <- range(c(a, b), na.rm = TRUE)
+  lim  <- max(abs(x$delta), na.rm = TRUE); if (!is.finite(lim) || lim == 0) lim <- 1
+  pal_s <- colorNumeric("viridis", domain = rng, na.color = "#00000000")
+  pal_d <- colorNumeric(c("#e8590c", "#f8f9fa", "#20c997"), domain = c(-lim, lim),
+                        na.color = "#00000000")
+  lbl <- glue("<b>{x$programarea_key}</b> {x$programarea_name}<br/>",
+              "{va}: {ifelse(is.na(a), '—', round(a, 2))}<br/>",
+              "{vb}: {ifelse(is.na(b), '—', round(b, 2))}<br/>",
+              "Δ: {ifelse(is.na(x$delta), '—', sprintf('%+.2f', x$delta))}") |>
+    lapply(HTML)
+  poly <- function(m, fill, grp) {
+    m |> addPolygons(
+      fillColor = fill, fillOpacity = 0.75, color = "#555", weight = 0.7, opacity = 0.8,
+      label = lbl, group = grp,
+      highlightOptions = highlightOptions(weight = 2, color = "#000", bringToFront = TRUE))
+  }
+  # Esri's grey canvas needs no API key (CARTO's basemaps now do)
+  leaflet(x, options = leafletOptions(worldCopyJump = FALSE)) |>
+    addProviderTiles("Esri.WorldGrayCanvas") |>
+    fitBounds(bb_l[["xmin"]], bb_l[["ymin"]], bb_l[["xmax"]], bb_l[["ymax"]]) |>
+    poly(~pal_s(a), va) |>
+    poly(~pal_s(b), vb) |>
+    poly(~pal_d(delta), "Δ") |>
+    addLegend(pal = pal_s, values = c(a, b), title = glue("{title}<br/>score ({va}, {vb})"),
+              position = "bottomleft", na.label = "") |>
+    addLegend(pal = pal_d, values = c(-lim, lim), title = glue("{title}<br/>Δ {vb} − {va}"),
+              position = "bottomright", na.label = "") |>
+    addLayersControl(baseGroups = c(va, vb, "Δ"), position = "topright",
+                     options = layersControlOptions(collapsed = FALSE))
+}
+
+# diverging background for a Δ column: n colours need n-1 cut points
+div_style <- function(x, n = 8) {
+  lim <- max(abs(x), na.rm = TRUE); if (!is.finite(lim) || lim == 0) lim <- 1
+  list(brks = seq(-lim, lim, length.out = n + 1)[2:n],
+       cols = colorRampPalette(c("#e8590c", "#ffffff", "#20c997"))(n))
+}
+
+# sortable table: Program Area, both scores, Δ and Δ %, coloured on Δ
+pa_table <- function(d, caption) {
+  t <- d |>
+    left_join(pa_names, by = "programarea_key") |>
+    transmute(`Program Area` = programarea_key, Name = programarea_name, Region = region_key,
+              !!va := round(.data[[va_col]], 2),
+              !!vb := round(.data[[vb_col]], 2),
+              `Δ` = round(delta, 2),
+              `Δ %` = ifelse(.data[[va_col]] != 0, round(100 * delta / .data[[va_col]], 1), NA)) |>
+    arrange(desc(abs(`Δ`)))
+  ds <- div_style(t$`Δ`)
+  DT::datatable(t, rownames = FALSE, caption = caption,
+                options = list(pageLength = 25, dom = "t", order = list(list(5, "desc")))) |>
+    DT::formatStyle("Δ", backgroundColor = DT::styleInterval(ds$brks, ds$cols))
+}
+
+# per-metric delta table from the two long score frames (same core as the composite)
+metric_delta <- function(m) {
+  msens::score_delta(
+    scores_a |> filter(metric_key == m) |> rename(programarea_key = zone_key),
+    scores_b |> filter(metric_key == m) |> rename(programarea_key = zone_key),
+    key = "programarea_key", value = "score", labels = c(va, vb))
+}
+```
+
+## Overall composite score
+
+The headline equivalence gate: the composite (`{r} mk`) per Program Area in each version,
+inner-joined so only Program Areas present in **both** are compared.
+
+```{r}
+#| label: pra-delta
+
+d <- msens::pra_score_delta(con_a, con_b, metric_key = mk, labels = c(va, vb), zone_set_key = zsk)
+s <- msens::score_delta_summary(d)
+
+# soft equivalence verdict — report, never hard-stop (a report must render either way)
+gate <- tryCatch(
+  { msens::assert_within_tolerance(d, mean_tol = params$mean_tol, max_tol = params$max_tol); "PASS" },
+  error = function(e) conditionMessage(e))
+
+knitr::kable(
+  tibble::tibble(
+    metric = c("Program Areas compared", "mean |Δ|", "max |Δ|", "RMSE", "correlation",
+               "tolerance (mean / max)", "verdict"),
+    value  = c(s$n, round(s$mean_abs, 3), round(s$max_abs, 3), round(s$rmse, 3),
+               round(cor(d[[va_col]], d[[vb_col]]), 4),
+               glue("{params$mean_tol} / {params$max_tol}"),
+               ifelse(gate == "PASS", "✅ within tolerance", paste0("⚠️ ", gate)))),
+  caption = glue("Composite-score equivalence, {va} → {vb}"))
+```
+
+### Map
+
+Switch between **`{r} va`**, **`{r} vb`** and **Δ** with the radio buttons; hover a Program Area for
+all three values. Both score layers share one colour scale so they are directly comparable.
+
+```{r}
+#| label: pra-map
+pa_map(d, "Composite")
+```
+
+### Table
+
+Click a column header to sort by Program Area, score or difference.
+
+```{r}
+#| label: pra-table
+pa_table(d, glue("Per-Program-Area composite score, {va} vs {vb}"))
+```
+
+```{r}
+#| label: pra-delta-plot
+#| fig-height: 6
+#| fig-width: 8
+
+d_plot <- d |>
+  mutate(programarea_key = factor(programarea_key, levels = programarea_key[order(delta)]),
+         sign = ifelse(delta >= 0, glue("higher in {vb}"), glue("higher in {va}")))
+
+ggplot(d_plot, aes(delta, programarea_key, fill = sign)) +
+  geom_col() +
+  geom_vline(xintercept = 0, linewidth = 0.3) +
+  scale_fill_manual(values = setNames(c("#20c997", "#e8590c"),
+                                      c(glue("higher in {vb}"), glue("higher in {va}")))) +
+  labs(x = glue("Δ composite score  ({vb} − {va})"), y = NULL, fill = NULL,
+       title = glue("Program-Area composite-score change: {va} → {vb}")) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top")
+```
+
+## Component scores
+
+Every Program-Area score of both releases is read once (`msens::zone_scores()`) and compared with
+`msens::zone_score_delta()`, which compares only shared zones and metrics and **returns what it had
+to drop**.
+
+```{r}
+#| label: components
+
+scores_a <- msens::zone_scores(con_a, zone_set_key = zsk, label = va)
+scores_b <- msens::zone_scores(con_b, zone_set_key = zsk, label = vb)
+zd <- msens::zone_score_delta(scores_a, scores_b, labels = c(va, vb))
+
+is_component <- function(m) grepl("^extrisk_[a-z_]+_ecoregion_rescaled$", m) |
+                            m == "primprod_ecoregion_rescaled"
+comp_label <- function(m) ifelse(m == "primprod_ecoregion_rescaled", "primary productivity",
+                                 sub("^extrisk_(.*)_ecoregion_rescaled$", "\\1", m))
+comp_title <- function(m) tools::toTitleCase(gsub("_", " ", comp_label(m)))
+
+comps <- zd$by_metric |>
+  filter(is_component(metric_key)) |>
+  mutate(component = comp_label(metric_key)) |>
+  arrange(desc(mean_abs_delta))
+
+only_a <- zd$metrics_only_a[is_component(zd$metrics_only_a)]
+only_b <- zd$metrics_only_b[is_component(zd$metrics_only_b)]
+
+cat(glue("- Program Areas shared: **{zd$n_zones_shared}**",
+         if (length(zd$zones_only_a)) glue(" (only in {va}: {paste(zd$zones_only_a, collapse = ', ')})") else "",
+         if (length(zd$zones_only_b)) glue(" (only in {vb}: {paste(zd$zones_only_b, collapse = ', ')})") else "",
+         "  \n- components compared: **{nrow(comps)}**  \n",
+         "- components only in {va} (not compared): ",
+         if (length(only_a)) paste0("`", only_a, "`", collapse = ", ") else "none", "  \n",
+         "- components only in {vb} (not compared): ",
+         if (length(only_b)) paste0("`", only_b, "`", collapse = ", ") else "none", "\n"))
+```
+
+### Summary by component
+
+`n` is the number of Program Areas carrying that component in **both** versions (a category absent
+from a Program Area, e.g. coral in the Arctic, has no row there).
+
+```{r}
+#| label: components-summary
+
+comps |>
+  transmute(component, metric_key, n = n_zones,
+            !!glue("mean {va}") := round(mean_a, 2), !!glue("mean {vb}") := round(mean_b, 2),
+            `mean Δ` = round(mean_delta, 2), `mean |Δ|` = round(mean_abs_delta, 2),
+            `max |Δ|` = round(max_abs_delta, 2), r = round(cor, 3)) |>
+  DT::datatable(rownames = FALSE, options = list(dom = "t", pageLength = 25),
+                caption = glue("Per-component Program-Area delta, {va} → {vb}, sorted by mean |Δ|"))
+```
+
+### Δ by Program Area × component
+
+One cell per (Program Area, component): Δ = B − A. Sort any column to find where a
+component moved most.
+
+```{r}
+#| label: components-heatmap
+
+comp_keys  <- comps$metric_key
+comp_delta <- setNames(lapply(comp_keys, metric_delta), comp_keys)
+
+wide <- bind_rows(
+    lapply(comp_keys, function(m) comp_delta[[m]] |> transmute(programarea_key, component = comp_label(m), delta)),
+    d |> transmute(programarea_key, component = "COMPOSITE", delta)) |>
+  mutate(delta = round(delta, 2)) |>
+  pivot_wider(names_from = component, values_from = delta) |>
+  left_join(pa_names, by = "programarea_key") |>
+  relocate(programarea_key, programarea_name, region_key, COMPOSITE) |>
+  rename(`Program Area` = programarea_key, Name = programarea_name, Region = region_key) |>
+  arrange(desc(abs(COMPOSITE)))
+
+num_cols <- names(wide)[sapply(wide, is.numeric)]
+ds <- div_style(unlist(wide[num_cols]), n = 10)
+DT::datatable(wide, rownames = FALSE, options = list(dom = "t", pageLength = 25, scrollX = TRUE),
+              caption = glue("Δ ({vb} − {va}) per Program Area and component")) |>
+  DT::formatStyle(num_cols, backgroundColor = DT::styleInterval(ds$brks, ds$cols))
+```
+
+### Each component: map and table
+
+::: {.panel-tabset}
+
+````{r}
+#| label: components-tabs
+#| output: asis
+#| echo: false
+
+tpl <- "
+#### {{title}}
+
+`{{metric}}` — {{n}} Program Areas compared; mean |Δ| {{mean_abs}}, max |Δ| {{max_abs}}, r = {{r}}.
+
+```{r}
+#| echo: false
+pa_map(comp_delta[['{{metric}}']], '{{title}}')
+```
+
+```{r}
+#| echo: false
+pa_table(comp_delta[['{{metric}}']], glue('{{title}} ({{metric}}), {va} vs {vb}'))
+```
+"
+kids <- lapply(seq_len(nrow(comps)), function(i) {
+  r <- comps[i, ]
+  knitr::knit_child(
+    text = knitr::knit_expand(text = tpl, metric = r$metric_key, title = comp_title(r$metric_key),
+                              n = r$n_zones, mean_abs = round(r$mean_abs_delta, 2),
+                              max_abs = round(r$max_abs_delta, 2), r = round(r$cor, 3)),
+    quiet = TRUE)
+})
+cat(unlist(kids), sep = "\n")
+````
+
+:::
+
+### Components present in only one version
+
+Listed for reference, **not** compared: their per-Program-Area score in the version that has them.
+
+```{r}
+#| label: components-one-sided
+
+one_sided <- bind_rows(
+  scores_a |> filter(metric_key %in% only_a) |> mutate(version = va),
+  scores_b |> filter(metric_key %in% only_b) |> mutate(version = vb))
+if (nrow(one_sided)) {
+  one_sided |>
+    transmute(version, component = comp_label(metric_key), metric_key,
+              `Program Area` = zone_key, score = round(score, 2)) |>
+    DT::datatable(rownames = FALSE, filter = "top", options = list(pageLength = 25))
+} else cat("none — both versions carry the same components.\n")
+```
+
+## All metrics, long form
+
+Every (Program Area, metric) present in both versions — the composite, the components, and the
+intermediate metrics (`extrisk_*` raw, ecoregion min/max, pre-area-weighting backups). Filter with
+the boxes above each column and sort by any column.
+
+```{r}
+#| label: all-metrics
+
+shared_m <- zd$by_metric$metric_key
+long <- bind_rows(lapply(shared_m, function(m) metric_delta(m) |> mutate(metric_key = m))) |>
+  left_join(pa_names, by = "programarea_key") |>
+  transmute(`Program Area` = programarea_key, Region = region_key, metric_key,
+            !!va := round(.data[[va_col]], 3), !!vb := round(.data[[vb_col]], 3),
+            `Δ` = round(delta, 3),
+            `Δ %` = ifelse(.data[[va_col]] != 0, round(100 * delta / .data[[va_col]], 1), NA)) |>
+  arrange(desc(abs(`Δ`)))
+DT::datatable(long, rownames = FALSE, filter = "top",
+              options = list(pageLength = 20, order = list(list(5, "desc"))),
+              caption = glue("{nrow(long)} (Program Area × metric) pairs shared by {va} and {vb}"))
+```
+
+```{r}
+#| label: cleanup
+#| include: false
+DBI::dbDisconnect(con_a, shutdown = TRUE)
+DBI::dbDisconnect(con_b, shutdown = TRUE)
+```

@@ -88,7 +88,9 @@ test. Two things are:
 2. **The explained gate** — the real run's delta is explained by the ingest's per-component /
    per-region Δ tables (`data/ax_vs_am_summary.csv`), and the components the new dataset cannot
    touch (bird, primary_producer, every non-modeled taxon) stay cor ≥ 0.999. Commit
-   `validate_v8_v9.html` beside it.
+   `compare_versions_v8_vs_v9.html` beside it (`Rscript scripts/render_compare.R v8 v9`; the report
+   is `compare_versions.qmd` — maps + sortable tables per component; the earlier `validate_v8_v9.html`
+   is the same comparison before the rename).
 
 Rule-level guards for the same change, all of which the v8 behaviour fails: `test-merge.R`
 `T_ax_*` fixtures + the control fixture; `merge_models.qmd`'s check that no `am` row survives inside
