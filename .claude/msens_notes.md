@@ -1,5 +1,7 @@
 ## TODO
 
+
+
 - report mentions "mapgl":  "submitted by the app at app.marinesensitivity.org/mapgl"
   Replace all instances of mapgl/mapsp with scores/species
 
@@ -40,6 +42,71 @@
 - [ ] draft atlas manuscript
   Let's write a manuscript (with a plan first to discuss) on forwarding the vision of this project to the next iteration (plan )
   '/Users/bbest/Library/CloudStorage/GoogleDrive-ben@ecoquants.com/.shortcut-targets-by-id/1sppUmlMtZ-sXaBm72M1-8PnjVudXO91v/US MBON Public Folder/Working Groups/BioIndicators/manuscripts/atlas/atlas _ BioIndicators manuscript.md'
+
+
+## 2026-09-04 alternative scheme for Alaska turtle fix and inter-regional comparison
+
+Review this suggestion to help resolve issues around regional comparability of scores, especially considering overrepresentation of Alaskan sea turtles issues (search emails with Tim within the last day):
+
+@`.claude/plans/2026-09-03 Tim's MST_distribution_share_method_brief.md`
+
+Consider our existing documentation (`@../docs`). Can  you come up with an interactive visualization to help elucidate methods existing and new that can be difficult to grasp and their implications for inter-regional comparability and skewed number of species per component?
+
+Can you justify and/or inform methods with a thorough literature review?
+
+---
+
+**Interactive page:** ⧉ https://claude.ai/code/artifact/773b9b71-efa4-4d46-9a99-385415bc04e5 (private until you share it; the first load in the viewer takes about 20 s).
+**Written review + literature:** `.claude/plans/2026-09-04 distribution-share review + literature.md`, beside Tim's brief.
+
+**Verdict on the brief.** The diagnosis and the shape of the fix are right. Formula 9.4 gives every ecoregion a cell scoring 100, so Table 10-2 compares grading curves, not turtles. Per-species normalization has a name and a literature: rarity-weighted richness / weighted endemism (Williams 1996, Crisp 2001, Albuquerque & Beier 2015), and it is the per-feature normalization Zonation applies to every layer. Build it.
+
+**What I found by running it on v9** (published scores reproduced at r = 0.9997; composite exactly):
+
+- **Step 1 is not the cause**. The leatherback's mean merged value in the Aleutian Arc is 51/100, not the floor of 1. The denominator fixes the illusion; the floor strip only removes noise.
+- **Step 4 is not a percent yet**. It needs division by the category's total weight, and Program Areas do not tile the study area.
+- **Denominator scope** is the real decision, and it should be global. With a study-area denominator the vagrant problem returns at species level: the Aleutian Arc holds 2.6 % of the US turtle share but 0.23 % of the global one. Global also matches Ramsar/KBA-style thresholds and the national-responsibility literature.
+- **A share is a total, so area counts**. The published score is a mean; the share is extensive. Aleutian Arc rises from composite rank 9 to 3, Cook Inlet falls from 2 to 20. A per-km² variant correlates 0.62 with the published ranking versus 0.25. The page has a toggle for both; the table needs to say which it uses.
+- **Validation targets pass with the global denominator**. Alaska areas hold 0.71 % of the national turtle share, the Gulf areas 2.3 %; GAA is the national 100; Rice's whale tops the mammal share in GAA and GAB; the Arctic keeps its mammal columns.
+- Percentile endpoints alone move several published numbers while keeping ranks (Spearman 0.90), and BOEM's own OFWESA model already normalized to fixed endpoints and averaged per species, a precedent for both moves.
+
+**The page** has six parts: the grading curve on real ecoregion ceilings, the two arithmetics side by side, a 24-cell sandbox with presets (turtles, Arctic endemics vs rich south, species-count skew, vagrant sliver) and five scoring rules, the v9 Program-Area explorer (category tabs, global/US denominator, total vs per-km², species contributions per area), the reading of the brief with the team decisions, and an annotated bibliography of 32 sources grouped by the question each answers.
+
+**Caveats stated on the page**: turtles and the 16 DPS taxa enter as risk-weighted surfaces; AquaX-superseded taxa use AquaMaps outside US waters; global cell areas are spherical (within 1 %). Nothing was added to the repos beyond the memo; the recompute scripts live in the session scratchpad and the memo describes how to reproduce them in msens.
+
+---
+
+For the [Interactive page](https://claude.ai/code/artifact/773b9b71-efa4-4d46-9a99-385415bc04e5), please make the following edits:
+
+
+
+Companion to the docs chapters [Scoring](https://marinesensitivity.org/docs/scoring.html) and [Model Merging](https://marinesensitivity.org/docs/model-merging.html) and to the method brief Distribution-Share Sensitivity Score for National Program Area Comparison (T. White, 2026-09-03)
+
+Companion to the docs chapters Scoring and Model Merging](https://preview.marinesensitivity.org/docs/v9/model-merging.html) and to the method brief Distribution-Share Sensitivity Score for National Program Area Comparison (T. White, 2026-09-03)
+
+Companion to the docs chapters Scoring and Model Merging 
+
+The 
+
+- Formula 9.1
+- https://marinesensitivity.org/docs/scoring.html now 404s, but should go to 
+  https://marinesensitivity.org/docs/{v#}/scoring.html
+  where v# is latest version
+
+
+
+## 2026-09-02 compare versions
+
+I thought there was a Quarto notebook to compare versions with input parameters. I want to know differences across overall and individual component scores between versions 6 and 9 for this run. It should render to a different name specific to the versions. Maybe this comparison was embedded in the release notebook to compare with previous version. I want to see chorpleth maps and tables with scores of each version and differences, sortable by Program Area / difference / score
+
+Note that the components differ slightly v6 has "other" and v9 has "primary producers"
+
+I am hoping something like a `compare_versions.qmd` with input parameters for versions can be generically created and rendered into output something like `compare_versions_v6_vs_v9.html`.
+
+---
+
+
+
 
 ## 2026-08-28 Cloudflare branding, invalid email login, logout 
 
@@ -122,7 +189,7 @@ Also unclear how the STAC API and auth works programmatically with helper functi
 
 Both questions answered from the code; nothing needed changing, so here's the assessment.
 
-1. Why v8/v9 are missing from storage.marinesensitivity.org/marine-atlas/
+1. **Why v8/v9 are missing from storage.marinesensitivity.org/marine-atlas/**
 
 It's working as designed — the design just hides rather than "shows locked":
 
@@ -134,7 +201,7 @@ Why it surprised you: decision 4 ("show it locked — 🔒 pre-release · restri
 
 One more thing to know: live versions.json does not yet list v9 — versions.csv got its v9 row in 28269cf6 this morning but build_version_manifest hasn't been re-published since. Once it is, v9 will be withheld the same way v8 is (the index target depends on release_marine_atlas, so it'll rerun on release).
 
-2. STAC API + auth, programmatically
+2. **STAC API + auth, programmatically**
 
 Short version: nothing programmatic needs auth, because only the preview host is gated.
 
@@ -153,9 +220,13 @@ Cloudflare Access?: yes
 how to hit it: browser: OTP login. Headless: service token headers CF-Access-Client-Id /
 CF-Access-Client-Secret
 
+### TODO: service token helper functions?
+
 The service tokens are minted by server/cloudflare/access.sh: msens-preview-check (reaches every version; secret in server .env as CF_ACCESS_CLIENT_ID/_SECRET) and msens-preview-probe-{ver} (only that version — proves isolation). The only code that uses them is the CHECK_PREVIEW=1 chunk in release_marine-atlas.qmd:842-963, and it builds the curl headers by hand. msens has no request helper for this — its helpers are URL/policy only: preview_app_url(), atlas_preview_url(), atlas_allow_access() (reads MS_PREVIEW), atlas_ver_access(), atlas_resolve_ver(), ver_token_*.
 
-So if "helper functions for these preview Cloudflare items" means something like msens::preview_get(url) that reads the token pair from env and adds the headers (usable from CHECK_PREVIEW, tests, and a reviewer script), that doesn't exist yet and would be a small addition — happy to add it with a test, plus the locked-row change to the storage index, if you want either.
+So if "helper functions for these preview Cloudflare items" means something like `msens::preview_get(url)` that reads the token pair from env and adds the headers (usable from `CHECK_PREVIEW`, tests, and a reviewer script), that doesn't exist yet and would be a small addition — happy to add it with a test, plus the locked-row change to the storage index, if you want either.
+
+> TODO [suggested]: `Yes, do both — locked rows in the storage index and msens::preview_get()`
 
 ## 2026-08-27 mobile friendly apps
 
