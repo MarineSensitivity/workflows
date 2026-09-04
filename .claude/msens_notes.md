@@ -386,6 +386,53 @@ It is ok to show v9 variants for the sake of demonstration and interactivity and
 
 ---
 
+Done. The page now defines v10 as recommended and uses it as the default view everywhere, with the v9 variants kept only as labelled demonstrations.
+
+**Published**: revision 12 of ⧉ Sensitivity Across Regions (https://claude.ai/code/artifact/773b9b71-efa4-4d46-9a99-385415bc04e5), same URL.
+
+**What v10 now means on the page (section 2, formulas v10·1–4)**:
+- Each species' risk-weighted share of its global range (27 national-only taxa via the fallback order), summed per component and zone.
+- The score is a concentration: the area's share of the nation's importance divided by its share of the nation's surface. 100 = the national average per km² (a location quotient), the same fixed reference for every area and component.
+- The percent of the world's importance is printed beside every score as the amount at stake.
+- Equal component weights, no richness damping, and a component below 5 % coverage is not reportable.
+
+**Where the defaults changed**: hero tiles, section 3 tables, the flower plot (dashed ring = 100), the map's v10 layer, the sandbox (v10 column now on the same 100 = average scale, columns reordered v9 → v9 variant → v10 → v10 variant), the explorer (Reference control defaults to national average, with top area = 100 and absolute as alternatives), findings and recommendations, the docs drop-ins (new eq-v10, the top-area rescale equation removed, metric names and the Table 10-2 template updated), the apps card and the footer.
+
+One consequence to be aware of: the hero turtle scores read 390 for GOA Program Area A and 19 for the Aleutian Arc, not the 100 and 11 from the top-area stretch you asked for two revisions ago. Under the recommended reference those are the honest numbers (3.9× and 0.19× the national average), and the top-area = 100 view is one click away in the explorer.
+
+┌─────────────────────┬─────────────────────────────────┬─────────────────────┐
+│    Turtles, v10     │              Score              │ % of world at stake │
+├─────────────────────┼─────────────────────────────────┼─────────────────────┤
+│ GOA Program Area A  │ 390                             │ 2.0 %               │
+├─────────────────────┼─────────────────────────────────┼─────────────────────┤
+│ GOA Program Area B  │ 235                             │ 0.26 %              │
+├─────────────────────┼─────────────────────────────────┼─────────────────────┤
+│ Southern California │ 124                             │ 0.47 %              │
+├─────────────────────┼─────────────────────────────────┼─────────────────────┤
+│ Aleutian Arc        │ 19                              │ 0.23 %              │
+├─────────────────────┼─────────────────────────────────┼─────────────────────┤
+│ St. George Basin    │ not reportable (coverage 1.5 %) │ 4e-4 %              │
+└─────────────────────┴─────────────────────────────────┴─────────────────────┘
+
+**Also updated**: the memo's decisions table, the draft email to Tim (now describes v10 as defined, with these numbers), a revision-12 addendum, and the memory note. Still uncommitted, as before: the memo, the fallback CSV draft in data/, and the docs repo's 404-redirect workflow change.
+
+---
+
+Both repos committed and pushed to main, the branch this history is kept on.
+
+workflows 3a9655a6: the review memo with v10 defined as recommended, the R2 fallback fractions for the 27 national-only taxa in data/us_share_fallback.csv, and your notes file. Tim's brief was already committed before this session.
+
+docs 8491493: the 404.html redirect so unversioned links like /docs/scoring.html land on the promoted release, plus the refreshed server-config copies the infrastructure chapter renders. The Quarto Publish workflow started on the push and is in progress, so the redirect goes live when it finishes.
+
+One thing not in any repo: the page's build sources (the R data prep, the JSON post-processing, the HTML template and the ASCII build script) live in the session scratchpad, which does not persist. If you want them kept, I can add them under scripts/ or beside the memo in a follow-up.
+
+----
+
+
+Yes, add them to this repo, ideally with full reproducibility. Also write a plan for going to v10 in markdown with a prompt for execution in phases with agents according to sufficient but not excessive
+  model intelligence / token usage. We will want to fold in redo of VGPM primary productivity which was a legitimate complaint of the v1 review by Michael that applied summer averages to winter months in
+  the Arctic. Put this plan in @.claude/plans_todo/ and write agentic subplans there as needed too. Also add to plan derive range maps from  AquaMaps for species without IUCN range maps by finding
+  taxa-based threshold to apply to AquaMaps that most closely matches species where they do match, probably per taxa class / component. See O'Hara paper evaluating this.
 
 
 ## 2026-09-02 compare versions
