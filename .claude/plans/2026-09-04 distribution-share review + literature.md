@@ -75,14 +75,21 @@ decision first.
 
 ## Decisions (recommendation)
 
-| Decision | Recommendation |
+| Decision | Recommendation (= the v10 definition, page revision 12) |
 |---|---|
-| Headline table | share-based for cross-region reporting; ecoregional retained for within-region use |
+| Headline table | v10 for cross-region reporting; ecoregional v9 retained for within-region use |
 | Scope | all categories, one rule (a single national column beside six ecoregional ones mixes scales in the composite) |
-| Denominator | global range (headline), study-area share as a second column, stated in the metric description |
-| Quantity | state whether the table reports total share or share per km²; consider carrying both |
-| Composite weights | equal, stated as policy, with the sensitivity reported |
-| Formula 9.4 | 1st/99th-percentile endpoints, plus the rank correlation |
+| Denominator | global range; 27 national-only taxa get the R2 fallback (endemic → literature → OBIS fraction); study-area denominator shown only as a demonstration |
+| Quantity | the score is the intensity (per km²); the total share (% of the world's importance) is the companion, printed beside every score |
+| Reference point | 100 = the national average concentration (location quotient: area's share of the nation's importance ÷ its share of the nation's surface); no best-performer stretch; "top area = 100" is a display comparison only |
+| Reporting floor | a component is reportable in a zone only if its scored cells cover ≥ 5 % of the zone's area (GEO turtles 1.5 % → not reportable) |
+| Richness | no damping (α = 0); publish n species and mean dependence beside the score |
+| Composite weights | equal, stated as policy, with a sensitivity appendix (species-count and risk-weight bases, stakeholder sets, Spearman vs equal) |
+| Formula 9.4 | moot under v10 (no min–max); percentile endpoints kept on the page as a v9 variant only; print the Spearman between the v9 and v10 rankings |
+
+(Earlier revisions recommended the brief's per-component top-area = 100 with the absolute percent beside it, and
+"total as the headline, per km² beside it"; superseded 2026-09-04 pm when Ben asked that every recommendation be the
+default and the page define v10 outright.)
 
 ## Real v9 numbers (global denominator, total share)
 
@@ -189,3 +196,253 @@ comparison.
 ## Interactive page
 
 https://claude.ai/code/artifact/773b9b71-efa4-4d46-9a99-385415bc04e5 — *Sensitivity Across Regions*: the grading-curve chart, the two arithmetics, a 24-cell sandbox with presets, the v9 Program-Area explorer (category tabs, global/US denominator, total vs per-km², species contributions), the reading of the brief, and the annotated literature.
+
+## Addendum 2026-09-04 (afternoon): page revision 2
+
+The interactive page now carries everything in this memo plus: a redesigned sandbox (vertical
+transect, south→north, colour-coded species, boxed zones, scenario notes), a "reading the controls"
+explainer for section 4 (denominator, total vs per-km², what the green dot is), findings split from
+recommendations with references, a literature synthesis, section 7 with drop-in text for the docs
+(scoring.qmd section + callout, science.qmd paragraph, metric rows, glossary entries, references.bib
+entries, a Table 10-2 template, an apps-guide paragraph) and section 8 on how to show two scores in the
+apps without showing six numbers.
+
+Additional finding (from Ben's note on TSS): the brief's Step 1 "apply AquaX's TSS cutoff" would
+binarize suitability. TSS is a skill statistic (sensitivity + specificity − 1, −1..+1, prevalence-
+independent; Allouche et al. 2006); the per-species `cutoff` AquaX ships is the suitability threshold
+that maximizes TSS (max-SSS, Liu et al. 2013), recorded in `model_ax.csv` and applied only under
+`AX_APPLY_CUTOFF=1` (about half of a typical model's pixels fall below it). Inside a share it changes
+numerator and denominator, discards the continuous information the share uses (Guillera-Arroita et al.
+2015) and pushes each species toward its cell-count fraction (Kemp's ridley 46 % by suitability vs 13 %
+by footprint). Recommendation R3: keep the surface continuous; the cutoff is at most a range-footprint
+option applied to numerator and denominator together, reported as a sensitivity.
+
+Denominator availability in v9: 2,113 species use the merged global surface, ~15,000 AquaMaps outside US
+waters + merged inside; 27 valid species have only a national dataset (12 invertebrates + 3 fishes
+AquaX-only; 12 FWS-range-only birds/fishes/mammals) and no global total. Proposed fallback order: merged
+global → AquaMaps global → expert-range footprint (IUCN/BirdLife/SWOT cell counts, whole-range ingests)
+→ literature fraction of global population/range in US waters (IUCN Red List range/EOO, BirdLife and
+Partners in Flight estimates, NOAA stock assessments, NatureServe national-responsibility ranks) →
+endemic assumption, flagged. `taxon.range_usa_km2 / range_km2` is 1.0 for every taxon (both are the US
+footprint), so the range-based fraction must come from the global range datasets, not the taxon table.
+
+Why keep the ecoregional score: inside one ecoregion Formula 9.4 is a linear transform of the raw cell
+score, so its within-region ranking equals the raw density ranking, which is the right answer for siting
+inside a region, for the cell maps and for continuity; the share ranks by irreplaceability and under-serves
+dense habitat of wide-ranging species. Two labelled numbers, each for its question; never mixed in a
+composite.
+
+Docs: `docs/.github/workflows/quarto-publish.yaml` now also writes a `404.html` that forwards unversioned
+paths (`/docs/scoring.html#…`) to `/docs/{latest}/…` and explains restricted versions with a link to the
+preview host; the prune regex keeps it. Uncommitted, needs a push to take effect.
+
+Page-building lesson: the artifact viewer showed mojibake ("minâ€"max", "kmÂ²") for Ben although Chrome
+rendered it; the page is now generated as pure ASCII (entities in markup, \u escapes in JS/JSON, \XXXX
+in CSS) by `build_page.py` in the scratchpad, with a charset meta at the top.
+
+## Naming (2026-09-04): v9 = the published rule (ecoregional rescale), v10 = the proposed rule (distribution share), applied to the same v9 merged models. The page, the docs drop-ins and the email use that naming.
+
+## Draft email to Tim
+
+Subject: v10 (distribution share): review, real numbers, and an interactive page
+
+Hi Tim,
+
+I worked through your distribution-share brief against the v9 tables and put the whole review on one page
+(private link; sign in with your claude.ai account or ask me to share it):
+https://claude.ai/code/artifact/773b9b71-efa4-4d46-9a99-385415bc04e5
+
+Since it advances the method rather than re-doing v9, the page calls the resulting rule v10 and implements it
+as the default view; the v9 variants (percentile endpoints, a single national min–max) stay on the page for
+comparison only.
+
+Short version: the brief is right about the problem and right about the fix. Per-species normalization is
+the standard move in spatial conservation planning (rarity-weighted richness / weighted endemism, and the
+first step of Zonation), and on v9 it does what you expected: the two Gulf Program Areas hold 2.3 % of the
+world's risk-weighted turtle importance, the six Alaska areas 0.7 %, Rice's whale tops the Gulf mammal
+column, and the Arctic keeps its mammal columns.
+
+Where v10 as defined on the page departs from the brief's steps, with the numbers:
+
+1. Step 1 (the floor and the TSS cutoff) is not where the work is. The leatherback's mean merged value in
+   the Aleutian Arc is 51/100, not the floor of 1; the suitability model times the Endangered weight is the
+   source, and the global denominator is what handles it (2 % of the leatherback's range is in US waters).
+   Applying AquaX's TSS cutoff would binarize the surface at the max-TSS threshold and move every species
+   toward its footprint fraction; the page keeps the surface continuous.
+2. The denominator is the global range, not the study area. A study-area denominator brings the vagrant
+   problem back at species level (Aleutian Arc: 2.6 % of the US turtle share, 0.2 % of the global). For the
+   27 species with only a national model the page applies a fallback in order: endemic, literature fraction,
+   OBIS occurrence fraction.
+3. The score is a concentration, and 100 is the national average rather than the top area. A total share
+   grows with the size of the Program Area (on total share the Aleutian Arc rises to composite rank 3 and
+   Cook Inlet falls to 20), so v10 divides an area's share of the nation's importance by its share of the
+   nation's surface: 100 = a fair share per km²; GOA Program Area A 390, Aleutian Arc 19. That reference is
+   the same for every area and component and does not move between releases; the "top area = 100" stretch of
+   Step 5 is on the page only for comparison. The total, as a percent of the world's importance, is printed
+   beside every score as the amount at stake.
+4. Three settled details: a coverage floor (a component whose scored cells cover < 5 % of an area is not
+   reportable; St. George Basin turtles, 1.5 %); equal component weights with a sensitivity appendix
+   (species-count weighting would hand 92 % of the composite to invertebrates and fishes); no richness
+   damping, because the score is n species × mean dependence and no exponent in [0, 1] removes richness on
+   v9's data, so the two factors are reported instead.
+
+The v9 ecoregional score stays for within-region use, labelled as such, and the re-issued table carries the
+Spearman between the two rankings. The page also has a sandbox for intuition, the literature, drop-in text
+for the docs, the Table 10-2 template and a proposal for how the apps show both. Happy to walk through it.
+
+Ben
+
+
+## Addendum: richness (page section 3, added 2026-09-04)
+
+Correction to an earlier line on the page ("richness-neutral by construction"): v10 is not richness-neutral.
+Each species is counted once nationally, split across its range (so a wide-ranging species can no longer
+inflate every region it touches), but a zone's share is still a sum over the species present:
+share_z,g = n_z,g × mean_s(w_s · share_s,z / 100), richness × mean dependence. A species-rich zone outscores
+a species-poor one only if its many species depend on it enough (1,000 tropical fishes at 1 % = 20 Arctic
+fishes at 50 %). On v9 fishes: GAA 1,455 species at a mean 0.10 % of global range (1.5 % of the category);
+Chukchi 158 at 0.03 % (0.056 %); Aleutian Arc 600 at 0.15 % (0.96 %). Options if richness should count less:
+mean share per species (OFWESA/CWE; rewards single endemics), core-area max (Zonation CAZ), damped richness
+total ÷ n^α. Recommendation: keep the total as the headline, publish n and the mean beside it; equal
+component weights already bound richness across categories. Page also gained a symbol definition list and a
+"richness gradient" sandbox scenario with a decomposition table; the v10 question now reads "what fraction
+of each species' whole range lies here?".
+
+
+## Addendum: absolute scale and R2 fallbacks applied (page revision 5, 2026-09-04)
+
+Two operations were being read as one. The DENOMINATOR (what each species' fraction is a fraction of: global
+range, R2) is separate from brief Step 5, a cosmetic stretch so the top Program Area reads 100. The page no
+longer says "rescaled nationally"; section 5 now has a Scale control: "% of the world (absolute)" (default;
+pct_z,g = zone total ÷ category total weight, nothing stretched, 100 = the whole world's importance, the way KBA
+and Ramsar thresholds read) and "top area = 100" (Step 5). In absolute scale the v9 and green dots are hidden
+(0–100 relative numbers would put two scales on one axis); ranks stay in the label.
+
+R2 fallback chain applied to the 27 valid species with only national datasets (all have zone_taxon rows and
+merged US surfaces; 12 FWS-range-only taxa even have a "merged global" surface, which IS their US range, so the
+fallback takes precedence over it):
+- endemic (fraction 1): Hawaiian stilt, Gulf sturgeon, tidewater goby, saltmarsh topminnow, four Hawaiian
+  anchialine shrimps, southern sea otter;
+- literature: northern sea otter 0.9 (USFWS stock assessments), laughing gull 0.5 (real fix: BOTW name
+  crosswalk Leucophaeus atricilla), Eskimo curlew 0.25 (presumed extinct, flagged);
+- OBIS occurrence fraction (records in OBIS area 266 "United States: all" ÷ worldwide, floor 0.02, effort-biased,
+  confidence flagged) for the 15 AquaX-only fishes and invertebrates.
+Draft curation file: `workflows/data/us_share_fallback.csv` (uncommitted; columns taxon_id, scientific_name,
+common_name, sp_cat, ds, fraction, method, basis, obis_total, obis_us). OBIS query pattern:
+https://api.obis.org/v3/occurrence?taxonid={aphia}&size=0 and &areaid=266.
+The recomputed numbers barely move (the 27 species are small contributors): hero and Spearman unchanged.
+
+
+## Addendum: sliver rule and the map (page revision 7, 2026-09-04)
+
+Ben's intent: the sliver rule is GEOMETRIC, the fraction of a Program Area covered by scored pixels of the
+component, not the component's share of value. St. George Basin (GEO), sea turtles, v9: scored cells cover
+1.5 % of the area (a strip along the southern boundary), 4 species, v9 score 0.7, 0.011 % of the nation's
+turtle importance. Rule (page section 4, recommendation in 7b, docs drop-in with an equation): a component is
+reported for a zone only if its scored cells cover >= kappa = 5 % of the zone's area (area-weighted fraction
+of the zone's cells carrying a value for the category); below that it is "not reportable": no data on maps,
+footnoted, excluded from the composite like a category with no cells, never a zero. Defined on the footprint,
+so identical for v9 and v10. On v9 it removes exactly one pair (GEO turtles); the next-lowest coverage is
+18 % (primary producers, Northern California; nearshore category, 18-49 % across the Pacific areas), then High
+Arctic corals at 40 %, so any kappa in 2-18 % gives the same result; 5 % keeps a wide margin below the
+nearshore categories. A share floor tau (importance, not presence) is offered as an optional complement, off
+by default, because at any useful setting it also removes low-share Arctic corals and primary producers.
+
+Section 3 now has a choropleth (Program Areas, shifted longitude, study-area outline) with metric (composite or
+component), layer (v9 | v10 at alpha, top area = 100 | delta) and a damped-richness slider alpha in [0,1]
+(zone total / n^alpha before the top-area rescale; alpha = 1 is mean share per species). Geometry: v8 Program
+Area gpkg simplified with rmapshaper (keep 3 %), embedded as GeoJSON; the 27-species fallback table moved to
+full width; ecoregion names corrected (HAR = High Arctic, EBS = East Bering Sea, CBS = Chukchi and Beaufort Seas).
+
+
+## Addendum: optimal alpha? (page revision 8, 2026-09-04)
+
+Ben asked whether the damped-richness exponent alpha (v10 total / n^alpha, 0 = total, 1 = mean share per
+species) has an optimum that balances importance across the study area. Answer on the page (section 3
+panel "Is there an optimal alpha?"): no ecological optimum exists in the literature; alpha is an order
+parameter like Hill's q (Hill 1973; Jost 2006; Chao et al. 2014: report the profile) or Zonation's
+ABF-vs-CAZ choice (Moilanen 2007); the ends have arguments (alpha = 0: representation efficiency, Williams
+1996 / Albuquerque & Beier 2015; alpha = 1: endemism independent of richness, Crisp 2001 / Laffan & Crisp
+2003). The one statistical anchor, the exponent beta that decouples the score from species count (slope of
+log total on log species present across the 20 PAs; the richness-corrected endemism idea, Jetz et al. 2004),
+is 1.4-1.8 for every v9 category with r2 >= 0.3 (turtles 5.7 on 11 points, r2 0.17, unreadable): species-rich
+Program Areas also hold LARGER mean fractions of their species, so richness and dependence reinforce and no
+alpha in [0,1] removes the richness gradient; alpha = 1 is merely the least richness-driven. alpha profile of
+the composite vs v9: rho 0.18 (alpha 0), 0.15, 0.19, 0.22, 0.28 (alpha 1); top three stable (GAA, SOC, then
+ALA/GOA). Recommendation: publish alpha = 0, report beta per category as a diagnostic and print the profile
+(alpha 0, 1/2, 1) in the report; alpha = 1/2 is a convention if a single compromise is demanded. Added refs:
+Hill 1973, Jost 2006, Chao 2014, Jetz 2004, Kier 2009 (endemism richness).
+
+
+## Addendum: reference points (page revision 10, 2026-09-04)
+
+Ben asked whether v10 yields at least one Program Area at 100 per component or one max across all components.
+Answer (new page section 3 "Reference points"): brief Step 5 takes the maximum PER COMPONENT over the reporting
+units, so every component has exactly one Program Area at 100 (the one holding the largest share of the
+nation's importance for that component: sea turtles GAA, etc.), and the composite (equal-weight mean of
+component scores) reaches 100 only if one area tops every component; on v9 the highest v10 composite is GAA at
+~75 (page value 74.8). Hero tiles now show the per-component rescaled v10 (GAA 100, ALA 11.4) with the absolute % beneath.
+Four reference options tabulated on the turtle example (v9 best cell in ecoregion; v10 per-component max; one
+max across all components (not recommended: drops equal component weighting); absolute % of the world; fixed
+policy reference 100 = 1 % of the world's importance, uncapped). Recommendation, literature-backed: keep the
+per-component max for the re-issued table (OHI "best performer" reference point, Halpern 2012 / Samhouri 2012;
+preserves equal weights) with the absolute % beside every value; for the standing product from v10 onward use
+the fixed 1 % reference ("distance to a reference" normalization preferred to min-max when an external benchmark
+exists, OECD/JRC 2008; fixed target preferred to spatial comparison, Samhouri 2012; OFWESA's hypothetical maximum
+"independent of the sensitivity of other regions", Morandi 2018; 1 % = Ramsar Criterion 6 / KBA D1, 0.5 % A1
+for CR/EN). Added Samhouri et al. 2012 (Ecosphere 3:art41) to the literature. Sections renumbered 1-11.
+
+
+## Addendum: area independence and component weights (page revision 11, 2026-09-04)
+
+Area independence (section 3 addition): "absolute" on the page meant unstretched, not area-free. The total
+share is extensive (grows with Program Area size); the area-independent form is the share per km2 (mean cell
+share), the like-for-like successor of v9's area-weighted mean and the form of the offshore-wind sensitivity
+maps. Refined recommendation: headline sensitivity score = intensity (per km2), rescaled per component for the
+re-issued table and anchored for the standing product to the national average concentration, i.e. the location
+quotient LQ = (area's share of the nation's category importance) / (area's share of the study-area surface),
+1 = fair share (Isserman 1977). v9 turtles: GAA 2.97, GAB 2.38, SOC 2.01, ALA 0.39, GEO ~0 (per-km2 rescaled:
+GAA 100, GAB 60, ALA 5). Total share % of the world printed beside it as the amount at stake. Hero still shows
+the total (as the brief does).
+
+Component weights (new section 4, interactive flower plot: PA picker, v9/v10 scores, weight base equal / species
+count / total risk weight / custom sliders, dial gamma with W_g = (base_g / geometric mean)^gamma, primprod fixed
+at 1; table of all 20 composites with ranks and Spearman vs equal weights). Facts: species count would hand
+~92 % of the composite to invertebrates + fishes and 0.04 % to turtles; total risk weight favours fishes /
+invertebrates / corals and nearly erases primary producers (sum w 3.3). Recommendation: equal weights published,
+with a sensitivity appendix (gamma = 1 on both bases + regulatory and biodiversity stakeholder sets, Spearman vs
+equal), as OHI reported extractive vs preservationist weightings (Halpern 2012). Literature: OECD/JRC 2008
+(weights follow the framework), Burgass et al. 2017 (weighting = dominant structural uncertainty), McRae et al.
+2017 (LPI diversity weighting = the species-count precedent, which here would double-count richness),
+Lehtomaki & Moilanen 2013 (group-normalized weights), Morandi 2018 (OFWESA equal groups), Isserman 1977 (LQ).
+Sections renumbered 1-12.
+
+## Addendum: v10 as recommended is the default (page revision 12, 2026-09-04)
+
+Ben: "This document IS the brief … Implement ALL your recommendations as the default view in this document for
+v10. Do NOT show level-up versions of v9" (then: v9 variants may stay for demonstration / interactivity). v10 is now
+DEFINED on the page (section 2, formulas v10·1–4 + companion + composite; symbol list):
+
+    share_s,c  = v_s,c A_c / Σ_c' v_s,c' A_c'        (denominator = the species' global range; R2 fallback)
+    share_c,g  = Σ_{s∈g} w_s,c share_s,c / 100
+    share_z,g  = Σ_c p_zc share_c,g                   (pct_z,g = 100 share_z,g / Σ w_s/100 = % of the world at stake)
+    v10_z,g    = 100 · (share_z,g / share_USA,g) / (A_z / A_USA)    location quotient; 100 = national average
+    composite  = equal-weight mean of the reportable components (coverage ≥ κ = 5 %); primprod_v10 = zone mean
+                 VGPM / national mean × 100; α = 0.
+
+v9 turtles under v10: GAA 390 (3.9× the national average, 2.0 % of the world), GAB 235, SOC 124, NOC 100, CEC 111,
+GOA 45, ALA 19 (0.19×, 0.23 %), GEO not reportable (coverage 1.5 %); highest composite GAA 242. The hero tiles now
+read 390 / 19 (they read 100 / 11.4 under the top-area stretch of revision 10).
+
+What defaults to v10 on the page: hero tiles; section 3 (alternatives table: v10 | total % of world | top area =
+100 | v9; per-component "most concentrated" table); section 4 flower (dashed ring = 100 = national average);
+section 5 map layer; section 7 sandbox (v10 column = LQ with equal-area zones, 100 = 6/N; columns reordered v9,
+v9 variant, v10, v10 variant, mean share); section 8 explorer (defaults global / per km² / 100 = national
+average; Reference seg also offers top area = 100 and absolute; bar mode with ranks; table columns v9 published |
+v9 p1–p99 | v9 nat. min–max | v10 | % of world | rank Δ); section 9 findings/recommendations rewritten (reference
+point, intensity, Spearman, next steps: `msens::share_sql(ver, category)` implementing v10·1–4 with the coverage
+floor); section 11 docs drop-ins (eq-v10 added, eq-share-national removed, metric rows `extrisk_{g}_share`,
+`_share_zone` + `_pct_world`, `_v10`, `_coverage`, `primprod_v10`, `score_v10_equalweights`; Table 10-2 template
+with v10 | % at stake | v9 rank | Δ; apps guide text); section 12 apps card (v10 score 390, at stake 2.0 %, sentence
+generated from the data); footer states the v10 computation. Page engineering: shared `V10` model object +
+`v10base/v10rows/v10all/v10composite` at the top of the script feed every section, so one definition drives all views.
