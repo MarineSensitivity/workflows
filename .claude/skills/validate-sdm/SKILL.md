@@ -34,19 +34,19 @@ On any pipeline change or version bump, the guardrail is: **Program-Area (PRA) s
 ~equivalent to the prior version on the *common* inputs.** Real divergence must be explained
 (more species, marine cull, taxonomy sp_cat, an intended exclusion like no_eez), not accidental.
 
-## The gate
-
-`msens::pra_score_delta` (run at the end of `score_zone_metrics.qmd`) compares the v8 PRA
-composite to v7's and reports `n`, `mean_abs`, `max_abs`, `rmse`, `cor`. Expect **cor high**
-(0.97+ once taxonomy sp_cat is in) and small deltas on common species.
+`msens::pra_score_delta` (run at the end of `score_zone_metrics.qmd`) compares `ver`'s PRA
+composite to `ver_prev`'s and reports `n`, `mean_abs`, `max_abs`, `rmse`, `cor`. On a same-input
+bump expect **cor 0.97+** and small deltas on common species; a dataset that supersedes another
+diverges by design (see the control run below).
 
 ## Apples-to-apples (isolate the algorithm from the species-set change)
 
 - `SCORE_V7COMMON=1` restricts scoring to v7's scored set (`in_v7`) — isolates grid/algorithm
   from the v8 species expansion.
 - `SCORE_ALLBIRDS=1` disables the marine-bird cull (diagnostic).
-- The **strongest** control: score v8 cells with **v7's exact er_score for the shared species**
-  (see the archived `apples.R` pattern) — then any residual delta is grid/merge, not ER/lists.
+- The **strongest** control: score `ver`'s cells with **`ver_prev`'s exact er_score for the shared
+  species** (join `ver_prev`'s `taxon.er_score` onto the common taxa before `score_cell_metrics`) —
+  then any residual delta is grid/merge, not ER/lists.
 
 ## Per-component breakdown
 
@@ -89,8 +89,7 @@ test. Two things are:
    per-region Δ tables (`data/ax_vs_am_summary.csv`), and the components the new dataset cannot
    touch (bird, primary_producer, every non-modeled taxon) stay cor ≥ 0.999. Commit
    `compare_versions_v8_vs_v9.html` beside it (`Rscript scripts/render_compare.R v8 v9`; the report
-   is `compare_versions.qmd` — maps + sortable tables per component; the earlier `validate_v8_v9.html`
-   is the same comparison before the rename).
+   is `compare_versions.qmd` — maps + sortable tables per component).
 
 Rule-level guards for the same change, all of which the v8 behaviour fails: `test-merge.R`
 `T_ax_*` fixtures + the control fixture; `merge_models.qmd`'s check that no `am` row survives inside

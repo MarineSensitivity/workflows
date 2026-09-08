@@ -72,16 +72,20 @@ the law is**: **MMPA (+20) = all WoRMS Mammalia** (not the incomplete NMFS direc
 no floor). `merge_models` applies the governing er to range cells (the "fitting point"), so
 `extrisk_*` sums `er_score × val`.
 
-## Listed entities below species level → SPATIAL extinction risk (`ingest_nmfs-dps.qmd`, v9.1)
+## Listed entities below species level → SPATIAL extinction risk (`ingest_nmfs-dps.qmd`, v9)
 
 `parse_noaa_status()` takes the highest domestic ESA listing on a species' NOAA page as the
 species' status — right for whole-species listings, wrong for DPS/ESU/subspecies-scoped ones
-(humpback: Endangered from DPSs outside US waters; US-waters DPSs Not at Risk). For those 18
-species the governing ER is not a number but a surface: `dps_nmfs` = each listed entity's
+(humpback: Endangered from DPSs outside US waters; US-waters DPSs Not at Risk). For every species
+with a listed entity below species level, the governing ER is not a number but a surface: `dps_nmfs` = each listed entity's
 critical-habitat polygons (NMFS `All_NMFS_Critical_Habitat` service, authoritative) at
 `compute_er_score("NMFS:{EN|TN}", is_mmpa)`, the IUCN range at `compute_er_score("IUCN:{cat}",
-is_mmpa)` elsewhere; the taxon merges in the turtle branch (ER × suitability) and scores with
-`is_er_spatial`. `taxon.er_score` for these taxa is display only. Never add such a species to a
+is_mmpa)` elsewhere. The taxon merges through `msens::dps_sql()`, NOT the turtle rule: `val` is the
+suitability masked to the ER footprint (the distribution), and the per-cell ER is written beside it
+(`dist_merged_er/`) for `score_cell_metrics` to multiply in (`taxon.er_mode = 'cell'`). The turtle
+rule (ER × suitability as the merged value) on these taxa collapses the surface to the baseline ER
+wherever there is no critical habitat — the app then draws the weight, not the species.
+`taxon.er_score` for these taxa is display only. Never add such a species to a
 listing override CSV — extend the DPS source instead (NOAA DPS-level ranges arrive end of CY2026).
 
 ## Marine-bird cull — `is_marine` (`merge_taxon.qmd`)

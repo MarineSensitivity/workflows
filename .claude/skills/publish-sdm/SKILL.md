@@ -92,14 +92,16 @@ SQL, ~0.07s tile; if cold reads ever exceed 1–2s, fall back to a local `/share
 ## Deploy (gated — all in-notebook chunks, no ad-hoc ssh)
 
 - **`RELEASE_DEPLOY=1`** — the notebook rsyncs the KB view DB + STAC subtree to `msens1`, `git pull`s
-  the server repo and (re)builds the **parallel** `titiler-{ver}` service (picks up the mdl_key→mdl_id
-  factory), restarts caddy, smoke-tests.
+  the server repo, rebuilds and force-recreates the ONE tiler (`TITILER_SERVICE`, default
+  `titiler-v8` — the stock `/cog` tiler every release shares; no per-version service), restarts
+  caddy, smoke-tests.
 - **`DEPLOY_APPS=1`** (also implied by `RELEASE_DEPLOY`) — pulls the `apps_v8` checkout
   (`MarineSensitivity/apps@main`) and reloads it via Shiny Server `restart.txt`. **Since the
   2026-08-12 cutover this IS the live `/scores` + `/species`**, one app rendering every release from
-  `?ver=` — so it restarts what everyone sees, not a parallel deployment. The 18 former per-version
+  the version in the URL path (`/v7/scores/`, header `X-MS-Version`; `?ver=` is 301'd to that form)
+  — so it restarts what everyone sees, not a parallel deployment. The 18 former per-version
   instances are in `/share/shiny_apps_retired/` (moved aside, not deleted) with Caddy 301ing every old
-  URL to `/scores/?ver=v{n}`.
+  URL to `/v{n}/scores/`, query intact.
 
 titiler-v8 (`titiler-v8.marinesensitivity.org`, port 8001) runs parallel to v7 (A/B).
 

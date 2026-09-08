@@ -156,9 +156,8 @@ sees**, not a parallel deployment.
 
 The 18 former instances (`mapgl`, `mapsp`, `mapgl_v1-v6`, `mapsp_v1-v6`, `scores_v6/v8`,
 `species_v6/v8`) are in `/share/shiny_apps_retired/` — moved aside, not deleted, so the cutover
-is reversible — with Caddy 301ing every old URL to `/scores/?ver=v{n}` (and `/mapgl`, `/mapsp` to
-`?ver=v7`, which is what they were). `DEPLOY_APPS_V7=1` still exists but has nothing to restart;
-the v7 checkout is retired.
+is reversible — with Caddy 301ing every old URL to `/v{n}/scores/` (and `/mapgl`, `/mapsp` to
+`/v7/…`, which is what they were), query intact.
 
 **Granular vs publishing runs.** A run that asks ONLY for `DEPLOY_*`/`CHECK_PREVIEW` targets
 converges the *server* on what is already published: it skips staging, the S3 push, the view DB,
@@ -172,8 +171,8 @@ back into the full path. A granular deploy now takes ~45 s instead of minutes.
 **Env flags** (gate expensive/side-effecting steps): `REDO_INGEST=1` (rebuild an ingest),
 `REDO_WORMS=1` (rebuild the worms table), `SCORE_V7COMMON=1` (score only v7's species, for
 apples-to-apples), `SCORE_ALLBIRDS=1` (disable the marine-bird cull), `RELEASE_NO_S3=1` /
-`RELEASE_RAW=1` / `RELEASE_DEPLOY=1` (release + serving), `DEPLOY_APPS=1` / `DEPLOY_APPS_V7=1`
-(reload the Shiny apps; the `_V7` variant is vestigial post-cutover), `DEPLOY_TABLES=1` (sync `tables/` + `model_cell/` local + repoint
+`RELEASE_RAW=1` / `RELEASE_DEPLOY=1` (release + serving), `DEPLOY_APPS=1`
+(reload the Shiny apps), `DEPLOY_TABLES=1` (sync `tables/` + `model_cell/` local + repoint
 the views), `DEPLOY_API=1` (pull the api repo + **rebuild** the plumber image — msens lives in that
 image, which is separate from `rstudio`, so `DEPLOY_APPS` never updates it),
 `DEPLOY_CADDY=1` (pull the server repo, `docker compose build caddy` (no-op unless its
@@ -240,8 +239,8 @@ v8 — so if the routing half lands while the apps still expect the old contract
 the notebook stops before it reaches the app deploy. **On the preview host
 the version is the URL PATH** (`/v9/scores/`, `/v9/species/`, `/docs/v9/` —
 `msens::preview_app_url()`), never `?ver=`, because Cloudflare Access holds one reviewer policy per
-version and scopes it by path; `server/caddy/preview_routes.caddy` strips the prefix and forces
-`?ver=` for the app (`server/caddy/test/run.sh` proves the routes; `DEPLOY_CADDY` runs it). And the
+version and scopes it by path; `server/caddy/preview_routes.caddy` strips the prefix and hands the
+version to the app as `X-MS-Version` (`server/caddy/test/run.sh` proves the routes; `DEPLOY_CADDY` runs it). And the
 session renders the version its PAGE was served for: `ui(req)` embeds `msens::ver_token_sign(ver)`
 and the server trusts only that token (`ver_of_session()`), because `url_search`/`url_pathname`
 are client-supplied — a v9 reviewer must not steer the shared preview process to v10. Readers derive
@@ -396,7 +395,9 @@ version-independent registries replace that:
   Capabilities derive from **presence and default to FALSE** — a release without `cell_model` must
   not advertise a per-cell species list. Publishing v9 means publishing a manifest, not editing an app.
 - **Promotion is gated**: `latest.txt` is written only under `PROMOTE_LATEST=1` and only names a
-  `released` version. It currently says **v7**; v8 is a `prerelease` reachable at `?ver=v8`.
+  `released` version. `data/versions.csv` is the registry (status + access per version);
+  `latest.txt` on S3 is what the apps default to, and a `prerelease` is reachable only at its
+  own path (`/v{n}/scores/`, restricted ones on the preview host).
 - **Two grids, and `cell_id` means a different place on each.** `usa05` (v1–v7) is 3103×2006 in
   **0–360 longitude**, running 141.10°E east *across the antimeridian*; `global05` (v8) is
   7200×3600 in −180..180. The cell-id COGs are **lookup images** (pixel value = cell id), so never

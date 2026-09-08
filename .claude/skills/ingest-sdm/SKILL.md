@@ -1,12 +1,13 @@
 ---
 name: ingest-sdm
-description: Add or update a species-distribution-model (SDM) ingest in the MarineSensitivity v8 pipeline — turn a source distribution into partitioned model_cell Parquet on the global 0.05° cell grid. Use when wiring a new dataset (vector ranges, raster SDMs, AquaMaps-style) into workflows/ingest_*.qmd.
+description: Add or update a species-distribution-model (SDM) ingest in the MarineSensitivity Marine Atlas pipeline (v8 onward) — turn a source distribution into partitioned model_cell Parquet on the global 0.05° cell grid. Use when wiring a new dataset (vector ranges, raster SDMs, AquaMaps-style) into workflows/ingest_*.qmd.
 ---
 
-# Ingest an SDM into MarineSensitivity v8
+# Ingest an SDM into the MarineSensitivity Marine Atlas
 
 Each `ingest_*.qmd` turns one dataset's per-species models into `model_cell`-shaped
-`(mdl_key, cell_id, value)` rows on the **global 0.05° cell grid**, written as one
+`(mdl_key, cell_id, val)` rows on the **global 0.05° cell grid** (`value` is a DuckDB reserved
+word — the column is `val`), written as one
 Parquet per model to `dist/dataset=<ds_key>/`. The merge (`merge_models_prep` →
 `merge_models` → `merge_taxon`) combines them per taxon.
 
@@ -98,7 +99,7 @@ source(here("libs/paths.R")); source(here("libs/vars.R"))
 ds_key <- "<key>"; dir_dist <- glue("{dir_big_v}/marine-atlas/dist/dataset={ds_key}")
 stopifnot(file_exists(cellid_tif))
 # species crosswalk -> model_{ds}.csv (mdl_key, sp_id, scientific_name, er_code, er_score)
-# resumable loop: cells_from_ranges/raster -> arrow::write_parquet(tibble(mdl_key,cell_id,value))
+# resumable loop: cells_from_ranges/raster -> arrow::write_parquet(tibble(mdl_key,cell_id,val))
 # verify (count/min/max) + write data/manifests/ingest_<ds>.json
 ```
 
@@ -111,7 +112,7 @@ islands confound it). See `feedback_marine_relevance`.
 
 ## Verify
 
-- `mdl_key`/`cell_id`(INTEGER)/`value` schema; `cell_id ∈ [1, 25,920,000]`.
+- `mdl_key`/`cell_id`(INTEGER)/`val` schema; `cell_id ∈ [1, 25,920,000]`.
 - Whole range captured (a terrestrial bird has land cells; `pct_marine` reflects it).
 - Range value == `compute_er_score(...)` (not a magic number).
 - Runs on the **laptop** (has all sources; the server has only `am.duckdb` — see
