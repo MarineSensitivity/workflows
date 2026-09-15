@@ -1,6 +1,6 @@
 ---
-title: "AquaX vs AquaMaps — side-by-side examples (v9 preview)"
-subtitle: "Habitat suitability in US waters: AquaMaps (v8 input), AquaX (v9 input), and the difference"
+title: "AquaMaps vs AquaX vs OBIS-SDM — side-by-side examples"
+subtitle: "Habitat suitability in US waters: AquaMaps 1.0 (v8 input), AquaX (v9 input), OBIS-SDM (v11 candidate), and their differences"
 format:
   html:
     toc: true
@@ -12,16 +12,21 @@ editor_options:
 ---
 
 > **Not a pipeline stage** — a standalone report rendered from the v9 ingest outputs
-> (`dist/dataset=ax`, `dist/dataset=am`) for review conversations. The systematic per-species
-> comparison (every superseded taxon × subregion, the 20 least / most different) is in
-> `ingest_aquax.html`; this page just draws a few species so the *kind* of difference is visible.
+> (`dist/dataset=ax`, `dist/dataset=am`) plus the public OBIS-SDM COGs, for review conversations. The
+> systematic per-species AquaX-vs-AquaMaps comparison (every superseded taxon × subregion, the 20 least /
+> most different) is in `ingest_aquax.html`; the OBIS-SDM coverage numbers are in `explore_obis-sdm.html`.
+> This page just draws a few species so the *kind* of difference is visible.
 
-**How to read a row.** Left: AquaMaps' 0.5° suitability bilinearly interpolated to the 0.05° grid
-(the v8 input). Middle: AquaX's ensemble suitability delivered on that grid (÷10 to the same 0–100
-scale; pixels below 1 dropped, as for AquaMaps). Right: AquaX − AquaMaps where both have a value
-(blue = AquaX lower, red = AquaX higher). Both models are shown only inside the AquaX mask (US
-waters); outside it AquaMaps continues unchanged in v9. Numbers under each species are computed on
-the shared cells.
+**How to read a species.** Top row, left to right: AquaMaps 1.0's 0.5° suitability bilinearly
+interpolated to the 0.05° grid (the v8 input); AquaX's ensemble suitability delivered on that grid (÷10
+to the same 0–100 scale; pixels below 1 dropped, as for AquaMaps); OBIS-SDM's ensemble median (MPA Europe
+v2, predicted globally on the same grid; the species' single published algorithm where no ensemble
+exists) kept where it is ≥ the model's own **minimum training presence** threshold (`mtp`, the lowest
+suitability at any record used to fit it — the plan's default ingest threshold). Bottom row: the pairwise
+differences on shared cells (blue = the later model lower, red = higher): AquaX − AquaMaps is the
+*improvement* AquaX brought; OBIS − AquaMaps the improvement OBIS-SDM would bring; OBIS − AquaX the
+*agreement* between the two modern models. All three are shown only inside the AquaX mask (US waters).
+Numbers under each species are computed on the shared cells. Species with no OBIS-SDM keep the v9 row.
 
 ```{r}
 #| label: setup
@@ -33,6 +38,14 @@ source(here("libs/paths.R"))
 dir_atlas <- path.expand(glue("{dir_big_v}/marine-atlas"))
 dir_ax <- glue("{dir_atlas}/dist/dataset=ax"); dir_am <- glue("{dir_atlas}/dist/dataset=am")
 stopifnot(dir_exists(dir_ax), dir_exists(dir_am), file_exists(glue("{dir_atlas}/dist/ax_mask.parquet")))
+
+# OBIS-SDM (MPA Europe v2): public bucket; per-species files cached under raw/obis-maps/taxonid={AphiaID}
+obis_s3     <- "https://obis-maps.s3.amazonaws.com/sdm/species"
+dir_obismap <- path.expand(glue("{dir_raw}/obis-maps")); dir_create(dir_obismap)
+aws_zip     <- glue("{dir_obismap}/aws_files_list.zip")
+if (!file_exists(aws_zip)) download.file("https://github.com/iobis/mpaeu_sdm/raw/main/aws_files_list.zip", aws_zip, quiet = TRUE)
+if (!file_exists(glue("{dir_obismap}/species_files.parquet"))) unzip(aws_zip, exdir = dir_obismap)
+obis_sf <- read_parquet(glue("{dir_obismap}/species_files.parquet"))   # taxonid, fit_n, available_models
 
 # species to show (scientific names; resolved to AphiaID through the WoRMS snapshot)
 species <- c(
@@ -65,10 +78,23 @@ if (length(missing)) message("not in AquaX (or not an accepted WoRMS name): ", p
 prev_tm <- read_parquet(glue("{dir_big}/{ver_prev}/marine-atlas/tables/taxon_model.parquet")) |>
   filter(ds_key == "am", taxon_authority == "worms") |> transmute(sp_id = as.character(taxon_id), am_key = mdl_key)
 sp <- sp |> left_join(prev_tm |> group_by(sp_id) |> summarise(am_keys = list(am_key), .groups = "drop"), by = "sp_id")
+
+# OBIS-SDM: which published method to draw (ensemble median > esm > the single algorithm)
+obis_method <- function(taxonid) {
+  m <- obis_sf |> filter(taxonid == !!as.integer(taxonid)) |> pull(available_models)
+  if (!length(m)) return(NA_character_)
+  m <- m[[1]]$method
+  pref <- c("ensemble", "esm", "maxent", "rf", "xgboost")
+  pref[pref %in% m][1]
+}
+sp <- sp |> mutate(ob_method = vapply(sp_id, obis_method, character(1)),
+                   ob_fit_n  = obis_sf$fit_n[match(as.integer(sp_id), obis_sf$taxonid)])
 dbExecute(con, glue("CREATE TABLE ax_mask AS SELECT cell_id FROM read_parquet('{dir_atlas}/dist/ax_mask.parquet')"))
+mask_ids <- dbGetQuery(con, "SELECT cell_id FROM ax_mask")$cell_id
 land <- ne_countries(scale = "medium", returnclass = "sf")
 grid <- msens::grid_spec_for("global05")
-kable(sp |> mutate(n_am_models = lengths(am_keys)) |> select(scientific_name, sp_id, cls, n_am_models))
+kable(sp |> mutate(n_am_models = lengths(am_keys)) |> select(scientific_name, sp_id, cls, n_am_models, ob_method, ob_fit_n),
+      caption = "ob_method = OBIS-SDM surface drawn (NA = no OBIS-SDM for this species); ob_fit_n = its fit points")
 ```
 
 ```{r}
@@ -84,6 +110,34 @@ cells_to_rast <- function(d, bb) {
   v <- rep(NA_real_, ncell(r)); v[(row - bb$r0) * ncol(r) + (col - bb$c0) + 1] <- d$val
   r[] <- v; r
 }
+
+# OBIS-SDM current surface for one species as (cell_id, val) inside the AquaX mask, >= its mtp threshold
+obis_cells <- function(taxonid, method) {
+  if (is.na(method)) return(NULL)
+  file_method <- c(ensemble = "ensemble", esm = "esm", maxent = "maxent", rf = "rf_classification_ds", xgboost = "xgboost")[[method]]
+  d <- glue("{dir_obismap}/taxonid={taxonid}"); dir_create(d)
+  get <- function(rel, f) { p <- glue("{d}/{f}")
+    if (!file_exists(p)) download.file(glue("{obis_s3}/taxonid={taxonid}/model=mpaeu/{rel}"), p, quiet = TRUE, mode = "wb"); p }
+  f_tif <- get(glue("predictions/taxonid={taxonid}_model=mpaeu_method={file_method}_scen=current_cog.tif"), glue("{file_method}_current.tif"))
+  f_thr <- get(glue("metrics/taxonid={taxonid}_model=mpaeu_what=thresholds.parquet"), "thresholds.parquet")
+  r <- rast(f_tif)
+  stopifnot(ncol(r) == grid$nc, nrow(r) == grid$nr, max(abs(as.vector(ext(r)) - c(-180, 180, -90, 90))) < 1e-4)
+  thr <- read_parquet(f_thr); mtp <- thr$mtp[thr$model == method]
+  if (!length(mtp) || is.na(mtp)) mtp <- 0.01
+  v <- values(r[[1]])[mask_ids, 1]   # the pixel index IS cell_id on global05 (asserted above)
+  tibble(cell_id = mask_ids, val = as.numeric(v)) |> filter(!is.na(val), val >= mtp * 100) |>
+    structure(mtp = mtp * 100, method = method)
+}
+
+pair_stats <- function(a, b, sfx) {
+  both <- inner_join(a, b, by = "cell_id", suffix = c("_a", "_b"))
+  tibble(n_shared = nrow(both), jaccard = round(nrow(both) / length(union(a$cell_id, b$cell_id)), 2),
+         mean_a = round(mean(both$val_a), 1), mean_b = round(mean(both$val_b), 1),
+         delta = round(mean(both$val_b - both$val_a), 1),
+         cor = round(suppressWarnings(cor(both$val_a, both$val_b)), 2)) |>
+    rename_with(~ paste0(.x, "_", sfx))
+}
+
 species_panels <- function(i) {
   s <- sp[i, ]
   ax <- dbGetQuery(con, glue("SELECT cell_id, val FROM read_parquet('{dir_ax}/{s$sp_id}.parquet')"))
@@ -92,19 +146,17 @@ species_panels <- function(i) {
     dbGetQuery(con, glue("SELECT a.cell_id, max(a.val) AS val FROM read_parquet([{files}]) a
                           JOIN ax_mask m USING (cell_id) GROUP BY 1"))
   } else tibble(cell_id = integer(), val = numeric())
-  both <- inner_join(ax, am, by = "cell_id", suffix = c("_ax", "_am"))
-  ids  <- c(ax$cell_id, am$cell_id)
+  ob <- obis_cells(s$sp_id, s$ob_method)
+  ids  <- c(ax$cell_id, am$cell_id, ob$cell_id)
   row  <- (ids - 1) %/% grid$nc + 1; col <- (ids - 1) %% grid$nc + 1
   pad  <- 10
   bb <- list(r0 = max(1, min(row) - pad), r1 = min(grid$nr, max(row) + pad),
              c0 = max(1, min(col) - pad), c1 = min(grid$nc, max(col) + pad))
+  diff_cells <- function(a, b) inner_join(a, b, by = "cell_id") |> transmute(cell_id, val = val.y - val.x)
   r_am <- cells_to_rast(am, bb); r_ax <- cells_to_rast(ax, bb)
-  r_d  <- cells_to_rast(both |> transmute(cell_id, val = val_ax - val_am), bb)
-  stats <- tibble(species = s$scientific_name, n_am = nrow(am), n_ax = nrow(ax), n_shared = nrow(both),
-                  jaccard = round(nrow(both) / length(union(ax$cell_id, am$cell_id)), 2),
-                  mean_am = round(mean(both$val_am), 1), mean_ax = round(mean(both$val_ax), 1),
-                  delta = round(mean(both$val_ax - both$val_am), 1),
-                  cor = round(suppressWarnings(cor(both$val_am, both$val_ax)), 2))
+  r_d_ax_am <- cells_to_rast(diff_cells(am, ax), bb)
+  stats <- bind_cols(tibble(species = s$scientific_name, n_am = nrow(am), n_ax = nrow(ax), n_ob = if (is.null(ob)) NA_integer_ else nrow(ob)),
+                     pair_stats(am, ax, "ax_am"))
   e <- ext(r_ax)
   base <- function(r, title, fill) ggplot() + geom_spatraster(data = r) + fill +
     geom_sf(data = land, fill = "grey92", colour = "grey70", linewidth = 0.2) +
@@ -112,14 +164,29 @@ species_panels <- function(i) {
     labs(title = title, x = NULL, y = NULL) +
     theme_minimal(base_size = 9) + theme(legend.position = "bottom", legend.key.height = unit(3, "pt"),
                                          panel.background = element_rect(fill = "#dfe9f3", colour = NA))
-  p1 <- base(r_am, "AquaMaps (v8 input, 0.05°)", scale_fill_viridis_c(limits = c(0, 100), na.value = NA, name = "suitability"))
-  p2 <- base(r_ax, "AquaX (v9 input, ÷10)",       scale_fill_viridis_c(limits = c(0, 100), na.value = NA, name = "suitability"))
-  p3 <- base(r_d,  "AquaX − AquaMaps (shared cells)",
-             scale_fill_gradient2(low = "#2166ac", mid = "white", high = "#b2182b", limits = c(-100, 100), na.value = NA, name = "Δ"))
-  list(plot = (p1 | p2 | p3) + plot_annotation(
-         title = glue("{s$scientific_name}  (WoRMS {s$sp_id})"),
-         subtitle = glue("shared cells {stats$n_shared} · Jaccard {stats$jaccard} · mean AquaMaps {stats$mean_am} → AquaX {stats$mean_ax} (Δ {stats$delta}) · r = {stats$cor}")),
-       stats = stats)
+  suit <- function() scale_fill_viridis_c(limits = c(0, 100), na.value = NA, name = "suitability")
+  dif  <- function() scale_fill_gradient2(low = "#2166ac", mid = "white", high = "#b2182b", limits = c(-100, 100), na.value = NA, name = "Δ")
+  p_am <- base(r_am, "AquaMaps 1.0 (v8 input, 0.05°)", suit())
+  p_ax <- base(r_ax, "AquaX (v9 input, ÷10)", suit())
+  p_d1 <- base(r_d_ax_am, "AquaX − AquaMaps (improvement)", dif())
+  if (is.null(ob)) {
+    plot <- (p_am | p_ax | p_d1) + plot_annotation(
+      title = glue("{s$scientific_name}  (WoRMS {s$sp_id}) — no OBIS-SDM"),
+      subtitle = glue("AquaX vs AquaMaps: shared {stats$n_shared_ax_am} · Jaccard {stats$jaccard_ax_am} · mean {stats$mean_a_ax_am} → {stats$mean_b_ax_am} (Δ {stats$delta_ax_am}) · r = {stats$cor_ax_am}"))
+    return(list(plot = plot, stats = stats))
+  }
+  r_ob <- cells_to_rast(ob, bb)
+  r_d_ob_am <- cells_to_rast(diff_cells(am, ob), bb); r_d_ob_ax <- cells_to_rast(diff_cells(ax, ob), bb)
+  stats <- bind_cols(stats, pair_stats(am, ob, "ob_am"), pair_stats(ax, ob, "ob_ax"))
+  p_ob <- base(r_ob, glue("OBIS-SDM ({attr(ob, 'method')}, ≥ mtp {attr(ob, 'mtp')})"), suit())
+  p_d2 <- base(r_d_ob_am, "OBIS − AquaMaps (improvement)", dif())
+  p_d3 <- base(r_d_ob_ax, "OBIS − AquaX (agreement)", dif())
+  plot <- ((p_am | p_ax | p_ob) / (p_d1 | p_d2 | p_d3)) + plot_annotation(
+    title = glue("{s$scientific_name}  (WoRMS {s$sp_id}) — OBIS-SDM fit on {s$ob_fit_n} points"),
+    subtitle = glue("AquaX vs AquaMaps: Jaccard {stats$jaccard_ax_am}, r = {stats$cor_ax_am}, Δ {stats$delta_ax_am}  ·  ",
+                    "OBIS vs AquaMaps: Jaccard {stats$jaccard_ob_am}, r = {stats$cor_ob_am}, Δ {stats$delta_ob_am}  ·  ",
+                    "OBIS vs AquaX: Jaccard {stats$jaccard_ob_ax}, r = {stats$cor_ob_ax}, Δ {stats$delta_ob_ax}"))
+  list(plot = plot, stats = stats)
 }
 ```
 
@@ -129,7 +196,7 @@ species_panels <- function(i) {
 #| label: maps
 #| results: asis
 #| fig-width: 13
-#| fig-height: 4.6
+#| fig-height: 9.2
 
 all_stats <- list()
 for (i in seq_len(nrow(sp))) {
@@ -144,6 +211,10 @@ for (i in seq_len(nrow(sp))) {
 
 ```{r}
 #| label: stats
-kable(bind_rows(all_stats), caption = "Computed on the cells where both models have a value (inside the AquaX mask). delta = mean AquaX − mean AquaMaps on the [0,100] scale; Jaccard = footprint overlap.")
+st <- bind_rows(all_stats)
+kable(st |> select(species, n_am, n_ax, n_ob, starts_with("jaccard"), starts_with("cor"), starts_with("delta")),
+      caption = "Computed on the cells where both models of a pair have a value (inside the AquaX mask). Suffix ax_am = AquaX vs AquaMaps 1.0, ob_am = OBIS-SDM vs AquaMaps 1.0 (improvement), ob_ax = OBIS-SDM vs AquaX (agreement). delta = mean of the later model − the earlier on the [0,100] scale; Jaccard = footprint overlap; cor = Pearson r on shared cells.")
+kable(st |> select(species, starts_with("n_shared"), starts_with("mean")),
+      caption = "Shared-cell counts and mean suitability per pair (mean_a = earlier model, mean_b = later model).")
 dbDisconnect(con, shutdown = TRUE)
 ```

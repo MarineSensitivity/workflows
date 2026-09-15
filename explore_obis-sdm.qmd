@@ -1,0 +1,224 @@
+---
+title: "Explore OBIS species distribution models (MPA Europe) for v11"
+author: "Ben Best"
+date: "2026-09-15"
+editor_options:
+  chunk_output_type: console
+---
+
+## Why
+
+AquaMaps 2.0 (the AquaX pipeline, ingested as `ax` in v9) cannot be redistributed: the FishBase
+consortium keeps the rasters, and BOEM-funded products are expected to be open. OBIS's MPA Europe
+contribution ([iobis/mpaeu_sdm](https://github.com/iobis/mpaeu_sdm), docs at
+[iobis.github.io/mpaeu_docs](https://iobis.github.io/mpaeu_docs/)) is a fully open alternative: an
+ensemble SDM framework (`obissdm`, Maxent + random forest + XGBoost; "ESM" ensembles of small models
+for 10–29 records) fitted on **global** OBIS + GBIF occurrences and predicted to the **whole globe on
+exactly our `global05` grid** (7200 × 3600, 0.05°, −180..180), published as COGs on
+`s3://obis-maps/sdm/species/taxonid={AphiaID}/` with a STAC catalogue.
+
+This notebook answers three questions with numbers, all reproducible from public sources plus the
+local OBIS snapshot:
+
+1. What species coverage does the OBIS/MPA Europe SDM set give us compared to AquaMaps 1.0 (`am`) and
+   2.0 (`ax`)?
+2. What is the minimum number of OBIS records the framework needs, and how many US species clear it
+   (so the same framework could fill the gaps)?
+3. Does an OBIS model clipped to the IUCN range (our merge rule) look like AquaX? (walrus test)
+
+```{r}
+#| label: setup
+librarian::shelf(
+  arrow, DBI, dplyr, duckdb, fs, glue, here, jsonlite, knitr, readr, terra, tibble,
+  quiet = T)
+options(readr.show_col_types = F)
+source(here("libs/paths.R"))
+
+# inputs ----
+# local OBIS snapshot (the obisindicators export, 136 M rows); on the server this is the
+# continuously-synced s3://obis-open-data/occurrence/ mirror (newer) — point OBIS_OCC at either
+obis_occ    <- Sys.getenv("OBIS_OCC", "~/_big/obis.duckdb")          # duckdb (table occ) or a dir of parquet
+dir_obismap <- glue("{dir_raw}/obis-maps")                            # cache of MPA Europe files
+dir_create(dir_obismap)
+mp_list_url <- "https://raw.githubusercontent.com/iobis/mpaeu_docs/main/files/sdm_list_iss_cons_20250903.csv"
+mp_list_csv <- glue("{dir_obismap}/sdm_list_iss_cons_20250903.csv")
+if (!file_exists(mp_list_csv)) download.file(mp_list_url, mp_list_csv, quiet = T)
+aws_zip_url <- "https://github.com/iobis/mpaeu_sdm/raw/main/aws_files_list.zip"
+aws_zip     <- glue("{dir_obismap}/aws_files_list.zip")
+if (!file_exists(aws_zip)) download.file(aws_zip_url, aws_zip, quiet = T)
+if (!file_exists(glue("{dir_obismap}/species_files.parquet"))) unzip(aws_zip, exdir = dir_obismap)
+
+# outputs ----
+obis_grid_db <- glue("{dir_derived}/obis_grid.duckdb")   # (species x cell) counts on global05
+gap_csv      <- here("data/obis_sdm_gap_species.csv")    # US species with >=30 cells and no am/ax
+```
+
+## The framework's thresholds (from the code)
+
+`mpaeu_sdm/functions/model_species.R` sets `minptslim <- 30` quality-controlled occurrence points for
+the standard model and `model_species_esm.R` sets `minptslim <- 10` for the ensemble-of-small-models
+path; a model is kept when its cross-validated continuous Boyce index is ≥ 0.3
+(`codes/model_fit.R`: `tg_metric <- "cbi"; tg_threshold <- 0.3`). The published species list
+(`sdm_list_iss_cons_20250903.csv`) records the outcome per species.
+
+```{r}
+#| label: mp-list
+mp <- read_csv(mp_list_csv) |>
+  rename(aphia = taxonID, mp_sdm = SDM, mp_info = SDMinfo, mp_rec = availableRecords)
+mp |>
+  count(mp_sdm, mp_info) |>
+  left_join(
+    mp |> group_by(mp_sdm, mp_info) |>
+      summarise(min_rec = min(mp_rec, na.rm = T), median_rec = median(mp_rec, na.rm = T), .groups = "drop"),
+    by = c("mp_sdm", "mp_info")) |>
+  kable(caption = "MPA Europe species list: SDM outcome by reason, with cleaned-record counts")
+
+sf <- read_parquet(glue("{dir_obismap}/species_files.parquet"))
+sf |>
+  select(taxonid, available_models) |> tidyr::unnest(available_models) |>
+  group_by(taxonid) |> summarise(models = paste(sort(unique(method)), collapse = "+")) |>
+  count(models, sort = T) |>
+  kable(caption = "Algorithms published per species on s3://obis-maps (esm = ensemble of small models, 10-29 points)")
+```
+
+## OBIS occurrences onto the 0.05° cell grid
+
+Species-rank records (`speciesid` = accepted WoRMS AphiaID) are binned to the `global05` cell whose
+pixel index is `cell_id` (asserted against the `cell` table), then joined to `in_usa`.
+
+```{r}
+#| label: obis-grid
+con <- dbConnect(duckdb(), obis_grid_db)
+dbExecute(con, glue("attach '{sdm_db}' as sdm (read_only)"))
+occ_sql <- if (file_exists(obis_occ) && !is_dir(obis_occ)) {
+  dbExecute(con, glue("attach '{obis_occ}' as ob (read_only)")); "ob.occ"
+} else {
+  glue("read_parquet('{obis_occ}/*.parquet')")
+}
+if (!"occ_cell" %in% dbListTables(con)) {
+  dbExecute(con, glue("
+    create table occ_cell as
+    select speciesid::int aphia, any_value(species) species, any_value(phylum) phylum, any_value(\"class\") \"class\",
+      (floor((90 - decimalLatitude)/0.05)::bigint * 7200 + floor((decimalLongitude+180)/0.05)::bigint + 1) cell_id,
+      count(*) records, min(date_year) min_year, max(date_year) max_year
+    from {occ_sql}
+    where speciesid is not null and decimalLongitude is not null and decimalLatitude is not null
+    group by 1, 5"))
+}
+# the pixel-index formula must reproduce cell_id exactly
+chk <- dbGetQuery(con, "select count(*) n, sum((cell_id = floor((90 - lat)/0.05)::bigint * 7200 + floor((lon+180)/0.05)::bigint + 1)::int) n_ok from sdm.cell")
+stopifnot(chk$n == chk$n_ok)
+
+dbExecute(con, "create or replace table occ_usa as select o.* from occ_cell o join sdm.cell c using (cell_id) where c.in_usa")
+dbExecute(con, glue("
+  create or replace table spp as
+  with g as (select aphia, any_value(species) species, any_value(phylum) phylum, any_value(\"class\") \"class\",
+               sum(records) rec_global, count(*) cells_global from occ_cell group by 1),
+       u as (select aphia, sum(records) rec_usa, count(*) cells_usa, min(min_year) min_year_usa, max(max_year) max_year_usa
+             from occ_usa group by 1),
+       v as (select try_cast(replace(t.taxon_id,'WORMS:','') as int) aphia, t.is_valid_usa, t.sp_cat,
+               bool_or(m.ds_key='am') has_am, bool_or(m.ds_key='ax') has_ax, bool_or(m.ds_key like 'rng%') has_rng
+             from sdm.taxon t left join sdm.taxon_model tm using (taxon_id) left join sdm.model m using (mdl_key)
+             where t.taxon_authority='worms' group by all),
+       b as (select distinct scientific_name from sdm.taxon where taxon_authority='botw'),
+       mp as (select taxonID aphia, SDM mp_sdm, SDMinfo mp_info, availableRecords mp_rec from read_csv('{mp_list_csv}'))
+  select g.*, coalesce(u.rec_usa,0) rec_usa, coalesce(u.cells_usa,0) cells_usa, u.min_year_usa, u.max_year_usa,
+    v.aphia is not null in_v9, coalesce(v.is_valid_usa,false) is_valid_usa, v.sp_cat,
+    coalesce(v.has_am,false) has_am, coalesce(v.has_ax,false) has_ax, coalesce(v.has_rng,false) has_rng,
+    (g.\"class\" = 'Aves' or b.scientific_name is not null) is_bird,
+    mp.mp_sdm, mp.mp_info, mp.mp_rec
+  from g left join u using (aphia) left join v using (aphia)
+    left join b on b.scientific_name = g.species left join mp using (aphia)"))
+q <- \(sql) dbGetQuery(con, sql)
+q("select count(*) n_spp, sum(rec_global) records, count(*) filter (where rec_usa>0) n_spp_usa, sum(rec_usa) records_usa from spp") |>
+  kable(caption = "OBIS snapshot: species-rank records, globally and inside in_usa cells")
+```
+
+Birds are keyed by BirdLife (`botw`) ids in the taxon table, not AphiaID, so they are matched by name
+and excluded from the gap counts below (BirdLife covers them).
+
+```{r}
+#| label: coverage
+bins <- "case when cells_usa>=1000 then 'e >=1000' when cells_usa>=100 then 'd 100-999' when cells_usa>=30 then 'c 30-99'
+         when cells_usa>=10 then 'b 10-29' else 'a 1-9' end"
+q(glue("select {bins} us_cells, count(*) n_spp, sum(has_ax::int) n_ax, sum((has_am and not has_ax)::int) n_am_only,
+   sum((not has_am and not has_ax)::int) n_gap, sum((not in_v9)::int) n_not_in_v9,
+   sum((mp_sdm='available')::int) n_mpaeu_sdm, sum((not has_am and not has_ax and mp_sdm='available')::int) n_gap_mpaeu_covers
+   from spp where rec_usa>0 and not is_bird group by 1 order by 1")) |>
+  kable(caption = "Non-bird species with OBIS records in US cells, by distinct 0.05° cells occupied, vs v9 suitability coverage")
+
+q("select case when has_ax then 'ax' when has_am then 'am_only' else 'other' end src, count(*) n_in_obis,
+   sum((rec_usa>0)::int) n_any_us, sum((cells_usa>=10)::int) n_ge10, sum((cells_usa>=30)::int) n_ge30, sum((cells_usa>=100)::int) n_ge100
+   from spp where in_v9 and not is_bird group by 1 order by 1") |>
+  kable(caption = "v9 taxa by suitability source: OBIS evidence in US cells (how many could be re-modelled openly)")
+
+q("select mp_sdm, count(*) n, sum((rec_usa>0)::int) n_any_us, sum((cells_usa>=30)::int) n_ge30_us,
+   sum(in_v9::int) n_in_v9, sum((has_am or has_ax)::int) n_am_or_ax, sum(has_ax::int) n_ax
+   from spp where mp_sdm is not null and not is_bird group by 1") |>
+  kable(caption = "MPA Europe species (non-bird) that also occur in US waters, and whether v9 already models them")
+
+q("select \"class\", count(*) n_ge30, sum(has_ax::int) n_ax, sum((has_am and not has_ax)::int) n_am_only,
+   sum((not has_am and not has_ax)::int) n_gap, sum((mp_sdm='available')::int) n_mpaeu
+   from spp where cells_usa>=30 and not is_bird and \"class\" in ('Mammalia','Elasmobranchii','Holocephali','Teleostei','Myxini','Petromyzonti')
+   group by 1 order by 1") |>
+  kable(caption = "Vertebrates with >=30 US cells: coverage by source")
+
+gap <- q("select aphia, species, phylum, \"class\", rec_usa, cells_usa, min_year_usa, max_year_usa, in_v9, has_rng, mp_sdm
+          from spp where cells_usa>=30 and not has_am and not has_ax and not is_bird order by cells_usa desc")
+write_csv(gap, gap_csv)
+gap |> count(phylum, class, sort = T) |> head(20) |>
+  kable(caption = glue("Gap species (>=30 US cells, no am/ax, non-bird; n = {nrow(gap)}) by class"))
+gap |> head(20) |> kable(caption = "Gap species with the most US cells")
+```
+
+## Walrus test: OBIS ensemble vs IUCN range vs AquaX
+
+The OBIS models are predicted to the whole globe and only carry a marine-realm mask
+(`native_ecoregions` = Costello realms with records), which for the walrus admits most of the US
+Pacific. Our merge rule masks suitability to the range dataset, so the useful comparison is the OBIS
+surface inside the IUCN range against AquaX.
+
+```{r}
+#| label: walrus
+aphia_w <- 137077   # Odobenus rosmarus
+u <- glue("https://obis-maps.s3.amazonaws.com/sdm/species/taxonid={aphia_w}/model=mpaeu")
+d_w <- glue("{dir_obismap}/taxonid={aphia_w}"); dir_create(d_w)
+get <- \(rel, f) { p <- glue("{d_w}/{f}"); if (!file_exists(p)) download.file(glue("{u}/{rel}"), p, quiet = T, mode = "wb"); p }
+f_ens  <- get(glue("predictions/taxonid={aphia_w}_model=mpaeu_method=ensemble_scen=current_cog.tif"), "ensemble_current.tif")
+f_mask <- get(glue("predictions/taxonid={aphia_w}_model=mpaeu_what=mask_cog.tif"), "mask.tif")
+f_thr  <- get(glue("metrics/taxonid={aphia_w}_model=mpaeu_what=thresholds.parquet"), "thresholds.parquet")
+f_log  <- get(glue("taxonid={aphia_w}_model=mpaeu_what=log.json"), "log.json")
+lg  <- fromJSON(f_log)
+thr <- read_parquet(f_thr); p10 <- thr$p10[thr$model == "ensemble"] * 100
+r   <- rast(f_ens); m <- rast(f_mask)
+stopifnot(ncol(r) == 7200, nrow(r) == 3600, max(abs(as.vector(ext(r)) - c(-180, 180, -90, 90))) < 1e-4)
+v <- values(r[[1]])[, 1]; mv <- values(m)
+
+D <- glue("{dir_big_v}/marine-atlas/dist")
+iucn <- q(glue("select cell_id from read_parquet('{D}/dataset=rng_iucn/*.parquet', hive_partitioning=false) where mdl_key = 'rng_iucn|15106'"))$cell_id
+axd  <- q(glue("select cell_id, val from read_parquet('{D}/dataset=ax/*.parquet', hive_partitioning=false) where mdl_key = 'ax|{aphia_w}'"))
+amd  <- q(glue("select cell_id, val from read_parquet('{D}/dataset=am/*.parquet', hive_partitioning=false) where mdl_key = 'am|ITS-Mam-180639'"))
+usa  <- q("select cell_id from sdm.cell where in_usa")$cell_id
+in_iucn <- usa %in% iucn; in_ax <- usa %in% axd$cell_id; in_am <- usa %in% amd$cell_id
+ens <- v[usa]
+r_shared <- \(d, sel) cor(ens[sel & !is.na(ens)], setNames(d$val, d$cell_id)[as.character(usa[sel & !is.na(ens)])])
+jacc <- \(a, b) sum(a & b) / sum(a | b)
+obis_p10 <- !is.na(ens) & ens >= p10
+tibble(
+  fit_points = unlist(lg$model_fit_points), good_models = paste(unlist(lg$model_good), collapse = "+"), p10 = p10,
+  us_cells_iucn = sum(in_iucn), us_cells_am = sum(in_am), us_cells_ax = sum(in_ax),
+  am_cells_outside_iucn = sum(in_am & !in_iucn), ax_cells_outside_iucn = sum(in_ax & !in_iucn),
+  us_cells_obis_gt0 = sum(ens > 0, na.rm = T), us_cells_obis_ge_p10 = sum(obis_p10),
+  obis_ge_p10_in_iucn = sum(obis_p10 & in_iucn),
+  obis_ge_p10_in_native_realm = sum(obis_p10 & mv[usa, "native_ecoregions"] == 1, na.rm = T),
+  jaccard_obis_p10_vs_am = jacc(obis_p10, in_am), jaccard_obis_p10_vs_ax = jacc(obis_p10, in_ax),
+  r_obis_vs_am_shared = r_shared(amd, in_am), r_obis_vs_ax_shared = r_shared(axd, in_ax),
+  r_am_vs_ax_shared = cor(setNames(amd$val, amd$cell_id)[as.character(usa[in_am & in_ax])], setNames(axd$val, axd$cell_id)[as.character(usa[in_am & in_ax])])) |>
+  t() |> kable(caption = "Walrus: OBIS ensemble (current) in US cells vs IUCN range, AquaMaps 1.0 (am) and AquaMaps 2.0 (ax)")
+dbDisconnect(con, shutdown = T)
+```
+
+Reading: unmasked, the OBIS walrus surface is nonzero over most US cells; at its own P10 threshold it
+shrinks to the Bering/Chukchi and almost entirely inside the IUCN range. Against AquaMaps 1.0 the
+question is improvement (the trapezoid envelope over-predicts outside the range); against AquaMaps 2.0
+it is agreement on the shared cells. The realm mask is not a substitute for the range mask.
