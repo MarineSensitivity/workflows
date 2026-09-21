@@ -67,7 +67,7 @@ done
 # without which every usa05 release ships a cell_model whose partitions the reader prunes
 # away, answering "no species" for a clicked cell instead of failing.
 # Bump this whenever a notebook here starts depending on newer msens logic.
-export MSENS_MIN="${MSENS_MIN:-0.25.0}"
+export MSENS_MIN="${MSENS_MIN:-0.42.0}"
 
 run() {  # run <ver> <label> <qmd> <output-stem> [extra args...]
   local ver="$1" label="$2" qmd="$3" stem="$4"; shift 4

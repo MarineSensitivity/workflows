@@ -60,15 +60,21 @@ source(here::here("libs/paths.R"))
 
 # env flags (default OFF, per the repo's reproducibility rule: expensive or
 # side-effecting steps are opt-in, and every step lives in this notebook)
-do_s3    <- Sys.getenv("MANIFEST_NO_S3")   == ""   # push to S3 unless told not to
-promote  <- Sys.getenv("PROMOTE_LATEST")   != ""   # rewrite latest.txt (gated below)
+do_s3         <- Sys.getenv("MANIFEST_NO_S3")        == ""   # push to S3 unless told not to
+promote       <- Sys.getenv("PROMOTE_LATEST")        != ""   # rewrite latest.txt (gated below)
+registry_only <- Sys.getenv("MANIFEST_REGISTRY_ONLY") != ""  # publish versions.json (+ latest.txt
+                                                              # under PROMOTE_LATEST=1) WITHOUT
+                                                              # rebuilding this ver's manifest.json
+                                                              # -- e.g. registering a new version's
+                                                              # row without opening this ver's sdm_db
 
 s3_root  <- s3_atlas                                # s3://oceanmetrics.io-public/marine-atlas
 http_root <- msens::atlas_base_url()
 dir_reg  <- glue("{dir_big_v}/registry-files")      # local staging, mirrors the S3 layout
 dir.create(glue("{dir_reg}/{ver}"), recursive = TRUE, showWarnings = FALSE)
 
-message(glue("ver={ver}  s3={s3_root}  push_s3={do_s3}  promote_latest={promote}"))
+message(glue("ver={ver}  s3={s3_root}  push_s3={do_s3}  promote_latest={promote}  ",
+             "registry_only={registry_only}"))
 ```
 
 ## The curated version registry
@@ -129,6 +135,15 @@ release without `cell_model` must not advertise a per-cell species list.
 
 ```{r}
 #| label: manifest
+
+v_row <- versions |> filter(ver == !!ver)
+
+if (registry_only) {
+  message(glue(
+    "MANIFEST_REGISTRY_ONLY=1 - publishing versions.json only, ",
+    "skipping {ver}'s manifest build (no sdm_db connection opened)"))
+  mfst <- NULL
+} else {
 
 con <- dbConnect(duckdb(), path.expand(sdm_db), read_only = TRUE)
 
@@ -192,7 +207,6 @@ zone_tiles <- setNames(
   zone_sets$zone_set_key)
 message(glue("zone tile sets: {length(zone_tiles)}"))
 
-v_row <- versions |> filter(ver == !!ver)
 mfst  <- msens::manifest_build(
   con, ver,
   status       = v_row$status,
@@ -218,15 +232,21 @@ cat(glue(
   "ver={mfst$ver}  status={mfst$status}  access={mfst$access}  grid={mfst$grid_id}  id_field={mfst$id_field}\n",
   "tables={length(mfst$tables)}  metrics={nrow(mfst$metrics)}  zone_sets={nrow(mfst$zones)}\n"))
 knitr::kable(mfst$zones)
+
+}  # !registry_only
 ```
 
 ```{r}
 #| label: capabilities
 
-knitr::kable(
-  data.frame(capability = names(mfst$capabilities),
-             supported  = unlist(mfst$capabilities)),
-  row.names = FALSE)
+if (!is.null(mfst)) {
+  knitr::kable(
+    data.frame(capability = names(mfst$capabilities),
+               supported  = unlist(mfst$capabilities)),
+    row.names = FALSE)
+} else {
+  cat("capabilities: skipped (MANIFEST_REGISTRY_ONLY=1)\n")
+}
 ```
 
 ## Validate, then write
@@ -237,7 +257,7 @@ would break an app can never be published in the first place.
 ```{r}
 #| label: write
 
-msens::validate_manifest(mfst, ver = ver)
+if (!is.null(mfst)) msens::validate_manifest(mfst, ver = ver)
 
 # jsonlite writes NULL as [] and NA as null; pretty-print for reviewable diffs
 wr <- function(obj, path) {
@@ -246,11 +266,16 @@ wr <- function(obj, path) {
 }
 
 f_versions <- wr(list(versions = versions), glue("{dir_reg}/versions.json"))
-f_manifest <- wr(mfst,                      glue("{dir_reg}/{ver}/manifest.json"))
 
-# round-trip: parse what we just wrote, exactly as an app would
-msens::validate_manifest(jsonlite::fromJSON(f_manifest), ver = ver)
-cat(glue("wrote {f_versions}\n     {f_manifest}\n"))
+if (!is.null(mfst)) {
+  f_manifest <- wr(mfst, glue("{dir_reg}/{ver}/manifest.json"))
+  # round-trip: parse what we just wrote, exactly as an app would
+  msens::validate_manifest(jsonlite::fromJSON(f_manifest), ver = ver)
+  cat(glue("wrote {f_versions}\n     {f_manifest}\n"))
+} else {
+  f_manifest <- NA_character_
+  cat(glue("wrote {f_versions}\n     (manifest.json skipped: MANIFEST_REGISTRY_ONLY=1)\n"))
+}
 ```
 
 ## Promote `latest.txt` (gated)
@@ -283,9 +308,14 @@ if (do_s3) {
   # expanded by the shell against the CWD before aws ever sees them (an
   # unquoted `--exclude *` becomes the entire repo listing). shQuote them, and
   # expand `~` ourselves since the CLI does not.
+  # MANIFEST_REGISTRY_ONLY=1 pushes the registry and NOTHING else: `*.json` would also
+  # sync whatever {ver}/manifest.json an earlier run left staged here, i.e. re-publish a
+  # stale manifest as a side effect of registering a version; and latest.txt goes only
+  # under PROMOTE_LATEST=1, so a leftover local copy cannot move the default
+  inc <- if (registry_only) c("versions.json", if (promote) "latest.txt") else c("*.json", "latest.txt")
   args <- c("s3", "sync", shQuote(path.expand(dir_reg)), shQuote(s3_root),
             "--exclude", shQuote("*"),
-            "--include", shQuote("*.json"), "--include", shQuote("latest.txt"),
+            as.vector(rbind("--include", shQuote(inc))),
             "--content-type", shQuote("application/json"),
             # these three are MUTABLE pointers; S3 has no default cache-control but
             # CDNs and browsers will happily hold a stale registry, which shows the
@@ -298,9 +328,13 @@ if (do_s3) {
 
   # verify by READING BACK through the public URL, not by trusting the exit
   # status — a zero exit has already proved not to mean the objects are there
-  # (CalCOFI's index publisher learned this the expensive way)
-  got <- msens::atlas_manifest(ver, base = http_root, refresh = TRUE)
-  stopifnot("published manifest does not round-trip" = identical(got$ver, ver))
+  # (CalCOFI's index publisher learned this the expensive way). Skipped when
+  # MANIFEST_REGISTRY_ONLY=1 didn't touch this ver's manifest.json this run --
+  # its already-published manifest is unaffected by a registry-only push.
+  if (!registry_only) {
+    got <- msens::atlas_manifest(ver, base = http_root, refresh = TRUE)
+    stopifnot("published manifest does not round-trip" = identical(got$ver, ver))
+  }
   # ...and the registry itself, read exactly as an app reads it: the `access` an
   # app will enforce must be the `access` this notebook just wrote (a stale
   # versions.json here would let the readers' fail-closed default hide a public
@@ -308,7 +342,8 @@ if (do_s3) {
   got_v <- msens::atlas_versions(base = http_root, refresh = TRUE)
   stopifnot("published versions.json access does not match versions.csv" =
               identical(got_v$access[match(versions$ver, got_v$ver)], versions$access))
-  cat(glue("verified {http_root}/{ver}/manifest.json and versions.json (access column)\n"))
+  cat(glue("verified {if (registry_only) '' else paste0(http_root, '/', ver, '/manifest.json and ')}",
+           "versions.json (access column)\n"))
 } else {
   cat("MANIFEST_NO_S3 set - staged locally only\n")
 }
@@ -324,15 +359,16 @@ msens::write_manifest(
   target        = "build_version_manifest",
   content_hash  = digest::digest(list(mfst, versions), algo = "xxhash64"),
   stats = list(
-    ver          = ver,
-    status       = mfst$status,
-    access       = mfst$access,
-    grid_id      = mfst$grid_id,
-    id_field     = mfst$id_field,
-    n_versions   = nrow(versions),
-    n_metrics    = nrow(mfst$metrics),
-    n_zone_sets  = nrow(mfst$zones),
-    latest       = latest,
-    promoted     = promote),
+    ver           = ver,
+    status        = if (!is.null(mfst)) mfst$status   else v_row$status,
+    access        = if (!is.null(mfst)) mfst$access   else v_row$access,
+    grid_id       = if (!is.null(mfst)) mfst$grid_id  else msens::grid_for_ver(ver),
+    id_field      = if (!is.null(mfst)) mfst$id_field else NA_character_,
+    n_versions    = nrow(versions),
+    n_metrics     = if (!is.null(mfst)) nrow(mfst$metrics) else NA_integer_,
+    n_zone_sets   = if (!is.null(mfst)) nrow(mfst$zones)   else NA_integer_,
+    latest        = latest,
+    promoted      = promote,
+    registry_only = registry_only),
   force = msens::force_target("build_version_manifest"))
 ```
