@@ -20,11 +20,27 @@
 # keys; a whitelist that only ever ACCEPTS the shapes this bundle actually
 # writes closes all of them at once, rather than enumerating attacks.
 
+# review round 2 (2026-09-21), gap 2: `!(s %in% c(".",".."))` named only the
+# TWO shortest all-dot strings, so a THIRD (or longer) one -- "..." -- passed
+# the charset check and was allowed. The real rule is general: a segment
+# meaning "traverse" is one with NO character other than ".", of any length.
+
 # is `s` a single valid PATH SEGMENT: non-empty, only [A-Za-z0-9._=-], and
-# never literally "." or ".." (those two are the only strings the segment
-# charset would otherwise accept that mean something other than themselves)
+# containing at least one character that is NOT "." (a segment of only dots,
+# any length, is a directory-traversal token, not a filename)
 .app_bundle_valid_segment <- function(s)
-  nzchar(s) && grepl("^[A-Za-z0-9._=-]+$", s, perl = TRUE) && !(s %in% c(".", ".."))
+  nzchar(s) && grepl("^[A-Za-z0-9._=-]+$", s, perl = TRUE) && grepl("[^.]", s, perl = TRUE)
+
+# review round 2, gap 1: is `ver` shaped like a real atlas version label
+# (msens::atlas_resolve_ver()'s own shape: "v" + digits + an optional single
+# lowercase letter -- v7, v9, v7b, v10, ...)? `ver` is interpolated into the
+# key prefix UNVALIDATED would let `ver = "v9/../v7"` build the prefix
+# "v9/../v7/app", which every real key would then legitimately start with.
+# Checking the shape FIRST is the escaping: this pattern cannot contain "/",
+# ".", or any other character the whitelist below treats specially, so a
+# `ver` that passes it cannot smuggle anything.
+app_bundle_valid_ver <- function(ver)
+  is.character(ver) && length(ver) == 1L && !is.na(ver) && grepl("^v[0-9]+[a-z]?$", ver, perl = TRUE)
 
 # is `key` exactly `{prefix}/{seg}(/{seg})*` for one or more valid segments —
 # checked structurally (prefix match, then split, then per-segment), not by
@@ -89,11 +105,19 @@
 #'   `list.files(dir_out, recursive = TRUE)`), and always pass the RESULT
 #'   through this guard before upload — never trust a path-join helper's
 #'   output unchecked, whatever computed it.
-#' @param ver the release this run is publishing (e.g. `"v9"`)
+#' @param ver the release this run is publishing (e.g. `"v9"`) — validated
+#'   against `^v[0-9]+[a-z]?$` BEFORE it is interpolated into anything; a
+#'   `ver` that is not this shape is refused outright, never regex-escaped
+#'   and used anyway (review round 2, gap 1: `ver = "v9/../v7"` used to build
+#'   a prefix a real key could legitimately start with)
 #' @param allow_v7_cell_model allow the one named exception (default `FALSE`)
 #' @return `keys`, invisibly, when every key is allowed
 app_bundle_assert_prefix <- function(keys, ver, allow_v7_cell_model = FALSE) {
-  stopifnot(is.character(ver), length(ver) == 1L, nzchar(ver))
+  if (!app_bundle_valid_ver(ver))
+    stop(sprintf(
+      "app_bundle_assert_prefix(): `ver` does not look like a version label (^v[0-9]+[a-z]?$) -- got %s",
+      if (is.character(ver) && length(ver) == 1L && !is.na(ver)) shQuote(ver) else "a non-scalar-character value"),
+      call. = FALSE)
   if (!is.character(keys))
     stop("app_bundle_assert_prefix(): `keys` must be a character vector", call. = FALSE)
   if (length(keys) == 0L)
@@ -158,6 +182,24 @@ app_bundle_assert_prefix_selftest <- function() {
   testthat::test_that("REFUSED: percent-encoded traversal", {
     testthat::expect_error(
       app_bundle_assert_prefix("v9/app/%2e%2e/tables/x.parquet", "v9"), "refusing to publish")
+  })
+  testthat::test_that("REFUSED (round 2, gap 1): `ver` itself smuggling traversal", {
+    testthat::expect_error(
+      app_bundle_assert_prefix("v9/../v7/app/x.json", ver = "v9/../v7"),
+      "does not look like a version label")
+    testthat::expect_error(
+      app_bundle_assert_prefix("v9.evil.com/app/x.json", ver = "v9.evil.com"),
+      "does not look like a version label")
+    testthat::expect_error(app_bundle_assert_prefix("v9/app/x.json", ver = ""),
+                           "does not look like a version label")
+    testthat::expect_error(app_bundle_assert_prefix("v9/app/x.json", ver = c("v9", "v7")),
+                           "does not look like a version label")
+    # legitimate version shapes must still work, including the letter suffix
+    testthat::expect_silent(app_bundle_assert_prefix("v7b/app/boot.json", "v7b"))
+  })
+  testthat::test_that("REFUSED (round 2, gap 2): a segment of only dots, any length", {
+    testthat::expect_error(app_bundle_assert_prefix("v9/app/.../x.json", "v9"), "refusing to publish")
+    testthat::expect_error(app_bundle_assert_prefix("v9/app/..../x.json", "v9"), "refusing to publish")
   })
   testthat::test_that("REFUSED: empty basename (trailing slash)", {
     testthat::expect_error(app_bundle_assert_prefix("v9/app/", "v9"), "refusing to publish")
@@ -449,18 +491,14 @@ app_bundle_budgets <- function() {
 #' (case-insensitive — the app's own comment records that the case and the
 #' column TYPE both drift by generation).
 #'
-#' **A legacy-generation quirk, normalized here — TEMPORARY, remove once
-#' msens's `app_taxon_table()` fix lands (tracked in the atlas-1 review; do
-#' NOT delete `.strip_trailing_dot0()` until the orchestrator confirms that
-#' fix is in and this notebook has been reinstalled against it).**
-#' `msens::app_taxon_table()`'s `taxon_id` is `CAST(t.taxon_id AS VARCHAR)` —
-#' fine when the underlying column is INTEGER, but v1-v7's `taxon.taxon_id`
-#' is DOUBLE, and DuckDB's `CAST(DOUBLE AS VARCHAR)` renders a whole number as
-#' `"125371.0"`, not `"125371"` (confirmed 2026-09-21 against the real v7
-#' release: 0 of 15,677 worms taxa matched the curated CSV before this fix,
-#' because the CSV's `species_id` has no decimal). `.strip_trailing_dot0()`
-#' normalizes BOTH sides before the join, so a v8/v9 integer id and a v1-v7
-#' double-cast one compare equal.
+#' **Round-2 update: the `.0`-suffix workaround is REMOVED.** msens 0.43.0 @
+#' `7c6eb3a` (review fix, landed 2026-09-21) fixed `app_taxon_table()`'s
+#' `taxon_id` so it no longer renders a DOUBLE-typed legacy id as `"125371.0"`
+#' — verified directly against the real v7 release (sample ids come back as
+#' `"22725044"`, `"22695503"`, ..., no trailing `.0`). The
+#' `.strip_trailing_dot0()` normalization this function carried through
+#' review round 1 is gone; a stale caller expecting it will simply get a
+#' clean join, since `taxon_id` was always the join key.
 #'
 #' @param taxon_tbl the release's normalized taxon table, from
 #'   [msens::app_taxon_table()] (`key, sci, common, sp_cat, taxon_id,
@@ -477,18 +515,13 @@ app_taxonomy_table <- function(taxon_tbl,
       all(c("taxon_id", "taxon_authority") %in% names(taxon_tbl)),
     "no curated taxonomy CSV at csv_path" = file.exists(csv_path))
 
-  # TEMPORARY -- see the roxygen note above. Remove this helper and its two
-  # call sites below once msens's app_taxon_table() stops emitting "N.0".
-  .strip_trailing_dot0 <- function(x) sub("^([0-9]+)\\.0$", "\\1", x)
-
   is_worms  <- !is.na(taxon_tbl$taxon_authority) &
     tolower(taxon_tbl$taxon_authority) == "worms"
-  worms_ids <- unique(.strip_trailing_dot0(
-    taxon_tbl$taxon_id[is_worms & !is.na(taxon_tbl$taxon_id)]))
+  worms_ids <- unique(taxon_tbl$taxon_id[is_worms & !is.na(taxon_tbl$taxon_id)])
 
   hier <- readr::read_csv(csv_path, show_col_types = FALSE, guess_max = Inf)
   stopifnot("csv_path is missing species_id" = "species_id" %in% names(hier))
-  hier$species_id <- .strip_trailing_dot0(as.character(hier$species_id))
+  hier$species_id <- as.character(hier$species_id)
 
   out <- hier[hier$species_id %in% worms_ids, , drop = FALSE]
   out <- out[!duplicated(out$species_id), , drop = FALSE]     # one row per taxon

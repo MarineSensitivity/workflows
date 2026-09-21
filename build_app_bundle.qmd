@@ -103,6 +103,14 @@ message(glue("msens {packageVersion('msens')} @ {find.package('msens')}"))
 versions_csv <- readr::read_csv(here("data/versions.csv"), show_col_types = FALSE)
 narrow       <- Sys.getenv("APP_BUNDLE_VERS")
 vers         <- if (nzchar(narrow)) trimws(strsplit(narrow, ",")[[1]]) else versions_csv$ver
+# review round 2: validate every entry BEFORE anything is built from it --
+# same shape app_bundle_assert_prefix() requires of its own `ver`, and the
+# same reason (a `ver` that isn't this shape could smuggle a path segment
+# into every key this run ever constructs)
+bad_vers <- vers[!vapply(vers, app_bundle_valid_ver, logical(1))]
+if (length(bad_vers))
+  stop(sprintf("APP_BUNDLE_VERS contains invalid version label(s): %s (must match ^v[0-9]+[a-z]?$)",
+               paste(bad_vers, collapse = ", ")), call. = FALSE)
 
 # strict: exactly "1" is on, unset/"" is off, anything else (0/true/false/no/...)
 # STOPS the render naming the variable -- see libs/app_bundle.R::app_bundle_flag()
@@ -255,10 +263,13 @@ zone-set registry's own source GeoPackage rather than guessing a filename.
 written here, from the JUST-WRITTEN `taxon.parquet` (never a second query), via
 `app_taxonomy_table()` (`libs/app_bundle.R`).
 
-`app_bundle_build()` does not yet isolate its own internal stages (an msens change landing in
-parallel with this round); until that lands, a single broken stage for one version aborts that
-version's WHOLE build here — the outer `tryCatch` below keeps that from aborting every OTHER
-version in the same run, which is the one thing this notebook can guarantee on its own side.
+`app_bundle_build()` now isolates its own internal stages (msens 0.43.0 @ `7c6eb3a`, landed
+during review round 1): `strict = TRUE` (its default) still stops the WHOLE build at the first
+failing stage — right for an actual publish, wrong for this notebook's diagnostic pass — so this
+notebook always passes `strict = FALSE`, matching the function's own documented "notebook's
+diagnostic pass" use case: every stage that CAN complete does, `out$failed` names whichever
+didn't, and the outer `tryCatch` below is only a safety net for anything upstream of `stage()`
+(e.g. `manifest_build()` itself).
 
 ```{r}
 #| label: build
@@ -289,16 +300,27 @@ build_one <- function(ver) {
   } else NULL
 
   zone_sets <- readr::read_csv(here("data/zone_sets.csv"), show_col_types = FALSE)
+  # round-2 fix: manifest_build()'s zone_tiles was never passed, so every
+  # zone's pmtiles stayed NA and app_units() -- which requires a non-NA
+  # pmtiles -- returned ZERO units regardless of geom_keys. Same construction
+  # build_version_manifest.qmd uses.
+  zone_tiles <- setNames(
+    as.list(glue("{base}/zones/{zone_sets$zone_set_key}/zones.pmtiles")),
+    zone_sets$zone_set_key)
   mfst <- msens::manifest_build(con, ver, status = status, access = access, base = base,
-                                metrics = metrics, zone_sets = zone_sets)
+                                metrics = metrics, zone_tiles = zone_tiles, zone_sets = zone_sets)
   geom_keys <- app_bundle_geom_keys(mfst$zones, zone_sets, dir_derived)
 
   out <- tryCatch(
-    msens::app_bundle_build(con, ver, dir_out, manifest = mfst, base = base, geom_keys = geom_keys),
+    msens::app_bundle_build(con, ver, dir_out, manifest = mfst, base = base,
+                            geom_keys = geom_keys, strict = FALSE),
     error = function(e) {
-      log_warn("{ver}: app_bundle_build() FAILED: {substr(conditionMessage(e), 1, 300)}")
+      log_warn("{ver}: app_bundle_build() FAILED (upstream of stage isolation): {substr(conditionMessage(e), 1, 300)}")
       NULL
     })
+  if (!is.null(out) && length(out$failed))
+    for (nm in names(out$failed))
+      log_warn("{ver}: stage '{nm}' FAILED: {substr(out$failed[[nm]], 1, 300)}")
 
   txm_ok <- FALSE
   if (!is.null(out)) {
@@ -315,17 +337,24 @@ build_one <- function(ver) {
 
   list(ver = ver, ok = !is.null(out), dir_out = dir_out, con_db = opened$db, manifest = mfst,
        geom_keys = geom_keys, out = out, taxonomy_ok = txm_ok,
+       n_failed_stages = if (is.null(out)) NA_integer_ else length(out$failed),
        wall_s = as.numeric(Sys.time() - t0, units = "secs"))
 }
 
 builds <- purrr::map(vers, build_one) |> setNames(vers)
-knitr::kable(
-  bind_rows(lapply(builds, function(b) data.frame(
-    ver = b$ver, ok = b$ok, n_taxa = if (!is.null(b$out)) b$out$n_taxa else NA,
-    n_tables = if (!is.null(b$out)) length(b$out$tables) else NA,
-    n_units = if (!is.null(b$out)) length(b$out$boot$units) else NA,
-    taxonomy_ok = b$taxonomy_ok, wall_s = round(b$wall_s, 1)))),
-  caption = "Per-version build result (this run)")
+build_tbl <- bind_rows(lapply(builds, function(b) data.frame(
+  ver = b$ver, ok = b$ok, n_taxa = if (!is.null(b$out)) b$out$n_taxa else NA,
+  n_tables = if (!is.null(b$out)) length(b$out$tables) else NA,
+  n_units = if (!is.null(b$out)) length(b$out$boot$units) else NA,
+  n_failed_stages = b$n_failed_stages, failed_stage_names = if (!is.null(b$out) && length(b$out$failed))
+    paste(names(b$out$failed), collapse = ", ") else "",
+  taxonomy_ok = b$taxonomy_ok, wall_s = round(b$wall_s, 1))))
+knitr::kable(build_tbl, caption = "Per-version build result (this run)")
+stopifnot(
+  "app_bundle_build() aborted upstream of stage isolation for at least one version" =
+    all(build_tbl$ok),
+  "at least one app_bundle_build() STAGE failed" = all(build_tbl$n_failed_stages == 0, na.rm = TRUE),
+  "taxonomy.parquet failed for at least one version" = all(build_tbl$taxonomy_ok))
 ```
 
 ## Validate
@@ -373,8 +402,10 @@ knitr::kable(val_tbl, caption = "Schema re-validation of the WRITTEN bytes, per 
 ### `boot.json` actually carries its OPFS keys and drawable units
 
 Review round 1's root finding: composing the bundle by hand (rather than calling
-`app_bundle_build()`) left `boot$tables` and `boot$units` EMPTY on both real dry runs. These four
-gates are what a regression back to hand-composing would fail.
+`app_bundle_build()`) left `boot$tables` and `boot$units` EMPTY on both real dry runs. `boot.json`
+now carries its own `id_field` (msens `7c6eb3a`), so this gate cross-checks it against the
+manifest's directly, rather than only checking the manifest's in isolation (round 1's stopgap,
+removed).
 
 ```{r}
 #| label: validate-boot-contract
@@ -395,12 +426,11 @@ boot_contract_gate <- function(b) {
     n_digest_mismatches = sum(!digest_ok),
     n_units             = length(boot$units),
     units_ge_1          = length(boot$units) >= 1,
-    # boot.json does not (yet) carry its own id_field -- msens issue, tracked
-    # in the atlas-1 review; check what CAN be checked today: the manifest's
-    # id_field is present and one of the two known values.
-    manifest_id_field    = b$manifest$id_field %||% NA_character_,
-    id_field_present_ok  = !is.null(b$manifest$id_field) &&
-      b$manifest$id_field %in% c("mdl_key", "mdl_seq"))
+    boot_id_field       = boot$id_field %||% NA_character_,
+    manifest_id_field   = b$manifest$id_field %||% NA_character_,
+    id_field_matches    = !is.null(boot$id_field) && !is.null(b$manifest$id_field) &&
+      identical(boot$id_field, b$manifest$id_field) &&
+      boot$id_field %in% c("mdl_key", "mdl_seq"))
 }
 `%||%` <- function(a, b) if (is.null(a)) b else a
 boot_contract_tbl <- bind_rows(purrr::map(builds, boot_contract_gate))
@@ -411,7 +441,7 @@ stopifnot(
   "a table descriptor's digest disagrees with the written file's" =
     nrow(boot_contract_tbl) == 0 || all(boot_contract_tbl$all_digests_match),
   "boot$units has fewer than 1 entry"             = nrow(boot_contract_tbl) == 0 || all(boot_contract_tbl$units_ge_1),
-  "manifest id_field missing or unrecognized"     = nrow(boot_contract_tbl) == 0 || all(boot_contract_tbl$id_field_present_ok))
+  "boot$id_field does not equal the manifest's"   = nrow(boot_contract_tbl) == 0 || all(boot_contract_tbl$id_field_matches))
 ```
 
 ```{r}
@@ -442,11 +472,10 @@ stopifnot("schema validation let a malformed boot.json through" = all(mal$reject
 
 Review round 1 found 290 of v9's 422 `cell/tile=*/` directories holding SEVERAL part files
 (`data_0.parquet`, `data_1.parquet`, ...) — an msens `COPY ... PARTITION_BY` bug under
-parallelism, fixed in `../msens` in parallel with this round. The browser only ever fetches the
-one fixed filename `tile={t}/data_0.parquet` (never a glob — anonymous LIST is denied), so a tile
-with more than one file is missing data from every part after the first, silently. This gate is
-what would have caught it; it is expected to be RED until the msens fix lands and this notebook
-re-renders against it.
+parallelism. The browser only ever fetches the one fixed filename `tile={t}/data_0.parquet`
+(never a glob — anonymous LIST is denied), so a tile with more than one file was missing data
+from every part after the first, silently. **Fixed in msens 0.43.0 @ `7c6eb3a`** (review round 2):
+this gate now FAILS the render on any tile directory with anything other than exactly one file.
 
 ```{r}
 #| label: validate-one-file-per-tile
@@ -465,13 +494,11 @@ one_file_per_tile_gate <- function(b) {
              worst_example_n_files = if (any(n_files > 1L)) max(n_files) else NA_integer_)
 }
 one_file_tbl <- bind_rows(purrr::map(builds, one_file_per_tile_gate))
-knitr::kable(one_file_tbl, caption = "cell/tile=*/ directories: exactly one file expected per tile")
-if (nrow(one_file_tbl) && any(one_file_tbl$n_with_multiple_files > 0))
-  message("RED (expected until the msens partition-writer fix lands): ",
-          paste(sprintf("%s has %d/%d tile dirs with >1 file (e.g. tile=%s has %d)",
-                        one_file_tbl$ver, one_file_tbl$n_with_multiple_files, one_file_tbl$n_tile_dirs,
-                        one_file_tbl$worst_example, one_file_tbl$worst_example_n_files),
-                collapse = "; "))
+knitr::kable(one_file_tbl, caption = "cell/tile=*/ directories: exactly one file per tile")
+stopifnot(
+  "a tile directory has zero or multiple .parquet files" =
+    nrow(one_file_tbl) == 0 ||
+    all(one_file_tbl$n_with_multiple_files == 0 & one_file_tbl$n_with_zero_files == 0))
 ```
 
 ### Tile-width gate (real nc, then the wrong one)
@@ -530,9 +557,9 @@ digest_gate <- function(b, ver) {
 dg_tbl <- purrr::imap(builds, digest_gate) |> bind_rows()
 knitr::kable(dg_tbl |> select(ver, metric_key, ok),
              caption = "cell/tile=*/data_0.parquet digest == cell_metric digest, per metric (browser-equivalent read)")
-if (nrow(dg_tbl) && any(!dg_tbl$ok))
-  message("RED (expected while any tile has >1 part file): ",
-          paste(sprintf("%s/%s", dg_tbl$ver[!dg_tbl$ok], dg_tbl$metric_key[!dg_tbl$ok]), collapse = ", "))
+stopifnot(
+  "a browser-equivalent wide-tile digest disagreed with cell_metric" =
+    nrow(dg_tbl) == 0 || all(dg_tbl$ok))
 ```
 
 ### `boot.json` zone metrics == `zone_metric` (joined on `zone_type` AND `metric_key`)
