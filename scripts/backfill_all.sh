@@ -40,7 +40,20 @@
 #                                           cell_species_list:false and a clicked
 #                                           cell cannot list species. ~1.2B rows per
 #                                           version: slow, run deliberately.
-#   manifest  backfill_versions.qmd                     -> manifest.json + serve.duckdb
+#   manifest  backfill_versions.qmd                     -> manifest.json + serve.duckdb,
+#                                           then (automatic, same render) the STAC
+#                                           catalog entry and a reload of BOTH Shiny
+#                                           instances, public and preview
+#   index     publish_storage_index.qmd (once, not per version)
+#                                        -> storage.marinesensitivity.org index pages.
+#                                           Runs after `all` and after `manifest` too: a
+#                                           release that landed is a bucket that changed.
+#                                           A RESTRICTED release gets no pages by design
+#                                           (they appear when it becomes public).
+#                                           BACKFILL_NO_INDEX=1 skips it.
+#
+# Extra VAR=value arguments are forwarded to every render of the run, e.g.
+#   scripts/backfill_all.sh --vers v7b --stage cellmodel V7_CELLMODEL_REDO=1
 #
 # `manifest` runs LAST and separately on purpose: a manifest is a projection of
 # what exists, so regenerating it before the COGs land publishes a contract the
@@ -52,12 +65,14 @@ cd "$(dirname "$0")/.."
 
 VERS="v7 v6 v5 v4b v4 v3 v2 v1"
 STAGE="all"
+EXTRA=()   # VAR=value arguments, forwarded to every render (srv_render.sh turns them into -e)
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --vers)  VERS="$2"; shift 2 ;;
     --stage) STAGE="$2"; shift 2 ;;
-    -h|--help) sed -n '1,45p' "$0"; exit 0 ;;
+    -h|--help) sed -n '1,58p' "$0"; exit 0 ;;
+    [A-Z_]*=*) EXTRA+=("$1"); shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -67,7 +82,7 @@ done
 # without which every usa05 release ships a cell_model whose partitions the reader prunes
 # away, answering "no species" for a clicked cell instead of failing.
 # Bump this whenever a notebook here starts depending on newer msens logic.
-export MSENS_MIN="${MSENS_MIN:-0.42.0}"
+export MSENS_MIN="${MSENS_MIN:-0.42.1}"
 
 run() {  # run <ver> <label> <qmd> <output-stem> [extra args...]
   local ver="$1" label="$2" qmd="$3" stem="$4"; shift 4
@@ -79,7 +94,7 @@ run() {  # run <ver> <label> <qmd> <output-stem> [extra args...]
   # not match (2026-09-21: a cell_model stage failed and left nothing to diagnose it with).
   local log="_output/logs/backfill_${stem}_${ver}_$(date +%Y%m%dT%H%M%S).log"
   mkdir -p _output/logs
-  scripts/srv_render.sh "$qmd" -P "ver:$ver" --output "${stem}_${ver}.html" "$@" \
+  scripts/srv_render.sh "$qmd" -P "ver:$ver" --output "${stem}_${ver}.html" "$@" ${EXTRA[@]+"${EXTRA[@]}"} \
     2>&1 | tee "$log" | grep -E "INFO|WARN|ERROR|Error|Output created|at [0-9a-f]{7}|msens" | sed 's/^/    /'
   echo "    full log: $log"
 }
@@ -111,6 +126,20 @@ for V in $VERS; do
     all|manifest) run "$V" "manifest"    backfill_versions.qmd  backfill_versions ;;
   esac
 done
+
+# The browsable index, ONCE for the whole bucket (the notebook takes no `ver`): a release that
+# landed is a bucket that changed, and the pages are a projection of it exactly as a manifest is.
+case "$STAGE" in
+  all|manifest|index)
+    if [ -z "${BACKFILL_NO_INDEX:-}" ]; then
+      echo "--- storage index  $(date +%H:%M) ---"
+      log="_output/logs/backfill_publish_storage_index_$(date +%Y%m%dT%H%M%S).log"
+      mkdir -p _output/logs
+      scripts/srv_render.sh publish_storage_index.qmd ${EXTRA[@]+"${EXTRA[@]}"} \
+        2>&1 | tee "$log" | grep -E "INFO|WARN|ERROR|Error|Output created|at [0-9a-f]{7}|msens" | sed 's/^/    /'
+      echo "    full log: $log"
+    fi ;;
+esac
 
 echo "==> done $(date +%H:%M).  store: usa05=$(store_count usa05) global05=$(store_count global05) objects"
 echo "    verify a manifest actually gained what this run should have added, e.g.:"

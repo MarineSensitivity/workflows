@@ -422,7 +422,6 @@ mfst <- msens::manifest_build(
 f_mfst <- file.path(dir_v, "manifest.json")
 writeLines(as.character(jsonlite::toJSON(mfst, auto_unbox = TRUE, pretty = TRUE, na = "null")), f_mfst)
 msens::validate_manifest(jsonlite::fromJSON(f_mfst), ver = bver)
-dbDisconnect(con, shutdown = TRUE)
 
 cat(glue("{bver}: id_field={mfst$id_field} grid={mfst$grid_id} tables={length(mfst$tables)} ",
          "metrics={nrow(mfst$metrics)} zones={nrow(mfst$zones)}\n"))
@@ -478,6 +477,66 @@ if (do_s3) {
 } else {
   log_info("BACKFILL_NO_S3 set - staged locally only")
 }
+```
+
+## STAC + app reload: what "a release landed" means
+
+Publishing the tables and the manifest is not the end of a release. Two things used to be left to
+memory, and v7b (v7.1) showed both: it was **absent from the STAC catalog** (no committed step
+registered a legacy release, and `msens::stac_build()` could not build one), and the **preview
+Shiny instance answered HTTP 500** for it until someone happened to reload the apps, because a
+worker memoizes the registry and manifests it read before the data existed. Both now happen here,
+on every run that publishes — `BACKFILL_NO_STAC=1` / `BACKFILL_NO_RELOAD=1` opt out.
+
+Rendered on the server (`scripts/srv_render.sh`), the catalog directory *is* the deployed one
+(`/share/data/derived/stac`, served at `file.marinesensitivity.org/stac`), so there is nothing to
+rsync; on a laptop the tree is staged beside the release and not deployed.
+
+```{r}
+#| label: stac
+
+source(here::here("libs/app_reload.R"))
+on_server <- dir.exists("/share/data/derived/stac")
+do_stac   <- Sys.getenv("BACKFILL_NO_STAC")   == ""
+do_reload <- Sys.getenv("BACKFILL_NO_RELOAD") == "" && on_server && do_s3
+
+if (do_stac) {
+  stac_root <- if (on_server) "/share/data/derived/stac" else file.path(dir_v, "stac")
+  tmp       <- tempfile("stac_")
+  msens::stac_build(bver, dir_out = tmp, con = con, model_asset = model_asset)
+  # replace this version's tree whole (a dropped dataset must not leave a stale node), then
+  # REGISTER it in the deployed root: stac_build()'s own root knows only this one version
+  dir.create(stac_root, recursive = TRUE, showWarnings = FALSE)
+  unlink(file.path(stac_root, bver), recursive = TRUE)
+  ok <- file.copy(file.path(tmp, bver), stac_root, recursive = TRUE)
+  stopifnot("could not write the STAC tree" = ok)
+  kids <- msens::stac_catalog_register(file.path(stac_root, "catalog.json"), bver)
+  n_ds <- length(list.dirs(file.path(stac_root, bver), recursive = FALSE))
+  log_info("STAC: {bver} written to {stac_root} ({n_ds} datasets); catalog children: ",
+           "{paste(sub('^\\./([^/]+)/.*$', '\\1', kids), collapse = ' ')}")
+
+  if (on_server) {
+    # read it back through the PUBLIC host, as a STAC client would
+    u   <- glue("https://file.marinesensitivity.org/stac/{bver}/collection.json")
+    got <- tryCatch(jsonlite::fromJSON(u, simplifyVector = FALSE), error = function(e) NULL)
+    cat0 <- tryCatch(jsonlite::fromJSON("https://file.marinesensitivity.org/stac/catalog.json",
+                                        simplifyVector = FALSE), error = function(e) NULL)
+    hrefs <- unlist(lapply(cat0$links, function(l) l$href))
+    stopifnot(
+      "the published version collection is not readable" = identical(got$id, paste0("msens-", bver)),
+      "the published root catalog does not list this version" =
+        glue("./{bver}/collection.json") %in% hrefs)
+    log_info("verified {u} and its entry in the root catalog")
+  }
+} else log_info("BACKFILL_NO_STAC set - STAC left as it is")
+
+dbDisconnect(con, shutdown = TRUE)
+
+if (do_reload) {
+  rc <- system2("bash", c("-c", shQuote(app_reload_cmd())))
+  stopifnot("could not touch the apps' restart.txt (public + preview)" = identical(as.integer(rc), 0L))
+  log_info("apps reloaded on BOTH instances (public + preview): {bver}'s data is what they now read")
+} else log_info("app reload skipped (not on the server, nothing published, or BACKFILL_NO_RELOAD)")
 ```
 
 ## Target manifest

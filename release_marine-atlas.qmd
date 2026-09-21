@@ -41,6 +41,7 @@ Publish the **v8 marine-atlas** and stand up its serving, reproducibly:
 
 librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, quiet = T)
 source(here("libs/paths.R"))
+source(here("libs/app_reload.R"))   # one definition of "reload the apps": public AND preview
 dir_atlas <- glue("{dir_big_v}/marine-atlas")
 tbl_dir   <- glue("{dir_atlas}/tables");  dir_create(tbl_dir)
 serve_dir <- glue("{dir_atlas}/serve");   dir_create(serve_dir)
@@ -522,7 +523,8 @@ if (!do_tables) {
     # -u 1000:1000 for the same reason as the cell_model repoint above
     "docker exec -u 1000:1000 rstudio Rscript -e {shQuote(repoint)}; ",
     "mv -f {srv_viewdb}.new {srv_viewdb}; ",                       # atomic swap
-    "{paste(sprintf('touch /share/github/MarineSensitivity/apps_v8/%s/restart.txt', v8_apps), collapse='; ')}")
+    # both instances, public AND preview (libs/app_reload.R)
+    "{app_reload_cmd(v8_apps)}")
   out_rp <- system2("ssh", c("msens", shQuote(cmd_rp)), stdout = TRUE, stderr = TRUE)
   if (!any(grepl("VIEWS_OK", out_rp))) stop(paste(tail(out_rp, 20), collapse = "\n"))
   log_info("views repointed to local Parquet + v8 apps reloaded: {grep('VIEWS_OK', out_rp, value = TRUE)}")
@@ -770,9 +772,7 @@ if (!do_apps) {
   # restart.txt in the directory it SERVES, so the wrapper's own dir is what
   # reloads the preview process -- touching the checkout alone would leave it
   # running the old code.
-  touches  <- paste(c(sprintf("touch %s/%s/restart.txt", apps_co, v8_apps),
-                      sprintf("touch %s/rstudio/shiny_apps_preview/%s/restart.txt", srv_repo, v8_apps)),
-                    collapse = "; ")
+  touches  <- app_reload_cmd(v8_apps, apps_co = apps_co, srv_repo = srv_repo)
   # `set -e` + explicit ff-only fetch (a silent `git pull --quiet` once left the app + msens
   # stale for hours). ALSO reinstall msens into the shiny/rstudio container: a stale container
   # msens lacked `cell_tile_url(mdl_key=)` and crashed the merged surface. Reload only the v8 apps.
@@ -841,6 +841,13 @@ if (!do_access) {
 } else {
   out_acc <- system2("ssh", c("msens", shQuote(glue(
     "set -e; cd {srv_repo} && git fetch --quiet origin && git merge --ff-only origin/main && ",
+    # .env is read by bash HERE and by docker compose elsewhere. An unquoted `v8|v9` is a
+    # pipeline to bash: the variable stays unset and, under `set -e`, this command died before
+    # access.sh ever ran (\"v9: command not found\") -- DEPLOY_ACCESS was dead for three weeks.
+    # Source it once in a subshell first, so that failure has a name instead of a riddle.
+    "if ! err=$( ( set -a; . ./.env ) 2>&1 >/dev/null ) || [ -n \"$err\" ]; then ",
+    "echo \"ERROR: server .env does not source cleanly in bash -- double-quote any value ",
+    "containing | & ; or spaces (key names only):\" >&2; echo \"$err\" | sed -E 's/=.*//' >&2; exit 1; fi; ",
     "set -a; . ./.env; set +a; cloudflare/access.sh"))), stdout = TRUE, stderr = TRUE)
   cat(paste(out_acc, collapse = "\n"), "\n")
   st <- attr(out_acc, "status")
