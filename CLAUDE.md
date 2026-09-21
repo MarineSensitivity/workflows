@@ -67,6 +67,26 @@ spatial-ER taxa's merge-input partitions + surfaces; the batched surfaces of the
 maps (`mkey_id`, `mmid`) have not moved before touching a partition. There is no "v9.1": the DPS work is
 part of v9.
 
+**v7.1 (release id `v7b`, 2026-09, `prerelease`/`restricted`) = a surgical PATCH of public v7**, not a
+new build: `build_v7b.qmd` clones v7's `sdm.duckdb` copy-on-write, rewrites the six merged sea-turtle
+models under their EXISTING `mdl_seq` 54238–54243, and re-evaluates v7's own scoring chunks by label from
+`old/calc_scores_v7.qmd`. Two rules, each a flag whose control value is OFF: **turtle core habitat**
+(`TURTLE_SUIT_MIN=50`, `TURTLE_FILL=none` → `msens::turtle_sql(suit_min, fill = NA, half_even = TRUE,
+ch_outer = TRUE)`: AquaMaps suitability enters only where P ≥ 0.5 and a range cell with none is DROPPED,
+not filled at 1; critical habitat joins the ER footprint so no designated cell is ever trimmed) and the
+**coverage floor** (`COVERAGE_FLOOR=0.05` → `msens::coverage_sql()` / `coverage_floor()`: a Program-Area
+component whose scored cells cover < 5 % of the area has its `_ecoregion_rescaled` row deleted — absent,
+never zero — and `{component}_coverage` zone metrics are written). With all flags off the notebook
+reproduces v7 **exactly** (2,022,909 turtle cells, 0 diffs; `cell_metric` bit-exact); each single-flag
+control moves only what it should and no `primprod*` row moves in any run (the productivity fix is v10's).
+`data/manifests/build_v7b.json` holds **reference digests** a same-flag build on any machine must
+reproduce (`BUILD_REFERENCE=1` is the only way to move them) — DOUBLE surfaces are digested as
+`CAST(.. AS FLOAT)` because parallel `SUM()` reassociates and raw-double digests differ between two correct
+builds. The release states its rules as data: a `release_method` table → `manifest$methods` (optional; the
+docs gate the method prose on it), and `versions.csv` has an optional `prev` (`v7b → v7`) because a patch
+dated after its successors must not take its lineage from `released` order. Dotted ids (`v7.1`) are
+rejected in 13 places by design; the id grammar is `^v[0-9]+[a-z]?$`.
+
 **Bumping the version on the same grid (v8 → v9) is `bootstrap_version.qmd`**, not a re-ingest:
 it clones the unchanged `dist/dataset=*` from `ver_prev` copy-on-write (APFS `cp -c`; hardlinks on
 Linux) so the ingests *resume*, and `BOOTSTRAP_VERIFY=1` re-hashes them against their checkpoints.
@@ -196,7 +216,12 @@ without `REDO_NATIVE`'s 7 GB IUCN gpkg rebuild and am re-sort), `REDO_MERGED_COG
 `REDO_MERGE_SPATIAL=1` (`merge_models`: refresh only the spatial-ER taxa), `REDO_DPS_COG=1`, `AX_COG=1`/`AX_COG_S3=1` (build/upload
 the AquaX COGs in `ingest_aquax`), `AX_TEST_N=<n>` (ingest smoke test: nothing written to `data/`),
 `AX_SUPERSEDE=0` (control merge), `AX_ABSENT_SUPERSEDES=1`, `AX_APPLY_CUTOFF=1`,
-`BOOTSTRAP_VERIFY=1` / `BOOTSTRAP_SKIP_DS=a,b` (`bootstrap_version`), `TITILER_SERVICE=titiler-v8`.
+`BOOTSTRAP_VERIFY=1` / `BOOTSTRAP_SKIP_DS=a,b` (`bootstrap_version`), `TITILER_SERVICE=titiler-v8`,
+`MANIFEST_REGISTRY_ONLY=1` (`build_version_manifest`: publish `versions.json` ALONE — plus `latest.txt`
+only under `PROMOTE_LATEST=1` — without rebuilding or re-pushing any manifest; how a legacy release is
+registered), `TURTLE_SUIT_MIN` / `TURTLE_FILL` / `COVERAGE_FLOOR` / `REDO_BUILD=1` / `BUILD_REFERENCE=1`
+(`build_v7b`), `BACKFILL_NO_STAC=1` / `BACKFILL_NO_RELOAD=1` / `BACKFILL_NO_INDEX=1` (backfill opt-outs),
+`BUILD_MEMORY_GB` / `BUILD_THREADS` (`libs/duckdb_budget.R`), `SRV_MIN_AVAIL_MB` (`srv_render.sh` watchdog).
 
 **The pre-release review gate (`preview.marinesensitivity.org`, 2026-08-15).** A release has
 `access` (`public` | `restricted`) beside `status` in `data/versions.csv` → `versions.json`; a
@@ -417,6 +442,26 @@ version-independent registries replace that:
   Rewriting objects at a stable URL left GDAL's `/vsicurl` serving a cached header for bytes that no
   longer existed: z5+ fine, z2–z4 HTTP 500.
 
+### A release that lands registers itself (2026-09-21)
+
+Publishing tables + a manifest is not the end of a release, and what followed used to be left to
+memory. `backfill_versions.qmd` (the legacy v1–v7b path; every `manifest`/`models` stage) now ends by
+(1) building the release's **STAC** tree and registering it in the DEPLOYED root catalog
+(`msens::stac_build()` introspects `mdl_key` vs `mdl_seq`; `msens::stac_catalog_register()` is
+idempotent and keeps children in release order, `v7 v7b v8 v9`) and reading it back through
+`file.marinesensitivity.org/stac`, then (2) **reloading the apps on BOTH Shiny instances**
+(`libs/app_reload.R` — public `:3838` AND preview `:3839`; three notebooks touched only the public
+`restart.txt`, so v7b's review-host app answered 500 until `DEPLOY_APPS=1` happened to run).
+`scripts/backfill_all.sh` then refreshes the **storage index** once per run (`index` stage; also after
+`all` and `manifest`). A RESTRICTED release gets no index pages by design — they appear when it becomes
+public. Opt-outs: `BACKFILL_NO_STAC=1`, `BACKFILL_NO_RELOAD=1`, `BACKFILL_NO_INDEX=1`. `VAR=value`
+arguments to `backfill_all.sh` are forwarded to every render (`V7_CELLMODEL_REDO=1`).
+
+Program-Area **geometry belongs to the zone-set vintage, not to a release**: the API reads
+`derived/{ver}/ply_programareas_2026_{ver}.gpkg` when it exists and otherwise the canonical
+`derived/v2/ply_programareas_2026.gpkg` (identical v2–v8; every v9 Program-Area report was a 500 for
+want of a file that would have been a copy).
+
 ### Server gotchas (both cost real time)
 
 - **`docker exec` runs as ROOT.** Use `scripts/srv_render.sh` (which passes `-u 1000:1000` and
@@ -424,6 +469,19 @@ version-independent registries replace that:
   the container's `rstudio` user is already uid 1000 — you just have to ask. A sweep found **23,729**
   root-owned files under `/share/data`; the damage is silent until `git merge` aborts with
   `unable to unlink … Permission denied`.
+- **msens1 is 16 GB / 4 cores / NO swap, shared with production** (apps, API, two titilers, ERDDAP).
+  Never hardcode `PRAGMA memory_limit='12GB'`/`threads=6` in a notebook that renders there:
+  `source(here("libs/duckdb_budget.R")); duckdb_tune(con, tmp_dir)` sizes DuckDB to 40 % of
+  MemAvailable (≤ 12 GB, threads ≤ cores; `BUILD_MEMORY_GB`/`BUILD_THREADS` override; a 2.3 GB limit
+  peaks ~3.2 GB resident). On 2026-09-21 a hardcoded 12 GB limit took R to 7.4 GB and the host to load
+  100 — sshd, `/scores`, `/species`, STAC unreachable ~22 min — ended by `pkill -9` of the render, no
+  restart. `scripts/srv_render.sh` now carries a **MemAvailable watchdog** (`SRV_MIN_AVAIL_MB`, default
+  1200 → kills the render, exit 137); fix the notebook's budget rather than raising the floor.
+- **Writes to a v1–v7 `sdm.duckdb` need DuckDB's `icu` extension**: `zone`/`metric`/`model`/`dataset`
+  carry `DEFAULT CURRENT_DATE`. A laptop autoloads it; the container has none for uid 1000 →
+  `dbExecute(con, "INSTALL icu; LOAD icu;")` on the write connection.
+- **The server `.env` has two readers.** docker compose strips quotes; bash (`. ./.env`, `DEPLOY_ACCESS=1`)
+  reads an unquoted `v8|v9` as a PIPELINE. Keep `PREVIEW_RESTRICTED_VERSIONS="v7b|v8|v9"` double-quoted.
 - **All four repos push over SSH.** `msens`, `workflows` and `api` had `https://` remotes and could
   not push from the server at all.
 
