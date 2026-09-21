@@ -1,0 +1,1635 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.8.25">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+
+<title>Build the atlas app/ bundle — the browser’s data contract</title>
+<style>
+code{white-space: pre-wrap;}
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: min(4vw, 1.5em);}
+div.column{flex: auto; overflow-x: auto;}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+/* CSS for syntax highlighting */
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+  { counter-reset: source-line 0; }
+pre.numberSource code > span
+  { position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+  { content: counter(source-line);
+    position: relative; left: -1em; text-align: right; vertical-align: baseline;
+    border: none; display: inline-block;
+    -webkit-touch-callout: none; -webkit-user-select: none;
+    -khtml-user-select: none; -moz-user-select: none;
+    -ms-user-select: none; user-select: none;
+    padding: 0 4px; width: 4em;
+  }
+pre.numberSource { margin-left: 3em;  padding-left: 4px; }
+div.sourceCode
+  {   }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+</style>
+
+
+<script src="build_app_bundle_files/libs/clipboard/clipboard.min.js"></script>
+<script src="build_app_bundle_files/libs/quarto-html/quarto.js" type="module"></script>
+<script src="build_app_bundle_files/libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="build_app_bundle_files/libs/quarto-html/axe/axe-check.js" type="module"></script>
+<script src="build_app_bundle_files/libs/quarto-html/popper.min.js"></script>
+<script src="build_app_bundle_files/libs/quarto-html/tippy.umd.min.js"></script>
+<script src="build_app_bundle_files/libs/quarto-html/anchor.min.js"></script>
+<link href="build_app_bundle_files/libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="build_app_bundle_files/libs/quarto-html/quarto-syntax-highlighting-7b89279ff1a6dce999919e0e67d4d9ec.css" rel="stylesheet" id="quarto-text-highlighting-styles">
+<script src="build_app_bundle_files/libs/bootstrap/bootstrap.min.js"></script>
+<link href="build_app_bundle_files/libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="build_app_bundle_files/libs/bootstrap/bootstrap-d6a003b94517c951b2d65075d42fb01b.min.css" rel="stylesheet" append-hash="true" id="quarto-bootstrap" data-mode="light">
+<script src="build_app_bundle_files/libs/quarto-diagram/mermaid.min.js"></script>
+<script src="build_app_bundle_files/libs/quarto-diagram/mermaid-init.js"></script>
+<link href="build_app_bundle_files/libs/quarto-diagram/mermaid.css" rel="stylesheet">
+
+
+</head>
+
+<body class="fullcontent quarto-light">
+
+<div id="quarto-content" class="page-columns page-rows-contents page-layout-article">
+
+<main class="content" id="quarto-document-content">
+
+<header id="title-block-header" class="quarto-title-block default">
+<div class="quarto-title">
+<h1 class="title">Build the atlas <code>app/</code> bundle — the browser’s data contract</h1>
+</div>
+
+
+
+<div class="quarto-title-meta">
+
+    
+  
+    
+  </div>
+  
+
+
+</header>
+
+
+<p>Master plan D5 (“normalize at publish, not in the browser”) and atlas-1 Deliverable 4. Both Shiny apps carry a per-version adapter today — two grids, <code>mdl_seq</code> vs <code>mdl_key</code>, <code>value</code> vs <code>val</code>, <code>is_ok</code> vs <code>is_valid_usa</code>, a <code>taxon_model</code> self-edge on one side only — each with a production bug recorded behind it. <code>msens::app_bundle_build()</code> (msens 0.43.0, <code>R/app_bundle.R</code>) already resolves every one of those quirks, with tests. This notebook is the thin publishing shell around it: <strong>build → validate → push (gated) → verify (gated)</strong>, one version-independent <code>{ver}/app/</code> bundle per release.</p>
+<p><strong>Nothing here publishes anything.</strong> The push and verification chunks are real, runnable code, gated behind <code>APP_BUNDLE_S3=1</code> (unset by default) exactly like every other side-effecting step in this repo (<code>../CLAUDE.md</code> reproducibility rule 1) — this notebook can be rendered top to bottom, safely, with no S3 credentials and no network write of any kind.</p>
+<p><code>APP_BUNDLE_VERS=v7,v9</code> narrows a run to that set (comma-separated); unset, every version in <code>data/versions.csv</code> is attempted, and a version whose release database is not on this machine is <strong>skipped, not failed</strong> (the same convention <code>build_version_manifest.qmd</code>’s <code>caps_override</code> uses: a capability this run cannot see is <code>FALSE</code>, never invented). <code>APP_BUNDLE_V7_CELLMODEL=1</code> additionally uploads v7’s missing <code>serve/cell_model/</code> (757 MB locally, absent from S3 today even though v7’s manifest advertises <code>cell_species_list: true</code> — the atlas-1 “Facts” note) under its own flag, separate from the ordinary <code>{ver}/app/</code> push.</p>
+<section id="design" class="level2">
+<h2 class="anchored" data-anchor-id="design">Design</h2>
+<div class="cell" data-layout-align="default">
+<div class="cell-output-display">
+<div id="fig-design" class="quarto-float quarto-figure quarto-figure-center anchored">
+<figure class="quarto-float quarto-float-fig figure">
+<div aria-describedby="fig-design-caption-0ceaefa1-69ba-4598-a22c-09a6ac19f8ca">
+<div>
+<pre class="mermaid mermaid-js" data-label="fig-design">flowchart LR
+  subgraph src["this version's release database"]
+    sdm[("sdm.duckdb&lt;br/&gt;(v8/v9: has model_asset-&gt;native_asset)")]
+    srv[("serve.duckdb&lt;br/&gt;(v1-v7b: model_asset lives HERE,&lt;br/&gt;not in sdm.duckdb -- see Setup)")]
+  end
+  sdm --&gt;|"sdm_db_path(ver)"| con(("read-only&lt;br/&gt;DuckDB connection"))
+  srv -.-&gt;|"fallback when sdm.duckdb&lt;br/&gt;has no asset registry"| con
+  con --&gt; abb["msens::app_bundle_build()"]
+  abb --&gt; boot["boot.json"]
+  abb --&gt; taxa["taxa.json"]
+  abb --&gt; tsh["taxon/{xx}.json x256"]
+  abb --&gt; alsh["alias/{xx}.json x256"]
+  abb --&gt; txp["taxon.parquet"]
+  abb --&gt; ztp["zone_taxon.parquet"]
+  abb --&gt; cell["cell/tile={t}/data_0.parquet"]
+  csv[("data/taxonomic_hierarchy_worms_…csv&lt;br/&gt;(curated, not a DB table)")] --&gt;|"app_taxonomy_table()&lt;br/&gt;libs/app_bundle.R"| txm["taxonomy.parquet"]
+  boot &amp; taxa &amp; tsh &amp; alsh &amp; txp &amp; ztp &amp; cell &amp; txm --&gt; val{{"app_validate()&lt;br/&gt;every object vs its&lt;br/&gt;inst/schema/app_*.schema.json"}}
+  val --&gt;|"APP_BUNDLE_S3=1"| grd{{"app_bundle_assert_prefix()&lt;br/&gt;refuses any key outside&lt;br/&gt;{ver}/app/"}}
+  grd --&gt; s3[["s3://…/marine-atlas/{ver}/app/"]]
+  s3 --&gt;|"APP_BUNDLE_S3=1"| anon{{"anonymous HTTPS HEAD/GET&lt;br/&gt;per object"}}
+  anon --&gt; mfst["build_version_manifest.qmd&lt;br/&gt;probes the SAME way -&gt;&lt;br/&gt;manifest.json $app{}"]
+
+  classDef gate fill:#3a1e1e,stroke:#e03131,color:#e6edf3;
+  classDef db fill:#1e3a5f,stroke:#3bc9db,color:#e6edf3;
+  class val,grd,anon gate;
+  class sdm,srv,con db;
+</pre>
+</div>
+</div>
+<figcaption class="quarto-float-caption-bottom quarto-float-caption quarto-float-fig" id="fig-design-caption-0ceaefa1-69ba-4598-a22c-09a6ac19f8ca">
+Figure&nbsp;1: One release database -&gt; app_bundle_build() -&gt; {ver}/app/, validated before it is ever written to S3
+</figcaption>
+</figure>
+</div>
+</div>
+</div>
+</section>
+<section id="setup" class="level2">
+<h2 class="anchored" data-anchor-id="setup">Setup</h2>
+<div class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb1"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a>librarian<span class="sc">::</span><span class="fu">shelf</span>(</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>  DBI, dplyr, duckdb, fs, glue, here, jsonlite, knitr, logger, purrr, readr,</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>  MarineSensitivity<span class="sc">/</span>msens, <span class="at">quiet =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="fu">source</span>(<span class="fu">here</span>(<span class="st">"libs/duckdb_budget.R"</span>))</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="fu">source</span>(<span class="fu">here</span>(<span class="st">"libs/app_bundle.R"</span>))</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="fu">stopifnot</span>(</span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>  <span class="st">"msens 0.43.0 or newer is required (app_bundle_build(), app_manifest_block())"</span> <span class="ot">=</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>    <span class="fu">packageVersion</span>(<span class="st">"msens"</span>) <span class="sc">&gt;=</span> <span class="st">"0.43.0"</span>)</span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="fu">message</span>(<span class="fu">glue</span>(<span class="st">"msens {packageVersion('msens')} @ {find.package('msens')}"</span>))</span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="co"># --- run scope ------------------------------------------------------------</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>versions_csv <span class="ot">&lt;-</span> readr<span class="sc">::</span><span class="fu">read_csv</span>(<span class="fu">here</span>(<span class="st">"data/versions.csv"</span>), <span class="at">show_col_types =</span> <span class="cn">FALSE</span>)</span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>narrow       <span class="ot">&lt;-</span> <span class="fu">Sys.getenv</span>(<span class="st">"APP_BUNDLE_VERS"</span>)</span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>vers         <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="fu">nzchar</span>(narrow)) <span class="fu">trimws</span>(<span class="fu">strsplit</span>(narrow, <span class="st">","</span>)[[<span class="dv">1</span>]]) <span class="cf">else</span> versions_csv<span class="sc">$</span>ver</span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>do_s3       <span class="ot">&lt;-</span> <span class="fu">Sys.getenv</span>(<span class="st">"APP_BUNDLE_S3"</span>)            <span class="sc">!=</span> <span class="st">""</span>   <span class="co"># push to S3 (default OFF)</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>do_v7_cm    <span class="ot">&lt;-</span> <span class="fu">Sys.getenv</span>(<span class="st">"APP_BUNDLE_V7_CELLMODEL"</span>)  <span class="sc">!=</span> <span class="st">""</span>   <span class="co"># also upload v7's serve/cell_model/</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>base        <span class="ot">&lt;-</span> msens<span class="sc">::</span><span class="fu">atlas_base_url</span>()</span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>dir_out_root <span class="ot">&lt;-</span> <span class="fu">here</span>(<span class="st">"_output"</span>, <span class="st">"app_bundle"</span>)                 <span class="co"># gitignored (see .gitignore)</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>fs<span class="sc">::</span><span class="fu">dir_create</span>(dir_out_root)</span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a><span class="fu">message</span>(<span class="fu">glue</span>(</span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a>  <span class="st">"versions: {paste(vers, collapse = ', ')}  push_s3={do_s3}  v7_cell_model={do_v7_cm}  "</span>,</span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a>  <span class="st">"base={base}"</span>))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</div>
+<p><strong>Which database.</strong> <code>msens::sdm_db_path(ver)</code> returns the release’s build database, and prefers <code>sdm.duckdb</code> over <code>serve.duckdb</code> whenever the former exists on this machine. That is right for v8/v9, whose <code>native_asset</code> table lives IN <code>sdm.duckdb</code> — but wrong for v1–v7b: their local <code>sdm.duckdb</code> has neither <code>model_asset</code> nor <code>native_asset</code> at all (verified 2026-09-21 against the real v7 release: <code>model</code>, not <code>model_asset</code>, holds only dataset/taxon/region metadata, no COG URL). <code>model_asset</code> is written only by <code>backfill_versions.qmd</code>, as a view in <code>serve.duckdb</code>. Opening the wrong database is not an error — <code>app_bundle_build()</code> runs to completion and every taxon’s <code>merged</code> and <code>inputs[].assets</code> come back silently empty, which is exactly the failure mode this contract exists to prevent everywhere else.</p>
+<p>Three tiers, each PROBED (a view existing by name is not enough — <code>serve.duckdb</code>’s views embed the LOCAL paths of the machine that built them, so a copy rsynced to a laptop lists a <code>model_asset</code> view that then fails the moment it is queried; discovered running this notebook for real against v7):</p>
+<ol type="1">
+<li><code>sdm_db_path(ver)</code> (<code>sdm.duckdb</code>, or <code>serve.duckdb</code> if that is what <code>sdm_db_path()</code> itself falls back to) — right for v8/v9.</li>
+<li><code>serve.duckdb</code> beside it, if (1) has no working asset table — right on the SERVER that built it.</li>
+<li>An ephemeral, <strong>anonymous, read-only</strong> DuckDB attached directly to this release’s <em>published</em> <code>tables/*.parquet</code> on S3 (httpfs, path-style; no credentials, no write) — right anywhere, including this laptop, for any <code>released</code>/public version. Never used for a <code>restricted</code> version (nothing to attach yet, or nothing this notebook should read anonymously either).</li>
+</ol>
+<div class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb2"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># does `tbl` exist AND actually return rows when queried (not just listed)?</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>.probe_table <span class="ot">&lt;-</span> <span class="cf">function</span>(con, tbl) {</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span>tbl <span class="sc">%in%</span> DBI<span class="sc">::</span><span class="fu">dbListTables</span>(con)) <span class="fu">return</span>(<span class="cn">FALSE</span>)</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>  <span class="fu">isTRUE</span>(<span class="fu">tryCatch</span>(DBI<span class="sc">::</span><span class="fu">dbGetQuery</span>(con, <span class="fu">glue</span>(<span class="st">"SELECT count(*) n FROM {tbl} LIMIT 1"</span>))<span class="sc">$</span>n <span class="sc">&gt;=</span> <span class="dv">0</span>,</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>                  <span class="at">error =</span> <span class="cf">function</span>(e) <span class="cn">FALSE</span>))</span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>.has_asset_tbl <span class="ot">&lt;-</span> <span class="cf">function</span>(con) <span class="fu">any</span>(<span class="fu">vapply</span>(<span class="fu">c</span>(<span class="st">"model_asset"</span>, <span class="st">"native_asset"</span>), .probe_table, <span class="fu">logical</span>(<span class="dv">1</span>), <span class="at">con =</span> con))</span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="co"># tier 3: views over a LOCAL CACHE of the PUBLISHED tables/*.parquet -- downloaded</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="co"># once, anonymously, read-only (no S3 write, no credentials). attach_atlas() does</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="co"># the remote-view version of this for v8+'s native_asset shape, but has no</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="co"># model_asset/taxon_model view -- and a REMOTE view here was measured to be</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="co"># impractically slow: a full aggregation over `cell_metric` (unprunable row</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="co"># groups) via anonymous httpfs range reads did not finish in over an hour, where</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="co"># the equivalent LOCAL query takes seconds. `tables/` for a whole legacy release</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="co"># is under 200 MB (atlas-1 plan "Facts": v7 cell 22.7 MB + cell_metric 109 MB +</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="co"># the rest under 25 MB combined), so caching it locally costs a one-time download,</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a><span class="co"># not a redesign.</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>.attach_s3_legacy <span class="ot">&lt;-</span> <span class="cf">function</span>(ver, access) {</span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">identical</span>(access, <span class="st">"public"</span>)) <span class="fu">return</span>(<span class="cn">NULL</span>)</span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>  cache_dir <span class="ot">&lt;-</span> <span class="fu">here</span>(<span class="st">"_output"</span>, <span class="st">"app_bundle"</span>, <span class="st">"_s3cache"</span>, ver, <span class="st">"tables"</span>)</span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>  fs<span class="sc">::</span><span class="fu">dir_create</span>(cache_dir)</span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>  http <span class="ot">&lt;-</span> <span class="fu">sprintf</span>(<span class="st">"%s/%s"</span>, base, ver)</span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>  tbls <span class="ot">&lt;-</span> <span class="fu">c</span>(<span class="st">"cell"</span>, <span class="st">"taxon"</span>, <span class="st">"model"</span>, <span class="st">"model_asset"</span>, <span class="st">"metric"</span>, <span class="st">"cell_metric"</span>,</span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>           <span class="st">"zone"</span>, <span class="st">"zone_cell"</span>, <span class="st">"zone_metric"</span>, <span class="st">"zone_taxon"</span>, <span class="st">"dataset"</span>, <span class="st">"taxon_model"</span>, <span class="st">"listing"</span>)</span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>  got <span class="ot">&lt;-</span> <span class="fu">vapply</span>(tbls, <span class="cf">function</span>(t) {</span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>    dest <span class="ot">&lt;-</span> <span class="fu">file.path</span>(cache_dir, <span class="fu">paste0</span>(t, <span class="st">".parquet"</span>))</span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="fu">file.exists</span>(dest)) <span class="fu">return</span>(<span class="cn">TRUE</span>)</span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a>    <span class="fu">isTRUE</span>(<span class="fu">tryCatch</span>(</span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a>      utils<span class="sc">::</span><span class="fu">download.file</span>(<span class="fu">sprintf</span>(<span class="st">"%s/tables/%s.parquet"</span>, http, t), dest,</span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a>                           <span class="at">mode =</span> <span class="st">"wb"</span>, <span class="at">quiet =</span> <span class="cn">TRUE</span>) <span class="sc">==</span> <span class="dv">0</span>L,</span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a>      <span class="at">error =</span> <span class="cf">function</span>(e) <span class="cn">FALSE</span>, <span class="at">warning =</span> <span class="cf">function</span>(w) <span class="cn">FALSE</span>))</span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a>  }, <span class="fu">logical</span>(<span class="dv">1</span>))</span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">any</span>(got)) <span class="fu">return</span>(<span class="cn">NULL</span>)</span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a>  con <span class="ot">&lt;-</span> DBI<span class="sc">::</span><span class="fu">dbConnect</span>(duckdb<span class="sc">::</span><span class="fu">duckdb</span>())</span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a>  ok <span class="ot">&lt;-</span> <span class="fu">vapply</span>(tbls[got], <span class="cf">function</span>(t) {</span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a>    <span class="fu">isTRUE</span>(<span class="fu">tryCatch</span>({</span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true" tabindex="-1"></a>      DBI<span class="sc">::</span><span class="fu">dbExecute</span>(con, <span class="fu">glue</span>(</span>
+<span id="cb2-39"><a href="#cb2-39" aria-hidden="true" tabindex="-1"></a>        <span class="st">"CREATE OR REPLACE VIEW {t} AS SELECT * FROM read_parquet('{cache_dir}/{t}.parquet')"</span>))</span>
+<span id="cb2-40"><a href="#cb2-40" aria-hidden="true" tabindex="-1"></a>      <span class="fu">.probe_table</span>(con, t)</span>
+<span id="cb2-41"><a href="#cb2-41" aria-hidden="true" tabindex="-1"></a>    }, <span class="at">error =</span> <span class="cf">function</span>(e) <span class="cn">FALSE</span>))</span>
+<span id="cb2-42"><a href="#cb2-42" aria-hidden="true" tabindex="-1"></a>  }, <span class="fu">logical</span>(<span class="dv">1</span>))</span>
+<span id="cb2-43"><a href="#cb2-43" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">.has_asset_tbl</span>(con)) { DBI<span class="sc">::</span><span class="fu">dbDisconnect</span>(con, <span class="at">shutdown =</span> <span class="cn">TRUE</span>); <span class="fu">return</span>(<span class="cn">NULL</span>) }</span>
+<span id="cb2-44"><a href="#cb2-44" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_warn</span>(<span class="st">"{ver}: cached + attached {sum(ok)}/{length(tbls)} tables from {http}/tables/ ({cache_dir})"</span>)</span>
+<span id="cb2-45"><a href="#cb2-45" aria-hidden="true" tabindex="-1"></a>  con</span>
+<span id="cb2-46"><a href="#cb2-46" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb2-47"><a href="#cb2-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-48"><a href="#cb2-48" aria-hidden="true" tabindex="-1"></a>app_bundle_open <span class="ot">&lt;-</span> <span class="cf">function</span>(ver) {</span>
+<span id="cb2-49"><a href="#cb2-49" aria-hidden="true" tabindex="-1"></a>  v_row  <span class="ot">&lt;-</span> versions_csv <span class="sc">|&gt;</span> <span class="fu">filter</span>(ver <span class="sc">==</span> <span class="sc">!!</span>ver)</span>
+<span id="cb2-50"><a href="#cb2-50" aria-hidden="true" tabindex="-1"></a>  access <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="fu">nrow</span>(v_row)) v_row<span class="sc">$</span>access[<span class="dv">1</span>] <span class="cf">else</span> <span class="st">"restricted"</span></span>
+<span id="cb2-51"><a href="#cb2-51" aria-hidden="true" tabindex="-1"></a>  db  <span class="ot">&lt;-</span> <span class="fu">path.expand</span>(msens<span class="sc">::</span><span class="fu">sdm_db_path</span>(ver))</span>
+<span id="cb2-52"><a href="#cb2-52" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="fu">file.exists</span>(db)) {</span>
+<span id="cb2-53"><a href="#cb2-53" aria-hidden="true" tabindex="-1"></a>    con <span class="ot">&lt;-</span> DBI<span class="sc">::</span><span class="fu">dbConnect</span>(duckdb<span class="sc">::</span><span class="fu">duckdb</span>(), db, <span class="at">read_only =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb2-54"><a href="#cb2-54" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="fu">.has_asset_tbl</span>(con)) <span class="fu">return</span>(<span class="fu">list</span>(<span class="at">con =</span> con, <span class="at">db =</span> db, <span class="at">ok =</span> <span class="cn">TRUE</span>))</span>
+<span id="cb2-55"><a href="#cb2-55" aria-hidden="true" tabindex="-1"></a>    DBI<span class="sc">::</span><span class="fu">dbDisconnect</span>(con, <span class="at">shutdown =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb2-56"><a href="#cb2-56" aria-hidden="true" tabindex="-1"></a>  }</span>
+<span id="cb2-57"><a href="#cb2-57" aria-hidden="true" tabindex="-1"></a>  alt <span class="ot">&lt;-</span> <span class="fu">file.path</span>(fs<span class="sc">::</span><span class="fu">path_dir</span>(db), <span class="st">"serve.duckdb"</span>)</span>
+<span id="cb2-58"><a href="#cb2-58" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (fs<span class="sc">::</span><span class="fu">path_file</span>(db) <span class="sc">!=</span> <span class="st">"serve.duckdb"</span> <span class="sc">&amp;&amp;</span> <span class="fu">file.exists</span>(alt)) {</span>
+<span id="cb2-59"><a href="#cb2-59" aria-hidden="true" tabindex="-1"></a>    con2 <span class="ot">&lt;-</span> DBI<span class="sc">::</span><span class="fu">dbConnect</span>(duckdb<span class="sc">::</span><span class="fu">duckdb</span>(), alt, <span class="at">read_only =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb2-60"><a href="#cb2-60" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="fu">.has_asset_tbl</span>(con2)) {</span>
+<span id="cb2-61"><a href="#cb2-61" aria-hidden="true" tabindex="-1"></a>      <span class="fu">log_warn</span>(<span class="st">"{ver}: sdm.duckdb has no working model_asset/native_asset; using serve.duckdb ({alt})"</span>)</span>
+<span id="cb2-62"><a href="#cb2-62" aria-hidden="true" tabindex="-1"></a>      <span class="fu">return</span>(<span class="fu">list</span>(<span class="at">con =</span> con2, <span class="at">db =</span> alt, <span class="at">ok =</span> <span class="cn">TRUE</span>))</span>
+<span id="cb2-63"><a href="#cb2-63" aria-hidden="true" tabindex="-1"></a>    }</span>
+<span id="cb2-64"><a href="#cb2-64" aria-hidden="true" tabindex="-1"></a>    DBI<span class="sc">::</span><span class="fu">dbDisconnect</span>(con2, <span class="at">shutdown =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb2-65"><a href="#cb2-65" aria-hidden="true" tabindex="-1"></a>  }</span>
+<span id="cb2-66"><a href="#cb2-66" aria-hidden="true" tabindex="-1"></a>  con3 <span class="ot">&lt;-</span> <span class="fu">.attach_s3_legacy</span>(ver, access)</span>
+<span id="cb2-67"><a href="#cb2-67" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">is.null</span>(con3)) <span class="fu">return</span>(<span class="fu">list</span>(<span class="at">con =</span> con3, <span class="at">db =</span> <span class="fu">sprintf</span>(<span class="st">"s3 (anonymous, tables/) %s/%s"</span>, base, ver), <span class="at">ok =</span> <span class="cn">TRUE</span>))</span>
+<span id="cb2-68"><a href="#cb2-68" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">file.exists</span>(db)) <span class="fu">return</span>(<span class="fu">list</span>(<span class="at">con =</span> <span class="cn">NULL</span>, <span class="at">db =</span> db, <span class="at">ok =</span> <span class="cn">FALSE</span>))</span>
+<span id="cb2-69"><a href="#cb2-69" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_warn</span>(<span class="fu">paste</span>(</span>
+<span id="cb2-70"><a href="#cb2-70" aria-hidden="true" tabindex="-1"></a>    <span class="st">"{ver}: no database anywhere (local sdm.duckdb, local serve.duckdb, S3 tables/) carries"</span>,</span>
+<span id="cb2-71"><a href="#cb2-71" aria-hidden="true" tabindex="-1"></a>    <span class="st">"model_asset/native_asset -- merged COG urls and input assets will be EMPTY (not an error)"</span>))</span>
+<span id="cb2-72"><a href="#cb2-72" aria-hidden="true" tabindex="-1"></a>  <span class="fu">list</span>(<span class="at">con =</span> DBI<span class="sc">::</span><span class="fu">dbConnect</span>(duckdb<span class="sc">::</span><span class="fu">duckdb</span>(), db, <span class="at">read_only =</span> <span class="cn">TRUE</span>), <span class="at">db =</span> db, <span class="at">ok =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb2-73"><a href="#cb2-73" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb2-74"><a href="#cb2-74" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-75"><a href="#cb2-75" aria-hidden="true" tabindex="-1"></a><span class="co"># the gates below only need cell/cell_metric/zone*/taxon/metric -- always present</span></span>
+<span id="cb2-76"><a href="#cb2-76" aria-hidden="true" tabindex="-1"></a><span class="co"># in sdm.duckdb (or its serve.duckdb fallback) for every generation -- so they</span></span>
+<span id="cb2-77"><a href="#cb2-77" aria-hidden="true" tabindex="-1"></a><span class="co"># open directly rather than paying app_bundle_open()'s S3-probe escalation,</span></span>
+<span id="cb2-78"><a href="#cb2-78" aria-hidden="true" tabindex="-1"></a><span class="co"># which exists only for the asset registry (model_asset/native_asset).</span></span>
+<span id="cb2-79"><a href="#cb2-79" aria-hidden="true" tabindex="-1"></a>app_bundle_open_scoring <span class="ot">&lt;-</span> <span class="cf">function</span>(ver)</span>
+<span id="cb2-80"><a href="#cb2-80" aria-hidden="true" tabindex="-1"></a>  DBI<span class="sc">::</span><span class="fu">dbConnect</span>(duckdb<span class="sc">::</span><span class="fu">duckdb</span>(), <span class="fu">path.expand</span>(msens<span class="sc">::</span><span class="fu">sdm_db_path</span>(ver)), <span class="at">read_only =</span> <span class="cn">TRUE</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</div>
+</section>
+<section id="guard-the-push-may-never-write-outside-verapp" class="level2">
+<h2 class="anchored" data-anchor-id="guard-the-push-may-never-write-outside-verapp">Guard: the push may never write outside <code>{ver}/app/</code></h2>
+<p>Run once, at render time, so the render itself is the proof — not just a definition nobody exercised. <code>app_bundle_assert_prefix()</code> (<code>libs/app_bundle.R</code>) is pure: no S3, no side effect.</p>
+<div class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb3"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">app_bundle_assert_prefix_selftest</span>()</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-stdout">
+<pre><code>Test passed with 1 success 🥳.
+Test passed with 2 successes 🎊.
+Test passed with 1 success 🥳.
+Test passed with 1 success 🌈.
+Test passed with 1 success 🌈.
+Test passed with 3 successes 😀.</code></pre>
+</div>
+</div>
+</section>
+<section id="build" class="level2">
+<h2 class="anchored" data-anchor-id="build">Build</h2>
+<p>One <code>app_bundle_build()</code> call per version, resiliently: a broken piece for ONE version (see the v7 finding below) must not lose the versions that work. <code>app/taxonomy.parquet</code> has no msens builder — it is a curated CSV restricted to the release, not a database table — so it is written here via <code>app_taxonomy_table()</code> (<code>libs/app_bundle.R</code>).</p>
+<div class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb5"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a>build_one <span class="ot">&lt;-</span> <span class="cf">function</span>(ver) {</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>  t0 <span class="ot">&lt;-</span> <span class="fu">Sys.time</span>()</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>  opened <span class="ot">&lt;-</span> <span class="fu">app_bundle_open</span>(ver)</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">isTRUE</span>(opened<span class="sc">$</span>ok)) {</span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    <span class="fu">log_warn</span>(<span class="st">"{ver}: no local release database at {opened$db} -- SKIPPED"</span>)</span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    <span class="fu">return</span>(<span class="fu">list</span>(<span class="at">ver =</span> ver, <span class="at">ok =</span> <span class="cn">FALSE</span>, <span class="at">reason =</span> <span class="st">"no local database"</span>, <span class="at">stages =</span> <span class="fu">tibble</span>()))</span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>  }</span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>  con <span class="ot">&lt;-</span> opened<span class="sc">$</span>con</span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>  <span class="fu">on.exit</span>(DBI<span class="sc">::</span><span class="fu">dbDisconnect</span>(con, <span class="at">shutdown =</span> <span class="cn">TRUE</span>), <span class="at">add =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>  <span class="fu">duckdb_tune</span>(con, <span class="fu">file.path</span>(<span class="fu">tempdir</span>(), <span class="st">"app_bundle_spill"</span>, ver))</span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>  dir_out <span class="ot">&lt;-</span> <span class="fu">file.path</span>(dir_out_root, ver)</span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (fs<span class="sc">::</span><span class="fu">dir_exists</span>(dir_out)) fs<span class="sc">::</span><span class="fu">dir_delete</span>(dir_out)   <span class="co"># clean slate every run</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a>  fs<span class="sc">::</span><span class="fu">dir_create</span>(dir_out)</span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>  v_row <span class="ot">&lt;-</span> versions_csv <span class="sc">|&gt;</span> <span class="fu">filter</span>(ver <span class="sc">==</span> <span class="sc">!!</span>ver)</span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a>  status <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="fu">nrow</span>(v_row)) v_row<span class="sc">$</span>status[<span class="dv">1</span>] <span class="cf">else</span> <span class="st">"prerelease"</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a>  access <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="fu">nrow</span>(v_row)) v_row<span class="sc">$</span>access[<span class="dv">1</span>] <span class="cf">else</span> <span class="st">"restricted"</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a>  f_scog  <span class="ot">&lt;-</span> <span class="fu">file.path</span>(fs<span class="sc">::</span><span class="fu">path_dir</span>(opened<span class="sc">$</span>db), <span class="st">"tables"</span>, <span class="st">"score_cog.parquet"</span>)</span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a>  metrics <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="fu">file.exists</span>(f_scog)) {</span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a>    arrow<span class="sc">::</span><span class="fu">read_parquet</span>(f_scog) <span class="sc">|&gt;</span> <span class="fu">filter</span>(<span class="sc">!</span><span class="fu">startsWith</span>(metric_key, <span class="st">"_"</span>)) <span class="sc">|&gt;</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a>      <span class="fu">transmute</span>(metric_key, subregion_key, <span class="at">cog =</span> cog_url, rescale_min, rescale_max, colormap)</span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a>  } <span class="cf">else</span> <span class="cn">NULL</span></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a>  zone_sets <span class="ot">&lt;-</span> readr<span class="sc">::</span><span class="fu">read_csv</span>(<span class="fu">here</span>(<span class="st">"data/zone_sets.csv"</span>), <span class="at">show_col_types =</span> <span class="cn">FALSE</span>)</span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true" tabindex="-1"></a>  mfst <span class="ot">&lt;-</span> msens<span class="sc">::</span><span class="fu">manifest_build</span>(con, ver, <span class="at">status =</span> status, <span class="at">access =</span> access, <span class="at">base =</span> base,</span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true" tabindex="-1"></a>                                <span class="at">metrics =</span> metrics, <span class="at">zone_sets =</span> zone_sets)</span>
+<span id="cb5-29"><a href="#cb5-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-30"><a href="#cb5-30" aria-hidden="true" tabindex="-1"></a>  <span class="co"># every stage isolated: ONE broken builder (see the v7 legacy-shape finding</span></span>
+<span id="cb5-31"><a href="#cb5-31" aria-hidden="true" tabindex="-1"></a>  <span class="co"># below) must not hide the objects that DID build correctly</span></span>
+<span id="cb5-32"><a href="#cb5-32" aria-hidden="true" tabindex="-1"></a>  stages <span class="ot">&lt;-</span> <span class="fu">list</span>(); errs <span class="ot">&lt;-</span> <span class="fu">list</span>()</span>
+<span id="cb5-33"><a href="#cb5-33" aria-hidden="true" tabindex="-1"></a>  step <span class="ot">&lt;-</span> <span class="cf">function</span>(label, expr) {</span>
+<span id="cb5-34"><a href="#cb5-34" aria-hidden="true" tabindex="-1"></a>    t_ <span class="ot">&lt;-</span> <span class="fu">Sys.time</span>()</span>
+<span id="cb5-35"><a href="#cb5-35" aria-hidden="true" tabindex="-1"></a>    r  <span class="ot">&lt;-</span> <span class="fu">tryCatch</span>(expr, <span class="at">error =</span> <span class="cf">function</span>(e) { errs[[label]] <span class="ot">&lt;&lt;-</span> <span class="fu">conditionMessage</span>(e); <span class="cn">NULL</span> })</span>
+<span id="cb5-36"><a href="#cb5-36" aria-hidden="true" tabindex="-1"></a>    stages[[label]] <span class="ot">&lt;&lt;-</span> <span class="fu">as.numeric</span>(<span class="fu">Sys.time</span>() <span class="sc">-</span> t_, <span class="at">units =</span> <span class="st">"secs"</span>)</span>
+<span id="cb5-37"><a href="#cb5-37" aria-hidden="true" tabindex="-1"></a>    r</span>
+<span id="cb5-38"><a href="#cb5-38" aria-hidden="true" tabindex="-1"></a>  }</span>
+<span id="cb5-39"><a href="#cb5-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-40"><a href="#cb5-40" aria-hidden="true" tabindex="-1"></a>  tx  <span class="ot">&lt;-</span> <span class="fu">step</span>(<span class="st">"taxon.parquet"</span>, {</span>
+<span id="cb5-41"><a href="#cb5-41" aria-hidden="true" tabindex="-1"></a>    d <span class="ot">&lt;-</span> msens<span class="sc">::</span><span class="fu">app_taxon_table</span>(con); msens<span class="sc">::</span><span class="fu">write_atlas_parquet</span>(d, <span class="fu">file.path</span>(dir_out, <span class="st">"taxon.parquet"</span>)); d })</span>
+<span id="cb5-42"><a href="#cb5-42" aria-hidden="true" tabindex="-1"></a>  zt  <span class="ot">&lt;-</span> <span class="fu">step</span>(<span class="st">"zone_taxon.parquet"</span>, {</span>
+<span id="cb5-43"><a href="#cb5-43" aria-hidden="true" tabindex="-1"></a>    d <span class="ot">&lt;-</span> msens<span class="sc">::</span><span class="fu">app_zone_taxon</span>(con)</span>
+<span id="cb5-44"><a href="#cb5-44" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="fu">nrow</span>(d)) msens<span class="sc">::</span><span class="fu">write_atlas_parquet</span>(d, <span class="fu">file.path</span>(dir_out, <span class="st">"zone_taxon.parquet"</span>)); d })</span>
+<span id="cb5-45"><a href="#cb5-45" aria-hidden="true" tabindex="-1"></a>  txm <span class="ot">&lt;-</span> <span class="fu">step</span>(<span class="st">"taxonomy.parquet"</span>, {</span>
+<span id="cb5-46"><a href="#cb5-46" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="fu">is.null</span>(tx)) <span class="fu">stop</span>(<span class="st">"taxon.parquet did not build; cannot restrict the taxonomy CSV"</span>)</span>
+<span id="cb5-47"><a href="#cb5-47" aria-hidden="true" tabindex="-1"></a>    d <span class="ot">&lt;-</span> <span class="fu">app_taxonomy_table</span>(tx); msens<span class="sc">::</span><span class="fu">write_atlas_parquet</span>(d, <span class="fu">file.path</span>(dir_out, <span class="st">"taxonomy.parquet"</span>)); d })</span>
+<span id="cb5-48"><a href="#cb5-48" aria-hidden="true" tabindex="-1"></a>  tiles <span class="ot">&lt;-</span> <span class="fu">step</span>(<span class="st">"cell/"</span>, msens<span class="sc">::</span><span class="fu">app_cell_tiles</span>(con, <span class="fu">file.path</span>(dir_out, <span class="st">"cell"</span>)))</span>
+<span id="cb5-49"><a href="#cb5-49" aria-hidden="true" tabindex="-1"></a>  boot  <span class="ot">&lt;-</span> <span class="fu">step</span>(<span class="st">"boot.json"</span>, {</span>
+<span id="cb5-50"><a href="#cb5-50" aria-hidden="true" tabindex="-1"></a>    b <span class="ot">&lt;-</span> msens<span class="sc">::</span><span class="fu">app_boot</span>(con, ver, mfst, <span class="at">tables =</span> <span class="fu">list</span>())</span>
+<span id="cb5-51"><a href="#cb5-51" aria-hidden="true" tabindex="-1"></a>    <span class="fu">writeLines</span>(msens<span class="sc">::</span><span class="fu">app_json</span>(b), <span class="fu">file.path</span>(dir_out, <span class="st">"boot.json"</span>)); b })</span>
+<span id="cb5-52"><a href="#cb5-52" aria-hidden="true" tabindex="-1"></a>  taxa  <span class="ot">&lt;-</span> <span class="fu">step</span>(<span class="st">"taxa.json"</span>, {</span>
+<span id="cb5-53"><a href="#cb5-53" aria-hidden="true" tabindex="-1"></a>    t_ <span class="ot">&lt;-</span> msens<span class="sc">::</span><span class="fu">app_taxa</span>(con, ver)</span>
+<span id="cb5-54"><a href="#cb5-54" aria-hidden="true" tabindex="-1"></a>    <span class="fu">writeLines</span>(msens<span class="sc">::</span><span class="fu">app_json</span>(t_), <span class="fu">file.path</span>(dir_out, <span class="st">"taxa.json"</span>)); t_ })</span>
+<span id="cb5-55"><a href="#cb5-55" aria-hidden="true" tabindex="-1"></a>  tsh   <span class="ot">&lt;-</span> <span class="fu">step</span>(<span class="st">"taxon/*.json"</span>, {</span>
+<span id="cb5-56"><a href="#cb5-56" aria-hidden="true" tabindex="-1"></a>    sh <span class="ot">&lt;-</span> msens<span class="sc">::</span><span class="fu">app_taxon_shards</span>(con, ver)</span>
+<span id="cb5-57"><a href="#cb5-57" aria-hidden="true" tabindex="-1"></a>    fs<span class="sc">::</span><span class="fu">dir_create</span>(<span class="fu">file.path</span>(dir_out, <span class="st">"taxon"</span>))</span>
+<span id="cb5-58"><a href="#cb5-58" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> (s <span class="cf">in</span> <span class="fu">names</span>(sh)) <span class="fu">writeLines</span>(msens<span class="sc">::</span><span class="fu">app_json</span>(sh[[s]]), <span class="fu">file.path</span>(dir_out, <span class="st">"taxon"</span>, <span class="fu">paste0</span>(s, <span class="st">".json"</span>)))</span>
+<span id="cb5-59"><a href="#cb5-59" aria-hidden="true" tabindex="-1"></a>    sh })</span>
+<span id="cb5-60"><a href="#cb5-60" aria-hidden="true" tabindex="-1"></a>  alsh  <span class="ot">&lt;-</span> <span class="fu">step</span>(<span class="st">"alias/*.json"</span>, {</span>
+<span id="cb5-61"><a href="#cb5-61" aria-hidden="true" tabindex="-1"></a>    al <span class="ot">&lt;-</span> msens<span class="sc">::</span><span class="fu">app_alias_shards</span>(con, ver)</span>
+<span id="cb5-62"><a href="#cb5-62" aria-hidden="true" tabindex="-1"></a>    fs<span class="sc">::</span><span class="fu">dir_create</span>(<span class="fu">file.path</span>(dir_out, <span class="st">"alias"</span>))</span>
+<span id="cb5-63"><a href="#cb5-63" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> (s <span class="cf">in</span> <span class="fu">names</span>(al)) <span class="fu">writeLines</span>(msens<span class="sc">::</span><span class="fu">app_json</span>(al[[s]]), <span class="fu">file.path</span>(dir_out, <span class="st">"alias"</span>, <span class="fu">paste0</span>(s, <span class="st">".json"</span>)))</span>
+<span id="cb5-64"><a href="#cb5-64" aria-hidden="true" tabindex="-1"></a>    al })</span>
+<span id="cb5-65"><a href="#cb5-65" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-66"><a href="#cb5-66" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="fu">length</span>(errs))</span>
+<span id="cb5-67"><a href="#cb5-67" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> (nm <span class="cf">in</span> <span class="fu">names</span>(errs)) <span class="fu">log_warn</span>(<span class="st">"{ver}: {nm} FAILED: {substr(errs[[nm]], 1, 200)}"</span>)</span>
+<span id="cb5-68"><a href="#cb5-68" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-69"><a href="#cb5-69" aria-hidden="true" tabindex="-1"></a>  <span class="fu">list</span>(<span class="at">ver =</span> ver, <span class="at">ok =</span> <span class="cn">TRUE</span>, <span class="at">dir_out =</span> dir_out, <span class="at">con_db =</span> opened<span class="sc">$</span>db, <span class="at">manifest =</span> mfst,</span>
+<span id="cb5-70"><a href="#cb5-70" aria-hidden="true" tabindex="-1"></a>       <span class="at">boot =</span> boot, <span class="at">taxa =</span> taxa, <span class="at">taxon_shards =</span> tsh, <span class="at">alias_shards =</span> alsh, <span class="at">cell_tiles =</span> tiles,</span>
+<span id="cb5-71"><a href="#cb5-71" aria-hidden="true" tabindex="-1"></a>       <span class="at">stages =</span> <span class="fu">tibble</span>(<span class="at">stage =</span> <span class="fu">names</span>(stages), <span class="at">seconds =</span> <span class="fu">unlist</span>(stages),</span>
+<span id="cb5-72"><a href="#cb5-72" aria-hidden="true" tabindex="-1"></a>                       <span class="at">error =</span> <span class="fu">vapply</span>(<span class="fu">names</span>(stages), <span class="cf">function</span>(n) errs[[n]] <span class="sc">%||%</span> <span class="cn">NA_character_</span>, <span class="st">""</span>)),</span>
+<span id="cb5-73"><a href="#cb5-73" aria-hidden="true" tabindex="-1"></a>       <span class="at">wall_s =</span> <span class="fu">as.numeric</span>(<span class="fu">Sys.time</span>() <span class="sc">-</span> t0, <span class="at">units =</span> <span class="st">"secs"</span>))</span>
+<span id="cb5-74"><a href="#cb5-74" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb5-75"><a href="#cb5-75" aria-hidden="true" tabindex="-1"></a><span class="st">`</span><span class="at">%||%</span><span class="st">`</span> <span class="ot">&lt;-</span> <span class="cf">function</span>(a, b) <span class="cf">if</span> (<span class="fu">is.null</span>(a)) b <span class="cf">else</span> a</span>
+<span id="cb5-76"><a href="#cb5-76" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-77"><a href="#cb5-77" aria-hidden="true" tabindex="-1"></a>builds <span class="ot">&lt;-</span> purrr<span class="sc">::</span><span class="fu">map</span>(vers, build_one) <span class="sc">|&gt;</span> <span class="fu">setNames</span>(vers)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-stderr">
+<pre><code>duckdb is storing downloaded extensions and secrets under ~/.duckdb:
+ℹ /Users/bbest/.duckdb
+This persists across sessions and is shared with the DuckDB CLI and other clients.
+ℹ Run duckdb(shared_home = FALSE) to use a temporary directory instead.
+ℹ See ?duckdb_storage for details and alternatives.</code></pre>
+</div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb7"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a>knitr<span class="sc">::</span><span class="fu">kable</span>(<span class="fu">bind_rows</span>(purrr<span class="sc">::</span><span class="fu">map</span>(builds, <span class="st">"stages"</span>), <span class="at">.id =</span> <span class="st">"ver"</span>),</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>             <span class="at">caption =</span> <span class="st">"Per-stage timing and errors, per version (this run)"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output-display">
+<table class="caption-top table table-sm table-striped small">
+<caption>Per-stage timing and errors, per version (this run)</caption>
+<thead>
+<tr class="header">
+<th style="text-align: left;">ver</th>
+<th style="text-align: left;">stage</th>
+<th style="text-align: right;">seconds</th>
+<th style="text-align: left;">error</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">taxon.parquet</td>
+<td style="text-align: right;">0.3655679</td>
+<td style="text-align: left;">NA</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">zone_taxon.parquet</td>
+<td style="text-align: right;">1.5035210</td>
+<td style="text-align: left;">NA</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">taxonomy.parquet</td>
+<td style="text-align: right;">0.2232010</td>
+<td style="text-align: left;">NA</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">cell/</td>
+<td style="text-align: right;">4.4562168</td>
+<td style="text-align: left;">NA</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">boot.json</td>
+<td style="text-align: right;">0.7893620</td>
+<td style="text-align: left;">NA</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">taxa.json</td>
+<td style="text-align: right;">3.6360631</td>
+<td style="text-align: left;">NA</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">taxon/*.json</td>
+<td style="text-align: right;">137.3030500</td>
+<td style="text-align: left;">NA</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">alias/*.json</td>
+<td style="text-align: right;">8.1619871</td>
+<td style="text-align: left;">NA</td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+</section>
+<section id="validate" class="level2">
+<h2 class="anchored" data-anchor-id="validate">Validate</h2>
+<p><code>app_bundle_build()</code>’s builders already validate their own output as they write it (<code>app_validate()</code>, <code>R/app_bundle.R</code>); this chunk re-validates the WRITTEN BYTES, round-tripped through disk exactly as an app would fetch them — the same discipline <code>build_version_manifest.qmd</code> applies to <code>manifest.json</code> — and proves the schemas actually reject a broken shape, not just accept a good one.</p>
+<div class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb8"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a>revalidate_written <span class="ot">&lt;-</span> <span class="cf">function</span>(b) {</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">isTRUE</span>(b<span class="sc">$</span>ok)) <span class="fu">return</span>(<span class="fu">tibble</span>())</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>  files <span class="ot">&lt;-</span> <span class="fu">list</span>(</span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>    <span class="at">boot  =</span> <span class="fu">list</span>(<span class="at">path =</span> <span class="fu">file.path</span>(b<span class="sc">$</span>dir_out, <span class="st">"boot.json"</span>),  <span class="at">schema =</span> <span class="st">"boot"</span>),</span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">taxa  =</span> <span class="fu">list</span>(<span class="at">path =</span> <span class="fu">file.path</span>(b<span class="sc">$</span>dir_out, <span class="st">"taxa.json"</span>),  <span class="at">schema =</span> <span class="st">"taxa"</span>))</span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>  rows <span class="ot">&lt;-</span> purrr<span class="sc">::</span><span class="fu">imap</span>(files, <span class="cf">function</span>(f, nm) {</span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="sc">!</span><span class="fu">file.exists</span>(f<span class="sc">$</span>path)) <span class="fu">return</span>(<span class="fu">data.frame</span>(<span class="at">ver =</span> b<span class="sc">$</span>ver, <span class="at">object =</span> nm, <span class="at">ok =</span> <span class="cn">NA</span>, <span class="at">note =</span> <span class="st">"not built"</span>))</span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>    x <span class="ot">&lt;-</span> jsonlite<span class="sc">::</span><span class="fu">fromJSON</span>(f<span class="sc">$</span>path, <span class="at">simplifyVector =</span> <span class="cn">FALSE</span>)</span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>    ok <span class="ot">&lt;-</span> <span class="fu">tryCatch</span>({ msens<span class="sc">::</span><span class="fu">app_validate</span>(x, f<span class="sc">$</span>schema); <span class="cn">TRUE</span> },</span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>                    <span class="at">error =</span> <span class="cf">function</span>(e) { <span class="fu">message</span>(<span class="fu">conditionMessage</span>(e)); <span class="cn">FALSE</span> })</span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>    <span class="fu">data.frame</span>(<span class="at">ver =</span> b<span class="sc">$</span>ver, <span class="at">object =</span> nm, <span class="at">ok =</span> ok, <span class="at">note =</span> <span class="st">""</span>)</span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>  })</span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>  <span class="cf">for</span> (kind <span class="cf">in</span> <span class="fu">c</span>(<span class="st">"taxon"</span>, <span class="st">"alias"</span>)) {</span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>    d <span class="ot">&lt;-</span> <span class="fu">file.path</span>(b<span class="sc">$</span>dir_out, kind)</span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="sc">!</span><span class="fu">dir.exists</span>(d)) <span class="cf">next</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>    fs_ <span class="ot">&lt;-</span> <span class="fu">list.files</span>(d, <span class="at">full.names =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>    bad <span class="ot">&lt;-</span> <span class="dv">0</span>L</span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> (f <span class="cf">in</span> fs_) {</span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a>      x <span class="ot">&lt;-</span> jsonlite<span class="sc">::</span><span class="fu">fromJSON</span>(f, <span class="at">simplifyVector =</span> <span class="cn">FALSE</span>)</span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a>      ok <span class="ot">&lt;-</span> <span class="fu">tryCatch</span>({ msens<span class="sc">::</span><span class="fu">app_validate</span>(x, kind); <span class="cn">TRUE</span> }, <span class="at">error =</span> <span class="cf">function</span>(e) <span class="cn">FALSE</span>)</span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a>      <span class="cf">if</span> (<span class="sc">!</span>ok) bad <span class="ot">&lt;-</span> bad <span class="sc">+</span> <span class="dv">1</span>L</span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a>    }</span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a>    rows[[kind]] <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(<span class="at">ver =</span> b<span class="sc">$</span>ver, <span class="at">object =</span> <span class="fu">sprintf</span>(<span class="st">"%s/*.json (n=%d)"</span>, kind, <span class="fu">length</span>(fs_)),</span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a>                               <span class="at">ok =</span> bad <span class="sc">==</span> <span class="dv">0</span>L, <span class="at">note =</span> <span class="cf">if</span> (bad) <span class="fu">sprintf</span>(<span class="st">"%d shard(s) FAILED"</span>, bad) <span class="cf">else</span> <span class="st">""</span>)</span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a>  }</span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a>  <span class="fu">bind_rows</span>(rows)</span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a>val_tbl <span class="ot">&lt;-</span> <span class="fu">bind_rows</span>(purrr<span class="sc">::</span><span class="fu">map</span>(builds, revalidate_written))</span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a>knitr<span class="sc">::</span><span class="fu">kable</span>(val_tbl, <span class="at">caption =</span> <span class="st">"Schema re-validation of the WRITTEN bytes, per version"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output-display">
+<table class="caption-top table table-sm table-striped small">
+<caption>Schema re-validation of the WRITTEN bytes, per version</caption>
+<thead>
+<tr class="header">
+<th style="text-align: left;">ver</th>
+<th style="text-align: left;">object</th>
+<th style="text-align: left;">ok</th>
+<th style="text-align: left;">note</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">boot</td>
+<td style="text-align: left;">TRUE</td>
+<td style="text-align: left;"></td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">taxa</td>
+<td style="text-align: left;">TRUE</td>
+<td style="text-align: left;"></td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">taxon/*.json (n=256)</td>
+<td style="text-align: left;">TRUE</td>
+<td style="text-align: left;"></td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">alias/*.json (n=256)</td>
+<td style="text-align: left;">TRUE</td>
+<td style="text-align: left;"></td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+<div class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb9"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co"># a deliberately malformed fixture must fail -- proves the two checks above are</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="co"># not vacuously green (msens's own test-app_bundle.R exercises the same five</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="co"># malformations against the builder output; this repeats it against ONE real</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="co"># written boot.json so the notebook, not just the package, is proven to enforce it)</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>good <span class="ot">&lt;-</span> jsonlite<span class="sc">::</span><span class="fu">fromJSON</span>(</span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>  <span class="fu">file.path</span>(builds[[<span class="fu">which</span>(purrr<span class="sc">::</span><span class="fu">map_lgl</span>(builds, <span class="st">"ok"</span>))[<span class="dv">1</span>]]]<span class="sc">$</span>dir_out, <span class="st">"boot.json"</span>),</span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">simplifyVector =</span> <span class="cn">FALSE</span>)</span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>bad_cases <span class="ot">&lt;-</span> <span class="fu">list</span>(</span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>  <span class="st">"required key removed"</span>    <span class="ot">=</span> { x <span class="ot">&lt;-</span> good; x<span class="sc">$</span>grid <span class="ot">&lt;-</span> <span class="cn">NULL</span>; x },</span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>  <span class="st">"wrong type (nc as string)"</span> <span class="ot">=</span> { x <span class="ot">&lt;-</span> good; x<span class="sc">$</span>grid<span class="sc">$</span>nc <span class="ot">&lt;-</span> <span class="st">"7200"</span>; x },</span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>  <span class="st">"undeclared key"</span>          <span class="ot">=</span> { x <span class="ot">&lt;-</span> good; x<span class="sc">$</span>surprise <span class="ot">&lt;-</span> <span class="dv">1</span>; x },</span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>  <span class="st">"out-of-range enum"</span>       <span class="ot">=</span> { x <span class="ot">&lt;-</span> good; x<span class="sc">$</span>release<span class="sc">$</span>access <span class="ot">&lt;-</span> <span class="st">"semi-public"</span>; x })</span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a>mal <span class="ot">&lt;-</span> purrr<span class="sc">::</span><span class="fu">imap</span>(bad_cases, <span class="cf">function</span>(x, nm) {</span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a>  ok <span class="ot">&lt;-</span> <span class="fu">tryCatch</span>({ msens<span class="sc">::</span><span class="fu">app_validate</span>(x, <span class="st">"boot"</span>); <span class="cn">TRUE</span> }, <span class="at">error =</span> <span class="cf">function</span>(e) <span class="cn">FALSE</span>)</span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a>  <span class="fu">data.frame</span>(<span class="at">case =</span> nm, <span class="at">rejected =</span> <span class="sc">!</span>ok)</span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a>}) <span class="sc">|&gt;</span> <span class="fu">bind_rows</span>()</span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a>knitr<span class="sc">::</span><span class="fu">kable</span>(mal, <span class="at">caption =</span> <span class="st">"A deliberately malformed boot.json must be REJECTED (rejected = TRUE)"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output-display">
+<table class="caption-top table table-sm table-striped small">
+<caption>A deliberately malformed boot.json must be REJECTED (rejected = TRUE)</caption>
+<thead>
+<tr class="header">
+<th style="text-align: left;">case</th>
+<th style="text-align: left;">rejected</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;">required key removed</td>
+<td style="text-align: left;">TRUE</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">wrong type (nc as string)</td>
+<td style="text-align: left;">TRUE</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">undeclared key</td>
+<td style="text-align: left;">TRUE</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">out-of-range enum</td>
+<td style="text-align: left;">TRUE</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb10"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="fu">stopifnot</span>(<span class="st">"schema validation let a malformed boot.json through"</span> <span class="ot">=</span> <span class="fu">all</span>(mal<span class="sc">$</span>rejected))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</div>
+<section id="tile-width-gate-real-nc-then-the-wrong-one" class="level3">
+<h3 class="anchored" data-anchor-id="tile-width-gate-real-nc-then-the-wrong-one">Tile-width gate (real nc, then the wrong one)</h3>
+<div class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb11"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a>tile_width_gate <span class="ot">&lt;-</span> <span class="cf">function</span>(b) {</span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">isTRUE</span>(b<span class="sc">$</span>ok) <span class="sc">||</span> <span class="fu">is.null</span>(b<span class="sc">$</span>cell_tiles)) <span class="fu">return</span>(<span class="fu">tibble</span>())</span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>  ncol_real <span class="ot">&lt;-</span> b<span class="sc">$</span>cell_tiles<span class="sc">$</span>ncol</span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>  ncol_wrong <span class="ot">&lt;-</span> <span class="cf">if</span> (ncol_real <span class="sc">==</span> <span class="dv">7200</span>L) <span class="dv">3103</span>L <span class="cf">else</span> <span class="dv">7200</span>L</span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>  ok_real  <span class="ot">&lt;-</span> <span class="fu">tryCatch</span>({ msens<span class="sc">::</span><span class="fu">app_cell_tile_check</span>(<span class="fu">file.path</span>(b<span class="sc">$</span>dir_out, <span class="st">"cell"</span>), ncol_real); <span class="cn">TRUE</span> },</span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>                       <span class="at">error =</span> <span class="cf">function</span>(e) <span class="cn">FALSE</span>)</span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>  bad_wrong <span class="ot">&lt;-</span> <span class="fu">tryCatch</span>({ msens<span class="sc">::</span><span class="fu">app_cell_tile_check</span>(<span class="fu">file.path</span>(b<span class="sc">$</span>dir_out, <span class="st">"cell"</span>), ncol_wrong); <span class="cn">FALSE</span> },</span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a>                        <span class="at">error =</span> <span class="cf">function</span>(e) <span class="cn">TRUE</span>)</span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a>  <span class="fu">data.frame</span>(<span class="at">ver =</span> b<span class="sc">$</span>ver, <span class="at">ncol_real =</span> ncol_real, <span class="at">real_passes =</span> ok_real,</span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a>             <span class="at">ncol_wrong =</span> ncol_wrong, <span class="at">wrong_fails_as_expected =</span> bad_wrong)</span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a>tw_tbl <span class="ot">&lt;-</span> <span class="fu">bind_rows</span>(purrr<span class="sc">::</span><span class="fu">map</span>(builds, tile_width_gate))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-stderr">
+<pre><code>duckdb is storing downloaded extensions and secrets under ~/.duckdb:
+ℹ /Users/bbest/.duckdb
+This persists across sessions and is shared with the DuckDB CLI and other clients.
+ℹ Run duckdb(shared_home = FALSE) to use a temporary directory instead.
+ℹ See ?duckdb_storage for details and alternatives.
+duckdb is storing downloaded extensions and secrets under ~/.duckdb:
+ℹ /Users/bbest/.duckdb
+This persists across sessions and is shared with the DuckDB CLI and other clients.
+ℹ Run duckdb(shared_home = FALSE) to use a temporary directory instead.
+ℹ See ?duckdb_storage for details and alternatives.</code></pre>
+</div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb13"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a>knitr<span class="sc">::</span><span class="fu">kable</span>(tw_tbl, <span class="at">caption =</span> <span class="st">"Tile-width gate: PASS at the release's own nc, FAIL at the wrong one"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output-display">
+<table class="caption-top table table-sm table-striped small">
+<caption>Tile-width gate: PASS at the release’s own nc, FAIL at the wrong one</caption>
+<thead>
+<tr class="header">
+<th style="text-align: left;">ver</th>
+<th style="text-align: right;">ncol_real</th>
+<th style="text-align: left;">real_passes</th>
+<th style="text-align: right;">ncol_wrong</th>
+<th style="text-align: left;">wrong_fails_as_expected</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;">v9</td>
+<td style="text-align: right;">7200</td>
+<td style="text-align: left;">TRUE</td>
+<td style="text-align: right;">3103</td>
+<td style="text-align: left;">TRUE</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb14"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="fu">stopifnot</span>(</span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a>  <span class="st">"tile-width gate did not pass at the real nc"</span>    <span class="ot">=</span> <span class="fu">all</span>(tw_tbl<span class="sc">$</span>real_passes),</span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a>  <span class="st">"tile-width gate did not fail at the wrong nc"</span>   <span class="ot">=</span> <span class="fu">all</span>(tw_tbl<span class="sc">$</span>wrong_fails_as_expected))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</div>
+</section>
+<section id="wide-tile-digest-gate-per-metric-multiset-digest-vs-cell_metric" class="level3">
+<h3 class="anchored" data-anchor-id="wide-tile-digest-gate-per-metric-multiset-digest-vs-cell_metric">Wide-tile digest gate (per-metric multiset digest vs <code>cell_metric</code>)</h3>
+<div class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb15"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a>digest_gate <span class="ot">&lt;-</span> <span class="cf">function</span>(b, ver) {</span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">isTRUE</span>(b<span class="sc">$</span>ok) <span class="sc">||</span> <span class="fu">is.null</span>(b<span class="sc">$</span>cell_tiles)) <span class="fu">return</span>(<span class="fu">tibble</span>())</span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a>  con <span class="ot">&lt;-</span> <span class="fu">app_bundle_open_scoring</span>(ver)</span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a>  <span class="fu">on.exit</span>(DBI<span class="sc">::</span><span class="fu">dbDisconnect</span>(con, <span class="at">shutdown =</span> <span class="cn">TRUE</span>), <span class="at">add =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a>  <span class="fu">duckdb_tune</span>(con, <span class="fu">file.path</span>(<span class="fu">tempdir</span>(), <span class="st">"app_bundle_spill_digest"</span>, ver))</span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a>  dg <span class="ot">&lt;-</span> msens<span class="sc">::</span><span class="fu">app_cell_tile_digests</span>(con, <span class="fu">file.path</span>(b<span class="sc">$</span>dir_out, <span class="st">"cell"</span>))</span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a>  dg<span class="sc">$</span>ver <span class="ot">&lt;-</span> ver</span>
+<span id="cb15-8"><a href="#cb15-8" aria-hidden="true" tabindex="-1"></a>  dg</span>
+<span id="cb15-9"><a href="#cb15-9" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb15-10"><a href="#cb15-10" aria-hidden="true" tabindex="-1"></a>dg_tbl <span class="ot">&lt;-</span> purrr<span class="sc">::</span><span class="fu">imap</span>(builds, digest_gate) <span class="sc">|&gt;</span> <span class="fu">bind_rows</span>()</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-stderr">
+<pre><code>duckdb is storing downloaded extensions and secrets under ~/.duckdb:
+ℹ /Users/bbest/.duckdb
+This persists across sessions and is shared with the DuckDB CLI and other clients.
+ℹ Run duckdb(shared_home = FALSE) to use a temporary directory instead.
+ℹ See ?duckdb_storage for details and alternatives.</code></pre>
+</div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb17"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a>knitr<span class="sc">::</span><span class="fu">kable</span>(dg_tbl <span class="sc">|&gt;</span> <span class="fu">select</span>(ver, metric_key, ok), <span class="at">caption =</span> <span class="st">"cell/*.parquet digest == cell_metric digest, per metric"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output-display">
+<table class="caption-top table table-sm table-striped small">
+<caption>cell/*.parquet digest == cell_metric digest, per metric</caption>
+<thead>
+<tr class="header">
+<th style="text-align: left;">ver</th>
+<th style="text-align: left;">metric_key</th>
+<th style="text-align: left;">ok</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">extrisk_bird</td>
+<td style="text-align: left;">TRUE</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">extrisk_coral</td>
+<td style="text-align: left;">TRUE</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">extrisk_fish</td>
+<td style="text-align: left;">TRUE</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">extrisk_invertebrate</td>
+<td style="text-align: left;">TRUE</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">extrisk_mammal</td>
+<td style="text-align: left;">TRUE</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">extrisk_primary_producer</td>
+<td style="text-align: left;">TRUE</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">extrisk_turtle</td>
+<td style="text-align: left;">TRUE</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">extrisk_bird_ecoregion_rescaled</td>
+<td style="text-align: left;">TRUE</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">extrisk_coral_ecoregion_rescaled</td>
+<td style="text-align: left;">TRUE</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">extrisk_fish_ecoregion_rescaled</td>
+<td style="text-align: left;">TRUE</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">extrisk_invertebrate_ecoregion_rescaled</td>
+<td style="text-align: left;">TRUE</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">extrisk_mammal_ecoregion_rescaled</td>
+<td style="text-align: left;">TRUE</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">extrisk_primary_producer_ecoregion_rescaled</td>
+<td style="text-align: left;">TRUE</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">extrisk_turtle_ecoregion_rescaled</td>
+<td style="text-align: left;">TRUE</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">primprod</td>
+<td style="text-align: left;">TRUE</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">primprod_ecoregion_rescaled</td>
+<td style="text-align: left;">TRUE</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">score_extriskspcat_primprod_ecoregionrescaled_equalweights</td>
+<td style="text-align: left;">TRUE</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb18"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="fu">stopifnot</span>(<span class="st">"a wide-tile digest disagreed with cell_metric"</span> <span class="ot">=</span> <span class="fu">nrow</span>(dg_tbl) <span class="sc">==</span> <span class="dv">0</span> <span class="sc">||</span> <span class="fu">all</span>(dg_tbl<span class="sc">$</span>ok))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</div>
+</section>
+<section id="boot.json-zone-metrics-zone_metric-joined-on-zone_type-and-metric_key" class="level3">
+<h3 class="anchored" data-anchor-id="boot.json-zone-metrics-zone_metric-joined-on-zone_type-and-metric_key"><code>boot.json</code> zone metrics == <code>zone_metric</code> (joined on <code>zone_type</code> AND <code>metric_key</code>)</h3>
+<div class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb19"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a>zone_metric_gate <span class="ot">&lt;-</span> <span class="cf">function</span>(b, ver) {</span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">isTRUE</span>(b<span class="sc">$</span>ok) <span class="sc">||</span> <span class="fu">is.null</span>(b<span class="sc">$</span>boot)) <span class="fu">return</span>(<span class="fu">tibble</span>())</span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a>  con <span class="ot">&lt;-</span> <span class="fu">app_bundle_open_scoring</span>(ver)</span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a>  <span class="fu">on.exit</span>(DBI<span class="sc">::</span><span class="fu">dbDisconnect</span>(con, <span class="at">shutdown =</span> <span class="cn">TRUE</span>), <span class="at">add =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb19-5"><a href="#cb19-5" aria-hidden="true" tabindex="-1"></a>  <span class="fu">duckdb_tune</span>(con, <span class="fu">file.path</span>(<span class="fu">tempdir</span>(), <span class="st">"app_bundle_spill_zm"</span>, ver))</span>
+<span id="cb19-6"><a href="#cb19-6" aria-hidden="true" tabindex="-1"></a>  vm <span class="ot">&lt;-</span> msens<span class="sc">::</span><span class="fu">sdm_val_col</span>(con, <span class="st">"zone_metric"</span>); vz <span class="ot">&lt;-</span> msens<span class="sc">::</span><span class="fu">sdm_val_col</span>(con, <span class="st">"zone"</span>)</span>
+<span id="cb19-7"><a href="#cb19-7" aria-hidden="true" tabindex="-1"></a>  pub <span class="ot">&lt;-</span> DBI<span class="sc">::</span><span class="fu">dbGetQuery</span>(con, glue<span class="sc">::</span><span class="fu">glue</span>(<span class="st">"</span></span>
+<span id="cb19-8"><a href="#cb19-8" aria-hidden="true" tabindex="-1"></a><span class="st">    SELECT z.fld, z.{vz} AS zkey, m.metric_key, zm.{vm} AS val</span></span>
+<span id="cb19-9"><a href="#cb19-9" aria-hidden="true" tabindex="-1"></a><span class="st">      FROM zone z JOIN zone_metric zm USING (zone_seq) JOIN metric m USING (metric_seq)"</span>))</span>
+<span id="cb19-10"><a href="#cb19-10" aria-hidden="true" tabindex="-1"></a>  pub<span class="sc">$</span>zone_type <span class="ot">&lt;-</span> <span class="fu">sub</span>(<span class="st">"_key$"</span>, <span class="st">""</span>, pub<span class="sc">$</span>fld)</span>
+<span id="cb19-11"><a href="#cb19-11" aria-hidden="true" tabindex="-1"></a>  boot_rows <span class="ot">&lt;-</span> <span class="fu">do.call</span>(rbind, <span class="fu">lapply</span>(<span class="fu">names</span>(b<span class="sc">$</span>boot<span class="sc">$</span>zones), <span class="cf">function</span>(ztype) {</span>
+<span id="cb19-12"><a href="#cb19-12" aria-hidden="true" tabindex="-1"></a>    zl <span class="ot">&lt;-</span> b<span class="sc">$</span>boot<span class="sc">$</span>zones[[ztype]]</span>
+<span id="cb19-13"><a href="#cb19-13" aria-hidden="true" tabindex="-1"></a>    <span class="fu">do.call</span>(rbind, <span class="fu">lapply</span>(zl, <span class="cf">function</span>(zr) {</span>
+<span id="cb19-14"><a href="#cb19-14" aria-hidden="true" tabindex="-1"></a>      <span class="cf">if</span> (<span class="sc">!</span><span class="fu">length</span>(zr<span class="sc">$</span>metrics)) <span class="fu">return</span>(<span class="cn">NULL</span>)</span>
+<span id="cb19-15"><a href="#cb19-15" aria-hidden="true" tabindex="-1"></a>      <span class="fu">data.frame</span>(<span class="at">zone_type =</span> ztype, <span class="at">zkey =</span> zr<span class="sc">$</span>key, <span class="at">metric_key =</span> <span class="fu">names</span>(zr<span class="sc">$</span>metrics),</span>
+<span id="cb19-16"><a href="#cb19-16" aria-hidden="true" tabindex="-1"></a>                <span class="at">val =</span> <span class="fu">as.numeric</span>(<span class="fu">unlist</span>(zr<span class="sc">$</span>metrics)), <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span>)</span>
+<span id="cb19-17"><a href="#cb19-17" aria-hidden="true" tabindex="-1"></a>    }))</span>
+<span id="cb19-18"><a href="#cb19-18" aria-hidden="true" tabindex="-1"></a>  }))</span>
+<span id="cb19-19"><a href="#cb19-19" aria-hidden="true" tabindex="-1"></a>  j <span class="ot">&lt;-</span> <span class="fu">merge</span>(pub, boot_rows, <span class="at">by =</span> <span class="fu">c</span>(<span class="st">"zone_type"</span>, <span class="st">"zkey"</span>, <span class="st">"metric_key"</span>), <span class="at">suffixes =</span> <span class="fu">c</span>(<span class="st">"_pub"</span>, <span class="st">"_boot"</span>))</span>
+<span id="cb19-20"><a href="#cb19-20" aria-hidden="true" tabindex="-1"></a>  <span class="fu">data.frame</span>(<span class="at">ver =</span> ver, <span class="at">n_pub =</span> <span class="fu">nrow</span>(pub), <span class="at">n_boot =</span> <span class="fu">nrow</span>(boot_rows), <span class="at">n_joined =</span> <span class="fu">nrow</span>(j),</span>
+<span id="cb19-21"><a href="#cb19-21" aria-hidden="true" tabindex="-1"></a>             <span class="at">max_abs_delta =</span> <span class="cf">if</span> (<span class="fu">nrow</span>(j)) <span class="fu">max</span>(<span class="fu">abs</span>(j<span class="sc">$</span>val_pub <span class="sc">-</span> j<span class="sc">$</span>val_boot)) <span class="cf">else</span> <span class="cn">NA_real_</span>)</span>
+<span id="cb19-22"><a href="#cb19-22" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb19-23"><a href="#cb19-23" aria-hidden="true" tabindex="-1"></a>zm_tbl <span class="ot">&lt;-</span> purrr<span class="sc">::</span><span class="fu">imap</span>(builds, zone_metric_gate) <span class="sc">|&gt;</span> <span class="fu">bind_rows</span>()</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-stderr">
+<pre><code>duckdb is storing downloaded extensions and secrets under ~/.duckdb:
+ℹ /Users/bbest/.duckdb
+This persists across sessions and is shared with the DuckDB CLI and other clients.
+ℹ Run duckdb(shared_home = FALSE) to use a temporary directory instead.
+ℹ See ?duckdb_storage for details and alternatives.</code></pre>
+</div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb21"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a>knitr<span class="sc">::</span><span class="fu">kable</span>(zm_tbl, <span class="at">caption =</span> <span class="st">"boot.json zone metrics vs published zone_metric (join on zone_type + zkey + metric_key)"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output-display">
+<table class="caption-top table table-sm table-striped small">
+<caption>boot.json zone metrics vs published zone_metric (join on zone_type + zkey + metric_key)</caption>
+<thead>
+<tr class="header">
+<th style="text-align: left;">ver</th>
+<th style="text-align: right;">n_pub</th>
+<th style="text-align: right;">n_boot</th>
+<th style="text-align: right;">n_joined</th>
+<th style="text-align: right;">max_abs_delta</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;">v9</td>
+<td style="text-align: right;">795</td>
+<td style="text-align: right;">795</td>
+<td style="text-align: right;">795</td>
+<td style="text-align: right;">0</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb22"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="fu">stopifnot</span>(<span class="st">"boot.json zone metrics disagree with zone_metric"</span> <span class="ot">=</span></span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a>  <span class="fu">nrow</span>(zm_tbl) <span class="sc">==</span> <span class="dv">0</span> <span class="sc">||</span> <span class="fu">all</span>(zm_tbl<span class="sc">$</span>n_pub <span class="sc">==</span> zm_tbl<span class="sc">$</span>n_boot <span class="sc">&amp;</span> zm_tbl<span class="sc">$</span>max_abs_delta <span class="sc">&lt;</span> <span class="fl">1e-6</span>, <span class="at">na.rm =</span> <span class="cn">TRUE</span>))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</div>
+</section>
+<section id="layer-list-manifests-drawable-cell-level-metrics-shard-keys-taxa.json-every-alias-resolves" class="level3">
+<h3 class="anchored" data-anchor-id="layer-list-manifests-drawable-cell-level-metrics-shard-keys-taxa.json-every-alias-resolves">Layer list == manifest’s drawable (cell-level) metrics; shard keys == <code>taxa.json</code>; every alias resolves</h3>
+<div class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb23"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb23-1"><a href="#cb23-1" aria-hidden="true" tabindex="-1"></a>set_gates <span class="ot">&lt;-</span> <span class="cf">function</span>(b, ver) {</span>
+<span id="cb23-2"><a href="#cb23-2" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">isTRUE</span>(b<span class="sc">$</span>ok)) <span class="fu">return</span>(<span class="fu">tibble</span>())</span>
+<span id="cb23-3"><a href="#cb23-3" aria-hidden="true" tabindex="-1"></a>  con <span class="ot">&lt;-</span> <span class="fu">app_bundle_open_scoring</span>(ver)</span>
+<span id="cb23-4"><a href="#cb23-4" aria-hidden="true" tabindex="-1"></a>  <span class="fu">on.exit</span>(DBI<span class="sc">::</span><span class="fu">dbDisconnect</span>(con, <span class="at">shutdown =</span> <span class="cn">TRUE</span>), <span class="at">add =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb23-5"><a href="#cb23-5" aria-hidden="true" tabindex="-1"></a>  cell_keys  <span class="ot">&lt;-</span> <span class="fu">sort</span>(<span class="fu">unique</span>(msens<span class="sc">:::</span><span class="fu">.app_cell_metric_keys</span>(con)))</span>
+<span id="cb23-6"><a href="#cb23-6" aria-hidden="true" tabindex="-1"></a>  layer_keys <span class="ot">&lt;-</span> <span class="cf">if</span> (<span class="sc">!</span><span class="fu">is.null</span>(b<span class="sc">$</span>boot)) <span class="fu">sort</span>(<span class="fu">vapply</span>(b<span class="sc">$</span>boot<span class="sc">$</span>layers, <span class="cf">function</span>(l) l<span class="sc">$</span>metric_key, <span class="st">""</span>)) <span class="cf">else</span> <span class="fu">character</span>()</span>
+<span id="cb23-7"><a href="#cb23-7" aria-hidden="true" tabindex="-1"></a>  layers_ok  <span class="ot">&lt;-</span> <span class="fu">identical</span>(cell_keys, layer_keys)</span>
+<span id="cb23-8"><a href="#cb23-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-9"><a href="#cb23-9" aria-hidden="true" tabindex="-1"></a>  shards_ok <span class="ot">&lt;-</span> <span class="cn">NA</span>; alias_ok <span class="ot">&lt;-</span> <span class="cn">NA</span>; n_shard_keys <span class="ot">&lt;-</span> <span class="cn">NA_integer_</span>; n_taxa_keys <span class="ot">&lt;-</span> <span class="cn">NA_integer_</span>; n_alias_bad <span class="ot">&lt;-</span> <span class="cn">NA_integer_</span></span>
+<span id="cb23-10"><a href="#cb23-10" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">is.null</span>(b<span class="sc">$</span>taxon_shards) <span class="sc">&amp;&amp;</span> <span class="sc">!</span><span class="fu">is.null</span>(b<span class="sc">$</span>taxa)) {</span>
+<span id="cb23-11"><a href="#cb23-11" aria-hidden="true" tabindex="-1"></a>    shard_keys <span class="ot">&lt;-</span> <span class="fu">sort</span>(<span class="fu">unname</span>(<span class="fu">unlist</span>(<span class="fu">lapply</span>(b<span class="sc">$</span>taxon_shards, <span class="cf">function</span>(s) <span class="fu">names</span>(s<span class="sc">$</span>taxa)))))</span>
+<span id="cb23-12"><a href="#cb23-12" aria-hidden="true" tabindex="-1"></a>    taxa_keys  <span class="ot">&lt;-</span> <span class="fu">sort</span>(<span class="fu">unname</span>(<span class="fu">unlist</span>(b<span class="sc">$</span>taxa<span class="sc">$</span>key)))</span>
+<span id="cb23-13"><a href="#cb23-13" aria-hidden="true" tabindex="-1"></a>    shards_ok  <span class="ot">&lt;-</span> <span class="fu">setequal</span>(shard_keys, taxa_keys)</span>
+<span id="cb23-14"><a href="#cb23-14" aria-hidden="true" tabindex="-1"></a>    n_shard_keys <span class="ot">&lt;-</span> <span class="fu">length</span>(shard_keys); n_taxa_keys <span class="ot">&lt;-</span> <span class="fu">length</span>(taxa_keys)</span>
+<span id="cb23-15"><a href="#cb23-15" aria-hidden="true" tabindex="-1"></a>  }</span>
+<span id="cb23-16"><a href="#cb23-16" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">is.null</span>(b<span class="sc">$</span>alias_shards) <span class="sc">&amp;&amp;</span> <span class="sc">!</span><span class="fu">is.null</span>(b<span class="sc">$</span>taxa)) {</span>
+<span id="cb23-17"><a href="#cb23-17" aria-hidden="true" tabindex="-1"></a>    taxa_keys <span class="ot">&lt;-</span> <span class="fu">unique</span>(<span class="fu">unname</span>(<span class="fu">unlist</span>(b<span class="sc">$</span>taxa<span class="sc">$</span>key)))</span>
+<span id="cb23-18"><a href="#cb23-18" aria-hidden="true" tabindex="-1"></a>    targets   <span class="ot">&lt;-</span> <span class="fu">unname</span>(<span class="fu">unlist</span>(<span class="fu">lapply</span>(b<span class="sc">$</span>alias_shards, <span class="cf">function</span>(s) <span class="fu">vapply</span>(s<span class="sc">$</span>alias, <span class="cf">function</span>(x) x[[<span class="dv">1</span>]], <span class="st">""</span>))))</span>
+<span id="cb23-19"><a href="#cb23-19" aria-hidden="true" tabindex="-1"></a>    bad       <span class="ot">&lt;-</span> <span class="fu">setdiff</span>(<span class="fu">unique</span>(targets), taxa_keys)</span>
+<span id="cb23-20"><a href="#cb23-20" aria-hidden="true" tabindex="-1"></a>    alias_ok  <span class="ot">&lt;-</span> <span class="fu">length</span>(bad) <span class="sc">==</span> <span class="dv">0</span></span>
+<span id="cb23-21"><a href="#cb23-21" aria-hidden="true" tabindex="-1"></a>    n_alias_bad <span class="ot">&lt;-</span> <span class="fu">length</span>(bad)</span>
+<span id="cb23-22"><a href="#cb23-22" aria-hidden="true" tabindex="-1"></a>  }</span>
+<span id="cb23-23"><a href="#cb23-23" aria-hidden="true" tabindex="-1"></a>  <span class="fu">data.frame</span>(<span class="at">ver =</span> ver, <span class="at">layers_eq_cell_metrics =</span> layers_ok,</span>
+<span id="cb23-24"><a href="#cb23-24" aria-hidden="true" tabindex="-1"></a>             <span class="at">n_cell_keys =</span> <span class="fu">length</span>(cell_keys), <span class="at">n_layer_keys =</span> <span class="fu">length</span>(layer_keys),</span>
+<span id="cb23-25"><a href="#cb23-25" aria-hidden="true" tabindex="-1"></a>             <span class="at">shard_keys_eq_taxa =</span> shards_ok, <span class="at">n_shard_keys =</span> n_shard_keys, <span class="at">n_taxa_keys =</span> n_taxa_keys,</span>
+<span id="cb23-26"><a href="#cb23-26" aria-hidden="true" tabindex="-1"></a>             <span class="at">every_alias_resolves =</span> alias_ok, <span class="at">n_alias_unresolved =</span> n_alias_bad)</span>
+<span id="cb23-27"><a href="#cb23-27" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb23-28"><a href="#cb23-28" aria-hidden="true" tabindex="-1"></a>sets_tbl <span class="ot">&lt;-</span> purrr<span class="sc">::</span><span class="fu">imap</span>(builds, set_gates) <span class="sc">|&gt;</span> <span class="fu">bind_rows</span>()</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-stderr">
+<pre><code>duckdb is storing downloaded extensions and secrets under ~/.duckdb:
+ℹ /Users/bbest/.duckdb
+This persists across sessions and is shared with the DuckDB CLI and other clients.
+ℹ Run duckdb(shared_home = FALSE) to use a temporary directory instead.
+ℹ See ?duckdb_storage for details and alternatives.</code></pre>
+</div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb25"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb25-1"><a href="#cb25-1" aria-hidden="true" tabindex="-1"></a>knitr<span class="sc">::</span><span class="fu">kable</span>(sets_tbl, <span class="at">caption =</span> <span class="st">"Set-equality gates: layers, taxon shard keys, alias targets"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output-display">
+<table class="caption-top table table-sm table-striped small">
+<caption>Set-equality gates: layers, taxon shard keys, alias targets</caption>
+<colgroup>
+<col style="width: 2%">
+<col style="width: 16%">
+<col style="width: 8%">
+<col style="width: 9%">
+<col style="width: 13%">
+<col style="width: 9%">
+<col style="width: 8%">
+<col style="width: 15%">
+<col style="width: 13%">
+</colgroup>
+<thead>
+<tr class="header">
+<th style="text-align: left;">ver</th>
+<th style="text-align: left;">layers_eq_cell_metrics</th>
+<th style="text-align: right;">n_cell_keys</th>
+<th style="text-align: right;">n_layer_keys</th>
+<th style="text-align: left;">shard_keys_eq_taxa</th>
+<th style="text-align: right;">n_shard_keys</th>
+<th style="text-align: right;">n_taxa_keys</th>
+<th style="text-align: left;">every_alias_resolves</th>
+<th style="text-align: right;">n_alias_unresolved</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">TRUE</td>
+<td style="text-align: right;">17</td>
+<td style="text-align: right;">17</td>
+<td style="text-align: left;">TRUE</td>
+<td style="text-align: right;">21600</td>
+<td style="text-align: right;">21600</td>
+<td style="text-align: left;">TRUE</td>
+<td style="text-align: right;">0</td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+</section>
+</section>
+<section id="budgets-bytes-raw-gzip-vs-the-subplans-per-object-budgets" class="level2">
+<h2 class="anchored" data-anchor-id="budgets-bytes-raw-gzip-vs-the-subplans-per-object-budgets">Budgets (bytes raw + gzip vs the subplan’s per-object budgets)</h2>
+<div class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb26"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb26-1"><a href="#cb26-1" aria-hidden="true" tabindex="-1"></a>gz_size <span class="ot">&lt;-</span> <span class="cf">function</span>(path) {</span>
+<span id="cb26-2"><a href="#cb26-2" aria-hidden="true" tabindex="-1"></a>  tmp <span class="ot">&lt;-</span> <span class="fu">tempfile</span>(<span class="at">fileext =</span> <span class="st">".gz"</span>)</span>
+<span id="cb26-3"><a href="#cb26-3" aria-hidden="true" tabindex="-1"></a>  con_ <span class="ot">&lt;-</span> <span class="fu">gzfile</span>(tmp, <span class="st">"wb"</span>, <span class="at">compression =</span> <span class="dv">9</span>L)</span>
+<span id="cb26-4"><a href="#cb26-4" aria-hidden="true" tabindex="-1"></a>  <span class="fu">writeLines</span>(<span class="fu">readLines</span>(path, <span class="at">warn =</span> <span class="cn">FALSE</span>), con_); <span class="fu">close</span>(con_)</span>
+<span id="cb26-5"><a href="#cb26-5" aria-hidden="true" tabindex="-1"></a>  sz <span class="ot">&lt;-</span> <span class="fu">file.size</span>(tmp); <span class="fu">unlink</span>(tmp); sz</span>
+<span id="cb26-6"><a href="#cb26-6" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb26-7"><a href="#cb26-7" aria-hidden="true" tabindex="-1"></a>json_budget_row <span class="ot">&lt;-</span> <span class="cf">function</span>(dir_out, rel, budget_kb, <span class="at">label =</span> rel) {</span>
+<span id="cb26-8"><a href="#cb26-8" aria-hidden="true" tabindex="-1"></a>  p <span class="ot">&lt;-</span> <span class="fu">file.path</span>(dir_out, rel)</span>
+<span id="cb26-9"><a href="#cb26-9" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">file.exists</span>(p)) <span class="fu">return</span>(<span class="cn">NULL</span>)</span>
+<span id="cb26-10"><a href="#cb26-10" aria-hidden="true" tabindex="-1"></a>  raw <span class="ot">&lt;-</span> <span class="fu">file.size</span>(p); gz <span class="ot">&lt;-</span> <span class="fu">gz_size</span>(p)</span>
+<span id="cb26-11"><a href="#cb26-11" aria-hidden="true" tabindex="-1"></a>  <span class="fu">data.frame</span>(<span class="at">object =</span> label, <span class="at">n =</span> <span class="dv">1</span>L, <span class="at">raw_bytes =</span> raw, <span class="at">gzip_bytes =</span> gz,</span>
+<span id="cb26-12"><a href="#cb26-12" aria-hidden="true" tabindex="-1"></a>             <span class="at">budget_gzip_bytes =</span> budget_kb <span class="sc">*</span> <span class="dv">1024</span>, <span class="at">over_budget =</span> gz <span class="sc">&gt;</span> budget_kb <span class="sc">*</span> <span class="dv">1024</span>)</span>
+<span id="cb26-13"><a href="#cb26-13" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb26-14"><a href="#cb26-14" aria-hidden="true" tabindex="-1"></a>shard_budget_rows <span class="ot">&lt;-</span> <span class="cf">function</span>(dir_out, kind, budget_kb) {</span>
+<span id="cb26-15"><a href="#cb26-15" aria-hidden="true" tabindex="-1"></a>  d <span class="ot">&lt;-</span> <span class="fu">file.path</span>(dir_out, kind)</span>
+<span id="cb26-16"><a href="#cb26-16" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">dir.exists</span>(d)) <span class="fu">return</span>(<span class="cn">NULL</span>)</span>
+<span id="cb26-17"><a href="#cb26-17" aria-hidden="true" tabindex="-1"></a>  fs_ <span class="ot">&lt;-</span> <span class="fu">list.files</span>(d, <span class="at">full.names =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb26-18"><a href="#cb26-18" aria-hidden="true" tabindex="-1"></a>  gzs <span class="ot">&lt;-</span> <span class="fu">vapply</span>(fs_, gz_size, <span class="fu">numeric</span>(<span class="dv">1</span>))</span>
+<span id="cb26-19"><a href="#cb26-19" aria-hidden="true" tabindex="-1"></a>  <span class="fu">data.frame</span>(<span class="at">object =</span> <span class="fu">sprintf</span>(<span class="st">"%s/*.json"</span>, kind), <span class="at">n =</span> <span class="fu">length</span>(fs_),</span>
+<span id="cb26-20"><a href="#cb26-20" aria-hidden="true" tabindex="-1"></a>             <span class="at">raw_bytes =</span> <span class="fu">as.integer</span>(<span class="fu">round</span>(<span class="fu">median</span>(<span class="fu">file.size</span>(fs_)))),</span>
+<span id="cb26-21"><a href="#cb26-21" aria-hidden="true" tabindex="-1"></a>             <span class="at">gzip_bytes =</span> <span class="fu">as.integer</span>(<span class="fu">round</span>(<span class="fu">median</span>(gzs))),</span>
+<span id="cb26-22"><a href="#cb26-22" aria-hidden="true" tabindex="-1"></a>             <span class="at">budget_gzip_bytes =</span> budget_kb <span class="sc">*</span> <span class="dv">1024</span>, <span class="at">over_budget =</span> <span class="fu">sum</span>(gzs <span class="sc">&gt;</span> budget_kb <span class="sc">*</span> <span class="dv">1024</span>),</span>
+<span id="cb26-23"><a href="#cb26-23" aria-hidden="true" tabindex="-1"></a>             <span class="at">gzip_p90 =</span> <span class="fu">as.integer</span>(<span class="fu">round</span>(<span class="fu">quantile</span>(gzs, <span class="fl">0.9</span>))), <span class="at">gzip_max =</span> <span class="fu">as.integer</span>(<span class="fu">max</span>(gzs)))</span>
+<span id="cb26-24"><a href="#cb26-24" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb26-25"><a href="#cb26-25" aria-hidden="true" tabindex="-1"></a>parquet_budget_row <span class="ot">&lt;-</span> <span class="cf">function</span>(dir_out, rel, budget_mb, <span class="at">label =</span> rel) {</span>
+<span id="cb26-26"><a href="#cb26-26" aria-hidden="true" tabindex="-1"></a>  p <span class="ot">&lt;-</span> <span class="fu">file.path</span>(dir_out, rel)</span>
+<span id="cb26-27"><a href="#cb26-27" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">file.exists</span>(p)) <span class="fu">return</span>(<span class="cn">NULL</span>)</span>
+<span id="cb26-28"><a href="#cb26-28" aria-hidden="true" tabindex="-1"></a>  sz <span class="ot">&lt;-</span> <span class="fu">file.size</span>(p)</span>
+<span id="cb26-29"><a href="#cb26-29" aria-hidden="true" tabindex="-1"></a>  <span class="fu">data.frame</span>(<span class="at">object =</span> label, <span class="at">n =</span> <span class="dv">1</span>L, <span class="at">raw_bytes =</span> sz, <span class="at">gzip_bytes =</span> <span class="cn">NA_integer_</span>,</span>
+<span id="cb26-30"><a href="#cb26-30" aria-hidden="true" tabindex="-1"></a>             <span class="at">budget_gzip_bytes =</span> budget_mb <span class="sc">*</span> <span class="fl">1e6</span>, <span class="at">over_budget =</span> sz <span class="sc">&gt;</span> budget_mb <span class="sc">*</span> <span class="fl">1e6</span>)</span>
+<span id="cb26-31"><a href="#cb26-31" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb26-32"><a href="#cb26-32" aria-hidden="true" tabindex="-1"></a>cell_tile_budget_row <span class="ot">&lt;-</span> <span class="cf">function</span>(dir_out, budget_kb_lo, budget_kb_hi) {</span>
+<span id="cb26-33"><a href="#cb26-33" aria-hidden="true" tabindex="-1"></a>  d <span class="ot">&lt;-</span> <span class="fu">file.path</span>(dir_out, <span class="st">"cell"</span>)</span>
+<span id="cb26-34"><a href="#cb26-34" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">dir.exists</span>(d)) <span class="fu">return</span>(<span class="cn">NULL</span>)</span>
+<span id="cb26-35"><a href="#cb26-35" aria-hidden="true" tabindex="-1"></a>  fs_ <span class="ot">&lt;-</span> <span class="fu">list.files</span>(d, <span class="at">pattern =</span> <span class="st">"</span><span class="sc">\\</span><span class="st">.parquet$"</span>, <span class="at">recursive =</span> <span class="cn">TRUE</span>, <span class="at">full.names =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb26-36"><a href="#cb26-36" aria-hidden="true" tabindex="-1"></a>  szs <span class="ot">&lt;-</span> <span class="fu">file.size</span>(fs_)</span>
+<span id="cb26-37"><a href="#cb26-37" aria-hidden="true" tabindex="-1"></a>  <span class="fu">data.frame</span>(<span class="at">object =</span> <span class="st">"cell/tile=*/data_0.parquet"</span>, <span class="at">n =</span> <span class="fu">length</span>(fs_),</span>
+<span id="cb26-38"><a href="#cb26-38" aria-hidden="true" tabindex="-1"></a>             <span class="at">raw_bytes =</span> <span class="fu">as.integer</span>(<span class="fu">round</span>(<span class="fu">median</span>(szs))), <span class="at">gzip_bytes =</span> <span class="cn">NA_integer_</span>,</span>
+<span id="cb26-39"><a href="#cb26-39" aria-hidden="true" tabindex="-1"></a>             <span class="at">budget_gzip_bytes =</span> budget_kb_hi <span class="sc">*</span> <span class="dv">1024</span>, <span class="at">over_budget =</span> <span class="fu">sum</span>(szs <span class="sc">&gt;</span> budget_kb_hi <span class="sc">*</span> <span class="dv">1024</span>),</span>
+<span id="cb26-40"><a href="#cb26-40" aria-hidden="true" tabindex="-1"></a>             <span class="at">gzip_p90 =</span> <span class="fu">as.integer</span>(<span class="fu">round</span>(<span class="fu">quantile</span>(szs, <span class="fl">0.9</span>))), <span class="at">gzip_max =</span> <span class="fu">as.integer</span>(<span class="fu">max</span>(szs)))</span>
+<span id="cb26-41"><a href="#cb26-41" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb26-42"><a href="#cb26-42" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb26-43"><a href="#cb26-43" aria-hidden="true" tabindex="-1"></a>budgets_one <span class="ot">&lt;-</span> <span class="cf">function</span>(b) {</span>
+<span id="cb26-44"><a href="#cb26-44" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">isTRUE</span>(b<span class="sc">$</span>ok)) <span class="fu">return</span>(<span class="fu">tibble</span>())</span>
+<span id="cb26-45"><a href="#cb26-45" aria-hidden="true" tabindex="-1"></a>  d <span class="ot">&lt;-</span> b<span class="sc">$</span>dir_out</span>
+<span id="cb26-46"><a href="#cb26-46" aria-hidden="true" tabindex="-1"></a>  rows <span class="ot">&lt;-</span> <span class="fu">list</span>(</span>
+<span id="cb26-47"><a href="#cb26-47" aria-hidden="true" tabindex="-1"></a>    <span class="fu">json_budget_row</span>(d, <span class="st">"boot.json"</span>, <span class="dv">60</span>),</span>
+<span id="cb26-48"><a href="#cb26-48" aria-hidden="true" tabindex="-1"></a>    <span class="fu">json_budget_row</span>(d, <span class="st">"taxa.json"</span>, <span class="dv">1024</span>),</span>
+<span id="cb26-49"><a href="#cb26-49" aria-hidden="true" tabindex="-1"></a>    <span class="fu">shard_budget_rows</span>(d, <span class="st">"taxon"</span>, <span class="dv">25</span>),</span>
+<span id="cb26-50"><a href="#cb26-50" aria-hidden="true" tabindex="-1"></a>    <span class="fu">shard_budget_rows</span>(d, <span class="st">"alias"</span>, <span class="dv">15</span>),</span>
+<span id="cb26-51"><a href="#cb26-51" aria-hidden="true" tabindex="-1"></a>    <span class="fu">parquet_budget_row</span>(d, <span class="st">"taxon.parquet"</span>, <span class="fl">1.5</span>),</span>
+<span id="cb26-52"><a href="#cb26-52" aria-hidden="true" tabindex="-1"></a>    <span class="fu">parquet_budget_row</span>(d, <span class="st">"zone_taxon.parquet"</span>, <span class="dv">9</span>),</span>
+<span id="cb26-53"><a href="#cb26-53" aria-hidden="true" tabindex="-1"></a>    <span class="fu">parquet_budget_row</span>(d, <span class="st">"taxonomy.parquet"</span>, <span class="fl">1.5</span>),</span>
+<span id="cb26-54"><a href="#cb26-54" aria-hidden="true" tabindex="-1"></a>    <span class="fu">cell_tile_budget_row</span>(d, <span class="dv">110</span>, <span class="dv">250</span>))</span>
+<span id="cb26-55"><a href="#cb26-55" aria-hidden="true" tabindex="-1"></a>  out <span class="ot">&lt;-</span> <span class="fu">bind_rows</span>(<span class="fu">Filter</span>(<span class="fu">Negate</span>(is.null), rows))</span>
+<span id="cb26-56"><a href="#cb26-56" aria-hidden="true" tabindex="-1"></a>  out<span class="sc">$</span>ver <span class="ot">&lt;-</span> b<span class="sc">$</span>ver</span>
+<span id="cb26-57"><a href="#cb26-57" aria-hidden="true" tabindex="-1"></a>  out</span>
+<span id="cb26-58"><a href="#cb26-58" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb26-59"><a href="#cb26-59" aria-hidden="true" tabindex="-1"></a>budgets_tbl <span class="ot">&lt;-</span> <span class="fu">bind_rows</span>(purrr<span class="sc">::</span><span class="fu">map</span>(builds, budgets_one))</span>
+<span id="cb26-60"><a href="#cb26-60" aria-hidden="true" tabindex="-1"></a>knitr<span class="sc">::</span><span class="fu">kable</span>(</span>
+<span id="cb26-61"><a href="#cb26-61" aria-hidden="true" tabindex="-1"></a>  budgets_tbl <span class="sc">|&gt;</span> <span class="fu">select</span>(ver, object, n, raw_bytes, gzip_bytes, budget_gzip_bytes, over_budget),</span>
+<span id="cb26-62"><a href="#cb26-62" aria-hidden="true" tabindex="-1"></a>  <span class="at">caption =</span> <span class="st">"Object budgets vs the subplan (bytes; over_budget = count/flag OVER budget)"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output-display">
+<table class="caption-top table table-sm table-striped small">
+<caption>Object budgets vs the subplan (bytes; over_budget = count/flag OVER budget)</caption>
+<colgroup>
+<col style="width: 4%">
+<col style="width: 31%">
+<col style="width: 5%">
+<col style="width: 11%">
+<col style="width: 12%">
+<col style="width: 20%">
+<col style="width: 13%">
+</colgroup>
+<thead>
+<tr class="header">
+<th style="text-align: left;">ver</th>
+<th style="text-align: left;">object</th>
+<th style="text-align: right;">n</th>
+<th style="text-align: right;">raw_bytes</th>
+<th style="text-align: right;">gzip_bytes</th>
+<th style="text-align: right;">budget_gzip_bytes</th>
+<th style="text-align: right;">over_budget</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">boot.json</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">73659</td>
+<td style="text-align: right;">13702</td>
+<td style="text-align: right;">61440</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">taxa.json</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">1297144</td>
+<td style="text-align: right;">263497</td>
+<td style="text-align: right;">1048576</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">taxon/*.json</td>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">110684</td>
+<td style="text-align: right;">8576</td>
+<td style="text-align: right;">25600</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">alias/*.json</td>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">11755</td>
+<td style="text-align: right;">1860</td>
+<td style="text-align: right;">15360</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">taxon.parquet</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">520948</td>
+<td style="text-align: right;">NA</td>
+<td style="text-align: right;">1500000</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">zone_taxon.parquet</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">7074125</td>
+<td style="text-align: right;">NA</td>
+<td style="text-align: right;">9000000</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">taxonomy.parquet</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">704841</td>
+<td style="text-align: right;">NA</td>
+<td style="text-align: right;">1500000</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">cell/tile=*/data_0.parquet</td>
+<td style="text-align: right;">1687</td>
+<td style="text-align: right;">23642</td>
+<td style="text-align: right;">NA</td>
+<td style="text-align: right;">256000</td>
+<td style="text-align: right;">0</td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+</section>
+<section id="per-version-summary-objects-bytes-taxa-tiles" class="level2">
+<h2 class="anchored" data-anchor-id="per-version-summary-objects-bytes-taxa-tiles">Per-version summary (objects, bytes, taxa, tiles)</h2>
+<div class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb27"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb27-1"><a href="#cb27-1" aria-hidden="true" tabindex="-1"></a>summary_one <span class="ot">&lt;-</span> <span class="cf">function</span>(b) {</span>
+<span id="cb27-2"><a href="#cb27-2" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">isTRUE</span>(b<span class="sc">$</span>ok))</span>
+<span id="cb27-3"><a href="#cb27-3" aria-hidden="true" tabindex="-1"></a>    <span class="fu">return</span>(<span class="fu">data.frame</span>(<span class="at">ver =</span> b<span class="sc">$</span>ver, <span class="at">ok =</span> <span class="cn">FALSE</span>, <span class="at">reason =</span> b<span class="sc">$</span>reason, <span class="at">n_objects =</span> <span class="cn">NA</span>, <span class="at">bytes_raw =</span> <span class="cn">NA</span>,</span>
+<span id="cb27-4"><a href="#cb27-4" aria-hidden="true" tabindex="-1"></a>                      <span class="at">bytes_gzip_est =</span> <span class="cn">NA</span>, <span class="at">n_taxa =</span> <span class="cn">NA</span>, <span class="at">n_tiles =</span> <span class="cn">NA</span>, <span class="at">wall_s =</span> <span class="cn">NA</span>))</span>
+<span id="cb27-5"><a href="#cb27-5" aria-hidden="true" tabindex="-1"></a>  d <span class="ot">&lt;-</span> b<span class="sc">$</span>dir_out</span>
+<span id="cb27-6"><a href="#cb27-6" aria-hidden="true" tabindex="-1"></a>  files <span class="ot">&lt;-</span> <span class="fu">list.files</span>(d, <span class="at">recursive =</span> <span class="cn">TRUE</span>, <span class="at">full.names =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb27-7"><a href="#cb27-7" aria-hidden="true" tabindex="-1"></a>  is_json <span class="ot">&lt;-</span> <span class="fu">grepl</span>(<span class="st">"</span><span class="sc">\\</span><span class="st">.json$"</span>, files)</span>
+<span id="cb27-8"><a href="#cb27-8" aria-hidden="true" tabindex="-1"></a>  raw <span class="ot">&lt;-</span> <span class="fu">sum</span>(<span class="fu">file.size</span>(files))</span>
+<span id="cb27-9"><a href="#cb27-9" aria-hidden="true" tabindex="-1"></a>  gz  <span class="ot">&lt;-</span> <span class="fu">sum</span>(<span class="fu">vapply</span>(files[is_json], gz_size, <span class="fu">numeric</span>(<span class="dv">1</span>))) <span class="sc">+</span> <span class="fu">sum</span>(<span class="fu">file.size</span>(files[<span class="sc">!</span>is_json]))</span>
+<span id="cb27-10"><a href="#cb27-10" aria-hidden="true" tabindex="-1"></a>  <span class="fu">data.frame</span>(<span class="at">ver =</span> b<span class="sc">$</span>ver, <span class="at">ok =</span> <span class="cn">TRUE</span>, <span class="at">reason =</span> <span class="st">""</span>,</span>
+<span id="cb27-11"><a href="#cb27-11" aria-hidden="true" tabindex="-1"></a>             <span class="at">n_objects =</span> <span class="fu">length</span>(files), <span class="at">bytes_raw =</span> raw, <span class="at">bytes_gzip_est =</span> gz,</span>
+<span id="cb27-12"><a href="#cb27-12" aria-hidden="true" tabindex="-1"></a>             <span class="at">n_taxa =</span> <span class="cf">if</span> (<span class="sc">!</span><span class="fu">is.null</span>(b<span class="sc">$</span>taxa)) b<span class="sc">$</span>taxa<span class="sc">$</span>n <span class="cf">else</span> <span class="cn">NA</span>,</span>
+<span id="cb27-13"><a href="#cb27-13" aria-hidden="true" tabindex="-1"></a>             <span class="at">n_tiles =</span> <span class="cf">if</span> (<span class="sc">!</span><span class="fu">is.null</span>(b<span class="sc">$</span>cell_tiles)) b<span class="sc">$</span>cell_tiles<span class="sc">$</span>tiles <span class="cf">else</span> <span class="cn">NA</span>,</span>
+<span id="cb27-14"><a href="#cb27-14" aria-hidden="true" tabindex="-1"></a>             <span class="at">wall_s =</span> <span class="fu">round</span>(b<span class="sc">$</span>wall_s, <span class="dv">1</span>))</span>
+<span id="cb27-15"><a href="#cb27-15" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb27-16"><a href="#cb27-16" aria-hidden="true" tabindex="-1"></a>summary_tbl <span class="ot">&lt;-</span> <span class="fu">bind_rows</span>(purrr<span class="sc">::</span><span class="fu">map</span>(builds, summary_one))</span>
+<span id="cb27-17"><a href="#cb27-17" aria-hidden="true" tabindex="-1"></a>knitr<span class="sc">::</span><span class="fu">kable</span>(summary_tbl, <span class="at">caption =</span> <span class="st">"Per-version summary: objects, raw/gzip-estimated bytes, taxa, tiles, wall clock"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output-display">
+<table class="caption-top table table-sm table-striped small">
+<caption>Per-version summary: objects, raw/gzip-estimated bytes, taxa, tiles, wall clock</caption>
+<colgroup>
+<col style="width: 5%">
+<col style="width: 6%">
+<col style="width: 9%">
+<col style="width: 13%">
+<col style="width: 13%">
+<col style="width: 20%">
+<col style="width: 9%">
+<col style="width: 10%">
+<col style="width: 9%">
+</colgroup>
+<thead>
+<tr class="header">
+<th style="text-align: left;">ver</th>
+<th style="text-align: left;">ok</th>
+<th style="text-align: left;">reason</th>
+<th style="text-align: right;">n_objects</th>
+<th style="text-align: right;">bytes_raw</th>
+<th style="text-align: right;">bytes_gzip_est</th>
+<th style="text-align: right;">n_taxa</th>
+<th style="text-align: right;">n_tiles</th>
+<th style="text-align: right;">wall_s</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;">v9</td>
+<td style="text-align: left;">TRUE</td>
+<td style="text-align: left;"></td>
+<td style="text-align: right;">2204</td>
+<td style="text-align: right;">95822054</td>
+<td style="text-align: right;">65921614</td>
+<td style="text-align: right;">21600</td>
+<td style="text-align: right;">1687</td>
+<td style="text-align: right;">157.2</td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+</section>
+<section id="push-app_bundle_s31-only-never-run-by-this-notebooks-author" class="level2">
+<h2 class="anchored" data-anchor-id="push-app_bundle_s31-only-never-run-by-this-notebooks-author">Push (<code>APP_BUNDLE_S3=1</code> only — never run by this notebook’s author)</h2>
+<p>Lists the target prefix before and after, refuses (via [app_bundle_assert_prefix()]) any key outside <code>{ver}/app/</code> — and <code>v7/serve/cell_model/</code>, only when <code>APP_BUNDLE_V7_CELLMODEL=1</code> — gzips every JSON object before upload (<code>Content-Encoding: gzip</code>, S3 does not compress on the fly), leaves Parquet as-is (already zstd-compressed by [msens::write_atlas_parquet()] / [msens::copy_atlas_parquet()]).</p>
+<div class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb28"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb28-1"><a href="#cb28-1" aria-hidden="true" tabindex="-1"></a>s3_root <span class="ot">&lt;-</span> <span class="st">"s3://oceanmetrics.io-public/marine-atlas"</span></span>
+<span id="cb28-2"><a href="#cb28-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-3"><a href="#cb28-3" aria-hidden="true" tabindex="-1"></a>list_prefix <span class="ot">&lt;-</span> <span class="cf">function</span>(prefix) {</span>
+<span id="cb28-4"><a href="#cb28-4" aria-hidden="true" tabindex="-1"></a>  out <span class="ot">&lt;-</span> <span class="fu">system2</span>(<span class="st">"aws"</span>, <span class="fu">c</span>(<span class="st">"s3"</span>, <span class="st">"ls"</span>, <span class="fu">shQuote</span>(<span class="fu">glue</span>(<span class="st">"{s3_root}/{prefix}"</span>)), <span class="st">"--recursive"</span>),</span>
+<span id="cb28-5"><a href="#cb28-5" aria-hidden="true" tabindex="-1"></a>                <span class="at">stdout =</span> <span class="cn">TRUE</span>, <span class="at">stderr =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb28-6"><a href="#cb28-6" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">is.null</span>(<span class="fu">attr</span>(out, <span class="st">"status"</span>)) <span class="sc">&amp;&amp;</span> <span class="fu">attr</span>(out, <span class="st">"status"</span>) <span class="sc">!=</span> <span class="dv">0</span>) <span class="fu">character</span>(<span class="dv">0</span>) <span class="cf">else</span> out</span>
+<span id="cb28-7"><a href="#cb28-7" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb28-8"><a href="#cb28-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-9"><a href="#cb28-9" aria-hidden="true" tabindex="-1"></a>push_one <span class="ot">&lt;-</span> <span class="cf">function</span>(b) {</span>
+<span id="cb28-10"><a href="#cb28-10" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">isTRUE</span>(b<span class="sc">$</span>ok)) <span class="fu">return</span>(<span class="fu">invisible</span>(<span class="cn">NULL</span>))</span>
+<span id="cb28-11"><a href="#cb28-11" aria-hidden="true" tabindex="-1"></a>  ver <span class="ot">&lt;-</span> b<span class="sc">$</span>ver</span>
+<span id="cb28-12"><a href="#cb28-12" aria-hidden="true" tabindex="-1"></a>  before <span class="ot">&lt;-</span> <span class="fu">list_prefix</span>(<span class="fu">glue</span>(<span class="st">"{ver}/app/"</span>))</span>
+<span id="cb28-13"><a href="#cb28-13" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"{ver}/app/ BEFORE push: {length(before)} object(s)"</span>)</span>
+<span id="cb28-14"><a href="#cb28-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-15"><a href="#cb28-15" aria-hidden="true" tabindex="-1"></a>  files <span class="ot">&lt;-</span> <span class="fu">list.files</span>(b<span class="sc">$</span>dir_out, <span class="at">recursive =</span> <span class="cn">TRUE</span>, <span class="at">full.names =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb28-16"><a href="#cb28-16" aria-hidden="true" tabindex="-1"></a>  rels  <span class="ot">&lt;-</span> fs<span class="sc">::</span><span class="fu">path_rel</span>(files, b<span class="sc">$</span>dir_out)</span>
+<span id="cb28-17"><a href="#cb28-17" aria-hidden="true" tabindex="-1"></a>  keys  <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{ver}/app/{rels}"</span>)</span>
+<span id="cb28-18"><a href="#cb28-18" aria-hidden="true" tabindex="-1"></a>  <span class="fu">app_bundle_assert_prefix</span>(keys, ver)                       <span class="co"># refuse before touching S3</span></span>
+<span id="cb28-19"><a href="#cb28-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-20"><a href="#cb28-20" aria-hidden="true" tabindex="-1"></a>  <span class="cf">for</span> (i <span class="cf">in</span> <span class="fu">seq_along</span>(files)) {</span>
+<span id="cb28-21"><a href="#cb28-21" aria-hidden="true" tabindex="-1"></a>    is_json <span class="ot">&lt;-</span> <span class="fu">grepl</span>(<span class="st">"</span><span class="sc">\\</span><span class="st">.json$"</span>, files[i])</span>
+<span id="cb28-22"><a href="#cb28-22" aria-hidden="true" tabindex="-1"></a>    src <span class="ot">&lt;-</span> files[i]</span>
+<span id="cb28-23"><a href="#cb28-23" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (is_json) {</span>
+<span id="cb28-24"><a href="#cb28-24" aria-hidden="true" tabindex="-1"></a>      src <span class="ot">&lt;-</span> <span class="fu">tempfile</span>(<span class="at">fileext =</span> <span class="st">".gz"</span>)</span>
+<span id="cb28-25"><a href="#cb28-25" aria-hidden="true" tabindex="-1"></a>      con_ <span class="ot">&lt;-</span> <span class="fu">gzfile</span>(src, <span class="st">"wb"</span>, <span class="at">compression =</span> <span class="dv">9</span>L); <span class="fu">writeLines</span>(<span class="fu">readLines</span>(files[i]), con_); <span class="fu">close</span>(con_)</span>
+<span id="cb28-26"><a href="#cb28-26" aria-hidden="true" tabindex="-1"></a>    }</span>
+<span id="cb28-27"><a href="#cb28-27" aria-hidden="true" tabindex="-1"></a>    args <span class="ot">&lt;-</span> <span class="fu">c</span>(<span class="st">"s3"</span>, <span class="st">"cp"</span>, <span class="fu">shQuote</span>(src), <span class="fu">shQuote</span>(<span class="fu">glue</span>(<span class="st">"{s3_root}/{keys[i]}"</span>)),</span>
+<span id="cb28-28"><a href="#cb28-28" aria-hidden="true" tabindex="-1"></a>              <span class="cf">if</span> (is_json) <span class="fu">c</span>(<span class="st">"--content-type"</span>, <span class="fu">shQuote</span>(<span class="st">"application/json"</span>),</span>
+<span id="cb28-29"><a href="#cb28-29" aria-hidden="true" tabindex="-1"></a>                             <span class="st">"--content-encoding"</span>, <span class="st">"gzip"</span>))</span>
+<span id="cb28-30"><a href="#cb28-30" aria-hidden="true" tabindex="-1"></a>    out <span class="ot">&lt;-</span> <span class="fu">system2</span>(<span class="st">"aws"</span>, args, <span class="at">stdout =</span> <span class="cn">TRUE</span>, <span class="at">stderr =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb28-31"><a href="#cb28-31" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="sc">!</span><span class="fu">is.null</span>(<span class="fu">attr</span>(out, <span class="st">"status"</span>)) <span class="sc">&amp;&amp;</span> <span class="fu">attr</span>(out, <span class="st">"status"</span>) <span class="sc">!=</span> <span class="dv">0</span>)</span>
+<span id="cb28-32"><a href="#cb28-32" aria-hidden="true" tabindex="-1"></a>      <span class="fu">stop</span>(<span class="fu">glue</span>(<span class="st">"aws s3 cp failed for {keys[i]}: {paste(out, collapse = '</span><span class="sc">\n</span><span class="st">')}"</span>))</span>
+<span id="cb28-33"><a href="#cb28-33" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (is_json) <span class="fu">unlink</span>(src)</span>
+<span id="cb28-34"><a href="#cb28-34" aria-hidden="true" tabindex="-1"></a>  }</span>
+<span id="cb28-35"><a href="#cb28-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-36"><a href="#cb28-36" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="fu">isTRUE</span>(do_v7_cm) <span class="sc">&amp;&amp;</span> ver <span class="sc">==</span> <span class="st">"v7"</span>) {</span>
+<span id="cb28-37"><a href="#cb28-37" aria-hidden="true" tabindex="-1"></a>    cm_local <span class="ot">&lt;-</span> <span class="fu">path.expand</span>(<span class="st">"~/_big/msens/derived/v7/cell_model"</span>)</span>
+<span id="cb28-38"><a href="#cb28-38" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="fu">dir.exists</span>(cm_local)) {</span>
+<span id="cb28-39"><a href="#cb28-39" aria-hidden="true" tabindex="-1"></a>      cm_files <span class="ot">&lt;-</span> <span class="fu">list.files</span>(cm_local, <span class="at">recursive =</span> <span class="cn">TRUE</span>, <span class="at">full.names =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb28-40"><a href="#cb28-40" aria-hidden="true" tabindex="-1"></a>      cm_keys  <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"v7/serve/cell_model/{fs::path_rel(cm_files, cm_local)}"</span>)</span>
+<span id="cb28-41"><a href="#cb28-41" aria-hidden="true" tabindex="-1"></a>      <span class="fu">app_bundle_assert_prefix</span>(cm_keys, <span class="st">"v7"</span>, <span class="at">allow_v7_cell_model =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb28-42"><a href="#cb28-42" aria-hidden="true" tabindex="-1"></a>      <span class="fu">system2</span>(<span class="st">"aws"</span>, <span class="fu">c</span>(<span class="st">"s3"</span>, <span class="st">"sync"</span>, <span class="fu">shQuote</span>(cm_local), <span class="fu">shQuote</span>(<span class="fu">glue</span>(<span class="st">"{s3_root}/v7/serve/cell_model"</span>)),</span>
+<span id="cb28-43"><a href="#cb28-43" aria-hidden="true" tabindex="-1"></a>                       <span class="st">"--only-show-errors"</span>), <span class="at">stdout =</span> <span class="cn">TRUE</span>, <span class="at">stderr =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb28-44"><a href="#cb28-44" aria-hidden="true" tabindex="-1"></a>    } <span class="cf">else</span> <span class="fu">log_warn</span>(<span class="st">"APP_BUNDLE_V7_CELLMODEL=1 but {cm_local} does not exist locally"</span>)</span>
+<span id="cb28-45"><a href="#cb28-45" aria-hidden="true" tabindex="-1"></a>  }</span>
+<span id="cb28-46"><a href="#cb28-46" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-47"><a href="#cb28-47" aria-hidden="true" tabindex="-1"></a>  after <span class="ot">&lt;-</span> <span class="fu">list_prefix</span>(<span class="fu">glue</span>(<span class="st">"{ver}/app/"</span>))</span>
+<span id="cb28-48"><a href="#cb28-48" aria-hidden="true" tabindex="-1"></a>  <span class="fu">log_info</span>(<span class="st">"{ver}/app/ AFTER push: {length(after)} object(s) ({length(after) - length(before)} new)"</span>)</span>
+<span id="cb28-49"><a href="#cb28-49" aria-hidden="true" tabindex="-1"></a>  <span class="fu">invisible</span>(<span class="fu">list</span>(<span class="at">before =</span> before, <span class="at">after =</span> after))</span>
+<span id="cb28-50"><a href="#cb28-50" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb28-51"><a href="#cb28-51" aria-hidden="true" tabindex="-1"></a>push_out <span class="ot">&lt;-</span> purrr<span class="sc">::</span><span class="fu">map</span>(builds, push_one)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</div>
+</section>
+<section id="anonymous-verification-app_bundle_s31-only" class="level2">
+<h2 class="anchored" data-anchor-id="anonymous-verification-app_bundle_s31-only">Anonymous verification (<code>APP_BUNDLE_S3=1</code> only)</h2>
+<p>HEAD (falling back to a ranged GET) per published object, anonymously — no credentials, exactly as the browser will fetch it: 200, <code>content-encoding: gzip</code> on every JSON object, path-style URL, size within budget.</p>
+<div class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb29"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb29-1"><a href="#cb29-1" aria-hidden="true" tabindex="-1"></a>verify_one <span class="ot">&lt;-</span> <span class="cf">function</span>(b) {</span>
+<span id="cb29-2"><a href="#cb29-2" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="sc">!</span><span class="fu">isTRUE</span>(b<span class="sc">$</span>ok)) <span class="fu">return</span>(<span class="fu">tibble</span>())</span>
+<span id="cb29-3"><a href="#cb29-3" aria-hidden="true" tabindex="-1"></a>  ver <span class="ot">&lt;-</span> b<span class="sc">$</span>ver</span>
+<span id="cb29-4"><a href="#cb29-4" aria-hidden="true" tabindex="-1"></a>  files <span class="ot">&lt;-</span> <span class="fu">list.files</span>(b<span class="sc">$</span>dir_out, <span class="at">recursive =</span> <span class="cn">TRUE</span>, <span class="at">full.names =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb29-5"><a href="#cb29-5" aria-hidden="true" tabindex="-1"></a>  rels  <span class="ot">&lt;-</span> fs<span class="sc">::</span><span class="fu">path_rel</span>(files, b<span class="sc">$</span>dir_out)</span>
+<span id="cb29-6"><a href="#cb29-6" aria-hidden="true" tabindex="-1"></a>  urls  <span class="ot">&lt;-</span> <span class="fu">glue</span>(<span class="st">"{base}/{ver}/app/{rels}"</span>)</span>
+<span id="cb29-7"><a href="#cb29-7" aria-hidden="true" tabindex="-1"></a>  purrr<span class="sc">::</span><span class="fu">map_dfr</span>(<span class="fu">seq_along</span>(urls), <span class="cf">function</span>(i) {</span>
+<span id="cb29-8"><a href="#cb29-8" aria-hidden="true" tabindex="-1"></a>    r <span class="ot">&lt;-</span> <span class="fu">tryCatch</span>(</span>
+<span id="cb29-9"><a href="#cb29-9" aria-hidden="true" tabindex="-1"></a>      httr2<span class="sc">::</span><span class="fu">req_perform</span>(httr2<span class="sc">::</span><span class="fu">req_error</span>(httr2<span class="sc">::</span><span class="fu">req_method</span>(httr2<span class="sc">::</span><span class="fu">request</span>(urls[i]), <span class="st">"HEAD"</span>),</span>
+<span id="cb29-10"><a href="#cb29-10" aria-hidden="true" tabindex="-1"></a>                                          <span class="at">is_error =</span> <span class="cf">function</span>(resp) <span class="cn">FALSE</span>)),</span>
+<span id="cb29-11"><a href="#cb29-11" aria-hidden="true" tabindex="-1"></a>      <span class="at">error =</span> <span class="cf">function</span>(e) <span class="cn">NULL</span>)</span>
+<span id="cb29-12"><a href="#cb29-12" aria-hidden="true" tabindex="-1"></a>    is_json <span class="ot">&lt;-</span> <span class="fu">grepl</span>(<span class="st">"</span><span class="sc">\\</span><span class="st">.json$"</span>, files[i])</span>
+<span id="cb29-13"><a href="#cb29-13" aria-hidden="true" tabindex="-1"></a>    <span class="fu">data.frame</span>(</span>
+<span id="cb29-14"><a href="#cb29-14" aria-hidden="true" tabindex="-1"></a>      <span class="at">ver =</span> ver, <span class="at">key =</span> rels[i],</span>
+<span id="cb29-15"><a href="#cb29-15" aria-hidden="true" tabindex="-1"></a>      <span class="at">status =</span> <span class="cf">if</span> (<span class="fu">is.null</span>(r)) <span class="cn">NA_integer_</span> <span class="cf">else</span> httr2<span class="sc">::</span><span class="fu">resp_status</span>(r),</span>
+<span id="cb29-16"><a href="#cb29-16" aria-hidden="true" tabindex="-1"></a>      <span class="at">path_style =</span> <span class="fu">grepl</span>(<span class="st">"^https://s3</span><span class="sc">\\</span><span class="st">.[a-z0-9-]+</span><span class="sc">\\</span><span class="st">.amazonaws</span><span class="sc">\\</span><span class="st">.com/"</span>, urls[i]),</span>
+<span id="cb29-17"><a href="#cb29-17" aria-hidden="true" tabindex="-1"></a>      <span class="at">gzip_ok =</span> <span class="cf">if</span> (<span class="fu">is.null</span>(r) <span class="sc">||</span> <span class="sc">!</span>is_json) <span class="cn">NA</span> <span class="cf">else</span></span>
+<span id="cb29-18"><a href="#cb29-18" aria-hidden="true" tabindex="-1"></a>        <span class="fu">identical</span>(httr2<span class="sc">::</span><span class="fu">resp_header</span>(r, <span class="st">"content-encoding"</span>), <span class="st">"gzip"</span>),</span>
+<span id="cb29-19"><a href="#cb29-19" aria-hidden="true" tabindex="-1"></a>      <span class="at">bytes =</span> <span class="cf">if</span> (<span class="fu">is.null</span>(r)) <span class="cn">NA_integer_</span> <span class="cf">else</span></span>
+<span id="cb29-20"><a href="#cb29-20" aria-hidden="true" tabindex="-1"></a>        <span class="fu">suppressWarnings</span>(<span class="fu">as.integer</span>(httr2<span class="sc">::</span><span class="fu">resp_header</span>(r, <span class="st">"content-length"</span>))))</span>
+<span id="cb29-21"><a href="#cb29-21" aria-hidden="true" tabindex="-1"></a>  })</span>
+<span id="cb29-22"><a href="#cb29-22" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb29-23"><a href="#cb29-23" aria-hidden="true" tabindex="-1"></a>verify_tbl <span class="ot">&lt;-</span> <span class="fu">bind_rows</span>(purrr<span class="sc">::</span><span class="fu">map</span>(builds, verify_one))</span>
+<span id="cb29-24"><a href="#cb29-24" aria-hidden="true" tabindex="-1"></a>knitr<span class="sc">::</span><span class="fu">kable</span>(</span>
+<span id="cb29-25"><a href="#cb29-25" aria-hidden="true" tabindex="-1"></a>  verify_tbl <span class="sc">|&gt;</span> <span class="fu">summarise</span>(<span class="at">n =</span> <span class="fu">n</span>(), <span class="at">n_200 =</span> <span class="fu">sum</span>(status <span class="sc">==</span> <span class="dv">200</span>, <span class="at">na.rm =</span> <span class="cn">TRUE</span>),</span>
+<span id="cb29-26"><a href="#cb29-26" aria-hidden="true" tabindex="-1"></a>                          <span class="at">n_gzip_ok =</span> <span class="fu">sum</span>(gzip_ok, <span class="at">na.rm =</span> <span class="cn">TRUE</span>), <span class="at">.by =</span> ver),</span>
+<span id="cb29-27"><a href="#cb29-27" aria-hidden="true" tabindex="-1"></a>  <span class="at">caption =</span> <span class="st">"Anonymous verification summary per version"</span>)</span>
+<span id="cb29-28"><a href="#cb29-28" aria-hidden="true" tabindex="-1"></a><span class="fu">stopifnot</span>(<span class="st">"not every pushed object answered 200 anonymously"</span> <span class="ot">=</span></span>
+<span id="cb29-29"><a href="#cb29-29" aria-hidden="true" tabindex="-1"></a>  <span class="fu">all</span>(verify_tbl<span class="sc">$</span>status <span class="sc">==</span> <span class="dv">200</span>, <span class="at">na.rm =</span> <span class="cn">TRUE</span>) <span class="sc">&amp;&amp;</span> <span class="sc">!</span><span class="fu">anyNA</span>(verify_tbl<span class="sc">$</span>status))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</div>
+</section>
+<section id="target-manifest" class="level2">
+<h2 class="anchored" data-anchor-id="target-manifest">Target manifest</h2>
+<div class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb30"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb30-1"><a href="#cb30-1" aria-hidden="true" tabindex="-1"></a>msens<span class="sc">::</span><span class="fu">write_manifest</span>(</span>
+<span id="cb30-2"><a href="#cb30-2" aria-hidden="true" tabindex="-1"></a>  <span class="fu">here</span>(<span class="st">"data/manifests/build_app_bundle.json"</span>),</span>
+<span id="cb30-3"><a href="#cb30-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">target       =</span> <span class="st">"build_app_bundle"</span>,</span>
+<span id="cb30-4"><a href="#cb30-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">content_hash =</span> digest<span class="sc">::</span><span class="fu">digest</span>(<span class="fu">list</span>(summary_tbl, val_tbl, tw_tbl, dg_tbl, zm_tbl, sets_tbl),</span>
+<span id="cb30-5"><a href="#cb30-5" aria-hidden="true" tabindex="-1"></a>                                <span class="at">algo =</span> <span class="st">"xxhash64"</span>),</span>
+<span id="cb30-6"><a href="#cb30-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">stats =</span> <span class="fu">list</span>(</span>
+<span id="cb30-7"><a href="#cb30-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">versions_attempted =</span> vers,</span>
+<span id="cb30-8"><a href="#cb30-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">versions_built      =</span> summary_tbl<span class="sc">$</span>ver[summary_tbl<span class="sc">$</span>ok],</span>
+<span id="cb30-9"><a href="#cb30-9" aria-hidden="true" tabindex="-1"></a>    <span class="at">push_s3             =</span> do_s3,</span>
+<span id="cb30-10"><a href="#cb30-10" aria-hidden="true" tabindex="-1"></a>    <span class="at">v7_cell_model       =</span> do_v7_cm,</span>
+<span id="cb30-11"><a href="#cb30-11" aria-hidden="true" tabindex="-1"></a>    <span class="at">n_objects_total     =</span> <span class="fu">sum</span>(summary_tbl<span class="sc">$</span>n_objects, <span class="at">na.rm =</span> <span class="cn">TRUE</span>)),</span>
+<span id="cb30-12"><a href="#cb30-12" aria-hidden="true" tabindex="-1"></a>  <span class="at">force =</span> msens<span class="sc">::</span><span class="fu">force_target</span>(<span class="st">"build_app_bundle"</span>))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</div>
+</section>
+
+</main>
+<!-- /main column -->
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp('/' + window.location.host + '/');
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+     var links = window.document.querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+        }
+      }
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          let top = null;
+          let height = null;
+          let parent = null;
+          if (lineIds.length > 0) {
+              //compute the position of the single el (top and bottom and make a div)
+              const el = window.document.getElementById(lineIds[0]);
+              top = el.offsetTop;
+              height = el.offsetHeight;
+              parent = el.parentElement.parentElement;
+            if (lineIds.length > 1) {
+              const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+              const bottom = lastEl.offsetTop + lastEl.offsetHeight;
+              height = bottom - top;
+            }
+            if (top !== null && height !== null && parent !== null) {
+              // cook up a div (if necessary) and position it 
+              let div = window.document.getElementById("code-annotation-line-highlight");
+              if (div === null) {
+                div = window.document.createElement("div");
+                div.setAttribute("id", "code-annotation-line-highlight");
+                div.style.position = 'absolute';
+                parent.appendChild(div);
+              }
+              div.style.top = top - 2 + "px";
+              div.style.height = height + 4 + "px";
+              div.style.left = 0;
+              let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+              if (gutterDiv === null) {
+                gutterDiv = window.document.createElement("div");
+                gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+                gutterDiv.style.position = 'absolute';
+                const codeCell = window.document.getElementById(targetCell);
+                const gutter = codeCell.querySelector('.code-annotation-gutter');
+                gutter.appendChild(gutterDiv);
+              }
+              gutterDiv.style.top = top - 2 + "px";
+              gutterDiv.style.height = height + 4 + "px";
+            }
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+</div> <!-- /content -->
+
+
+
+
+</body></html>

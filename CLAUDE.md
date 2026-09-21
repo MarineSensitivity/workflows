@@ -417,6 +417,33 @@ version-independent registries replace that:
   Rewriting objects at a stable URL left GDAL's `/vsicurl` serving a cached header for bytes that no
   longer existed: z5+ fine, z2–z4 HTTP 500.
 
+### The atlas browser's `app/` bundle (2026-09, master plan D5)
+
+`build_app_bundle.qmd` publishes a second, smaller contract beside the tables above —
+`s3://oceanmetrics.io-public/marine-atlas/{ver}/app/` — that the standalone `MarineSensitivity/atlas`
+browser app reads directly, without ever opening `sdm.duckdb`/`serve.duckdb` or touching the two
+generations' `usa05`/`global05` grid quirks itself. `msens::app_bundle_build()` (msens 0.43.0+,
+`R/app_bundle.R`) is the single normalizer: one `boot.json` + `taxa.json` + 256-way
+`taxon/{xx}.json`/`alias/{xx}.json` shards + `taxon.parquet`/`zone_taxon.parquet`/`taxonomy.parquet`
++ wide `cell/tile={t}/` Parquet, the SAME shape for v1 and v9 alike, every object validated
+against `inst/schema/app_*.schema.json` before it is written. Run it **after**
+`release_marine-atlas.qmd` and **before** `build_version_manifest.qmd`, which records the
+resulting `manifest.json` `app{capabilities{…}}` block by an **anonymous HTTPS HEAD of the
+pushed objects** — never by copying `manifest$capabilities`, because those two legitimately
+disagree (v7/v7b advertise `cell_species_list: true` from a server-only `cell_model` that never
+reaches S3). `APP_BUNDLE_S3=1` gates the push (default off, like every other publishing flag in
+this file); `APP_BUNDLE_VERS=v7,v9` narrows which versions a run attempts;
+`APP_BUNDLE_V7_CELLMODEL=1` is the one-time flag that additionally uploads v7's missing
+`serve/cell_model/`, kept separate from the ordinary `{ver}/app/` push by
+`app_bundle_assert_prefix()` (`libs/app_bundle.R`), a pure guard the push chunk runs on every
+candidate key before it ever reaches `aws s3 cp`. **Legacy releases (v1–v7b) need a DIFFERENT
+database than `msens::sdm_db_path(ver)` returns by default**: their local `sdm.duckdb` has no
+`model_asset`/`native_asset` table at all (it lives only in `serve.duckdb`'s views, or in the
+published `tables/model_asset.parquet`) — opening the wrong one is not an error, it just leaves
+every taxon's `merged` COG and `inputs[].assets` silently empty, so `build_app_bundle.qmd` probes
+(queries, not just lists) for a working asset table across `sdm.duckdb` → `serve.duckdb` →
+anonymous S3-attached `tables/*.parquet`, in that order, before giving up.
+
 ### Server gotchas (both cost real time)
 
 - **`docker exec` runs as ROOT.** Use `scripts/srv_render.sh` (which passes `-u 1000:1000` and
