@@ -107,41 +107,9 @@ DS_ER   <- "rng_turtle_swot_dps"
 DS_SUIT <- "am_0.05"
 DS_CH   <- c("ch_nmfs", "ch_fws", "ca_nmfs")
 
-# size DuckDB to the MACHINE, not to the laptop it was written on ----
-# A hardcoded `memory_limit='12GB'` is a promise the server cannot keep: msens1 has 16 GB and
-# 4 cores shared with ERDDAP, two titilers and the Shiny workers, ~4 GB of it available, and
-# with a limit above what exists DuckDB never spills -- it grows until the kernel OOM-kills
-# R (the first P4 server build died that way in calc_cell_metric_redlist, with no R error
-# and no gate reached). So: 40 % of what is AVAILABLE, capped at 12 GB, and the operators
-# spill to temp_directory beyond it. 40 and not more because the limit bounds DuckDB's buffer
-# pool, not the process: measured, a 2.3 GB limit peaks at 3.2 GB resident (R + the chunks'
-# data frames + allocations outside the pool). Barely slower on a small box (5.4 min for the
-# build + three controls at 2.3 GB / 4 threads, vs 5 at 12 GB / 6), identical output -- the
-# reference digests below are the proof. BUILD_MEMORY_GB / BUILD_THREADS override.
-duckdb_budget <- function() {
-  gb_env <- suppressWarnings(as.numeric(Sys.getenv("BUILD_MEMORY_GB")))
-  th_env <- suppressWarnings(as.integer(Sys.getenv("BUILD_THREADS")))
-  avail  <- NA_real_
-  if (file_exists("/proc/meminfo")) {
-    l     <- grep("^MemAvailable:", readLines("/proc/meminfo"), value = TRUE)
-    avail <- as.numeric(gsub("\\D", "", l)) / 1024^2               # kB -> GB
-  }
-  list(
-    gb      = if (!is.na(gb_env)) gb_env else if (!is.na(avail)) max(1.5, min(12, round(avail * 0.4, 1))) else 12,
-    threads = if (!is.na(th_env)) th_env else min(6L, parallel::detectCores()),
-    avail   = avail)
-}
-duckdb_tune <- function(con, tmp_dir) {
-  b <- duckdb_budget()
-  dir_create(tmp_dir)
-  dbExecute(con, glue("PRAGMA memory_limit='{b$gb}GB'"))
-  dbExecute(con, glue("PRAGMA threads={b$threads}"))
-  dbExecute(con, glue("PRAGMA temp_directory='{tmp_dir}'"))
-  # insertion order is not part of any result here, and preserving it costs memory
-  dbExecute(con, "SET preserve_insertion_order = false")
-  log_info("duckdb budget: {b$gb} GB, {b$threads} threads (available: {round(b$avail, 1)} GB)")
-  invisible(b)
-}
+# size DuckDB to the machine, not to the laptop this was written on: duckdb_budget() /
+# duckdb_tune() (40 % of available memory, <= 12 GB, threads <= cores; the why is in the file)
+source(here("libs/duckdb_budget.R"))
 
 f_gates <- file.path(dir_v, glue("tbl_gates_{ver}.csv"))
 f_attr  <- file.path(dir_v, glue("tbl_attribution_programarea_{ver}.csv"))

@@ -74,8 +74,14 @@ run() {  # run <ver> <label> <qmd> <output-stem> [extra args...]
   echo "--- $label $ver  $(date +%H:%M) ---"
   # --output keeps one HTML per version, so a version's run stays auditable
   # instead of each render overwriting the last.
+  # the FULL output is kept: the filter below is for the console only. It used to be the only
+  # copy, so when a render died the R error text was discarded with everything else that did
+  # not match (2026-09-21: a cell_model stage failed and left nothing to diagnose it with).
+  local log="_output/logs/backfill_${stem}_${ver}_$(date +%Y%m%dT%H%M%S).log"
+  mkdir -p _output/logs
   scripts/srv_render.sh "$qmd" -P "ver:$ver" --output "${stem}_${ver}.html" "$@" \
-    2>&1 | grep -E "INFO|WARN|ERROR|Error|Output created|at [0-9a-f]{7}|msens" | sed 's/^/    /'
+    2>&1 | tee "$log" | grep -E "INFO|WARN|ERROR|Error|Output created|at [0-9a-f]{7}|msens" | sed 's/^/    /'
+  echo "    full log: $log"
 }
 
 store_count() {

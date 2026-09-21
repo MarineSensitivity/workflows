@@ -56,6 +56,9 @@ done
 # is exactly what the NEWS/Version rule exists to make impossible.
 minver="${MSENS_MIN:-}"
 
+# the render is killed if the HOST's MemAvailable falls below this (see the watchdog below)
+minavail="${SRV_MIN_AVAIL_MB:-1200}"
+
 echo "==> rendering $QMD on $HOST as uid $UIDGID"
 
 # shellcheck disable=SC2029  # $QMD/$envs are meant to expand locally
@@ -85,7 +88,49 @@ ssh "$HOST" "set -e
     echo \"    msens \$have (>= $minver)\"
   fi
 
-  docker exec -u $UIDGID -w '$REPO'$envs rstudio quarto render '$QMD'$qargs
+  # MEMORY WATCHDOG. msens1 is the PRODUCTION box: 16 GB, no swap, shared with the apps,
+  # the API, two titilers and ERDDAP, and the rstudio container has no memory cap. With no
+  # swap the kernel does not OOM-kill promptly -- it evicts file pages and thrashes. On
+  # 2026-09-21 a render at a hardcoded 12 GB DuckDB limit took MemAvailable to 175 MB and the
+  # host to load 100: sshd unreachable, /scores, /species and STAC timing out for ~25 min,
+  # until the render was killed by hand. Notebooks now size DuckDB to the machine
+  # (libs/duckdb_budget.R); this is the second line of defence for the ones that do not.
+  # A render that pushes the HOST below SRV_MIN_AVAIL_MB is killed (exit 137) while the box
+  # can still answer. Reproducibility beats uptime -- but not by taking the site down.
+  docker exec -u $UIDGID -w '$REPO'$envs rstudio quarto render '$QMD'$qargs &
+  rpid=\$!
+  flag=/tmp/srv_render_lowmem.\$rpid
+  (
+    while kill -0 \$rpid 2>/dev/null; do
+      avail=\$(awk '/^MemAvailable:/ {print int(\$2/1024)}' /proc/meminfo)
+      if [ \"\$avail\" -lt $minavail ]; then
+        echo \"ERROR: host MemAvailable \${avail} MB < $minavail MB -- killing the render of $QMD\" >&2
+        touch \$flag
+        # [.] keeps pkill -f from matching THIS shell, whose command line contains the
+        # pattern text (the first version killed itself and left the render running).
+        # Loop: at the moment of the first kill R may not have started yet.
+        n=0
+        while kill -0 \$rpid 2>/dev/null && [ \$n -lt 60 ]; do
+          pkill -9 -u 1000 -f 'quarto/share/rmd/rmd[.]R' || true
+          pkill -9 -u 1000 -f 'quarto[.]js render'       || true
+          n=\$((n + 1)); sleep 1
+        done
+        kill -9 \$rpid 2>/dev/null || true
+        break
+      fi
+      sleep 5
+    done
+  ) &
+  wpid=\$!
+  rc=0; wait \$rpid || rc=\$?
+  kill \$wpid 2>/dev/null || true
+  if [ -e \$flag ]; then
+    rm -f \$flag
+    echo \"ERROR: render killed by the memory watchdog (SRV_MIN_AVAIL_MB=$minavail). Give the notebook\" >&2
+    echo \"       a machine-sized DuckDB budget (libs/duckdb_budget.R) rather than raising the floor.\" >&2
+    exit 137
+  fi
+  [ \$rc -eq 0 ] || exit \$rc
 
   # Belt and braces: a render can still shell out to something that escalates,
   # and one root-owned file is enough to wedge the next git operation. Report it
