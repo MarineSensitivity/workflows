@@ -432,17 +432,31 @@ resulting `manifest.json` `app{capabilities{…}}` block by an **anonymous HTTPS
 pushed objects** — never by copying `manifest$capabilities`, because those two legitimately
 disagree (v7/v7b advertise `cell_species_list: true` from a server-only `cell_model` that never
 reaches S3). `APP_BUNDLE_S3=1` gates the push (default off, like every other publishing flag in
-this file); `APP_BUNDLE_VERS=v7,v9` narrows which versions a run attempts;
-`APP_BUNDLE_V7_CELLMODEL=1` is the one-time flag that additionally uploads v7's missing
-`serve/cell_model/`, kept separate from the ordinary `{ver}/app/` push by
-`app_bundle_assert_prefix()` (`libs/app_bundle.R`), a pure guard the push chunk runs on every
-candidate key before it ever reaches `aws s3 cp`. **Legacy releases (v1–v7b) need a DIFFERENT
-database than `msens::sdm_db_path(ver)` returns by default**: their local `sdm.duckdb` has no
-`model_asset`/`native_asset` table at all (it lives only in `serve.duckdb`'s views, or in the
-published `tables/model_asset.parquet`) — opening the wrong one is not an error, it just leaves
-every taxon's `merged` COG and `inputs[].assets` silently empty, so `build_app_bundle.qmd` probes
-(queries, not just lists) for a working asset table across `sdm.duckdb` → `serve.duckdb` →
-anonymous S3-attached `tables/*.parquet`, in that order, before giving up.
+this file); `APP_BUNDLE_VERS=v7,v9` narrows which versions a run attempts — every entry is checked
+against BOTH the shape `^v[0-9]+[a-z]?$` and membership in `data/versions.csv` (unset, every
+registered version is attempted; v3b is never attempted, it is not registered).
+`APP_BUNDLE_CELLMODEL_VERS=v7,v7b` (round 3, 2026-09-21: generalized from a single, v7-only
+`APP_BUNDLE_V7_CELLMODEL` flag) is the allow-list of version(s) that additionally upload their
+missing `serve/cell_model/` — validated the same way as `APP_BUNDLE_VERS`, plus each must be one
+of this run's own `vers`. Each candidate is planned and gated **before any write, even when
+`APP_BUNDLE_S3` is unset** (`validate-cell-model-plan`, a pure dry run): the local tile-width gate
+(`nc=3103`) and one-file-per-tile gate run on the LOCAL source tiles, every planned key is checked
+against the exact shape `^{ver}/serve/cell_model/tile=[0-9]+/data_0\.parquet$`
+(`app_bundle_assert_cell_model_keys()`), and a version already on S3 is refused outright
+(`app_bundle_cell_model_already_on_s3()`, one anonymous HEAD) — upload is all-or-nothing, never a
+partial overwrite. `app_bundle_assert_prefix()` (`libs/app_bundle.R`), a pure whitelist guard the
+push chunk runs on every candidate key before it ever reaches `aws s3 cp`, takes `allow_cell_model
+= TRUE` to admit `{ver}/serve/cell_model/` for THAT SAME `ver` — never a second, hardcoded version
+string. **Legacy releases (v1–v7b) need a DIFFERENT database than `msens::sdm_db_path(ver)` returns
+by default**: their local `sdm.duckdb` has no `model_asset`/`native_asset` table at all (it lives
+only in `serve.duckdb`'s views, or in the published `tables/model_asset.parquet`) — opening the
+wrong one is not an error, it just leaves every taxon's `merged` COG and `inputs[].assets` silently
+empty, so `build_app_bundle.qmd` probes (queries, not just lists) for a working asset table across
+`sdm.duckdb` → `serve.duckdb` → anonymous S3-attached `tables/*.parquet`, in that order, before
+giving up. A release that cannot supply a capability (no cell table, no `zone_metric` table, no
+merged COG asset) does not fail its gates, it SKIPS them with a reason (`app_bundle_gate_note()` /
+`app_bundle_gate_coverage()`); the notebook's gate-coverage table says which gates ran per version
+and why one didn't.
 
 ### Server gotchas (both cost real time)
 

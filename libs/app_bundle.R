@@ -110,9 +110,15 @@ app_bundle_valid_ver <- function(ver)
 #'   `ver` that is not this shape is refused outright, never regex-escaped
 #'   and used anyway (review round 2, gap 1: `ver = "v9/../v7"` used to build
 #'   a prefix a real key could legitimately start with)
-#' @param allow_v7_cell_model allow the one named exception (default `FALSE`)
+#' @param allow_cell_model allow keys under `{ver}/serve/cell_model/` too
+#'   (default `FALSE`). Round 3 (item 3): generalized from a literal, hardcoded
+#'   `"v7/serve/cell_model"` exception to `{ver}/serve/cell_model` — the SAME
+#'   `ver` this call is asserting, already validated above, never a second,
+#'   independently-trusted version string. A key for any OTHER version's
+#'   `serve/cell_model/` is still refused, because it fails the prefix match,
+#'   not because the version was hardcoded.
 #' @return `keys`, invisibly, when every key is allowed
-app_bundle_assert_prefix <- function(keys, ver, allow_v7_cell_model = FALSE) {
+app_bundle_assert_prefix <- function(keys, ver, allow_cell_model = FALSE) {
   if (!app_bundle_valid_ver(ver))
     stop(sprintf(
       "app_bundle_assert_prefix(): `ver` does not look like a version label (^v[0-9]+[a-z]?$) -- got %s",
@@ -127,15 +133,15 @@ app_bundle_assert_prefix <- function(keys, ver, allow_v7_cell_model = FALSE) {
 
   ok_app <- vapply(keys, .app_bundle_key_under_prefix, logical(1),
                    prefix = sprintf("%s/app", ver))
-  ok_cm  <- if (isTRUE(allow_v7_cell_model))
-    vapply(keys, .app_bundle_key_under_prefix, logical(1), prefix = "v7/serve/cell_model")
+  ok_cm  <- if (isTRUE(allow_cell_model))
+    vapply(keys, .app_bundle_key_under_prefix, logical(1), prefix = sprintf("%s/serve/cell_model", ver))
   else rep(FALSE, length(keys))
 
   bad <- keys[!(ok_app | ok_cm)]
   if (length(bad))
     stop(sprintf(
       "refusing to publish %d key(s) outside {%s/app/}%s:\n  %s%s",
-      length(bad), ver, if (isTRUE(allow_v7_cell_model)) " or v7/serve/cell_model/" else "",
+      length(bad), ver, if (isTRUE(allow_cell_model)) sprintf(" or %s/serve/cell_model/", ver) else "",
       paste(utils::head(bad, 10), collapse = "\n  "),
       if (length(bad) > 10) sprintf("\n  ... and %d more", length(bad) - 10) else ""),
       call. = FALSE)
@@ -162,9 +168,13 @@ app_bundle_assert_prefix_selftest <- function() {
     testthat::expect_silent(app_bundle_assert_prefix(
       c("v9/app/boot.json", "v9/app/taxon/00.json"), "v9"))
   })
-  testthat::test_that("ALLOWED: the v7 cell_model exception, named and enabled", {
+  testthat::test_that("ALLOWED: the cell_model exception, per-version, when enabled", {
     testthat::expect_silent(app_bundle_assert_prefix(
-      "v7/serve/cell_model/tile=0/data_0.parquet", "v7", allow_v7_cell_model = TRUE))
+      "v7/serve/cell_model/tile=0/data_0.parquet", "v7", allow_cell_model = TRUE))
+    # round 3 (item 3): generalized -- any registered version can use its OWN
+    # cell_model prefix when it asks for the exception, not just v7
+    testthat::expect_silent(app_bundle_assert_prefix(
+      "v7b/serve/cell_model/tile=0/data_0.parquet", "v7b", allow_cell_model = TRUE))
   })
 
   testthat::test_that("REFUSED: parent-directory traversal ('..' segment)", {
@@ -243,23 +253,29 @@ app_bundle_assert_prefix_selftest <- function() {
       app_bundle_assert_prefix("v9/serve/model_cell/mdl_id=1/data_0.parquet", "v9"),
       "refusing to publish")
   })
-  testthat::test_that("REFUSED: the v7 cell_model exception is OFF by default", {
+  testthat::test_that("REFUSED: the cell_model exception is OFF by default", {
     testthat::expect_error(
       app_bundle_assert_prefix("v7/serve/cell_model/tile=0/data_0.parquet", "v7"),
       "refusing to publish")
   })
-  testthat::test_that("REFUSED: the v7 exception does not generalize to the running version", {
-    # a copy-paste flag error (running v9 with the exception flag on) must still
-    # refuse a v9/serve/cell_model key -- the exception names v7 literally
+  testthat::test_that("REFUSED: the exception is scoped to THIS call's own `ver`, never another version's", {
+    # v7's exception must not admit a v9 key, and vice versa -- the prefix is
+    # built from `ver`, which is already validated, but a key for a DIFFERENT
+    # version smuggled into the same batch must still be refused
     testthat::expect_error(
-      app_bundle_assert_prefix("v9/serve/cell_model/tile=0/data_0.parquet", "v9",
-                               allow_v7_cell_model = TRUE),
+      app_bundle_assert_prefix("v9/serve/cell_model/tile=0/data_0.parquet", "v7",
+                               allow_cell_model = TRUE),
       "refusing to publish")
+    testthat::expect_error(
+      app_bundle_assert_prefix(c("v7/serve/cell_model/tile=0/data_0.parquet",
+                                 "v9/serve/cell_model/tile=0/data_0.parquet"),
+                               "v7", allow_cell_model = TRUE),
+      "1 key\\(s\\)")
   })
-  testthat::test_that("REFUSED: the v7 exception is itself whitelisted, not a bare prefix", {
+  testthat::test_that("REFUSED: the cell_model exception is itself whitelisted, not a bare prefix", {
     testthat::expect_error(
       app_bundle_assert_prefix("v7/serve/cell_model/../../app/x", "v7",
-                               allow_v7_cell_model = TRUE),
+                               allow_cell_model = TRUE),
       "refusing to publish")
   })
   testthat::test_that("the error names every offending key, not just the first", {
@@ -330,6 +346,110 @@ app_bundle_flag_selftest <- function() {
         once(bad, app_bundle_flag("APP_BUNDLE_FLAG_SELFTEST_VAR")),
         "not a recognized value")
     })
+  invisible(TRUE)
+}
+
+# ---- anonymous COG spot-check (species assets, read the way the app does) ---
+
+#' A reproducible sample of merged-COG URLs to spot-check anonymously
+#'
+#' ALL `sp_cat == "turtle"` taxa (a handful, always checked) plus up to
+#' `n_random` other taxa with a merged COG, sampled from the WRITTEN
+#' `taxon/*.json` shards — the exact bytes an app would fetch, not a query
+#' against the database.
+#'
+#' @param dir_out the built bundle's directory (has a `taxon/` subdir)
+#' @param n_random how many non-turtle taxa to sample (default 300)
+#' @param seed RNG seed, for a reproducible sample across runs
+#' @return data frame `key, url` — zero rows if there is no `taxon/` directory
+#'   or no taxon has a merged COG (a release this notebook should SKIP the
+#'   check for, not fail)
+app_bundle_cog_sample <- function(dir_out, n_random = 300, seed = 2026) {
+  taxon_dir <- file.path(dir_out, "taxon")
+  none <- data.frame(key = character(), url = character(), stringsAsFactors = FALSE)
+  if (!dir.exists(taxon_dir)) return(none)
+  turtles <- list(); others <- list()
+  for (f in list.files(taxon_dir, full.names = TRUE)) {
+    d <- jsonlite::fromJSON(f, simplifyVector = FALSE)
+    for (k in names(d$taxa)) {
+      taxon <- d$taxa[[k]]
+      m <- taxon$merged
+      url <- if (is.null(m$url)) "" else m$url
+      if (is.null(m) || !identical(m$type, "cog") || !nzchar(url)) next
+      if (identical(taxon$sp_cat, "turtle")) turtles[[k]] <- m$url else others[[k]] <- m$url
+    }
+  }
+  if (!length(turtles) && !length(others)) return(none)
+  old_seed <- if (exists(".Random.seed", envir = .GlobalEnv)) .Random.seed else NULL
+  set.seed(seed)
+  keys_o <- names(others)
+  samp   <- if (length(keys_o) > n_random) sample(keys_o, n_random) else keys_o
+  if (!is.null(old_seed)) assign(".Random.seed", old_seed, envir = .GlobalEnv)
+  data.frame(key = c(names(turtles), samp),
+            url = c(unlist(turtles, use.names = FALSE), unlist(others[samp], use.names = FALSE)),
+            stringsAsFactors = FALSE)
+}
+
+#' Anonymous HEAD each URL, in parallel, order preserved by construction
+#'
+#' Shells out to `curl`/`xargs` for speed (a few hundred URLs sequentially
+#' through `httr2` is slow); each output line carries BOTH its URL and its
+#' status code so `xargs -P`'s unordered completion can never misalign a
+#' status with the wrong URL.
+#'
+#' @param urls character vector
+#' @param timeout_s per-request timeout (seconds)
+#' @param parallel concurrent requests
+#' @return data frame `url, status` (integer; `NA` on a request that errored
+#'   or timed out), same length and order as `urls`
+app_bundle_head_check <- function(urls, timeout_s = 10, parallel = 12) {
+  if (!length(urls)) return(data.frame(url = character(), status = integer()))
+  # a helper SCRIPT FILE, not an inline `sh -c` string with {} substituted
+  # twice -- xargs's own {}-in-a-quoted-sh-c-string composition was measured to
+  # fail outright on macOS ("xargs: command line cannot be assembled, too
+  # long"), so each URL is passed as $1 to a tiny standalone script instead;
+  # {} is substituted exactly once, as xargs's own argument, never re-parsed
+  # by a nested shell.
+  helper <- tempfile(fileext = ".sh")
+  urls_f <- tempfile()
+  on.exit(unlink(c(helper, urls_f)), add = TRUE)
+  writeLines(c(
+    "#!/bin/sh",
+    "url=\"$1\"",
+    sprintf("st=$(curl -s -o /dev/null -w '%%{http_code}' --max-time %d -I \"$url\")",
+            as.integer(timeout_s)),
+    "printf '%s\\t%s\\n' \"$url\" \"$st\""), helper)
+  Sys.chmod(helper, "0755")
+  writeLines(urls, urls_f)
+  out <- system2("xargs", c("-P", as.integer(parallel), "-I{}", helper, "{}"),
+                stdin = urls_f, stdout = TRUE, stderr = FALSE)
+  parts <- strsplit(out, "\t", fixed = TRUE)
+  got_url <- vapply(parts, function(p) if (length(p) >= 1) p[1] else NA_character_, "")
+  got_st  <- vapply(parts, function(p) if (length(p) >= 2) p[2] else NA_character_, "")
+  m <- match(urls, got_url)
+  data.frame(url = urls, status = suppressWarnings(as.integer(got_st[m])), stringsAsFactors = FALSE)
+}
+
+#' Self-test for [app_bundle_head_check()] — real network, tiny sample
+#'
+#' No mocking: one known-anonymous-readable URL (this bucket's `latest.txt`,
+#' small and stable) and one URL that cannot resolve, so the round-trip is
+#' proven against the real thing rather than a fake server.
+#'
+#' @return `TRUE`, invisibly; stops on the first failed expectation
+app_bundle_head_check_selftest <- function() {
+  stopifnot(requireNamespace("testthat", quietly = TRUE))
+  good <- paste0(msens::atlas_base_url(), "/latest.txt")
+  bad  <- "https://s3.us-east-1.amazonaws.com/oceanmetrics.io-public/marine-atlas/does-not-exist-atlas1.txt"
+  testthat::test_that("order is preserved and status is correct for a real 200 and a real non-200", {
+    r <- app_bundle_head_check(c(bad, good, good, bad))
+    testthat::expect_identical(r$url, c(bad, good, good, bad))
+    testthat::expect_identical(r$status[c(2, 3)], c(200L, 200L))
+    testthat::expect_true(all(r$status[c(1, 4)] != 200L))
+  })
+  testthat::test_that("empty input returns zero rows, not an error", {
+    testthat::expect_equal(nrow(app_bundle_head_check(character(0))), 0L)
+  })
   invisible(TRUE)
 }
 
@@ -413,41 +533,311 @@ app_bundle_gzip_selftest <- function() {
 #' `programarea_key` are literal attribute columns in each, not something
 #' this function invents).
 #'
-#' A zone type whose source cannot be read (missing file, no such column) is
-#' OMITTED from the result, never given an empty vector — `app_units()`
-#' documents that a type absent from `geom_keys` is treated as "geometry not
-#' checked", not "geometry has no keys", so this failure mode degrades to the
-#' pre-review-fix behavior for that one type rather than hiding every unit.
+#' **Round 3 (2026-09-21): a missing/unreadable GeoPackage is now a HARD
+#' FAILURE, not a message-and-continue.** The graceful-degradation design in
+#' rounds 1-2 was right when the files genuinely did not exist anywhere on
+#' this laptop; now that all five of `data/zone_sets.csv`'s registered
+#' sources ARE present (copied from the server), a release publishing with
+#' `geom_keys` silently missing a zone type is no longer "the best this
+#' machine can do" — it is the exact bug D5 exists to prevent (v9's boot
+#' listed 5 subregion keys where only 4 -- AK/AT/GA/PA -- are drawable,
+#' because "no geometry to check against" silently meant "don't check").
+#' Every zone type the release's manifest names now MUST resolve, or this
+#' function stops, naming the missing/unreadable path.
 #'
 #' @param zones the release's zones table (`manifest_build()`'s `$zones`:
 #'   `fld`, `zone_set_key`, ...)
 #' @param zone_sets the zone-set registry (`data/zone_sets.csv`)
 #' @param dir_derived base directory each registry `source` path is relative to
-#' @return named list `zone_type -> character keys`
+#' @return named list `zone_type -> character keys`, one entry per row of
+#'   `zones` that carries a `zone_set_key` (`length(result) ==
+#'   sum(!is.na(zones$zone_set_key))` is asserted before returning); errors
+#'   otherwise, naming the exact path that could not be read
 app_bundle_geom_keys <- function(zones, zone_sets, dir_derived) {
   out <- list()
-  if (is.null(zones) || !nrow(zones) || !"zone_set_key" %in% names(zones)) return(out)
-  for (i in seq_len(nrow(zones))) {
-    fld <- zones$fld[i]
-    zsk <- zones$zone_set_key[i]
-    if (is.na(zsk) || !nzchar(zsk)) next
-    src_row <- zone_sets[zone_sets$zone_set_key == zsk, , drop = FALSE]
-    if (!nrow(src_row)) next
+  if (is.null(zones) || !nrow(zones)) return(out)
+  stopifnot("zones needs a zone_set_key column (pass zone_sets to manifest_build())" =
+              "zone_set_key" %in% names(zones))
+  want <- zones[!is.na(zones$zone_set_key) & nzchar(zones$zone_set_key), , drop = FALSE]
+  for (i in seq_len(nrow(want))) {
+    fld <- want$fld[i]
+    zsk <- want$zone_set_key[i]
     type <- sub("_key$", "", fld)
-    keys <- tryCatch({
-      if (!requireNamespace("sf", quietly = TRUE)) stop("package 'sf' not available")
-      path <- path.expand(file.path(dir_derived, src_row$source[1]))
-      if (!file.exists(path)) stop(sprintf("no GeoPackage at %s", path))
-      d <- sf::st_drop_geometry(sf::st_read(path, quiet = TRUE))
-      if (!fld %in% names(d)) stop(sprintf("no column '%s' in %s", fld, path))
-      sort(unique(as.character(d[[fld]])))
-    }, error = function(e) {
-      message(sprintf("app_bundle_geom_keys(): %s (%s) -- %s", zsk, type, conditionMessage(e)))
-      NULL
-    })
-    if (!is.null(keys)) out[[type]] <- keys
+    src_row <- zone_sets[zone_sets$zone_set_key == zsk, , drop = FALSE]
+    if (!nrow(src_row))
+      stop(sprintf(
+        "app_bundle_geom_keys(): zone_set_key '%s' (%s) has no row in the zone-set registry (data/zone_sets.csv)",
+        zsk, type), call. = FALSE)
+    path <- path.expand(file.path(dir_derived, src_row$source[1]))
+    if (!requireNamespace("sf", quietly = TRUE))
+      stop("app_bundle_geom_keys(): package 'sf' is required and is not available", call. = FALSE)
+    if (!file.exists(path))
+      stop(sprintf(
+        "app_bundle_geom_keys(): missing GeoPackage for zone_set_key '%s' (%s): %s does not exist -- ",
+        zsk, type, path),
+        "a release cannot publish units for a spatial unit whose drawable keys were never checked",
+        call. = FALSE)
+    d <- tryCatch(sf::st_drop_geometry(sf::st_read(path, quiet = TRUE)),
+                 error = function(e) stop(sprintf(
+                   "app_bundle_geom_keys(): could not read %s (zone_set_key '%s', %s): %s",
+                   path, zsk, type, conditionMessage(e)), call. = FALSE))
+    if (!fld %in% names(d))
+      stop(sprintf("app_bundle_geom_keys(): %s has no column '%s' (zone_set_key '%s', %s)",
+                   path, fld, zsk, type), call. = FALSE)
+    out[[type]] <- sort(unique(as.character(d[[fld]])))
   }
+  stopifnot(
+    "app_bundle_geom_keys(): resolved fewer zone types than the release's manifest names" =
+      length(out) == nrow(want))
   out
+}
+#' Self-test for [app_bundle_geom_keys()]
+#'
+#' Uses SCRATCH `zone_sets`/`zones` frames only — never touches the real
+#' registry or the real GeoPackages, so this is safe to run unattended. The
+#' "rename a GeoPackage away" seeded fault is exercised the same way: point a
+#' scratch registry row at a path that does not exist, which is exactly what
+#' a renamed-away file looks like to this function.
+#'
+#' @return `TRUE`, invisibly; stops on the first failed expectation
+app_bundle_geom_keys_selftest <- function() {
+  stopifnot(requireNamespace("testthat", quietly = TRUE))
+  scratch_gpkg <- function(keys, fld) {
+    stopifnot(requireNamespace("sf", quietly = TRUE))
+    p <- tempfile(fileext = ".gpkg")
+    d <- sf::st_sf(x = keys, geometry = sf::st_sfc(lapply(keys, function(k) sf::st_point(c(0, 0))), crs = 4326))
+    names(d)[1] <- fld
+    sf::st_write(d, p, quiet = TRUE)
+    p
+  }
+  testthat::test_that("resolves real keys from a real (scratch) GeoPackage", {
+    p <- scratch_gpkg(c("AA", "BB", "CC"), "ecoregion_key")
+    zone_sets <- data.frame(zone_set_key = "eco_test", source = basename(p), stringsAsFactors = FALSE)
+    zones <- data.frame(fld = "ecoregion_key", zone_set_key = "eco_test", stringsAsFactors = FALSE)
+    gk <- app_bundle_geom_keys(zones, zone_sets, dirname(p))
+    testthat::expect_identical(gk, list(ecoregion = c("AA", "BB", "CC")))
+    unlink(p)
+  })
+  testthat::test_that("REFUSED (round 3, seeded fault): GeoPackage path does not exist", {
+    zone_sets <- data.frame(zone_set_key = "eco_test", source = "does_not_exist.gpkg", stringsAsFactors = FALSE)
+    zones <- data.frame(fld = "ecoregion_key", zone_set_key = "eco_test", stringsAsFactors = FALSE)
+    testthat::expect_error(
+      app_bundle_geom_keys(zones, zone_sets, tempdir()),
+      "missing GeoPackage")
+  })
+  testthat::test_that("REFUSED: zone_set_key absent from the registry", {
+    zone_sets <- data.frame(zone_set_key = "other", source = "x.gpkg", stringsAsFactors = FALSE)
+    zones <- data.frame(fld = "ecoregion_key", zone_set_key = "eco_test", stringsAsFactors = FALSE)
+    testthat::expect_error(
+      app_bundle_geom_keys(zones, zone_sets, tempdir()),
+      "no row in the zone-set registry")
+  })
+  testthat::test_that("REFUSED: GeoPackage exists but lacks the fld column", {
+    p <- scratch_gpkg(c("AA", "BB"), "wrong_key")
+    zone_sets <- data.frame(zone_set_key = "eco_test", source = basename(p), stringsAsFactors = FALSE)
+    zones <- data.frame(fld = "ecoregion_key", zone_set_key = "eco_test", stringsAsFactors = FALSE)
+    testthat::expect_error(
+      app_bundle_geom_keys(zones, zone_sets, dirname(p)),
+      "no column")
+    unlink(p)
+  })
+  testthat::test_that("zones with no zone_set_key at all resolve to an empty (not erroring) result", {
+    zones <- data.frame(fld = "ecoregion_key", zone_set_key = NA_character_, stringsAsFactors = FALSE)
+    gk <- app_bundle_geom_keys(zones, data.frame(zone_set_key = character(), source = character()), tempdir())
+    testthat::expect_length(gk, 0)
+  })
+  invisible(TRUE)
+}
+
+# ---- per-unit geometry-consistency assertions (run AFTER app_bundle_build()) -
+
+#' Assert every drawable unit's keys are a subset of >= 2 of its real geometry
+#'
+#' The point of [app_bundle_geom_keys()] existing at all: this is the
+#' assertion that would have caught the original bug (v9's subregion unit
+#' listing 5 keys — a whole-study-area rollup included — when only 4 keys
+#' (`AK`, `AT`, `GA`, `PA`) are drawable, per its own GeoPackage).
+#'
+#' @param units `boot$units` (from a built bundle)
+#' @param geom_keys the SAME `geom_keys` passed to `app_bundle_build()`
+#' @return a data frame, one row per unit: `zone_type`, `n_keys`,
+#'   `n_keys_in_geometry`, `keys_ge_2`, `all_keys_in_geometry`
+app_bundle_assert_units_match_geometry <- function(units, geom_keys) {
+  rows <- lapply(units, function(u) {
+    gk <- geom_keys[[u$zone_type]]
+    ks <- as.character(u$keys)
+    in_geom <- if (is.null(gk)) rep(NA, length(ks)) else ks %in% gk
+    data.frame(zone_type = u$zone_type, n_keys = length(ks),
+              n_keys_in_geometry = sum(in_geom, na.rm = TRUE),
+              keys_ge_2 = length(ks) >= 2,
+              all_keys_in_geometry = if (is.null(gk)) NA else all(in_geom))
+  })
+  out <- do.call(rbind, rows)
+  stopifnot(
+    "a drawable unit has fewer than 2 keys" = nrow(out) == 0 || all(out$keys_ge_2),
+    "a drawable unit advertises a key absent from its own geometry" =
+      nrow(out) == 0 || all(out$all_keys_in_geometry, na.rm = TRUE))
+  out
+}
+
+# ---- gate coverage: which gates ran per version, and why one didn't (round 3 item 2) --
+#
+# Round 3 item 2: a release that cannot supply a capability (no cell table, no
+# zone_metric table, no merged COG, ...) must not FAIL its gates -- it must
+# SKIP them, with a reason, and the notebook's summary must say so explicitly
+# rather than the reader having to notice an empty table. Gates call
+# [app_bundle_gate_note()] themselves (right beside the same condition that
+# decides whether they run), so the coverage table can never drift from what
+# the gate actually did.
+
+.app_bundle_gate_coverage_env <- new.env(parent = emptyenv())
+.app_bundle_gate_coverage_env$rows <- list()
+
+#' Record whether a capability-conditioned gate ran for one version
+#'
+#' Call once per gate per version, right beside the `if` that decides it.
+#'
+#' @param gate short gate name, e.g. `"tile_width"`
+#' @param ver version label
+#' @param ran did the gate actually run its checks (not just get called)?
+#' @param reason why not, when `ran` is `FALSE` (ignored, and recorded as `""`, when `ran` is `TRUE`)
+#' @return `NULL`, invisibly
+app_bundle_gate_note <- function(gate, ver, ran, reason = "") {
+  .app_bundle_gate_coverage_env$rows[[length(.app_bundle_gate_coverage_env$rows) + 1L]] <-
+    data.frame(gate = gate, ver = ver, ran = isTRUE(ran),
+              reason = if (isTRUE(ran)) "" else reason, stringsAsFactors = FALSE)
+  invisible(NULL)
+}
+
+#' The gate-coverage table recorded so far this render
+#'
+#' @param reset clear the recorded rows after reading them (default `TRUE`, so
+#'   a second render in the same R session starts clean)
+#' @return data frame `gate, ver, ran, reason`
+app_bundle_gate_coverage <- function(reset = TRUE) {
+  out <- if (length(.app_bundle_gate_coverage_env$rows))
+    do.call(rbind, .app_bundle_gate_coverage_env$rows) else
+    data.frame(gate = character(), ver = character(), ran = logical(),
+              reason = character(), stringsAsFactors = FALSE)
+  if (reset) .app_bundle_gate_coverage_env$rows <- list()
+  out
+}
+
+# ---- serve/cell_model/ upload: local source, exact keys, guards, dry-run (round 3 item 3) --
+#
+# Generalized from a v7-only flag (`APP_BUNDLE_V7_CELLMODEL`) to an explicit
+# ALLOW-LIST parameter of version labels (default empty -- nothing is planned
+# unless asked for). Today's only two candidates are v7 and v7b: both
+# advertise a per-cell species list but have no tiles on S3 yet. v8/v9 are
+# never at risk even if mis-listed: they have no local `{ver}/cell_model/`
+# directory at all (their asset registry lives in the database, not a
+# filesystem export), so [app_bundle_cell_model_dir()] returns `NA` for them
+# and the plan below refuses with a "no local source directory" reason before
+# any key is even constructed.
+
+#' The local `cell_model/` source directory for a version, or `NA`
+#'
+#' @param ver version label
+#' @param dir_derived the machine's derived-data root (`~/_big/msens/derived`
+#'   on the laptop, `/share/data/derived` on the server)
+#' @return the directory path if it exists, else `NA_character_`
+app_bundle_cell_model_dir <- function(ver, dir_derived) {
+  d <- file.path(path.expand(dir_derived), ver, "cell_model")
+  if (dir.exists(d)) d else NA_character_
+}
+
+#' The exact keys + byte total `serve/cell_model/` would upload for one version
+#'
+#' A pure directory walk -- never writes, never touches S3.
+#'
+#' @return `list(ver, dir, keys, bytes, n_tiles)`; `keys` is `character(0)`
+#'   when there is no local source directory
+app_bundle_cell_model_plan <- function(ver, dir_derived) {
+  d <- app_bundle_cell_model_dir(ver, dir_derived)
+  if (is.na(d))
+    return(list(ver = ver, dir = NA_character_, keys = character(0), bytes = 0, n_tiles = 0L))
+  files <- list.files(d, recursive = TRUE, full.names = TRUE)
+  rels  <- fs::path_rel(files, d)
+  keys  <- as.character(glue::glue("{ver}/serve/cell_model/{rels}"))
+  list(ver = ver, dir = d, keys = keys, bytes = sum(file.size(files)),
+       n_tiles = length(list.dirs(d, full.names = TRUE, recursive = FALSE)))
+}
+
+#' Assert every planned `serve/cell_model/` key matches the EXACT tile shape
+#'
+#' `^{ver}/serve/cell_model/tile=[0-9]+/data_0\.parquet$` -- exactly, nothing
+#' else (no second file per tile, no other filename, no nesting, no other
+#' version's prefix smuggled into `ver`). Stops naming the count and the first
+#' offending key.
+#'
+#' @param keys character vector of proposed S3 keys
+#' @param ver version label (checked for shape FIRST, before any key is
+#'   matched against it -- same discipline as [app_bundle_assert_prefix()])
+#' @return `TRUE`, invisibly, if every key matches
+app_bundle_assert_cell_model_keys <- function(keys, ver) {
+  stopifnot("ver must match ^v[0-9]+[a-z]?$" = app_bundle_valid_ver(ver))
+  pat <- sprintf("^%s/serve/cell_model/tile=[0-9]+/data_0\\.parquet$", ver)
+  bad <- keys[!grepl(pat, keys)]
+  if (length(bad))
+    stop(sprintf(
+      "app_bundle_assert_cell_model_keys(): %d of %d key(s) do not match %s -- first: %s",
+      length(bad), length(keys), pat, bad[1]), call. = FALSE)
+  invisible(TRUE)
+}
+
+#' Refuse a version whose `serve/cell_model/` already has objects on S3
+#'
+#' The upload is all-or-nothing per version, never a partial refresh: if the
+#' FIRST tile (`tile=0/data_0.parquet`) already answers 200 anonymously, the
+#' whole version is refused rather than risk a silent partial overwrite.
+#'
+#' @param ver version label
+#' @param base atlas base URL ([msens::atlas_base_url()])
+#' @return `TRUE` if already present (should be refused), `FALSE` if clear
+app_bundle_cell_model_already_on_s3 <- function(ver, base) {
+  url <- as.character(glue::glue("{base}/{ver}/serve/cell_model/tile=0/data_0.parquet"))
+  st  <- app_bundle_head_check(url)$status
+  isTRUE(length(st) == 1 && !is.na(st) && st == 200L)
+}
+
+#' Self-test for the `serve/cell_model/` key-shape guard (offline, no network)
+#'
+#' @return `TRUE`, invisibly; stops on the first failed expectation
+app_bundle_cell_model_selftest <- function() {
+  stopifnot(requireNamespace("testthat", quietly = TRUE))
+  testthat::test_that("exactly-shaped keys are accepted", {
+    good <- c("v7/serve/cell_model/tile=0/data_0.parquet",
+             "v7/serve/cell_model/tile=427/data_0.parquet")
+    testthat::expect_true(app_bundle_assert_cell_model_keys(good, "v7"))
+  })
+  testthat::test_that("a second file in a tile directory is refused", {
+    bad <- c("v7/serve/cell_model/tile=0/data_0.parquet",
+            "v7/serve/cell_model/tile=0/data_1.parquet")
+    testthat::expect_error(app_bundle_assert_cell_model_keys(bad, "v7"), "do not match")
+  })
+  testthat::test_that("a key stamped with a DIFFERENT version than `ver` is refused", {
+    testthat::expect_error(
+      app_bundle_assert_cell_model_keys("v9/serve/cell_model/tile=0/data_0.parquet", "v7"),
+      "do not match")
+  })
+  testthat::test_that("nesting or an extra path segment is refused", {
+    testthat::expect_error(
+      app_bundle_assert_cell_model_keys("v7/serve/cell_model/tile=0/sub/data_0.parquet", "v7"),
+      "do not match")
+  })
+  testthat::test_that("a malformed `ver` is refused before any key is even matched", {
+    testthat::expect_error(app_bundle_assert_cell_model_keys(character(0), "v9/../v7"),
+                           "must match")
+  })
+  testthat::test_that("a version with no local cell_model/ directory plans zero keys", {
+    d <- tempfile("app_bundle_cm_")
+    dir.create(d)
+    on.exit(unlink(d, recursive = TRUE), add = TRUE)
+    plan <- app_bundle_cell_model_plan("v9", d)
+    testthat::expect_length(plan$keys, 0)
+    testthat::expect_true(is.na(plan$dir))
+  })
+  invisible(TRUE)
 }
 
 # ---- the one place the atlas-1 subplan's per-object budgets live ------------

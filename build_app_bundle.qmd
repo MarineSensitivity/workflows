@@ -29,15 +29,52 @@ gated behind `APP_BUNDLE_S3=1` (unset by default) exactly like every other side-
 this repo (`../CLAUDE.md` reproducibility rule 1) — this notebook can be rendered top to bottom,
 safely, with no S3 credentials and no network write of any kind.
 
+**Rendering.** `quarto render build_app_bundle.qmd` — with or without an explicit `--output` —
+always writes its HTML BESIDE THE SOURCE (`./build_app_bundle.html`), never into `_output/`
+despite this project's `_quarto.yml` `output-dir: _output` (confirmed empirically 2026-09-21: a
+project-wide render like `scripts/run_version.sh` respects it, a single ad hoc `quarto render` of
+THIS file does not — a quirk of quarto's single-file vs. project render path, not this notebook).
+The documented, ONE-TRUE command therefore always ends in a move — never render this file any
+other way, and never leave the moved file's name as the version-less default:
+
+```sh
+APP_BUNDLE_VERS=v7 quarto render build_app_bundle.qmd && \
+  mv -f build_app_bundle.html _output/build_app_bundle_v7.html && \
+  rm -rf build_app_bundle_files
+```
+
+`scripts/render_app_bundle.sh <ver> [ver ...]` wraps exactly this (one version at a time,
+sequentially, in the background — see its header for why: a foreground `quarto render` here runs
+90–190s per legacy release and longer per v8/v9, and this notebook must never be waited on in a
+chat turn) and is the only invocation that should be used from here on.
+
 `APP_BUNDLE_VERS=v7,v9` narrows a run to that set (comma-separated); unset, every version in
-`data/versions.csv` is attempted, and a version whose release database is not on this machine is
+`data/versions.csv` is attempted (v1, v2, v3, v4, v4b, v5, v6, v7, v7b, v8, v9 — **not** v3b, which
+is not a registered release), and a version whose release database is not on this machine is
 **skipped, not failed** (the same convention `build_version_manifest.qmd`'s `caps_override`
-uses: a capability this run cannot see is `FALSE`, never invented). `APP_BUNDLE_V7_CELLMODEL=1`
-additionally uploads v7's missing `serve/cell_model/` (757 MB locally, absent from S3 today even
-though v7's manifest advertises `cell_species_list: true` — the atlas-1 "Facts" note) under its
-own flag, separate from the ordinary `{ver}/app/` push. Both flags are strict
-([app_bundle_flag()]): only exactly `1` turns them on — `0`, `true`, `false`, `no`, anything else
-STOPS the render naming the variable, rather than guessing.
+uses: a capability this run cannot see is `FALSE`, never invented). Every entry is checked
+against BOTH the version-label shape (`^v[0-9]+[a-z]?$`) AND membership in `data/versions.csv` —
+round 3 (2026-09-21): shape alone let a shape-valid-but-unregistered label (e.g. `v3b`) silently
+build a bundle for a release that does not exist.
+
+`APP_BUNDLE_CELLMODEL_VERS=v7,v7b` (round 3: generalized from the single, v7-only
+`APP_BUNDLE_V7_CELLMODEL` flag) additionally uploads the named version(s)' missing
+`serve/cell_model/` — today v7 (757 MB locally, 428 tiles) and v7b (753 MB locally, 428 tiles),
+both absent from S3 despite their manifest advertising `cell_species_list: true` (the atlas-1
+"Facts" note). Default empty (nothing planned). Every entry is validated the same way as
+`APP_BUNDLE_VERS` (shape + registry) and must also be one of THIS run's `vers`; each version's
+plan is then checked — local tile-width (nc=3103) and one-file-per-tile gates, the exact key
+shape `^{ver}/serve/cell_model/tile=[0-9]+/data_0\.parquet$`, and an anonymous HEAD refusing any
+version whose tiles already exist on S3 — **before** any upload, in [validate-cell-model-plan]
+below, which runs even when `APP_BUNDLE_S3` is unset (a pure dry run: it prints the exact key list
+and byte total per version and writes nothing). v8 and v9 are never at risk even if
+mis-listed: neither has a local `{ver}/cell_model/` export (their asset registry lives in the
+database, not a filesystem directory), so the plan refuses them with "no local source directory"
+before a single key is constructed.
+
+Both `APP_BUNDLE_S3` and `APP_BUNDLE_V7_CELLMODEL`'s replacement are strict
+([app_bundle_flag()]/allow-list validation): `APP_BUNDLE_S3` only exactly `1` turns it on — `0`,
+`true`, `false`, `no`, anything else STOPS the render naming the variable, rather than guessing.
 
 **Two things worth saying out loud so nobody "fixes" them.** First, a `restricted` release gets
 **exactly the same objects** under `{ver}/app/` as a `public` one — the review gate that matters is
@@ -111,19 +148,50 @@ bad_vers <- vers[!vapply(vers, app_bundle_valid_ver, logical(1))]
 if (length(bad_vers))
   stop(sprintf("APP_BUNDLE_VERS contains invalid version label(s): %s (must match ^v[0-9]+[a-z]?$)",
                paste(bad_vers, collapse = ", ")), call. = FALSE)
+# round 3 item 2: shape alone is not enough -- v3b is shape-valid but is NOT a
+# registered release (skipped per the owner's explicit instruction), and any
+# other shape-valid-but-unregistered label would otherwise silently build a
+# bundle for a release that doesn't exist in data/versions.csv
+unreg_vers <- setdiff(vers, versions_csv$ver)
+if (length(unreg_vers))
+  stop(sprintf(
+    "APP_BUNDLE_VERS contains version label(s) not registered in data/versions.csv: %s (registered: %s)",
+    paste(unreg_vers, collapse = ", "), paste(versions_csv$ver, collapse = ", ")), call. = FALSE)
 
 # strict: exactly "1" is on, unset/"" is off, anything else (0/true/false/no/...)
 # STOPS the render naming the variable -- see libs/app_bundle.R::app_bundle_flag()
 do_s3       <- app_bundle_flag("APP_BUNDLE_S3")          # push to S3 (default OFF)
-do_v7_cm    <- app_bundle_flag("APP_BUNDLE_V7_CELLMODEL") # also upload v7's serve/cell_model/
 base        <- msens::atlas_base_url()
 dir_derived <- if (Sys.info()[["sysname"]] == "Linux") "/share/data/derived" else "~/_big/msens/derived"
 dir_out_root <- here("_output", "app_bundle")                 # gitignored (see .gitignore)
 fs::dir_create(dir_out_root)
 
+# round 3 item 3: generalized from the single v7-only APP_BUNDLE_V7_CELLMODEL
+# flag to an explicit allow-list of version labels -- validated exactly like
+# APP_BUNDLE_VERS above (shape + registry), PLUS must be inside this run's own
+# `vers` (uploading cell_model for a version this run did not even build makes
+# no sense). Default empty: nothing is planned unless asked for.
+narrow_cm   <- Sys.getenv("APP_BUNDLE_CELLMODEL_VERS")
+cm_vers     <- if (nzchar(narrow_cm)) trimws(strsplit(narrow_cm, ",")[[1]]) else character(0)
+bad_cm_vers <- cm_vers[!vapply(cm_vers, app_bundle_valid_ver, logical(1))]
+if (length(bad_cm_vers))
+  stop(sprintf(
+    "APP_BUNDLE_CELLMODEL_VERS contains invalid version label(s): %s (must match ^v[0-9]+[a-z]?$)",
+    paste(bad_cm_vers, collapse = ", ")), call. = FALSE)
+unreg_cm_vers <- setdiff(cm_vers, versions_csv$ver)
+if (length(unreg_cm_vers))
+  stop(sprintf(
+    "APP_BUNDLE_CELLMODEL_VERS contains version label(s) not registered in data/versions.csv: %s",
+    paste(unreg_cm_vers, collapse = ", ")), call. = FALSE)
+notinrun_cm_vers <- setdiff(cm_vers, vers)
+if (length(notinrun_cm_vers))
+  stop(sprintf(
+    "APP_BUNDLE_CELLMODEL_VERS names version(s) outside this run's APP_BUNDLE_VERS scope (%s): %s",
+    paste(vers, collapse = ", "), paste(notinrun_cm_vers, collapse = ", ")), call. = FALSE)
+
 message(glue(
-  "versions: {paste(vers, collapse = ', ')}  push_s3={do_s3}  v7_cell_model={do_v7_cm}  ",
-  "base={base}"))
+  "versions: {paste(vers, collapse = ', ')}  push_s3={do_s3}  ",
+  "cell_model_vers={if (length(cm_vers)) paste(cm_vers, collapse = ',') else '(none)'}  base={base}"))
 ```
 
 **Which database.** `msens::sdm_db_path(ver)` returns the release's build database, and prefers
@@ -237,14 +305,20 @@ app_bundle_open_scoring <- function(ver)
 ## Guard: the push may never write outside `{ver}/app/`, and a publish flag is never guessed at
 
 Run once, at render time, so the render itself is the proof — not just a definition nobody
-exercised. `app_bundle_assert_prefix()` (whitelist, not blocklist) and `app_bundle_flag()` are both
-pure: no S3, no side effect.
+exercised. `app_bundle_assert_prefix()`, `app_bundle_flag()`, `app_bundle_assert_cell_model_keys()`
+and `app_bundle_geom_keys()`'s own selftest are pure/offline (no S3, no side effect);
+`app_bundle_head_check()`'s selftest is the one exception — it makes two real anonymous HTTPS HEAD
+requests (one known-200, one known-non-200) to prove the URL/status pairing is never misaligned by
+`xargs -P`'s out-of-order completion, which is exactly the hazard this function exists to close.
 
 ```{r}
 #| label: guard-selftest
 app_bundle_assert_prefix_selftest()
 app_bundle_flag_selftest()
 app_bundle_gzip_selftest()
+app_bundle_geom_keys_selftest()
+app_bundle_cell_model_selftest()
+app_bundle_head_check_selftest()
 ```
 
 ## Build
@@ -309,7 +383,14 @@ build_one <- function(ver) {
     zone_sets$zone_set_key)
   mfst <- msens::manifest_build(con, ver, status = status, access = access, base = base,
                                 metrics = metrics, zone_tiles = zone_tiles, zone_sets = zone_sets)
+  # round 3: a missing/unreadable GeoPackage is now a HARD FAILURE inside
+  # app_bundle_geom_keys() itself (it stops, naming the path); this outer
+  # stopifnot is the second, notebook-level check the review asked for --
+  # every zone the manifest names must resolve an entry, full stop.
   geom_keys <- app_bundle_geom_keys(mfst$zones, zone_sets, dir_derived)
+  stopifnot(
+    "geom_keys resolved fewer entries than the manifest names zones (round-3 hard-fail)" =
+      length(geom_keys) == nrow(mfst$zones))
 
   out <- tryCatch(
     msens::app_bundle_build(con, ver, dir_out, manifest = mfst, base = base,
@@ -321,6 +402,12 @@ build_one <- function(ver) {
   if (!is.null(out) && length(out$failed))
     for (nm in names(out$failed))
       log_warn("{ver}: stage '{nm}' FAILED: {substr(out$failed[[nm]], 1, 300)}")
+
+  # every drawable unit's keys must be a subset of >= 2 of its REAL geometry
+  # (the assertion the original bug -- 5 subregion keys where only 4 are
+  # drawable -- would have failed had it existed)
+  geom_check <- if (!is.null(out) && !is.null(out$boot))
+    app_bundle_assert_units_match_geometry(out$boot$units, geom_keys) else tibble()
 
   txm_ok <- FALSE
   if (!is.null(out)) {
@@ -336,7 +423,7 @@ build_one <- function(ver) {
   }
 
   list(ver = ver, ok = !is.null(out), dir_out = dir_out, con_db = opened$db, manifest = mfst,
-       geom_keys = geom_keys, out = out, taxonomy_ok = txm_ok,
+       geom_keys = geom_keys, geom_check = geom_check, out = out, taxonomy_ok = txm_ok,
        n_failed_stages = if (is.null(out)) NA_integer_ else length(out$failed),
        wall_s = as.numeric(Sys.time() - t0, units = "secs"))
 }
@@ -355,6 +442,39 @@ stopifnot(
     all(build_tbl$ok),
   "at least one app_bundle_build() STAGE failed" = all(build_tbl$n_failed_stages == 0, na.rm = TRUE),
   "taxonomy.parquet failed for at least one version" = all(build_tbl$taxonomy_ok))
+```
+
+### Every drawable unit's keys are a subset of >= 2 keys in its REAL geometry
+
+Round 3's fix: `geom_keys` used to resolve empty (message + continue) when a zone GeoPackage was
+missing, so `app_units()`'s own `>= 2 keys in the geometry` check was silently skipped for every
+type — v9's `boot.json` listed **5** subregion keys where only **`AK`, `AT`, `GA`, `PA`** (4) are
+actually drawable. `app_bundle_geom_keys()` now hard-fails on a missing/unreadable GeoPackage
+(seeded fault verified 2026-09-21: renaming `v1/ply_ecoregions_2025.gpkg` away made this render
+STOP with `app_bundle_geom_keys(): missing GeoPackage for zone_set_key 'ecoregion_2025-06'
+(ecoregion): .../v1/ply_ecoregions_2025.gpkg does not exist`; file restored before this render).
+
+```{r}
+#| label: validate-geom-keys
+
+geom_check_tbl <- bind_rows(lapply(builds, function(b) {
+  if (!nrow(b$geom_check)) return(tibble())
+  cbind(ver = b$ver, b$geom_check)
+}))
+knitr::kable(geom_check_tbl,
+             caption = "Drawable units vs their real GeoPackage keys (keys_ge_2 and all_keys_in_geometry must be TRUE)")
+
+# the literal keys per unit, for the subregion case specifically named in the review
+unit_keys_tbl <- bind_rows(lapply(builds, function(b) {
+  if (is.null(b$out) || is.null(b$out$boot)) return(tibble())
+  bind_rows(lapply(b$out$boot$units, function(u)
+    data.frame(ver = b$ver, zone_type = u$zone_type, n_keys = length(u$keys),
+              keys = paste(sort(unlist(u$keys)), collapse = ","))))
+}))
+knitr::kable(unit_keys_tbl, caption = "Every drawable unit's actual keys, per version")
+stopifnot(
+  "a drawable unit failed the geometry-consistency check" =
+    nrow(geom_check_tbl) == 0 || (all(geom_check_tbl$keys_ge_2) && all(geom_check_tbl$all_keys_in_geometry)))
 ```
 
 ## Validate
@@ -481,7 +601,12 @@ this gate now FAILS the render on any tile directory with anything other than ex
 #| label: validate-one-file-per-tile
 
 one_file_per_tile_gate <- function(b) {
-  if (!isTRUE(b$ok) || is.null(b$out$tiles)) return(tibble())
+  if (!isTRUE(b$ok) || is.null(b$out$tiles)) {
+    app_bundle_gate_note("one_file_per_tile", b$ver, FALSE, if (!isTRUE(b$ok))
+      "build did not complete" else "release has no cell table (no tiles were built)")
+    return(tibble())
+  }
+  app_bundle_gate_note("one_file_per_tile", b$ver, TRUE)
   d <- file.path(b$dir_out, "cell")
   tiledirs <- list.dirs(d, full.names = TRUE, recursive = FALSE)
   n_files <- vapply(tiledirs, function(td) length(list.files(td, pattern = "\\.parquet$")), integer(1))
@@ -507,7 +632,12 @@ stopifnot(
 #| label: validate-tile-width
 
 tile_width_gate <- function(b) {
-  if (!isTRUE(b$ok) || is.null(b$out$tiles)) return(tibble())
+  if (!isTRUE(b$ok) || is.null(b$out$tiles)) {
+    app_bundle_gate_note("tile_width", b$ver, FALSE, if (!isTRUE(b$ok))
+      "build did not complete" else "release has no cell table (no tiles were built)")
+    return(tibble())
+  }
+  app_bundle_gate_note("tile_width", b$ver, TRUE)
   ncol_real <- b$out$tiles$ncol
   ncol_wrong <- if (ncol_real == 7200L) 3103L else 7200L
   ok_real  <- tryCatch({ msens::app_cell_tile_check(file.path(b$dir_out, "cell"), ncol_real); TRUE },
@@ -535,7 +665,13 @@ invisible to this query exactly as they are to the app.
 #| label: validate-digest
 
 digest_gate <- function(b, ver) {
-  if (!isTRUE(b$ok) || is.null(b$out$tiles)) return(tibble())
+  if (!isTRUE(b$ok) || is.null(b$out$tiles)) {
+    app_bundle_gate_note("digest", ver, FALSE, if (!isTRUE(b$ok))
+      "build did not complete" else
+      "release has no cell table (no tiles were built, so no per-metric digest to check)")
+    return(tibble())
+  }
+  app_bundle_gate_note("digest", ver, TRUE)
   con <- app_bundle_open_scoring(ver)
   on.exit(DBI::dbDisconnect(con, shutdown = TRUE), add = TRUE)
   duckdb_tune(con, file.path(tempdir(), "app_bundle_spill_digest", ver))
@@ -568,9 +704,22 @@ stopifnot(
 #| label: validate-zone-metrics
 
 zone_metric_gate <- function(b, ver) {
-  if (!isTRUE(b$ok) || is.null(b$out$boot)) return(tibble())
+  if (!isTRUE(b$ok) || is.null(b$out$boot)) {
+    app_bundle_gate_note("zone_metric", ver, FALSE, if (!isTRUE(b$ok))
+      "build did not complete" else "release has no boot.json (build did not reach that stage)")
+    return(tibble())
+  }
   con <- app_bundle_open_scoring(ver)
   on.exit(DBI::dbDisconnect(con, shutdown = TRUE), add = TRUE)
+  # round 3 item 2: a release with no zone_metric table would otherwise hit
+  # the JOIN below and ERROR (unknown table), not gracefully return zero rows
+  # -- this is exactly the "no capability -> SKIP, don't fail" case, caught
+  # BEFORE the query rather than relying on the query to fail safely
+  if (!"zone_metric" %in% DBI::dbListTables(con)) {
+    app_bundle_gate_note("zone_metric", ver, FALSE, "release has no zone_metric table")
+    return(tibble())
+  }
+  app_bundle_gate_note("zone_metric", ver, TRUE)
   duckdb_tune(con, file.path(tempdir(), "app_bundle_spill_zm", ver))
   vm <- msens::sdm_val_col(con, "zone_metric"); vz <- msens::sdm_val_col(con, "zone")
   pub <- DBI::dbGetQuery(con, glue::glue("
@@ -606,7 +755,12 @@ published bytes anyway, not what the builder happened to hold before writing the
 #| label: validate-sets
 
 set_gates <- function(b, ver) {
-  if (!isTRUE(b$ok) || is.null(b$out$boot)) return(tibble())
+  if (!isTRUE(b$ok) || is.null(b$out$boot)) {
+    app_bundle_gate_note("sets", ver, FALSE, if (!isTRUE(b$ok))
+      "build did not complete" else "release has no boot.json (build did not reach that stage)")
+    return(tibble())
+  }
+  app_bundle_gate_note("sets", ver, TRUE)
   con <- app_bundle_open_scoring(ver)
   on.exit(DBI::dbDisconnect(con, shutdown = TRUE), add = TRUE)
   cell_keys  <- sort(unique(msens:::.app_cell_metric_keys(con)))
@@ -644,6 +798,75 @@ set_gates <- function(b, ver) {
 }
 sets_tbl <- purrr::imap(builds, set_gates) |> bind_rows()
 knitr::kable(sets_tbl, caption = "Set-equality gates: layers, taxon shard keys, alias targets")
+```
+
+### Anonymous COG spot-check (species assets) — SKIPS, with a reason, when a release has no merged COG
+
+Formalizes what was previously an ad-hoc post-render `curl` script into a real notebook gate.
+Samples ALL `sp_cat == "turtle"` taxa (a handful, always checked in full) plus up to 300 other
+taxa, from the WRITTEN `taxon/*.json` shards ([app_bundle_cog_sample()]) — the exact bytes an app
+would fetch, not a query against the database — then HEADs each URL anonymously, in parallel
+([app_bundle_head_check()]). `xargs -P`'s workers finish in an unpredictable order, so each result
+line carries both its URL and its status code and is re-associated by CONTENT, never by position —
+a naive positional read would silently pair the wrong status with the wrong URL under load. A
+release whose written bundle has no taxon with a merged COG (no asset registry — `model_asset` /
+`native_asset` — was reachable at build time; see [app_bundle_open()]'s 3-tier probe above) SKIPS
+this gate with that reason rather than failing it: there is nothing to check, which is not the same
+as everything being broken.
+
+```{r}
+#| label: validate-cog-sample
+
+cog_gate <- function(b) {
+  none <- function(reason) data.frame(
+    ver = b$ver, ran = FALSE, reason = reason, n_sampled = NA_integer_,
+    n_checked = NA_integer_, n_200 = NA_integer_, n_bad = NA_integer_,
+    worst_status = NA_integer_, worst_url = NA_character_)
+  if (!isTRUE(b$ok)) {
+    app_bundle_gate_note("cog_species_spotcheck", b$ver, FALSE, "build did not complete")
+    return(none("build did not complete"))
+  }
+  samp <- app_bundle_cog_sample(b$dir_out)
+  if (!nrow(samp)) {
+    reason <- "no taxon in this release's written bundle carries a merged COG (no asset registry at build time)"
+    app_bundle_gate_note("cog_species_spotcheck", b$ver, FALSE, reason)
+    return(none(reason))
+  }
+  app_bundle_gate_note("cog_species_spotcheck", b$ver, TRUE)
+  chk <- app_bundle_head_check(samp$url)
+  bad <- chk[is.na(chk$status) | chk$status != 200L, , drop = FALSE]
+  data.frame(ver = b$ver, ran = TRUE, reason = "", n_sampled = nrow(samp), n_checked = nrow(chk),
+             n_200 = sum(chk$status == 200L, na.rm = TRUE), n_bad = nrow(bad),
+             worst_status = if (nrow(bad)) bad$status[1] else NA_integer_,
+             worst_url = if (nrow(bad)) bad$url[1] else NA_character_)
+}
+cog_tbl <- bind_rows(lapply(builds, cog_gate))
+knitr::kable(cog_tbl, caption = paste(
+  "Anonymous COG spot-check (all turtle taxa + up to 300 random others);",
+  "ran=FALSE with a reason is a SKIP, not a failure"))
+stopifnot(
+  "an anonymous COG spot-check found a non-200 response for a version that DOES have merged COGs" =
+    nrow(cog_tbl) == 0 || all(!cog_tbl$ran | cog_tbl$n_bad == 0))
+```
+
+### Gate coverage — which capability-conditioned gates ran per version, and why one was skipped
+
+Every gate above that can legitimately have nothing to check ([one_file_per_tile_gate],
+[tile_width_gate], [digest_gate], `zone_metric_gate`, `set_gates`, `cog_gate`) calls
+[app_bundle_gate_note()] right beside the condition that decides whether it runs, so this table can
+never drift from what the gates actually did.
+
+```{r}
+#| label: validate-gate-coverage
+
+gate_coverage_tbl <- app_bundle_gate_coverage()
+knitr::kable(gate_coverage_tbl,
+             caption = "Capability-conditioned gates: ran (TRUE/FALSE) per version, and the reason when FALSE")
+stopifnot(
+  "every attempted version must have exactly one coverage row per capability-conditioned gate" =
+    nrow(gate_coverage_tbl) == 0 ||
+    (setequal(unique(gate_coverage_tbl$ver), vers) &&
+     length(unique(table(gate_coverage_tbl$ver))) == 1L))
 ```
 
 ## Budgets (bytes vs the subplan's per-object budgets — FAILS the render, not just flags)
@@ -737,13 +960,81 @@ summary_tbl <- bind_rows(purrr::map(builds, summary_one))
 knitr::kable(summary_tbl, caption = "Per-version summary: objects, raw/gzip-estimated bytes, taxa, tiles, wall clock")
 ```
 
+## `serve/cell_model/` upload plan (allow-listed versions only) — local gates, dry-run, never a write
+
+Round 3 item 3: generalized from a single v7-only flag to an explicit ALLOW-LIST parameter
+(`APP_BUNDLE_CELLMODEL_VERS`, default empty). This chunk always runs, even when `APP_BUNDLE_S3` is
+unset — it is a pure dry run: a local directory walk plus one anonymous HEAD per allow-listed
+version, nothing is ever written here. Per version: the local tile-width gate (`nc=3103`) and
+one-file-per-tile gate run on the LOCAL source tiles [app_bundle_cell_model_plan()], every planned
+key is checked against the EXACT shape `^{ver}/serve/cell_model/tile=[0-9]+/data_0\.parquet$`
+[app_bundle_assert_cell_model_keys()], and the version is refused outright if its cell_model is
+ALREADY on S3 [app_bundle_cell_model_already_on_s3()] — upload is all-or-nothing, never a partial
+overwrite. v8/v9 are refused before any of that even runs: neither has a local `{ver}/cell_model/`
+export (verified 2026-09-21: `~/_big/msens/derived/v9/cell_model` does not exist on this machine),
+so [app_bundle_cell_model_dir()] returns `NA` and the plan reports "no local source directory".
+
+```{r}
+#| label: validate-cell-model-plan
+
+cm_plan_one <- function(ver) {
+  plan <- app_bundle_cell_model_plan(ver, dir_derived)
+  if (!length(plan$keys))
+    return(data.frame(ver = ver, n_tiles = 0L, n_keys = 0L, bytes = 0, keys_ok = NA,
+                      one_file_per_tile_ok = NA, tile_width_ok = NA, already_on_s3 = NA,
+                      clear_to_upload = FALSE,
+                      reason = sprintf("no local source directory (%s)",
+                                       file.path(dir_derived, ver, "cell_model"))))
+  keys_ok <- isTRUE(tryCatch({ app_bundle_assert_cell_model_keys(plan$keys, ver); TRUE },
+                             error = function(e) { message(conditionMessage(e)); FALSE }))
+  tiledirs <- list.dirs(plan$dir, full.names = TRUE, recursive = FALSE)
+  n_files  <- vapply(tiledirs, function(td) length(list.files(td, pattern = "\\.parquet$")), integer(1))
+  one_ok   <- length(n_files) > 0 && all(n_files == 1L)
+  tw_ok    <- isTRUE(tryCatch({ msens::app_cell_tile_check(plan$dir, 3103L); TRUE },
+                              error = function(e) { message(conditionMessage(e)); FALSE }))
+  already  <- app_bundle_cell_model_already_on_s3(ver, base)
+  clear    <- isTRUE(keys_ok) && isTRUE(one_ok) && isTRUE(tw_ok) && !isTRUE(already)
+  reason   <- if (!isTRUE(keys_ok)) "a key failed the exact tile-filename shape check" else
+              if (!isTRUE(one_ok)) "a local tile directory has zero or multiple .parquet files" else
+              if (!isTRUE(tw_ok))  "a local tile failed the width check (nc=3103)" else
+              if (isTRUE(already)) "already present on S3 (refusing to overwrite)" else ""
+  data.frame(ver = ver, n_tiles = plan$n_tiles, n_keys = length(plan$keys), bytes = plan$bytes,
+             keys_ok = keys_ok, one_file_per_tile_ok = one_ok, tile_width_ok = tw_ok,
+             already_on_s3 = already, clear_to_upload = clear, reason = reason)
+}
+cm_plan_tbl <- bind_rows(lapply(cm_vers, cm_plan_one))
+if (!length(cm_vers))
+  message("APP_BUNDLE_CELLMODEL_VERS is empty -- no serve/cell_model/ upload planned")
+# `knitr::kable()` must be its OWN top-level chunk statement to auto-print --
+# a plain print() (or one buried inside an `if {}`/`for` block) bypasses
+# knitr's knit_print() "asis" hook and pandoc is left with a literal pipe-table
+# STRING instead of an HTML <table> (found rendering this exact chunk
+# 2026-09-21: the table above showed as unrendered `|ver|n_tiles|...` text).
+# A zero-row cm_plan_tbl (the ordinary case: the allow-list is empty) still
+# kables cleanly -- header only, no data rows.
+knitr::kable(cm_plan_tbl, caption = paste(
+  "serve/cell_model/ upload plan: local gates + already-on-S3 refusal,",
+  "per allow-listed version (dry run; nothing written here)"))
+if (nrow(cm_plan_tbl))
+  for (i in seq_len(nrow(cm_plan_tbl)))
+    log_info(paste0(
+      "cell_model plan {cm_plan_tbl$ver[i]}: {cm_plan_tbl$n_keys[i]} keys, ",
+      "{cm_plan_tbl$bytes[i]} bytes, clear_to_upload={cm_plan_tbl$clear_to_upload[i]}",
+      if (!cm_plan_tbl$clear_to_upload[i]) " ({cm_plan_tbl$reason[i]})" else ""))
+stopifnot(
+  "a version in the cell_model allow-list is not clear to upload (see the reason column)" =
+    nrow(cm_plan_tbl) == 0 || all(cm_plan_tbl$clear_to_upload))
+```
+
 ## Push (`APP_BUNDLE_S3=1` only — never run by this notebook's author)
 
 Lists the target prefix before and after, refuses (via [app_bundle_assert_prefix()]) any key
-outside `{ver}/app/` — and `v7/serve/cell_model/`, only when `APP_BUNDLE_V7_CELLMODEL=1` — gzips
-every JSON object before upload (`Content-Encoding: gzip`, S3 does not compress on the fly),
-leaves Parquet as-is (already zstd-compressed by [msens::write_atlas_parquet()] /
-[msens::copy_atlas_parquet()]).
+outside `{ver}/app/` — and, for a version in `APP_BUNDLE_CELLMODEL_VERS`, `{ver}/serve/cell_model/`
+— gzips every JSON object before upload (`Content-Encoding: gzip`, S3 does not compress on the
+fly), leaves Parquet as-is (already zstd-compressed by [msens::write_atlas_parquet()] /
+[msens::copy_atlas_parquet()]). The `serve/cell_model/` sync itself reuses [cm_plan_tbl] computed
+above — a version is only synced if THIS run's plan already marked it `clear_to_upload`, so the
+dry-run gates above are not just printed, they gate the write.
 
 ```{r}
 #| label: push
@@ -790,15 +1081,21 @@ push_one <- function(b) {
     if (is_json) unlink(src)
   }
 
-  if (isTRUE(do_v7_cm) && ver == "v7") {
-    cm_local <- path.expand("~/_big/msens/derived/v7/cell_model")
-    if (dir.exists(cm_local)) {
-      cm_files <- list.files(cm_local, recursive = TRUE, full.names = TRUE)
-      cm_keys  <- glue("v7/serve/cell_model/{fs::path_rel(cm_files, cm_local)}")
-      app_bundle_assert_prefix(cm_keys, "v7", allow_v7_cell_model = TRUE)
-      system2("aws", c("s3", "sync", shQuote(cm_local), shQuote(glue("{s3_root}/v7/serve/cell_model")),
-                       "--only-show-errors"), stdout = TRUE, stderr = TRUE)
-    } else log_warn("APP_BUNDLE_V7_CELLMODEL=1 but {cm_local} does not exist locally")
+  if (ver %in% cm_vers) {
+    plan_row <- cm_plan_tbl[cm_plan_tbl$ver == ver, , drop = FALSE]
+    if (nrow(plan_row) && isTRUE(plan_row$clear_to_upload[1])) {
+      plan <- app_bundle_cell_model_plan(ver, dir_derived)
+      app_bundle_assert_cell_model_keys(plan$keys, ver)          # exact shape, again, right before the write
+      app_bundle_assert_prefix(plan$keys, ver, allow_cell_model = TRUE)  # whitelist, again
+      system2("aws", c("s3", "sync", shQuote(plan$dir),
+                       shQuote(glue("{s3_root}/{ver}/serve/cell_model")), "--only-show-errors"),
+              stdout = TRUE, stderr = TRUE)
+      log_info("{ver}: synced serve/cell_model/ -- {length(plan$keys)} keys, {plan$bytes} bytes")
+    } else {
+      stop(glue(
+        "{ver} is in APP_BUNDLE_CELLMODEL_VERS but this run's plan did not mark it clear_to_upload ",
+        "-- refusing to sync (see the validate-cell-model-plan chunk's reason column)"))
+    }
   }
 
   after <- list_prefix(glue("{ver}/app/"))
@@ -859,14 +1156,16 @@ msens::write_manifest(
   target       = "build_app_bundle",
   content_hash = digest::digest(
     list(summary_tbl, val_tbl, boot_contract_tbl, one_file_tbl, tw_tbl, dg_tbl, zm_tbl, sets_tbl,
-        budgets_tbl),
+        cog_tbl, gate_coverage_tbl, budgets_tbl, cm_plan_tbl),
     algo = "xxhash64"),
   stats = list(
-    versions_attempted = vers,
+    versions_attempted  = vers,
     versions_built      = summary_tbl$ver[summary_tbl$ok],
     push_s3             = do_s3,
-    v7_cell_model       = do_v7_cm,
+    cell_model_vers     = cm_vers,
+    cell_model_clear_to_upload = if (nrow(cm_plan_tbl)) cm_plan_tbl$ver[cm_plan_tbl$clear_to_upload] else character(0),
     n_objects_total     = sum(summary_tbl$n_objects, na.rm = TRUE),
-    n_tile_dirs_with_multiple_files = sum(one_file_tbl$n_with_multiple_files, na.rm = TRUE)),
+    n_tile_dirs_with_multiple_files = sum(one_file_tbl$n_with_multiple_files, na.rm = TRUE),
+    n_gates_skipped     = sum(!gate_coverage_tbl$ran)),
   force = msens::force_target("build_app_bundle"))
 ```
