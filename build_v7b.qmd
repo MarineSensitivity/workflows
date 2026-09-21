@@ -107,6 +107,42 @@ DS_ER   <- "rng_turtle_swot_dps"
 DS_SUIT <- "am_0.05"
 DS_CH   <- c("ch_nmfs", "ch_fws", "ca_nmfs")
 
+# size DuckDB to the MACHINE, not to the laptop it was written on ----
+# A hardcoded `memory_limit='12GB'` is a promise the server cannot keep: msens1 has 16 GB and
+# 4 cores shared with ERDDAP, two titilers and the Shiny workers, ~4 GB of it available, and
+# with a limit above what exists DuckDB never spills -- it grows until the kernel OOM-kills
+# R (the first P4 server build died that way in calc_cell_metric_redlist, with no R error
+# and no gate reached). So: 40 % of what is AVAILABLE, capped at 12 GB, and the operators
+# spill to temp_directory beyond it. 40 and not more because the limit bounds DuckDB's buffer
+# pool, not the process: measured, a 2.3 GB limit peaks at 3.2 GB resident (R + the chunks'
+# data frames + allocations outside the pool). Barely slower on a small box (5.4 min for the
+# build + three controls at 2.3 GB / 4 threads, vs 5 at 12 GB / 6), identical output -- the
+# reference digests below are the proof. BUILD_MEMORY_GB / BUILD_THREADS override.
+duckdb_budget <- function() {
+  gb_env <- suppressWarnings(as.numeric(Sys.getenv("BUILD_MEMORY_GB")))
+  th_env <- suppressWarnings(as.integer(Sys.getenv("BUILD_THREADS")))
+  avail  <- NA_real_
+  if (file_exists("/proc/meminfo")) {
+    l     <- grep("^MemAvailable:", readLines("/proc/meminfo"), value = TRUE)
+    avail <- as.numeric(gsub("\\D", "", l)) / 1024^2               # kB -> GB
+  }
+  list(
+    gb      = if (!is.na(gb_env)) gb_env else if (!is.na(avail)) max(1.5, min(12, round(avail * 0.4, 1))) else 12,
+    threads = if (!is.na(th_env)) th_env else min(6L, parallel::detectCores()),
+    avail   = avail)
+}
+duckdb_tune <- function(con, tmp_dir) {
+  b <- duckdb_budget()
+  dir_create(tmp_dir)
+  dbExecute(con, glue("PRAGMA memory_limit='{b$gb}GB'"))
+  dbExecute(con, glue("PRAGMA threads={b$threads}"))
+  dbExecute(con, glue("PRAGMA temp_directory='{tmp_dir}'"))
+  # insertion order is not part of any result here, and preserving it costs memory
+  dbExecute(con, "SET preserve_insertion_order = false")
+  log_info("duckdb budget: {b$gb} GB, {b$threads} threads (available: {round(b$avail, 1)} GB)")
+  invisible(b)
+}
+
 f_gates <- file.path(dir_v, glue("tbl_gates_{ver}.csv"))
 f_attr  <- file.path(dir_v, glue("tbl_attribution_programarea_{ver}.csv"))
 
@@ -353,9 +389,7 @@ build_release <- function(db_path, out_dir, suit_min, fill, kappa, label) {
   # uid 1000 and halted here on its first UPDATE. Declared, as the other notebooks declare httpfs.
   dbExecute(con, "INSTALL icu; LOAD icu;")
   on.exit(dbDisconnect(con, shutdown = TRUE), add = TRUE)
-  dbExecute(con, "PRAGMA memory_limit='12GB'")
-  dbExecute(con, "PRAGMA threads=6")
-  dbExecute(con, glue("PRAGMA temp_directory='{out_dir}/duckdb_tmp'"))
+  duckdb_tune(con, glue("{out_dir}/duckdb_tmp"))
 
   # the server's clone inherits a cell_model VIEW whose read_parquet path is absolute and
   # points at {ver_prev}: left in place it would serve the PREVIOUS release's cells under
@@ -423,7 +457,7 @@ if (!do_build) {
 stopifnot("release database missing after build" = file_exists(sdm_db))
 
 con <- dbConnect(duckdb(dbdir = sdm_db, read_only = TRUE))
-dbExecute(con, "PRAGMA memory_limit='12GB'"); dbExecute(con, "PRAGMA threads=6")
+duckdb_tune(con, glue("{dir_big_v}/duckdb_tmp"))
 dbExecute(con, glue("ATTACH '{sdm_db_prev}' AS prev (READ_ONLY)"))
 
 tbl_pra <- glue("ply_programareas_2026_{ver}")
@@ -520,8 +554,7 @@ REL_TOL <- 1e-9
 compare_build <- function(db_path) {
   cc <- dbConnect(duckdb(dbdir = db_path, read_only = TRUE))
   on.exit(dbDisconnect(cc, shutdown = TRUE), add = TRUE)
-  dbExecute(cc, "PRAGMA memory_limit='12GB'"); dbExecute(cc, "PRAGMA threads=6")
-  dbExecute(cc, glue("PRAGMA temp_directory='{path_dir(db_path)}/duckdb_tmp'"))
+  duckdb_tune(cc, glue("{path_dir(db_path)}/duckdb_tmp"))
   # ATTACH is per DATABASE INSTANCE, not per connection: comparing the release this notebook
   # already holds open would otherwise fail with `database with name "prev" already exists`.
   if (!nrow(dbGetQuery(cc, "SELECT 1 FROM duckdb_databases() WHERE database_name = 'prev'")))
