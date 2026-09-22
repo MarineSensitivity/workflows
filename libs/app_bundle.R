@@ -958,6 +958,98 @@ app_bundle_cell_model_selftest <- function() {
   invisible(TRUE)
 }
 
+# ---- subregion geometry: hand app_bundle_build() what each release ACTUALLY scored --
+
+#' The subregion geometry a release actually scored, cut (or omitted) honestly
+#'
+#' Master plan D16 ruling (2026-09-22): measured against each release's own
+#' `zone` table for `subregion_key`, and against the ONE published canonical
+#' geometry every manifest links (`zones/subregion_2025-06/zones.pmtiles`,
+#' keys `AK`, `AT`, `GA`, `PA`):
+#'
+#' | ver          | scored (besides the rollup) | published subset handed to `app_bundle_build()` |
+#' |--------------|------------------------------|--------------------------------------------------|
+#' | v1, v2, v3   | AK, AKL48, L48               | NONE -- no subregion unit (AKL48/L48 have no published geometry) |
+#' | v4-v6        | AK, GA, PA                   | AK, GA, PA (AT not scored) |
+#' | v7, v7b      | AK, GA, PA                   | AK, GA, PA (AT not scored) |
+#' | v8, v9       | AK, AT, GA, PA               | AK, AT, GA, PA (full -- only these two scored the published polygons) |
+#'
+#' This function ONLY ever REMOVES keys from the canonical set (or empties it
+#' entirely) — it never invents a key the canonical geometry doesn't already
+#' have. Handing `app_bundle_build()` the FULL canonical set for a release
+#' that never scored `AT` is a lie the strict subset check
+#' (`msens::app_zone_tbl()`) correctly refuses; cutting the geometry to what
+#' was actually scored is honest, not a workaround for the check.
+#'
+#' @param ver version label
+#' @param canonical_keys the full canonical geometry's keys, e.g.
+#'   `app_bundle_geom_keys(...)[["subregion"]]` (typically `AK`, `AT`, `GA`, `PA`)
+#' @return list: `keys` (character vector to actually hand `app_bundle_build()`
+#'   for `subregion` -- possibly `character(0)`), `omitted` (logical: no
+#'   subregion unit at all), `cut` (logical: fewer keys than canonical),
+#'   `reason` (one-line, never blank -- this is the "never silent" record)
+app_bundle_subregion_plan <- function(ver, canonical_keys) {
+  none_scored <- c("AK", "AKL48", "L48")
+  none_vers   <- c("v1", "v2", "v3")
+  cut_keys    <- c("AK", "GA", "PA")
+  cut_vers    <- c("v4", "v4b", "v5", "v6", "v7", "v7b")
+
+  if (ver %in% none_vers) {
+    missing <- setdiff(none_scored, canonical_keys)
+    return(list(keys = character(0), omitted = TRUE, cut = FALSE,
+               reason = sprintf("no subregion unit: %s have no published geometry",
+                                paste(missing, collapse = ", "))))
+  }
+  if (ver %in% cut_vers) {
+    keep    <- intersect(canonical_keys, cut_keys)
+    dropped <- setdiff(canonical_keys, keep)
+    return(list(keys = keep, omitted = FALSE, cut = length(dropped) > 0,
+               reason = sprintf("subregion unit keys %s; %s not scored by this release",
+                                paste(sort(keep), collapse = ", "),
+                                paste(sort(dropped), collapse = ", "))))
+  }
+  list(keys = canonical_keys, omitted = FALSE, cut = FALSE,
+      reason = "full published geometry scored (AK, AT, GA, PA)")
+}
+
+#' Self-test for [app_bundle_subregion_plan()] — the exact D16 expectation table
+#'
+#' @return `TRUE`, invisibly; stops on the first failed expectation
+app_bundle_subregion_plan_selftest <- function() {
+  stopifnot(requireNamespace("testthat", quietly = TRUE))
+  canon <- c("AK", "AT", "GA", "PA")
+  testthat::test_that("v1/v2/v3 get no subregion unit at all", {
+    for (v in c("v1", "v2", "v3")) {
+      p <- app_bundle_subregion_plan(v, canon)
+      testthat::expect_length(p$keys, 0)
+      testthat::expect_true(p$omitted)
+      testthat::expect_match(p$reason, "no subregion unit")
+    }
+  })
+  testthat::test_that("v4-v7b get AK/GA/PA, AT cut", {
+    for (v in c("v4", "v4b", "v5", "v6", "v7", "v7b")) {
+      p <- app_bundle_subregion_plan(v, canon)
+      testthat::expect_identical(sort(p$keys), c("AK", "GA", "PA"))
+      testthat::expect_false(p$omitted)
+      testthat::expect_true(p$cut)
+      testthat::expect_match(p$reason, "AT not scored")
+    }
+  })
+  testthat::test_that("v8/v9 get the full canonical set, uncut", {
+    for (v in c("v8", "v9")) {
+      p <- app_bundle_subregion_plan(v, canon)
+      testthat::expect_identical(sort(p$keys), sort(canon))
+      testthat::expect_false(p$omitted)
+      testthat::expect_false(p$cut)
+    }
+  })
+  testthat::test_that("an unknown version passes the canonical set through unchanged", {
+    p <- app_bundle_subregion_plan("v99", canon)
+    testthat::expect_identical(sort(p$keys), sort(canon))
+  })
+  invisible(TRUE)
+}
+
 # ---- the one place the atlas-1 subplan's per-object budgets live ------------
 
 #' The subplan's per-object size budgets — ONE table, ONE place

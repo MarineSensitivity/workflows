@@ -419,6 +419,17 @@ build_one <- function(ver) {
     "geom_keys resolved fewer entries than the manifest names zones (round-3 hard-fail)" =
       length(geom_keys) == nrow(mfst$zones))
 
+  # master plan D16 (2026-09-22): the canonical subregion geometry (AK, AT,
+  # GA, PA) is not what most releases actually scored -- handing
+  # app_bundle_build() the full canonical set for a release that never
+  # scored AT is a lie msens's own subset check correctly refuses (v1-v7b
+  # all HARD STOPPED there before this fix landed). app_bundle_subregion_plan()
+  # cuts (or omits) the geometry to exactly what each release scored, and its
+  # `reason` is recorded on every build -- "never silent" per the ruling.
+  subregion_plan <- if ("subregion" %in% names(geom_keys))
+    app_bundle_subregion_plan(ver, geom_keys[["subregion"]]) else NULL
+  if (!is.null(subregion_plan)) geom_keys[["subregion"]] <- subregion_plan$keys
+
   # round 4: msens 0.43.0 @ 71aa231 moved app/taxonomy.parquet INTO
   # app_bundle_build() itself (as app_taxonomy(), fed by taxonomy_csv) and
   # added app_model() for the v8+ mdl_id -> mdl_key mapping -- both now get
@@ -885,7 +896,11 @@ comparison. Two checks:
    same zone, cannot appear twice with two different `area_km2`.
 2. For every drawable unit, `boot$units[].keys` (what the app offers), the real GeoPackage's keys
    (`app_bundle_geom_keys()`), and the distinct `zone_value`s actually published in
-   `zone_taxon.parquet` for that field must all agree.
+   `zone_taxon.parquet` for that field must all agree — after dropping any whole-study-area
+   rollup (`USA`/`FULL`) from the `zone_taxon.parquet` side, since a rollup is scored, has no
+   polygon, and is never in the GeoPackage or in `boot$units[].keys` by round 3's own rule (found
+   running v8/v9 for real, 2026-09-22: both list `USA` as a `subregion_key` value beside
+   `AK`/`AT`/`GA`/`PA`, which is correct, not a defect).
 
 **Proved RED on today's v2 bundle** (built on msens 0.43.0 @ `71aa231`, before its zone-table fix
 landed): v2's source has two zone tables for `subregion_key`
@@ -914,12 +929,20 @@ zone_taxon_integrity_gate <- function(b) {
                         n_dup_rows = if (nrow(dupg)) sum(dupg$n - 1) else 0L,
                         zone_taxon_unique = nrow(dupg) == 0)
 
+  # whole-study-area rollups (USA/FULL) are scored and have no polygon, so
+  # they are never in the GeoPackage and never in boot$units[].keys (round
+  # 3's own rule for geom_keys/app_units()) -- but they ARE real rows in
+  # zone_taxon.parquet (found running v8/v9 for real, 2026-09-22: both list
+  # "USA" as a distinct subregion_key value beside AK/AT/GA/PA). Strip them
+  # from the zone_taxon side before comparing, or every release with a USA
+  # rollup shows a false three-way mismatch.
+  .rollup <- c("USA", "FULL")
   units <- b$out$boot$units
   unit_rows <- bind_rows(lapply(units, function(u) {
     fld       <- paste0(u$zone_type, "_key")
     boot_keys <- sort(unique(as.character(unlist(u$keys))))
     geom_k    <- sort(unique(as.character(b$geom_keys[[u$zone_type]])))
-    zt_keys   <- sort(unique(as.character(zt$zone_value[zt$zone_fld == fld])))
+    zt_keys   <- sort(setdiff(unique(as.character(zt$zone_value[zt$zone_fld == fld])), .rollup))
     data.frame(ver = b$ver, zone_type = u$zone_type,
               n_boot_keys = length(boot_keys), n_geom_keys = length(geom_k), n_zt_keys = length(zt_keys),
               boot_eq_geom = identical(boot_keys, geom_k),
