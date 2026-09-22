@@ -671,6 +671,38 @@ app_bundle_gzip_selftest <- function() {
 #'   `zones` that carries a `zone_set_key` (`length(result) ==
 #'   sum(!is.na(zones$zone_set_key))` is asserted before returning); errors
 #'   otherwise, naming the exact path that could not be read
+#' The release's PUBLISHED `{ver}/manifest.json`, fetched anonymously and cached
+#'
+#' Round 10 (2026-09-22): `app_bundle_build()` must be handed the manifest
+#' the APP will actually read, not a freshly re-run `manifest_build()`.
+#' `manifest_build()`'s one-row-per-`zone_set_key` collapse breaks a genuine
+#' tie (v2's `subregion_key`: two zone tables, `n = 4` each) by DuckDB's own
+#' row order, which was found to differ between an installed-package build
+#' and a source-tree run of the identical commit -- non-deterministic in a
+#' way a rebuild cannot fix. The PUBLISHED manifest is a fixed artifact
+#' (already resolved, one row per `fld`); reading it is deterministic where
+#' rebuilding it was not.
+#'
+#' @param ver version label
+#' @param base atlas base URL ([msens::atlas_base_url()])
+#' @param cache_dir directory to cache the download under (created if needed);
+#'   a file already there is reused, never re-downloaded
+#' @return the manifest as a list (`$zones` is a data frame, one row per
+#'   `fld`, via `jsonlite::fromJSON(simplifyVector = TRUE)`), or `NULL` if it
+#'   could not be fetched or parsed
+app_bundle_fetch_published_manifest <- function(ver, base, cache_dir) {
+  fs::dir_create(cache_dir)
+  dest <- file.path(cache_dir, "manifest.json")
+  if (!file.exists(dest)) {
+    ok <- isTRUE(tryCatch(
+      utils::download.file(sprintf("%s/%s/manifest.json", base, ver), dest,
+                           mode = "wb", quiet = TRUE) == 0L,
+      error = function(e) FALSE, warning = function(w) FALSE))
+    if (!ok) { unlink(dest); return(NULL) }
+  }
+  tryCatch(jsonlite::fromJSON(dest, simplifyVector = TRUE), error = function(e) NULL)
+}
+
 app_bundle_geom_keys <- function(zones, zone_sets, dir_derived) {
   out <- list()
   if (is.null(zones) || !nrow(zones)) return(out)

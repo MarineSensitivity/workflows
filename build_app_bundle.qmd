@@ -411,14 +411,31 @@ build_one <- function(ver) {
     zone_sets$zone_set_key)
   mfst <- msens::manifest_build(con, ver, status = status, access = access, base = base,
                                 metrics = metrics, zone_tiles = zone_tiles, zone_sets = zone_sets)
+  # round 10 (2026-09-22): app_bundle_build() (and this notebook's own
+  # geom_keys, below) must be handed the PUBLISHED manifest.json, not the
+  # one just rebuilt above. manifest_build()'s one-row-per-zone_set_key
+  # collapse breaks a genuine tie (v2's subregion_key: two zone tables,
+  # n = 4 each) by DuckDB's own row order -- non-deterministic between an
+  # installed-package build and a source-tree run of the IDENTICAL commit.
+  # `mfst` (above) is kept only for the app{} manifest-patch proposal
+  # (PROPOSAL.md) and the id_field cross-check below, neither of which
+  # touches the ambiguous zone-table resolution. A missing/unreadable
+  # published manifest is a hard stop: a release with no manifest cannot
+  # have a bundle at all.
+  pub_manifest <- app_bundle_fetch_published_manifest(
+    ver, base, here("_output", "app_bundle", "_s3cache", ver))
+  stopifnot(
+    "could not fetch/parse the published {ver}/manifest.json (round-10 hard-fail)" =
+      !is.null(pub_manifest) && !is.null(pub_manifest$zones) && nrow(pub_manifest$zones) > 0)
+
   # round 3: a missing/unreadable GeoPackage is now a HARD FAILURE inside
   # app_bundle_geom_keys() itself (it stops, naming the path); this outer
   # stopifnot is the second, notebook-level check the review asked for --
   # every zone the manifest names must resolve an entry, full stop.
-  geom_keys <- app_bundle_geom_keys(mfst$zones, zone_sets, dir_derived)
+  geom_keys <- app_bundle_geom_keys(pub_manifest$zones, zone_sets, dir_derived)
   stopifnot(
     "geom_keys resolved fewer entries than the manifest names zones (round-3 hard-fail)" =
-      length(geom_keys) == nrow(mfst$zones))
+      length(geom_keys) == nrow(pub_manifest$zones))
 
   # master plan D16, corrected (2026-09-22): the FIRST fix cut/omitted
   # subregion geometry per a hand-written, per-release table -- wrong.
@@ -457,7 +474,7 @@ build_one <- function(ver) {
   # once per boot$zones unit -- the exact 13,077-row v2 defect item (c)'s own
   # independent gate caught on the PRE-fix build.
   out <- tryCatch(
-    msens::app_bundle_build(con, ver, dir_out, manifest = mfst, base = base,
+    msens::app_bundle_build(con, ver, dir_out, manifest = pub_manifest, base = base,
                             geom_keys = geom_keys, zone_sets = zone_sets, strict = FALSE,
                             taxonomy_csv = here("data/taxonomic_hierarchy_worms_2025-10-30.csv")),
     error = function(e) {
@@ -475,6 +492,7 @@ build_one <- function(ver) {
     app_bundle_assert_units_match_geometry(out$boot$units, geom_keys) else tibble()
 
   list(ver = ver, ok = !is.null(out), dir_out = dir_out, con_db = opened$db, manifest = mfst,
+       pub_manifest = pub_manifest,
        geom_keys = geom_keys, geom_check = geom_check, unit_expectation = unit_expectation, out = out,
        has_taxonomy = !is.null(out) && "taxonomy" %in% names(out$tables),
        has_model    = !is.null(out) && "model"    %in% names(out$tables),
@@ -929,6 +947,73 @@ set_gates <- function(b, ver) {
 }
 sets_tbl <- purrr::imap(builds, set_gates) |> bind_rows()
 knitr::kable(sets_tbl, caption = "Set-equality gates: layers, taxon shard keys, alias targets")
+```
+
+### Manifest identity — the manifest `app_bundle_build()` actually used, never a rebuilt one
+
+Round 10 (2026-09-22): `msens::manifest_build()`'s one-row-per-`zone_set_key` collapse can lose a
+genuine tie between two zone tables for the same field to DuckDB's own row order — found on v2's
+`subregion_key` (`ply_subregions_2025` vs `ply_subregions_2026`, `n = 4` each): an installed
+package build and a source-tree run of the SAME commit picked different tables. The fix moved to
+[app_bundle_fetch_published_manifest()] — the fixed, already-published `{ver}/manifest.json`, not a
+fresh rebuild — but the fix needs its own gate, or a future regression (something reintroducing a
+rebuilt manifest into the `app_bundle_build()` call) would be silent again. This gate checks the
+PUBLISHED manifest against the release DATABASE's own `zone_taxon.zone_tbl` column (where the
+release has one: v2, v3, ..., v7b) and against `boot$units[].zone_tbl` — no rebuilt manifest
+anywhere in the comparison.
+
+```{r}
+#| label: validate-manifest-identity
+
+manifest_identity_gate <- function(b) {
+  none <- data.frame(ver = character(), zone_fld = character(), manifest_tbl = character(),
+                     n_manifest_rows = integer(), boot_zone_tbl = character(),
+                     content_matches_chosen_tbl = logical(), ok = logical())
+  if (!isTRUE(b$ok) || is.null(b$pub_manifest) || is.null(b$out$boot)) return(none)
+  mz <- b$pub_manifest$zones
+  if (is.null(mz) || !nrow(mz)) return(none)
+  p <- file.path(b$dir_out, "zone_taxon.parquet")
+  if (!file.exists(p)) return(none)
+  zt <- arrow::read_parquet(p)
+  dup_flds <- unique(mz$fld[duplicated(mz$fld)])   # requirement 1: exactly one row per fld
+
+  con <- app_bundle_open_scoring(b$ver)
+  on.exit(DBI::dbDisconnect(con, shutdown = TRUE), add = TRUE)
+  has_zt_tbl_col <- "zone_taxon" %in% DBI::dbListTables(con) &&
+    "zone_tbl" %in% DBI::dbListFields(con, "zone_taxon")
+
+  units_by_type <- setNames(b$out$boot$units, vapply(b$out$boot$units, function(u) u$zone_type, ""))
+  bind_rows(lapply(seq_len(nrow(mz)), function(i) {
+    fld  <- mz$fld[i]; tbl <- mz$tbl[i]; type <- sub("_key$", "", fld)
+    u        <- units_by_type[[type]]
+    boot_tbl <- if (!is.null(u) && !is.null(u$zone_tbl)) u$zone_tbl else NA_character_
+    # requirement 3: the WRITTEN zone_taxon.parquet must hold the CHOSEN
+    # table's own rows -- checked as content (its zone_value SET), not just a
+    # name, because the raw db zone_taxon table legitimately carries EVERY
+    # candidate table's rows for a genuine tie (v2 subregion_key: both
+    # ply_subregions_2025 and _2026 are really there) -- a name-only check
+    # would pass no matter which table's rows actually got written.
+    content_ok <- TRUE
+    if (has_zt_tbl_col) {
+      db_keys_for_tbl <- sort(unique(DBI::dbGetQuery(con, glue::glue(
+        "SELECT DISTINCT zone_value FROM zone_taxon
+          WHERE zone_fld = {DBI::dbQuoteString(con, fld)} AND zone_tbl = {DBI::dbQuoteString(con, tbl)}"))$zone_value))
+      written_keys <- sort(unique(as.character(zt$zone_value[zt$zone_fld == fld])))
+      content_ok <- length(db_keys_for_tbl) > 0 && identical(written_keys, db_keys_for_tbl)
+    }
+    ok <- !(fld %in% dup_flds) && (is.null(u) || identical(boot_tbl, tbl)) && content_ok
+    data.frame(ver = b$ver, zone_fld = fld, manifest_tbl = tbl, n_manifest_rows = sum(mz$fld == fld),
+               boot_zone_tbl = boot_tbl, content_matches_chosen_tbl = content_ok, ok = ok)
+  }))
+}
+manifest_identity_tbl <- bind_rows(lapply(builds, manifest_identity_gate))
+knitr::kable(manifest_identity_tbl, caption = paste(
+  "Manifest identity: the PUBLISHED manifest's zones[].tbl (one row per fld) must equal",
+  "boot$units[].zone_tbl for every published unit, and the WRITTEN zone_taxon.parquet's content",
+  "must match that table's own rows in the release db -- ok must be TRUE"))
+stopifnot(
+  "the published manifest, boot$units[].zone_tbl, or the written zone_taxon.parquet disagree on which zone table won" =
+    nrow(manifest_identity_tbl) == 0 || all(manifest_identity_tbl$ok))
 ```
 
 ### `zone_taxon.parquet` integrity — independent of msens, by design
