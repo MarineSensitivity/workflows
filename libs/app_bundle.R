@@ -958,94 +958,103 @@ app_bundle_cell_model_selftest <- function() {
   invisible(TRUE)
 }
 
-# ---- subregion geometry: hand app_bundle_build() what each release ACTUALLY scored --
+# ---- unit expectation: which spatial units a release can actually DRAW ------
+#
+# Master plan D16, corrected (2026-09-22): the first D16 fix cut/omitted
+# subregion geometry per hand-written, per-release rule -- WRONG. msens's
+# geometry-subset check was right all along; the real rule or reads:
+# app_units() requires >= 2 zones with a `score_%` metric (apps/scores/app.R
+# ~570-647) -- a zone with no score has nothing to color a choropleth by.
+# The published geometry is handed to app_bundle_build() UNCUT for every
+# release and every zone type; whether a UNIT gets drawn is derived from
+# (scored zones) INTERSECT (geometry keys), never from a hand-written table.
 
-#' The subregion geometry a release actually scored, cut (or omitted) honestly
+#' Zone keys (for one `fld`) that carry at least one `score_%` metric
 #'
-#' Master plan D16 ruling (2026-09-22): measured against each release's own
-#' `zone` table for `subregion_key`, and against the ONE published canonical
-#' geometry every manifest links (`zones/subregion_2025-06/zones.pmtiles`,
-#' keys `AK`, `AT`, `GA`, `PA`):
-#'
-#' | ver          | scored (besides the rollup) | published subset handed to `app_bundle_build()` |
-#' |--------------|------------------------------|--------------------------------------------------|
-#' | v1, v2, v3   | AK, AKL48, L48               | NONE -- no subregion unit (AKL48/L48 have no published geometry) |
-#' | v4-v6        | AK, GA, PA                   | AK, GA, PA (AT not scored) |
-#' | v7, v7b      | AK, GA, PA                   | AK, GA, PA (AT not scored) |
-#' | v8, v9       | AK, AT, GA, PA               | AK, AT, GA, PA (full -- only these two scored the published polygons) |
-#'
-#' This function ONLY ever REMOVES keys from the canonical set (or empties it
-#' entirely) — it never invents a key the canonical geometry doesn't already
-#' have. Handing `app_bundle_build()` the FULL canonical set for a release
-#' that never scored `AT` is a lie the strict subset check
-#' (`msens::app_zone_tbl()`) correctly refuses; cutting the geometry to what
-#' was actually scored is honest, not a workaround for the check.
-#'
-#' @param ver version label
-#' @param canonical_keys the full canonical geometry's keys, e.g.
-#'   `app_bundle_geom_keys(...)[["subregion"]]` (typically `AK`, `AT`, `GA`, `PA`)
-#' @return list: `keys` (character vector to actually hand `app_bundle_build()`
-#'   for `subregion` -- possibly `character(0)`), `omitted` (logical: no
-#'   subregion unit at all), `cut` (logical: fewer keys than canonical),
-#'   `reason` (one-line, never blank -- this is the "never silent" record)
-app_bundle_subregion_plan <- function(ver, canonical_keys) {
-  none_scored <- c("AK", "AKL48", "L48")
-  none_vers   <- c("v1", "v2", "v3")
-  cut_keys    <- c("AK", "GA", "PA")
-  cut_vers    <- c("v4", "v4b", "v5", "v6", "v7", "v7b")
-
-  if (ver %in% none_vers) {
-    missing <- setdiff(none_scored, canonical_keys)
-    return(list(keys = character(0), omitted = TRUE, cut = FALSE,
-               reason = sprintf("no subregion unit: %s have no published geometry",
-                                paste(missing, collapse = ", "))))
-  }
-  if (ver %in% cut_vers) {
-    keep    <- intersect(canonical_keys, cut_keys)
-    dropped <- setdiff(canonical_keys, keep)
-    return(list(keys = keep, omitted = FALSE, cut = length(dropped) > 0,
-               reason = sprintf("subregion unit keys %s; %s not scored by this release",
-                                paste(sort(keep), collapse = ", "),
-                                paste(sort(dropped), collapse = ", "))))
-  }
-  list(keys = canonical_keys, omitted = FALSE, cut = FALSE,
-      reason = "full published geometry scored (AK, AT, GA, PA)")
+#' @param con open DBI connection
+#' @param fld e.g. `"subregion_key"`
+#' @return list: `keys` (distinct zone key values with >= 1 `score_%`
+#'   `zone_metric` row), `n_zones` (distinct zones for this `fld`), `n_scored`
+#'   (of those, how many carry a `score_%` metric)
+app_bundle_scored_zone_keys <- function(con, fld) {
+  none <- list(keys = character(0), n_zones = 0L, n_scored = 0L)
+  if (!all(c("zone", "zone_metric", "metric") %in% DBI::dbListTables(con))) return(none)
+  vz <- msens::sdm_val_col(con, "zone")
+  d <- DBI::dbGetQuery(con, glue::glue("
+    SELECT z.{vz} AS zkey, z.zone_seq,
+           max(CASE WHEN m.metric_key LIKE 'score\\_%' ESCAPE '\\' THEN 1 ELSE 0 END) AS scored
+      FROM zone z
+      LEFT JOIN zone_metric zm USING (zone_seq)
+      LEFT JOIN metric m USING (metric_seq)
+     WHERE z.fld = {DBI::dbQuoteString(con, fld)}
+     GROUP BY 1, 2"))
+  if (!nrow(d)) return(none)
+  list(keys = sort(unique(as.character(d$zkey[d$scored == 1]))),
+      n_zones = length(unique(d$zone_seq)), n_scored = sum(d$scored == 1))
 }
 
-#' Self-test for [app_bundle_subregion_plan()] — the exact D16 expectation table
+#' Whether a spatial unit is drawable, and with which keys — derived, not guessed
+#'
+#' The SAME rule `msens::app_units()` applies: a unit is drawable iff at least
+#' 2 of its zones carry a `score_%` metric AND are also in the published
+#' geometry. Never hand-codes a per-release exception; a release's own data
+#' (via [app_bundle_scored_zone_keys()]) decides.
+#'
+#' @param scored result of [app_bundle_scored_zone_keys()]
+#' @param geom_keys_type the geometry's real keys for this zone type (e.g.
+#'   `app_bundle_geom_keys(...)[["subregion"]]`)
+#' @return list: `keys` (character, possibly empty), `present` (logical,
+#'   `length(keys) >= 2`), `reason` (one-line, never blank)
+app_bundle_unit_expectation <- function(scored, geom_keys_type) {
+  keys <- intersect(scored$keys, geom_keys_type)
+  present <- length(keys) >= 2
+  reason <- if (present)
+    sprintf("unit present: keys %s (%d of %d zones score_%%-metric AND published)",
+           paste(sort(keys), collapse = ", "), scored$n_scored, scored$n_zones)
+  else
+    sprintf("no unit: %d of %d zones carr%s a score_%% metric (need >= 2 that are also published)",
+           scored$n_scored, scored$n_zones, if (scored$n_scored == 1L) "ies" else "y")
+  list(keys = sort(keys), present = present, reason = reason)
+}
+
+#' Self-test for [app_bundle_unit_expectation()] — the derivation rule itself
+#'
+#' Offline: fabricates `scored`/`geom_keys_type` inputs directly rather than
+#' hitting a database, since the RULE (>= 2 scored AND published) is what is
+#' under test, not any one release's numbers (those are verified separately,
+#' against real data, in the notebook's own render).
 #'
 #' @return `TRUE`, invisibly; stops on the first failed expectation
-app_bundle_subregion_plan_selftest <- function() {
+app_bundle_unit_expectation_selftest <- function() {
   stopifnot(requireNamespace("testthat", quietly = TRUE))
-  canon <- c("AK", "AT", "GA", "PA")
-  testthat::test_that("v1/v2/v3 get no subregion unit at all", {
-    for (v in c("v1", "v2", "v3")) {
-      p <- app_bundle_subregion_plan(v, canon)
-      testthat::expect_length(p$keys, 0)
-      testthat::expect_true(p$omitted)
-      testthat::expect_match(p$reason, "no subregion unit")
-    }
+  testthat::test_that("< 2 scored zones -> no unit, even if the geometry has plenty", {
+    e <- app_bundle_unit_expectation(list(keys = "FULL", n_zones = 5, n_scored = 1),
+                                     c("AK", "AT", "GA", "PA"))
+    testthat::expect_false(e$present)
+    testthat::expect_length(e$keys, 0)
+    testthat::expect_match(e$reason, "no unit")
   })
-  testthat::test_that("v4-v7b get AK/GA/PA, AT cut", {
-    for (v in c("v4", "v4b", "v5", "v6", "v7", "v7b")) {
-      p <- app_bundle_subregion_plan(v, canon)
-      testthat::expect_identical(sort(p$keys), c("AK", "GA", "PA"))
-      testthat::expect_false(p$omitted)
-      testthat::expect_true(p$cut)
-      testthat::expect_match(p$reason, "AT not scored")
-    }
+  testthat::test_that(">= 2 scored AND published -> present, keys = the intersection", {
+    e <- app_bundle_unit_expectation(list(keys = c("AK", "AT", "GA", "PA", "USA"), n_zones = 5, n_scored = 5),
+                                     c("AK", "AT", "GA", "PA"))
+    testthat::expect_true(e$present)
+    testthat::expect_identical(e$keys, c("AK", "AT", "GA", "PA"))   # USA (no polygon) never in keys
   })
-  testthat::test_that("v8/v9 get the full canonical set, uncut", {
-    for (v in c("v8", "v9")) {
-      p <- app_bundle_subregion_plan(v, canon)
-      testthat::expect_identical(sort(p$keys), sort(canon))
-      testthat::expect_false(p$omitted)
-      testthat::expect_false(p$cut)
-    }
+  testthat::test_that("scored but NOT published never counts toward the >= 2", {
+    e <- app_bundle_unit_expectation(list(keys = c("AKL48", "L48"), n_zones = 2, n_scored = 2),
+                                     c("AK", "AT", "GA", "PA"))
+    testthat::expect_false(e$present)
   })
-  testthat::test_that("an unknown version passes the canonical set through unchanged", {
-    p <- app_bundle_subregion_plan("v99", canon)
-    testthat::expect_identical(sort(p$keys), sort(canon))
+  testthat::test_that("seeded fault: dropping the score_% filter invents a unit that should not exist", {
+    # simulates "every zone counts as scored" (the bug this function exists to
+    # prevent) -- v7's real subregion geometry has 1 of 5 REAL scores, but if
+    # the filter were dropped all 5 would look scored, wrongly crossing >= 2
+    fake_all_scored <- list(keys = c("AK", "AT", "GA", "PA", "FULL"), n_zones = 5, n_scored = 5)
+    e_bug <- app_bundle_unit_expectation(fake_all_scored, c("AK", "AT", "GA", "PA"))
+    testthat::expect_true(e_bug$present)     # RED: a unit the real data does not support
+    e_real <- app_bundle_unit_expectation(list(keys = "FULL", n_zones = 5, n_scored = 1),
+                                          c("AK", "AT", "GA", "PA"))
+    testthat::expect_false(e_real$present)   # GREEN: the real (filtered) data correctly has none
   })
   invisible(TRUE)
 }

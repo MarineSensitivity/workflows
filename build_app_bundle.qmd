@@ -340,7 +340,7 @@ app_bundle_cell_model_selftest()
 app_bundle_head_check_selftest()
 app_bundle_head_check_retry_selftest()
 app_bundle_zone_taxon_check_selftest()
-app_bundle_subregion_plan_selftest()
+app_bundle_unit_expectation_selftest()
 ```
 
 ## Build
@@ -420,16 +420,18 @@ build_one <- function(ver) {
     "geom_keys resolved fewer entries than the manifest names zones (round-3 hard-fail)" =
       length(geom_keys) == nrow(mfst$zones))
 
-  # master plan D16 (2026-09-22): the canonical subregion geometry (AK, AT,
-  # GA, PA) is not what most releases actually scored -- handing
-  # app_bundle_build() the full canonical set for a release that never
-  # scored AT is a lie msens's own subset check correctly refuses (v1-v7b
-  # all HARD STOPPED there before this fix landed). app_bundle_subregion_plan()
-  # cuts (or omits) the geometry to exactly what each release scored, and its
-  # `reason` is recorded on every build -- "never silent" per the ruling.
-  subregion_plan <- if ("subregion" %in% names(geom_keys))
-    app_bundle_subregion_plan(ver, geom_keys[["subregion"]]) else NULL
-  if (!is.null(subregion_plan)) geom_keys[["subregion"]] <- subregion_plan$keys
+  # master plan D16, corrected (2026-09-22): the FIRST fix cut/omitted
+  # subregion geometry per a hand-written, per-release table -- wrong.
+  # msens's geometry-subset check was right; the geometry passed to
+  # app_bundle_build() is now the FULL published geometry, UNCUT, for every
+  # release and every zone type (matching every other zone type already).
+  # Whether a spatial unit is drawable at all is a SEPARATE, DERIVED question
+  # (app_bundle_unit_expectation(), below) -- never a hand-written exception.
+  unit_expectation <- lapply(setNames(names(geom_keys), names(geom_keys)), function(type) {
+    fld    <- paste0(type, "_key")
+    scored <- app_bundle_scored_zone_keys(con, fld)
+    app_bundle_unit_expectation(scored, geom_keys[[type]])
+  })
 
   # round 4: msens 0.43.0 @ 71aa231 moved app/taxonomy.parquet INTO
   # app_bundle_build() itself (as app_taxonomy(), fed by taxonomy_csv) and
@@ -473,7 +475,7 @@ build_one <- function(ver) {
     app_bundle_assert_units_match_geometry(out$boot$units, geom_keys) else tibble()
 
   list(ver = ver, ok = !is.null(out), dir_out = dir_out, con_db = opened$db, manifest = mfst,
-       geom_keys = geom_keys, geom_check = geom_check, subregion_plan = subregion_plan, out = out,
+       geom_keys = geom_keys, geom_check = geom_check, unit_expectation = unit_expectation, out = out,
        has_taxonomy = !is.null(out) && "taxonomy" %in% names(out$tables),
        has_model    = !is.null(out) && "model"    %in% names(out$tables),
        n_failed_stages = if (is.null(out)) NA_integer_ else length(out$failed),
@@ -532,46 +534,50 @@ stopifnot(
   "a drawable unit failed the geometry-consistency check" =
     nrow(geom_check_tbl) == 0 || (all(geom_check_tbl$keys_ge_2) && all(geom_check_tbl$all_keys_in_geometry)))
 
-# master plan D16: every subregion cut/omission is a ROW here, never silent
-subregion_plan_tbl <- bind_rows(lapply(builds, function(b) {
-  if (is.null(b$subregion_plan)) return(tibble())
-  data.frame(ver = b$ver, omitted = b$subregion_plan$omitted, cut = b$subregion_plan$cut,
-             keys_handed_to_build = paste(sort(b$subregion_plan$keys), collapse = ","),
-             reason = b$subregion_plan$reason)
+# master plan D16, corrected: every zone type's unit expectation is a ROW
+# here (present or not, and why), never silent -- for EVERY zone type a
+# release's manifest names, not just subregion.
+unit_expectation_tbl <- bind_rows(lapply(builds, function(b) {
+  if (is.null(b$unit_expectation) || !length(b$unit_expectation)) return(tibble())
+  bind_rows(lapply(names(b$unit_expectation), function(type) {
+    e <- b$unit_expectation[[type]]
+    data.frame(ver = b$ver, zone_type = type, present = e$present,
+               keys = paste(e$keys, collapse = ","), reason = e$reason)
+  }))
 }))
-knitr::kable(subregion_plan_tbl, caption = paste(
-  "D16: subregion geometry actually handed to app_bundle_build(), per release --",
-  "cut/omitted is a finding, reported here and in PUBLISH_PLAN.md, never silent"))
+knitr::kable(unit_expectation_tbl, caption = paste(
+  "D16: every zone type's unit expectation, derived from (zones with a score_%",
+  "metric) INTERSECT (published geometry) -- present=FALSE is a finding,",
+  "reported here and in PUBLISH_PLAN.md, never silent"))
 
-# D16 expectation gate: the RENDERED subregion unit (present/absent, keys)
-# must equal the plan exactly. Seeded fault (verified 2026-09-22, real
-# render): giving v7 the UNCUT canonical geometry instead of its planned
-# {AK, GA, PA} makes msens::app_bundle_build() itself STOP --
-#   "the geometry given for `subregion_key` does not match the table the
-#    manifest names ... in the geometry but NOT in that table: AT"
-# -- which already fails the pre-existing `all(build_tbl$ok)` check above;
-# this gate is the SECOND, independent proof for when a build does NOT stop
-# but still drifts from what D16 says should be published.
-subregion_expect_tbl <- bind_rows(lapply(builds, function(b) {
-  if (!isTRUE(b$ok) || is.null(b$subregion_plan)) return(tibble())
-  units <- if (!is.null(b$out$boot)) b$out$boot$units else list()
-  u <- Filter(function(x) x$zone_type == "subregion", units)
-  actual_present <- length(u) > 0
-  actual_keys    <- if (actual_present) sort(unique(as.character(unlist(u[[1]]$keys)))) else character(0)
-  expected_present <- !b$subregion_plan$omitted
-  expected_keys    <- sort(b$subregion_plan$keys)
-  data.frame(ver = b$ver, expected_present = expected_present, actual_present = actual_present,
-             expected_keys = paste(expected_keys, collapse = ","),
-             actual_keys   = paste(actual_keys, collapse = ","),
-             matches_expectation = identical(expected_present, actual_present) &&
-               (!expected_present || identical(actual_keys, expected_keys)))
+# D16 expectation gate: the RENDERED unit set (present/absent per zone type,
+# and its keys) must equal the DERIVED expectation exactly -- never a
+# hand-written table. Seeded fault (app_bundle_unit_expectation_selftest(),
+# guard-selftest above): dropping the score_% filter makes every zone look
+# scored, wrongly crossing the >= 2 threshold for v7's subregion (1 of 5
+# REALLY scored) -- shown red there, on the derivation rule itself, offline.
+unit_expect_gate_tbl <- bind_rows(lapply(builds, function(b) {
+  if (!isTRUE(b$ok) || is.null(b$unit_expectation) || is.null(b$out$boot)) return(tibble())
+  actual_by_type <- setNames(b$out$boot$units, vapply(b$out$boot$units, function(u) u$zone_type, ""))
+  bind_rows(lapply(names(b$unit_expectation), function(type) {
+    exp <- b$unit_expectation[[type]]
+    u   <- actual_by_type[[type]]
+    actual_present <- !is.null(u)
+    actual_keys    <- if (actual_present) sort(unique(as.character(unlist(u$keys)))) else character(0)
+    data.frame(ver = b$ver, zone_type = type,
+               expected_present = exp$present, actual_present = actual_present,
+               expected_keys = paste(exp$keys, collapse = ","),
+               actual_keys   = paste(actual_keys, collapse = ","),
+               matches_expectation = identical(exp$present, actual_present) &&
+                 (!exp$present || identical(actual_keys, exp$keys)))
+  }))
 }))
-knitr::kable(subregion_expect_tbl, caption = paste(
-  "D16 expectation gate: the rendered subregion unit (present/absent, keys)",
-  "must equal the plan exactly -- matches_expectation must be TRUE"))
+knitr::kable(unit_expect_gate_tbl, caption = paste(
+  "D16 expectation gate: the rendered unit (present/absent, keys) must equal",
+  "the derived expectation exactly -- matches_expectation must be TRUE"))
 stopifnot(
-  "a release's rendered subregion unit does not match the D16 expectation" =
-    nrow(subregion_expect_tbl) == 0 || all(subregion_expect_tbl$matches_expectation))
+  "a release's rendered unit does not match the derived D16 expectation" =
+    nrow(unit_expect_gate_tbl) == 0 || all(unit_expect_gate_tbl$matches_expectation))
 ```
 
 ## Validate
@@ -971,20 +977,19 @@ zone_taxon_integrity_gate <- function(b) {
                         n_dup_rows = if (nrow(dupg)) sum(dupg$n - 1) else 0L,
                         zone_taxon_unique = nrow(dupg) == 0)
 
-  # whole-study-area rollups (USA/FULL) are scored and have no polygon, so
-  # they are never in the GeoPackage and never in boot$units[].keys (round
-  # 3's own rule for geom_keys/app_units()) -- but they ARE real rows in
-  # zone_taxon.parquet (found running v8/v9 for real, 2026-09-22: both list
-  # "USA" as a distinct subregion_key value beside AK/AT/GA/PA). Strip them
-  # from the zone_taxon side before comparing, or every release with a USA
-  # rollup shows a false three-way mismatch.
-  .rollup <- c("USA", "FULL")
+  # a key with no polygon in the published geometry (USA/FULL rollups, and
+  # generally any zone the geometry does not draw) is a real row in
+  # zone_taxon.parquet and in boot$zones, but msens's app_units() (round 3's
+  # own rule) never puts it in boot$units[].keys -- found running v8/v9 for
+  # real, 2026-09-22: both list "USA" beside AK/AT/GA/PA. Rather than a
+  # hardcoded name list, keep only zone_taxon keys that ARE in the geometry
+  # (the general form: no polygon -> never a unit key, whatever it's called).
   units <- b$out$boot$units
   unit_rows <- bind_rows(lapply(units, function(u) {
     fld       <- paste0(u$zone_type, "_key")
     boot_keys <- sort(unique(as.character(unlist(u$keys))))
     geom_k    <- sort(unique(as.character(b$geom_keys[[u$zone_type]])))
-    zt_keys   <- sort(setdiff(unique(as.character(zt$zone_value[zt$zone_fld == fld])), .rollup))
+    zt_keys   <- sort(intersect(unique(as.character(zt$zone_value[zt$zone_fld == fld])), geom_k))
     data.frame(ver = b$ver, zone_type = u$zone_type,
               n_boot_keys = length(boot_keys), n_geom_keys = length(geom_k), n_zt_keys = length(zt_keys),
               boot_eq_geom = identical(boot_keys, geom_k),
