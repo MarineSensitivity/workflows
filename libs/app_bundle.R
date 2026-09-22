@@ -990,103 +990,78 @@ app_bundle_cell_model_selftest <- function() {
   invisible(TRUE)
 }
 
-# ---- unit expectation: which spatial units a release can actually DRAW ------
+# ---- D17: exactly one drawable unit per release, with the exact key count --
 #
-# Master plan D16, corrected (2026-09-22): the first D16 fix cut/omitted
-# subregion geometry per hand-written, per-release rule -- WRONG. msens's
-# geometry-subset check was right all along; the real rule or reads:
-# app_units() requires >= 2 zones with a `score_%` metric (apps/scores/app.R
-# ~570-647) -- a zone with no score has nothing to color a choropleth by.
-# The published geometry is handed to app_bundle_build() UNCUT for every
-# release and every zone type; whether a UNIT gets drawn is derived from
-# (scored zones) INTERSECT (geometry keys), never from a hand-written table.
+# Master plan D17 (Ben's decision, 2026-09-22) supersedes D16 in full:
+# drawable units are Program Areas ONLY (v2-v9), Planning Areas on v1 -- no
+# subregion or ecoregion unit on ANY release. There is no more "derive which
+# zone types are drawable from score_% metrics" (D16's own fix, itself a
+# correction of an earlier wrong per-release geometry cut): the answer is
+# always exactly ONE unit, of a KNOWN type, with a KNOWN exact key count
+# (v1 planarea = 36; v2-v9 programarea = 20) -- checked, not derived.
 
-#' Zone keys (for one `fld`) that carry at least one `score_%` metric
+#' Does a release's rendered `boot$units` match the D17 expectation?
 #'
-#' @param con open DBI connection
-#' @param fld e.g. `"subregion_key"`
-#' @return list: `keys` (distinct zone key values with >= 1 `score_%`
-#'   `zone_metric` row), `n_zones` (distinct zones for this `fld`), `n_scored`
-#'   (of those, how many carry a `score_%` metric)
-app_bundle_scored_zone_keys <- function(con, fld) {
-  none <- list(keys = character(0), n_zones = 0L, n_scored = 0L)
-  if (!all(c("zone", "zone_metric", "metric") %in% DBI::dbListTables(con))) return(none)
-  vz <- msens::sdm_val_col(con, "zone")
-  d <- DBI::dbGetQuery(con, glue::glue("
-    SELECT z.{vz} AS zkey, z.zone_seq,
-           max(CASE WHEN m.metric_key LIKE 'score\\_%' ESCAPE '\\' THEN 1 ELSE 0 END) AS scored
-      FROM zone z
-      LEFT JOIN zone_metric zm USING (zone_seq)
-      LEFT JOIN metric m USING (metric_seq)
-     WHERE z.fld = {DBI::dbQuoteString(con, fld)}
-     GROUP BY 1, 2"))
-  if (!nrow(d)) return(none)
-  list(keys = sort(unique(as.character(d$zkey[d$scored == 1]))),
-      n_zones = length(unique(d$zone_seq)), n_scored = sum(d$scored == 1))
-}
-
-#' Whether a spatial unit is drawable, and with which keys — derived, not guessed
-#'
-#' The SAME rule `msens::app_units()` applies: a unit is drawable iff at least
-#' 2 of its zones carry a `score_%` metric AND are also in the published
-#' geometry. Never hand-codes a per-release exception; a release's own data
-#' (via [app_bundle_scored_zone_keys()]) decides.
-#'
-#' @param scored result of [app_bundle_scored_zone_keys()]
-#' @param geom_keys_type the geometry's real keys for this zone type (e.g.
-#'   `app_bundle_geom_keys(...)[["subregion"]]`)
-#' @return list: `keys` (character, possibly empty), `present` (logical,
-#'   `length(keys) >= 2`), `reason` (one-line, never blank)
-app_bundle_unit_expectation <- function(scored, geom_keys_type) {
-  keys <- intersect(scored$keys, geom_keys_type)
-  present <- length(keys) >= 2
-  reason <- if (present)
-    sprintf("unit present: keys %s (%d of %d zones score_%%-metric AND published)",
-           paste(sort(keys), collapse = ", "), scored$n_scored, scored$n_zones)
+#' @param zone_type_expected `"programarea"` or `"planarea"`
+#' @param n_keys_expected the exact key count expected (36 for v1's
+#'   `planarea`, 20 for `programarea`)
+#' @param units the release's actual `boot$units`
+#' @param n_units_expected normally `1` -- exposed as a parameter ONLY so
+#'   [app_bundle_d17_check_selftest()] can demonstrate what "expect two"
+#'   looks like; the notebook itself always calls this with the default.
+#' @return list: `matches` (logical), `n_units_actual`, `n_keys_actual`,
+#'   `reason` (one-line, never blank)
+app_bundle_d17_check <- function(zone_type_expected, n_keys_expected, units, n_units_expected = 1L) {
+  u <- Filter(function(x) identical(x$zone_type, zone_type_expected), units)
+  n_units_actual <- length(units)
+  n_keys_actual  <- if (length(u) == 1L) length(unique(unlist(u[[1]]$keys))) else NA_integer_
+  matches <- n_units_actual == n_units_expected && length(u) == 1L &&
+    isTRUE(n_keys_actual == n_keys_expected)
+  reason <- if (matches)
+    sprintf("exactly %d unit (%s), %d keys, as expected", n_units_expected, zone_type_expected, n_keys_actual)
   else
-    sprintf("no unit: %d of %d zones carr%s a score_%% metric (need >= 2 that are also published)",
-           scored$n_scored, scored$n_zones, if (scored$n_scored == 1L) "ies" else "y")
-  list(keys = sort(keys), present = present, reason = reason)
+    sprintf("expected %d unit(s) of type '%s' with %d keys; got %d unit(s) total, %s keys",
+           n_units_expected, zone_type_expected, n_keys_expected, n_units_actual,
+           if (is.na(n_keys_actual)) "NA" else as.character(n_keys_actual))
+  list(matches = matches, n_units_actual = n_units_actual, n_keys_actual = n_keys_actual, reason = reason)
 }
 
-#' Self-test for [app_bundle_unit_expectation()] — the derivation rule itself
+#' Self-test for [app_bundle_d17_check()]
 #'
-#' Offline: fabricates `scored`/`geom_keys_type` inputs directly rather than
-#' hitting a database, since the RULE (>= 2 scored AND published) is what is
-#' under test, not any one release's numbers (those are verified separately,
-#' against real data, in the notebook's own render).
+#' Offline: fabricates a `boot$units`-shaped list directly. The seeded fault
+#' IS the point of `n_units_expected` existing as a parameter at all: real
+#' data always has exactly one unit, so "expect two" must always be red.
 #'
 #' @return `TRUE`, invisibly; stops on the first failed expectation
-app_bundle_unit_expectation_selftest <- function() {
+app_bundle_d17_check_selftest <- function() {
   stopifnot(requireNamespace("testthat", quietly = TRUE))
-  testthat::test_that("< 2 scored zones -> no unit, even if the geometry has plenty", {
-    e <- app_bundle_unit_expectation(list(keys = "FULL", n_zones = 5, n_scored = 1),
-                                     c("AK", "AT", "GA", "PA"))
-    testthat::expect_false(e$present)
-    testthat::expect_length(e$keys, 0)
-    testthat::expect_match(e$reason, "no unit")
+  units_pa <- list(list(zone_type = "programarea", keys = as.list(sprintf("PA%02d", 1:20))))
+  units_pl <- list(list(zone_type = "planarea",    keys = as.list(sprintf("PL%02d", 1:36))))
+
+  testthat::test_that("GREEN: exactly one programarea unit, 20 keys, matches", {
+    chk <- app_bundle_d17_check("programarea", 20L, units_pa)
+    testthat::expect_true(chk$matches)
+    testthat::expect_equal(chk$n_units_actual, 1L)
+    testthat::expect_equal(chk$n_keys_actual, 20L)
   })
-  testthat::test_that(">= 2 scored AND published -> present, keys = the intersection", {
-    e <- app_bundle_unit_expectation(list(keys = c("AK", "AT", "GA", "PA", "USA"), n_zones = 5, n_scored = 5),
-                                     c("AK", "AT", "GA", "PA"))
-    testthat::expect_true(e$present)
-    testthat::expect_identical(e$keys, c("AK", "AT", "GA", "PA"))   # USA (no polygon) never in keys
+  testthat::test_that("GREEN: exactly one planarea unit, 36 keys, matches (v1)", {
+    chk <- app_bundle_d17_check("planarea", 36L, units_pl)
+    testthat::expect_true(chk$matches)
   })
-  testthat::test_that("scored but NOT published never counts toward the >= 2", {
-    e <- app_bundle_unit_expectation(list(keys = c("AKL48", "L48"), n_zones = 2, n_scored = 2),
-                                     c("AK", "AT", "GA", "PA"))
-    testthat::expect_false(e$present)
+  testthat::test_that("RED: wrong key count does not match", {
+    chk <- app_bundle_d17_check("programarea", 19L, units_pa)
+    testthat::expect_false(chk$matches)
   })
-  testthat::test_that("seeded fault: dropping the score_% filter invents a unit that should not exist", {
-    # simulates "every zone counts as scored" (the bug this function exists to
-    # prevent) -- v7's real subregion geometry has 1 of 5 REAL scores, but if
-    # the filter were dropped all 5 would look scored, wrongly crossing >= 2
-    fake_all_scored <- list(keys = c("AK", "AT", "GA", "PA", "FULL"), n_zones = 5, n_scored = 5)
-    e_bug <- app_bundle_unit_expectation(fake_all_scored, c("AK", "AT", "GA", "PA"))
-    testthat::expect_true(e_bug$present)     # RED: a unit the real data does not support
-    e_real <- app_bundle_unit_expectation(list(keys = "FULL", n_zones = 5, n_scored = 1),
-                                          c("AK", "AT", "GA", "PA"))
-    testthat::expect_false(e_real$present)   # GREEN: the real (filtered) data correctly has none
+  testthat::test_that("RED: an extra unit (subregion/ecoregion reappearing) does not match", {
+    chk <- app_bundle_d17_check("programarea", 20L, c(units_pa,
+      list(list(zone_type = "subregion", keys = list("AK", "AT")))))
+    testthat::expect_false(chk$matches)
+    testthat::expect_equal(chk$n_units_actual, 2L)
+  })
+  testthat::test_that("SEEDED FAULT: expecting TWO units when there is only one is red", {
+    chk <- app_bundle_d17_check("programarea", 20L, units_pa, n_units_expected = 2L)
+    testthat::expect_false(chk$matches)
+    testthat::expect_match(chk$reason, "expected 2 unit")
   })
   invisible(TRUE)
 }

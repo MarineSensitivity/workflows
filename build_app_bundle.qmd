@@ -340,7 +340,7 @@ app_bundle_cell_model_selftest()
 app_bundle_head_check_selftest()
 app_bundle_head_check_retry_selftest()
 app_bundle_zone_taxon_check_selftest()
-app_bundle_unit_expectation_selftest()
+app_bundle_d17_check_selftest()
 ```
 
 ## Build
@@ -428,27 +428,26 @@ build_one <- function(ver) {
     "could not fetch/parse the published {ver}/manifest.json (round-10 hard-fail)" =
       !is.null(pub_manifest) && !is.null(pub_manifest$zones) && nrow(pub_manifest$zones) > 0)
 
-  # round 3: a missing/unreadable GeoPackage is now a HARD FAILURE inside
-  # app_bundle_geom_keys() itself (it stops, naming the path); this outer
-  # stopifnot is the second, notebook-level check the review asked for --
-  # every zone the manifest names must resolve an entry, full stop.
-  geom_keys <- app_bundle_geom_keys(pub_manifest$zones, zone_sets, dir_derived)
+  # master plan D17 (Ben's decision, 2026-09-22): drawable units are Program
+  # Areas ONLY (v2-v9), Planning Areas on v1 -- no subregion or ecoregion
+  # unit on ANY release. This supersedes D16 entirely (its per-zone-type
+  # derivation, the subregion cut/omit logic, the v8 AT warning): there is
+  # exactly ONE unit type per release now, so ONLY that one geometry is ever
+  # resolved or handed to app_bundle_build() -- not "every zone type the
+  # manifest names," which is what let ecoregion/subregion geometry checks
+  # (and their false mismatches) into the build at all.
+  d17_type <- if (ver == "v1") "planarea" else "programarea"
+  d17_fld  <- paste0(d17_type, "_key")
+  zones_for_unit <- pub_manifest$zones[pub_manifest$zones$fld == d17_fld, , drop = FALSE]
   stopifnot(
-    "geom_keys resolved fewer entries than the manifest names zones (round-3 hard-fail)" =
-      length(geom_keys) == nrow(pub_manifest$zones))
-
-  # master plan D16, corrected (2026-09-22): the FIRST fix cut/omitted
-  # subregion geometry per a hand-written, per-release table -- wrong.
-  # msens's geometry-subset check was right; the geometry passed to
-  # app_bundle_build() is now the FULL published geometry, UNCUT, for every
-  # release and every zone type (matching every other zone type already).
-  # Whether a spatial unit is drawable at all is a SEPARATE, DERIVED question
-  # (app_bundle_unit_expectation(), below) -- never a hand-written exception.
-  unit_expectation <- lapply(setNames(names(geom_keys), names(geom_keys)), function(type) {
-    fld    <- paste0(type, "_key")
-    scored <- app_bundle_scored_zone_keys(con, fld)
-    app_bundle_unit_expectation(scored, geom_keys[[type]])
-  })
+    "D17: this release's manifest has no row for its own drawable unit's field" =
+      nrow(zones_for_unit) == 1)
+  # round 3: a missing/unreadable GeoPackage is now a HARD FAILURE inside
+  # app_bundle_geom_keys() itself (it stops, naming the path).
+  geom_keys <- app_bundle_geom_keys(zones_for_unit, zone_sets, dir_derived)
+  stopifnot(
+    "D17: exactly the release's ONE drawable unit's geometry must be passed -- no more, no fewer" =
+      length(geom_keys) == 1 && identical(names(geom_keys), d17_type))
 
   # round 4: msens 0.43.0 @ 71aa231 moved app/taxonomy.parquet INTO
   # app_bundle_build() itself (as app_taxonomy(), fed by taxonomy_csv) and
@@ -492,8 +491,8 @@ build_one <- function(ver) {
     app_bundle_assert_units_match_geometry(out$boot$units, geom_keys) else tibble()
 
   list(ver = ver, ok = !is.null(out), dir_out = dir_out, con_db = opened$db, manifest = mfst,
-       pub_manifest = pub_manifest,
-       geom_keys = geom_keys, geom_check = geom_check, unit_expectation = unit_expectation, out = out,
+       pub_manifest = pub_manifest, d17_type = d17_type,
+       geom_keys = geom_keys, geom_check = geom_check, out = out,
        has_taxonomy = !is.null(out) && "taxonomy" %in% names(out$tables),
        has_model    = !is.null(out) && "model"    %in% names(out$tables),
        n_failed_stages = if (is.null(out)) NA_integer_ else length(out$failed),
@@ -552,50 +551,26 @@ stopifnot(
   "a drawable unit failed the geometry-consistency check" =
     nrow(geom_check_tbl) == 0 || (all(geom_check_tbl$keys_ge_2) && all(geom_check_tbl$all_keys_in_geometry)))
 
-# master plan D16, corrected: every zone type's unit expectation is a ROW
-# here (present or not, and why), never silent -- for EVERY zone type a
-# release's manifest names, not just subregion.
-unit_expectation_tbl <- bind_rows(lapply(builds, function(b) {
-  if (is.null(b$unit_expectation) || !length(b$unit_expectation)) return(tibble())
-  bind_rows(lapply(names(b$unit_expectation), function(type) {
-    e <- b$unit_expectation[[type]]
-    data.frame(ver = b$ver, zone_type = type, present = e$present,
-               keys = paste(e$keys, collapse = ","), reason = e$reason)
-  }))
+# master plan D17 (Ben's decision, 2026-09-22, supersedes D16 in full):
+# drawable units are Program Areas ONLY (v2-v9), Planning Areas on v1 -- no
+# subregion or ecoregion unit on any release. Exactly ONE unit per release,
+# with an EXACT key count (v1 planarea=36; v2-v9 programarea=20) --
+# app_bundle_d17_check() asserts it, never derives or hand-cuts it. Every
+# release still gets a ROW here regardless of pass/fail, per "never silent."
+d17_gate_tbl <- bind_rows(lapply(builds, function(b) {
+  if (!isTRUE(b$ok) || is.null(b$out$boot)) return(tibble())
+  n_keys_expected <- length(b$geom_keys[[b$d17_type]])
+  chk <- app_bundle_d17_check(b$d17_type, n_keys_expected, b$out$boot$units)
+  data.frame(ver = b$ver, expected_zone_type = b$d17_type, n_keys_expected = n_keys_expected,
+             n_units_actual = chk$n_units_actual, n_keys_actual = chk$n_keys_actual,
+             matches_expectation = chk$matches, reason = chk$reason)
 }))
-knitr::kable(unit_expectation_tbl, caption = paste(
-  "D16: every zone type's unit expectation, derived from (zones with a score_%",
-  "metric) INTERSECT (published geometry) -- present=FALSE is a finding,",
-  "reported here and in PUBLISH_PLAN.md, never silent"))
-
-# D16 expectation gate: the RENDERED unit set (present/absent per zone type,
-# and its keys) must equal the DERIVED expectation exactly -- never a
-# hand-written table. Seeded fault (app_bundle_unit_expectation_selftest(),
-# guard-selftest above): dropping the score_% filter makes every zone look
-# scored, wrongly crossing the >= 2 threshold for v7's subregion (1 of 5
-# REALLY scored) -- shown red there, on the derivation rule itself, offline.
-unit_expect_gate_tbl <- bind_rows(lapply(builds, function(b) {
-  if (!isTRUE(b$ok) || is.null(b$unit_expectation) || is.null(b$out$boot)) return(tibble())
-  actual_by_type <- setNames(b$out$boot$units, vapply(b$out$boot$units, function(u) u$zone_type, ""))
-  bind_rows(lapply(names(b$unit_expectation), function(type) {
-    exp <- b$unit_expectation[[type]]
-    u   <- actual_by_type[[type]]
-    actual_present <- !is.null(u)
-    actual_keys    <- if (actual_present) sort(unique(as.character(unlist(u$keys)))) else character(0)
-    data.frame(ver = b$ver, zone_type = type,
-               expected_present = exp$present, actual_present = actual_present,
-               expected_keys = paste(exp$keys, collapse = ","),
-               actual_keys   = paste(actual_keys, collapse = ","),
-               matches_expectation = identical(exp$present, actual_present) &&
-                 (!exp$present || identical(actual_keys, exp$keys)))
-  }))
-}))
-knitr::kable(unit_expect_gate_tbl, caption = paste(
-  "D16 expectation gate: the rendered unit (present/absent, keys) must equal",
-  "the derived expectation exactly -- matches_expectation must be TRUE"))
+knitr::kable(d17_gate_tbl, caption = paste(
+  "D17: exactly ONE drawable unit per release (programarea v2-v9, planarea v1),",
+  "with the exact published key count -- matches_expectation must be TRUE"))
 stopifnot(
-  "a release's rendered unit does not match the derived D16 expectation" =
-    nrow(unit_expect_gate_tbl) == 0 || all(unit_expect_gate_tbl$matches_expectation))
+  "D17: a release does not have exactly one drawable unit with the exact expected key count" =
+    nrow(d17_gate_tbl) == 0 || all(d17_gate_tbl$matches_expectation))
 ```
 
 ## Validate
