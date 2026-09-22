@@ -93,11 +93,18 @@ APP_BUNDLE_S3=1 APP_BUNDLE_CELLMODEL_VERS=v7b EXIT_FILE=_output/logs/render_app_
   nohup scripts/render_app_bundle.sh v7b > _output/logs/render_app_bundle_publish_v7b.log 2>&1 &
 ```
 
-Each of the three invocations is judged by its OWN exit-codes file (named above) plus that
-render's own `verify-anonymous` chunk (`label: verify-anonymous`, `eval: !expr do_s3`), which HEADs
-every object it just wrote anonymously — no credentials, exactly as the browser will fetch it —
-asserting 200, `content-encoding: gzip` on every JSON object, and a path-style URL. A publish is
-not "done" until all three exit-codes files read 0 and all three verify-anonymous tables are clean.
+**`scripts/render_app_bundle.sh` itself always exits 0, regardless of any version's render
+outcome** — its loop captures each `quarto render`'s `$?` only to append it to `$EXIT_FILE`; the
+script never acts on that value itself and ends with `echo "==> driver done ..."`, so the last
+command it runs is always a successful `echo`. `wait`/`$?` on the `nohup`'d job above therefore
+proves NOTHING about whether any version actually built. The ONLY verdicts are: the three
+exit-codes files (`render_app_bundle_exit_codes.txt`, `..._exit_codes_publish_v7.txt`,
+`..._exit_codes_publish_v7b.txt`) — every line must read `<ver> 0` — and the three
+`verify-anonymous` tables, one per invocation (`label: verify-anonymous`, `eval: !expr do_s3`),
+which HEAD every object each invocation just wrote, anonymously — no credentials, exactly as the
+browser will fetch it — asserting 200, `content-encoding: gzip` on every JSON object, and a
+path-style URL. A publish is not "done" until all three exit-codes files read all-0 and all three
+verify-anonymous tables are clean; the driver's own shell exit status is never evidence either way.
 
 ## Total upload, one publish turn
 
