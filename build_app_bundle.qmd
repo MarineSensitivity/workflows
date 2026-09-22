@@ -152,7 +152,12 @@ stopifnot(
   "installed msens::app_bundle_build() has no `taxonomy_csv` argument -- reinstall from atlas-contract @ 71aa231 or later" =
     "taxonomy_csv" %in% names(formals(msens::app_bundle_build)),
   "installed msens::app_bundle_build() has no `zone_sets` argument -- reinstall from atlas-contract @ ba4b6d0 or later (the v2 zone-table fix)" =
-    "zone_sets" %in% names(formals(msens::app_bundle_build)))
+    "zone_sets" %in% names(formals(msens::app_bundle_build)),
+  # this-round fix: the app{} patch is built from app_manifest_block() (standalone,
+  # never manifest_build()) -- guard its presence the same way, since it is now
+  # load-bearing for the patch and not just an optional extra.
+  "installed msens has no exported app_manifest_block() -- reinstall from atlas-contract @ 7d8c6c0 or later" =
+    "app_manifest_block" %in% getNamespaceExports("msens"))
 message(glue("msens {packageVersion('msens')} @ {find.package('msens')}"))
 
 # --- run scope ------------------------------------------------------------
@@ -371,7 +376,7 @@ failing stage — right for an actual publish, wrong for this notebook's diagnos
 notebook always passes `strict = FALSE`, matching the function's own documented "notebook's
 diagnostic pass" use case: every stage that CAN complete does, `out$failed` names whichever
 didn't, and the outer `tryCatch` below is only a safety net for anything upstream of `stage()`
-(e.g. `manifest_build()` itself).
+(e.g. `app_bundle_fetch_published_manifest()` itself, or the connection open).
 
 ```{r}
 #| label: build
@@ -392,34 +397,13 @@ build_one <- function(ver) {
   fs::dir_create(dir_out)
 
   v_row <- versions_csv |> filter(ver == !!ver)
-  status <- if (nrow(v_row)) v_row$status[1] else "prerelease"
-  access <- if (nrow(v_row)) v_row$access[1] else "restricted"
-
-  f_scog  <- file.path(fs::path_dir(opened$db), "tables", "score_cog.parquet")
-  metrics <- if (file.exists(f_scog)) {
-    arrow::read_parquet(f_scog) |> filter(!startsWith(metric_key, "_")) |>
-      transmute(metric_key, subregion_key, cog = cog_url, rescale_min, rescale_max, colormap)
-  } else NULL
-
   zone_sets <- readr::read_csv(here("data/zone_sets.csv"), show_col_types = FALSE)
-  # round-2 fix: manifest_build()'s zone_tiles was never passed, so every
-  # zone's pmtiles stayed NA and app_units() -- which requires a non-NA
-  # pmtiles -- returned ZERO units regardless of geom_keys. Same construction
-  # build_version_manifest.qmd uses.
-  zone_tiles <- setNames(
-    as.list(glue("{base}/zones/{zone_sets$zone_set_key}/zones.pmtiles")),
-    zone_sets$zone_set_key)
-  mfst <- msens::manifest_build(con, ver, status = status, access = access, base = base,
-                                metrics = metrics, zone_tiles = zone_tiles, zone_sets = zone_sets)
-  # round 10 (2026-09-22): app_bundle_build() (and this notebook's own
-  # geom_keys, below) must be handed the PUBLISHED manifest.json, not the
-  # one just rebuilt above. manifest_build()'s one-row-per-zone_set_key
-  # collapse breaks a genuine tie (v2's subregion_key: two zone tables,
-  # n = 4 each) by DuckDB's own row order -- non-deterministic between an
-  # installed-package build and a source-tree run of the IDENTICAL commit.
-  # `mfst` (above) is kept only for the app{} manifest-patch proposal
-  # (PROPOSAL.md) and the id_field cross-check below, neither of which
-  # touches the ambiguous zone-table resolution. A missing/unreadable
+  # round 10 fix (2026-09-22): app_bundle_build() (and this notebook's own
+  # geom_keys, below) must be handed the PUBLISHED manifest.json, never a
+  # rebuilt one. manifest_build()'s one-row-per-zone_set_key collapse breaks
+  # a genuine tie (v2's subregion_key: two zone tables, n = 4 each) by
+  # DuckDB's own row order -- non-deterministic between an installed-package
+  # build and a source-tree run of the IDENTICAL commit. A missing/unreadable
   # published manifest is a hard stop: a release with no manifest cannot
   # have a bundle at all.
   pub_manifest <- app_bundle_fetch_published_manifest(
@@ -427,6 +411,38 @@ build_one <- function(ver) {
   stopifnot(
     "could not fetch/parse the published {ver}/manifest.json (round-10 hard-fail)" =
       !is.null(pub_manifest) && !is.null(pub_manifest$zones) && nrow(pub_manifest$zones) > 0)
+
+  # this-round fix (2026-09-22): manifest_build() itself -- status/access/
+  # metrics/zone_tiles above, and the `mfst <- msens::manifest_build(...)`
+  # call that used to sit here -- is now REMOVED from this notebook's render
+  # path entirely, not just from app_bundle_build()'s input. Round 10 only
+  # moved app_bundle_build()'s manifest= argument off of a rebuild; it left a
+  # SECOND rebuild sitting right here "for the app{} patch and the id_field
+  # cross-check", and that second rebuild hits the EXACT SAME tie -- v3, v4,
+  # v4b, v5, v6, v7, v7b all have two subregion zone tables tied at n=4 -- so
+  # msens's round-10 hard stop on manifest_build() fired on every one of
+  # those seven releases even though D17 never draws a subregion unit and
+  # nothing downstream of `mfst` needed the zones it resolved. The id_field
+  # cross-check below now reads `pub_manifest$id_field` (the published
+  # manifest already carries it). The app{} patch is built from
+  # `msens::app_manifest_block(ver, base)` -- confirmed standalone in
+  # ../msens/R/app_bundle.R (~line 1592): it needs only ver/base (it probes
+  # `app_capabilities()` itself), never a zones table, so it cannot trip this
+  # tie at all. `app_bundle_build()`'s own return list (dir, ver, bytes,
+  # tables, tiles, boot, failed, n_taxa, n_shards, n_alias -- confirmed by
+  # reading msens R/app_bundle.R's final `invisible(list(...))`) has no
+  # manifest_app-equivalent field, so app_manifest_block() is the only
+  # source, not a fallback.
+  app_block <- tryCatch(msens::app_manifest_block(ver, base), error = function(e) {
+    log_warn("{ver}: app_manifest_block() FAILED: {substr(conditionMessage(e), 1, 300)}")
+    NULL
+  })
+  patch <- if (!is.null(app_block)) { p <- pub_manifest; p$app <- app_block; p } else NULL
+  patch_path <- here("_output", "app_bundle", "patches", sprintf("%s_manifest_with_app.json", ver))
+  if (!is.null(patch)) {
+    fs::dir_create(fs::path_dir(patch_path))
+    jsonlite::write_json(patch, patch_path, auto_unbox = TRUE, pretty = TRUE, null = "null")
+  }
 
   # master plan D17 (Ben's decision, 2026-09-22): drawable units are Program
   # Areas ONLY (v2-v9), Planning Areas on v1 -- no subregion or ecoregion
@@ -490,8 +506,9 @@ build_one <- function(ver) {
   geom_check <- if (!is.null(out) && !is.null(out$boot))
     app_bundle_assert_units_match_geometry(out$boot$units, geom_keys) else tibble()
 
-  list(ver = ver, ok = !is.null(out), dir_out = dir_out, con_db = opened$db, manifest = mfst,
-       pub_manifest = pub_manifest, d17_type = d17_type,
+  list(ver = ver, ok = !is.null(out), dir_out = dir_out, con_db = opened$db,
+       pub_manifest = pub_manifest, patch_ok = !is.null(patch), patch_path = patch_path,
+       d17_type = d17_type,
        geom_keys = geom_keys, geom_check = geom_check, out = out,
        has_taxonomy = !is.null(out) && "taxonomy" %in% names(out$tables),
        has_model    = !is.null(out) && "model"    %in% names(out$tables),
@@ -506,8 +523,12 @@ build_tbl <- bind_rows(lapply(builds, function(b) data.frame(
   n_units = if (!is.null(b$out)) length(b$out$boot$units) else NA,
   n_failed_stages = b$n_failed_stages, failed_stage_names = if (!is.null(b$out) && length(b$out$failed))
     paste(names(b$out$failed), collapse = ", ") else "",
-  has_taxonomy = b$has_taxonomy, has_model = b$has_model, wall_s = round(b$wall_s, 1))))
+  has_taxonomy = b$has_taxonomy, has_model = b$has_model, patch_ok = b$patch_ok,
+  wall_s = round(b$wall_s, 1))))
 knitr::kable(build_tbl, caption = "Per-version build result (this run)")
+stopifnot(
+  "app{} manifest patch (published manifest + app_manifest_block()) failed to write for at least one version" =
+    all(build_tbl$patch_ok))
 stopifnot(
   "app_bundle_build() aborted upstream of stage isolation for at least one version" =
     all(build_tbl$ok),
@@ -643,9 +664,9 @@ boot_contract_gate <- function(b) {
     n_units             = length(boot$units),
     units_ge_1          = length(boot$units) >= 1,
     boot_id_field       = boot$id_field %||% NA_character_,
-    manifest_id_field   = b$manifest$id_field %||% NA_character_,
-    id_field_matches    = !is.null(boot$id_field) && !is.null(b$manifest$id_field) &&
-      identical(boot$id_field, b$manifest$id_field) &&
+    manifest_id_field   = b$pub_manifest$id_field %||% NA_character_,
+    id_field_matches    = !is.null(boot$id_field) && !is.null(b$pub_manifest$id_field) &&
+      identical(boot$id_field, b$pub_manifest$id_field) &&
       boot$id_field %in% c("mdl_key", "mdl_seq"))
 }
 `%||%` <- function(a, b) if (is.null(a)) b else a
