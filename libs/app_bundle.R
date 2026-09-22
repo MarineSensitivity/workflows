@@ -416,8 +416,12 @@ app_bundle_head_check <- function(urls, timeout_s = 10, parallel = 12) {
   writeLines(c(
     "#!/bin/sh",
     "url=\"$1\"",
-    sprintf("st=$(curl -s -o /dev/null -w '%%{http_code}' --max-time %d -I \"$url\")",
-            as.integer(timeout_s)),
+    # curl's --max-time takes a real (fractional seconds ARE honoured, e.g.
+    # 0.001) -- truncating to as.integer() here used to silently turn any
+    # sub-second seeded-fault timeout into `--max-time 0`, which curl treats
+    # as "no limit at all", defeating the exact test it was meant to run.
+    sprintf("st=$(curl -s -o /dev/null -w '%%{http_code}' --max-time %s -I \"$url\")",
+            format(as.numeric(timeout_s), scientific = FALSE)),
     "printf '%s\\t%s\\n' \"$url\" \"$st\""), helper)
   Sys.chmod(helper, "0755")
   writeLines(urls, urls_f)
@@ -428,6 +432,120 @@ app_bundle_head_check <- function(urls, timeout_s = 10, parallel = 12) {
   got_st  <- vapply(parts, function(p) if (length(p) >= 2) p[2] else NA_character_, "")
   m <- match(urls, got_url)
   data.frame(url = urls, status = suppressWarnings(as.integer(got_st[m])), stringsAsFactors = FALSE)
+}
+
+#' Anonymous HEAD each URL, RETRYING only the "no answer" ones
+#'
+#' `curl -w %{http_code}` reports `000` when nothing came back at all (DNS
+#' failure, connection refused, or `--max-time` expired) — that is a
+#' statement about THIS MACHINE'S network right now, not about the object.
+#' Found for real 2026-09-21: this gate reported "an object DOES NOT exist"
+#' while four concurrent Playwright suites (load ~40) were saturating the
+#' laptop's network stack, and 15/15 of the SAME URLs answered 200 seconds
+#' later. A `000` (or any missing/unparseable status) is retried up to
+#' `max_retries` times, at a LOWER parallelism than the first pass (contention
+#' is exactly what caused it) and with backoff; only a REAL, non-200 HTTP
+#' status that survives every retry is treated as "the object is missing" and
+#' fails the render for that reason. A URL that still has no answer after
+#' every retry is NOT the same as "verified missing" -- see
+#' [app_bundle_head_classify()], which keeps the two apart.
+#'
+#' @param urls character vector
+#' @param timeout_s per-request timeout (seconds)
+#' @param parallel concurrent requests on the FIRST pass
+#' @param max_retries retries for a `000`/unparseable result (default 3)
+#' @param retry_parallel concurrent requests on a retry pass (default 4, lower
+#'   than `parallel` on purpose)
+#' @param backoff_s sleep before each retry pass, in order (default
+#'   `c(2, 4, 8)`, recycled if `max_retries` exceeds its length)
+#' @return data frame `url, status` (integer; `0L` if every attempt, including
+#'   retries, came back with no answer), same length and order as `urls`
+app_bundle_head_check_retry <- function(urls, timeout_s = 10, parallel = 12,
+                                        max_retries = 3, retry_parallel = 4,
+                                        backoff_s = c(2, 4, 8)) {
+  if (!length(urls)) return(data.frame(url = character(), status = integer()))
+  cur <- app_bundle_head_check(urls, timeout_s = timeout_s, parallel = parallel)
+  attempt <- 0L
+  while (attempt < max_retries && any(is.na(cur$status) | cur$status == 0L)) {
+    attempt <- attempt + 1L
+    Sys.sleep(backoff_s[((attempt - 1L) %% length(backoff_s)) + 1L])
+    no_answer <- is.na(cur$status) | cur$status == 0L
+    retry_urls <- unique(cur$url[no_answer])
+    retried <- app_bundle_head_check(retry_urls, timeout_s = timeout_s, parallel = retry_parallel)
+    m <- match(cur$url, retried$url)
+    fixed <- no_answer & !is.na(m)
+    cur$status[fixed] <- retried$status[m[fixed]]
+  }
+  cur
+}
+
+#' Classify a batch of [app_bundle_head_check_retry()] results
+#'
+#' Splits `status` into the categories that decide the gate's verdict: a real
+#' HTTP code that is 200, a real HTTP code that is NOT 200 (the actual
+#' defect -- the object answered and it is wrong), and "no answer" (every
+#' attempt, including retries, failed -- NOTHING was verified for that URL,
+#' which must never be silently read as "it's fine").
+#'
+#' @param chk result of [app_bundle_head_check_retry()] (or
+#'   [app_bundle_head_check()])
+#' @return list with `n_200`, `n_other` (real non-200), `n_no_answer`,
+#'   `ok` (`TRUE` only if `n_other == 0 && n_no_answer == 0`), and
+#'   `worst_status`/`worst_url` (a real non-200 first, else `NA`)
+app_bundle_head_classify <- function(chk) {
+  is_no_answer <- is.na(chk$status) | chk$status == 0L
+  is_other     <- !is_no_answer & chk$status != 200L
+  bad <- chk[is_other, , drop = FALSE]
+  list(n_200 = sum(chk$status == 200L, na.rm = TRUE),
+       n_other = sum(is_other), n_no_answer = sum(is_no_answer),
+       ok = sum(is_other) == 0L && sum(is_no_answer) == 0L,
+       worst_status = if (nrow(bad)) bad$status[1] else NA_integer_,
+       worst_url = if (nrow(bad)) bad$url[1] else NA_character_)
+}
+
+#' Self-test for [app_bundle_head_check_retry()]/[app_bundle_head_classify()]
+#' — seeded fault: EVERY request times out
+#'
+#' `timeout_s = 0.001` makes every real HTTPS request time out regardless of
+#' network conditions (a real network round-trip cannot complete in 1 ms) --
+#' the retries then also all fail the same way, by construction, without
+#' depending on this machine's actual load at test time. Confirms the classify
+#' step reports "no answer", never "missing", and that the overall verdict is
+#' still NOT ok (nothing was verified, so it cannot pass) -- both the wrong
+#' claim this replaces and the right one it makes are shown.
+#'
+#' @return `TRUE`, invisibly; stops on the first failed expectation
+app_bundle_head_check_retry_selftest <- function() {
+  stopifnot(requireNamespace("testthat", quietly = TRUE))
+  good <- paste0(msens::atlas_base_url(), "/latest.txt")
+
+  testthat::test_that("RED: an all-timeout batch is classified 'no answer', never 'missing', and overall NOT ok", {
+    chk <- app_bundle_head_check_retry(c(good, good), timeout_s = 0.001,
+                                       max_retries = 1, backoff_s = 0)
+    testthat::expect_true(all(chk$status == 0L))
+    cl <- app_bundle_head_classify(chk)
+    testthat::expect_equal(cl$n_other, 0L)          # NOT reported as "object missing"
+    testthat::expect_equal(cl$n_no_answer, 2L)      # correctly reported as "no answer"
+    testthat::expect_false(cl$ok)                   # verified nothing -> cannot pass
+  })
+
+  testthat::test_that("GREEN: a normal-timeout check of a real 200 URL is ok", {
+    chk <- app_bundle_head_check_retry(good, timeout_s = 10, max_retries = 1)
+    cl <- app_bundle_head_classify(chk)
+    testthat::expect_true(cl$ok)
+    testthat::expect_equal(cl$n_200, 1L)
+  })
+
+  testthat::test_that("a 000 on the first pass that a retry resolves to 200 is NOT a defect", {
+    # simulate: first pass returns 0 (as if it timed out), the "retry" (still
+    # timeout_s=10 here) actually reaches the real object -- since we cannot
+    # force ONE specific pass to fail without controlling the network, this
+    # exercises the retry PATH structurally: max_retries=2 with a real URL
+    # must converge to 200 even if an early pass is slow/unlucky.
+    chk <- app_bundle_head_check_retry(good, timeout_s = 10, max_retries = 2, backoff_s = c(1, 1))
+    testthat::expect_equal(chk$status, 200L)
+  })
+  invisible(TRUE)
 }
 
 #' Self-test for [app_bundle_head_check()] — real network, tiny sample
@@ -847,10 +965,16 @@ app_bundle_cell_model_selftest <- function() {
 #' Corrected 2026-09-21 (review round 1): the notebook previously carried a
 #' private, undocumented 9 MB threshold for `zone_taxon.parquet` and 1.5 MB
 #' for `taxon.parquet`, which meant the table it printed could never flag
-#' either object as over budget. These are the subplan's own numbers,
-#' `zone_taxon.parquet` corrected to 8 MB against the two real measurements
-#' (7,074,125 B on v9, 6,140,626 B on v7 — both under 8 MB, over the
-#' subplan's earlier ~6 MB estimate).
+#' either object as over budget.
+#'
+#' **`zone_taxon.parquet` no longer has a flat byte budget at all — see
+#' [app_bundle_zone_taxon_check()].** Round 4 (2026-09-21) raised the flat cap
+#' twice in a row chasing real releases (8 MB after v7/v9, then 12 MB after
+#' v1) and the SAME motion broke again on v2 (12,244,691 B) before the render
+#' that would have proven it wrong even finished. A flat byte cap on this
+#' object was never the right shape of gate: size tracks ROW COUNT, not
+#' vintage. It is excluded from this table; the calling chunk applies the
+#' bytes-per-row rule to it separately.
 #'
 #' @return data frame: `object`, `kind` (`"gzip"` or `"raw"` — which bytes the
 #'   budget applies to), `budget_bytes`
@@ -858,64 +982,125 @@ app_bundle_budgets <- function() {
   data.frame(
     object = c("boot.json", "taxa.json", "taxon/*.json", "alias/*.json",
               "cell/tile=*/data_0.parquet", "taxon.parquet",
-              "taxonomy.parquet", "zone_taxon.parquet"),
-    kind = c("gzip", "gzip", "gzip", "gzip", "raw", "raw", "raw", "raw"),
-    budget_bytes = as.integer(c(60, 1024, 25, 15, 250, 1024, 1024, 8192) * 1024),
+              "taxonomy.parquet"),
+    kind = c("gzip", "gzip", "gzip", "gzip", "raw", "raw", "raw"),
+    budget_bytes = as.integer(c(60, 1024, 25, 15, 250, 1024, 1024) * 1024),
     stringsAsFactors = FALSE)
 }
 
-# ---- app/taxonomy.parquet: the release's slice of the curated WoRMS hierarchy --
+# ---- zone_taxon.parquet: bytes-PER-ROW, not a flat cap -----------------------
 
-#' The release's slice of the curated WoRMS taxonomic hierarchy
+#' `zone_taxon.parquet`'s size gate: bytes per row, not a flat byte cap
 #'
-#' `app/taxonomy.parquet` — restricted to this release's taxa, so the Composition
-#' treemap never ships a hierarchy row the picker cannot even select. msens has
-#' no builder for this: the source is a curated CSV
-#' (`data/taxonomic_hierarchy_worms_2025-10-30.csv`), not a database table, and
-#' the join it feeds is a v1-v9-SHARED rule (not a per-version quirk), so it
-#' belongs here rather than in `R/app_bundle.R`.
+#' Measured across the FULL 11-release registry (2026-09-21), bytes / rows /
+#' bytes-per-row:
 #'
-#' Joins exactly the way the species app already does it
-#' (`apps/scores/app.R:2857-2866`, `spp_comp`): `taxon_id` cast to character
-#' against the CSV's `species_id`, restricted to `taxon_authority == "worms"`
-#' (case-insensitive — the app's own comment records that the case and the
-#' column TYPE both drift by generation).
+#' | ver | bytes      |    rows | B/row |
+#' |-----|-----------:|--------:|------:|
+#' | v1  |  9,699,882 | 220,534 |  44.0 |
+#' | v2  | 12,244,691 | 282,808 |  43.3 |
+#' | v3  |  2,911,834 |  61,219 |  47.6 |
+#' | v4  |  2,903,429 |       — |     — |
+#' | v4b |  2,904,087 |       — |     — |
+#' | v5  |  2,904,087 |       — |     — |
+#' | v6  |  2,826,737 |  59,440 |  47.6 |
+#' | v7  |  6,151,245 | 126,835 |  48.5 |
+#' | v7b |  6,145,430 |       — |     — |
+#' | v8  |  6,041,791 | 115,700 |  52.2 |
+#' | v9  |  7,074,136 | 140,717 |  50.3 |
 #'
-#' **Round-2 update: the `.0`-suffix workaround is REMOVED.** msens 0.43.0 @
-#' `7c6eb3a` (review fix, landed 2026-09-21) fixed `app_taxon_table()`'s
-#' `taxon_id` so it no longer renders a DOUBLE-typed legacy id as `"125371.0"`
-#' — verified directly against the real v7 release (sample ids come back as
-#' `"22725044"`, `"22695503"`, ..., no trailing `.0`). The
-#' `.strip_trailing_dot0()` normalization this function carried through
-#' review round 1 is gone; a stale caller expecting it will simply get a
-#' clean join, since `taxon_id` was always the join key.
+#' Size tracks ROWS (43–52 B/row across every release measured — a legacy
+#' release scores more zone x taxon combinations, not bigger ones), not the
+#' release's vintage or age: a flat byte cap chases whichever release is
+#' currently biggest and breaks on the next one (round 4's own 8 MB, then
+#' 12 MB). The gate that actually catches bloat — a duplicated column, an
+#' uncompressed write, a join that fans out — is bytes-per-row, with an
+#' absolute floor so the app's own pre-download refusal (> 25 MB) keeps
+#' margin.
 #'
-#' @param taxon_tbl the release's normalized taxon table, from
-#'   [msens::app_taxon_table()] (`key, sci, common, sp_cat, taxon_id,
-#'   taxon_authority, ...`)
-#' @param csv_path path to the curated hierarchy CSV (default: this repo's copy)
-#' @return a data frame: `taxon_id` (character, renamed from the CSV's
-#'   `species_id`) + the CSV's hierarchy columns, one row per release taxon x
-#'   worms authority, never duplicated
-app_taxonomy_table <- function(taxon_tbl,
-                               csv_path = here::here(
-                                 "data/taxonomic_hierarchy_worms_2025-10-30.csv")) {
-  stopifnot(
-    "taxon_tbl needs taxon_id and taxon_authority (see msens::app_taxon_table())" =
-      all(c("taxon_id", "taxon_authority") %in% names(taxon_tbl)),
-    "no curated taxonomy CSV at csv_path" = file.exists(csv_path))
+#' @return `list(max_bytes_per_row = 60, max_bytes = 16 * 1024 * 1024)`
+app_bundle_zone_taxon_budget <- function()
+  list(max_bytes_per_row = 60, max_bytes = 16L * 1024L * 1024L)
 
-  is_worms  <- !is.na(taxon_tbl$taxon_authority) &
-    tolower(taxon_tbl$taxon_authority) == "worms"
-  worms_ids <- unique(taxon_tbl$taxon_id[is_worms & !is.na(taxon_tbl$taxon_id)])
-
-  hier <- readr::read_csv(csv_path, show_col_types = FALSE, guess_max = Inf)
-  stopifnot("csv_path is missing species_id" = "species_id" %in% names(hier))
-  hier$species_id <- as.character(hier$species_id)
-
-  out <- hier[hier$species_id %in% worms_ids, , drop = FALSE]
-  out <- out[!duplicated(out$species_id), , drop = FALSE]     # one row per taxon
-  names(out)[names(out) == "species_id"] <- "taxon_id"
-  rownames(out) <- NULL
-  out
+#' Assert a written `zone_taxon.parquet` meets the bytes-per-row + absolute rule
+#'
+#' @param path path to the written `zone_taxon.parquet`
+#' @return one-row data frame: `bytes`, `rows`, `bytes_per_row`,
+#'   `budget_bytes_per_row`, `budget_bytes`, `ok`
+app_bundle_zone_taxon_check <- function(path) {
+  b <- app_bundle_zone_taxon_budget()
+  if (!file.exists(path))
+    return(data.frame(bytes = NA_real_, rows = NA_integer_, bytes_per_row = NA_real_,
+                      budget_bytes_per_row = b$max_bytes_per_row, budget_bytes = b$max_bytes,
+                      ok = NA))
+  bytes <- as.numeric(file.size(path))
+  rows  <- as.integer(nrow(arrow::read_parquet(path, col_select = 1)))
+  bpr   <- bytes / max(rows, 1)
+  data.frame(bytes = bytes, rows = rows, bytes_per_row = round(bpr, 1),
+             budget_bytes_per_row = b$max_bytes_per_row, budget_bytes = b$max_bytes,
+             ok = bpr <= b$max_bytes_per_row && bytes <= b$max_bytes)
 }
+
+#' Self-test for [app_bundle_zone_taxon_check()] — a real seeded fault, shown red then restored
+#'
+#' Writes a genuine `zone_taxon.parquet` (a handful of rows), confirms it
+#' passes, then writes a BLOATED version with a duplicated wide text column
+#' (each row several KB of repeated text) that stays comfortably under the
+#' 16 MB absolute cap but fails bytes-per-row -- exactly the shape of fault
+#' (a fan-out join, an accidental duplicate column) the absolute cap alone
+#' would miss on a small release. Confirms RED, then restores the real file
+#' and confirms GREEN again, so this proves the fault and the recovery, not
+#' just the fault.
+#'
+#' @return `TRUE`, invisibly; stops on the first failed expectation
+app_bundle_zone_taxon_check_selftest <- function() {
+  stopifnot(requireNamespace("testthat", quietly = TRUE))
+  d <- tempfile("zt_"); dir.create(d)
+  on.exit(unlink(d, recursive = TRUE), add = TRUE)
+  good_path <- file.path(d, "zone_taxon.parquet")
+  bad_path  <- file.path(d, "zone_taxon_bloated.parquet")
+
+  good <- data.frame(zone_fld = rep("subregion_key", 100),
+                     zone_value = rep(c("AK", "AT", "GA", "PA"), 25),
+                     key = sprintf("sp%03d", 1:100),
+                     area_km2 = runif(100, 1, 1000))
+  msens::write_atlas_parquet(good, good_path)
+
+  testthat::test_that("a real zone_taxon.parquet passes bytes-per-row + absolute", {
+    chk <- app_bundle_zone_taxon_check(good_path)
+    testthat::expect_true(chk$ok)
+    testthat::expect_lte(chk$bytes_per_row, chk$budget_bytes_per_row)
+  })
+
+  # seeded fault: bloat every row with a duplicated wide text column -- LOW-
+  # ENTROPY padding (a repeated short string) compresses away under
+  # write_atlas_parquet()'s zstd almost for free and does not reproduce the
+  # fault; RANDOM text does not compress, which is the point: it stands in
+  # for a real fan-out join or an accidental duplicate column, not for
+  # "any large string"
+  set.seed(2026)
+  rand_str <- function(n) paste0(sample(c(letters, LETTERS, 0:9), n, replace = TRUE), collapse = "")
+  bad <- good
+  bad$bloat <- vapply(seq_len(nrow(bad)), function(i) rand_str(120), "")   # ~120 B/row, incompressible
+  msens::write_atlas_parquet(bad, bad_path)
+
+  testthat::test_that("RED: a bloated zone_taxon.parquet fails bytes-per-row while under the absolute cap", {
+    chk <- app_bundle_zone_taxon_check(bad_path)
+    testthat::expect_false(chk$ok)
+    testthat::expect_gt(chk$bytes_per_row, chk$budget_bytes_per_row)
+    testthat::expect_lte(chk$bytes, chk$budget_bytes)   # the absolute cap ALONE would have missed this
+  })
+
+  testthat::test_that("GREEN: restoring the real file passes again", {
+    testthat::expect_true(app_bundle_zone_taxon_check(good_path)$ok)
+  })
+  invisible(TRUE)
+}
+
+# ---- app/taxonomy.parquet -----------------------------------------------------
+#
+# round 4 (2026-09-21): msens 0.43.0 @ 71aa231 moved this INTO
+# app_bundle_build() itself (app_taxonomy(), fed by taxonomy_csv=) -- the
+# notebook's own writer (formerly app_taxonomy_table(), here) is deleted; a
+# stale caller should get a "could not find function" error, not a silent
+# stale copy running beside the real one.

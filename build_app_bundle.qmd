@@ -48,6 +48,16 @@ sequentially, in the background — see its header for why: a foreground `quarto
 90–190s per legacy release and longer per v8/v9, and this notebook must never be waited on in a
 chat turn) and is the only invocation that should be used from here on.
 
+**A cache-invalidation rule from the atlas-2 review, stated here because a publish turn must know
+it BEFORE it decides what to re-run**: re-publishing ANY object the app reads OUTSIDE `app/` —
+`{ver}/tables/model.parquet`, `{ver}/serve/cell_model/**` — requires rebuilding and re-publishing
+`app/` too, because the browser caches those objects keyed on `boot.built_at` (OPFS), not on the
+object's own URL or ETag. A `tables/model.parquet` re-push with no matching `app/` re-push (a new
+`built_at`) leaves every already-cached client reading stale `model.parquet` bytes under an
+unchanged cache key — it will never refetch until something else bumps `built_at` for an unrelated
+reason. There is no partial-republish path for these two: either both `app/` and the object move
+together, in the same publish turn, or neither does.
+
 `APP_BUNDLE_VERS=v7,v9` narrows a run to that set (comma-separated); unset, every version in
 `data/versions.csv` is attempted (v1, v2, v3, v4, v4b, v5, v6, v7, v7b, v8, v9 — **not** v3b, which
 is not a registered release), and a version whose release database is not on this machine is
@@ -106,8 +116,9 @@ flowchart LR
   abb --> txp["taxon.parquet"]
   abb --> ztp["zone_taxon.parquet"]
   abb --> cell["cell/tile={t}/data_0.parquet"]
-  csv[("data/taxonomic_hierarchy_worms_…csv<br/>(curated, not a DB table)")] -->|"app_taxonomy_table()<br/>libs/app_bundle.R"| txm["taxonomy.parquet"]
-  boot & taxa & tsh & alsh & txp & ztp & cell & txm --> val{{"app_validate()<br/>every object vs its<br/>inst/schema/app_*.schema.json"}}
+  csv[("data/taxonomic_hierarchy_worms_…csv<br/>(curated, not a DB table)")] -->|"app_taxonomy()<br/>msens, taxonomy_csv="| txm["taxonomy.parquet"]
+  abb --> mdl["model.parquet (v8+ only)"]
+  boot & taxa & tsh & alsh & txp & ztp & cell & txm & mdl --> val{{"app_validate()<br/>every object vs its<br/>inst/schema/app_*.schema.json"}}
   val -->|"APP_BUNDLE_S3=1"| grd{{"app_bundle_assert_prefix()<br/>refuses any key outside<br/>{ver}/app/"}}
   grd --> s3[["s3://…/marine-atlas/{ver}/app/"]]
   s3 -->|"APP_BUNDLE_S3=1"| anon{{"anonymous HTTPS HEAD/GET<br/>per object"}}
@@ -133,7 +144,13 @@ source(here("libs/app_bundle.R"))
 
 stopifnot(
   "msens 0.43.0 or newer is required (app_bundle_build(), app_manifest_block())" =
-    packageVersion("msens") >= "0.43.0")
+    packageVersion("msens") >= "0.43.0",
+  # round 4: 71aa231 landed taxonomy_csv= and app_model() WITHOUT a Version:
+  # bump (still 0.43.0), so the version-string check above cannot tell 71aa231
+  # apart from an older 0.43.0 build (e.g. 7c6eb3a) -- check the one formal
+  # argument this notebook actually depends on existing, not just a string.
+  "installed msens::app_bundle_build() has no `taxonomy_csv` argument -- reinstall from atlas-contract @ 71aa231 or later" =
+    "taxonomy_csv" %in% names(formals(msens::app_bundle_build)))
 message(glue("msens {packageVersion('msens')} @ {find.package('msens')}"))
 
 # --- run scope ------------------------------------------------------------
@@ -319,6 +336,8 @@ app_bundle_gzip_selftest()
 app_bundle_geom_keys_selftest()
 app_bundle_cell_model_selftest()
 app_bundle_head_check_selftest()
+app_bundle_head_check_retry_selftest()
+app_bundle_zone_taxon_check_selftest()
 ```
 
 ## Build
@@ -333,9 +352,15 @@ correctly; calling it directly is what makes `tables` and `units` non-empty, not
 whole-study-area rollups (`USA`/`FULL`) — comes from [app_bundle_geom_keys()], which reads the
 zone-set registry's own source GeoPackage rather than guessing a filename.
 
-`app/taxonomy.parquet` still has no msens builder (a curated CSV, not a database table), so it is
-written here, from the JUST-WRITTEN `taxon.parquet` (never a second query), via
-`app_taxonomy_table()` (`libs/app_bundle.R`).
+`app/taxonomy.parquet` and `app/model.parquet` (round 4, msens 0.43.0 @ `71aa231`): both moved INTO
+`app_bundle_build()` itself — `taxonomy_csv=` feeds `app_taxonomy()` (still a curated CSV join, not
+a database table, but now one of the builder's own stages, with a `boot$tables` digest like every
+other object) and `app_model()` writes the v8+ `mdl_id -> mdl_key` mapping unconditionally,
+returning `NULL` (not a failure) for v1-v7b, which have no such mapping to give. This notebook no
+longer composes either writer itself, and `app_bundle_build()` now asserts
+`names(boot$tables)` equals the Parquet objects actually on disk (`msens::app_tables_match()`,
+called inside the `boot.json` stage) — the exact drift `app/taxonomy.parquet` and `model.parquet`
+used to be invisible to (OPFS could never invalidate an object with no digest).
 
 `app_bundle_build()` now isolates its own internal stages (msens 0.43.0 @ `7c6eb3a`, landed
 during review round 1): `strict = TRUE` (its default) still stops the WHOLE build at the first
@@ -392,9 +417,20 @@ build_one <- function(ver) {
     "geom_keys resolved fewer entries than the manifest names zones (round-3 hard-fail)" =
       length(geom_keys) == nrow(mfst$zones))
 
+  # round 4: msens 0.43.0 @ 71aa231 moved app/taxonomy.parquet INTO
+  # app_bundle_build() itself (as app_taxonomy(), fed by taxonomy_csv) and
+  # added app_model() for the v8+ mdl_id -> mdl_key mapping -- both now get
+  # boot$tables entries (with digests) the same way every other object does,
+  # and app_bundle_build() already asserts names(boot$tables) == the Parquet
+  # objects on disk (msens::app_tables_match(), called inside the boot.json
+  # stage) -- so this notebook's own taxonomy writer (app_taxonomy_table(),
+  # removed from libs/app_bundle.R) and its separate ok-flag are both gone;
+  # a taxonomy-stage failure is caught the same way every other stage is,
+  # via out$failed below.
   out <- tryCatch(
     msens::app_bundle_build(con, ver, dir_out, manifest = mfst, base = base,
-                            geom_keys = geom_keys, strict = FALSE),
+                            geom_keys = geom_keys, strict = FALSE,
+                            taxonomy_csv = here("data/taxonomic_hierarchy_worms_2025-10-30.csv")),
     error = function(e) {
       log_warn("{ver}: app_bundle_build() FAILED (upstream of stage isolation): {substr(conditionMessage(e), 1, 300)}")
       NULL
@@ -409,21 +445,10 @@ build_one <- function(ver) {
   geom_check <- if (!is.null(out) && !is.null(out$boot))
     app_bundle_assert_units_match_geometry(out$boot$units, geom_keys) else tibble()
 
-  txm_ok <- FALSE
-  if (!is.null(out)) {
-    txm_ok <- isTRUE(tryCatch({
-      tx <- arrow::read_parquet(file.path(dir_out, "taxon.parquet"))
-      d  <- app_taxonomy_table(tx)
-      msens::write_atlas_parquet(d, file.path(dir_out, "taxonomy.parquet"))
-      TRUE
-    }, error = function(e) {
-      log_warn("{ver}: taxonomy.parquet FAILED: {conditionMessage(e)}")
-      FALSE
-    }))
-  }
-
   list(ver = ver, ok = !is.null(out), dir_out = dir_out, con_db = opened$db, manifest = mfst,
-       geom_keys = geom_keys, geom_check = geom_check, out = out, taxonomy_ok = txm_ok,
+       geom_keys = geom_keys, geom_check = geom_check, out = out,
+       has_taxonomy = !is.null(out) && "taxonomy" %in% names(out$tables),
+       has_model    = !is.null(out) && "model"    %in% names(out$tables),
        n_failed_stages = if (is.null(out)) NA_integer_ else length(out$failed),
        wall_s = as.numeric(Sys.time() - t0, units = "secs"))
 }
@@ -435,13 +460,17 @@ build_tbl <- bind_rows(lapply(builds, function(b) data.frame(
   n_units = if (!is.null(b$out)) length(b$out$boot$units) else NA,
   n_failed_stages = b$n_failed_stages, failed_stage_names = if (!is.null(b$out) && length(b$out$failed))
     paste(names(b$out$failed), collapse = ", ") else "",
-  taxonomy_ok = b$taxonomy_ok, wall_s = round(b$wall_s, 1))))
+  has_taxonomy = b$has_taxonomy, has_model = b$has_model, wall_s = round(b$wall_s, 1))))
 knitr::kable(build_tbl, caption = "Per-version build result (this run)")
 stopifnot(
   "app_bundle_build() aborted upstream of stage isolation for at least one version" =
     all(build_tbl$ok),
   "at least one app_bundle_build() STAGE failed" = all(build_tbl$n_failed_stages == 0, na.rm = TRUE),
-  "taxonomy.parquet failed for at least one version" = all(build_tbl$taxonomy_ok))
+  # every release's taxa are a slice of the SAME curated CSV -- taxonomy.parquet
+  # must exist for every release, unlike model.parquet (has_model), which is
+  # TRUE only for v8+ (app_model() correctly returns NULL for v1-v7b, no
+  # mdl_id/mdl_key mapping to give -- not a failure, a capability)
+  "taxonomy.parquet is missing for at least one version" = all(build_tbl$has_taxonomy))
 ```
 
 ### Every drawable unit's keys are a subset of >= 2 keys in its REAL geometry
@@ -683,8 +712,18 @@ digest_gate <- function(b, ver) {
     a <- msens::hash_query(con, glue::glue(
       "SELECT cell_id, {kq} AS val FROM read_parquet('{glob}', hive_partitioning = true)
         WHERE {kq} IS NOT NULL"), cols = c("cell_id", "val"))
+    # round 4 (found rendering v1 for real, 2026-09-21): v1's cell_metric has 703
+    # rows whose cell_id is NOT in `cell` at all (an orphan, pre-existing in the
+    # legacy database, nothing to do with this notebook) -- app_cell_tiles()
+    # correctly never writes them (its own query JOINs against `cell`), so the
+    # ground-truth query here must scope to the SAME cells or every legacy
+    # release with an orphan cell_metric row shows a false digest mismatch. A
+    # cell_metric row for a cell_id the bundle could never contain is out of
+    # scope for "does the published bundle disagree with the database" -- it
+    # was never a candidate to publish in the first place.
     bb <- msens::hash_query(con, glue::glue(
       "SELECT cm.cell_id, cm.{vc} AS val FROM cell_metric cm JOIN metric m USING (metric_seq)
+        JOIN cell c USING (cell_id)
         WHERE m.metric_key = {DBI::dbQuoteString(con, k)} AND cm.{vc} IS NOT NULL"),
       cols = c("cell_id", "val"))
     data.frame(ver = ver, metric_key = k, tiles = a, cell_metric = bb, ok = identical(a, bb))
@@ -722,6 +761,20 @@ zone_metric_gate <- function(b, ver) {
   app_bundle_gate_note("zone_metric", ver, TRUE)
   duckdb_tune(con, file.path(tempdir(), "app_bundle_spill_zm", ver))
   vm <- msens::sdm_val_col(con, "zone_metric"); vz <- msens::sdm_val_col(con, "zone")
+  # round 4 (found rendering v7b for real, 2026-09-21; correction from review):
+  # `zone_metric` carries "*_coverage" rows (e.g.
+  # extrisk_bird_ecoregion_rescaled_coverage) beside the real score metrics --
+  # my FIRST fix here excluded them from the ground truth, on the theory
+  # msens never publishes them. Wrong: `msens::app_boot()` (R/app_bundle.R
+  # ~407-423) DOES publish every one, split into two objects per zone --
+  # `metrics` (keys NOT ending "_coverage") and `coverage` (keys ending
+  # "_coverage", published with the suffix STRIPPED, e.g.
+  # `coverage$extrisk_bird_ecoregion_rescaled`). Proved against the real v7b
+  # bundle: programarea alone has 458 `metrics` + 146 `coverage` values;
+  # every unit together is 983 + 146 = 1129 = n_pub exactly. The bug was this
+  # GATE never reading `zr$coverage` at all, not the ground truth -- fixed by
+  # reading both and mapping a coverage entry's key back to `{key}_coverage`
+  # to rejoin it against `pub`.
   pub <- DBI::dbGetQuery(con, glue::glue("
     SELECT z.fld, z.{vz} AS zkey, m.metric_key, zm.{vm} AS val
       FROM zone z JOIN zone_metric zm USING (zone_seq) JOIN metric m USING (metric_seq)"))
@@ -730,9 +783,13 @@ zone_metric_gate <- function(b, ver) {
   boot_rows <- do.call(rbind, lapply(names(boot$zones), function(ztype) {
     zl <- boot$zones[[ztype]]
     do.call(rbind, lapply(zl, function(zr) {
-      if (!length(zr$metrics)) return(NULL)
-      data.frame(zone_type = ztype, zkey = zr$key, metric_key = names(zr$metrics),
-                val = as.numeric(unlist(zr$metrics)), stringsAsFactors = FALSE)
+      m_rows <- if (length(zr$metrics)) data.frame(
+        zone_type = ztype, zkey = zr$key, metric_key = names(zr$metrics),
+        val = as.numeric(unlist(zr$metrics)), stringsAsFactors = FALSE) else NULL
+      c_rows <- if (length(zr$coverage)) data.frame(
+        zone_type = ztype, zkey = zr$key, metric_key = paste0(names(zr$coverage), "_coverage"),
+        val = as.numeric(unlist(zr$coverage)), stringsAsFactors = FALSE) else NULL
+      rbind(m_rows, c_rows)
     }))
   }))
   j <- merge(pub, boot_rows, by = c("zone_type", "zkey", "metric_key"), suffixes = c("_pub", "_boot"))
@@ -820,8 +877,8 @@ as everything being broken.
 cog_gate <- function(b) {
   none <- function(reason) data.frame(
     ver = b$ver, ran = FALSE, reason = reason, n_sampled = NA_integer_,
-    n_checked = NA_integer_, n_200 = NA_integer_, n_bad = NA_integer_,
-    worst_status = NA_integer_, worst_url = NA_character_)
+    n_checked = NA_integer_, n_200 = NA_integer_, n_other = NA_integer_,
+    n_no_answer = NA_integer_, worst_status = NA_integer_, worst_url = NA_character_)
   if (!isTRUE(b$ok)) {
     app_bundle_gate_note("cog_species_spotcheck", b$ver, FALSE, "build did not complete")
     return(none("build did not complete"))
@@ -833,20 +890,32 @@ cog_gate <- function(b) {
     return(none(reason))
   }
   app_bundle_gate_note("cog_species_spotcheck", b$ver, TRUE)
-  chk <- app_bundle_head_check(samp$url)
-  bad <- chk[is.na(chk$status) | chk$status != 200L, , drop = FALSE]
+  # round 4 (found for real 2026-09-21: this gate reported "an object is
+  # missing" while four concurrent Playwright suites saturated the laptop's
+  # own network, load ~40 -- every request timed out (curl's `000`), and the
+  # SAME urls answered 200 seconds later with the load gone).
+  # app_bundle_head_check_retry() retries only a `000`/no-answer result, at
+  # LOWER parallelism, with backoff; app_bundle_head_classify() then keeps a
+  # REAL non-200 (the actual defect: the object answered and it is wrong)
+  # separate from "no answer after every retry" (nothing was verified for
+  # that URL -- NOT the same claim, and still not a PASS: see `ok` below).
+  chk <- app_bundle_head_check_retry(samp$url)
+  cl  <- app_bundle_head_classify(chk)
   data.frame(ver = b$ver, ran = TRUE, reason = "", n_sampled = nrow(samp), n_checked = nrow(chk),
-             n_200 = sum(chk$status == 200L, na.rm = TRUE), n_bad = nrow(bad),
-             worst_status = if (nrow(bad)) bad$status[1] else NA_integer_,
-             worst_url = if (nrow(bad)) bad$url[1] else NA_character_)
+             n_200 = cl$n_200, n_other = cl$n_other, n_no_answer = cl$n_no_answer,
+             worst_status = cl$worst_status, worst_url = cl$worst_url)
 }
 cog_tbl <- bind_rows(lapply(builds, cog_gate))
 knitr::kable(cog_tbl, caption = paste(
   "Anonymous COG spot-check (all turtle taxa + up to 300 random others);",
-  "ran=FALSE with a reason is a SKIP, not a failure"))
+  "ran=FALSE with a reason is a SKIP, not a failure. n_200/n_other/n_no_answer is the",
+  "status histogram AFTER retries -- n_other is a real non-200 (the defect);",
+  "n_no_answer means nothing was verified for that URL (network/local load, not a missing object)."))
 stopifnot(
-  "an anonymous COG spot-check found a non-200 response for a version that DOES have merged COGs" =
-    nrow(cog_tbl) == 0 || all(!cog_tbl$ran | cog_tbl$n_bad == 0))
+  "an anonymous COG spot-check found a real non-200 response for a version that DOES have merged COGs" =
+    nrow(cog_tbl) == 0 || all(!cog_tbl$ran | cog_tbl$n_other == 0),
+  "an anonymous COG spot-check could not verify every URL even after retries (no-answer, not a PASS)" =
+    nrow(cog_tbl) == 0 || all(!cog_tbl$ran | cog_tbl$n_no_answer == 0))
 ```
 
 ### Gate coverage — which capability-conditioned gates ran per version, and why one was skipped
