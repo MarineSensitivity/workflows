@@ -340,6 +340,7 @@ app_bundle_cell_model_selftest()
 app_bundle_head_check_selftest()
 app_bundle_head_check_retry_selftest()
 app_bundle_zone_taxon_check_selftest()
+app_bundle_subregion_plan_selftest()
 ```
 
 ## Build
@@ -472,7 +473,7 @@ build_one <- function(ver) {
     app_bundle_assert_units_match_geometry(out$boot$units, geom_keys) else tibble()
 
   list(ver = ver, ok = !is.null(out), dir_out = dir_out, con_db = opened$db, manifest = mfst,
-       geom_keys = geom_keys, geom_check = geom_check, out = out,
+       geom_keys = geom_keys, geom_check = geom_check, subregion_plan = subregion_plan, out = out,
        has_taxonomy = !is.null(out) && "taxonomy" %in% names(out$tables),
        has_model    = !is.null(out) && "model"    %in% names(out$tables),
        n_failed_stages = if (is.null(out)) NA_integer_ else length(out$failed),
@@ -530,6 +531,47 @@ knitr::kable(unit_keys_tbl, caption = "Every drawable unit's actual keys, per ve
 stopifnot(
   "a drawable unit failed the geometry-consistency check" =
     nrow(geom_check_tbl) == 0 || (all(geom_check_tbl$keys_ge_2) && all(geom_check_tbl$all_keys_in_geometry)))
+
+# master plan D16: every subregion cut/omission is a ROW here, never silent
+subregion_plan_tbl <- bind_rows(lapply(builds, function(b) {
+  if (is.null(b$subregion_plan)) return(tibble())
+  data.frame(ver = b$ver, omitted = b$subregion_plan$omitted, cut = b$subregion_plan$cut,
+             keys_handed_to_build = paste(sort(b$subregion_plan$keys), collapse = ","),
+             reason = b$subregion_plan$reason)
+}))
+knitr::kable(subregion_plan_tbl, caption = paste(
+  "D16: subregion geometry actually handed to app_bundle_build(), per release --",
+  "cut/omitted is a finding, reported here and in PUBLISH_PLAN.md, never silent"))
+
+# D16 expectation gate: the RENDERED subregion unit (present/absent, keys)
+# must equal the plan exactly. Seeded fault (verified 2026-09-22, real
+# render): giving v7 the UNCUT canonical geometry instead of its planned
+# {AK, GA, PA} makes msens::app_bundle_build() itself STOP --
+#   "the geometry given for `subregion_key` does not match the table the
+#    manifest names ... in the geometry but NOT in that table: AT"
+# -- which already fails the pre-existing `all(build_tbl$ok)` check above;
+# this gate is the SECOND, independent proof for when a build does NOT stop
+# but still drifts from what D16 says should be published.
+subregion_expect_tbl <- bind_rows(lapply(builds, function(b) {
+  if (!isTRUE(b$ok) || is.null(b$subregion_plan)) return(tibble())
+  units <- if (!is.null(b$out$boot)) b$out$boot$units else list()
+  u <- Filter(function(x) x$zone_type == "subregion", units)
+  actual_present <- length(u) > 0
+  actual_keys    <- if (actual_present) sort(unique(as.character(unlist(u[[1]]$keys)))) else character(0)
+  expected_present <- !b$subregion_plan$omitted
+  expected_keys    <- sort(b$subregion_plan$keys)
+  data.frame(ver = b$ver, expected_present = expected_present, actual_present = actual_present,
+             expected_keys = paste(expected_keys, collapse = ","),
+             actual_keys   = paste(actual_keys, collapse = ","),
+             matches_expectation = identical(expected_present, actual_present) &&
+               (!expected_present || identical(actual_keys, expected_keys)))
+}))
+knitr::kable(subregion_expect_tbl, caption = paste(
+  "D16 expectation gate: the rendered subregion unit (present/absent, keys)",
+  "must equal the plan exactly -- matches_expectation must be TRUE"))
+stopifnot(
+  "a release's rendered subregion unit does not match the D16 expectation" =
+    nrow(subregion_expect_tbl) == 0 || all(subregion_expect_tbl$matches_expectation))
 ```
 
 ## Validate
