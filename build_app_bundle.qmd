@@ -965,8 +965,8 @@ zone_taxon_integrity_gate <- function(b) {
                           zone_taxon_unique = logical())
   none_unit <- data.frame(ver = character(), zone_type = character(),
                           n_boot_keys = integer(), n_geom_keys = integer(), n_zt_keys = integer(),
-                          boot_eq_geom = logical(), boot_eq_zt = logical(), geom_eq_zt = logical(),
-                          all_three_equal = logical())
+                          missing_from_zt = character(), extra_in_zt = character(),
+                          warn_missing = logical(), stop_extra = logical())
   if (!isTRUE(b$ok) || is.null(b$out$boot)) return(list(dup = none_dup, unit = none_unit))
   p <- file.path(b$dir_out, "zone_taxon.parquet")
   if (!file.exists(p)) return(list(dup = none_dup, unit = none_unit))
@@ -977,25 +977,29 @@ zone_taxon_integrity_gate <- function(b) {
                         n_dup_rows = if (nrow(dupg)) sum(dupg$n - 1) else 0L,
                         zone_taxon_unique = nrow(dupg) == 0)
 
-  # a key with no polygon in the published geometry (USA/FULL rollups, and
-  # generally any zone the geometry does not draw) is a real row in
-  # zone_taxon.parquet and in boot$zones, but msens's app_units() (round 3's
-  # own rule) never puts it in boot$units[].keys -- found running v8/v9 for
-  # real, 2026-09-22: both list "USA" beside AK/AT/GA/PA. Rather than a
-  # hardcoded name list, keep only zone_taxon keys that ARE in the geometry
-  # (the general form: no polygon -> never a unit key, whatever it's called).
+  # round 9 (msens 0.43.0 @ 9e66946, "the geometry check asks about units"):
+  # a scored, published unit key can legitimately have ZERO zone_taxon rows
+  # (v8 subregion AT: scored, 52,674 cells, but no species-per-zone rows --
+  # boot$zones[unit][].n_taxa == 0, a gap in the release's OWN table, not an
+  # error msens invents around). That direction -- a boot key missing from
+  # zone_taxon -- is a WARNING here, never a stop. The OTHER direction -- a
+  # zone_taxon key that ISN'T a boot key at all -- is still a real integrity
+  # violation (data for a key that was never even a valid unit) and stays a
+  # hard stop. A key with no polygon (USA/FULL rollups) is dropped from the
+  # zone_taxon side before either comparison, same as before.
   units <- b$out$boot$units
   unit_rows <- bind_rows(lapply(units, function(u) {
     fld       <- paste0(u$zone_type, "_key")
     boot_keys <- sort(unique(as.character(unlist(u$keys))))
     geom_k    <- sort(unique(as.character(b$geom_keys[[u$zone_type]])))
     zt_keys   <- sort(intersect(unique(as.character(zt$zone_value[zt$zone_fld == fld])), geom_k))
+    missing <- setdiff(boot_keys, zt_keys)   # scored+published, but 0 zone_taxon rows -- WARN
+    extra   <- setdiff(zt_keys, boot_keys)   # zone_taxon data for a non-unit key -- STOP
     data.frame(ver = b$ver, zone_type = u$zone_type,
               n_boot_keys = length(boot_keys), n_geom_keys = length(geom_k), n_zt_keys = length(zt_keys),
-              boot_eq_geom = identical(boot_keys, geom_k),
-              boot_eq_zt   = identical(boot_keys, zt_keys),
-              geom_eq_zt   = identical(geom_k, zt_keys),
-              all_three_equal = identical(boot_keys, geom_k) && identical(geom_k, zt_keys))
+              missing_from_zt = paste(missing, collapse = ","),
+              extra_in_zt     = paste(extra, collapse = ","),
+              warn_missing = length(missing) > 0, stop_extra = length(extra) > 0)
   }))
   list(dup = dup_row, unit = if (is.null(unit_rows)) none_unit else unit_rows)
 }
@@ -1006,13 +1010,18 @@ knitr::kable(zti_dup_tbl, caption = paste(
   "zone_taxon.parquet uniqueness: (zone_fld, zone_value, mdl_key) must never repeat",
   "-- zone_taxon_unique=FALSE is a real defect (a fan-out from a stale zone-table join)"))
 knitr::kable(zti_unit_tbl, caption = paste(
-  "Per unit: boot$units[].keys == the GeoPackage's real keys == the distinct zone_value",
-  "published in zone_taxon.parquet for that field -- all_three_equal must be TRUE"))
+  "Per unit: boot$units[].keys vs the distinct (in-geometry) zone_value published in",
+  "zone_taxon.parquet -- warn_missing (scored+published, 0 zone_taxon rows) is a WARNING;",
+  "stop_extra (zone_taxon data for a non-unit key) is a hard stop"))
+if (any(zti_unit_tbl$warn_missing))
+  for (i in which(zti_unit_tbl$warn_missing))
+    log_warn(paste0("{zti_unit_tbl$ver[i]} {zti_unit_tbl$zone_type[i]} {zti_unit_tbl$missing_from_zt[i]}: ",
+                    "scored but 0 zone_taxon rows"))
 stopifnot(
   "zone_taxon.parquet has a duplicated (zone_fld, zone_value, mdl_key) triple" =
     nrow(zti_dup_tbl) == 0 || all(zti_dup_tbl$zone_taxon_unique),
-  "a unit's boot/geometry/zone_taxon keys disagree" =
-    nrow(zti_unit_tbl) == 0 || all(zti_unit_tbl$all_three_equal))
+  "zone_taxon.parquet has rows for a key that is not a published unit key" =
+    nrow(zti_unit_tbl) == 0 || !any(zti_unit_tbl$stop_extra))
 ```
 
 ### Anonymous COG spot-check (species assets) — SKIPS, with a reason, when a release has no merged COG
