@@ -857,6 +857,79 @@ sets_tbl <- purrr::imap(builds, set_gates) |> bind_rows()
 knitr::kable(sets_tbl, caption = "Set-equality gates: layers, taxon shard keys, alias targets")
 ```
 
+### `zone_taxon.parquet` integrity — independent of msens, by design
+
+msens owns `app_zone_taxon()`'s internals (which of a zone type's source tables to keep, how a
+duplicate resolves). This gate does not call into any of that: it reads the WRITTEN
+`zone_taxon.parquet` and `boot.json` bytes and checks them against each other and against the
+same GeoPackage geometry `app_bundle_geom_keys()` already resolved for the geometry-consistency
+gate above — three independent sources that must agree, with no msens function anywhere in the
+comparison. Two checks:
+
+1. `(zone_fld, zone_value, mdl_key)` is unique in `zone_taxon.parquet` — the same taxon, in the
+   same zone, cannot appear twice with two different `area_km2`.
+2. For every drawable unit, `boot$units[].keys` (what the app offers), the real GeoPackage's keys
+   (`app_bundle_geom_keys()`), and the distinct `zone_value`s actually published in
+   `zone_taxon.parquet` for that field must all agree.
+
+**Proved RED on today's v2 bundle** (built on msens 0.43.0 @ `71aa231`, before its zone-table fix
+landed): v2's source has two zone tables for `subregion_key`
+(`ply_subregions_2025`/`ply_subregions_2026`); `app_zone_taxon()` merged rows from both instead of
+choosing one, so 13,077 `(zone_fld, zone_value, mdl_key)` triples are duplicated with two different
+`area_km2` values each (e.g. `subregion_key`/`AK`/mdl_key `1` appears twice) — verified directly
+against `_output/app_bundle/v2/zone_taxon.parquet`: `n_dup_groups = 13077`, `n_dup_rows = 13077`.
+
+```{r}
+#| label: validate-zone-taxon-integrity
+
+zone_taxon_integrity_gate <- function(b) {
+  none_dup  <- data.frame(ver = character(), n_dup_groups = integer(), n_dup_rows = integer(),
+                          zone_taxon_unique = logical())
+  none_unit <- data.frame(ver = character(), zone_type = character(),
+                          n_boot_keys = integer(), n_geom_keys = integer(), n_zt_keys = integer(),
+                          boot_eq_geom = logical(), boot_eq_zt = logical(), geom_eq_zt = logical(),
+                          all_three_equal = logical())
+  if (!isTRUE(b$ok) || is.null(b$out$boot)) return(list(dup = none_dup, unit = none_unit))
+  p <- file.path(b$dir_out, "zone_taxon.parquet")
+  if (!file.exists(p)) return(list(dup = none_dup, unit = none_unit))
+  zt <- arrow::read_parquet(p)
+
+  dupg <- zt |> dplyr::count(zone_fld, zone_value, mdl_key) |> dplyr::filter(n > 1)
+  dup_row <- data.frame(ver = b$ver, n_dup_groups = nrow(dupg),
+                        n_dup_rows = if (nrow(dupg)) sum(dupg$n - 1) else 0L,
+                        zone_taxon_unique = nrow(dupg) == 0)
+
+  units <- b$out$boot$units
+  unit_rows <- bind_rows(lapply(units, function(u) {
+    fld       <- paste0(u$zone_type, "_key")
+    boot_keys <- sort(unique(as.character(unlist(u$keys))))
+    geom_k    <- sort(unique(as.character(b$geom_keys[[u$zone_type]])))
+    zt_keys   <- sort(unique(as.character(zt$zone_value[zt$zone_fld == fld])))
+    data.frame(ver = b$ver, zone_type = u$zone_type,
+              n_boot_keys = length(boot_keys), n_geom_keys = length(geom_k), n_zt_keys = length(zt_keys),
+              boot_eq_geom = identical(boot_keys, geom_k),
+              boot_eq_zt   = identical(boot_keys, zt_keys),
+              geom_eq_zt   = identical(geom_k, zt_keys),
+              all_three_equal = identical(boot_keys, geom_k) && identical(geom_k, zt_keys))
+  }))
+  list(dup = dup_row, unit = if (is.null(unit_rows)) none_unit else unit_rows)
+}
+zti <- lapply(builds, zone_taxon_integrity_gate)
+zti_dup_tbl  <- bind_rows(lapply(zti, `[[`, "dup"))
+zti_unit_tbl <- bind_rows(lapply(zti, `[[`, "unit"))
+knitr::kable(zti_dup_tbl, caption = paste(
+  "zone_taxon.parquet uniqueness: (zone_fld, zone_value, mdl_key) must never repeat",
+  "-- zone_taxon_unique=FALSE is a real defect (a fan-out from a stale zone-table join)"))
+knitr::kable(zti_unit_tbl, caption = paste(
+  "Per unit: boot$units[].keys == the GeoPackage's real keys == the distinct zone_value",
+  "published in zone_taxon.parquet for that field -- all_three_equal must be TRUE"))
+stopifnot(
+  "zone_taxon.parquet has a duplicated (zone_fld, zone_value, mdl_key) triple" =
+    nrow(zti_dup_tbl) == 0 || all(zti_dup_tbl$zone_taxon_unique),
+  "a unit's boot/geometry/zone_taxon keys disagree" =
+    nrow(zti_unit_tbl) == 0 || all(zti_unit_tbl$all_three_equal))
+```
+
 ### Anonymous COG spot-check (species assets) — SKIPS, with a reason, when a release has no merged COG
 
 Formalizes what was previously an ad-hoc post-render `curl` script into a real notebook gate.
