@@ -33,7 +33,11 @@ mkdir -p _output/logs
 RENDER_TMPDIR="/tmp/atlas_contract_render_tmp"
 mkdir -p "$RENDER_TMPDIR"
 
-EXIT_FILE="_output/logs/render_app_bundle_exit_codes.txt"
+# EXIT_FILE is override-able (a publish turn is 2+ separate invocations of this
+# script run one after another -- app/-only, then v7's cell_model, then v7b's --
+# and the default name is truncated fresh on EVERY start, so a second invocation
+# would silently erase the first invocation's result unless each names its own).
+EXIT_FILE="${EXIT_FILE:-_output/logs/render_app_bundle_exit_codes.txt}"
 : > "$EXIT_FILE"   # fresh file every driver run -- a stale line from a prior run must never be mistaken for this one's result
 
 if [ "$#" -eq 0 ]; then
