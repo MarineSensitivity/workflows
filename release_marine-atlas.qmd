@@ -33,6 +33,8 @@ Publish the **v8 marine-atlas** and stand up its serving, reproducibly:
    Parquet + views), `DEPLOY_API=1` (plumber image), `DEPLOY_CADDY=1` (URL routing alone),
    `DEPLOY_TITILER=1` (restart the tiler so it drops GDAL's cached headers for COGs
    repainted at their existing URLs — run it after any `publish_native` that rebuilt them).
+   Before the first `DEPLOY_CADDY=1` that adds the atlas-preview service: `sudo mkdir -p
+   /share/atlas_preview && sudo chown 1000:1000 /share/atlas_preview` on the server.
 
 ## Setup
 
@@ -880,6 +882,12 @@ asserts on it, so a misrouted host or a leaked release fails the render. The app
   must redirect, never 200.
 - **origin-direct** (`--resolve` the preview hostname to this server's IP, bypassing
   Cloudflare) → 401, never 200. This is what proves proxying only that hostname is safe.
+- **the atlas app** (`/{ver}/atlas/`, a static build served straight off disk — restricted
+  releases only, `server/caddy/atlas_preview_routes.caddy`) gets the same shape of probe as
+  scores/species: a version's own token → 200 for both `/{ver}/atlas/` and its synthesized
+  `/{ver}/atlas/session.json`, whose `ver` field must equal that version; no token → 401/302;
+  origin-direct → 401; and since `@restricted_app` covers atlas too (2026-09-24), the public
+  host 302s a restricted version's `/{ver}/atlas/` to the review host with the query intact.
 - **docs**: restricted versions 404 on GitHub Pages and (with a token) 200 on the preview host.
 
 Reachability failures (no DNS yet, no cert yet — Phase 0/1 of the plan) are **warned**, never
@@ -904,7 +912,7 @@ if (!do_check_preview) {
                             "-H", shQuote(glue("CF-Access-Client-Secret: {tok_sec}"))) else character()
   log_info("versions: restricted=[{paste(restricted, collapse=',')}] public=[{paste(public, collapse=',')}] latest={latest} token={has_tok}")
 
-  # one GET -> list(code, ms_ver, ms_preview, location, ok=reachable)
+  # one GET -> list(code, ms_ver, ms_preview, json_ver, location, ok=reachable)
   probe <- function(url, extra = character()) {
     f <- tempfile(); on.exit(unlink(f))
     out <- suppressWarnings(system2("curl", c("-sS", "-m", "90", "-o", shQuote(f),
@@ -912,9 +920,12 @@ if (!do_check_preview) {
     st <- attr(out, "status"); if (!is.null(st) && st != 0) return(list(ok = FALSE, err = paste(out, collapse = " ")))
     w  <- strsplit(trimws(tail(out, 1)), " ")[[1]]
     html <- if (file.exists(f)) paste(readLines(f, warn = FALSE), collapse = "\n") else ""
-    m <- function(nm) { r <- regmatches(html, regexec(sprintf('<meta name="%s" content="([^"]*)"', nm), html))[[1]]; if (length(r) > 1) r[2] else NA_character_ }
+    m  <- function(nm) { r <- regmatches(html, regexec(sprintf('<meta name="%s" content="([^"]*)"', nm), html))[[1]]; if (length(r) > 1) r[2] else NA_character_ }
+    # atlas's session.json is synthesized JSON, not an HTML <meta> page -- same idea,
+    # a bare regex capture on the raw body, good enough for `{"preview":true,"ver":"v9"}`
+    mj <- function(key) { r <- regmatches(html, regexec(sprintf('"%s":"([^"]*)"', key), html))[[1]]; if (length(r) > 1) r[2] else NA_character_ }
     list(ok = TRUE, code = as.integer(w[1]), location = if (length(w) > 1) w[2] else "",
-         ms_ver = m("ms-ver"), ms_preview = m("ms-preview"), html = html)
+         ms_ver = m("ms-ver"), ms_preview = m("ms-preview"), json_ver = mj("ver"), html = html)
   }
   fail <- character()
   bad  <- function(msg) { fail <<- c(fail, msg); log_error(msg) }
@@ -1015,6 +1026,62 @@ if (!do_check_preview) {
         bad(glue("ISOLATION BROKEN: the {v} probe token opened {u}"))
       else log_info("probe {v} refused at {u} -> {r$code %||% 'unreachable'} (ok)")
     }
+  }
+
+  # 2c. the ATLAS app: a static build served at /{ver}/atlas/ off the preview host, restricted
+  # releases only (server/caddy/atlas_preview_routes.caddy) -- no Shiny process, so there is no
+  # <meta name="ms-ver"> page to read; the equivalent is session.json, SYNTHESIZED by Caddy from
+  # the URL PATH alone (never ?ver= or a header, server README "The atlas app (restricted
+  # releases)"). Same shape of probe as the scores/species checks above, mirrored for this app.
+  for (v in restricted) {
+    idx_u <- glue("{prev_url}/{v}/atlas/")
+    ses_u <- glue("{idx_u}session.json")
+
+    # (a) with the version's own token: the index page and session.json both answer 200, and
+    # session.json's `ver` is exactly this version -- never another one.
+    if (has_tok) {
+      ri <- probe(idx_u, tok_hdr)
+      if (!ri$ok || !identical(ri$code, 200L))
+        bad(glue("atlas {idx_u} with token: ok={ri$ok} code={ri$code %||% NA}"))
+      else log_info("atlas {idx_u} with token -> 200 (ok)")
+
+      rs <- probe(ses_u, tok_hdr)
+      if (!rs$ok || !identical(rs$code, 200L) || !identical(rs$json_ver, v))
+        bad(glue("atlas {ses_u} with token: ok={rs$ok} code={rs$code %||% NA} json_ver={rs$json_ver %||% NA} (want {v})"))
+      else log_info("atlas {ses_u} with token -> 200, ver={v} (ok)")
+    } else {
+      log_warn("no Cloudflare Access token in the environment -- atlas with-token checks for {v} skipped")
+    }
+
+    # (b) without a token: never 200 (Cloudflare Access 302s to its login; the origin's
+    # jwtauth 401s) -- for both the index page and session.json.
+    for (u in c(idx_u, ses_u)) {
+      r <- probe(u)
+      if (!r$ok) log_warn("atlas {u}: unreachable without token ({r$err}) — DNS/cert not in place yet?")
+      else if (identical(r$code, 200L)) bad(glue("OPEN: atlas {u} answered 200 with no token"))
+      else log_info("atlas {u} without token -> {r$code} {r$location} (closed)")
+    }
+
+    # (d) origin-direct (bypassing Cloudflare) -- never 200, same proof as the scores/species
+    # origin-direct probe above.
+    if (nzchar(origin_ip)) {
+      r0 <- probe(idx_u, c("--resolve", shQuote(glue("{prev_host}:443:{origin_ip}"))))
+      if (!r0$ok) log_warn("origin-direct atlas {idx_u}: unreachable ({r0$err}) — no cert yet?")
+      else if (identical(r0$code, 200L)) bad(glue("OPEN: origin-direct atlas {idx_u} answered 200 (jwtauth not enforcing)"))
+      else log_info("origin-direct atlas {idx_u} -> {r0$code} (closed)")
+    }
+
+    # (c) the PUBLIC host: @restricted_app also covers atlas (2026-09-24), so a restricted
+    # version's /{ver}/atlas/ 302s to the review host with the query intact -- the same
+    # LEAK/redirect shape as the scores/species probe in section 1 above.
+    rp   <- probe(glue("https://app.marinesensitivity.org/{v}/atlas/?x=1"))
+    want <- glue("{idx_u}?x=1")
+    if (!rp$ok) { bad(glue("public /{v}/atlas/: unreachable ({rp$err})")); next }
+    if (identical(rp$code, 200L))
+      bad(glue("LEAK: public /{v}/atlas/ -> code=200 (should 302 to the review host)"))
+    else if (!identical(rp$code, 302L) || !identical(rp$location, as.character(want)))
+      bad(glue("public /{v}/atlas/ does not send a restricted version to the review host: code={rp$code} -> {rp$location} (want 302 {want}; is PREVIEW_RESTRICTED_VERSIONS in the server .env current?)"))
+    else log_info("public /{v}/atlas/ -> 302 {rp$location} (review host, query kept; ok)")
   }
 
   # 3. docs: restricted versions are NOT on GitHub Pages; with a token they are on the preview host
