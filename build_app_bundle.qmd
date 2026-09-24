@@ -208,7 +208,23 @@ if (length(unreg_vers))
 
 # strict: exactly "1" is on, unset/"" is off, anything else (0/true/false/no/...)
 # STOPS the render naming the variable -- see libs/app_bundle.R::app_bundle_flag()
-do_s3       <- app_bundle_flag("APP_BUNDLE_S3")          # push to S3 (default OFF)
+app_bundle_s3 <- app_bundle_flag("APP_BUNDLE_S3")         # the FLAG (default OFF)
+# round 7 (2026-09-26 review, item 8): the same up-front check
+# backfill_versions.qmd runs (its own `has_aws`) -- presence of the CLI is
+# not the question, whether it can AUTHENTICATE is, and a credential-less
+# CLI failing at the publish step is the worst place to find out, after the
+# expensive build already ran. Only actually shells out when the flag is on
+# (a dry run with APP_BUNDLE_S3 unset never touches `aws` at all, same as
+# every other publishing check in this notebook).
+has_aws <- !app_bundle_s3 || (nzchar(Sys.which("aws")) &&
+  identical(0L, suppressWarnings(system2("aws", c("sts", "get-caller-identity"),
+                                         stdout = FALSE, stderr = FALSE))))
+if (app_bundle_s3 && !has_aws)
+  stop(paste(
+    "APP_BUNDLE_S3=1 but `aws sts get-caller-identity` failed (no `aws` CLI, or no/invalid",
+    "credentials) -- refusing to start a build this run cannot finish by pushing. Fix",
+    "credentials (or unset APP_BUNDLE_S3 for a dry run) before rendering."), call. = FALSE)
+do_s3       <- app_bundle_s3 && has_aws                  # push to S3 (default OFF)
 base        <- msens::atlas_base_url()
 dir_derived <- if (Sys.info()[["sysname"]] == "Linux") "/share/data/derived" else "~/_big/msens/derived"
 dir_out_root <- here("_output", "app_bundle")                 # gitignored (see .gitignore)
@@ -472,6 +488,19 @@ didn't, and the outer `tryCatch` below is only a safety net for anything upstrea
 
 build_one <- function(ver) {
   t0 <- Sys.time()
+  # round 7 (2026-09-26 review, item 2): clear THIS version's S3 cache
+  # (manifest.json AND tables/*.parquet) at the start of every build, not
+  # just once ever. `app_bundle_fetch_published_manifest()`'s `if
+  # (!file.exists(dest)) return(TRUE)` and `.attach_s3_legacy()`'s identical
+  # check both reused whatever was on disk FOREVER, across separate renders
+  # on separate days -- a stale `pub_manifest` or a stale tier-3 table could
+  # silently survive a real republish. Scoped to THIS version only (never a
+  # blanket `_s3cache/` wipe): the driver renders one version per R process
+  # (`scripts/render_app_bundle.sh`), so clearing here already makes every
+  # real render start genuinely fresh without discarding a sibling version's
+  # cache it never touches.
+  s3cache_dir_ver <- here("_output", "app_bundle", "_s3cache", ver)
+  if (fs::dir_exists(s3cache_dir_ver)) fs::dir_delete(s3cache_dir_ver)
   opened <- app_bundle_open(ver)
   if (!isTRUE(opened$ok)) {
     log_warn("{ver}: no local release database at {opened$db} -- SKIPPED")
@@ -727,6 +756,12 @@ stopifnot(
   # the check above with name = NULL published for every single zone.
   "not every zone of this release's drawable unit type got a name in the WRITTEN boot.json" =
     all(build_tbl$n_zone_names_landed == build_tbl$n_zone_names_expected),
+  # round 7 (2026-09-26 review, item 6): the equality above passes VACUOUSLY
+  # (0 == 0) when boot$zones[[d17_type]] is missing/empty entirely -- add the
+  # floor explicitly, or a release that silently stopped publishing zones at
+  # all would sail through the check meant to catch exactly that
+  "boot$zones[[d17_type]] is empty (zero zones expected) for at least one version" =
+    all(build_tbl$n_zone_names_expected > 0),
   # round 6 (R3): surface msens's own "zone_names matches 0 real zones"
   # warning (E3, app_zones()) rather than letting `_quarto.yml`'s project-wide
   # `warning: false` swallow it -- any warning raised inside app_bundle_build()
@@ -842,6 +877,13 @@ revalidate_written <- function(b) {
 }
 val_tbl <- bind_rows(purrr::map(builds, revalidate_written))
 knitr::kable(val_tbl, caption = "Schema re-validation of the WRITTEN bytes, per version")
+# round 7 (2026-09-26 review, item 6): this table was printed but never
+# asserted on -- a schema failure (`ok = FALSE`) or a missing object
+# (`ok = NA`, "not built") for a version whose overall build reported
+# `ok = TRUE` both stayed invisible unless someone actually read the table.
+stopifnot(
+  "the WRITTEN boot.json/taxa.json/taxon*/alias* bytes failed re-validation (or were missing) for at least one object" =
+    nrow(val_tbl) == 0 || all(!is.na(val_tbl$ok) & val_tbl$ok))
 ```
 
 ### `boot.json` actually carries its OPFS keys and drawable units
@@ -1151,6 +1193,16 @@ set_gates <- function(b, ver) {
 }
 sets_tbl <- purrr::imap(builds, set_gates) |> bind_rows()
 knitr::kable(sets_tbl, caption = "Set-equality gates: layers, taxon shard keys, alias targets")
+# round 7 (2026-09-26 review, item 6): printed but never asserted on. NA
+# (no taxa_keys/no dir to compare) stays a legitimate "nothing to check";
+# FALSE is a real defect and now stops the render.
+stopifnot(
+  "boot.json's layers do not equal the release's cell_metric keys for at least one version" =
+    nrow(sets_tbl) == 0 || all(sets_tbl$layers_eq_cell_metrics),
+  "taxon shard keys do not equal taxa.json's keys for at least one version" =
+    nrow(sets_tbl) == 0 || all(is.na(sets_tbl$shard_keys_eq_taxa) | sets_tbl$shard_keys_eq_taxa),
+  "at least one alias target does not resolve to a real taxon key" =
+    nrow(sets_tbl) == 0 || all(is.na(sets_tbl$every_alias_resolves) | sets_tbl$every_alias_resolves))
 ```
 
 ### R5: asset resolution — the M1 regression check, at release level
@@ -1270,6 +1322,89 @@ stopifnot(
         asset_tbl$n_bundle_total == asset_tbl$n_truth_total),
   "R5: zero input edges resolved an asset for a release whose model_asset table is non-empty (the M1 bug)" =
     nrow(asset_tbl) == 0 || all(asset_tbl$n_truth_with_asset == 0 | asset_tbl$n_bundle_with_asset > 0))
+```
+
+### R5 (native_asset variant): v8/v9 input-asset resolution, independently
+
+Round 7 (2026-09-26 review, item 7). The `asset_resolution` gate above is scoped to `mdl_seq`-shaped
+releases (v1–v7b) and allow-lists v8/v9's skip as a genuine scope exclusion — but that left v8/v9
+with **no independent asset-resolution check at all**, only whatever `app_bundle_build()` itself
+already asserts. This gate closes that gap: it reads the SAME WRITTEN `taxon/*.json` bytes and
+compares against an independent ground-truth query against `taxon_model`/`native_asset` directly —
+never `.app_assets()`/`.app_edges()` — keyed on `mdl_key` (v8+'s stable string id; `taxon_model`
+already carries each row's own `ms_merge_key`, so no join to `taxon` is even needed, unlike the
+`mdl_seq` variant above).
+
+```{r}
+#| label: validate-asset-resolution-native
+
+asset_gate_native <- function(b) {
+  if (!isTRUE(b$ok) || is.null(b$out$boot) || !identical(b$out$boot$id_field, "mdl_key")) {
+    app_bundle_gate_note("asset_resolution_native", b$ver, FALSE, if (!isTRUE(b$ok))
+      "build did not complete" else if (is.null(b$out$boot)) "no boot.json" else
+      "not a mdl_key-shaped release (v1-v7b's model_asset join is the other R5 gate)")
+    return(tibble())
+  }
+  app_bundle_gate_note("asset_resolution_native", b$ver, TRUE)
+
+  taxon_dir <- file.path(b$dir_out, "taxon")
+  n_bundle_total <- 0L; n_bundle_with_asset <- 0L
+  published_keys <- character()
+  for (f in list.files(taxon_dir, full.names = TRUE)) {
+    d <- jsonlite::fromJSON(f, simplifyVector = FALSE)
+    published_keys <- c(published_keys, names(d$taxa))
+    for (taxon in d$taxa) for (inp in taxon$inputs) {
+      n_bundle_total <- n_bundle_total + 1L
+      if (length(inp$assets)) n_bundle_with_asset <- n_bundle_with_asset + 1L
+    }
+  }
+
+  opened2 <- app_bundle_open(b$ver)
+  if (!isTRUE(opened2$ok))
+    stop(sprintf(
+      "R5 (native_asset): %s qualified for the asset-resolution gate but its asset source could not be re-opened (build_one() used %s) -- refusing to silently skip",
+      b$ver, b$con_db), call. = FALSE)
+  con2 <- opened2$con
+  on.exit(DBI::dbDisconnect(con2, shutdown = TRUE), add = TRUE)
+  if (!identical(opened2$db, b$con_db))
+    stop(sprintf(
+      "R5 (native_asset): %s's re-opened asset source (%s) differs from the one build_one() actually built the bundle from (%s)",
+      b$ver, opened2$db, b$con_db), call. = FALSE)
+  duckdb_tune(con2, file.path(tempdir(), "app_bundle_spill_r5native", b$ver))
+  # `mdl_key`/`ms_merge_key` are already strings on v8+ -- no HUGEINT-safety
+  # casting needed (unlike the mdl_seq variant's numeric ids)
+  DBI::dbWriteTable(con2, "_r5n_published_keys",
+                    data.frame(key = published_keys, stringsAsFactors = FALSE),
+                    temporary = TRUE, overwrite = TRUE)
+  truth <- DBI::dbGetQuery(con2, glue::glue("
+    WITH edges AS (
+      SELECT DISTINCT tm.mdl_key
+        FROM taxon_model tm
+        JOIN _r5n_published_keys pk ON pk.key = tm.ms_merge_key
+       WHERE tm.ds_key <> 'ms_merge' AND tm.mdl_key <> tm.ms_merge_key
+    )
+    SELECT count(*) AS n_total,
+           count(*) FILTER (WHERE EXISTS (
+             SELECT 1 FROM native_asset na WHERE na.mdl_key = edges.mdl_key)) AS n_with_asset
+      FROM edges"))
+
+  data.frame(ver = b$ver,
+             n_bundle_total = n_bundle_total, n_bundle_with_asset = n_bundle_with_asset,
+             n_truth_total = truth$n_total[1], n_truth_with_asset = truth$n_with_asset[1])
+}
+asset_tbl_native <- bind_rows(lapply(builds, asset_gate_native))
+knitr::kable(asset_tbl_native, caption = paste(
+  "R5 (native_asset variant, mdl_key releases only): WRITTEN bundle inputs-with-asset vs an",
+  "INDEPENDENT ground-truth query against taxon_model/native_asset -- fills the gap the",
+  "mdl_seq-only R5 gate above left for v8/v9"))
+stopifnot(
+  "R5 (native_asset): the bundle's inputs-with-asset count disagrees with the independent ground truth" =
+    nrow(asset_tbl_native) == 0 ||
+    all(asset_tbl_native$n_bundle_with_asset == asset_tbl_native$n_truth_with_asset &
+        asset_tbl_native$n_bundle_total == asset_tbl_native$n_truth_total),
+  "R5 (native_asset): zero input edges resolved an asset for a release whose native_asset table is non-empty" =
+    nrow(asset_tbl_native) == 0 ||
+    all(asset_tbl_native$n_truth_with_asset == 0 | asset_tbl_native$n_bundle_with_asset > 0))
 ```
 
 ### Manifest identity — the manifest `app_bundle_build()` actually used, never a rebuilt one
@@ -1649,7 +1784,10 @@ cm_plan_one <- function(ver) {
   one_ok   <- length(n_files) > 0 && all(n_files == 1L)
   tw_ok    <- isTRUE(tryCatch({ msens::app_cell_tile_check(plan$dir, 3103L); TRUE },
                               error = function(e) { message(conditionMessage(e)); FALSE }))
-  already  <- app_bundle_cell_model_already_on_s3(ver, base)
+  # round 7 (item 4 BLOCKER): probe the plan's OWN first key -- tile=0 is
+  # never real (usa05 starts at tile=19, global05 at tile=436), so probing
+  # it could never trigger the all-or-nothing protection on any version
+  already  <- app_bundle_cell_model_already_on_s3(ver, base, plan$keys[1])
   clear    <- isTRUE(keys_ok) && isTRUE(one_ok) && isTRUE(tw_ok) && !isTRUE(already)
   reason   <- if (!isTRUE(keys_ok)) "a key failed the exact tile-filename shape check" else
               if (!isTRUE(one_ok)) "a local tile directory has zero or multiple .parquet files" else
@@ -1709,7 +1847,10 @@ not applying to that release's shape). Every other SKIP for a version about to b
 #| label: push-gate-allowlist
 
 gate_push_allowlist <- list(
-  asset_resolution = "not a mdl_seq-shaped release (v8+'s native_asset join is out of scope for this gate)")
+  asset_resolution = "not a mdl_seq-shaped release (v8+'s native_asset join is out of scope for this gate)",
+  # round 7 (item 7): the mirror-image scope exclusion for the NEW
+  # native_asset R5 variant, which correctly does not apply to v1-v7b
+  asset_resolution_native = "not a mdl_key-shaped release (v1-v7b's model_asset join is the other R5 gate)")
 
 gate_push_block <- gate_coverage_tbl |>
   dplyr::filter(!ran, ver %in% build_tbl$ver[build_tbl$ok]) |>
@@ -1743,6 +1884,40 @@ push_one <- function(b) {
   before <- list_prefix(glue("{ver}/app/"))
   log_info("{ver}/app/ BEFORE push: {length(before)} object(s)")
 
+  # round 7 (2026-09-26 review, item 4): `serve/cell_model/` syncs BEFORE the
+  # `app/` loop below, so `boot.json` -- uploaded LAST within that loop --
+  # stays the true final write of this version's whole push, cell_model
+  # included. Its own exit status is now checked (previously ignored
+  # entirely: `system2()`'s result was discarded, so a failed `aws s3 sync`
+  # looked identical to a successful one), and the uploaded keys are HEADed
+  # afterward to prove they actually landed -- the "already on S3" probe
+  # above only ever checked `plan$keys[1]` BEFORE the sync; this checks every
+  # key AFTER it.
+  if (ver %in% cm_vers) {
+    plan_row <- cm_plan_tbl[cm_plan_tbl$ver == ver, , drop = FALSE]
+    if (nrow(plan_row) && isTRUE(plan_row$clear_to_upload[1])) {
+      plan <- app_bundle_cell_model_plan(ver, dir_derived)
+      app_bundle_assert_cell_model_keys(plan$keys, ver)          # exact shape, again, right before the write
+      app_bundle_assert_prefix(plan$keys, ver, allow_cell_model = TRUE)  # whitelist, again
+      cm_out <- system2("aws", c("s3", "sync", shQuote(plan$dir),
+                                 shQuote(glue("{s3_root}/{ver}/serve/cell_model")), "--only-show-errors"),
+                        stdout = TRUE, stderr = TRUE)
+      if (!is.null(attr(cm_out, "status")) && attr(cm_out, "status") != 0)
+        stop(glue("aws s3 sync failed for {ver}/serve/cell_model/: {paste(cm_out, collapse = '\n')}"))
+      cm_check <- app_bundle_head_check(paste0(base, "/", plan$keys))
+      cm_bad   <- cm_check[is.na(cm_check$status) | cm_check$status != 200L, , drop = FALSE]
+      if (nrow(cm_bad))
+        stop(glue(paste(
+          "{ver}: serve/cell_model/ sync reported success but {nrow(cm_bad)} of {length(plan$keys)}",
+          "keys do not answer 200 anonymously afterward (e.g. {cm_bad$url[1]} -> {cm_bad$status[1]})")))
+      log_info("{ver}: synced serve/cell_model/ -- {length(plan$keys)} keys, {plan$bytes} bytes, all HEAD 200")
+    } else {
+      stop(glue(
+        "{ver} is in APP_BUNDLE_CELLMODEL_VERS but this run's plan did not mark it clear_to_upload ",
+        "-- refusing to sync (see the validate-cell-model-plan chunk's reason column)"))
+    }
+  }
+
   # a controlled directory walk of dir_out -- every file that exists under it,
   # nothing else -- then EVERY key derived from it still goes through the
   # whitelist guard before anything touches S3; the walk being "controlled"
@@ -1765,7 +1940,8 @@ push_one <- function(b) {
   # boot.json is ever reached), means: a visitor sees either the complete OLD
   # bundle or the complete NEW one, never a mix, and a partial failure leaves
   # the OLD boot.json live on S3 -- this notebook never writes boot.json
-  # unless every other object of that version's push already landed.
+  # unless every other object of that version's push (cell_model included,
+  # now that it syncs FIRST) already landed.
   is_boot <- rels == "boot.json"
   stopifnot("exactly one boot.json must be in this version's written bundle" = sum(is_boot) == 1)
   upload_order <- c(which(!is_boot), which(is_boot))
@@ -1779,30 +1955,19 @@ push_one <- function(b) {
       app_bundle_assert_gzip_roundtrip(gz, files[i])         # proves upload bytes == validated bytes
       src <- gz
     }
+    # round 7 (item 3): boot.json is a MUTABLE cache-invalidation pointer
+    # (its own bytes change what `built_at`/digests every OTHER object is
+    # keyed under), never content-addressed, so it gets `no-cache` too --
+    # the same convention `backfill_versions.qmd`/`build_version_manifest.qmd`
+    # already apply to manifest.json
     args <- c("s3", "cp", shQuote(src), shQuote(glue("{s3_root}/{keys[i]}")),
               if (is_json) c("--content-type", shQuote("application/json"),
-                             "--content-encoding", "gzip"))
+                             "--content-encoding", "gzip"),
+              if (is_boot[i]) c("--cache-control", shQuote("no-cache")))
     out <- system2("aws", args, stdout = TRUE, stderr = TRUE)
     if (!is.null(attr(out, "status")) && attr(out, "status") != 0)
       stop(glue("aws s3 cp failed for {keys[i]}: {paste(out, collapse = '\n')}"))
     if (is_json) unlink(src)
-  }
-
-  if (ver %in% cm_vers) {
-    plan_row <- cm_plan_tbl[cm_plan_tbl$ver == ver, , drop = FALSE]
-    if (nrow(plan_row) && isTRUE(plan_row$clear_to_upload[1])) {
-      plan <- app_bundle_cell_model_plan(ver, dir_derived)
-      app_bundle_assert_cell_model_keys(plan$keys, ver)          # exact shape, again, right before the write
-      app_bundle_assert_prefix(plan$keys, ver, allow_cell_model = TRUE)  # whitelist, again
-      system2("aws", c("s3", "sync", shQuote(plan$dir),
-                       shQuote(glue("{s3_root}/{ver}/serve/cell_model")), "--only-show-errors"),
-              stdout = TRUE, stderr = TRUE)
-      log_info("{ver}: synced serve/cell_model/ -- {length(plan$keys)} keys, {plan$bytes} bytes")
-    } else {
-      stop(glue(
-        "{ver} is in APP_BUNDLE_CELLMODEL_VERS but this run's plan did not mark it clear_to_upload ",
-        "-- refusing to sync (see the validate-cell-model-plan chunk's reason column)"))
-    }
   }
 
   after <- list_prefix(glue("{ver}/app/"))
@@ -1814,20 +1979,28 @@ push_out <- purrr::map(builds, push_one)
 
 ## Push the manifest patch (`APP_BUNDLE_S3=1` only, AFTER the bundle objects above)
 
-Round 6 (2026-09-25 review, item 4). Every earlier round built and validated `patch` (the live
-`{ver}/manifest.json` plus [app_manifest_block()]'s `app{}` block and the R4 label backfill) and
-wrote it to `patch_path` — but nothing ever pushed it: the key guard refused any key outside
-`{ver}/app/`, so `{ver}/manifest.json` itself was unreachable, and the staged file just sat under
-`_output/app_bundle/patches/`. This chunk is the missing publish step: it reads that SAME staged
-file (never the in-memory `patch` object, so what gets pushed is provably the bytes that were
-already validated on disk), asserts via [app_bundle_assert_manifest_patch_diff()] that its diff
-against the live manifest this run fetched is **exactly** the `app{}` block plus blank labels
-becoming non-blank — any other change (a different `id_field`, a different `capabilities`, a
-changed `zones` row, a curated label overwritten, a metrics column other than `label`) stops the
-render rather than publish it — then pushes `{ver}/manifest.json` through
-[app_bundle_assert_prefix()]'s new `allow_manifest = TRUE` exception, which admits ONLY that exact
-key. Runs **after** the bundle-objects push above, on purpose: the manifest's `app{}` block
-advertises objects that must already exist before anything can read them.
+Round 6 (2026-09-25 review, item 4), extended round 7 (2026-09-26 review, items 2, 3, 5). Every
+earlier round built and validated `patch` (the live `{ver}/manifest.json` plus
+[app_manifest_block()]'s `app{}` block and the R4 label backfill) and wrote it to `patch_path` —
+but nothing ever pushed it, the `app{}` block was computed BEFORE anything from this run existed on
+S3, and `msens::app_capabilities()` probed the never-real `tile=0` placeholder. This chunk is the
+real publish step, doing all three things the build-time `patch` structurally could not:
+
+1. **Recomputes `app{}` AFTER the bundle-objects push**, from the tiles this run actually just
+   wrote and (if pushed) synced — `msens::app_capabilities()`'s new `cell_tile`/`cell_model_tile`
+   arguments (msens 0.44.1) probe the REAL first tile instead of `tile=0`, which no release ever
+   publishes.
+2. **Re-fetches the live manifest FRESH** (never the build-time cache) and asserts it is
+   `identical()` to `b$pub_manifest` — if it differs, someone republished `{ver}/manifest.json`
+   between this run's build and this push, and pushing a patch computed against a now-stale copy
+   would silently discard whatever changed it. Stops rather than guess.
+3. Re-stages the patch at the SAME `patch_path` with the recomputed `app{}` block, re-runs
+   [app_bundle_assert_manifest_patch_diff()] against the FRESH live manifest (never the build-time
+   one) — any change other than `app{}` plus blank-to-non-blank labels still stops the render — then
+   pushes `{ver}/manifest.json` through [app_bundle_assert_prefix()]'s `allow_manifest = TRUE`
+   exception (an exact key, never a prefix), with `--cache-control no-cache`: `manifest.json` is a
+   MUTABLE pointer (the same convention `backfill_versions.qmd`/`build_version_manifest.qmd` already
+   use), never a content-addressed object, so a CDN/browser must always revalidate it.
 
 `{ver}/manifest.json` is published as **plain JSON, not gzip** — matching the live manifest's own
 encoding (verified: `Content-Type: application/json`, no `Content-Encoding` header on every
@@ -1848,18 +2021,74 @@ push_manifest_one <- function(b) {
     return(invisible(NULL))
   }
   ver <- b$ver
+
+  # item 5: the REAL first tile this run actually wrote -- read off the
+  # WRITTEN local bundle, never guessed. `app/cell/tile=*/` -- browser-
+  # equivalent single-file-per-tile glob, matching every other gate in this
+  # notebook that reads tiles this way.
+  cell_tiles <- Sys.glob(file.path(b$dir_out, "cell", "tile=*", "data_0.parquet"))
+  cell_tile  <- if (length(cell_tiles)) sub(".*tile=([0-9]+).*", "\\1", cell_tiles[1]) else NULL
+  # only a version this run actually planned AND synced `serve/cell_model/`
+  # for gets a cell_model_tile hint -- anything else must keep probing the
+  # (correctly, honestly) never-real tile=0 default
+  cell_model_tile <- NULL
+  if (ver %in% cm_vers) {
+    cm_row <- cm_plan_tbl[cm_plan_tbl$ver == ver, , drop = FALSE]
+    if (nrow(cm_row) && isTRUE(cm_row$clear_to_upload[1])) {
+      plan <- app_bundle_cell_model_plan(ver, dir_derived)
+      if (length(plan$keys)) cell_model_tile <- sub(".*tile=([0-9]+).*", "\\1", plan$keys[1])
+    }
+  }
+  caps <- msens::app_capabilities(ver, base, cell_tile = cell_tile, cell_model_tile = cell_model_tile)
+  app_block <- tryCatch(msens::app_manifest_block(ver, base, capabilities = caps), error = function(e) {
+    log_warn("{ver}: post-push app_manifest_block() FAILED: {substr(conditionMessage(e), 1, 300)}")
+    NULL
+  })
+  if (is.null(app_block)) {
+    log_warn("{ver}: no recomputed app{{}} block -- skipping manifest push")
+    return(invisible(NULL))
+  }
+
+  # item 2: a FRESH, never-cached read of the live manifest -- proves nothing
+  # republished it since this run's build-time read
+  # (app_bundle_fetch_published_manifest(), which DOES cache within a run)
+  live_fresh <- app_bundle_fetch_manifest_nocache(ver, base)
+  if (is.null(live_fresh))
+    stop(sprintf(
+      "%s: could not fetch a FRESH copy of the live manifest.json before pushing -- refusing to push blind",
+      ver), call. = FALSE)
+  if (!identical(live_fresh, b$pub_manifest))
+    stop(sprintf(paste(
+      "%s: the live manifest.json changed since this run's build-time read -- someone",
+      "republished it mid-run; refusing to push a patch computed against a stale copy"), ver),
+      call. = FALSE)
+
+  # re-stage the patch at the SAME path, now with the recomputed app{} block,
+  # and re-run the label backfill against the (unchanged, just-proven-fresh)
+  # live metrics -- same rule as the build-time patch, just not re-derived
+  # from a second, independently-invented call
+  p <- live_fresh; p$app <- app_block
+  p <- msens::manifest_labels_backfill(p)
+  fs::dir_create(fs::path_dir(b$patch_path))
+  jsonlite::write_json(p, b$patch_path, auto_unbox = TRUE, pretty = TRUE, null = "null")
+
   staged <- jsonlite::fromJSON(b$patch_path, simplifyVector = TRUE)
-  app_bundle_assert_manifest_patch_diff(b$pub_manifest, staged, ver)   # stops on anything unexpected
+  app_bundle_assert_manifest_patch_diff(live_fresh, staged, ver)   # stops on anything unexpected
 
   key <- sprintf("%s/manifest.json", ver)
   app_bundle_assert_prefix(key, ver, allow_manifest = TRUE)            # whitelist: ONLY this exact key
 
+  # item 3: manifest.json is a MUTABLE pointer, never content-addressed --
+  # same convention backfill_versions.qmd/build_version_manifest.qmd already
+  # use for it -- so a CDN/browser must always revalidate, never serve a
+  # cached copy past this push
   args <- c("s3", "cp", shQuote(b$patch_path), shQuote(glue("{s3_root}/{key}")),
-            "--content-type", shQuote("application/json"))            # plain JSON, matching the live object
+            "--content-type", shQuote("application/json"),        # plain JSON, matching the live object
+            "--cache-control", shQuote("no-cache"))
   out <- system2("aws", args, stdout = TRUE, stderr = TRUE)
   if (!is.null(attr(out, "status")) && attr(out, "status") != 0)
     stop(glue("aws s3 cp failed for {key}: {paste(out, collapse = '\n')}"))
-  log_info("{ver}: pushed {key}")
+  log_info("{ver}: pushed {key} (cell_tile={cell_tile %||% 'NA'}, cell_model_tile={cell_model_tile %||% 'NA'})")
   invisible(key)
 }
 push_manifest_out <- purrr::map(builds, push_manifest_one)
@@ -1902,8 +2131,16 @@ knitr::kable(
   verify_tbl |> summarise(n = n(), n_200 = sum(status == 200, na.rm = TRUE),
                           n_gzip_ok = sum(gzip_ok, na.rm = TRUE), .by = ver),
   caption = "Anonymous verification summary per version")
-stopifnot("not every pushed object answered 200 anonymously" =
-  all(verify_tbl$status == 200, na.rm = TRUE) && !anyNA(verify_tbl$status))
+stopifnot(
+  "not every pushed object answered 200 anonymously" =
+    all(verify_tbl$status == 200, na.rm = TRUE) && !anyNA(verify_tbl$status),
+  # round 7 (2026-09-26 review, item 6): gzip_ok was computed and printed in
+  # the summary table but never asserted on -- a JSON object pushed WITHOUT
+  # `content-encoding: gzip` (a bug in the push loop, or a proxy/CDN
+  # stripping it) would silently read back not-gzip and this gate stayed
+  # green regardless
+  "at least one JSON object under {ver}/app/ did not answer content-encoding: gzip" =
+    all(is.na(verify_tbl$gzip_ok) | verify_tbl$gzip_ok))
 ```
 
 ## Target manifest
@@ -1916,7 +2153,7 @@ msens::write_manifest(
   target       = "build_app_bundle",
   content_hash = digest::digest(
     list(summary_tbl, val_tbl, boot_contract_tbl, one_file_tbl, tw_tbl, dg_tbl, zm_tbl, sets_tbl,
-        asset_tbl, cog_tbl, gate_coverage_tbl, budgets_tbl, cm_plan_tbl),
+        asset_tbl, asset_tbl_native, cog_tbl, gate_coverage_tbl, budgets_tbl, cm_plan_tbl),
     algo = "xxhash64"),
   stats = list(
     versions_attempted  = vers,
@@ -1929,6 +2166,7 @@ msens::write_manifest(
     n_gates_skipped     = sum(!gate_coverage_tbl$ran),
     n_zone_names_total  = sum(build_tbl$n_zone_names, na.rm = TRUE),
     n_label_patches_total = sum(build_tbl$label_patch_n_blank, na.rm = TRUE),
-    n_asset_gate_versions = nrow(asset_tbl)),
+    n_asset_gate_versions = nrow(asset_tbl),
+    n_asset_gate_native_versions = nrow(asset_tbl_native)),
   force = msens::force_target("build_app_bundle"))
 ```
