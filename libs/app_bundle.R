@@ -371,28 +371,56 @@ app_bundle_assert_manifest_patch_diff <- function(live, staged, ver) {
 
   lm <- live$metrics; sm <- staged$metrics
   if (is.null(lm) && is.null(sm)) return(invisible(TRUE))
-  if (is.null(lm) || is.null(sm) || !identical(dim(lm), dim(sm)) || !identical(names(lm), names(sm)))
+  if (is.null(lm) || is.null(sm) || !identical(nrow(lm), nrow(sm)))
     stop(sprintf(
-      "%s: the staged manifest patch's `metrics` has a different shape (rows/columns) than the live manifest's -- refusing to push",
+      "%s: the staged manifest patch's `metrics` has a different row count than the live manifest's -- refusing to push",
       ver), call. = FALSE)
 
-  non_label <- setdiff(names(lm), "label")
+  # round 7 (2026-09-26 review, item 1): a live manifest with NO `label`
+  # column at all (v1, v2, v9 today) is not a CHANGED column, it is an ADDED
+  # one -- the whole point of the backfill -- and treating "same column set"
+  # as a hard requirement refused every one of those three releases outright.
+  # Allow EXACTLY one added column, named `label`, with every value
+  # non-blank (manifest_labels_backfill() never leaves one blank: a
+  # metric_key it doesn't recognise falls back to the raw key itself, which
+  # is never empty). A REMOVED column, or an added column that isn't
+  # `label`, still stops -- this is not a general "any shape is fine" escape
+  # hatch.
+  added_cols   <- setdiff(names(sm), names(lm))
+  removed_cols <- setdiff(names(lm), names(sm))
+  if (length(removed_cols))
+    stop(sprintf(
+      "%s: the staged manifest patch DROPS metrics column(s): %s -- refusing to push",
+      ver, paste(removed_cols, collapse = ", ")), call. = FALSE)
+  if (length(added_cols) && !identical(added_cols, "label"))
+    stop(sprintf(
+      "%s: the staged manifest patch adds metrics column(s) other than `label`: %s -- refusing to push",
+      ver, paste(added_cols, collapse = ", ")), call. = FALSE)
+  if ("label" %in% added_cols && any(.app_bundle_label_is_blank(sm$label)))
+    stop(sprintf(
+      "%s: the staged manifest patch adds `label` but leaves some value(s) blank -- refusing to push",
+      ver), call. = FALSE)
+
+  non_label <- intersect(setdiff(names(lm), "label"), names(sm))
   if (length(non_label) && !identical(lm[non_label], sm[non_label]))
     stop(sprintf(
       "%s: the staged manifest patch changes a `metrics` column other than `label` -- refusing to push",
       ver), call. = FALSE)
 
-  lab_before <- if ("label" %in% names(lm)) lm$label else rep(NA_character_, nrow(lm))
-  lab_after  <- if ("label" %in% names(sm)) sm$label else rep(NA_character_, nrow(sm))
-  changed <- !(is.na(lab_before) & is.na(lab_after)) & !(!is.na(lab_before) & !is.na(lab_after) & lab_before == lab_after)
-  if (any(changed)) {
-    was_blank <- .app_bundle_label_is_blank(lab_before[changed])
-    now_blank <- .app_bundle_label_is_blank(lab_after[changed])
-    if (!all(was_blank & !now_blank))
-      stop(sprintf(paste(
-        "%s: the staged manifest patch changes a metrics$label that was NOT blank/NA/whitespace",
-        "(or changes it to something still blank) -- only a blank label becoming non-blank is",
-        "allowed -- refusing to push"), ver), call. = FALSE)
+  if ("label" %in% names(lm)) {
+    lab_before <- lm$label
+    lab_after  <- sm$label
+    changed <- !(is.na(lab_before) & is.na(lab_after)) &
+      !(!is.na(lab_before) & !is.na(lab_after) & lab_before == lab_after)
+    if (any(changed)) {
+      was_blank <- .app_bundle_label_is_blank(lab_before[changed])
+      now_blank <- .app_bundle_label_is_blank(lab_after[changed])
+      if (!all(was_blank & !now_blank))
+        stop(sprintf(paste(
+          "%s: the staged manifest patch changes a metrics$label that was NOT blank/NA/whitespace",
+          "(or changes it to something still blank) -- only a blank label becoming non-blank is",
+          "allowed -- refusing to push"), ver), call. = FALSE)
+    }
   }
   invisible(TRUE)
 }
@@ -435,11 +463,64 @@ app_bundle_assert_manifest_patch_diff_selftest <- function() {
     testthat::expect_error(
       app_bundle_assert_manifest_patch_diff(live, staged, "v9"), "refusing to push")
   })
-  testthat::test_that("REFUSED: metrics gains/loses rows", {
+  testthat::test_that("REFUSED: metrics loses a row", {
     staged <- live
     staged$metrics <- staged$metrics[1, , drop = FALSE]
     testthat::expect_error(
       app_bundle_assert_manifest_patch_diff(live, staged, "v9"), "refusing to push")
+  })
+  testthat::test_that("REFUSED: metrics gains a row (round 7, previously untested)", {
+    staged <- live
+    staged$metrics <- rbind(staged$metrics,
+      data.frame(metric_key = "extrisk_fish", label = "fish: ext. risk",
+                category = "raw", stringsAsFactors = FALSE))
+    testthat::expect_error(
+      app_bundle_assert_manifest_patch_diff(live, staged, "v9"), "refusing to push")
+  })
+  testthat::test_that("REFUSED: staged ADDS a top-level key live doesn't have (round 7, previously untested)", {
+    staged <- live
+    staged$extra_key <- "surprise"
+    testthat::expect_error(
+      app_bundle_assert_manifest_patch_diff(live, staged, "v9"), "refusing to push")
+  })
+  testthat::test_that("REFUSED: staged REMOVES a top-level key live has (round 7, previously untested)", {
+    staged <- live
+    staged$status <- NULL
+    testthat::expect_error(
+      app_bundle_assert_manifest_patch_diff(live, staged, "v9"), "refusing to push")
+  })
+
+  # round 7 (2026-09-26 review, item 1 BLOCKER): the live manifest has NO
+  # `label` column at all -- exactly v1/v2/v9's real published shape today --
+  # so the backfill APPENDS the column rather than changing values in place.
+  live_no_label <- list(ver = "v2", status = "released", grid_id = "usa05", id_field = "mdl_seq",
+                        capabilities = list(cell = TRUE), tables = list(cell = "x.parquet"),
+                        metrics = data.frame(metric_key = c("score_x", "extrisk_bird"),
+                                             category = c("composite", "raw"),
+                                             stringsAsFactors = FALSE))
+  testthat::test_that("ALLOWED (round 7 BLOCKER fix): adding a `label` column that didn't exist at all", {
+    staged <- live_no_label
+    staged$app <- list(capabilities = list(cell = TRUE))
+    staged$metrics$label <- c("Overall score", "bird: ext. risk")
+    testthat::expect_true(app_bundle_assert_manifest_patch_diff(live_no_label, staged, "v2"))
+  })
+  testthat::test_that("REFUSED: an added `label` column leaves a value blank", {
+    staged <- live_no_label
+    staged$metrics$label <- c("Overall score", NA_character_)
+    testthat::expect_error(
+      app_bundle_assert_manifest_patch_diff(live_no_label, staged, "v2"), "refusing to push")
+  })
+  testthat::test_that("REFUSED: an added metrics column that isn't `label`", {
+    staged <- live_no_label
+    staged$metrics$surprise <- c("a", "b")
+    testthat::expect_error(
+      app_bundle_assert_manifest_patch_diff(live_no_label, staged, "v2"), "refusing to push")
+  })
+  testthat::test_that("REFUSED: a metrics column is DROPPED", {
+    staged <- live_no_label
+    staged$metrics$category <- NULL
+    testthat::expect_error(
+      app_bundle_assert_manifest_patch_diff(live_no_label, staged, "v2"), "refusing to push")
   })
   invisible(TRUE)
 }
@@ -857,6 +938,32 @@ app_bundle_fetch_published_manifest <- function(ver, base, cache_dir) {
   tryCatch(jsonlite::fromJSON(dest, simplifyVector = TRUE), error = function(e) NULL)
 }
 
+#' Fetch a release's PUBLISHED `manifest.json`, always FRESH — never cached
+#'
+#' Round 7 (2026-09-26 review, item 2). [app_bundle_fetch_published_manifest()]
+#' caches to `_output/app_bundle/_s3cache/{ver}/manifest.json` and, once that
+#' file exists, reuses it FOREVER — right for the one BUILD-time read
+#' (`b$pub_manifest`), which the notebook's own per-version cache-clear at the
+#' start of `build_one()` keeps fresh across separate RENDERS, but wrong for
+#' the ONE place a truly current copy matters WITHIN a single render: proving
+#' nothing republished `{ver}/manifest.json` between that build-time read and
+#' this run's own push. This function never touches the cache directory at
+#' all — every call is a real network read into a throwaway `tempfile()`.
+#'
+#' @param ver version label
+#' @param base atlas base URL
+#' @return the manifest as a list, or `NULL` if it could not be fetched/parsed
+app_bundle_fetch_manifest_nocache <- function(ver, base) {
+  dest <- tempfile(fileext = ".json")
+  on.exit(unlink(dest), add = TRUE)
+  ok <- isTRUE(tryCatch(
+    utils::download.file(sprintf("%s/%s/manifest.json", base, ver), dest,
+                         mode = "wb", quiet = TRUE) == 0L,
+    error = function(e) FALSE, warning = function(w) FALSE))
+  if (!ok) return(NULL)
+  tryCatch(jsonlite::fromJSON(dest, simplifyVector = TRUE), error = function(e) NULL)
+}
+
 app_bundle_geom_keys <- function(zones, zone_sets, dir_derived) {
   out <- list()
   if (is.null(zones) || !nrow(zones)) return(out)
@@ -1092,14 +1199,28 @@ app_bundle_assert_cell_model_keys <- function(keys, ver) {
 #' Refuse a version whose `serve/cell_model/` already has objects on S3
 #'
 #' The upload is all-or-nothing per version, never a partial refresh: if the
-#' FIRST tile (`tile=0/data_0.parquet`) already answers 200 anonymously, the
-#' whole version is refused rather than risk a silent partial overwrite.
+#' FIRST key this plan would actually write already answers 200 anonymously,
+#' the whole version is refused rather than risk a silent partial overwrite.
+#'
+#' Round 7 (2026-09-26 review, item 4 BLOCKER): this used to probe
+#' `tile=0/data_0.parquet` unconditionally — a tile number no release's
+#' `cell_model` tiling scheme ever starts at (`usa05`, v7/v7b, starts at
+#' `tile=19`; `global05` starts at `tile=436`), so the probe 403ed every
+#' single time and the "already published, refuse to overwrite" protection
+#' could never fire, on any version, ever. `key` must be the plan's own
+#' first key (`plan$keys[1]`, e.g. `"v7/serve/cell_model/tile=19/data_0.parquet"`)
+#' — the ACTUAL first object THIS run's plan would write — never a guessed
+#' placeholder.
 #'
 #' @param ver version label
 #' @param base atlas base URL ([msens::atlas_base_url()])
+#' @param key the plan's own first key, relative to `base` (e.g.
+#'   `app_bundle_cell_model_plan(ver, dir_derived)$keys[1]`)
 #' @return `TRUE` if already present (should be refused), `FALSE` if clear
-app_bundle_cell_model_already_on_s3 <- function(ver, base) {
-  url <- as.character(glue::glue("{base}/{ver}/serve/cell_model/tile=0/data_0.parquet"))
+app_bundle_cell_model_already_on_s3 <- function(ver, base, key) {
+  stopifnot("`key` must be a single non-NA, non-empty relative key (e.g. plan$keys[1])" =
+              is.character(key) && length(key) == 1L && !is.na(key) && nzchar(key))
+  url <- as.character(glue::glue("{base}/{key}"))
   st  <- app_bundle_head_check(url)$status
   isTRUE(length(st) == 1 && !is.na(st) && st == 200L)
 }
