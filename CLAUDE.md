@@ -510,7 +510,7 @@ and why one didn't.
   the container's `rstudio` user is already uid 1000 — you just have to ask. A sweep found **23,729**
   root-owned files under `/share/data`; the damage is silent until `git merge` aborts with
   `unable to unlink … Permission denied`.
-- **msens1 is 16 GB / 4 cores / NO swap, shared with production** (apps, API, two titilers, ERDDAP).
+- **msens1 is 16 GB / 4 cores, shared with production** (apps, API, two titilers, ERDDAP); since 2026-09-24 it has a 4 GiB swapfile (`server/host/swap.sh`, swappiness 10) and the `rstudio` container a 9 GB cgroup ceiling (`mem_limit`), after a Shiny worker at 7.8 GB RSS wedged the whole host for an hour with every service and sshd unreachable (EC2 reboot).
   Never hardcode `PRAGMA memory_limit='12GB'`/`threads=6` in a notebook that renders there:
   `source(here("libs/duckdb_budget.R")); duckdb_tune(con, tmp_dir)` sizes DuckDB to 40 % of
   MemAvailable (≤ 12 GB, threads ≤ cores; `BUILD_MEMORY_GB`/`BUILD_THREADS` override; a 2.3 GB limit
