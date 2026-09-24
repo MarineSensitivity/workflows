@@ -143,8 +143,14 @@ source(here("libs/duckdb_budget.R"))
 source(here("libs/app_bundle.R"))
 
 stopifnot(
-  "msens 0.43.0 or newer is required (app_bundle_build(), app_manifest_block())" =
-    packageVersion("msens") >= "0.43.0",
+  # round 5 (2026-09-24 review, R1): raised from 0.43.0 -- the M1 asset-join fix
+  # (`.app_assets()`'s LEFT JOIN, atlas-contract-fixes @ c250a0a) and the
+  # zone-name backfill (`app_zone_names()`) both ship as msens 0.44.0. A stale
+  # 0.43.0 install would still pass every gate below (they are all green on the
+  # OLD, broken join too -- none of them looked at `inputs[].assets` at all)
+  # and silently republish the bundle every input pill renders struck through.
+  "msens 0.44.0 or newer is required (app_bundle_build() zone_names=, the M1 asset-join fix)" =
+    packageVersion("msens") >= "0.44.0",
   # round 4: 71aa231, then ba4b6d0, both landed WITHOUT a Version: bump (still
   # 0.43.0), so the version-string check above cannot tell either apart from
   # an older 0.43.0 build (e.g. 7c6eb3a) -- check the formal arguments this
@@ -153,11 +159,29 @@ stopifnot(
     "taxonomy_csv" %in% names(formals(msens::app_bundle_build)),
   "installed msens::app_bundle_build() has no `zone_sets` argument -- reinstall from atlas-contract @ ba4b6d0 or later (the v2 zone-table fix)" =
     "zone_sets" %in% names(formals(msens::app_bundle_build)),
+  # round 5 (R1): same discipline as taxonomy_csv/zone_sets above -- the FORMAL
+  # is the load-bearing signal a version-string check cannot give, because a
+  # future fix can land the same way 71aa231/ba4b6d0 did, with no Version: bump.
+  # `zone_names` is also what makes R3 (zone-name backfill, below) possible at
+  # all -- if this formal is missing, passing `zone_names =` to
+  # app_bundle_build() would silently be swallowed by nothing (it would simply
+  # error "unused argument"), which is exactly the loud failure wanted here.
+  "installed msens::app_bundle_build() has no `zone_names` argument -- reinstall from atlas-contract-fixes @ c250a0a or later (msens 0.44.0, the M1 fix)" =
+    "zone_names" %in% names(formals(msens::app_bundle_build)),
   # this-round fix: the app{} patch is built from app_manifest_block() (standalone,
   # never manifest_build()) -- guard its presence the same way, since it is now
   # load-bearing for the patch and not just an optional extra.
   "installed msens has no exported app_manifest_block() -- reinstall from atlas-contract @ 7d8c6c0 or later" =
-    "app_manifest_block" %in% getNamespaceExports("msens"))
+    "app_manifest_block" %in% getNamespaceExports("msens"),
+  # round 5 (R3): app_zone_names() must be exported for the zone-name backfill below
+  "installed msens has no exported app_zone_names() -- reinstall from atlas-contract-fixes @ c250a0a or later" =
+    "app_zone_names" %in% getNamespaceExports("msens"),
+  # round 5 (R4; review edit E7, msens 0.44.0 @ cbf3d67): manifest_labels_backfill()
+  # must be exported for the label patch below -- without this check a stale
+  # install would fail deep inside the Build loop with an opaque "could not
+  # find function" instead of a clear guard message here.
+  "installed msens has no exported manifest_labels_backfill() -- reinstall from atlas-contract-fixes @ cbf3d67 or later" =
+    "manifest_labels_backfill" %in% getNamespaceExports("msens"))
 message(glue("msens {packageVersion('msens')} @ {find.package('msens')}"))
 
 # --- run scope ------------------------------------------------------------
@@ -238,8 +262,17 @@ v7):
 2. `serve.duckdb` beside it, if (1) has no working asset table — right on the SERVER that built it.
 3. An ephemeral, **anonymous, read-only** DuckDB attached directly to this release's *published*
    `tables/*.parquet` on S3 (httpfs, path-style; no credentials, no write) — right anywhere,
-   including this laptop, for any `released`/public version. Never used for a `restricted` version
-   (nothing to attach yet, or nothing this notebook should read anonymously either).
+   including this laptop, for any version whose `tables/*.parquet` objects answer anonymously,
+   `restricted` included. Round 5 (2026-09-24 review, R2): the tier used to gate on
+   `access == "public"` on the theory that a `restricted` release's objects are never
+   anonymously readable — wrong for `v7b`, whose `tables/model_asset.parquet` HEADs 200
+   anonymously (`RELEASE_S3_TABLES` pushes `tables/` independently of the full serve
+   cutover; only the app HOST distinguishes public from restricted, per `../CLAUDE.md`'s
+   pre-release review gate). This tier now attempts the download regardless of `access`
+   and lets the real HTTP outcome decide: each per-table `download.file()` call already
+   fails safely (`tryCatch` -> `FALSE`) on a genuine 403 (e.g. `v9`'s `tables/` today), so
+   a version whose objects really are private still resolves to `NULL` here, just after a
+   few fast rejected requests instead of being skipped outright.
 
 ```{r}
 #| label: db-open
@@ -263,7 +296,6 @@ v7):
 # the rest under 25 MB combined), so caching it locally costs a one-time download,
 # not a redesign.
 .attach_s3_legacy <- function(ver, access) {
-  if (!identical(access, "public")) return(NULL)
   cache_dir <- here("_output", "app_bundle", "_s3cache", ver, "tables")
   fs::dir_create(cache_dir)
   http <- sprintf("%s/%s", base, ver)
@@ -287,7 +319,7 @@ v7):
     }, error = function(e) FALSE))
   }, logical(1))
   if (!.has_asset_tbl(con)) { DBI::dbDisconnect(con, shutdown = TRUE); return(NULL) }
-  log_warn("{ver}: cached + attached {sum(ok)}/{length(tbls)} tables from {http}/tables/ ({cache_dir})")
+  log_warn("{ver}: cached + attached {sum(ok)}/{length(tbls)} tables from {http}/tables/ (access={access}, {cache_dir})")
   con
 }
 
@@ -438,6 +470,39 @@ build_one <- function(ver) {
     NULL
   })
   patch <- if (!is.null(app_block)) { p <- pub_manifest; p$app <- app_block; p } else NULL
+
+  # round 5 (2026-09-24 review, R4; msens 0.44.0 @ cbf3d67, review edit E7):
+  # backfill BLANK metric labels on the same staged patch the app{} block
+  # above lands on -- never a separate push, so a manual republish of this
+  # file carries both fixes together or neither. Only v1, v2 and v9 are
+  # missing a `label` column entirely today (v3-v8/v7b already carry curated
+  # labels from a hand-edited `layers_{ver}.csv` and must NEVER be overwritten
+  # -- asserted below, not just hoped for). `msens::manifest_labels_backfill()`
+  # is now EXPORTED and shares its ONE implementation with `manifest_build()`'s
+  # own backfill (`.metrics_backfill_labels()`), so a release built fresh and a
+  # published manifest patched later can never apply a different rule -- no
+  # more `:::` needed here.
+  label_patch_ok <- TRUE
+  label_patch_n_blank <- 0L
+  if (!is.null(patch) && !is.null(patch$metrics) && NROW(patch$metrics)) {
+    met0 <- as.data.frame(patch$metrics, stringsAsFactors = FALSE)
+    if (!"label" %in% names(met0)) met0$label <- NA_character_   # absent column counts as blank
+    labels_before <- met0$label
+    blank_before  <- is.na(labels_before) | !nzchar(trimws(labels_before))
+    label_patch_n_blank <- sum(blank_before)
+    patched <- msens::manifest_labels_backfill(patch)
+    # the assertion the review asked for: a CURATED (non-blank) label must come
+    # back byte-identical -- this backfill only ever fills a blank, never
+    # overwrites a curated one
+    label_patch_ok <- identical(patched$metrics$label[!blank_before], labels_before[!blank_before])
+    patch <- tryCatch({ msens::validate_manifest(patched, ver); patched },
+                      error = function(e) {
+                        log_warn("{ver}: label-patched manifest FAILED validate_manifest(): {substr(conditionMessage(e), 1, 300)}")
+                        label_patch_ok <<- FALSE
+                        NULL
+                      })
+  }
+
   patch_path <- here("_output", "app_bundle", "patches", sprintf("%s_manifest_with_app.json", ver))
   if (!is.null(patch)) {
     fs::dir_create(fs::path_dir(patch_path))
@@ -465,6 +530,27 @@ build_one <- function(ver) {
     "D17: exactly the release's ONE drawable unit's geometry must be passed -- no more, no fewer" =
       length(geom_keys) == 1 && identical(names(geom_keys), d17_type))
 
+  # round 5 (2026-09-24 review, R3): `app_zone_names()` reads the SAME
+  # GeoPackage `app_bundle_geom_keys()` just resolved for this release's one
+  # drawable unit -- resolved the identical way (zone_set_key -> zone_sets'
+  # own `source`, under dir_derived), never a second, independently-guessed
+  # path. Without this the Atlas keeps falling back to the bare key ("ALA"
+  # instead of "Aleutian Arc (ALA)") on every release, because `app_zones()`
+  # silently publishes `name: null` for a NULL `zone_names` -- "a check that
+  # cannot fail" per the review, not an error, so nothing short of reading
+  # this catches a release that never got a name at all.
+  zsk_for_unit <- zones_for_unit$zone_set_key[1]
+  src_row_for_unit <- zone_sets[zone_sets$zone_set_key == zsk_for_unit, , drop = FALSE]
+  stopifnot(
+    "R3: the release's drawable unit's zone_set_key has no row in the zone-set registry (data/zone_sets.csv) -- app_bundle_geom_keys() would already have stopped on this" =
+      nrow(src_row_for_unit) == 1)
+  gpkg_for_unit <- path.expand(file.path(dir_derived, src_row_for_unit$source[1]))
+  zone_names <- msens::app_zone_names(gpkg_for_unit, d17_type)
+  stopifnot(
+    "R3: app_zone_names() resolved no names for this release's drawable unit" =
+      is.data.frame(zone_names) && nrow(zone_names) > 0 &&
+      all(c("fld", "key", "name") %in% names(zone_names)))
+
   # round 4: msens 0.43.0 @ 71aa231 moved app/taxonomy.parquet INTO
   # app_bundle_build() itself (as app_taxonomy(), fed by taxonomy_csv) and
   # added app_model() for the v8+ mdl_id -> mdl_key mapping -- both now get
@@ -491,6 +577,7 @@ build_one <- function(ver) {
   out <- tryCatch(
     msens::app_bundle_build(con, ver, dir_out, manifest = pub_manifest, base = base,
                             geom_keys = geom_keys, zone_sets = zone_sets, strict = FALSE,
+                            zone_names = zone_names,
                             taxonomy_csv = here("data/taxonomic_hierarchy_worms_2025-10-30.csv")),
     error = function(e) {
       log_warn("{ver}: app_bundle_build() FAILED (upstream of stage isolation): {substr(conditionMessage(e), 1, 300)}")
@@ -508,8 +595,10 @@ build_one <- function(ver) {
 
   list(ver = ver, ok = !is.null(out), dir_out = dir_out, con_db = opened$db,
        pub_manifest = pub_manifest, patch_ok = !is.null(patch), patch_path = patch_path,
+       label_patch_ok = label_patch_ok, label_patch_n_blank = label_patch_n_blank,
        d17_type = d17_type,
        geom_keys = geom_keys, geom_check = geom_check, out = out,
+       zone_names = zone_names, n_zone_names = nrow(zone_names),
        has_taxonomy = !is.null(out) && "taxonomy" %in% names(out$tables),
        has_model    = !is.null(out) && "model"    %in% names(out$tables),
        n_failed_stages = if (is.null(out)) NA_integer_ else length(out$failed),
@@ -524,11 +613,19 @@ build_tbl <- bind_rows(lapply(builds, function(b) data.frame(
   n_failed_stages = b$n_failed_stages, failed_stage_names = if (!is.null(b$out) && length(b$out$failed))
     paste(names(b$out$failed), collapse = ", ") else "",
   has_taxonomy = b$has_taxonomy, has_model = b$has_model, patch_ok = b$patch_ok,
+  n_zone_names = b$n_zone_names,
+  label_patch_ok = b$label_patch_ok, label_patch_n_blank = b$label_patch_n_blank,
   wall_s = round(b$wall_s, 1))))
 knitr::kable(build_tbl, caption = "Per-version build result (this run)")
 stopifnot(
   "app{} manifest patch (published manifest + app_manifest_block()) failed to write for at least one version" =
-    all(build_tbl$patch_ok))
+    all(build_tbl$patch_ok),
+  # R3: every release's drawable unit must have resolved at least one zone name
+  "app_zone_names() resolved zero names for at least one version's drawable unit" =
+    all(build_tbl$n_zone_names > 0),
+  # R4: the label backfill must never have touched a curated (non-blank) label
+  "the metric-label backfill overwrote a curated (non-blank) label for at least one version" =
+    all(build_tbl$label_patch_ok))
 stopifnot(
   "app_bundle_build() aborted upstream of stage isolation for at least one version" =
     all(build_tbl$ok),
@@ -943,6 +1040,98 @@ set_gates <- function(b, ver) {
 }
 sets_tbl <- purrr::imap(builds, set_gates) |> bind_rows()
 knitr::kable(sets_tbl, caption = "Set-equality gates: layers, taxon shard keys, alias targets")
+```
+
+### R5: asset resolution — the M1 regression check, at release level
+
+Review round 5 (2026-09-24), item R5: the M1 bug (an INNER JOIN in `.app_assets()` keyed to the
+taxon's OWN merged model id) silently dropped **every** raw input's COG — 0 of 12,120 v7 input
+edges resolved an asset, and every input pill in the species app rendered struck through — while
+every gate above this one stayed green, because none of them reads `inputs[].assets` at all
+(`app_bundle_build()` completed, schemas validated, digests matched). This gate reads the WRITTEN
+`taxon/*.json` bytes (what the fix actually produced) and compares the count against an
+**independent** ground-truth query straight against `taxon_model`/`taxon`/`model_asset` — never
+calling `.app_assets()`/`.app_edges()` — so a future regression in either of those internal
+functions cannot make this gate agree with itself (the way it would if the gate simply called the
+same function `app_bundle_build()` already calls). Scoped to `mdl_seq`-shaped releases (v1–v7b);
+v8+'s `native_asset` join is a different code path the review did not find broken.
+
+```{r}
+#| label: validate-asset-resolution
+
+asset_gate <- function(b) {
+  if (!isTRUE(b$ok) || is.null(b$out$boot) || !identical(b$out$boot$id_field, "mdl_seq")) {
+    app_bundle_gate_note("asset_resolution", b$ver, FALSE, if (!isTRUE(b$ok))
+      "build did not complete" else if (is.null(b$out$boot)) "no boot.json" else
+      "not a mdl_seq-shaped release (v8+'s native_asset join is out of scope for this gate)")
+    return(tibble())
+  }
+  app_bundle_gate_note("asset_resolution", b$ver, TRUE)
+
+  # WRITTEN bytes: the exact taxon/*.json shards the bundle published -- an
+  # input "has an asset" iff its `assets` array is non-empty, exactly what
+  # card() (R/app_bundle.R) writes. Also collect the PUBLISHED taxon keys
+  # (taxon/*.json's own `taxa` names) -- app_taxon_table() applies its own
+  # publication filter (is_ok / valid_usa / valid_global) upstream of
+  # `.app_edges()`, so a ground-truth query scoped only to
+  # `taxon.mdl_seq IS NOT NULL` over-counts by exactly the taxa that HAVE a
+  # merged model but are not otherwise published (27 of them on v7) --
+  # verified against the real bundle: unscoped gives 12,147/10,271, scoped to
+  # these published keys gives 12,120/10,247, matching the review exactly.
+  taxon_dir <- file.path(b$dir_out, "taxon")
+  n_bundle_total <- 0L; n_bundle_with_asset <- 0L
+  published_keys <- character()
+  for (f in list.files(taxon_dir, full.names = TRUE)) {
+    d <- jsonlite::fromJSON(f, simplifyVector = FALSE)
+    published_keys <- c(published_keys, names(d$taxa))
+    for (taxon in d$taxa) for (inp in taxon$inputs) {
+      n_bundle_total <- n_bundle_total + 1L
+      if (length(inp$assets)) n_bundle_with_asset <- n_bundle_with_asset + 1L
+    }
+  }
+
+  # independent ground truth: raw SQL, no msens internal helper (`.app_edges()`/
+  # `.app_assets()`) anywhere in this comparison -- only the published KEY SET
+  # read directly from the written bundle above. Re-opens the SAME asset
+  # source build_one() used (cheap: tier 3's per-table download is a no-op
+  # once the cache from the build above already exists on disk).
+  opened2 <- app_bundle_open(b$ver)
+  if (!isTRUE(opened2$ok)) return(tibble())
+  con2 <- opened2$con
+  on.exit(DBI::dbDisconnect(con2, shutdown = TRUE), add = TRUE)
+  k <- if ("ms_merge_key" %in% DBI::dbListFields(con2, "taxon")) "ms_merge_key" else "mdl_seq"
+  # `con2` is this call's OWN ephemeral connection (torn down by the
+  # dbDisconnect on.exit() above), so the temp table needs no explicit drop
+  DBI::dbWriteTable(con2, "_r5_published_keys", data.frame(key = as.numeric(published_keys)), overwrite = TRUE)
+  truth <- DBI::dbGetQuery(con2, glue::glue("
+    WITH edges AS (
+      SELECT DISTINCT tm.mdl_seq
+        FROM taxon_model tm
+        JOIN taxon t USING (taxon_id)
+        JOIN _r5_published_keys pk ON pk.key = t.{k}
+       WHERE tm.ds_key <> 'ms_merge' AND tm.mdl_seq <> t.{k}
+    )
+    SELECT count(*) AS n_total,
+           count(*) FILTER (WHERE EXISTS (
+             SELECT 1 FROM model_asset ma WHERE ma.mdl_seq = edges.mdl_seq)) AS n_with_asset
+      FROM edges"))
+
+  data.frame(ver = b$ver,
+             n_bundle_total = n_bundle_total, n_bundle_with_asset = n_bundle_with_asset,
+             n_truth_total = truth$n_total[1], n_truth_with_asset = truth$n_with_asset[1])
+}
+asset_tbl <- bind_rows(lapply(builds, asset_gate))
+knitr::kable(asset_tbl, caption = paste(
+  "R5 regression gate (mdl_seq releases only): WRITTEN bundle inputs-with-asset vs an",
+  "INDEPENDENT ground-truth query against taxon_model/taxon/model_asset -- the M1 bug",
+  "(0 assets) fails this even though every gate above it stays green"))
+stopifnot(
+  "R5: the bundle's inputs-with-asset count disagrees with the independent ground truth" =
+    nrow(asset_tbl) == 0 ||
+    all(asset_tbl$n_bundle_with_asset == asset_tbl$n_truth_with_asset &
+        asset_tbl$n_bundle_total == asset_tbl$n_truth_total),
+  "R5: zero input edges resolved an asset for a release whose model_asset table is non-empty (the M1 bug)" =
+    nrow(asset_tbl) == 0 || all(asset_tbl$n_truth_with_asset == 0 | asset_tbl$n_bundle_with_asset > 0))
 ```
 
 ### Manifest identity — the manifest `app_bundle_build()` actually used, never a rebuilt one
@@ -1486,7 +1675,7 @@ msens::write_manifest(
   target       = "build_app_bundle",
   content_hash = digest::digest(
     list(summary_tbl, val_tbl, boot_contract_tbl, one_file_tbl, tw_tbl, dg_tbl, zm_tbl, sets_tbl,
-        cog_tbl, gate_coverage_tbl, budgets_tbl, cm_plan_tbl),
+        asset_tbl, cog_tbl, gate_coverage_tbl, budgets_tbl, cm_plan_tbl),
     algo = "xxhash64"),
   stats = list(
     versions_attempted  = vers,
@@ -1496,6 +1685,9 @@ msens::write_manifest(
     cell_model_clear_to_upload = if (nrow(cm_plan_tbl)) cm_plan_tbl$ver[cm_plan_tbl$clear_to_upload] else character(0),
     n_objects_total     = sum(summary_tbl$n_objects, na.rm = TRUE),
     n_tile_dirs_with_multiple_files = sum(one_file_tbl$n_with_multiple_files, na.rm = TRUE),
-    n_gates_skipped     = sum(!gate_coverage_tbl$ran)),
+    n_gates_skipped     = sum(!gate_coverage_tbl$ran),
+    n_zone_names_total  = sum(build_tbl$n_zone_names, na.rm = TRUE),
+    n_label_patches_total = sum(build_tbl$label_patch_n_blank, na.rm = TRUE),
+    n_asset_gate_versions = nrow(asset_tbl)),
   force = msens::force_target("build_app_bundle"))
 ```
