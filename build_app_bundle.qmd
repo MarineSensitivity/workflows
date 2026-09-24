@@ -1,0 +1,1501 @@
+---
+title: "Build the atlas `app/` bundle — the browser's data contract"
+msens:
+  target_name: build_app_bundle
+  workflow_type: publish
+  # after release_marine-atlas (needs the release's own sdm.duckdb / serve.duckdb
+  # and, for a legacy generation, its published tables/model_asset.parquet), and
+  # BEFORE build_version_manifest (which records the `app{}` block by probing
+  # THIS notebook's push with an anonymous HTTPS HEAD, never by copying
+  # local presence).
+  dependency: [release_marine_atlas]
+  output: data/manifests/build_app_bundle.json
+params:
+  ver: null
+editor_options:
+  chunk_output_type: console
+---
+
+Master plan D5 ("normalize at publish, not in the browser") and atlas-1 Deliverable 4. Both
+Shiny apps carry a per-version adapter today — two grids, `mdl_seq` vs `mdl_key`, `value` vs
+`val`, `is_ok` vs `is_valid_usa`, a `taxon_model` self-edge on one side only — each with a
+production bug recorded behind it. `msens::app_bundle_build()` (msens 0.43.0, `R/app_bundle.R`)
+already resolves every one of those quirks, with tests. This notebook is the thin publishing
+shell around it: **build → validate → push (gated) → verify (gated)**, one version-independent
+`{ver}/app/` bundle per release.
+
+**Nothing here publishes anything.** The push and verification chunks are real, runnable code,
+gated behind `APP_BUNDLE_S3=1` (unset by default) exactly like every other side-effecting step in
+this repo (`../CLAUDE.md` reproducibility rule 1) — this notebook can be rendered top to bottom,
+safely, with no S3 credentials and no network write of any kind.
+
+**Rendering.** `quarto render build_app_bundle.qmd` — with or without an explicit `--output` —
+always writes its HTML BESIDE THE SOURCE (`./build_app_bundle.html`), never into `_output/`
+despite this project's `_quarto.yml` `output-dir: _output` (confirmed empirically 2026-09-21: a
+project-wide render like `scripts/run_version.sh` respects it, a single ad hoc `quarto render` of
+THIS file does not — a quirk of quarto's single-file vs. project render path, not this notebook).
+The documented, ONE-TRUE command therefore always ends in a move — never render this file any
+other way, and never leave the moved file's name as the version-less default:
+
+```sh
+APP_BUNDLE_VERS=v7 quarto render build_app_bundle.qmd && \
+  mv -f build_app_bundle.html _output/build_app_bundle_v7.html && \
+  rm -rf build_app_bundle_files
+```
+
+`scripts/render_app_bundle.sh <ver> [ver ...]` wraps exactly this (one version at a time,
+sequentially, in the background — see its header for why: a foreground `quarto render` here runs
+90–190s per legacy release and longer per v8/v9, and this notebook must never be waited on in a
+chat turn) and is the only invocation that should be used from here on.
+
+**A cache-invalidation rule from the atlas-2 review, stated here because a publish turn must know
+it BEFORE it decides what to re-run**: re-publishing ANY object the app reads OUTSIDE `app/` —
+`{ver}/tables/model.parquet`, `{ver}/serve/cell_model/**` — requires rebuilding and re-publishing
+`app/` too, because the browser caches those objects keyed on `boot.built_at` (OPFS), not on the
+object's own URL or ETag. A `tables/model.parquet` re-push with no matching `app/` re-push (a new
+`built_at`) leaves every already-cached client reading stale `model.parquet` bytes under an
+unchanged cache key — it will never refetch until something else bumps `built_at` for an unrelated
+reason. There is no partial-republish path for these two: either both `app/` and the object move
+together, in the same publish turn, or neither does.
+
+`APP_BUNDLE_VERS=v7,v9` narrows a run to that set (comma-separated); unset, every version in
+`data/versions.csv` is attempted (v1, v2, v3, v4, v4b, v5, v6, v7, v7b, v8, v9 — **not** v3b, which
+is not a registered release), and a version whose release database is not on this machine is
+**skipped, not failed** (the same convention `build_version_manifest.qmd`'s `caps_override`
+uses: a capability this run cannot see is `FALSE`, never invented). Every entry is checked
+against BOTH the version-label shape (`^v[0-9]+[a-z]?$`) AND membership in `data/versions.csv` —
+round 3 (2026-09-21): shape alone let a shape-valid-but-unregistered label (e.g. `v3b`) silently
+build a bundle for a release that does not exist.
+
+`APP_BUNDLE_CELLMODEL_VERS=v7,v7b` (round 3: generalized from the single, v7-only
+`APP_BUNDLE_V7_CELLMODEL` flag) additionally uploads the named version(s)' missing
+`serve/cell_model/` — today v7 (757 MB locally, 428 tiles) and v7b (753 MB locally, 428 tiles),
+both absent from S3 despite their manifest advertising `cell_species_list: true` (the atlas-1
+"Facts" note). Default empty (nothing planned). Every entry is validated the same way as
+`APP_BUNDLE_VERS` (shape + registry) and must also be one of THIS run's `vers`; each version's
+plan is then checked — local tile-width (nc=3103) and one-file-per-tile gates, the exact key
+shape `^{ver}/serve/cell_model/tile=[0-9]+/data_0\.parquet$`, and an anonymous HEAD refusing any
+version whose tiles already exist on S3 — **before** any upload, in [validate-cell-model-plan]
+below, which runs even when `APP_BUNDLE_S3` is unset (a pure dry run: it prints the exact key list
+and byte total per version and writes nothing). v8 and v9 are never at risk even if
+mis-listed: neither has a local `{ver}/cell_model/` export (their asset registry lives in the
+database, not a filesystem directory), so the plan refuses them with "no local source directory"
+before a single key is constructed.
+
+Both `APP_BUNDLE_S3` and `APP_BUNDLE_V7_CELLMODEL`'s replacement are strict
+([app_bundle_flag()]/allow-list validation): `APP_BUNDLE_S3` only exactly `1` turns it on — `0`,
+`true`, `false`, `no`, anything else STOPS the render naming the variable, rather than guessing.
+
+**Two things worth saying out loud so nobody "fixes" them.** First, a `restricted` release gets
+**exactly the same objects** under `{ver}/app/` as a `public` one — the review gate that matters is
+which HOST serves them (atlas-9: the public site never renders a restricted version; the preview
+host does, behind Access), not what this notebook writes, so `build_app_bundle.qmd` never branches
+on `access`. Second, even with `APP_BUNDLE_S3` and `APP_BUNDLE_V7_CELLMODEL` both unset — the
+default, publish-nothing case — a legacy-generation dry run (v1–v7b) still downloads roughly
+**165 MB anonymously** from the public bucket (`.attach_s3_legacy()`'s `tables/*.parquet` cache,
+measured against v7, 2026-09-21: 13 tables, 164,894,811 bytes, dominated by `cell_metric` at 109
+MB): reading nothing is not the same as touching nothing.
+
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "One release database -> app_bundle_build() -> {ver}/app/, validated before it is ever written to S3"
+flowchart LR
+  subgraph src["this version's release database"]
+    sdm[("sdm.duckdb<br/>(v8/v9: has model_asset->native_asset)")]
+    srv[("serve.duckdb<br/>(v1-v7b: model_asset lives HERE,<br/>not in sdm.duckdb -- see Setup)")]
+  end
+  sdm -->|"sdm_db_path(ver)"| con(("read-only<br/>DuckDB connection"))
+  srv -.->|"fallback when sdm.duckdb<br/>has no asset registry"| con
+  con --> abb["msens::app_bundle_build()"]
+  abb --> boot["boot.json"]
+  abb --> taxa["taxa.json"]
+  abb --> tsh["taxon/{xx}.json x256"]
+  abb --> alsh["alias/{xx}.json x256"]
+  abb --> txp["taxon.parquet"]
+  abb --> ztp["zone_taxon.parquet"]
+  abb --> cell["cell/tile={t}/data_0.parquet"]
+  csv[("data/taxonomic_hierarchy_worms_…csv<br/>(curated, not a DB table)")] -->|"app_taxonomy()<br/>msens, taxonomy_csv="| txm["taxonomy.parquet"]
+  abb --> mdl["model.parquet (v8+ only)"]
+  boot & taxa & tsh & alsh & txp & ztp & cell & txm & mdl --> val{{"app_validate()<br/>every object vs its<br/>inst/schema/app_*.schema.json"}}
+  val -->|"APP_BUNDLE_S3=1"| grd{{"app_bundle_assert_prefix()<br/>refuses any key outside<br/>{ver}/app/"}}
+  grd --> s3[["s3://…/marine-atlas/{ver}/app/"]]
+  s3 -->|"APP_BUNDLE_S3=1"| anon{{"anonymous HTTPS HEAD/GET<br/>per object"}}
+  anon --> mfst["build_version_manifest.qmd<br/>probes the SAME way -><br/>manifest.json $app{}"]
+
+  classDef gate fill:#3a1e1e,stroke:#e03131,color:#e6edf3;
+  classDef db fill:#1e3a5f,stroke:#3bc9db,color:#e6edf3;
+  class val,grd,anon gate;
+  class sdm,srv,con db;
+```
+
+## Setup
+
+```{r}
+#| label: setup
+#| message: false
+
+librarian::shelf(
+  DBI, dplyr, duckdb, fs, glue, here, jsonlite, knitr, logger, purrr, readr,
+  MarineSensitivity/msens, quiet = TRUE)
+source(here("libs/duckdb_budget.R"))
+source(here("libs/app_bundle.R"))
+
+stopifnot(
+  "msens 0.43.0 or newer is required (app_bundle_build(), app_manifest_block())" =
+    packageVersion("msens") >= "0.43.0",
+  # round 4: 71aa231, then ba4b6d0, both landed WITHOUT a Version: bump (still
+  # 0.43.0), so the version-string check above cannot tell either apart from
+  # an older 0.43.0 build (e.g. 7c6eb3a) -- check the formal arguments this
+  # notebook actually depends on existing, not just a string.
+  "installed msens::app_bundle_build() has no `taxonomy_csv` argument -- reinstall from atlas-contract @ 71aa231 or later" =
+    "taxonomy_csv" %in% names(formals(msens::app_bundle_build)),
+  "installed msens::app_bundle_build() has no `zone_sets` argument -- reinstall from atlas-contract @ ba4b6d0 or later (the v2 zone-table fix)" =
+    "zone_sets" %in% names(formals(msens::app_bundle_build)),
+  # this-round fix: the app{} patch is built from app_manifest_block() (standalone,
+  # never manifest_build()) -- guard its presence the same way, since it is now
+  # load-bearing for the patch and not just an optional extra.
+  "installed msens has no exported app_manifest_block() -- reinstall from atlas-contract @ 7d8c6c0 or later" =
+    "app_manifest_block" %in% getNamespaceExports("msens"))
+message(glue("msens {packageVersion('msens')} @ {find.package('msens')}"))
+
+# --- run scope ------------------------------------------------------------
+versions_csv <- readr::read_csv(here("data/versions.csv"), show_col_types = FALSE)
+narrow       <- Sys.getenv("APP_BUNDLE_VERS")
+vers         <- if (nzchar(narrow)) trimws(strsplit(narrow, ",")[[1]]) else versions_csv$ver
+# review round 2: validate every entry BEFORE anything is built from it --
+# same shape app_bundle_assert_prefix() requires of its own `ver`, and the
+# same reason (a `ver` that isn't this shape could smuggle a path segment
+# into every key this run ever constructs)
+bad_vers <- vers[!vapply(vers, app_bundle_valid_ver, logical(1))]
+if (length(bad_vers))
+  stop(sprintf("APP_BUNDLE_VERS contains invalid version label(s): %s (must match ^v[0-9]+[a-z]?$)",
+               paste(bad_vers, collapse = ", ")), call. = FALSE)
+# round 3 item 2: shape alone is not enough -- v3b is shape-valid but is NOT a
+# registered release (skipped per the owner's explicit instruction), and any
+# other shape-valid-but-unregistered label would otherwise silently build a
+# bundle for a release that doesn't exist in data/versions.csv
+unreg_vers <- setdiff(vers, versions_csv$ver)
+if (length(unreg_vers))
+  stop(sprintf(
+    "APP_BUNDLE_VERS contains version label(s) not registered in data/versions.csv: %s (registered: %s)",
+    paste(unreg_vers, collapse = ", "), paste(versions_csv$ver, collapse = ", ")), call. = FALSE)
+
+# strict: exactly "1" is on, unset/"" is off, anything else (0/true/false/no/...)
+# STOPS the render naming the variable -- see libs/app_bundle.R::app_bundle_flag()
+do_s3       <- app_bundle_flag("APP_BUNDLE_S3")          # push to S3 (default OFF)
+base        <- msens::atlas_base_url()
+dir_derived <- if (Sys.info()[["sysname"]] == "Linux") "/share/data/derived" else "~/_big/msens/derived"
+dir_out_root <- here("_output", "app_bundle")                 # gitignored (see .gitignore)
+fs::dir_create(dir_out_root)
+
+# round 3 item 3: generalized from the single v7-only APP_BUNDLE_V7_CELLMODEL
+# flag to an explicit allow-list of version labels -- validated exactly like
+# APP_BUNDLE_VERS above (shape + registry), PLUS must be inside this run's own
+# `vers` (uploading cell_model for a version this run did not even build makes
+# no sense). Default empty: nothing is planned unless asked for.
+narrow_cm   <- Sys.getenv("APP_BUNDLE_CELLMODEL_VERS")
+cm_vers     <- if (nzchar(narrow_cm)) trimws(strsplit(narrow_cm, ",")[[1]]) else character(0)
+bad_cm_vers <- cm_vers[!vapply(cm_vers, app_bundle_valid_ver, logical(1))]
+if (length(bad_cm_vers))
+  stop(sprintf(
+    "APP_BUNDLE_CELLMODEL_VERS contains invalid version label(s): %s (must match ^v[0-9]+[a-z]?$)",
+    paste(bad_cm_vers, collapse = ", ")), call. = FALSE)
+unreg_cm_vers <- setdiff(cm_vers, versions_csv$ver)
+if (length(unreg_cm_vers))
+  stop(sprintf(
+    "APP_BUNDLE_CELLMODEL_VERS contains version label(s) not registered in data/versions.csv: %s",
+    paste(unreg_cm_vers, collapse = ", ")), call. = FALSE)
+notinrun_cm_vers <- setdiff(cm_vers, vers)
+if (length(notinrun_cm_vers))
+  stop(sprintf(
+    "APP_BUNDLE_CELLMODEL_VERS names version(s) outside this run's APP_BUNDLE_VERS scope (%s): %s",
+    paste(vers, collapse = ", "), paste(notinrun_cm_vers, collapse = ", ")), call. = FALSE)
+
+message(glue(
+  "versions: {paste(vers, collapse = ', ')}  push_s3={do_s3}  ",
+  "cell_model_vers={if (length(cm_vers)) paste(cm_vers, collapse = ',') else '(none)'}  base={base}"))
+```
+
+**Which database.** `msens::sdm_db_path(ver)` returns the release's build database, and prefers
+`sdm.duckdb` over `serve.duckdb` whenever the former exists on this machine. That is right for
+v8/v9, whose `native_asset` table lives IN `sdm.duckdb` — but wrong for v1–v7b: their local
+`sdm.duckdb` has neither `model_asset` nor `native_asset` at all (verified 2026-09-21 against the
+real v7 release: `model`, not `model_asset`, holds only dataset/taxon/region metadata, no COG
+URL). `model_asset` is written only by `backfill_versions.qmd`, as a view in `serve.duckdb`. Opening
+the wrong database is not an error — `app_bundle_build()` runs to completion and every taxon's
+`merged` and `inputs[].assets` come back silently empty, which is exactly the failure mode this
+contract exists to prevent everywhere else.
+
+Three tiers, each PROBED (a view existing by name is not enough — `serve.duckdb`'s views embed
+the LOCAL paths of the machine that built them, so a copy rsynced to a laptop lists a `model_asset`
+view that then fails the moment it is queried; discovered running this notebook for real against
+v7):
+
+1. `sdm_db_path(ver)` (`sdm.duckdb`, or `serve.duckdb` if that is what `sdm_db_path()` itself
+   falls back to) — right for v8/v9.
+2. `serve.duckdb` beside it, if (1) has no working asset table — right on the SERVER that built it.
+3. An ephemeral, **anonymous, read-only** DuckDB attached directly to this release's *published*
+   `tables/*.parquet` on S3 (httpfs, path-style; no credentials, no write) — right anywhere,
+   including this laptop, for any `released`/public version. Never used for a `restricted` version
+   (nothing to attach yet, or nothing this notebook should read anonymously either).
+
+```{r}
+#| label: db-open
+
+# does `tbl` exist AND actually return rows when queried (not just listed)?
+.probe_table <- function(con, tbl) {
+  if (!tbl %in% DBI::dbListTables(con)) return(FALSE)
+  isTRUE(tryCatch(DBI::dbGetQuery(con, glue("SELECT count(*) n FROM {tbl} LIMIT 1"))$n >= 0,
+                  error = function(e) FALSE))
+}
+.has_asset_tbl <- function(con) any(vapply(c("model_asset", "native_asset"), .probe_table, logical(1), con = con))
+
+# tier 3: views over a LOCAL CACHE of the PUBLISHED tables/*.parquet -- downloaded
+# once, anonymously, read-only (no S3 write, no credentials). attach_atlas() does
+# the remote-view version of this for v8+'s native_asset shape, but has no
+# model_asset/taxon_model view -- and a REMOTE view here was measured to be
+# impractically slow: a full aggregation over `cell_metric` (unprunable row
+# groups) via anonymous httpfs range reads did not finish in over an hour, where
+# the equivalent LOCAL query takes seconds. `tables/` for a whole legacy release
+# is under 200 MB (atlas-1 plan "Facts": v7 cell 22.7 MB + cell_metric 109 MB +
+# the rest under 25 MB combined), so caching it locally costs a one-time download,
+# not a redesign.
+.attach_s3_legacy <- function(ver, access) {
+  if (!identical(access, "public")) return(NULL)
+  cache_dir <- here("_output", "app_bundle", "_s3cache", ver, "tables")
+  fs::dir_create(cache_dir)
+  http <- sprintf("%s/%s", base, ver)
+  tbls <- c("cell", "taxon", "model", "model_asset", "metric", "cell_metric",
+           "zone", "zone_cell", "zone_metric", "zone_taxon", "dataset", "taxon_model", "listing")
+  got <- vapply(tbls, function(t) {
+    dest <- file.path(cache_dir, paste0(t, ".parquet"))
+    if (file.exists(dest)) return(TRUE)
+    isTRUE(tryCatch(
+      utils::download.file(sprintf("%s/tables/%s.parquet", http, t), dest,
+                           mode = "wb", quiet = TRUE) == 0L,
+      error = function(e) FALSE, warning = function(w) FALSE))
+  }, logical(1))
+  if (!any(got)) return(NULL)
+  con <- DBI::dbConnect(duckdb::duckdb())
+  ok <- vapply(tbls[got], function(t) {
+    isTRUE(tryCatch({
+      DBI::dbExecute(con, glue(
+        "CREATE OR REPLACE VIEW {t} AS SELECT * FROM read_parquet('{cache_dir}/{t}.parquet')"))
+      .probe_table(con, t)
+    }, error = function(e) FALSE))
+  }, logical(1))
+  if (!.has_asset_tbl(con)) { DBI::dbDisconnect(con, shutdown = TRUE); return(NULL) }
+  log_warn("{ver}: cached + attached {sum(ok)}/{length(tbls)} tables from {http}/tables/ ({cache_dir})")
+  con
+}
+
+app_bundle_open <- function(ver) {
+  v_row  <- versions_csv |> filter(ver == !!ver)
+  access <- if (nrow(v_row)) v_row$access[1] else "restricted"
+  db  <- path.expand(msens::sdm_db_path(ver))
+  if (file.exists(db)) {
+    con <- DBI::dbConnect(duckdb::duckdb(), db, read_only = TRUE)
+    if (.has_asset_tbl(con)) return(list(con = con, db = db, ok = TRUE))
+    DBI::dbDisconnect(con, shutdown = TRUE)
+  }
+  alt <- file.path(fs::path_dir(db), "serve.duckdb")
+  if (fs::path_file(db) != "serve.duckdb" && file.exists(alt)) {
+    con2 <- DBI::dbConnect(duckdb::duckdb(), alt, read_only = TRUE)
+    if (.has_asset_tbl(con2)) {
+      log_warn("{ver}: sdm.duckdb has no working model_asset/native_asset; using serve.duckdb ({alt})")
+      return(list(con = con2, db = alt, ok = TRUE))
+    }
+    DBI::dbDisconnect(con2, shutdown = TRUE)
+  }
+  con3 <- .attach_s3_legacy(ver, access)
+  if (!is.null(con3)) return(list(con = con3, db = sprintf("s3 (anonymous, tables/) %s/%s", base, ver), ok = TRUE))
+  if (!file.exists(db)) return(list(con = NULL, db = db, ok = FALSE))
+  log_warn(paste(
+    "{ver}: no database anywhere (local sdm.duckdb, local serve.duckdb, S3 tables/) carries",
+    "model_asset/native_asset -- merged COG urls and input assets will be EMPTY (not an error)"))
+  list(con = DBI::dbConnect(duckdb::duckdb(), db, read_only = TRUE), db = db, ok = TRUE)
+}
+
+# the gates below only need cell/cell_metric/zone*/taxon/metric -- always present
+# in sdm.duckdb (or its serve.duckdb fallback) for every generation -- so they
+# open directly rather than paying app_bundle_open()'s S3-probe escalation,
+# which exists only for the asset registry (model_asset/native_asset).
+app_bundle_open_scoring <- function(ver)
+  DBI::dbConnect(duckdb::duckdb(), path.expand(msens::sdm_db_path(ver)), read_only = TRUE)
+```
+
+## Guard: the push may never write outside `{ver}/app/`, and a publish flag is never guessed at
+
+Run once, at render time, so the render itself is the proof — not just a definition nobody
+exercised. `app_bundle_assert_prefix()`, `app_bundle_flag()`, `app_bundle_assert_cell_model_keys()`
+and `app_bundle_geom_keys()`'s own selftest are pure/offline (no S3, no side effect);
+`app_bundle_head_check()`'s selftest is the one exception — it makes two real anonymous HTTPS HEAD
+requests (one known-200, one known-non-200) to prove the URL/status pairing is never misaligned by
+`xargs -P`'s out-of-order completion, which is exactly the hazard this function exists to close.
+
+```{r}
+#| label: guard-selftest
+app_bundle_assert_prefix_selftest()
+app_bundle_flag_selftest()
+app_bundle_gzip_selftest()
+app_bundle_geom_keys_selftest()
+app_bundle_cell_model_selftest()
+app_bundle_head_check_selftest()
+app_bundle_head_check_retry_selftest()
+app_bundle_zone_taxon_check_selftest()
+app_bundle_d17_check_selftest()
+```
+
+## Build
+
+**One `msens::app_bundle_build()` call per version** — review round 1 (2026-09-21): the prior
+version of this notebook composed the bundle itself (`app_boot(..., tables = list())`,
+`manifest_build()` with no `zone_tiles`), which is why `boot$tables` (the OPFS invalidation key)
+and `boot$units` (the drawable units) came out EMPTY on both real dry runs. `app_bundle_build()`
+is the one function that wires `app_table_descriptor()`/`app_table_manifest()` into `app_boot()`
+correctly; calling it directly is what makes `tables` and `units` non-empty, not a bigger
+`tryCatch`. `geom_keys` — the published geometry keys `app_units()` needs to exclude
+whole-study-area rollups (`USA`/`FULL`) — comes from [app_bundle_geom_keys()], which reads the
+zone-set registry's own source GeoPackage rather than guessing a filename.
+
+`app/taxonomy.parquet` and `app/model.parquet` (round 4, msens 0.43.0 @ `71aa231`): both moved INTO
+`app_bundle_build()` itself — `taxonomy_csv=` feeds `app_taxonomy()` (still a curated CSV join, not
+a database table, but now one of the builder's own stages, with a `boot$tables` digest like every
+other object) and `app_model()` writes the v8+ `mdl_id -> mdl_key` mapping unconditionally,
+returning `NULL` (not a failure) for v1-v7b, which have no such mapping to give. This notebook no
+longer composes either writer itself, and `app_bundle_build()` now asserts
+`names(boot$tables)` equals the Parquet objects actually on disk (`msens::app_tables_match()`,
+called inside the `boot.json` stage) — the exact drift `app/taxonomy.parquet` and `model.parquet`
+used to be invisible to (OPFS could never invalidate an object with no digest).
+
+`app_bundle_build()` now isolates its own internal stages (msens 0.43.0 @ `7c6eb3a`, landed
+during review round 1): `strict = TRUE` (its default) still stops the WHOLE build at the first
+failing stage — right for an actual publish, wrong for this notebook's diagnostic pass — so this
+notebook always passes `strict = FALSE`, matching the function's own documented "notebook's
+diagnostic pass" use case: every stage that CAN complete does, `out$failed` names whichever
+didn't, and the outer `tryCatch` below is only a safety net for anything upstream of `stage()`
+(e.g. `app_bundle_fetch_published_manifest()` itself, or the connection open).
+
+```{r}
+#| label: build
+
+build_one <- function(ver) {
+  t0 <- Sys.time()
+  opened <- app_bundle_open(ver)
+  if (!isTRUE(opened$ok)) {
+    log_warn("{ver}: no local release database at {opened$db} -- SKIPPED")
+    return(list(ver = ver, ok = FALSE, reason = "no local database"))
+  }
+  con <- opened$con
+  on.exit(DBI::dbDisconnect(con, shutdown = TRUE), add = TRUE)
+  duckdb_tune(con, file.path(tempdir(), "app_bundle_spill", ver))
+
+  dir_out <- file.path(dir_out_root, ver)
+  if (fs::dir_exists(dir_out)) fs::dir_delete(dir_out)   # clean slate every run
+  fs::dir_create(dir_out)
+
+  v_row <- versions_csv |> filter(ver == !!ver)
+  zone_sets <- readr::read_csv(here("data/zone_sets.csv"), show_col_types = FALSE)
+  # round 10 fix (2026-09-22): app_bundle_build() (and this notebook's own
+  # geom_keys, below) must be handed the PUBLISHED manifest.json, never a
+  # rebuilt one. manifest_build()'s one-row-per-zone_set_key collapse breaks
+  # a genuine tie (v2's subregion_key: two zone tables, n = 4 each) by
+  # DuckDB's own row order -- non-deterministic between an installed-package
+  # build and a source-tree run of the IDENTICAL commit. A missing/unreadable
+  # published manifest is a hard stop: a release with no manifest cannot
+  # have a bundle at all.
+  pub_manifest <- app_bundle_fetch_published_manifest(
+    ver, base, here("_output", "app_bundle", "_s3cache", ver))
+  stopifnot(
+    "could not fetch/parse the published {ver}/manifest.json (round-10 hard-fail)" =
+      !is.null(pub_manifest) && !is.null(pub_manifest$zones) && nrow(pub_manifest$zones) > 0)
+
+  # this-round fix (2026-09-22): manifest_build() itself -- status/access/
+  # metrics/zone_tiles above, and the `mfst <- msens::manifest_build(...)`
+  # call that used to sit here -- is now REMOVED from this notebook's render
+  # path entirely, not just from app_bundle_build()'s input. Round 10 only
+  # moved app_bundle_build()'s manifest= argument off of a rebuild; it left a
+  # SECOND rebuild sitting right here "for the app{} patch and the id_field
+  # cross-check", and that second rebuild hits the EXACT SAME tie -- v3, v4,
+  # v4b, v5, v6, v7, v7b all have two subregion zone tables tied at n=4 -- so
+  # msens's round-10 hard stop on manifest_build() fired on every one of
+  # those seven releases even though D17 never draws a subregion unit and
+  # nothing downstream of `mfst` needed the zones it resolved. The id_field
+  # cross-check below now reads `pub_manifest$id_field` (the published
+  # manifest already carries it). The app{} patch is built from
+  # `msens::app_manifest_block(ver, base)` -- confirmed standalone in
+  # ../msens/R/app_bundle.R (~line 1592): it needs only ver/base (it probes
+  # `app_capabilities()` itself), never a zones table, so it cannot trip this
+  # tie at all. `app_bundle_build()`'s own return list (dir, ver, bytes,
+  # tables, tiles, boot, failed, n_taxa, n_shards, n_alias -- confirmed by
+  # reading msens R/app_bundle.R's final `invisible(list(...))`) has no
+  # manifest_app-equivalent field, so app_manifest_block() is the only
+  # source, not a fallback.
+  app_block <- tryCatch(msens::app_manifest_block(ver, base), error = function(e) {
+    log_warn("{ver}: app_manifest_block() FAILED: {substr(conditionMessage(e), 1, 300)}")
+    NULL
+  })
+  patch <- if (!is.null(app_block)) { p <- pub_manifest; p$app <- app_block; p } else NULL
+  patch_path <- here("_output", "app_bundle", "patches", sprintf("%s_manifest_with_app.json", ver))
+  if (!is.null(patch)) {
+    fs::dir_create(fs::path_dir(patch_path))
+    jsonlite::write_json(patch, patch_path, auto_unbox = TRUE, pretty = TRUE, null = "null")
+  }
+
+  # master plan D17 (Ben's decision, 2026-09-22): drawable units are Program
+  # Areas ONLY (v2-v9), Planning Areas on v1 -- no subregion or ecoregion
+  # unit on ANY release. This supersedes D16 entirely (its per-zone-type
+  # derivation, the subregion cut/omit logic, the v8 AT warning): there is
+  # exactly ONE unit type per release now, so ONLY that one geometry is ever
+  # resolved or handed to app_bundle_build() -- not "every zone type the
+  # manifest names," which is what let ecoregion/subregion geometry checks
+  # (and their false mismatches) into the build at all.
+  d17_type <- if (ver == "v1") "planarea" else "programarea"
+  d17_fld  <- paste0(d17_type, "_key")
+  zones_for_unit <- pub_manifest$zones[pub_manifest$zones$fld == d17_fld, , drop = FALSE]
+  stopifnot(
+    "D17: this release's manifest has no row for its own drawable unit's field" =
+      nrow(zones_for_unit) == 1)
+  # round 3: a missing/unreadable GeoPackage is now a HARD FAILURE inside
+  # app_bundle_geom_keys() itself (it stops, naming the path).
+  geom_keys <- app_bundle_geom_keys(zones_for_unit, zone_sets, dir_derived)
+  stopifnot(
+    "D17: exactly the release's ONE drawable unit's geometry must be passed -- no more, no fewer" =
+      length(geom_keys) == 1 && identical(names(geom_keys), d17_type))
+
+  # round 4: msens 0.43.0 @ 71aa231 moved app/taxonomy.parquet INTO
+  # app_bundle_build() itself (as app_taxonomy(), fed by taxonomy_csv) and
+  # added app_model() for the v8+ mdl_id -> mdl_key mapping -- both now get
+  # boot$tables entries (with digests) the same way every other object does,
+  # and app_bundle_build() already asserts names(boot$tables) == the Parquet
+  # objects on disk (msens::app_tables_match(), called inside the boot.json
+  # stage) -- so this notebook's own taxonomy writer (app_taxonomy_table(),
+  # removed from libs/app_bundle.R) and its separate ok-flag are both gone;
+  # a taxonomy-stage failure is caught the same way every other stage is,
+  # via out$failed below.
+  # round 4 (msens 0.43.0 @ ba4b6d0, round 5-7 fix): a zone_fld with more than
+  # one source zone table (v2's subregion_key: ply_subregions_2025 AND
+  # ply_subregions_2026) is resolved ONCE, inside app_bundle_build(), via
+  # app_zone_tbl(con, manifest, geom_keys, zone_sets) -- manifest$zones[].tbl
+  # is the deciding evidence (already present: manifest_build() has always
+  # queried `tbl` alongside `fld`), geom_keys is the agreement check, and
+  # zone_sets is a cross-check recorded in `why`. zone_sets MUST be passed
+  # here too now, not only to manifest_build() above, or app_zone_tbl() loses
+  # its cross-check silently (still resolves, just with one fewer thing
+  # checked). app_zones_unique() (msens, a builder-level hard stop) then
+  # asserts (zone_fld, zone_value, key) unique in zone_taxon and each key
+  # once per boot$zones unit -- the exact 13,077-row v2 defect item (c)'s own
+  # independent gate caught on the PRE-fix build.
+  out <- tryCatch(
+    msens::app_bundle_build(con, ver, dir_out, manifest = pub_manifest, base = base,
+                            geom_keys = geom_keys, zone_sets = zone_sets, strict = FALSE,
+                            taxonomy_csv = here("data/taxonomic_hierarchy_worms_2025-10-30.csv")),
+    error = function(e) {
+      log_warn("{ver}: app_bundle_build() FAILED (upstream of stage isolation): {substr(conditionMessage(e), 1, 300)}")
+      NULL
+    })
+  if (!is.null(out) && length(out$failed))
+    for (nm in names(out$failed))
+      log_warn("{ver}: stage '{nm}' FAILED: {substr(out$failed[[nm]], 1, 300)}")
+
+  # every drawable unit's keys must be a subset of >= 2 of its REAL geometry
+  # (the assertion the original bug -- 5 subregion keys where only 4 are
+  # drawable -- would have failed had it existed)
+  geom_check <- if (!is.null(out) && !is.null(out$boot))
+    app_bundle_assert_units_match_geometry(out$boot$units, geom_keys) else tibble()
+
+  list(ver = ver, ok = !is.null(out), dir_out = dir_out, con_db = opened$db,
+       pub_manifest = pub_manifest, patch_ok = !is.null(patch), patch_path = patch_path,
+       d17_type = d17_type,
+       geom_keys = geom_keys, geom_check = geom_check, out = out,
+       has_taxonomy = !is.null(out) && "taxonomy" %in% names(out$tables),
+       has_model    = !is.null(out) && "model"    %in% names(out$tables),
+       n_failed_stages = if (is.null(out)) NA_integer_ else length(out$failed),
+       wall_s = as.numeric(Sys.time() - t0, units = "secs"))
+}
+
+builds <- purrr::map(vers, build_one) |> setNames(vers)
+build_tbl <- bind_rows(lapply(builds, function(b) data.frame(
+  ver = b$ver, ok = b$ok, n_taxa = if (!is.null(b$out)) b$out$n_taxa else NA,
+  n_tables = if (!is.null(b$out)) length(b$out$tables) else NA,
+  n_units = if (!is.null(b$out)) length(b$out$boot$units) else NA,
+  n_failed_stages = b$n_failed_stages, failed_stage_names = if (!is.null(b$out) && length(b$out$failed))
+    paste(names(b$out$failed), collapse = ", ") else "",
+  has_taxonomy = b$has_taxonomy, has_model = b$has_model, patch_ok = b$patch_ok,
+  wall_s = round(b$wall_s, 1))))
+knitr::kable(build_tbl, caption = "Per-version build result (this run)")
+stopifnot(
+  "app{} manifest patch (published manifest + app_manifest_block()) failed to write for at least one version" =
+    all(build_tbl$patch_ok))
+stopifnot(
+  "app_bundle_build() aborted upstream of stage isolation for at least one version" =
+    all(build_tbl$ok),
+  "at least one app_bundle_build() STAGE failed" = all(build_tbl$n_failed_stages == 0, na.rm = TRUE),
+  # every release's taxa are a slice of the SAME curated CSV -- taxonomy.parquet
+  # must exist for every release, unlike model.parquet (has_model), which is
+  # TRUE only for v8+ (app_model() correctly returns NULL for v1-v7b, no
+  # mdl_id/mdl_key mapping to give -- not a failure, a capability)
+  "taxonomy.parquet is missing for at least one version" = all(build_tbl$has_taxonomy))
+```
+
+### Every drawable unit's keys are a subset of >= 2 keys in its REAL geometry
+
+Round 3's fix: `geom_keys` used to resolve empty (message + continue) when a zone GeoPackage was
+missing, so `app_units()`'s own `>= 2 keys in the geometry` check was silently skipped for every
+type — v9's `boot.json` listed **5** subregion keys where only **`AK`, `AT`, `GA`, `PA`** (4) are
+actually drawable. `app_bundle_geom_keys()` now hard-fails on a missing/unreadable GeoPackage
+(seeded fault verified 2026-09-21: renaming `v1/ply_ecoregions_2025.gpkg` away made this render
+STOP with `app_bundle_geom_keys(): missing GeoPackage for zone_set_key 'ecoregion_2025-06'
+(ecoregion): .../v1/ply_ecoregions_2025.gpkg does not exist`; file restored before this render).
+
+```{r}
+#| label: validate-geom-keys
+
+geom_check_tbl <- bind_rows(lapply(builds, function(b) {
+  if (!nrow(b$geom_check)) return(tibble())
+  cbind(ver = b$ver, b$geom_check)
+}))
+knitr::kable(geom_check_tbl,
+             caption = "Drawable units vs their real GeoPackage keys (keys_ge_2 and all_keys_in_geometry must be TRUE)")
+
+# the literal keys per unit, for the subregion case specifically named in the review
+unit_keys_tbl <- bind_rows(lapply(builds, function(b) {
+  if (is.null(b$out) || is.null(b$out$boot)) return(tibble())
+  bind_rows(lapply(b$out$boot$units, function(u)
+    data.frame(ver = b$ver, zone_type = u$zone_type, n_keys = length(u$keys),
+              keys = paste(sort(unlist(u$keys)), collapse = ","))))
+}))
+knitr::kable(unit_keys_tbl, caption = "Every drawable unit's actual keys, per version")
+stopifnot(
+  "a drawable unit failed the geometry-consistency check" =
+    nrow(geom_check_tbl) == 0 || (all(geom_check_tbl$keys_ge_2) && all(geom_check_tbl$all_keys_in_geometry)))
+
+# master plan D17 (Ben's decision, 2026-09-22, supersedes D16 in full):
+# drawable units are Program Areas ONLY (v2-v9), Planning Areas on v1 -- no
+# subregion or ecoregion unit on any release. Exactly ONE unit per release,
+# with an EXACT key count (v1 planarea=36; v2-v9 programarea=20) --
+# app_bundle_d17_check() asserts it, never derives or hand-cuts it. Every
+# release still gets a ROW here regardless of pass/fail, per "never silent."
+d17_gate_tbl <- bind_rows(lapply(builds, function(b) {
+  if (!isTRUE(b$ok) || is.null(b$out$boot)) return(tibble())
+  n_keys_expected <- length(b$geom_keys[[b$d17_type]])
+  chk <- app_bundle_d17_check(b$d17_type, n_keys_expected, b$out$boot$units)
+  data.frame(ver = b$ver, expected_zone_type = b$d17_type, n_keys_expected = n_keys_expected,
+             n_units_actual = chk$n_units_actual, n_keys_actual = chk$n_keys_actual,
+             matches_expectation = chk$matches, reason = chk$reason)
+}))
+knitr::kable(d17_gate_tbl, caption = paste(
+  "D17: exactly ONE drawable unit per release (programarea v2-v9, planarea v1),",
+  "with the exact published key count -- matches_expectation must be TRUE"))
+stopifnot(
+  "D17: a release does not have exactly one drawable unit with the exact expected key count" =
+    nrow(d17_gate_tbl) == 0 || all(d17_gate_tbl$matches_expectation))
+```
+
+## Validate
+
+`app_bundle_build()`'s builders already validate their own output as they write it
+(`app_validate()`, `R/app_bundle.R`); this chunk re-validates the WRITTEN BYTES, round-tripped
+through disk exactly as an app would fetch them — the same discipline
+`build_version_manifest.qmd` applies to `manifest.json` — and proves the schemas actually reject
+a broken shape, not just accept a good one.
+
+```{r}
+#| label: validate-schema
+
+revalidate_written <- function(b) {
+  if (!isTRUE(b$ok)) return(tibble())
+  files <- list(
+    boot  = list(path = file.path(b$dir_out, "boot.json"),  schema = "boot"),
+    taxa  = list(path = file.path(b$dir_out, "taxa.json"),  schema = "taxa"))
+  rows <- purrr::imap(files, function(f, nm) {
+    if (!file.exists(f$path)) return(data.frame(ver = b$ver, object = nm, ok = NA, note = "not built"))
+    x <- jsonlite::fromJSON(f$path, simplifyVector = FALSE)
+    ok <- tryCatch({ msens::app_validate(x, f$schema); TRUE },
+                    error = function(e) { message(conditionMessage(e)); FALSE })
+    data.frame(ver = b$ver, object = nm, ok = ok, note = "")
+  })
+  for (kind in c("taxon", "alias")) {
+    d <- file.path(b$dir_out, kind)
+    if (!dir.exists(d)) next
+    fs_ <- list.files(d, full.names = TRUE)
+    bad <- 0L
+    for (f in fs_) {
+      x <- jsonlite::fromJSON(f, simplifyVector = FALSE)
+      ok <- tryCatch({ msens::app_validate(x, kind); TRUE }, error = function(e) FALSE)
+      if (!ok) bad <- bad + 1L
+    }
+    rows[[kind]] <- data.frame(ver = b$ver, object = sprintf("%s/*.json (n=%d)", kind, length(fs_)),
+                               ok = bad == 0L, note = if (bad) sprintf("%d shard(s) FAILED", bad) else "")
+  }
+  bind_rows(rows)
+}
+val_tbl <- bind_rows(purrr::map(builds, revalidate_written))
+knitr::kable(val_tbl, caption = "Schema re-validation of the WRITTEN bytes, per version")
+```
+
+### `boot.json` actually carries its OPFS keys and drawable units
+
+Review round 1's root finding: composing the bundle by hand (rather than calling
+`app_bundle_build()`) left `boot$tables` and `boot$units` EMPTY on both real dry runs. `boot.json`
+now carries its own `id_field` (msens `7c6eb3a`), so this gate cross-checks it against the
+manifest's directly, rather than only checking the manifest's in isolation (round 1's stopgap,
+removed).
+
+```{r}
+#| label: validate-boot-contract
+
+boot_contract_gate <- function(b) {
+  if (!isTRUE(b$ok) || is.null(b$out)) return(tibble())
+  boot   <- b$out$boot
+  tables <- b$out$tables      # named list of app_table_descriptor() results
+  digest_ok <- vapply(tables, function(d) {
+    got <- as.character(msens::parquet_digest(file.path(b$dir_out, d$path))$digest[1])
+    identical(got, d$digest)
+  }, logical(1))
+  data.frame(
+    ver = b$ver,
+    n_tables            = length(tables),
+    tables_ge_3         = length(tables) >= 3,
+    all_digests_match   = length(digest_ok) > 0 && all(digest_ok),
+    n_digest_mismatches = sum(!digest_ok),
+    n_units             = length(boot$units),
+    units_ge_1          = length(boot$units) >= 1,
+    boot_id_field       = boot$id_field %||% NA_character_,
+    manifest_id_field   = b$pub_manifest$id_field %||% NA_character_,
+    id_field_matches    = !is.null(boot$id_field) && !is.null(b$pub_manifest$id_field) &&
+      identical(boot$id_field, b$pub_manifest$id_field) &&
+      boot$id_field %in% c("mdl_key", "mdl_seq"))
+}
+`%||%` <- function(a, b) if (is.null(a)) b else a
+boot_contract_tbl <- bind_rows(purrr::map(builds, boot_contract_gate))
+knitr::kable(boot_contract_tbl,
+             caption = "boot.json contract: tables (OPFS digests), units (drawable), id_field")
+stopifnot(
+  "boot$tables has fewer than 3 entries"          = nrow(boot_contract_tbl) == 0 || all(boot_contract_tbl$tables_ge_3),
+  "a table descriptor's digest disagrees with the written file's" =
+    nrow(boot_contract_tbl) == 0 || all(boot_contract_tbl$all_digests_match),
+  "boot$units has fewer than 1 entry"             = nrow(boot_contract_tbl) == 0 || all(boot_contract_tbl$units_ge_1),
+  "boot$id_field does not equal the manifest's"   = nrow(boot_contract_tbl) == 0 || all(boot_contract_tbl$id_field_matches))
+```
+
+```{r}
+#| label: validate-malformed-fixture
+#| eval: !expr any(purrr::map_lgl(builds, "ok"))
+
+# a deliberately malformed fixture must fail -- proves the two checks above are
+# not vacuously green (msens's own test-app_bundle.R exercises the same five
+# malformations against the builder output; this repeats it against ONE real
+# written boot.json so the notebook, not just the package, is proven to enforce it)
+good <- jsonlite::fromJSON(
+  file.path(builds[[which(purrr::map_lgl(builds, "ok"))[1]]]$dir_out, "boot.json"),
+  simplifyVector = FALSE)
+bad_cases <- list(
+  "required key removed"    = { x <- good; x$grid <- NULL; x },
+  "wrong type (nc as string)" = { x <- good; x$grid$nc <- "7200"; x },
+  "undeclared key"          = { x <- good; x$surprise <- 1; x },
+  "out-of-range enum"       = { x <- good; x$release$access <- "semi-public"; x })
+mal <- purrr::imap(bad_cases, function(x, nm) {
+  ok <- tryCatch({ msens::app_validate(x, "boot"); TRUE }, error = function(e) FALSE)
+  data.frame(case = nm, rejected = !ok)
+}) |> bind_rows()
+knitr::kable(mal, caption = "A deliberately malformed boot.json must be REJECTED (rejected = TRUE)")
+stopifnot("schema validation let a malformed boot.json through" = all(mal$rejected))
+```
+
+### Exactly one file per tile directory
+
+Review round 1 found 290 of v9's 422 `cell/tile=*/` directories holding SEVERAL part files
+(`data_0.parquet`, `data_1.parquet`, ...) — an msens `COPY ... PARTITION_BY` bug under
+parallelism. The browser only ever fetches the one fixed filename `tile={t}/data_0.parquet`
+(never a glob — anonymous LIST is denied), so a tile with more than one file was missing data
+from every part after the first, silently. **Fixed in msens 0.43.0 @ `7c6eb3a`** (review round 2):
+this gate now FAILS the render on any tile directory with anything other than exactly one file.
+
+```{r}
+#| label: validate-one-file-per-tile
+
+one_file_per_tile_gate <- function(b) {
+  if (!isTRUE(b$ok) || is.null(b$out$tiles)) {
+    app_bundle_gate_note("one_file_per_tile", b$ver, FALSE, if (!isTRUE(b$ok))
+      "build did not complete" else "release has no cell table (no tiles were built)")
+    return(tibble())
+  }
+  app_bundle_gate_note("one_file_per_tile", b$ver, TRUE)
+  d <- file.path(b$dir_out, "cell")
+  tiledirs <- list.dirs(d, full.names = TRUE, recursive = FALSE)
+  n_files <- vapply(tiledirs, function(td) length(list.files(td, pattern = "\\.parquet$")), integer(1))
+  data.frame(ver = b$ver, n_tile_dirs = length(tiledirs),
+             n_with_exactly_1_file = sum(n_files == 1L),
+             n_with_multiple_files = sum(n_files > 1L),
+             n_with_zero_files     = sum(n_files == 0L),
+             worst_example = if (any(n_files > 1L))
+               basename(tiledirs[which(n_files > 1L)[1]]) else NA_character_,
+             worst_example_n_files = if (any(n_files > 1L)) max(n_files) else NA_integer_)
+}
+one_file_tbl <- bind_rows(purrr::map(builds, one_file_per_tile_gate))
+knitr::kable(one_file_tbl, caption = "cell/tile=*/ directories: exactly one file per tile")
+stopifnot(
+  "a tile directory has zero or multiple .parquet files" =
+    nrow(one_file_tbl) == 0 ||
+    all(one_file_tbl$n_with_multiple_files == 0 & one_file_tbl$n_with_zero_files == 0))
+```
+
+### Tile-width gate (real nc, then the wrong one)
+
+```{r}
+#| label: validate-tile-width
+
+tile_width_gate <- function(b) {
+  if (!isTRUE(b$ok) || is.null(b$out$tiles)) {
+    app_bundle_gate_note("tile_width", b$ver, FALSE, if (!isTRUE(b$ok))
+      "build did not complete" else "release has no cell table (no tiles were built)")
+    return(tibble())
+  }
+  app_bundle_gate_note("tile_width", b$ver, TRUE)
+  ncol_real <- b$out$tiles$ncol
+  ncol_wrong <- if (ncol_real == 7200L) 3103L else 7200L
+  ok_real  <- tryCatch({ msens::app_cell_tile_check(file.path(b$dir_out, "cell"), ncol_real); TRUE },
+                       error = function(e) FALSE)
+  bad_wrong <- tryCatch({ msens::app_cell_tile_check(file.path(b$dir_out, "cell"), ncol_wrong); FALSE },
+                        error = function(e) TRUE)
+  data.frame(ver = b$ver, ncol_real = ncol_real, real_passes = ok_real,
+             ncol_wrong = ncol_wrong, wrong_fails_as_expected = bad_wrong)
+}
+tw_tbl <- bind_rows(purrr::map(builds, tile_width_gate))
+knitr::kable(tw_tbl, caption = "Tile-width gate: PASS at the release's own nc, FAIL at the wrong one")
+stopifnot(
+  "tile-width gate did not pass at the real nc"    = all(tw_tbl$real_passes),
+  "tile-width gate did not fail at the wrong nc"   = all(tw_tbl$wrong_fails_as_expected))
+```
+
+### Wide-tile digest gate (per-metric multiset digest vs `cell_metric`, read the way the browser does)
+
+`msens::app_cell_tile_digests()` globs every `*.parquet` under `cell/`; the browser fetches only
+`tile={t}/data_0.parquet`. Read the SAME single file per tile here — a tile with extra part files
+(see above) then correctly shows a digest MISMATCH, because the rows in `data_1.parquet` etc. are
+invisible to this query exactly as they are to the app.
+
+```{r}
+#| label: validate-digest
+
+digest_gate <- function(b, ver) {
+  if (!isTRUE(b$ok) || is.null(b$out$tiles)) {
+    app_bundle_gate_note("digest", ver, FALSE, if (!isTRUE(b$ok))
+      "build did not complete" else
+      "release has no cell table (no tiles were built, so no per-metric digest to check)")
+    return(tibble())
+  }
+  app_bundle_gate_note("digest", ver, TRUE)
+  con <- app_bundle_open_scoring(ver)
+  on.exit(DBI::dbDisconnect(con, shutdown = TRUE), add = TRUE)
+  duckdb_tune(con, file.path(tempdir(), "app_bundle_spill_digest", ver))
+  keys <- b$out$tiles$metric_keys
+  vc   <- msens::sdm_val_col(con, "cell_metric")
+  glob <- file.path(b$dir_out, "cell", "tile=*", "data_0.parquet")   # browser-equivalent, not **/*.parquet
+  bind_rows(lapply(keys, function(k) {
+    kq <- DBI::dbQuoteIdentifier(con, k)
+    a <- msens::hash_query(con, glue::glue(
+      "SELECT cell_id, {kq} AS val FROM read_parquet('{glob}', hive_partitioning = true)
+        WHERE {kq} IS NOT NULL"), cols = c("cell_id", "val"))
+    # round 4 (found rendering v1 for real, 2026-09-21): v1's cell_metric has 703
+    # rows whose cell_id is NOT in `cell` at all (an orphan, pre-existing in the
+    # legacy database, nothing to do with this notebook) -- app_cell_tiles()
+    # correctly never writes them (its own query JOINs against `cell`), so the
+    # ground-truth query here must scope to the SAME cells or every legacy
+    # release with an orphan cell_metric row shows a false digest mismatch. A
+    # cell_metric row for a cell_id the bundle could never contain is out of
+    # scope for "does the published bundle disagree with the database" -- it
+    # was never a candidate to publish in the first place.
+    bb <- msens::hash_query(con, glue::glue(
+      "SELECT cm.cell_id, cm.{vc} AS val FROM cell_metric cm JOIN metric m USING (metric_seq)
+        JOIN cell c USING (cell_id)
+        WHERE m.metric_key = {DBI::dbQuoteString(con, k)} AND cm.{vc} IS NOT NULL"),
+      cols = c("cell_id", "val"))
+    data.frame(ver = ver, metric_key = k, tiles = a, cell_metric = bb, ok = identical(a, bb))
+  }))
+}
+dg_tbl <- purrr::imap(builds, digest_gate) |> bind_rows()
+knitr::kable(dg_tbl |> select(ver, metric_key, ok),
+             caption = "cell/tile=*/data_0.parquet digest == cell_metric digest, per metric (browser-equivalent read)")
+stopifnot(
+  "a browser-equivalent wide-tile digest disagreed with cell_metric" =
+    nrow(dg_tbl) == 0 || all(dg_tbl$ok))
+```
+
+### `boot.json` zone metrics == `zone_metric` (joined on `zone_type` AND `metric_key`)
+
+```{r}
+#| label: validate-zone-metrics
+
+zone_metric_gate <- function(b, ver) {
+  if (!isTRUE(b$ok) || is.null(b$out$boot)) {
+    app_bundle_gate_note("zone_metric", ver, FALSE, if (!isTRUE(b$ok))
+      "build did not complete" else "release has no boot.json (build did not reach that stage)")
+    return(tibble())
+  }
+  con <- app_bundle_open_scoring(ver)
+  on.exit(DBI::dbDisconnect(con, shutdown = TRUE), add = TRUE)
+  # round 3 item 2: a release with no zone_metric table would otherwise hit
+  # the JOIN below and ERROR (unknown table), not gracefully return zero rows
+  # -- this is exactly the "no capability -> SKIP, don't fail" case, caught
+  # BEFORE the query rather than relying on the query to fail safely
+  if (!"zone_metric" %in% DBI::dbListTables(con)) {
+    app_bundle_gate_note("zone_metric", ver, FALSE, "release has no zone_metric table")
+    return(tibble())
+  }
+  app_bundle_gate_note("zone_metric", ver, TRUE)
+  duckdb_tune(con, file.path(tempdir(), "app_bundle_spill_zm", ver))
+  vm <- msens::sdm_val_col(con, "zone_metric"); vz <- msens::sdm_val_col(con, "zone")
+  # round 4 (found rendering v7b for real, 2026-09-21; correction from review):
+  # `zone_metric` carries "*_coverage" rows (e.g.
+  # extrisk_bird_ecoregion_rescaled_coverage) beside the real score metrics --
+  # my FIRST fix here excluded them from the ground truth, on the theory
+  # msens never publishes them. Wrong: `msens::app_boot()` (R/app_bundle.R
+  # ~407-423) DOES publish every one, split into two objects per zone --
+  # `metrics` (keys NOT ending "_coverage") and `coverage` (keys ending
+  # "_coverage", published with the suffix STRIPPED, e.g.
+  # `coverage$extrisk_bird_ecoregion_rescaled`). Proved against the real v7b
+  # bundle: programarea alone has 458 `metrics` + 146 `coverage` values;
+  # every unit together is 983 + 146 = 1129 = n_pub exactly. The bug was this
+  # GATE never reading `zr$coverage` at all, not the ground truth -- fixed by
+  # reading both and mapping a coverage entry's key back to `{key}_coverage`
+  # to rejoin it against `pub`.
+  pub <- DBI::dbGetQuery(con, glue::glue("
+    SELECT z.fld, z.{vz} AS zkey, m.metric_key, zm.{vm} AS val
+      FROM zone z JOIN zone_metric zm USING (zone_seq) JOIN metric m USING (metric_seq)"))
+  pub$zone_type <- sub("_key$", "", pub$fld)
+  boot <- b$out$boot
+  boot_rows <- do.call(rbind, lapply(names(boot$zones), function(ztype) {
+    zl <- boot$zones[[ztype]]
+    do.call(rbind, lapply(zl, function(zr) {
+      m_rows <- if (length(zr$metrics)) data.frame(
+        zone_type = ztype, zkey = zr$key, metric_key = names(zr$metrics),
+        val = as.numeric(unlist(zr$metrics)), stringsAsFactors = FALSE) else NULL
+      c_rows <- if (length(zr$coverage)) data.frame(
+        zone_type = ztype, zkey = zr$key, metric_key = paste0(names(zr$coverage), "_coverage"),
+        val = as.numeric(unlist(zr$coverage)), stringsAsFactors = FALSE) else NULL
+      rbind(m_rows, c_rows)
+    }))
+  }))
+  j <- merge(pub, boot_rows, by = c("zone_type", "zkey", "metric_key"), suffixes = c("_pub", "_boot"))
+  data.frame(ver = ver, n_pub = nrow(pub), n_boot = nrow(boot_rows), n_joined = nrow(j),
+             max_abs_delta = if (nrow(j)) max(abs(j$val_pub - j$val_boot)) else NA_real_)
+}
+zm_tbl <- purrr::imap(builds, zone_metric_gate) |> bind_rows()
+knitr::kable(zm_tbl, caption = "boot.json zone metrics vs published zone_metric (join on zone_type + zkey + metric_key)")
+stopifnot("boot.json zone metrics disagree with zone_metric" =
+  nrow(zm_tbl) == 0 || all(zm_tbl$n_pub == zm_tbl$n_boot & zm_tbl$max_abs_delta < 1e-6, na.rm = TRUE))
+```
+
+### Layer list == manifest's drawable (cell-level) metrics; shard keys == `taxa.json`; every alias resolves
+
+Reads the WRITTEN `taxa.json` / `taxon/*.json` / `alias/*.json` from disk — `app_bundle_build()`
+does not return the full shard contents in memory, only counts, and the point of this gate is the
+published bytes anyway, not what the builder happened to hold before writing them.
+
+```{r}
+#| label: validate-sets
+
+set_gates <- function(b, ver) {
+  if (!isTRUE(b$ok) || is.null(b$out$boot)) {
+    app_bundle_gate_note("sets", ver, FALSE, if (!isTRUE(b$ok))
+      "build did not complete" else "release has no boot.json (build did not reach that stage)")
+    return(tibble())
+  }
+  app_bundle_gate_note("sets", ver, TRUE)
+  con <- app_bundle_open_scoring(ver)
+  on.exit(DBI::dbDisconnect(con, shutdown = TRUE), add = TRUE)
+  cell_keys  <- sort(unique(msens:::.app_cell_metric_keys(con)))
+  layer_keys <- sort(vapply(b$out$boot$layers, function(l) l$metric_key, ""))
+  layers_ok  <- identical(cell_keys, layer_keys)
+
+  taxa_path <- file.path(b$dir_out, "taxa.json")
+  taxa_keys <- if (file.exists(taxa_path))
+    unique(unname(unlist(jsonlite::fromJSON(taxa_path, simplifyVector = FALSE)$key))) else character()
+
+  shards_ok <- NA; n_shard_keys <- NA_integer_
+  taxon_dir <- file.path(b$dir_out, "taxon")
+  if (dir.exists(taxon_dir) && length(taxa_keys)) {
+    shard_keys <- unique(unname(unlist(lapply(list.files(taxon_dir, full.names = TRUE), function(f)
+      names(jsonlite::fromJSON(f, simplifyVector = FALSE)$taxa)))))
+    shards_ok <- setequal(shard_keys, taxa_keys)
+    n_shard_keys <- length(shard_keys)
+  }
+
+  alias_ok <- NA; n_alias_bad <- NA_integer_
+  alias_dir <- file.path(b$dir_out, "alias")
+  if (dir.exists(alias_dir) && length(taxa_keys)) {
+    targets <- unname(unlist(lapply(list.files(alias_dir, full.names = TRUE), function(f) {
+      al <- jsonlite::fromJSON(f, simplifyVector = FALSE)$alias
+      vapply(al, function(x) x[[1]], "")
+    })))
+    bad <- setdiff(unique(targets), taxa_keys)
+    alias_ok <- length(bad) == 0
+    n_alias_bad <- length(bad)
+  }
+  data.frame(ver = ver, layers_eq_cell_metrics = layers_ok,
+             n_cell_keys = length(cell_keys), n_layer_keys = length(layer_keys),
+             shard_keys_eq_taxa = shards_ok, n_shard_keys = n_shard_keys, n_taxa_keys = length(taxa_keys),
+             every_alias_resolves = alias_ok, n_alias_unresolved = n_alias_bad)
+}
+sets_tbl <- purrr::imap(builds, set_gates) |> bind_rows()
+knitr::kable(sets_tbl, caption = "Set-equality gates: layers, taxon shard keys, alias targets")
+```
+
+### Manifest identity — the manifest `app_bundle_build()` actually used, never a rebuilt one
+
+Round 10 (2026-09-22): `msens::manifest_build()`'s one-row-per-`zone_set_key` collapse can lose a
+genuine tie between two zone tables for the same field to DuckDB's own row order — found on v2's
+`subregion_key` (`ply_subregions_2025` vs `ply_subregions_2026`, `n = 4` each): an installed
+package build and a source-tree run of the SAME commit picked different tables. The fix moved to
+[app_bundle_fetch_published_manifest()] — the fixed, already-published `{ver}/manifest.json`, not a
+fresh rebuild — but the fix needs its own gate, or a future regression (something reintroducing a
+rebuilt manifest into the `app_bundle_build()` call) would be silent again. This gate checks the
+PUBLISHED manifest against the release DATABASE's own `zone_taxon.zone_tbl` column (where the
+release has one: v2, v3, ..., v7b) and against `boot$units[].zone_tbl` — no rebuilt manifest
+anywhere in the comparison.
+
+```{r}
+#| label: validate-manifest-identity
+
+manifest_identity_gate <- function(b) {
+  none <- data.frame(ver = character(), zone_fld = character(), manifest_tbl = character(),
+                     n_manifest_rows = integer(), boot_zone_tbl = character(),
+                     content_matches_chosen_tbl = logical(), ok = logical())
+  if (!isTRUE(b$ok) || is.null(b$pub_manifest) || is.null(b$out$boot)) return(none)
+  mz <- b$pub_manifest$zones
+  if (is.null(mz) || !nrow(mz)) return(none)
+  p <- file.path(b$dir_out, "zone_taxon.parquet")
+  if (!file.exists(p)) return(none)
+  zt <- arrow::read_parquet(p)
+  dup_flds <- unique(mz$fld[duplicated(mz$fld)])   # requirement 1: exactly one row per fld
+
+  con <- app_bundle_open_scoring(b$ver)
+  on.exit(DBI::dbDisconnect(con, shutdown = TRUE), add = TRUE)
+  has_zt_tbl_col <- "zone_taxon" %in% DBI::dbListTables(con) &&
+    "zone_tbl" %in% DBI::dbListFields(con, "zone_taxon")
+
+  units_by_type <- setNames(b$out$boot$units, vapply(b$out$boot$units, function(u) u$zone_type, ""))
+  bind_rows(lapply(seq_len(nrow(mz)), function(i) {
+    fld  <- mz$fld[i]; tbl <- mz$tbl[i]; type <- sub("_key$", "", fld)
+    u        <- units_by_type[[type]]
+    boot_tbl <- if (!is.null(u) && !is.null(u$zone_tbl)) u$zone_tbl else NA_character_
+    # requirement 3: the WRITTEN zone_taxon.parquet must hold the CHOSEN
+    # table's own rows -- checked as content (its zone_value SET), not just a
+    # name, because the raw db zone_taxon table legitimately carries EVERY
+    # candidate table's rows for a genuine tie (v2 subregion_key: both
+    # ply_subregions_2025 and _2026 are really there) -- a name-only check
+    # would pass no matter which table's rows actually got written.
+    content_ok <- TRUE
+    if (has_zt_tbl_col) {
+      db_keys_for_tbl <- sort(unique(DBI::dbGetQuery(con, glue::glue(
+        "SELECT DISTINCT zone_value FROM zone_taxon
+          WHERE zone_fld = {DBI::dbQuoteString(con, fld)} AND zone_tbl = {DBI::dbQuoteString(con, tbl)}"))$zone_value))
+      written_keys <- sort(unique(as.character(zt$zone_value[zt$zone_fld == fld])))
+      # this-round fix (2026-09-22): dropped the `length(db_keys_for_tbl) > 0`
+      # requirement. Under D17 a field with no drawable unit (ecoregion_key,
+      # planarea_key on v3-v7b) can legitimately have ZERO zone_taxon rows
+      # for its manifest-named table on BOTH sides -- v3's own scoring db has
+      # no ecoregion/planarea zone_taxon rows at all, so db_keys_for_tbl and
+      # written_keys are both character(0), a true match, not a defect. The
+      # `>0` floor turned that into a false STOP for every one of v3-v7b's
+      # undrawn fields (seeded-fault-verified below: restoring the floor
+      # reproduces the exact v3 stop this round's real run hit). identical()
+      # alone still catches the real defect this gate exists for: a written
+      # set that differs from the manifest-named table's own content,
+      # empty-vs-nonempty in either direction or a wrong non-empty set (the
+      # v2 tie).
+      content_ok <- identical(written_keys, db_keys_for_tbl)
+    }
+    ok <- !(fld %in% dup_flds) && (is.null(u) || identical(boot_tbl, tbl)) && content_ok
+    data.frame(ver = b$ver, zone_fld = fld, manifest_tbl = tbl, n_manifest_rows = sum(mz$fld == fld),
+               boot_zone_tbl = boot_tbl, content_matches_chosen_tbl = content_ok, ok = ok)
+  }))
+}
+manifest_identity_tbl <- bind_rows(lapply(builds, manifest_identity_gate))
+knitr::kable(manifest_identity_tbl, caption = paste(
+  "Manifest identity: the PUBLISHED manifest's zones[].tbl (one row per fld) must equal",
+  "boot$units[].zone_tbl for every published unit, and the WRITTEN zone_taxon.parquet's content",
+  "must match that table's own rows in the release db -- ok must be TRUE"))
+stopifnot(
+  "the published manifest, boot$units[].zone_tbl, or the written zone_taxon.parquet disagree on which zone table won" =
+    nrow(manifest_identity_tbl) == 0 || all(manifest_identity_tbl$ok))
+```
+
+### `zone_taxon.parquet` integrity — independent of msens, by design
+
+msens owns `app_zone_taxon()`'s internals (which of a zone type's source tables to keep, how a
+duplicate resolves). This gate does not call into any of that: it reads the WRITTEN
+`zone_taxon.parquet` and `boot.json` bytes and checks them against each other and against the
+same GeoPackage geometry `app_bundle_geom_keys()` already resolved for the geometry-consistency
+gate above — three independent sources that must agree, with no msens function anywhere in the
+comparison. Two checks:
+
+1. `(zone_fld, zone_value, mdl_key)` is unique in `zone_taxon.parquet` — the same taxon, in the
+   same zone, cannot appear twice with two different `area_km2`.
+2. For every drawable unit, `boot$units[].keys` (what the app offers), the real GeoPackage's keys
+   (`app_bundle_geom_keys()`), and the distinct `zone_value`s actually published in
+   `zone_taxon.parquet` for that field must all agree — after dropping any whole-study-area
+   rollup (`USA`/`FULL`) from the `zone_taxon.parquet` side, since a rollup is scored, has no
+   polygon, and is never in the GeoPackage or in `boot$units[].keys` by round 3's own rule (found
+   running v8/v9 for real, 2026-09-22: both list `USA` as a `subregion_key` value beside
+   `AK`/`AT`/`GA`/`PA`, which is correct, not a defect).
+
+**Proved RED on today's v2 bundle** (built on msens 0.43.0 @ `71aa231`, before its zone-table fix
+landed): v2's source has two zone tables for `subregion_key`
+(`ply_subregions_2025`/`ply_subregions_2026`); `app_zone_taxon()` merged rows from both instead of
+choosing one, so 13,077 `(zone_fld, zone_value, mdl_key)` triples are duplicated with two different
+`area_km2` values each (e.g. `subregion_key`/`AK`/mdl_key `1` appears twice) — verified directly
+against `_output/app_bundle/v2/zone_taxon.parquet`: `n_dup_groups = 13077`, `n_dup_rows = 13077`.
+
+```{r}
+#| label: validate-zone-taxon-integrity
+
+zone_taxon_integrity_gate <- function(b) {
+  none_dup  <- data.frame(ver = character(), n_dup_groups = integer(), n_dup_rows = integer(),
+                          zone_taxon_unique = logical())
+  none_unit <- data.frame(ver = character(), zone_type = character(),
+                          n_boot_keys = integer(), n_geom_keys = integer(), n_zt_keys = integer(),
+                          missing_from_zt = character(), extra_in_zt = character(),
+                          warn_missing = logical(), stop_extra = logical())
+  if (!isTRUE(b$ok) || is.null(b$out$boot)) return(list(dup = none_dup, unit = none_unit))
+  p <- file.path(b$dir_out, "zone_taxon.parquet")
+  if (!file.exists(p)) return(list(dup = none_dup, unit = none_unit))
+  zt <- arrow::read_parquet(p)
+
+  dupg <- zt |> dplyr::count(zone_fld, zone_value, mdl_key) |> dplyr::filter(n > 1)
+  dup_row <- data.frame(ver = b$ver, n_dup_groups = nrow(dupg),
+                        n_dup_rows = if (nrow(dupg)) sum(dupg$n - 1) else 0L,
+                        zone_taxon_unique = nrow(dupg) == 0)
+
+  # round 9 (msens 0.43.0 @ 9e66946, "the geometry check asks about units"):
+  # a scored, published unit key can legitimately have ZERO zone_taxon rows
+  # (v8 subregion AT: scored, 52,674 cells, but no species-per-zone rows --
+  # boot$zones[unit][].n_taxa == 0, a gap in the release's OWN table, not an
+  # error msens invents around). That direction -- a boot key missing from
+  # zone_taxon -- is a WARNING here, never a stop. The OTHER direction -- a
+  # zone_taxon key that ISN'T a boot key at all -- is still a real integrity
+  # violation (data for a key that was never even a valid unit) and stays a
+  # hard stop. A key with no polygon (USA/FULL rollups) is dropped from the
+  # zone_taxon side before either comparison, same as before.
+  units <- b$out$boot$units
+  unit_rows <- bind_rows(lapply(units, function(u) {
+    fld       <- paste0(u$zone_type, "_key")
+    boot_keys <- sort(unique(as.character(unlist(u$keys))))
+    geom_k    <- sort(unique(as.character(b$geom_keys[[u$zone_type]])))
+    zt_keys   <- sort(intersect(unique(as.character(zt$zone_value[zt$zone_fld == fld])), geom_k))
+    missing <- setdiff(boot_keys, zt_keys)   # scored+published, but 0 zone_taxon rows -- WARN
+    extra   <- setdiff(zt_keys, boot_keys)   # zone_taxon data for a non-unit key -- STOP
+    data.frame(ver = b$ver, zone_type = u$zone_type,
+              n_boot_keys = length(boot_keys), n_geom_keys = length(geom_k), n_zt_keys = length(zt_keys),
+              missing_from_zt = paste(missing, collapse = ","),
+              extra_in_zt     = paste(extra, collapse = ","),
+              warn_missing = length(missing) > 0, stop_extra = length(extra) > 0)
+  }))
+  list(dup = dup_row, unit = if (is.null(unit_rows)) none_unit else unit_rows)
+}
+zti <- lapply(builds, zone_taxon_integrity_gate)
+zti_dup_tbl  <- bind_rows(lapply(zti, `[[`, "dup"))
+zti_unit_tbl <- bind_rows(lapply(zti, `[[`, "unit"))
+knitr::kable(zti_dup_tbl, caption = paste(
+  "zone_taxon.parquet uniqueness: (zone_fld, zone_value, mdl_key) must never repeat",
+  "-- zone_taxon_unique=FALSE is a real defect (a fan-out from a stale zone-table join)"))
+knitr::kable(zti_unit_tbl, caption = paste(
+  "Per unit: boot$units[].keys vs the distinct (in-geometry) zone_value published in",
+  "zone_taxon.parquet -- warn_missing (scored+published, 0 zone_taxon rows) is a WARNING;",
+  "stop_extra (zone_taxon data for a non-unit key) is a hard stop"))
+if (any(zti_unit_tbl$warn_missing))
+  for (i in which(zti_unit_tbl$warn_missing))
+    log_warn(paste0("{zti_unit_tbl$ver[i]} {zti_unit_tbl$zone_type[i]} {zti_unit_tbl$missing_from_zt[i]}: ",
+                    "scored but 0 zone_taxon rows"))
+stopifnot(
+  "zone_taxon.parquet has a duplicated (zone_fld, zone_value, mdl_key) triple" =
+    nrow(zti_dup_tbl) == 0 || all(zti_dup_tbl$zone_taxon_unique),
+  "zone_taxon.parquet has rows for a key that is not a published unit key" =
+    nrow(zti_unit_tbl) == 0 || !any(zti_unit_tbl$stop_extra))
+```
+
+### Anonymous COG spot-check (species assets) — SKIPS, with a reason, when a release has no merged COG
+
+Formalizes what was previously an ad-hoc post-render `curl` script into a real notebook gate.
+Samples ALL `sp_cat == "turtle"` taxa (a handful, always checked in full) plus up to 300 other
+taxa, from the WRITTEN `taxon/*.json` shards ([app_bundle_cog_sample()]) — the exact bytes an app
+would fetch, not a query against the database — then HEADs each URL anonymously, in parallel
+([app_bundle_head_check()]). `xargs -P`'s workers finish in an unpredictable order, so each result
+line carries both its URL and its status code and is re-associated by CONTENT, never by position —
+a naive positional read would silently pair the wrong status with the wrong URL under load. A
+release whose written bundle has no taxon with a merged COG (no asset registry — `model_asset` /
+`native_asset` — was reachable at build time; see [app_bundle_open()]'s 3-tier probe above) SKIPS
+this gate with that reason rather than failing it: there is nothing to check, which is not the same
+as everything being broken.
+
+```{r}
+#| label: validate-cog-sample
+
+cog_gate <- function(b) {
+  none <- function(reason) data.frame(
+    ver = b$ver, ran = FALSE, reason = reason, n_sampled = NA_integer_,
+    n_checked = NA_integer_, n_200 = NA_integer_, n_other = NA_integer_,
+    n_no_answer = NA_integer_, worst_status = NA_integer_, worst_url = NA_character_)
+  if (!isTRUE(b$ok)) {
+    app_bundle_gate_note("cog_species_spotcheck", b$ver, FALSE, "build did not complete")
+    return(none("build did not complete"))
+  }
+  samp <- app_bundle_cog_sample(b$dir_out)
+  if (!nrow(samp)) {
+    reason <- "no taxon in this release's written bundle carries a merged COG (no asset registry at build time)"
+    app_bundle_gate_note("cog_species_spotcheck", b$ver, FALSE, reason)
+    return(none(reason))
+  }
+  app_bundle_gate_note("cog_species_spotcheck", b$ver, TRUE)
+  # round 4 (found for real 2026-09-21: this gate reported "an object is
+  # missing" while four concurrent Playwright suites saturated the laptop's
+  # own network, load ~40 -- every request timed out (curl's `000`), and the
+  # SAME urls answered 200 seconds later with the load gone).
+  # app_bundle_head_check_retry() retries only a `000`/no-answer result, at
+  # LOWER parallelism, with backoff; app_bundle_head_classify() then keeps a
+  # REAL non-200 (the actual defect: the object answered and it is wrong)
+  # separate from "no answer after every retry" (nothing was verified for
+  # that URL -- NOT the same claim, and still not a PASS: see `ok` below).
+  chk <- app_bundle_head_check_retry(samp$url)
+  cl  <- app_bundle_head_classify(chk)
+  data.frame(ver = b$ver, ran = TRUE, reason = "", n_sampled = nrow(samp), n_checked = nrow(chk),
+             n_200 = cl$n_200, n_other = cl$n_other, n_no_answer = cl$n_no_answer,
+             worst_status = cl$worst_status, worst_url = cl$worst_url)
+}
+cog_tbl <- bind_rows(lapply(builds, cog_gate))
+knitr::kable(cog_tbl, caption = paste(
+  "Anonymous COG spot-check (all turtle taxa + up to 300 random others);",
+  "ran=FALSE with a reason is a SKIP, not a failure. n_200/n_other/n_no_answer is the",
+  "status histogram AFTER retries -- n_other is a real non-200 (the defect);",
+  "n_no_answer means nothing was verified for that URL (network/local load, not a missing object)."))
+stopifnot(
+  "an anonymous COG spot-check found a real non-200 response for a version that DOES have merged COGs" =
+    nrow(cog_tbl) == 0 || all(!cog_tbl$ran | cog_tbl$n_other == 0),
+  "an anonymous COG spot-check could not verify every URL even after retries (no-answer, not a PASS)" =
+    nrow(cog_tbl) == 0 || all(!cog_tbl$ran | cog_tbl$n_no_answer == 0))
+```
+
+### Gate coverage — which capability-conditioned gates ran per version, and why one was skipped
+
+Every gate above that can legitimately have nothing to check ([one_file_per_tile_gate],
+[tile_width_gate], [digest_gate], `zone_metric_gate`, `set_gates`, `cog_gate`) calls
+[app_bundle_gate_note()] right beside the condition that decides whether it runs, so this table can
+never drift from what the gates actually did.
+
+```{r}
+#| label: validate-gate-coverage
+
+gate_coverage_tbl <- app_bundle_gate_coverage()
+knitr::kable(gate_coverage_tbl,
+             caption = "Capability-conditioned gates: ran (TRUE/FALSE) per version, and the reason when FALSE")
+stopifnot(
+  "every attempted version must have exactly one coverage row per capability-conditioned gate" =
+    nrow(gate_coverage_tbl) == 0 ||
+    (setequal(unique(gate_coverage_tbl$ver), vers) &&
+     length(unique(table(gate_coverage_tbl$ver))) == 1L))
+```
+
+## Budgets (bytes vs the subplan's per-object budgets — FAILS the render, not just flags)
+
+Review round 1: the notebook used to carry its own private thresholds (9 MB for
+`zone_taxon.parquet`, 1.5 MB for `taxon.parquet`) that the two real measurements could never
+exceed, and only ever printed a table rather than stopping anything. [app_bundle_budgets()]
+(`libs/app_bundle.R`) is now the ONE place those numbers live — the subplan's own, with
+`zone_taxon.parquet` corrected to 8 MB — and this chunk `stopifnot()`s on the result: an object
+over budget fails the render, exactly like every other gate here. Sizes are measured the same
+way a real push would produce them: gzip via [app_bundle_gzip_file()] (byte-safe, never
+`readLines()`/`writeLines()`) for JSON, raw bytes for Parquet; the cell-tile row reads ONLY
+`tile=*/data_0.parquet` (browser-equivalent, see the digest gate above).
+
+```{r}
+#| label: budgets
+
+budgets_spec <- app_bundle_budgets()
+
+.budget_row <- function(object, sizes, kind, budget_bytes) {
+  if (!length(sizes)) return(NULL)
+  data.frame(object = object, kind = kind, n = length(sizes),
+             bytes_p50 = as.integer(round(median(sizes))),
+             bytes_p90 = as.integer(round(quantile(sizes, 0.9))),
+             bytes_max = as.integer(max(sizes)),
+             budget_bytes = as.integer(budget_bytes),
+             n_over_budget = sum(sizes > budget_bytes))
+}
+.sizes_for <- function(dir_out, object, kind) {
+  gz_of <- function(p) { tmp <- tempfile(fileext = ".gz"); app_bundle_gzip_file(p, tmp)
+                         sz <- file.size(tmp); unlink(tmp); sz }
+  if (object %in% c("boot.json", "taxa.json")) {
+    p <- file.path(dir_out, object)
+    if (!file.exists(p)) return(numeric())
+    if (kind == "gzip") gz_of(p) else file.size(p)
+  } else if (object %in% c("taxon/*.json", "alias/*.json")) {
+    d <- file.path(dir_out, sub("/\\*\\.json$", "", object))
+    if (!dir.exists(d)) return(numeric())
+    fs_ <- list.files(d, full.names = TRUE)
+    if (kind == "gzip") vapply(fs_, gz_of, numeric(1)) else file.size(fs_)
+  } else if (object == "cell/tile=*/data_0.parquet") {
+    fs_ <- Sys.glob(file.path(dir_out, "cell", "tile=*", "data_0.parquet"))  # browser-equivalent
+    file.size(fs_)
+  } else {  # taxon.parquet, taxonomy.parquet, zone_taxon.parquet
+    p <- file.path(dir_out, object)
+    if (!file.exists(p)) numeric() else file.size(p)
+  }
+}
+
+budgets_one <- function(b) {
+  if (!isTRUE(b$ok)) return(tibble())
+  rows <- lapply(seq_len(nrow(budgets_spec)), function(i) {
+    spec <- budgets_spec[i, ]
+    .budget_row(spec$object, .sizes_for(b$dir_out, spec$object, spec$kind), spec$kind, spec$budget_bytes)
+  })
+  out <- bind_rows(Filter(Negate(is.null), rows))
+  if (nrow(out)) out$ver <- b$ver
+  out
+}
+budgets_tbl <- bind_rows(purrr::map(builds, budgets_one))
+knitr::kable(
+  budgets_tbl |> select(ver, object, kind, n, bytes_p50, bytes_p90, bytes_max, budget_bytes, n_over_budget),
+  caption = "Object budgets vs the subplan (bytes; n_over_budget must be 0)")
+stopifnot(
+  "an object exceeds its subplan budget" = nrow(budgets_tbl) == 0 || all(budgets_tbl$n_over_budget == 0))
+```
+
+## Per-version summary (objects, bytes, taxa, tiles)
+
+```{r}
+#| label: summary-per-version
+
+summary_one <- function(b) {
+  if (!isTRUE(b$ok))
+    return(data.frame(ver = b$ver, ok = FALSE, reason = b$reason %||% NA_character_, n_objects = NA,
+                      bytes_raw = NA, bytes_gzip_est = NA, n_taxa = NA, n_tiles = NA, wall_s = NA))
+  d <- b$dir_out
+  files <- list.files(d, recursive = TRUE, full.names = TRUE)
+  is_json <- grepl("\\.json$", files)
+  gz1 <- function(p) { tmp <- tempfile(fileext = ".gz"); app_bundle_gzip_file(p, tmp)
+                       sz <- file.size(tmp); unlink(tmp); sz }
+  raw <- sum(file.size(files))
+  gz  <- sum(vapply(files[is_json], gz1, numeric(1))) + sum(file.size(files[!is_json]))
+  data.frame(ver = b$ver, ok = TRUE, reason = "",
+             n_objects = length(files), bytes_raw = raw, bytes_gzip_est = gz,
+             n_taxa = if (!is.null(b$out)) b$out$n_taxa else NA,
+             n_tiles = if (!is.null(b$out$tiles)) b$out$tiles$tiles else NA,
+             wall_s = round(b$wall_s, 1))
+}
+summary_tbl <- bind_rows(purrr::map(builds, summary_one))
+knitr::kable(summary_tbl, caption = "Per-version summary: objects, raw/gzip-estimated bytes, taxa, tiles, wall clock")
+```
+
+## `serve/cell_model/` upload plan (allow-listed versions only) — local gates, dry-run, never a write
+
+Round 3 item 3: generalized from a single v7-only flag to an explicit ALLOW-LIST parameter
+(`APP_BUNDLE_CELLMODEL_VERS`, default empty). This chunk always runs, even when `APP_BUNDLE_S3` is
+unset — it is a pure dry run: a local directory walk plus one anonymous HEAD per allow-listed
+version, nothing is ever written here. Per version: the local tile-width gate (`nc=3103`) and
+one-file-per-tile gate run on the LOCAL source tiles [app_bundle_cell_model_plan()], every planned
+key is checked against the EXACT shape `^{ver}/serve/cell_model/tile=[0-9]+/data_0\.parquet$`
+[app_bundle_assert_cell_model_keys()], and the version is refused outright if its cell_model is
+ALREADY on S3 [app_bundle_cell_model_already_on_s3()] — upload is all-or-nothing, never a partial
+overwrite. v8/v9 are refused before any of that even runs: neither has a local `{ver}/cell_model/`
+export (verified 2026-09-21: `~/_big/msens/derived/v9/cell_model` does not exist on this machine),
+so [app_bundle_cell_model_dir()] returns `NA` and the plan reports "no local source directory".
+
+```{r}
+#| label: validate-cell-model-plan
+
+cm_plan_one <- function(ver) {
+  plan <- app_bundle_cell_model_plan(ver, dir_derived)
+  if (!length(plan$keys))
+    return(data.frame(ver = ver, n_tiles = 0L, n_keys = 0L, bytes = 0, keys_ok = NA,
+                      one_file_per_tile_ok = NA, tile_width_ok = NA, already_on_s3 = NA,
+                      clear_to_upload = FALSE,
+                      reason = sprintf("no local source directory (%s)",
+                                       file.path(dir_derived, ver, "cell_model"))))
+  keys_ok <- isTRUE(tryCatch({ app_bundle_assert_cell_model_keys(plan$keys, ver); TRUE },
+                             error = function(e) { message(conditionMessage(e)); FALSE }))
+  tiledirs <- list.dirs(plan$dir, full.names = TRUE, recursive = FALSE)
+  n_files  <- vapply(tiledirs, function(td) length(list.files(td, pattern = "\\.parquet$")), integer(1))
+  one_ok   <- length(n_files) > 0 && all(n_files == 1L)
+  tw_ok    <- isTRUE(tryCatch({ msens::app_cell_tile_check(plan$dir, 3103L); TRUE },
+                              error = function(e) { message(conditionMessage(e)); FALSE }))
+  already  <- app_bundle_cell_model_already_on_s3(ver, base)
+  clear    <- isTRUE(keys_ok) && isTRUE(one_ok) && isTRUE(tw_ok) && !isTRUE(already)
+  reason   <- if (!isTRUE(keys_ok)) "a key failed the exact tile-filename shape check" else
+              if (!isTRUE(one_ok)) "a local tile directory has zero or multiple .parquet files" else
+              if (!isTRUE(tw_ok))  "a local tile failed the width check (nc=3103)" else
+              if (isTRUE(already)) "already present on S3 (refusing to overwrite)" else ""
+  data.frame(ver = ver, n_tiles = plan$n_tiles, n_keys = length(plan$keys), bytes = plan$bytes,
+             keys_ok = keys_ok, one_file_per_tile_ok = one_ok, tile_width_ok = tw_ok,
+             already_on_s3 = already, clear_to_upload = clear, reason = reason)
+}
+cm_plan_tbl <- bind_rows(lapply(cm_vers, cm_plan_one))
+if (!length(cm_vers))
+  message("APP_BUNDLE_CELLMODEL_VERS is empty -- no serve/cell_model/ upload planned")
+# `knitr::kable()` must be its OWN top-level chunk statement to auto-print --
+# a plain print() (or one buried inside an `if {}`/`for` block) bypasses
+# knitr's knit_print() "asis" hook and pandoc is left with a literal pipe-table
+# STRING instead of an HTML <table> (found rendering this exact chunk
+# 2026-09-21: the table above showed as unrendered `|ver|n_tiles|...` text).
+# A zero-row cm_plan_tbl (the ordinary case: the allow-list is empty) still
+# kables cleanly -- header only, no data rows.
+knitr::kable(cm_plan_tbl, caption = paste(
+  "serve/cell_model/ upload plan: local gates + already-on-S3 refusal,",
+  "per allow-listed version (dry run; nothing written here)"))
+if (nrow(cm_plan_tbl))
+  for (i in seq_len(nrow(cm_plan_tbl)))
+    log_info(paste0(
+      "cell_model plan {cm_plan_tbl$ver[i]}: {cm_plan_tbl$n_keys[i]} keys, ",
+      "{cm_plan_tbl$bytes[i]} bytes, clear_to_upload={cm_plan_tbl$clear_to_upload[i]}",
+      if (!cm_plan_tbl$clear_to_upload[i]) " ({cm_plan_tbl$reason[i]})" else ""))
+stopifnot(
+  "a version in the cell_model allow-list is not clear to upload (see the reason column)" =
+    nrow(cm_plan_tbl) == 0 || all(cm_plan_tbl$clear_to_upload))
+```
+
+## Push (`APP_BUNDLE_S3=1` only — never run by this notebook's author)
+
+Lists the target prefix before and after, refuses (via [app_bundle_assert_prefix()]) any key
+outside `{ver}/app/` — and, for a version in `APP_BUNDLE_CELLMODEL_VERS`, `{ver}/serve/cell_model/`
+— gzips every JSON object before upload (`Content-Encoding: gzip`, S3 does not compress on the
+fly), leaves Parquet as-is (already zstd-compressed by [msens::write_atlas_parquet()] /
+[msens::copy_atlas_parquet()]). The `serve/cell_model/` sync itself reuses [cm_plan_tbl] computed
+above — a version is only synced if THIS run's plan already marked it `clear_to_upload`, so the
+dry-run gates above are not just printed, they gate the write.
+
+```{r}
+#| label: push
+#| eval: !expr do_s3
+
+s3_root <- "s3://oceanmetrics.io-public/marine-atlas"
+
+list_prefix <- function(prefix) {
+  out <- system2("aws", c("s3", "ls", shQuote(glue("{s3_root}/{prefix}")), "--recursive"),
+                stdout = TRUE, stderr = TRUE)
+  if (!is.null(attr(out, "status")) && attr(out, "status") != 0) character(0) else out
+}
+
+push_one <- function(b) {
+  if (!isTRUE(b$ok)) return(invisible(NULL))
+  ver <- b$ver
+  before <- list_prefix(glue("{ver}/app/"))
+  log_info("{ver}/app/ BEFORE push: {length(before)} object(s)")
+
+  # a controlled directory walk of dir_out -- every file that exists under it,
+  # nothing else -- then EVERY key derived from it still goes through the
+  # whitelist guard before anything touches S3; the walk being "controlled"
+  # is not itself the protection, the guard call two lines down is
+  files <- list.files(b$dir_out, recursive = TRUE, full.names = TRUE)
+  rels  <- fs::path_rel(files, b$dir_out)
+  keys  <- glue("{ver}/app/{rels}")
+  app_bundle_assert_prefix(keys, ver)                       # refuse before touching S3
+
+  for (i in seq_along(files)) {
+    is_json <- grepl("\\.json$", files[i])
+    src <- files[i]
+    if (is_json) {
+      gz <- tempfile(fileext = ".gz")
+      app_bundle_gzip_file(files[i], gz)                    # byte-safe, never readLines()
+      app_bundle_assert_gzip_roundtrip(gz, files[i])         # proves upload bytes == validated bytes
+      src <- gz
+    }
+    args <- c("s3", "cp", shQuote(src), shQuote(glue("{s3_root}/{keys[i]}")),
+              if (is_json) c("--content-type", shQuote("application/json"),
+                             "--content-encoding", "gzip"))
+    out <- system2("aws", args, stdout = TRUE, stderr = TRUE)
+    if (!is.null(attr(out, "status")) && attr(out, "status") != 0)
+      stop(glue("aws s3 cp failed for {keys[i]}: {paste(out, collapse = '\n')}"))
+    if (is_json) unlink(src)
+  }
+
+  if (ver %in% cm_vers) {
+    plan_row <- cm_plan_tbl[cm_plan_tbl$ver == ver, , drop = FALSE]
+    if (nrow(plan_row) && isTRUE(plan_row$clear_to_upload[1])) {
+      plan <- app_bundle_cell_model_plan(ver, dir_derived)
+      app_bundle_assert_cell_model_keys(plan$keys, ver)          # exact shape, again, right before the write
+      app_bundle_assert_prefix(plan$keys, ver, allow_cell_model = TRUE)  # whitelist, again
+      system2("aws", c("s3", "sync", shQuote(plan$dir),
+                       shQuote(glue("{s3_root}/{ver}/serve/cell_model")), "--only-show-errors"),
+              stdout = TRUE, stderr = TRUE)
+      log_info("{ver}: synced serve/cell_model/ -- {length(plan$keys)} keys, {plan$bytes} bytes")
+    } else {
+      stop(glue(
+        "{ver} is in APP_BUNDLE_CELLMODEL_VERS but this run's plan did not mark it clear_to_upload ",
+        "-- refusing to sync (see the validate-cell-model-plan chunk's reason column)"))
+    }
+  }
+
+  after <- list_prefix(glue("{ver}/app/"))
+  log_info("{ver}/app/ AFTER push: {length(after)} object(s) ({length(after) - length(before)} new)")
+  invisible(list(before = before, after = after))
+}
+push_out <- purrr::map(builds, push_one)
+```
+
+## Anonymous verification (`APP_BUNDLE_S3=1` only)
+
+HEAD (falling back to a ranged GET) per published object, anonymously — no credentials, exactly
+as the browser will fetch it: 200, `content-encoding: gzip` on every JSON object, path-style URL,
+size within budget.
+
+```{r}
+#| label: verify-anonymous
+#| eval: !expr do_s3
+
+verify_one <- function(b) {
+  if (!isTRUE(b$ok)) return(tibble())
+  ver <- b$ver
+  files <- list.files(b$dir_out, recursive = TRUE, full.names = TRUE)
+  rels  <- fs::path_rel(files, b$dir_out)
+  urls  <- glue("{base}/{ver}/app/{rels}")
+  purrr::map_dfr(seq_along(urls), function(i) {
+    r <- tryCatch(
+      httr2::req_perform(httr2::req_error(httr2::req_method(httr2::request(urls[i]), "HEAD"),
+                                          is_error = function(resp) FALSE)),
+      error = function(e) NULL)
+    is_json <- grepl("\\.json$", files[i])
+    data.frame(
+      ver = ver, key = rels[i],
+      status = if (is.null(r)) NA_integer_ else httr2::resp_status(r),
+      path_style = grepl("^https://s3\\.[a-z0-9-]+\\.amazonaws\\.com/", urls[i]),
+      gzip_ok = if (is.null(r) || !is_json) NA else
+        identical(httr2::resp_header(r, "content-encoding"), "gzip"),
+      bytes = if (is.null(r)) NA_integer_ else
+        suppressWarnings(as.integer(httr2::resp_header(r, "content-length"))))
+  })
+}
+verify_tbl <- bind_rows(purrr::map(builds, verify_one))
+knitr::kable(
+  verify_tbl |> summarise(n = n(), n_200 = sum(status == 200, na.rm = TRUE),
+                          n_gzip_ok = sum(gzip_ok, na.rm = TRUE), .by = ver),
+  caption = "Anonymous verification summary per version")
+stopifnot("not every pushed object answered 200 anonymously" =
+  all(verify_tbl$status == 200, na.rm = TRUE) && !anyNA(verify_tbl$status))
+```
+
+## Target manifest
+
+```{r}
+#| label: target-manifest
+
+msens::write_manifest(
+  here("data/manifests/build_app_bundle.json"),
+  target       = "build_app_bundle",
+  content_hash = digest::digest(
+    list(summary_tbl, val_tbl, boot_contract_tbl, one_file_tbl, tw_tbl, dg_tbl, zm_tbl, sets_tbl,
+        cog_tbl, gate_coverage_tbl, budgets_tbl, cm_plan_tbl),
+    algo = "xxhash64"),
+  stats = list(
+    versions_attempted  = vers,
+    versions_built      = summary_tbl$ver[summary_tbl$ok],
+    push_s3             = do_s3,
+    cell_model_vers     = cm_vers,
+    cell_model_clear_to_upload = if (nrow(cm_plan_tbl)) cm_plan_tbl$ver[cm_plan_tbl$clear_to_upload] else character(0),
+    n_objects_total     = sum(summary_tbl$n_objects, na.rm = TRUE),
+    n_tile_dirs_with_multiple_files = sum(one_file_tbl$n_with_multiple_files, na.rm = TRUE),
+    n_gates_skipped     = sum(!gate_coverage_tbl$ran)),
+  force = msens::force_target("build_app_bundle"))
+```

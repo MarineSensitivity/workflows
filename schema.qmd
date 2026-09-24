@@ -349,6 +349,67 @@ zs <- readr::read_csv(here::here("data/zone_sets.csv"), show_col_types = FALSE)
 knitr::kable(zs |> dplyr::select(zone_set_key, zone_type, vintage, n_zones, versions, canonical))
 ```
 
+## Browser contract — `{ver}/app/`
+
+The tables above are what a *DuckDB client* reads. The atlas **browser app** (`MarineSensitivity/atlas`,
+master plan D5) never opens `sdm.duckdb`, `serve.duckdb`, or the raw `tables/*.parquet` — it reads
+a small, **version-independent** contract that `build_app_bundle.qmd` (atlas-1, msens 0.43.0+)
+publishes alongside the release, under `s3://oceanmetrics.io-public/marine-atlas/{ver}/app/`.
+
+**Why a separate contract at all.** Both Shiny apps above carry a per-version adapter — two grids
+(`usa05` 0–360 vs `global05` −180..180), `mdl_seq` vs `mdl_key`, `value` vs `val`, `is_ok` vs
+`is_valid_usa`, unsuffixed v1/v2 zone tables, a `taxon_model` self-edge on one side only — and
+every one of those quirks has a production bug on record behind it. Re-implementing them in the
+browser's TypeScript would double that surface and halve the test coverage. Instead
+`msens::app_bundle_build()` resolves every quirk once, here, where its fixtures and tests already
+live (`../msens/tests/testthat/test-app_bundle.R`), and writes ONE shape that v1 and v9 both
+satisfy.
+
+| object | contents | who builds it | budget (gzip) |
+|---|---|---|---|
+| `boot.json` | release identity, grid, study-area cameras, drawable units, cell-level layers (COG + rescale by subregion), every zone's precomputed metrics, the versioned flower default, datasets, colour ramps, table digests | `msens::app_boot()` | ≤ 60 KB |
+| `taxa.json` | picker index: parallel arrays (`key, sci, common, cat_idx, flags`) | `msens::app_taxa()` | ≤ 1 MB |
+| `taxon/{xx}.json` | 256 shards, full per-taxon card (ids, listings, validity, merged-surface COG with a **precomputed** bbox, normalized input edges + their assets) | `msens::app_taxon_shards()` | ≤ 25 KB each |
+| `alias/{xx}.json` | 256 shards, every raw model key AND legacy `mdl_seq` → `[merged_key, ds_key]` | `msens::app_alias_shards()` | ≤ 15 KB each |
+| `taxon.parquet` | the normalized scored-taxon table, one schema v1…v9 | `msens::app_taxon_table()` | ≈ 1 MB (raw) |
+| `zone_taxon.parquet` | `.zone_taxon_normalize()`'d species-per-zone table | `msens::app_zone_taxon()` | ≈ 6 MB (raw) |
+| `taxonomy.parquet` | the curated WoRMS hierarchy CSV, restricted to this release's taxa | `app_taxonomy_table()` (`libs/app_bundle.R` — a curated CSV, not a DB table, so msens has no builder for it) | < 1.5 MB (raw) |
+| `cell/tile={t}/data_0.parquet` | **wide** per-cell metrics: one `DOUBLE` column per scored `metric_key` (never `metric_seq`, dropped/recreated every run), every `cell` row of any tile holding a `cell_metric`/`cell_model` row | `msens::app_cell_tiles()` | ≈ 110–250 KB each |
+
+Every builder **validates its own output** against `inst/schema/app_*.schema.json`
+(`msens::app_validate()`) before it is written — `additionalProperties: false` at the top level,
+so a key the schema does not name is a key that fails the render rather than shipping silently.
+JSON objects are uploaded gzip-compressed (`Content-Encoding: gzip`; S3 does not compress on the
+fly); Parquet is left as-is (already zstd-compressed).
+
+**Capabilities are PROBED, never copied.** `manifest.json` gains an `app{schema, base, boot,
+built_at, capabilities{cell, cell_model, taxonomy, alias, pmtiles_s3}}` block —
+`msens::manifest_build(..., app = msens::app_capabilities(ver, base))` (`app` is an argument of
+`manifest_build()` itself, not bolted on afterward, since `build_version_manifest.qmd` writes only
+v9's manifest and `backfill_versions.qmd` writes v1–v7b's separately: see the atlas-1 patch
+proposal in `../CLAUDE.md`) — and every capability comes from an
+**anonymous HTTPS HEAD of a sample object** — never from `manifest$capabilities`. This matters
+because those two can legitimately disagree: v7 and v7b both advertise `cell_species_list: true`
+in the main manifest because the *server-side* Shiny apps can read a `cell_model` that lives only
+on `/share/data/big/{ver}/cell_model` — S3 holds `tables/` and `manifest.json` for those releases
+and nothing else, so a static browser client genuinely cannot fetch it, and `app.capabilities.cell_model`
+says so.
+
+**A known limitation, found running this notebook against the real v7 release (2026-09-21):**
+`msens::app_taxon_shards()`'s legacy (pre-`mdl_key`) code path can attach spurious NA-valued
+"input" entries to every taxon's card when the release's `taxon_model` join touches a `taxon` row
+whose own key is NULL (a taxon representable only through `ms_merge`, no direct `mdl_seq`) — R's
+`x[cond, ]` indexing inserts one placeholder row per `NA` in `cond`, not just for genuine matches.
+Confirmed msens-side, not workflows-side; `taxon/*.json` is unaffected for v8/v9 (whose
+`taxon_model` carries no such NULLs). `app_alias_shards()` is unaffected on any generation (it
+filters with `%in%`, which never propagates `NA`). Tracked for msens to fix with a regression
+fixture; `build_app_bundle.qmd`'s per-stage `tryCatch` means this blocks only the two shard
+objects for an affected release, not the rest of the bundle.
+
+See `../CLAUDE.md` (workflows) for the `msens:` front-matter / env-flag conventions
+`build_app_bundle.qmd` follows, and `MarineSensitivity/atlas`'s own docs for how the browser
+consumes this contract (tiers 0–2, the DuckDB-WASM layer, the place codec).
+
 ---
 
 # serve.duckdb — the local view database
