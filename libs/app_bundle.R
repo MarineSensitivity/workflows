@@ -117,8 +117,16 @@ app_bundle_valid_ver <- function(ver)
 #'   independently-trusted version string. A key for any OTHER version's
 #'   `serve/cell_model/` is still refused, because it fails the prefix match,
 #'   not because the version was hardcoded.
+#' @param allow_manifest allow EXACTLY the single key `{ver}/manifest.json` too
+#'   (default `FALSE`). Round 6 (2026-09-25 review, item 4): the manifest-patch
+#'   push chunk is the one place this notebook writes outside `{ver}/app/` at
+#'   all, so the exception is an EXACT key match — never a prefix — for
+#'   `{ver}/manifest.json` alone, using the SAME `ver` this call already
+#'   validated. A key for any OTHER path under `{ver}/` (`{ver}/manifest2.json`,
+#'   `{ver}/tables/manifest.json`, another version's `manifest.json`) is still
+#'   refused.
 #' @return `keys`, invisibly, when every key is allowed
-app_bundle_assert_prefix <- function(keys, ver, allow_cell_model = FALSE) {
+app_bundle_assert_prefix <- function(keys, ver, allow_cell_model = FALSE, allow_manifest = FALSE) {
   if (!app_bundle_valid_ver(ver))
     stop(sprintf(
       "app_bundle_assert_prefix(): `ver` does not look like a version label (^v[0-9]+[a-z]?$) -- got %s",
@@ -136,12 +144,16 @@ app_bundle_assert_prefix <- function(keys, ver, allow_cell_model = FALSE) {
   ok_cm  <- if (isTRUE(allow_cell_model))
     vapply(keys, .app_bundle_key_under_prefix, logical(1), prefix = sprintf("%s/serve/cell_model", ver))
   else rep(FALSE, length(keys))
+  ok_mfst <- if (isTRUE(allow_manifest))
+    !is.na(keys) & keys == sprintf("%s/manifest.json", ver)
+  else rep(FALSE, length(keys))
 
-  bad <- keys[!(ok_app | ok_cm)]
+  bad <- keys[!(ok_app | ok_cm | ok_mfst)]
   if (length(bad))
     stop(sprintf(
-      "refusing to publish %d key(s) outside {%s/app/}%s:\n  %s%s",
+      "refusing to publish %d key(s) outside {%s/app/}%s%s:\n  %s%s",
       length(bad), ver, if (isTRUE(allow_cell_model)) sprintf(" or %s/serve/cell_model/", ver) else "",
+      if (isTRUE(allow_manifest)) sprintf(" or exactly %s/manifest.json", ver) else "",
       paste(utils::head(bad, 10), collapse = "\n  "),
       if (length(bad) > 10) sprintf("\n  ... and %d more", length(bad) - 10) else ""),
       call. = FALSE)
@@ -286,6 +298,148 @@ app_bundle_assert_prefix_selftest <- function() {
     testthat::expect_match(err, "2 key\\(s\\)")
     testthat::expect_match(err, "v9/tables/a.parquet")
     testthat::expect_match(err, "v9/tables/b.parquet")
+  })
+  testthat::test_that("ALLOWED (round 6, item 4): the manifest exception, EXACTLY {ver}/manifest.json, when enabled", {
+    testthat::expect_silent(app_bundle_assert_prefix("v7/manifest.json", "v7", allow_manifest = TRUE))
+    testthat::expect_silent(app_bundle_assert_prefix(
+      c("v7/app/boot.json", "v7/manifest.json"), "v7", allow_manifest = TRUE))
+  })
+  testthat::test_that("REFUSED: the manifest exception is OFF by default", {
+    testthat::expect_error(
+      app_bundle_assert_prefix("v7/manifest.json", "v7"), "refusing to publish")
+  })
+  testthat::test_that("REFUSED: the manifest exception is an EXACT key, not a prefix", {
+    testthat::expect_error(
+      app_bundle_assert_prefix("v7/manifest2.json", "v7", allow_manifest = TRUE),
+      "refusing to publish")
+    testthat::expect_error(
+      app_bundle_assert_prefix("v7/tables/manifest.json", "v7", allow_manifest = TRUE),
+      "refusing to publish")
+    testthat::expect_error(
+      app_bundle_assert_prefix("v7/manifest.json/x", "v7", allow_manifest = TRUE),
+      "refusing to publish")
+  })
+  testthat::test_that("REFUSED: the manifest exception is scoped to THIS call's own `ver`", {
+    testthat::expect_error(
+      app_bundle_assert_prefix("v9/manifest.json", "v7", allow_manifest = TRUE),
+      "refusing to publish")
+  })
+  invisible(TRUE)
+}
+
+# ---- manifest-patch diff guard (round 6, review item 4) ----------------------
+#
+# The staged `{ver}_manifest_with_app.json` patch (the LIVE published manifest
+# plus the `app{}` block and a metric-label backfill) is only ever pushed after
+# proving its diff against the live manifest is EXACTLY those two things --
+# never a surprise change to `id_field`, `capabilities`, `tables`, `zones`, or a
+# metrics column other than `label`, and never a label that was already
+# curated changing to something else. Kept independent of `jsonlite`'s own
+# comparison semantics: every field is compared with `identical()` on R's own
+# parsed representation, not by re-serializing to JSON text and diffing bytes.
+
+#' A `label` is "blank": absent, `NA`, or whitespace-only
+#'
+#' The same rule [msens::manifest_labels_backfill()] uses (never re-implemented
+#' independently here — this is only ever used to classify which `label` VALUES
+#' changed, not to decide what they change TO).
+#'
+#' @param x character vector
+#' @return logical vector, same length
+.app_bundle_label_is_blank <- function(x) is.na(x) | !nzchar(trimws(x))
+
+#' Assert a staged manifest patch differs from the live manifest ONLY by the
+#' `app{}` block and blank-to-non-blank metric labels
+#'
+#' @param live the LIVE published manifest, parsed (e.g. this run's own
+#'   `b$pub_manifest`, fetched before any push)
+#' @param staged the STAGED patch, parsed from the file this notebook is about
+#'   to push (never the in-memory object mid-build — read the same bytes that
+#'   will actually go over the wire)
+#' @param ver version label, for the error messages only
+#' @return `TRUE`, invisibly, when the diff is exactly the allowed shape;
+#'   stops naming what else changed otherwise
+app_bundle_assert_manifest_patch_diff <- function(live, staged, ver) {
+  stopifnot(is.list(live), is.list(staged), app_bundle_valid_ver(ver))
+
+  other <- setdiff(union(names(live), names(staged)), c("app", "metrics"))
+  bad_fields <- other[!vapply(other, function(nm) identical(live[[nm]], staged[[nm]]), logical(1))]
+  if (length(bad_fields))
+    stop(sprintf(
+      "%s: the staged manifest patch changes field(s) other than app{}/metrics$label: %s -- refusing to push",
+      ver, paste(bad_fields, collapse = ", ")), call. = FALSE)
+
+  lm <- live$metrics; sm <- staged$metrics
+  if (is.null(lm) && is.null(sm)) return(invisible(TRUE))
+  if (is.null(lm) || is.null(sm) || !identical(dim(lm), dim(sm)) || !identical(names(lm), names(sm)))
+    stop(sprintf(
+      "%s: the staged manifest patch's `metrics` has a different shape (rows/columns) than the live manifest's -- refusing to push",
+      ver), call. = FALSE)
+
+  non_label <- setdiff(names(lm), "label")
+  if (length(non_label) && !identical(lm[non_label], sm[non_label]))
+    stop(sprintf(
+      "%s: the staged manifest patch changes a `metrics` column other than `label` -- refusing to push",
+      ver), call. = FALSE)
+
+  lab_before <- if ("label" %in% names(lm)) lm$label else rep(NA_character_, nrow(lm))
+  lab_after  <- if ("label" %in% names(sm)) sm$label else rep(NA_character_, nrow(sm))
+  changed <- !(is.na(lab_before) & is.na(lab_after)) & !(!is.na(lab_before) & !is.na(lab_after) & lab_before == lab_after)
+  if (any(changed)) {
+    was_blank <- .app_bundle_label_is_blank(lab_before[changed])
+    now_blank <- .app_bundle_label_is_blank(lab_after[changed])
+    if (!all(was_blank & !now_blank))
+      stop(sprintf(paste(
+        "%s: the staged manifest patch changes a metrics$label that was NOT blank/NA/whitespace",
+        "(or changes it to something still blank) -- only a blank label becoming non-blank is",
+        "allowed -- refusing to push"), ver), call. = FALSE)
+  }
+  invisible(TRUE)
+}
+
+#' Self-test for [app_bundle_assert_manifest_patch_diff()]
+#'
+#' @return `TRUE`, invisibly; stops on the first failed expectation
+app_bundle_assert_manifest_patch_diff_selftest <- function() {
+  stopifnot(requireNamespace("testthat", quietly = TRUE))
+  live <- list(ver = "v9", status = "released", grid_id = "global05", id_field = "mdl_key",
+              capabilities = list(cell = TRUE), tables = list(cell = "x.parquet"),
+              metrics = data.frame(metric_key = c("score_x", "extrisk_bird"),
+                                   label = c(NA_character_, "bird: ext. risk"),
+                                   category = c("composite", "raw"), stringsAsFactors = FALSE))
+
+  testthat::test_that("ALLOWED: adding app{} and backfilling only the blank label", {
+    staged <- live
+    staged$app <- list(capabilities = list(cell = TRUE))
+    staged$metrics$label[1] <- "Overall score"
+    testthat::expect_true(app_bundle_assert_manifest_patch_diff(live, staged, "v9"))
+  })
+  testthat::test_that("ALLOWED: no change at all (nothing to backfill)", {
+    testthat::expect_true(app_bundle_assert_manifest_patch_diff(live, live, "v9"))
+  })
+  testthat::test_that("REFUSED: a curated (non-blank) label changes", {
+    staged <- live
+    staged$metrics$label[2] <- "Something else"
+    testthat::expect_error(
+      app_bundle_assert_manifest_patch_diff(live, staged, "v9"), "refusing to push")
+  })
+  testthat::test_that("REFUSED: a non-label metrics column changes", {
+    staged <- live
+    staged$metrics$category[1] <- "raw"
+    testthat::expect_error(
+      app_bundle_assert_manifest_patch_diff(live, staged, "v9"), "refusing to push")
+  })
+  testthat::test_that("REFUSED: a top-level field other than app/metrics changes", {
+    staged <- live
+    staged$id_field <- "mdl_seq"
+    testthat::expect_error(
+      app_bundle_assert_manifest_patch_diff(live, staged, "v9"), "refusing to push")
+  })
+  testthat::test_that("REFUSED: metrics gains/loses rows", {
+    staged <- live
+    staged$metrics <- staged$metrics[1, , drop = FALSE]
+    testthat::expect_error(
+      app_bundle_assert_manifest_patch_diff(live, staged, "v9"), "refusing to push")
   })
   invisible(TRUE)
 }
