@@ -215,7 +215,16 @@ happened). `PUBLISH_PLAN.md` should say so.
 
 ## D. Process and tooling debt
 
-### R3-D1 — Gallery baselines are two sets, and the linux one only comes from CI
+### R3-D1 — Gallery baselines are two sets, the linux one only comes from CI — and the desktop full-page shot is 1 px non-deterministic
+**Diagnosis (2026-09-25, CI run 36114961882):** with the linux baselines taken from the previous run's own
+actual PNGs, the desktop gallery screenshots still failed — `Expected an image 1280px by 10212px,
+received 1280px by 10211px` (and the reverse on the retry). Playwright's `toHaveScreenshot` refuses any
+size mismatch before it compares pixels, so a 1 px full-page height jitter (a section's subpixel
+rounding or font metric under CI's fonts) fails the job every time regardless of `maxDiffPixelRatio`.
+Fix in `e2e/gallery.spec.ts`: screenshot each gallery **section** element (stable heights) instead of
+the full page, or clip the full-page shot to a fixed height and mask the jittering section; then
+regenerate both baseline sets once. The phone sizes did not show the jitter.
+
 Every change to a gallery-rendered component (Flower, Segmented, Pill, Panel, Switch…) needs
 `npm run e2e:gallery -- --update-snapshots` for the darwin set **and** the linux set from the
 next CI run's `gallery-test-results` artifact (`gh run download <run> -n gallery-test-results`,
