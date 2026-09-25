@@ -604,3 +604,56 @@ and why one didn't.
     reliably "graph too large": this hang produced no figures on a tiny graph. Still bound
     what a diagram enumerates rather than letting it walk every dataset/taxon/table — it is
     slow and unreadable even without Chrome in the path.
+
+### The app-bundle publish and the 2026-09-24/25 round — what actually held
+
+- **The laptop is the publish machine for `build_app_bundle.qmd`.** v1–v7b resolve their asset
+  table from the anonymous S3 `tables/` cache (tier 3), v8/v9 from the local `sdm.duckdb`; the server
+  works too (the read-only `serve.duckdb` tier, after R5 learned `temporary = TRUE`) but shares its
+  rstudio container with the live Shiny workers under a 9 GB ceiling. Publish **one version per
+  render** through the committed loop: `env APP_BUNDLE_S3=1 TMPDIR=$PWD/.tmp nohup
+  scripts/render_app_bundle.sh <vers> > _output/logs/… &` from this directory, then poll
+  `_output/logs/render_app_bundle_exit_codes.txt`; never wait on it in a chat turn. A version takes
+  ~25 min, almost all of it 945 single `aws s3 cp` calls (`boot.json` last, so a visitor mid-upload
+  keeps the old contract). **Commit `data/manifests/build_app_bundle.json` after every run** before
+  merging a notebook branch, or the merge aborts on the modified tracked output.
+- **Verify a publish by reading the bucket, not the log:** `boot.json` (`--compressed`; the objects
+  are gzip-encoded) has `zones.programarea[].name` for every zone, a taxon shard's `inputs[].assets`
+  carry COG URLs that HEAD 200, `manifest.json` carries `app{capabilities}` and `Cache-Control:
+  no-cache`. The first real publish showed `cell_model: false` for v7 although its tiles were on S3 —
+  the probe knew only tiles uploaded in the same run (round 4 now HEADs the local source's first
+  key regardless). A dry run cannot exercise the flagged push chunks; two Opus reviews of the
+  notebook diff found the blockers (a `CREATE` into a read-only DB, `boot.json` not last, an empty
+  asset fallback that published, a manifest guard refusing the very label-less releases it existed
+  for, a stale-cache compare).
+- **`release_marine-atlas.qmd`'s deploy chunks run from the LAPTOP.** They `ssh msens …`
+  themselves; `scripts/srv_render.sh release_marine-atlas.qmd DEPLOY_CADDY=1` halts inside the
+  container with `system2(): Function not implemented`. In a sandboxed shell Quarto needs
+  `TMPDIR=$PWD/.tmp`. The auto-mode classifier refuses production deploys/publishes from the
+  orchestrator; the user runs them with the `!` prefix or grants a narrow permission rule
+  (`Bash(env APP_BUNDLE_S3=1:*)` was granted for the bundle publish).
+- **`DEPLOY_CADDY` must start every sidecar the routes serve from.** `up -d --no-deps caddy` never
+  started `atlas-preview` (the clone of the atlas `gh-pages` build behind `/{ver}/atlas/`), so the
+  route would have served an empty directory; the chunk now names it, and `/share/atlas_preview`
+  must exist owned by 1000:1000 first. `caddy/test/run.sh` once asserted a marker (`ms-app-sha`) no
+  atlas build emits — a check that could never pass is the mirror image of one that cannot fail.
+- **The server container converges msens by its own script:** `docker exec rstudio
+  /etc/cont-init.d/03_msens_from_share` after `git pull` in `/share/github/MarineSensitivity/msens`
+  installs the checkout's version (it is what runs at every container start). A missing R package
+  (`jsonvalidate`) is fixed in `server/rstudio/Dockerfile` + `rstudio/build.sh` + recreate, never
+  installed by hand. The rstudio image DOES carry the AWS CLI v2 (older notes said otherwise).
+- **msens1 wedged for an hour on 2026-09-24** (CPU flat at 32 %, sshd/apps/STAC/API unreachable,
+  EC2 status checks green, console = login prompt): a Shiny worker (uid 996 `shiny`) reached 7.8 GB
+  RSS in the unlimited rstudio container on a no-swap host, and the kernel reclaimed page cache
+  instead of killing it until an `aws ec2 reboot-instances` ended it. Post-mortem recipe:
+  `sudo journalctl -b -1 -k | grep -iE "out of memory|oom-kill"` (the memcg names the container),
+  `docker logs --since … rstudio` for the app in the window, CloudWatch CPU/NetworkIn to date the
+  onset. Fix baked in (server `978111c`): `rstudio: mem_limit: 9g / memswap_limit: 9g` and
+  `server/host/swap.sh` (4 GiB swapfile, swappiness 10). The `msens-sync@boem` key logging in every
+  5 min from an Azure address is legitimate.
+- **Docs prose needs a fact-check against the source, not just a review.** An Opus fact-check of the
+  Atlas chapter found two false privacy statements (the feedback script always files the public
+  issue; the email never enters it), a claim about a GeoPackage check that cannot fire, "Reproduce
+  in R" describing an unreleased decoder that had been on msens main for days, and version-gated
+  passages describing a build not yet live. Give the checker the truth sources and the live state;
+  hold the merge until the described build is on Pages.

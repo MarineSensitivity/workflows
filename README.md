@@ -64,3 +64,14 @@ The **global 0.05° raster cell** in `[-180,180]` (Bio-Oracle v3 / AquaX topolog
 
 Each writes one Parquet per model to `dist/dataset=<ds_key>/`, resumable, keyed by
 `mdl_key`.
+
+## The atlas browser's `app/` bundle
+
+`build_app_bundle.qmd` (msens `app_bundle_build()`, 0.44.1+) writes each release's
+`s3://…/marine-atlas/{ver}/app/` — `boot.json` (zones with names, metric labels, capabilities), the
+taxa shards with every input's registered raster, cell tiles and Parquet tables — and patches the
+release's `manifest.json`. `scripts/render_app_bundle.sh <vers>` is the committed one-version-per-
+render loop; `APP_BUNDLE_S3=1` gates the push and every gate runs before the first write. Verify a
+publish by reading the bucket (names in `boot.json`, COG URLs in a taxon shard, `app{}` +
+`Cache-Control: no-cache` on the manifest). See `CLAUDE.md` "The app-bundle publish" for the
+machine, the permission rule, and the pitfalls found on the first real publish (2026-09-25).
