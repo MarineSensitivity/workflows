@@ -181,7 +181,16 @@ stopifnot(
   # install would fail deep inside the Build loop with an opaque "could not
   # find function" instead of a clear guard message here.
   "installed msens has no exported manifest_labels_backfill() -- reinstall from atlas-contract-fixes @ cbf3d67 or later" =
-    "manifest_labels_backfill" %in% getNamespaceExports("msens"))
+    "manifest_labels_backfill" %in% getNamespaceExports("msens"),
+  # R3-C3 (round 3 plan, 2026-09-25): app_zone_bbox() (msens 0.44.2) publishes each
+  # zone's WGS84 extent in boot.json so the app's scores search can zoom without a
+  # loaded vector tile (R3-B14). Same discipline as the checks above: check the
+  # export directly rather than trust the version string, since a fix can land
+  # without a Version: bump.
+  "installed msens has no exported app_zone_bbox() -- reinstall from r3-c-app-zones-bbox @ msens 0.44.2 or later" =
+    "app_zone_bbox" %in% getNamespaceExports("msens"),
+  "installed msens::app_bundle_build() has no `zone_bbox` argument -- reinstall from r3-c-app-zones-bbox @ msens 0.44.2 or later" =
+    "zone_bbox" %in% names(formals(msens::app_bundle_build)))
 message(glue("msens {packageVersion('msens')} @ {find.package('msens')}"))
 
 # --- run scope ------------------------------------------------------------
@@ -642,6 +651,17 @@ build_one <- function(ver) {
       is.data.frame(zone_names) && nrow(zone_names) > 0 &&
       all(c("fld", "key", "name") %in% names(zone_names)))
 
+  # R3-C3 (round 3 plan, 2026-09-25): app_zone_bbox() reads the SAME GeoPackage,
+  # resolved the identical way, so the search-zoom bbox and the human name can
+  # never come from two different sources of truth. Not a hard stop the way
+  # app_zone_names() is above -- bbox is OPTIONAL by schema (unlike name, which
+  # every zone the app draws needs), so a geometry that resolves no bbox at all
+  # (e.g. every feature is degenerate/empty) is logged and the run continues;
+  # the write-side gate below (n_zone_bbox_landed) is what a real regression trips.
+  zone_bbox <- msens::app_zone_bbox(gpkg_for_unit, d17_type)
+  if (!is.data.frame(zone_bbox) || !nrow(zone_bbox))
+    log_warn("{ver}: app_zone_bbox() resolved no bboxes for this release's drawable unit")
+
   # round 4: msens 0.43.0 @ 71aa231 moved app/taxonomy.parquet INTO
   # app_bundle_build() itself (as app_taxonomy(), fed by taxonomy_csv) and
   # added app_model() for the v8+ mdl_id -> mdl_key mapping -- both now get
@@ -678,7 +698,7 @@ build_one <- function(ver) {
     tryCatch(
       msens::app_bundle_build(con, ver, dir_out, manifest = pub_manifest, base = base,
                               geom_keys = geom_keys, zone_sets = zone_sets, strict = FALSE,
-                              zone_names = zone_names,
+                              zone_names = zone_names, zone_bbox = zone_bbox,
                               taxonomy_csv = here("data/taxonomic_hierarchy_worms_2025-10-30.csv")),
       error = function(e) {
         log_warn("{ver}: app_bundle_build() FAILED (upstream of stage isolation): {substr(conditionMessage(e), 1, 300)}")
@@ -711,6 +731,12 @@ build_one <- function(ver) {
   n_zone_names_expected <- length(zboot)
   n_zone_names_landed   <- if (is.null(zboot)) 0L else
     sum(vapply(zboot, function(z) !is.null(z$name) && nzchar(z$name), logical(1)))
+  # R3-C3: the same "count what LANDED in the written boot.json" discipline as
+  # n_zone_names_landed above, applied to bbox -- a diagnostic count only (see the
+  # non-fatal app_zone_bbox() warning above), not yet a hard stopifnot gate below,
+  # since this is the first release-side call publishing it against real geometry.
+  n_zone_bbox_landed <- if (is.null(zboot)) 0L else
+    sum(vapply(zboot, function(z) !is.null(z$bbox) && length(z$bbox) == 4, logical(1)))
 
   list(ver = ver, ok = !is.null(out), dir_out = dir_out, con_db = opened$db,
        pub_manifest = pub_manifest, patch_ok = !is.null(patch), patch_path = patch_path,
@@ -719,6 +745,8 @@ build_one <- function(ver) {
        geom_keys = geom_keys, geom_check = geom_check, out = out,
        zone_names = zone_names, n_zone_names = nrow(zone_names),
        n_zone_names_landed = n_zone_names_landed, n_zone_names_expected = n_zone_names_expected,
+       zone_bbox = zone_bbox, n_zone_bbox = if (is.data.frame(zone_bbox)) nrow(zone_bbox) else 0L,
+       n_zone_bbox_landed = n_zone_bbox_landed, n_zone_bbox_expected = n_zone_names_expected,
        warnings = caught_warnings,
        has_taxonomy = !is.null(out) && "taxonomy" %in% names(out$tables),
        has_model    = !is.null(out) && "model"    %in% names(out$tables),
@@ -736,11 +764,24 @@ build_tbl <- bind_rows(lapply(builds, function(b) data.frame(
   has_taxonomy = b$has_taxonomy, has_model = b$has_model, patch_ok = b$patch_ok,
   n_zone_names = b$n_zone_names,
   n_zone_names_landed = b$n_zone_names_landed, n_zone_names_expected = b$n_zone_names_expected,
+  n_zone_bbox = b$n_zone_bbox,
+  n_zone_bbox_landed = b$n_zone_bbox_landed, n_zone_bbox_expected = b$n_zone_bbox_expected,
   n_warnings = length(b$warnings %||% character()),
   label_patch_ok = b$label_patch_ok, label_patch_n_blank = b$label_patch_n_blank,
   wall_s = round(b$wall_s, 1))))
 `%||%` <- function(a, b) if (is.null(a)) b else a
 knitr::kable(build_tbl, caption = "Per-version build result (this run)")
+# R3-C3 (round 3 plan, 2026-09-25): counts only, not yet a hard gate -- unlike
+# `name`, `bbox` is OPTIONAL by schema (a zone whose geometry resolves no finite
+# vertex publishes bbox = NULL, and that is a correct answer, not a defect the
+# way an unnamed zone is). This is the first release-side run to populate it
+# against real geometry; once a run shows n_zone_bbox_landed == n_zone_bbox_expected
+# for every release the way the zone-name gate below does, promote this to the
+# same stopifnot() the zone-name count already gets.
+for (i in seq_len(nrow(build_tbl)))
+  if (build_tbl$n_zone_bbox_landed[i] < build_tbl$n_zone_bbox_expected[i])
+    log_warn("{build_tbl$ver[i]}: only {build_tbl$n_zone_bbox_landed[i]} of ",
+             "{build_tbl$n_zone_bbox_expected[i]} zones landed a bbox in boot.json")
 stopifnot(
   "app{} manifest patch (published manifest + app_manifest_block()) failed to write for at least one version" =
     all(build_tbl$patch_ok),

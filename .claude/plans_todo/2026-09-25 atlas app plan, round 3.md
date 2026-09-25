@@ -33,6 +33,9 @@ the **densest** cells (needs a cheap density probe — `/cog/point` samples or t
 statistics); (c) keep the whole-range fit and add a "Zoom to US waters" affordance. Recommendation:
 (a) as the default with (c) as the escape hatch.
 
+**Decisions 2026-09-25:** (a) + (c) — frame the in-US portion by default, keep the whole-range fit
+reachable via a "Zoom to US waters" affordance.
+
 ### R3-A2 — The phone's default first view
 ![phone-02](atlas-refs/round3-shots/phone-02-map.png)
 
@@ -40,6 +43,8 @@ statistics); (c) keep the whole-range fit and add a "Zoom to US waters" affordan
 study-area frame put Canada in the middle of a 390 px screen). Reviewers keep noting it is one
 region of four. *Options:* keep the Gulf; open on the user's nearest region if geolocation is
 granted; a two-row "Alaska | Pacific | Gulf | Atlantic" chooser in the welcome modal on phones.
+
+**Decisions 2026-09-25:** lower-48 waters + a sliver of Alaska.
 
 ### R3-A3 — Component palette pairs
 ![desktop-14](atlas-refs/round3-shots/desktop-14-report-scrolled.png)
@@ -50,6 +55,8 @@ report legend and flower petals inherit it. The palette is a design decision, so
 alone. *Options:* re-hue Fish (teal) and Turtle (olive → moss), keeping the contrast gate
 (`scripts/contrast.mjs`) green; or order petals so the near pairs never sit adjacent.
 
+**Decisions 2026-09-25:** re-hue Fish teal, Turtle moss.
+
 ### R3-A4 — "GOA Program Area A (GAA)" beside "Gulf of Alaska (GOA)"
 ![desktop-19](atlas-refs/round3-shots/desktop-19-programarea-popup.png)
 
@@ -57,6 +64,8 @@ alone. *Options:* re-hue Fish (teal) and Turtle (olive → moss), keeping the co
 the Gulf of Alaska key. The app shows the geometry's own names verbatim (V1 fallback table,
 generated from `ply_programareas_2026.gpkg`). *Options:* rename in the geometry/zone-set source
 ("Gulf of America Program Area A") so every product agrees; or keep the official BOEM wording.
+
+**Decisions 2026-09-25:** keep the official BOEM wording (no change).
 
 ### R3-A5 — Restricted releases' `app/` objects are anonymously readable
 *What:* by the notebook's original design (`build_app_bundle.qmd` lines 89–93, since its first
@@ -67,10 +76,14 @@ preview session, but the bytes are fetchable by anyone who knows the key. *Optio
 bundle carries scores at zone/cell level, not the source tables); or restrict `app/` and serve it
 through the review host's signed session (`session.data` prefix — the app already supports it).
 
+**Decisions 2026-09-25:** accept as is.
+
 ### R3-A6 — The health banner's placement
 *What:* V7 moved it below the top bar inside the stage (never over interactive chrome). It covers
 the map's top strip while shown. Reviewers accepted it; flagging only because it was a UX cost you
 raised. No action unless you want it as a toast at the bottom instead.
+
+**Decisions 2026-09-25:** no action.
 
 ---
 

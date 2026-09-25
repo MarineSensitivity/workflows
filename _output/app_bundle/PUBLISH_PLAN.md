@@ -181,3 +181,23 @@ this round:             v3 0 (solo verify)   v4 0  v4b 0  v5 0  v6 0  v7 0  v7b 
 All eleven registered releases build clean (exit 0) on `atlas-contract` @ `b95b34e1`. Nothing has
 been pushed to S3 (`APP_BUNDLE_S3` unset throughout this plan's generation) — the publish turn
 above is what would run next, on Ben's/the orchestrator's go-ahead.
+
+## Publish hygiene: commit before merging (R3-C5)
+
+Every `render_app_bundle.sh` run — publish or dry run — leaves two things modified in the working
+tree: `data/manifests/build_app_bundle.json` (the content-hash checkpoint every notebook render
+writes, per `../CLAUDE.md`'s "NEWS.md is not optional"-adjacent reproducibility rule) and each built
+version's `_output/build_app_bundle_{ver}.html`. **Commit both, on the branch the render actually
+ran on, before merging that branch anywhere** — not after, not as part of an unrelated later commit.
+Skipping this step is what happened on 2026-09-25: a publish ran, the round's log line claimed a
+merge that had not actually happened, and the modified checkpoint + HTML sat uncommitted in the
+working tree until the next `git merge` aborted on them (a merge cannot land a branch while the
+target tree has uncommitted changes to files the merge also touches). The fix is procedural, not a
+gate a notebook chunk can enforce: after any `render_app_bundle.sh` invocation, before touching
+`git merge`, run
+```sh
+git add data/manifests/build_app_bundle.json _output/build_app_bundle_*.html
+git commit -m "build_app_bundle: <what this run published/verified>"
+```
+(explicit paths — never `git add -A` in this repo, per this notebook's own git-hygiene practice)
+and only then merge the notebook branch.
