@@ -451,6 +451,7 @@ app_bundle_head_check_retry_selftest()
 app_bundle_zone_taxon_check_selftest()
 app_bundle_d17_check_selftest()
 app_bundle_assert_manifest_patch_diff_selftest()
+app_bundle_resolve_cell_model_tile_selftest()
 ```
 
 ## Build
@@ -1977,48 +1978,46 @@ push_one <- function(b) {
 push_out <- purrr::map(builds, push_one)
 ```
 
-## Push the manifest patch (`APP_BUNDLE_S3=1` only, AFTER the bundle objects above)
+## Stage the manifest patch (always runs — a real dry run, same discipline as `validate-cell-model-plan`)
 
-Round 6 (2026-09-25 review, item 4), extended round 7 (2026-09-26 review, items 2, 3, 5). Every
+Round 6 (2026-09-25 review, item 4), extended round 7 (items 2, 3, 5) and round 8 (2026-09-25). Every
 earlier round built and validated `patch` (the live `{ver}/manifest.json` plus
-[app_manifest_block()]'s `app{}` block and the R4 label backfill) and wrote it to `patch_path` —
-but nothing ever pushed it, the `app{}` block was computed BEFORE anything from this run existed on
-S3, and `msens::app_capabilities()` probed the never-real `tile=0` placeholder. This chunk is the
-real publish step, doing all three things the build-time `patch` structurally could not:
+[app_manifest_block()]'s `app{}` block and the R4 label backfill) at BUILD time — before anything
+from this run existed on S3, with `msens::app_capabilities()` probing the never-real `tile=0`
+placeholder. This chunk RE-stages that patch, correctly, and **always runs, `APP_BUNDLE_S3` or
+not** — round 8's own bug is why: the first real publish of v7 pushed `cell_model: FALSE` even
+though `v7/serve/cell_model/tile=19/data_0.parquet` was genuinely on S3, and the only way to catch
+that kind of mistake before a push is to make the SAME staging step run on every dry run too, not
+only inside the `do_s3`-gated push.
 
-1. **Recomputes `app{}` AFTER the bundle-objects push**, from the tiles this run actually just
-   wrote and (if pushed) synced — `msens::app_capabilities()`'s new `cell_tile`/`cell_model_tile`
-   arguments (msens 0.44.1) probe the REAL first tile instead of `tile=0`, which no release ever
-   publishes.
+1. **Recomputes `app{}`** from the REAL tiles on disk/S3 right now — `msens::app_capabilities()`'s
+   `cell_tile`/`cell_model_tile` arguments (msens 0.44.1) probe the real first tile instead of
+   `tile=0`. `cell_model_tile` is resolved by [app_bundle_resolve_cell_model_tile()], independent of
+   whether THIS run synced `serve/cell_model/` at all (`APP_BUNDLE_CELLMODEL_VERS`) — it HEADs the
+   local plan's own first key anonymously, so a version whose cell_model was uploaded in an EARLIER
+   run still correctly resolves `cell_model: true` (the round 8 bug: the OLD logic only ever looked
+   when `ver %in% cm_vers`, true for the one sync run and false for every run since).
 2. **Re-fetches the live manifest FRESH** (never the build-time cache) and asserts it is
    `identical()` to `b$pub_manifest` — if it differs, someone republished `{ver}/manifest.json`
-   between this run's build and this push, and pushing a patch computed against a now-stale copy
-   would silently discard whatever changed it. Stops rather than guess.
-3. Re-stages the patch at the SAME `patch_path` with the recomputed `app{}` block, re-runs
+   between this run's build and this stage, and staging a patch against a now-stale copy would
+   silently discard whatever changed it. Stops rather than guess.
+3. Re-stages the patch at the SAME `patch_path` with the recomputed `app{}` block and re-runs
    [app_bundle_assert_manifest_patch_diff()] against the FRESH live manifest (never the build-time
-   one) — any change other than `app{}` plus blank-to-non-blank labels still stops the render — then
-   pushes `{ver}/manifest.json` through [app_bundle_assert_prefix()]'s `allow_manifest = TRUE`
-   exception (an exact key, never a prefix), with `--cache-control no-cache`: `manifest.json` is a
-   MUTABLE pointer (the same convention `backfill_versions.qmd`/`build_version_manifest.qmd` already
-   use), never a content-addressed object, so a CDN/browser must always revalidate it.
+   one) — any change other than `app{}` plus blank-to-non-blank labels still stops the render.
 
-`{ver}/manifest.json` is published as **plain JSON, not gzip** — matching the live manifest's own
-encoding (verified: `Content-Type: application/json`, no `Content-Encoding` header on every
-published manifest.json checked while building this notebook), unlike every object under
-`{ver}/app/`, which this notebook always gzips. Pushing it gzipped would silently break any
-existing consumer that fetches `manifest.json` without requesting/decoding gzip — including this
-notebook's own [app_bundle_fetch_published_manifest()], a plain `download.file()` with no
-decompression step.
+Nothing here touches S3 for a write — HEAD probes and a `GET` of the live `manifest.json` are the
+only network calls, exactly the same anonymous-read discipline `validate-cell-model-plan`'s
+already-on-S3 probe and the COG spot-check use.
 
 ```{r}
-#| label: push-manifest
-#| eval: !expr do_s3
+#| label: stage-manifest-patch
 
-push_manifest_one <- function(b) {
-  if (!isTRUE(b$ok)) return(invisible(NULL))
+stage_manifest_patch_one <- function(b) {
+  none <- list(ver = b$ver, ok = FALSE, cell_tile = NA_character_, cell_model_tile = NA_character_)
+  if (!isTRUE(b$ok)) return(none)
   if (!isTRUE(b$patch_ok) || is.null(b$patch_path) || !file.exists(b$patch_path)) {
-    log_warn("{b$ver}: no staged manifest patch to push (patch_ok={b$patch_ok}) -- skipping manifest push")
-    return(invisible(NULL))
+    log_warn("{b$ver}: no staged manifest patch to re-stage (patch_ok={b$patch_ok})")
+    return(none)
   }
   ver <- b$ver
 
@@ -2028,25 +2027,17 @@ push_manifest_one <- function(b) {
   # notebook that reads tiles this way.
   cell_tiles <- Sys.glob(file.path(b$dir_out, "cell", "tile=*", "data_0.parquet"))
   cell_tile  <- if (length(cell_tiles)) sub(".*tile=([0-9]+).*", "\\1", cell_tiles[1]) else NULL
-  # only a version this run actually planned AND synced `serve/cell_model/`
-  # for gets a cell_model_tile hint -- anything else must keep probing the
-  # (correctly, honestly) never-real tile=0 default
-  cell_model_tile <- NULL
-  if (ver %in% cm_vers) {
-    cm_row <- cm_plan_tbl[cm_plan_tbl$ver == ver, , drop = FALSE]
-    if (nrow(cm_row) && isTRUE(cm_row$clear_to_upload[1])) {
-      plan <- app_bundle_cell_model_plan(ver, dir_derived)
-      if (length(plan$keys)) cell_model_tile <- sub(".*tile=([0-9]+).*", "\\1", plan$keys[1])
-    }
-  }
+  # round 8: independent of cm_vers entirely -- see [app_bundle_resolve_cell_model_tile()]
+  cell_model_tile <- app_bundle_resolve_cell_model_tile(ver, base, dir_derived)
   caps <- msens::app_capabilities(ver, base, cell_tile = cell_tile, cell_model_tile = cell_model_tile)
   app_block <- tryCatch(msens::app_manifest_block(ver, base, capabilities = caps), error = function(e) {
-    log_warn("{ver}: post-push app_manifest_block() FAILED: {substr(conditionMessage(e), 1, 300)}")
+    log_warn("{ver}: app_manifest_block() FAILED: {substr(conditionMessage(e), 1, 300)}")
     NULL
   })
   if (is.null(app_block)) {
-    log_warn("{ver}: no recomputed app{{}} block -- skipping manifest push")
-    return(invisible(NULL))
+    log_warn("{ver}: no recomputed app{{}} block -- patch left at its build-time content")
+    return(list(ver = ver, ok = FALSE, cell_tile = cell_tile %||% NA_character_,
+               cell_model_tile = cell_model_tile %||% NA_character_))
   }
 
   # item 2: a FRESH, never-cached read of the live manifest -- proves nothing
@@ -2055,13 +2046,12 @@ push_manifest_one <- function(b) {
   live_fresh <- app_bundle_fetch_manifest_nocache(ver, base)
   if (is.null(live_fresh))
     stop(sprintf(
-      "%s: could not fetch a FRESH copy of the live manifest.json before pushing -- refusing to push blind",
+      "%s: could not fetch a FRESH copy of the live manifest.json -- refusing to stage blind",
       ver), call. = FALSE)
   if (!identical(live_fresh, b$pub_manifest))
     stop(sprintf(paste(
       "%s: the live manifest.json changed since this run's build-time read -- someone",
-      "republished it mid-run; refusing to push a patch computed against a stale copy"), ver),
-      call. = FALSE)
+      "republished it mid-run; refusing to stage a patch against a stale copy"), ver), call. = FALSE)
 
   # re-stage the patch at the SAME path, now with the recomputed app{} block,
   # and re-run the label backfill against the (unchanged, just-proven-fresh)
@@ -2075,20 +2065,57 @@ push_manifest_one <- function(b) {
   staged <- jsonlite::fromJSON(b$patch_path, simplifyVector = TRUE)
   app_bundle_assert_manifest_patch_diff(live_fresh, staged, ver)   # stops on anything unexpected
 
-  key <- sprintf("%s/manifest.json", ver)
-  app_bundle_assert_prefix(key, ver, allow_manifest = TRUE)            # whitelist: ONLY this exact key
+  list(ver = ver, ok = TRUE, cell_tile = cell_tile %||% NA_character_,
+       cell_model_tile = cell_model_tile %||% NA_character_)
+}
+stage_tbl <- bind_rows(lapply(builds, stage_manifest_patch_one))
+knitr::kable(stage_tbl, caption = paste(
+  "Manifest patch re-staged (always, dry run or not): cell_tile/cell_model_tile actually resolved,",
+  "and whether the re-stage + diff-guard succeeded"))
+stopifnot(
+  # every row here already has b$ok == TRUE -- the earlier "Build" chunk's own
+  # stopifnot(all(build_tbl$ok)) would already have stopped the render otherwise
+  "the manifest patch failed to re-stage for at least one version" =
+    nrow(stage_tbl) == 0 || all(stage_tbl$ok))
+```
 
-  # item 3: manifest.json is a MUTABLE pointer, never content-addressed --
-  # same convention backfill_versions.qmd/build_version_manifest.qmd already
-  # use for it -- so a CDN/browser must always revalidate, never serve a
-  # cached copy past this push
+## Push the manifest patch (`APP_BUNDLE_S3=1` only, AFTER the bundle objects above)
+
+The push itself is now trivial: [stage-manifest-patch] above already produced a validated,
+up-to-date `patch_path` on disk for every version, `do_s3` or not — this chunk's only job is the
+actual `aws s3 cp`.
+
+`{ver}/manifest.json` is published as **plain JSON, not gzip** — matching the live manifest's own
+encoding (verified: `Content-Type: application/json`, no `Content-Encoding` header on every
+published manifest.json checked while building this notebook), unlike every object under
+`{ver}/app/`, which this notebook always gzips. Pushing it gzipped would silently break any
+existing consumer that fetches `manifest.json` without requesting/decoding gzip — including this
+notebook's own [app_bundle_fetch_published_manifest()], a plain `download.file()` with no
+decompression step. `--cache-control no-cache`: `manifest.json` is a MUTABLE pointer (the same
+convention `backfill_versions.qmd`/`build_version_manifest.qmd` already use), never a
+content-addressed object, so a CDN/browser must always revalidate it.
+
+```{r}
+#| label: push-manifest
+#| eval: !expr do_s3
+
+push_manifest_one <- function(b) {
+  st <- stage_tbl[stage_tbl$ver == b$ver, , drop = FALSE]
+  if (!isTRUE(b$ok) || !nrow(st) || !isTRUE(st$ok[1])) {
+    log_warn("{b$ver}: manifest patch did not stage successfully -- skipping manifest push")
+    return(invisible(NULL))
+  }
+  ver <- b$ver
+  key <- sprintf("%s/manifest.json", ver)
+  app_bundle_assert_prefix(key, ver, allow_manifest = TRUE)     # whitelist: ONLY this exact key
+
   args <- c("s3", "cp", shQuote(b$patch_path), shQuote(glue("{s3_root}/{key}")),
-            "--content-type", shQuote("application/json"),        # plain JSON, matching the live object
+            "--content-type", shQuote("application/json"),      # plain JSON, matching the live object
             "--cache-control", shQuote("no-cache"))
   out <- system2("aws", args, stdout = TRUE, stderr = TRUE)
   if (!is.null(attr(out, "status")) && attr(out, "status") != 0)
     stop(glue("aws s3 cp failed for {key}: {paste(out, collapse = '\n')}"))
-  log_info("{ver}: pushed {key} (cell_tile={cell_tile %||% 'NA'}, cell_model_tile={cell_model_tile %||% 'NA'})")
+  log_info("{ver}: pushed {key} (cell_tile={st$cell_tile[1]}, cell_model_tile={st$cell_model_tile[1]})")
   invisible(key)
 }
 push_manifest_out <- purrr::map(builds, push_manifest_one)

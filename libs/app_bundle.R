@@ -1225,6 +1225,80 @@ app_bundle_cell_model_already_on_s3 <- function(ver, base, key) {
   isTRUE(length(st) == 1 && !is.na(st) && st == 200L)
 }
 
+#' The REAL first `serve/cell_model/` tile number for `app_capabilities()`, whether
+#' or not THIS run uploaded it
+#'
+#' Round 8 (2026-09-25 review): the first real publish of v7 pushed a manifest
+#' patch with `capabilities.cell_model = FALSE` even though
+#' `v7/serve/cell_model/tile=19/data_0.parquet` was genuinely on S3 (HEAD 200) —
+#' because the manifest-push chunk only ever computed a `cell_model_tile` hint
+#' when `ver %in% cm_vers` (i.e. THIS run's own `APP_BUNDLE_CELLMODEL_VERS`
+#' actually synced it). A run that leaves an ALREADY-uploaded cell_model alone
+#' (the normal case after the one-time sync) had no way to know it was there and
+#' silently kept publishing a false contract every time after.
+#'
+#' This is independent of `cm_vers`/whether THIS run plans to sync anything: it
+#' always checks the LOCAL `cell_model/` source directory (if the release has
+#' one at all — v8/v9 never do) for its own first key, then HEADs that EXACT
+#' key anonymously. A 200 means the tile is really there (freshly uploaded this
+#' run, or from any earlier one — both look identical from here, which is the
+#' point); anything else (403/404/no answer) means it genuinely is not
+#' published yet, and this returns `NULL` rather than guess.
+#'
+#' @param ver version label
+#' @param base atlas base URL
+#' @param dir_derived the machine's derived-data root (same argument
+#'   [app_bundle_cell_model_plan()] takes)
+#' @param head_check the HEAD-check function to use, `(urls) -> data.frame(url,
+#'   status)` — defaults to the real, network-calling
+#'   [app_bundle_head_check()]; overridden in the selftest with a fake
+#'   responder so it never touches the network
+#' @return the tile number as a string (e.g. `"19"`), or `NULL` if there is no
+#'   local cell_model source for this release, or its first key does not
+#'   answer 200 anonymously
+app_bundle_resolve_cell_model_tile <- function(ver, base, dir_derived, head_check = app_bundle_head_check) {
+  plan <- app_bundle_cell_model_plan(ver, dir_derived)
+  if (!length(plan$keys)) return(NULL)
+  url <- as.character(glue::glue("{base}/{plan$keys[1]}"))
+  st  <- head_check(url)$status
+  if (!isTRUE(length(st) == 1 && !is.na(st) && st == 200L)) return(NULL)
+  sub(".*tile=([0-9]+).*", "\\1", plan$keys[1])
+}
+
+#' Self-test for [app_bundle_resolve_cell_model_tile()] — a FAKE HEAD responder,
+#' never the network
+#'
+#' @return `TRUE`, invisibly; stops on the first failed expectation
+app_bundle_resolve_cell_model_tile_selftest <- function() {
+  stopifnot(requireNamespace("testthat", quietly = TRUE))
+  # a scratch local cell_model source, so app_bundle_cell_model_plan() has a
+  # real key to resolve from without touching the real derived-data tree
+  d <- tempfile("cm_")
+  dir.create(file.path(d, "v7", "cell_model", "tile=19"), recursive = TRUE)
+  writeLines("x", file.path(d, "v7", "cell_model", "tile=19", "data_0.parquet"))
+  on.exit(unlink(d, recursive = TRUE), add = TRUE)
+
+  fake_200 <- function(urls) data.frame(url = urls, status = 200L, stringsAsFactors = FALSE)
+  fake_403 <- function(urls) data.frame(url = urls, status = 403L, stringsAsFactors = FALSE)
+
+  testthat::test_that("ALREADY on S3 (no upload THIS run) still resolves the real tile -- the round 8 regression", {
+    tile <- app_bundle_resolve_cell_model_tile("v7", "https://example.invalid", d, head_check = fake_200)
+    testthat::expect_identical(tile, "19")
+  })
+  testthat::test_that("not yet on S3 stays NULL -- never guesses a tile that doesn't answer", {
+    tile <- app_bundle_resolve_cell_model_tile("v7", "https://example.invalid", d, head_check = fake_403)
+    testthat::expect_null(tile)
+  })
+  testthat::test_that("no local cell_model source (v8/v9's real shape) stays NULL, no HEAD even attempted", {
+    called <- FALSE
+    spy <- function(urls) { called <<- TRUE; fake_200(urls) }
+    tile <- app_bundle_resolve_cell_model_tile("v9", "https://example.invalid", d, head_check = spy)
+    testthat::expect_null(tile)
+    testthat::expect_false(called)
+  })
+  invisible(TRUE)
+}
+
 #' Self-test for the `serve/cell_model/` key-shape guard (offline, no network)
 #'
 #' @return `TRUE`, invisibly; stops on the first failed expectation
