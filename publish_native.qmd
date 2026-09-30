@@ -49,6 +49,36 @@ a skipped class is carried forward rather than deleted).
 > spent its time by then. Repaint merged COGs with `REDO_MERGED_COG=1` and leave am unskipped: am
 > is resumable by file existence, so an existing set costs one `file_exists` sweep.
 
+
+## Where the ORIGINAL surfaces live: the content-addressed native store (R4-F design)
+
+Original (`representation = "native"`) objects live OUTSIDE any versioned path, exactly as the
+model/merged COGs already do at `marine-atlas/cog/{grid_id}/{content_hash}.tif`:
+
+```
+S3 (mirror of everything)  marine-atlas/native/{ds_key}/{hash}.tif        native COGs (am, ax)
+                           marine-atlas/native/{ds_key}/{hash}.pmtiles    PMTiles (mirror)
+file host (PMTiles served) https://file.marinesensitivity.org/pmtiles/native/{ds_key}/{hash}.pmtiles
+                           (= /share/data/derived/pmtiles/native/{ds_key}/{hash}.pmtiles on `msens`)
+```
+
+- **Key helpers:** `msens::native_url(ds_key, hash, type)` / `native_key()` (twins of `content_url()`),
+  `msens::native_store_index()` (twin of `cog_store_index()`: one listing -> "already published?").
+- **The hash** identifies the object, never the release. Prefer the SOURCE content, the way
+  `content_hashes()` fingerprints `model_cell` (16 hex; folded with an encoding tag through
+  `content_hash_encoded()` so a tiling/overview change gets a new key):
+  `am` = hash of the `(cell_id, val)` rows of the 0.5 deg source (`spp_cells`), encoding
+  `flt4-0.5deg-cog`; `bl`, `rng_fws`, `ca_nmfs`, `ch_fws`, `ch_nmfs`, `rng_turtle_swot_dps` = hash of the
+  source geometry (WKB) + attributes per model, encoding `mvt-z0-10-simp10`. FALLBACK, the MD5 of the
+  object's bytes (32 hex, cannot collide with a 16-hex key): `rng_iucn` (its ~7 GB source is read per
+  species from the indexed gpkg, so the built file is the only cheap thing to hash) and every already
+  existing v8/v9 object (source not at hand; see `backfill_versions.qmd`'s mapping table).
+- **A release's `native_asset` row** stores the absolute store URL in `asset_url` (no `?v=`: the key
+  IS the version). `representation = "model"` rows are unchanged.
+- **Re-publish:** same content -> same hash -> same key -> `native_store_index()` already lists it ->
+  nothing is uploaded; only the new release's `native_asset` rows are written. Changed content -> a new
+  key; old releases keep pointing at the old, still-present object.
+
 ## Design
 
 ```{mermaid}
@@ -294,6 +324,12 @@ if (!file_exists(iucn_gpkg) || redo_src) {
 pmt_only <- Sys.getenv("NATIVE_PMT_DS")                    # optional comma-list to restrict (partial reruns/tests)
 pmt_ds   <- if (nzchar(pmt_only)) intersect(names(pmt_specs), strsplit(pmt_only, ",")[[1]]) else names(pmt_specs)
 pmt_rows <- list()
+# source-content hash of one model's polygons (store design, above): WKB + attributes, xxhash64 = 16 hex,
+# folded with the tiling encoding so a re-tile with other settings gets a new key
+pmt_src_hash <- function(part)
+  msens::content_hash_encoded(
+    digest::digest(list(sf::st_as_binary(sf::st_geometry(part)), sf::st_drop_geometry(part)), algo = "xxhash64"),
+    "mvt-z0-10-simp10")
 if (!skip_pmt) for (ds in pmt_ds) {
   keys <- served_by_ds[[ds]]
   if (is.null(keys)) { log_warn("no served keys for {ds} — skip PMTiles"); next }
@@ -306,6 +342,7 @@ if (!skip_pmt) for (ds in pmt_ds) {
   # REDO_PMTILES exists separately from REDO_NATIVE because the latter also rebuilds the
   # ~7 GB IUCN gpkg and re-sorts AquaMaps. Forcing a tile rebuild used to mean moving the
   # output directory aside by hand, which leaves no record of what was rebuilt or why.
+  src_hash <- NULL   # rng_iucn: bytes-MD5 fallback (below)
   if (ds == "rng_iucn") {
     # IUCN's full-res source is ~7 GB — read each model on demand from the indexed gpkg
     # (never load it all into memory), one index hit per species.
@@ -322,14 +359,16 @@ if (!skip_pmt) for (ds in pmt_ds) {
     log_info("{ds}: {nrow(x)} features, {n_distinct(x$mdl_key)} models -> per-model PMTiles ({n_workers} workers)")
     built <- publish_pmtiles_models(x, dir_ds, layer = ds, workers = n_workers,
                                     redo = redo_pmt, minzoom = 0, maxzoom = 10)
+    src_hash <- vapply(split(x, x$mdl_key), pmt_src_hash, "")
   }
   if (is.null(built) || !nrow(built)) { log_warn("{ds}: no PMTiles built"); next }
+  built$hash <- if (is.null(src_hash)) msens::native_hash_file(built$file) else unname(src_hash[built$mdl_key])
   pmt_rows[[ds]] <- built |> transmute(
     mdl_key, ds_key = ds, asset_type = "pmtiles", representation = "native",   # source polygons = original
     # per-model URL; ?v={mtime} busts the browser/PMTiles-protocol cache on rebuild
     # (Caddy ignores the query and serves the file).
     asset_url = glue("{pmt_base}/{ds}/{path_file(file)}?v={as.integer(file_info(file)$modification_time)}"),
-    source_layer = ds)
+    source_layer = ds, hash, file)   # asset_url is REWRITTEN to the store URL in "native-store" below
 }
 pmt_reg <- bind_rows(pmt_rows)   # now ONE ROW PER MODEL (mdl_key, asset_url)
 if (nrow(pmt_reg)) knitr::kable(pmt_reg |> count(ds_key, name = "n_models"))
@@ -512,6 +551,17 @@ if (!skip_am && length(am_take) && file_exists(am_db)) {
     asset_url = glue("{s3_http}/native/am_native/{safe_key(am_map$mdl_key)}.tif"),
     rescale_min = 1L, rescale_max = 100L, colormap = "spectral_r")[file_exists(built_n), ]
   log_info("am native 0.5° COGs on disk: {nrow(am_native_reg)} / {nrow(am_map)}")
+  # store hash = source content of the 0.5 deg cells (same fingerprint as content_hashes() on model_cell)
+  con_h <- dbConnect(duckdb(am_db, read_only = TRUE))
+  dbExecute(con_h, "CREATE OR REPLACE TEMP VIEW am_native_src AS
+    SELECT s.sp_key, c.loiczid AS cell_id, s.probability*100 AS val
+      FROM spp_cells s JOIN cells c USING (cell_id)")
+  am_h <- msens::content_hashes(con_h, "am_native_src", "sp_key")
+  dbDisconnect(con_h, shutdown = TRUE)
+  am_native_reg <- am_native_reg |>
+    mutate(hash = msens::content_hash_encoded(am_h$content_hash[match(sub("^am\\|", "", mdl_key), am_h$sp_key)],
+                                              "flt4-0.5deg-cog"),
+           file = glue("{dir_cog_native}/{safe_key(mdl_key)}.tif"))
 }
 ```
 
@@ -707,6 +757,33 @@ if (do_merged_cog && dir_exists(dir_gmerged)) {
     asset_url = glue("{s3_http}/native/merged/{safe_key(merged_map$mdl_key)}.tif"),
     rescale_min = 1L, rescale_max = 100L, colormap = "spectral_r")[file_exists(built), ]
   log_info("merged model COGs on disk: {nrow(merged_reg)} / {nrow(merged_map)}")
+}
+```
+
+## Native store: stage + register the ORIGINAL surfaces by content hash
+
+Code only here; nothing is uploaded until the sync chunk runs with `do_s3`. Rewrites the `native`
+rows' `asset_url` to the store URL (`msens::native_url()`), so the registry below and every later
+release reference the unversioned objects.
+
+```{r}
+#| label: native-store
+
+store_rows <- bind_rows(
+  if (exists("am_native_reg") && nrow(am_native_reg)) am_native_reg |> mutate(type = "cog"),
+  if (nrow(pmt_reg)) pmt_reg |> mutate(type = "pmtiles"))
+native_store_todo <- tibble()
+if (nrow(store_rows)) {
+  stopifnot("every native object needs a hash" = !anyNA(store_rows$hash))
+  store_rows <- store_rows |> mutate(
+    asset_url = mapply(msens::native_url, ds_key, hash, type, USE.NAMES = FALSE))
+  have <- if (do_s3) msens::native_store_index() else character()
+  native_store_todo <- store_rows |> filter(!hash %in% have) |> distinct(ds_key, hash, type, .keep_all = TRUE)
+  log_info("native store: {nrow(store_rows)} originals, {nrow(native_store_todo)} new object(s) to upload, ",
+           "{nrow(store_rows) - nrow(native_store_todo)} already present (same content -> same key)")
+  if (exists("am_native_reg") && nrow(am_native_reg))
+    am_native_reg <- store_rows |> filter(type == "cog") |> select(-type, -hash, -file)
+  if (nrow(pmt_reg)) pmt_reg <- store_rows |> filter(type == "pmtiles") |> select(-type, -hash, -file)
 }
 ```
 
@@ -974,20 +1051,27 @@ aws_sync <- function(local, prefix) {
 }
 if (do_s3) {
   if (nrow(am_reg))        aws_sync(dir_cog,        "native/am")         # model (0.05° resampled)
-  if (nrow(am_native_reg)) aws_sync(dir_cog_native, "native/am_native") # original (0.5° native)
+  # originals -> the content-addressed native store (see "native-store"): only NEW hashes are copied
+  for (i in seq_len(nrow(native_store_todo))) {
+    r <- native_store_todo[i, ]
+    st <- system2("aws", c("s3", "cp", r$file, glue("s3://oceanmetrics.io-public/marine-atlas/{msens::native_key(r$ds_key, r$hash, r$type)}"),
+                           "--only-show-errors"), stdout = TRUE, stderr = TRUE)
+    if (!is.null(attr(st, "status")) && attr(st, "status") != 0) stop(paste(st, collapse = "\n"))
+  }
   if (exists("vec_cog_reg") && nrow(vec_cog_reg))
                            aws_sync(glue("{dir_native}/vec_grid"), "native/vec_grid")  # vector model grid
   if (exists("merged_reg") && nrow(merged_reg))
                            aws_sync(glue("{dir_native}/merged"),   "native/merged")    # merged whole-range COGs
   if (exists("dps_reg") && nrow(dps_reg))
                            aws_sync(glue("{dir_native}/dps_nmfs"), "native/dps_nmfs")  # NMFS DPS per-cell ER surfaces
-  # PMTiles -> server file host (/share/data/derived/pmtiles/{ver}); also keep on S3
-  if (nrow(pmt_reg)) {
-    system2("ssh", c("msens", glue("mkdir -p /share/data/derived/pmtiles/{ver}")))
-    system2("rsync", c("-aq", glue("{dir_pmt}/"), glue("msens:/share/data/derived/pmtiles/{ver}/")))
-    st <- system2("aws", c("s3","sync", dir_pmt, glue("{s3_ver}/native/pmtiles"),
-                           "--only-show-errors","--no-progress"), stdout=TRUE, stderr=TRUE)
-    log_info("synced PMTiles -> file host /pmtiles/{ver} + {s3_ver}/native/pmtiles")
+  # PMTiles -> server file host, same content-addressed layout (S3 mirror was copied above)
+  pm <- native_store_todo[native_store_todo$type == "pmtiles", ]
+  if (nrow(pm)) for (d in unique(pm$ds_key)) {
+    f <- pm[pm$ds_key == d, ]
+    stage <- glue("{dir_native}/store/{d}"); dir_create(stage)              # {hash}.pmtiles, the served name
+    file_copy(f$file, glue("{stage}/{f$hash}.pmtiles"), overwrite = TRUE)
+    system2("ssh", c("msens", glue("mkdir -p /share/data/derived/pmtiles/native/{d}")))
+    system2("rsync", c("-aq", "--ignore-existing", glue("{stage}/"), glue("msens:/share/data/derived/pmtiles/native/{d}/")))
   }
 } else log_info("NATIVE_NO_S3 set — staged locally only ({dir_native})")
 ```
