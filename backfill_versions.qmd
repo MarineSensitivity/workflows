@@ -259,6 +259,43 @@ knitr::kable(data.frame(table = c(have, "model_asset"), rows = c(sizes, nrow(mod
              caption = glue("{bver} tables exported to {dir_tbl}"))
 ```
 
+## The v8-shaped `native_asset` (original next to interpolated)
+
+v1-v7 publish one gridded COG per model, which the app used to label `native`. This reuses the
+ORIGINAL surface (PMTiles range or the 0.5 deg AquaMaps COG) that a later release already
+publishes for the same source object, so the atlas can offer Original | Interpolated on this
+release too. **Code only until asked for**: gated by `BACKFILL_NATIVE=<ref ver>` (e.g. `v8`), it
+reads the reference's `tables/native_asset.parquet` + `dataset.parquet` (anonymous GET, no
+write), refuses any dataset whose source vintage differs
+(`msens::native_vintage_check()`), and writes `native_asset.parquet` beside the other tables.
+Nothing is uploaded here; publishing is the release session's step.
+
+```{r}
+#| label: native-asset
+#| eval: !expr Sys.getenv("BACKFILL_NATIVE") != ""
+
+ref_ver <- Sys.getenv("BACKFILL_NATIVE")
+stopifnot("native_asset backfill is for mdl_seq releases (v1-v7b)" = "mdl_seq" %in% names(model_asset),
+          "BACKFILL_NATIVE must be a version label" = grepl("^v[0-9]+[a-z]?$", ref_ver))
+ref_url <- \(t) sprintf("%s/%s/tables/%s.parquet", msens::atlas_base_url(), ref_ver, t)
+ref_tbl <- \(t) arrow::read_parquet(ref_url(t))
+native_ref <- ref_tbl("native_asset")
+vint <- msens::native_vintage_check(dbGetQuery(con, "SELECT * FROM dataset"), ref_tbl("dataset"))
+print(vint)
+bad <- vint$ds_key[which(vint$same %in% FALSE)]
+if (length(bad)) {                                   # a reused original is honest only for the same source
+  log_warn("dropping originals for dataset(s) with a different source vintage in {ref_ver}: {paste(bad, collapse=', ')}")
+  native_ref <- native_ref[!native_ref$ds_key %in% bad, ]
+}
+# taxon keys: v1-v7 pick a taxon's own surface via taxon.mdl_seq, single-dataset taxa included
+native_asset <- msens::native_asset_backfill(
+  model_asset, model_asset[, c("mdl_seq", "mdl_key")], native_ref,
+  taxon_key = dbGetQuery(con, "SELECT mdl_seq FROM taxon WHERE mdl_seq IS NOT NULL")$mdl_seq)
+arrow::write_parquet(native_asset, file.path(dir_tbl, "native_asset.parquet"), compression = "zstd")
+log_info("native_asset: {nrow(native_asset)} rows ({sum(native_asset$representation == 'native')} native) from {ref_ver}")
+have <- c(have, "native_asset")
+```
+
 ## The per-version view DB
 
 The app resolves its database as `{dir_big}/serve.duckdb`, falling back to the multi-GB
@@ -285,7 +322,7 @@ sv <- dbConnect(duckdb::duckdb(), f_serve)
 # `zone`/`cell_metric`/`zone_metric` carry the scored value; the apps still say `value`
 vt   <- c("cell_metric", "zone_metric", "zone")
 made <- character()
-for (t in c(have, "model_asset")) {
+for (t in unique(c(have, "model_asset", "native_asset"))) {
   f <- file.path(dir_tbl, paste0(t, ".parquet"))
   if (!file.exists(f)) next
   # ask DuckDB what the file holds rather than assuming the generation: v1-v7 name
