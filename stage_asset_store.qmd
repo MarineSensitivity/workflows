@@ -312,25 +312,37 @@ g7 <- grid_spec_for("usa05")
 # the cell test is applied to ALL exact+unambiguous matches (the 1,426 that passed the bbox test included): the bbox test
 # turned out to be both too strict (dateline, near-global ranges) and too lenient (2 of a 60-control the cells reject)
 chk <- m7 |> mutate(set = if_else(bbox_ok, "passed the bbox test", "failed the bbox test"))
+frac_worker <- function(o, cells, gpkg, g7) {
+  suppressMessages({library(sf); library(msens)})
+  p <- st_read(gpkg, quiet = TRUE, query = sprintf("SELECT * FROM rng_iucn WHERE mdl_key = 'rng_iucn|%s'", o$id_no)) |> st_zm(drop = TRUE)
+  cl <- cells[cells$mdl_seq == o$mdl_seq, ]; ll <- cell_lonlat(cl$cell_id, g7, wrap = TRUE)
+  pts <- st_as_sf(ll, coords = c("lon", "lat"), crs = 4326)
+  near <- function(s2) {                                     # within 25 km: spherical; the planar fallback uses 0.25 deg
+    sf_use_s2(s2); on.exit(sf_use_s2(TRUE))
+    poly <- st_union(if (s2) st_make_valid(st_geometry(p)) else st_geometry(p)); st_crs(poly) <- 4326
+    mean(lengths(st_is_within_distance(pts, poly, dist = if (s2) 25000 else 0.25)) > 0)
+  }
+  # s2 rejects a range with a degenerate loop (duplicate vertex): fall back to planar rather than call it a disagreement
+  tryCatch(near(TRUE), error = function(e) tryCatch(near(FALSE), error = function(e2) NA_real_))
+}
 f_final <- glue("{dir_out}/v7_rng_iucn_match_final.parquet")
 if (!redo && test_n == 0 && file_exists(f_final)) {            # the cell test is 25 min: reuse a finished one (REDO_STAGE=1 repeats it)
   chk <- chk |> left_join(read_parquet(f_final) |> select(mdl_seq, frac_cells_on_range), by = "mdl_seq")
+  na_i <- which(is.na(chk$frac_cells_on_range))               # ranges the test could not evaluate last time: only those are redone
+  if (length(na_i)) {
+    log_info("cell test: re-evaluating {length(na_i)} range(s) that errored")
+    con7 <- dbConnect(duckdb(glue("{dir_big_x}/v7/sdm.duckdb"), read_only = TRUE), config = list(threads = "4", memory_limit = "6GB"))
+    cells <- dbGetQuery(con7, glue("SELECT mdl_seq, cell_id FROM model_cell WHERE mdl_seq IN ({paste(chk$mdl_seq[na_i], collapse = ',')})
+       QUALIFY row_number() OVER (PARTITION BY mdl_seq ORDER BY hash(cell_id)) <= 300")) |> as_tibble()
+    dbDisconnect(con7, shutdown = TRUE)
+    chk$frac_cells_on_range[na_i] <- vapply(split(chk[na_i, ], seq_along(na_i)), frac_worker, 0, cells = cells, gpkg = as.character(iucn_gpkg), g7 = g7)
+  }
 } else {
 if (test_n > 0) chk <- slice_head(chk, n = test_n * 5)
 con7 <- dbConnect(duckdb(glue("{dir_big_x}/v7/sdm.duckdb"), read_only = TRUE), config = list(threads = "4", memory_limit = "6GB"))
 cells <- dbGetQuery(con7, glue("SELECT mdl_seq, cell_id FROM model_cell WHERE mdl_seq IN ({paste(chk$mdl_seq, collapse = ',')})
    QUALIFY row_number() OVER (PARTITION BY mdl_seq ORDER BY hash(cell_id)) <= 300")) |> as_tibble()
 dbDisconnect(con7, shutdown = TRUE)
-frac_worker <- function(o, cells, gpkg, g7) {
-  suppressMessages({library(sf); library(msens)}); sf_use_s2(TRUE)
-  tryCatch({
-    p <- st_read(gpkg, quiet = TRUE, query = sprintf("SELECT * FROM rng_iucn WHERE mdl_key = 'rng_iucn|%s'", o$id_no)) |> st_zm(drop = TRUE)
-    poly <- st_union(st_make_valid(st_geometry(p))); st_crs(poly) <- 4326
-    cl <- cells[cells$mdl_seq == o$mdl_seq, ]; ll <- cell_lonlat(cl$cell_id, g7, wrap = TRUE)
-    pts <- st_as_sf(ll, coords = c("lon", "lat"), crs = 4326)
-    mean(lengths(st_is_within_distance(pts, poly, dist = 25000)) > 0)
-  }, error = function(e) NA_real_)
-}
 plan(multisession, workers = n_workers); t0 <- Sys.time()
 chk$frac_cells_on_range <- unlist(future_map(split(chk, seq_len(nrow(chk))), frac_worker, cells = cells, gpkg = as.character(iucn_gpkg), g7 = g7,
                                              .options = furrr_options(seed = TRUE, packages = c("sf", "msens"))), use.names = FALSE)
