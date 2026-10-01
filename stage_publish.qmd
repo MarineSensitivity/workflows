@@ -170,7 +170,8 @@ mk_con <- function(v, native = c("published", "staged")) {
 canon <- function(x) toJSON(fromJSON(toJSON(x, auto_unbox = TRUE, null = "null", digits = NA), simplifyVector = FALSE), auto_unbox = TRUE, null = "null", digits = NA)
 rd_pub <- function(v, kind, k) { f <- glue("{dir_pub}/{v}/app/{kind}/{k}.json"); stopifnot(dl(glue("{base}/{v}/app/{kind}/{k}.json"), f)); fromJSON(gzfile(f), simplifyVector = FALSE) }
 gz_bytes <- function(txt) length(memCompress(charToRaw(txt), "gzip"))
-strip_assets <- function(card) { card$inputs <- lapply(card$inputs, function(i) { i$assets <- NULL; i }); card }
+# everything in a card that is a POINTER at a file: each input's assets, and the taxon's own merged-surface url. All else must not move.
+strip_assets <- function(card) { card$inputs <- lapply(card$inputs, function(i) { i$assets <- NULL; i }); if (!is.null(card$merged)) card$merged$url <- NULL; card }
 assets_of <- function(card) unlist(lapply(card$inputs, function(i) lapply(i$assets, function(a) list(mdl = i$mdl_key, rep = a$rep, type = a$type, url = a$url))), recursive = FALSE)
 
 compare_release <- function(v) {
@@ -183,7 +184,7 @@ compare_release <- function(v) {
   for (k in names(tx1)) writeLines(app_json(tx1[[k]]), glue("{out}/taxon/{k}.json"))
   for (k in names(al1)) writeLines(app_json(al1[[k]]), glue("{out}/alias/{k}.json"))
   base_tx <- 0L; base_al <- 0L; n_taxa <- 0L; other_diff <- 0L; inputs_changed <- 0L
-  a_pub <- 0L; a_new <- 0L; a_added <- 0L; a_removed <- 0L; a_url <- 0L; a_other <- 0L; both_pub <- 0L; both_new <- 0L; sz <- numeric()
+  merged_url <- 0L; a_pub <- 0L; a_new <- 0L; a_added <- 0L; a_removed <- 0L; a_url <- 0L; a_other <- 0L; both_pub <- 0L; both_new <- 0L; sz <- numeric()
   for (k in names(tx1)) {
     p <- rd_pub(v, "taxon", k); a <- fromJSON(toJSON(tx1[[k]], auto_unbox = TRUE, null = "null", digits = NA), simplifyVector = FALSE)
     if (identical(canon(tx0[[k]]), canon(p))) base_tx <- base_tx + 1L
@@ -191,8 +192,10 @@ compare_release <- function(v) {
     stopifnot(setequal(names(p$taxa), names(a$taxa)))
     for (nm in names(a$taxa)) {
       n_taxa <- n_taxa + 1L
-      if (!identical(canon(strip_assets(a$taxa[[nm]])), canon(strip_assets(p$taxa[[nm]])))) other_diff <- other_diff + 1L
-      if (!identical(canon(a$taxa[[nm]]$inputs), canon(p$taxa[[nm]]$inputs))) inputs_changed <- inputs_changed + 1L
+      # both sides are parsed JSON (the staged shard went through one toJSON/fromJSON), so identical() on the lists is exact
+      if (!identical(strip_assets(a$taxa[[nm]]), strip_assets(p$taxa[[nm]]))) other_diff <- other_diff + 1L
+      if (!identical(a$taxa[[nm]]$inputs, p$taxa[[nm]]$inputs)) inputs_changed <- inputs_changed + 1L
+      if (!identical(a$taxa[[nm]]$merged$url, p$taxa[[nm]]$merged$url)) merged_url <- merged_url + 1L
       ap <- assets_of(p$taxa[[nm]]); an <- assets_of(a$taxa[[nm]])
       kp <- vapply(ap, function(x) paste(x$mdl, x$rep, x$type), ""); kn <- vapply(an, function(x) paste(x$mdl, x$rep, x$type), "")
       a_pub <- a_pub + length(ap); a_new <- a_new + length(an)
@@ -210,7 +213,7 @@ compare_release <- function(v) {
            all(vapply(names(al1), function(k) isTRUE(tryCatch({ app_validate(al1[[k]], "alias"); TRUE }, error = function(e) FALSE)), NA))
   tibble(ver = v, taxon_shards = length(tx1), alias_shards = length(al1),
          baseline_taxon_identical = base_tx, baseline_alias_identical = base_al,
-         taxa = n_taxa, taxa_differing_outside_input_assets = other_diff, taxa_with_changed_inputs = inputs_changed,
+         taxa = n_taxa, taxa_differing_outside_pointers = other_diff, taxa_with_changed_inputs = inputs_changed, taxa_with_changed_merged_url = merged_url,
          asset_rows_published = a_pub, asset_rows_staged = a_new, asset_rows_added = a_added, asset_rows_removed = a_removed, asset_urls_changed_same_row = a_url,
          inputs_with_both_reps_published = both_pub, inputs_with_both_reps_staged = both_new,
          alias_shards_identical = alias_same, shards_validate = valid, largest_taxon_shard_gzip_bytes = max(sz), contract_bytes = 25600L,
@@ -221,7 +224,7 @@ cmp <- if (!redo && file_exists(cmp_f) && all(vers %in% read_parquet(cmp_f)$ver)
   r <- map_dfr(vers, compare_release); write_parquet(r, cmp_f); r }
 cmp |> pivot_longer(-ver) |> pivot_wider(names_from = ver, values_from = value) |> knitr::kable(caption = "staged app shards vs published (per release)")
 stopifnot("the builder does not reproduce a published bundle from its published tables" = all(cmp$baseline_taxon_identical == cmp$taxon_shards, cmp$baseline_alias_identical == cmp$alias_shards),
-          "taxa changed outside inputs[].assets" = all(cmp$taxa_differing_outside_input_assets == 0),
+          "a taxon changed outside its pointers (inputs[].assets, merged.url)" = all(cmp$taxa_differing_outside_pointers == 0),
           "alias shards changed" = all(cmp$alias_shards_identical), "a shard fails its schema" = all(cmp$shards_validate),
           "a shard exceeds the gzip contract" = all(cmp$largest_taxon_shard_gzip_bytes <= cmp$contract_bytes))
 ```
