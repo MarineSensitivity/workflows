@@ -1,0 +1,716 @@
+---
+title: "Asset store · M1 · map every existing distribution file to its store key"
+subtitle: "Read-only: nothing here writes to S3, the file host or any release"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    embed-resources: false
+editor_options:
+  chunk_output_type: console
+---
+
+> **Not a pipeline stage** — milestone **M1** of
+> `.claude/plans_todo/2026-10-01 asset store — every distribution file stored once, referenced by every release.md`.
+> A release owns *pointers*; every distribution file lives once in an unversioned, content-addressed
+> store (`cog/{grid}/{hash}.tif`, `native/{ds}/{hash}.{tif|pmtiles}`). This notebook computes, for
+> every object that already sits under `v8/native/` and `v9/native/`, the store key it **would** have —
+> from the release databases and the source data, never from the object's bytes — and writes
+> `store_migration.parquet`. Nothing is copied, deleted or published. The hashing functions are
+> `msens::content_hashes()` / `native_vector_hash()` / `native_raster_rows()` (unit-tested in
+> `test-asset_store.R`); the vector readers are `libs/native_sources.R`, the same ones
+> `publish_native.qmd` tiles from.
+>
+> Flags: `MAP_VERS` (default `v8,v9`), `MAP_TEST_N` (smoke test on N objects per folder, own cache dir),
+> `REDO_ASSET_MAP=1` (recompute cached hashes), `ASSET_RELIST=1` (re-list S3).
+
+## Setup
+
+```{r}
+#| label: setup
+
+librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, logger, purrr, readr, sf, stringr, terra,
+                 tibble, tidyr, arrow, quiet = T)
+library(msens)
+stopifnot("needs msens >= 0.47.0 (asset store functions)" = packageVersion("msens") >= "0.47.0")
+source(here("libs/paths.R"))
+source(here("libs/native_sources.R"))
+
+vers     <- strsplit(Sys.getenv("MAP_VERS", "v8,v9"), ",")[[1]]
+stopifnot("MAP_VERS must be labels like v8,v9" = all(grepl("^v[0-9]+[a-z]?$", vers)))
+test_n   <- as.integer(Sys.getenv("MAP_TEST_N", "0"))
+redo     <- nzchar(Sys.getenv("REDO_ASSET_MAP"))
+relist   <- nzchar(Sys.getenv("ASSET_RELIST"))
+dir_as   <- path.expand(glue("{dir_derived}/asset_store{if (test_n > 0) '_test' else ''}"))
+dir_inv  <- path.expand(glue("{dir_derived}/asset_store/inventory"))     # the listing is shared by test mode
+dir_big_x <- path.expand(dir_big)
+dir_raw_x <- path.expand(dir_raw)
+dir_create(c(dir_as, dir_inv, glue("{dir_as}/duckdb_tmp")))
+bucket   <- "oceanmetrics.io-public"
+s3_http  <- atlas_base_url()
+s3_root  <- sub("/marine-atlas$", "", s3_http)                    # https://s3.../oceanmetrics.io-public
+atlas_dir <- function(v) glue("{dir_big_x}/{v}/marine-atlas")
+safe_key <- function(k) gsub("[^A-Za-z0-9._-]", "_", k)        # mdl_key -> file stem (publish_native.qmd)
+slug_sp  <- function(k) gsub("^_|_$", "", gsub("[^A-Za-z0-9]+", "_", sub("^[^|]*\\|", "", k)))   # PMTiles stem
+grid_g05 <- grid_spec_for("global05", path.expand(cellid_tif))
+
+new_con <- function(mem = "10GB") {
+  con <- dbConnect(duckdb(), config = list(threads = "6", memory_limit = mem))
+  dbExecute(con, glue("SET temp_directory='{dir_as}/duckdb_tmp'"))
+  con
+}
+cached <- function(name, expr) {                                   # resumable: a computed table is a file
+  f <- glue("{dir_as}/{name}.parquet")
+  if (!redo && file_exists(f)) return(as_tibble(read_parquet(f)))
+  x <- expr; write_parquet(x, f, compression = "zstd"); x
+}
+log_info("M1 asset-store map | vers {paste(vers, collapse = ',')} | test_n {test_n} | cache {dir_as}")
+```
+
+## 1 · What exists on S3 today
+
+One recursive `list-objects-v2` per prefix (the bucket denies anonymous listing; this uses the
+account's credentials and reads only).
+
+```{r}
+#| label: inventory
+
+list_prefix <- function(prefix, out) {
+  if (file_exists(out) && !relist) return(out)
+  st <- system2("aws", c("s3api", "list-objects-v2", "--bucket", bucket, "--prefix", shQuote(prefix),
+                         "--query", shQuote("Contents[].[Key,Size,ETag,LastModified]"), "--output", "text"),
+                stdout = out, stderr = FALSE)
+  stopifnot("aws s3api list-objects-v2 failed" = identical(st, 0L))
+  out
+}
+read_inv <- function(f) {
+  ln <- readLines(f, n = 1)
+  if (!length(ln) || identical(trimws(ln), "None"))                # an empty prefix prints "None"
+    return(tibble(s3_key = character(), bytes = double(), etag = character(), last_modified = character()))
+  x <- read_tsv(f, col_names = c("s3_key", "bytes", "etag", "last_modified"), col_types = "cdcc", show_col_types = FALSE)
+  x[!is.na(x$bytes), ]
+}
+inv <- map_dfr(vers, function(v) {
+  f <- list_prefix(glue("marine-atlas/{v}/native/"), glue("{dir_inv}/{v}_native.tsv"))
+  read_inv(f) |> mutate(ver = v)
+}) |> mutate(
+  etag      = gsub('"', "", etag),
+  multipart = grepl("-", etag, fixed = TRUE),
+  rel       = str_remove(s3_key, "^marine-atlas/v[0-9a-z]+/native/"),
+  p1        = str_extract(rel, "^[^/]+"),
+  p2        = str_match(rel, "^pmtiles/([^/]+)/")[, 2],
+  grp       = if_else(p1 == "pmtiles", paste0("pmtiles/", p2), p1),    # am, am_native, merged, ..., pmtiles/{ds}
+  file      = basename(rel),
+  ext       = tools::file_ext(file),
+  stem      = tools::file_path_sans_ext(file)) |>
+  filter(ext %in% c("tif", "pmtiles"))
+store_now <- map_dfr(c("cog/global05", "cog/usa05", "native"), function(p) {
+  f <- list_prefix(glue("marine-atlas/{p}/"), glue("{dir_inv}/{gsub('/', '_', p)}.tsv")); read_inv(f) |> mutate(prefix = p)
+})
+if (test_n > 0) inv <- inv |> group_by(ver, grp) |> slice_head(n = test_n) |> ungroup()
+inv |> group_by(ver, grp) |> summarise(objects = n(), GB = round(sum(bytes) / 1e9, 3), multipart = sum(multipart),
+                                       .groups = "drop") |> knitr::kable(caption = "objects under {ver}/native/ today")
+store_now |> count(prefix, name = "objects") |> knitr::kable(caption = "the shared stores today (native/ is empty: nothing is stored there yet)")
+```
+
+## 2 · What each release points at (the published `native_asset`)
+
+```{r}
+#| label: registry
+
+con <- new_con("2GB"); dbExecute(con, "INSTALL httpfs; LOAD httpfs;")
+reg <- map_dfr(vers, function(v) {
+  u <- glue("{s3_http}/{v}/tables/native_asset.parquet")
+  dbGetQuery(con, glue("SELECT '{v}' AS ver, ms_merge_key, mdl_key, ds_key, asset_type, representation, asset_url
+                        FROM read_parquet('{u}')"))
+}) |> as_tibble()
+dbDisconnect(con, shutdown = TRUE)
+reg <- reg |> mutate(u = sub("\\?.*$", "", asset_url),
+  rel = case_when(
+    str_detect(u, "/marine-atlas/v[0-9a-z]+/native/") ~ str_replace(u, "^.*/marine-atlas/v[0-9a-z]+/native/", ""),
+    str_detect(u, "file\\.marinesensitivity\\.org/pmtiles/v[0-9a-z]+/") ~
+      paste0("pmtiles/", str_replace(u, "^.*/pmtiles/v[0-9a-z]+/", "")),
+    TRUE ~ NA_character_))
+stopifnot("every published pointer must name a versioned native/ object (or the file-host mirror of one)" = !anyNA(reg$rel))
+reg |> count(ver, representation, asset_type, name = "pointers") |> knitr::kable(caption = "pointer rows per release")
+```
+
+## 3 · Content hashes — gridded surfaces (`cog/global05`)
+
+`(cell_id, val)` rows by `mdl_key` straight from each release's `dist/` Parquet (inputs) and
+`dist_merged_global/` (range-derived merged models), via `msens::content_hashes()` — the reduction
+`backfill_versions.qmd` already uses for v1–v7. Both are `(cell_id INTEGER, val DOUBLE)`.
+
+```{r}
+#| label: hash-dist
+
+dist_ds <- c("am", "ax", "bl", "ca_nmfs", "ch_fws", "ch_nmfs", "rng_fws", "rng_iucn", "rng_turtle_swot_dps", "dps_nmfs")
+hash_glob <- function(v, name, src_glob, files = NULL) {
+  cached(glue("h_{name}_{v}"), {
+    con <- new_con(); on.exit(dbDisconnect(con, shutdown = TRUE))
+    src <- if (is.null(files)) sprintf("read_parquet('%s')", src_glob)
+           else sprintf("read_parquet([%s])", paste0("'", files, "'", collapse = ","))
+    t0 <- Sys.time()
+    h  <- msens::content_hashes(con, src, "mdl_key")
+    log_info("{name} {v}: {nrow(h)} models, {sum(h$n)} rows, {round(as.numeric(Sys.time() - t0, units = 'mins'), 1)} min")
+    as_tibble(h) |> mutate(ver = v, src = name)
+  })
+}
+h_dist <- map_dfr(vers, function(v) map_dfr(dist_ds, function(ds) {
+  d <- glue("{atlas_dir(v)}/dist/dataset={ds}")
+  if (!dir_exists(d)) return(NULL)
+  files <- if (test_n > 0) head(sort(dir_ls(d, glob = "*.parquet")), test_n) else NULL
+  hash_glob(v, glue("dist_{ds}"), glue("{d}/*.parquet"), files)
+}))
+h_merged_g <- map_dfr(vers, function(v) {
+  d <- glue("{atlas_dir(v)}/dist_merged_global")
+  files <- if (test_n > 0) head(sort(dir_ls(d, glob = "*.parquet", recurse = TRUE)), test_n) else NULL
+  hash_glob(v, "merged_global", glue("{d}/**/*.parquet"), files)
+})
+h_dist |> group_by(ver, src) |> summarise(models = n(), rows = sum(n), .groups = "drop") |> knitr::kable()
+```
+
+### Suitability-only merged models (painted from `mc_parts`, not `dist_merged_global`)
+
+`publish_native.qmd` paints a merged COG for a taxon with several AquaMaps models, or any AquaX model,
+as `round(max(val))` per cell over its post-supersession `mc_parts` partition. Those rows are the
+content; `round_even` matches R's `round()` (half to even), which is what the painted pixels used.
+
+```{r}
+#| label: hash-merged-suit
+
+h_merged_s <- map_dfr(vers, function(v) {
+  stems_have <- inv |> filter(ver == v, grp == "merged") |> pull(stem)
+  need <- setdiff(stems_have, safe_key(h_merged_g$mdl_key[h_merged_g$ver == v]))
+  if (!length(need)) return(NULL)
+  cached(glue("h_merged_suit_{v}"), {
+    con <- new_con(); on.exit(dbDisconnect(con, shutdown = TRUE))
+    dbExecute(con, glue("ATTACH '{atlas_dir(v)}/merge.duckdb' AS m (READ_ONLY)"))
+    mk <- dbGetQuery(con, "SELECT ms_merge_key, mkey_id FROM m.mkey_map") |> as_tibble() |>
+      mutate(stem = safe_key(ms_merge_key))
+    stopifnot("mkey_map: two taxa share a file stem" = !anyDuplicated(mk$stem))
+    todo <- mk[mk$stem %in% need, ]
+    log_info("{v}: {length(need)} merged objects not in dist_merged_global; {nrow(todo)} resolve via mkey_map")
+    out <- map_dfr(split(todo, ceiling(seq_len(nrow(todo)) / 200)), function(b) {
+      ids <- paste(b$mkey_id, collapse = ",")
+      q <- glue("(SELECT mkey_id, cell_id, round_even(max(val), 0) AS val
+                  FROM read_parquet('{atlas_dir(v)}/mc_parts/mkey_id=*/*.parquet', hive_partitioning = true)
+                  WHERE mkey_id IN ({ids}) GROUP BY mkey_id, cell_id) q")
+      msens::content_hashes(con, q, "mkey_id") |> as_tibble()
+    })
+    todo |> inner_join(out |> mutate(mkey_id = as.numeric(mkey_id)), by = "mkey_id") |>
+      transmute(mdl_key = ms_merge_key, n, content_hash, ver = v, src = "merged_suit")
+  })
+})
+log_info("suitability-only merged hashes: {nrow(h_merged_s)}")
+```
+
+## 4 · Content hashes — native rasters (`native/am`, `native/ax`)
+
+* **`am_native`**: the AquaMaps HCAF `probability × 100` on the 720 × 360 grid, straight from
+  `am.duckdb` (`spp_cells`), the table `publish_native.qmd` paints from.
+* **`ax_native`**: a bit-exact copy of AquaX band 1 *as delivered* (Float32; includes pixels the merge
+  drops), so the rows are its decoded non-NoData pixels (`native_raster_rows()`), which equal the source
+  TIF's (checked against the TIFs on a sample in §8).
+
+```{r}
+#| label: hash-native-raster
+
+h_am_nat <- cached("h_am_native", {
+  con <- dbConnect(duckdb(path.expand(am_db), read_only = TRUE), config = list(threads = "6", memory_limit = "10GB"))
+  on.exit(dbDisconnect(con, shutdown = TRUE))
+  q <- "(SELECT s.sp_key AS sp_key, CAST(c.loiczid AS INTEGER) AS cell_id, CAST(s.probability * 100 AS DOUBLE) AS val
+           FROM spp_cells s JOIN cells c USING (cell_id)) q"
+  t0 <- Sys.time(); h <- msens::content_hashes(con, q, "sp_key")
+  log_info("am_native: {nrow(h)} species, {round(as.numeric(Sys.time() - t0, units = 'mins'), 1)} min")
+  as_tibble(h) |> transmute(mdl_key = paste0("am|", sp_key), n, content_hash, src = "am_native")
+})
+
+h_ax_nat <- map_dfr(intersect(vers, "v9"), function(v) cached(glue("h_ax_native_{v}"), {
+  fl <- dir_ls(glue("{atlas_dir(v)}/native/ax_native"), glob = "*.tif")
+  if (test_n > 0) fl <- head(fl, test_n)
+  t0 <- Sys.time()
+  out <- map_dfr(split(fl, ceiling(seq_along(fl) / 100)), function(b) {
+    rows <- map_dfr(b, function(f) native_raster_rows(rast(f), grid_g05) |> mutate(stem = path_ext_remove(path_file(f))))
+    content_hashes_df(rows, by = "stem") |> as_tibble()
+  })
+  log_info("ax_native {v}: {nrow(out)} rasters, {round(as.numeric(Sys.time() - t0, units = 'mins'), 1)} min")
+  out |> mutate(ver = v, src = "ax_native")
+}))
+```
+
+## 5 · Content hashes — vector ranges (`native/{ds}/*.pmtiles`)
+
+Per model: sorted WKB + the tile attributes (`native_vector_hash()`), from the SAME readers and sources
+`publish_native.qmd` tiles (`libs/native_sources.R`; the 9 GB indexed IUCN GeoPackage for `rng_iucn`).
+Hashed for **every** source model, not only the served ones, so objects on S3 that no release registers
+(orphans) resolve too.
+
+```{r}
+#| label: hash-vector
+
+iucn_gpkg <- glue("{atlas_dir('v9')}/native/src/rng_iucn.gpkg")
+bl_ids    <- inv |> filter(grp == "pmtiles/bl") |> pull(stem) |> unique()
+specs     <- native_pmt_specs(dir_raw_x, dir_big_x, iucn_gpkg, bl_sisids = bl_ids)
+hash_ds <- function(ds) cached(glue("h_vec_{ds}"), {
+  t0 <- Sys.time()
+  if (ds == "rng_iucn") {
+    con <- DBI::dbConnect(RSQLite::SQLite(), iucn_gpkg, flags = RSQLite::SQLITE_RO)
+    keys <- DBI::dbGetQuery(con, "SELECT DISTINCT mdl_key FROM rng_iucn")$mdl_key; DBI::dbDisconnect(con)
+    if (test_n > 0) keys <- head(keys, test_n)
+    h <- map_dfr(keys, function(k) {
+      part <- st_read(iucn_gpkg, quiet = TRUE, query = sprintf("SELECT * FROM \"rng_iucn\" WHERE mdl_key = '%s'", k))
+      part$mdl_key <- k; part <- st_zm(part, drop = TRUE)
+      tibble(mdl_key = k, n_features = nrow(part), content_hash = native_vector_hash(part))
+    })
+  } else {
+    x <- specs[[ds]](); x$mdl_key <- as.character(x$mdl_key)
+    if (test_n > 0) x <- x[x$mdl_key %in% head(unique(x$mdl_key), test_n), ]
+    h <- as_tibble(native_vector_hashes(x))
+  }
+  log_info("vector {ds}: {nrow(h)} models, {round(as.numeric(Sys.time() - t0, units = 'mins'), 1)} min")
+  h |> mutate(src = ds)
+})
+h_vec <- map_dfr(names(specs), hash_ds) |> mutate(stem = slug_sp(mdl_key))
+h_vec |> group_by(src) |> summarise(models = n(), features = sum(n_features), .groups = "drop") |> knitr::kable()
+```
+
+## 6 · Join: every existing object → its store key
+
+```{r}
+#| label: join
+
+enc_of <- c(cog_model = asset_enc("cog_model"), native_am = asset_enc("native_am"),
+            native_ax = asset_enc("native_ax"), native_pmtiles = asset_enc("native_pmtiles"))
+vec_ds <- c("bl", "ca_nmfs", "ch_fws", "ch_nmfs", "rng_fws", "rng_iucn", "rng_turtle_swot_dps")
+
+# one lookup of (ver, grp, stem) -> content hash; `grp` is the folder under {ver}/native/
+H <- bind_rows(
+  h_dist |> filter(src %in% glue("dist_{c('am','ax','dps_nmfs')}")) |>
+    mutate(grp = sub("^dist_", "", src), ds_key = grp, family = "cog_model"),
+  h_dist |> filter(src %in% glue("dist_{vec_ds}")) |>
+    mutate(grp = "vec_grid", ds_key = sub("^dist_", "", src), family = "cog_model"),
+  h_merged_g |> mutate(grp = "merged", ds_key = "ms_merge", family = "cog_model"),
+  h_merged_s |> mutate(grp = "merged", ds_key = "ms_merge", family = "cog_model"),
+  tidyr::crossing(vers, h_am_nat) |> rename(ver = vers) |> mutate(grp = "am_native", ds_key = "am", family = "native_am"),
+  h_ax_nat |> mutate(mdl_key = sub("^ax_", "ax|", stem), grp = "ax_native", ds_key = "ax", family = "native_ax"),
+  tidyr::crossing(vers, h_vec) |> rename(ver = vers) |>
+    mutate(grp = paste0("pmtiles/", src), ds_key = src, family = "native_pmtiles", n = n_features)) |>
+  mutate(stem = if_else(family == "native_pmtiles", slug_sp(mdl_key),
+                if_else(grp == "ax_native", stem, safe_key(mdl_key)))) |>
+  select(ver, grp, stem, mdl_key, ds_key, family, n, content_hash)
+stopifnot("two source models share a (ver, folder, file stem): the key would be ambiguous" =
+            !anyDuplicated(H[c("ver", "grp", "stem")]))
+
+objects <- inv |> left_join(H, by = c("ver", "grp", "stem")) |>
+  mutate(resolved = !is.na(content_hash),
+         enc      = unname(enc_of[family]),
+         store    = case_when(family == "cog_model" ~ "cog", !is.na(family) ~ "native"),
+         scope    = case_when(family == "cog_model" ~ "global05", !is.na(family) ~ ds_key),
+         old_url  = glue("{s3_root}/{s3_key}"))
+# content_hash_encoded folds ONE encoding tag per call: do it per family
+objects$hash <- NA_character_
+for (f in names(enc_of)) {
+  i <- which(objects$family %in% f & objects$resolved)
+  if (length(i)) objects$hash[i] <- msens::content_hash_encoded(objects$content_hash[i], enc_of[[f]])
+}
+objects$key <- NA_character_
+for (st in c("cog", "native")) {
+  i <- which(objects$resolved & objects$store %in% st)
+  if (length(i)) objects$key[i] <- asset_key(st, objects$scope[i], objects$hash[i], objects$ext[i])
+}
+pointers <- reg |> group_by(ver, rel) |>
+  summarise(n_pointers = n(), reps = paste(sort(unique(representation)), collapse = "+"),
+            ds_key_reg = first(ds_key), .groups = "drop")
+objects <- objects |> left_join(pointers, by = c("ver", "rel")) |>
+  mutate(registered = !is.na(n_pointers), n_pointers = coalesce(n_pointers, 0L))
+
+objects |> group_by(ver, grp) |>
+  summarise(objects = n(), n_resolved = sum(resolved), n_unresolved = sum(!resolved), n_registered = sum(registered),
+            n_orphans = sum(!registered), .groups = "drop") |> knitr::kable(caption = "join coverage per folder (orphan = on S3, in no release's native_asset)")
+```
+
+## 7 · The collapse
+
+```{r}
+#| label: collapse
+
+# one object stored per key: prefer the newest release's copy
+rep_obj <- objects |> filter(resolved) |> arrange(desc(ver)) |> distinct(key, .keep_all = TRUE)
+fam_tbl <- function(o) o |> group_by(family) |> summarise(objects = n(), GB = round(sum(bytes) / 1e9, 3), .groups = "drop")
+bind_rows(
+  objects |> filter(resolved) |> group_by(family) |> summarise(stage = "today (v8+v9 trees)", objects = n(), GB = round(sum(bytes) / 1e9, 3), .groups = "drop"),
+  rep_obj |> group_by(family) |> summarise(stage = "after (distinct store keys)", objects = n(), GB = round(sum(bytes) / 1e9, 3), .groups = "drop")) |>
+  arrange(family, stage) |> knitr::kable(caption = "objects and GB, today vs distinct store keys (resolved objects only)")
+cat(sprintf("TOTAL today %d objects %.2f GB (incl. %d unresolved, %.2f GB) -> after %d keys %.2f GB\n",
+            nrow(objects), sum(objects$bytes) / 1e9, sum(!objects$resolved), sum(objects$bytes[!objects$resolved]) / 1e9,
+            nrow(rep_obj), sum(rep_obj$bytes) / 1e9))
+
+# which merged objects collapse onto an input's object (same key as an am / ax / vec_grid / dps object)?
+mk <- objects |> filter(resolved)
+merged_onto_input <- mk |> filter(grp == "merged") |> semi_join(mk |> filter(grp != "merged"), by = "key")
+cat(sprintf("merged objects whose key equals an input's object: %d of %d (%.2f GB)\n", nrow(merged_onto_input),
+            sum(mk$grp == "merged"), sum(merged_onto_input$bytes) / 1e9))
+mk |> filter(grp != "merged") |> semi_join(merged_onto_input, by = "key") |> count(ver, grp, name = "input_objects_shared") |> knitr::kable()
+```
+
+## 8 · Checks
+
+### (a) the same name in v8 and v9: the same key? the same bytes?
+
+```{r}
+#| label: check-a
+
+pair <- objects |> filter(resolved, ver %in% c("v8", "v9")) |>
+  select(ver, grp, file, key, etag, bytes) |>
+  pivot_wider(names_from = ver, values_from = c(key, etag, bytes), names_sep = ".") |>
+  filter(!is.na(key.v8), !is.na(key.v9)) |>
+  mutate(same_key = key.v8 == key.v9, same_etag = etag.v8 == etag.v9, same_bytes = bytes.v8 == bytes.v9)
+pair |> group_by(grp) |> summarise(same_name = n(), n_same_key = sum(same_key), n_diff_key = sum(!same_key),
+  same_key_same_etag = sum(same_key & same_etag), same_key_diff_etag = sum(same_key & !same_etag),
+  diff_key_diff_etag = sum(!same_key & !same_etag), .groups = "drop") |>
+  knitr::kable(caption = "objects present under the same name in v8 and v9")
+```
+
+Where the keys agree but the ETags do not (a rebuilt GeoTIFF is not byte-identical; a multipart upload
+has a different ETag for the same bytes), do the two files **decode to the same pixels**? Up to 200
+per raster folder:
+
+```{r}
+#| label: check-a-decode
+
+set.seed(20261001)
+smp <- pair |> filter(same_key, !same_etag, !grepl("^pmtiles", grp)) |> group_by(grp) |> slice_sample(n = 200) |> ungroup()
+px <- function(f) { r <- rast(f); list(dim = dim(r), ext = as.vector(ext(r)), v = terra::values(r, mat = FALSE)) }
+smp$pixels_equal <- map2_lgl(smp$grp, smp$file, function(g, f) {
+  a <- px(glue("{atlas_dir('v8')}/native/{g}/{f}")); b <- px(glue("{atlas_dir('v9')}/native/{g}/{f}"))
+  identical(a$dim, b$dim) && isTRUE(all.equal(a$ext, b$ext)) && isTRUE(all.equal(a$v, b$v))
+})
+if (nrow(smp)) smp |> group_by(grp) |> summarise(sampled = n(), n_pixels_equal = sum(pixels_equal), n_differ = sum(!pixels_equal),
+  .groups = "drop") |> knitr::kable() else cat("every same-key pair is also byte-identical (same ETag): nothing to decode\n")
+```
+
+### (b) decoded COGs equal their database rows
+
+Twenty per raster folder and release: decode the local COG with `native_raster_rows()` and compare with the
+rows its key was computed from (INT1U quantisation = `round_even`, clipped to 0–255). One query per
+(release, folder), reading only the sampled models' own files.
+
+```{r}
+#| label: check-b
+
+# terra writes a double into INT1U by TRUNCATING (verified: every pixel of an am model == trunc(val));
+# ax is rounded explicitly before painting (ingest_aquax.qmd), and the suitability-only merged rows are
+# rounded in SQL (round_even) -- so truncation is the one quantiser, preceded by round() for ax
+quant <- function(v, g = "") pmin(255, pmax(0, trunc(if (g == "ax") round(v) else v)))
+dist_files <- function(v, mdl_keys) {                     # dist/dataset={ds}/{sp_id}.parquet, one model per file
+  ds <- sub("\\|.*$", "", mdl_keys); id <- sub("^[^|]*\\|", "", mdl_keys)
+  glue("{atlas_dir(v)}/dist/dataset={ds}/{id}.parquet")
+}
+db_rows <- function(v, g, keys, con, con_am) {          # -> data.frame(mdl_key, cell_id, val)
+  if (g %in% c("am", "ax", "dps_nmfs", "vec_grid")) {
+    f <- dist_files(v, keys); stopifnot(all(file_exists(f)))
+    return(dbGetQuery(con, sprintf("SELECT mdl_key, cell_id, val FROM read_parquet([%s])", paste0("'", f, "'", collapse = ","))))
+  }
+  if (g == "merged") {
+    k <- paste0("'", keys, "'", collapse = ",")
+    d <- dbGetQuery(con, sprintf("SELECT mdl_key, cell_id, val FROM read_parquet('%s/dist_merged_global/**/*.parquet') WHERE mdl_key IN (%s)", atlas_dir(v), k))
+    left <- setdiff(keys, unique(d$mdl_key))
+    if (length(left)) {
+      dbExecute(con, glue("ATTACH IF NOT EXISTS '{atlas_dir(v)}/merge.duckdb' AS m_{v} (READ_ONLY)"))
+      ids <- dbGetQuery(con, sprintf("SELECT ms_merge_key AS mdl_key, mkey_id FROM m_%s.mkey_map WHERE ms_merge_key IN (%s)", v, paste0("'", left, "'", collapse = ",")))
+      d2 <- map_dfr(seq_len(nrow(ids)), function(i) dbGetQuery(con, sprintf(
+        "SELECT '%s' AS mdl_key, cell_id, round_even(max(val), 0) AS val FROM read_parquet('%s/mc_parts/mkey_id=%d/*.parquet') GROUP BY cell_id",
+        ids$mdl_key[i], atlas_dir(v), ids$mkey_id[i])))
+      d <- bind_rows(d, d2)
+    }
+    return(d)
+  }
+  if (g == "am_native") {
+    sp <- sub("^am\\|", "", keys)
+    return(dbGetQuery(con_am, sprintf("SELECT 'am|' || s.sp_key AS mdl_key, c.loiczid AS cell_id, s.probability * 100 AS val
+      FROM spp_cells s JOIN cells c USING (cell_id) WHERE s.sp_key IN (%s)", paste0("'", sp, "'", collapse = ","))))
+  }
+  stop("no row source for folder ", g)
+}
+con_b  <- new_con("6GB")
+con_am <- dbConnect(duckdb(path.expand(am_db), read_only = TRUE))
+grid_half <- grid_spec(rast(nrows = 360, ncols = 720, xmin = -180, xmax = 180, ymin = -90, ymax = 90, crs = "EPSG:4326"))
+set.seed(20261001)
+sm_b <- objects |> filter(resolved, !family %in% c("native_pmtiles", "native_ax")) |> group_by(ver, grp) |> slice_sample(n = 20) |> ungroup()
+chk_b <- sm_b |> group_by(ver, grp) |> group_modify(function(d, k) {
+  db <- db_rows(k$ver, k$grp, d$mdl_key, con_b, con_am)
+  db <- split(db, db$mdl_key)
+  grid <- if (k$grp == "am_native") grid_half else grid_g05
+  d |> rowwise() |> mutate(
+    local = file_exists(glue("{atlas_dir(k$ver)}/native/{rel}")),
+    cmp = list({
+      if (!local) tibble(rows_equal = NA, n_db = NA_integer_, n_cog = NA_integer_)
+      else {
+        dec <- native_raster_rows(rast(glue("{atlas_dir(k$ver)}/native/{rel}")), grid)
+        x <- db[[mdl_key]]; x$val <- quant(x$val, k$grp); x <- x[!is.na(x$val) & x$val > 0, c("cell_id", "val")]
+        j <- merge(dec, x, by = "cell_id", all = TRUE, suffixes = c(".cog", ".db"))
+        tibble(rows_equal = nrow(j) == nrow(dec) && nrow(j) == nrow(x) && isTRUE(all(j$val.cog == j$val.db)),
+               n_db = nrow(x), n_cog = nrow(dec))
+      }})) |> ungroup() |> unnest(cmp)
+}) |> ungroup()
+chk_b |> group_by(ver, grp) |> summarise(sampled = n(), n_local = sum(local), n_rows_equal = sum(rows_equal, na.rm = TRUE),
+  n_differ = sum(!rows_equal, na.rm = TRUE), .groups = "drop") |> knitr::kable(caption = "(b) decoded COG == DB rows (quantised), sample of 20")
+dbDisconnect(con_b, shutdown = TRUE); dbDisconnect(con_am, shutdown = TRUE)
+```
+
+`ax_native` is a bit-exact copy of the delivered TIF's band 1, which is why its rows can be hashed from the
+COG; confirm that on five rasters against the source TIFs:
+
+```{r}
+#| label: check-b-ax
+
+ax_s <- objects |> filter(grp == "ax_native", ver == "v9", resolved)
+set.seed(3); ax_s <- slice_sample(ax_s, n = min(5, nrow(ax_s)))
+ax_tif <- vapply(ax_s$stem, function(st) {
+  tif <- glue("{path.expand(ax_tif_dir)}/BOEM_MASKED_EMMEAN_SP_{sub('^ax_', '', st)}.tif")      # as ingest_aquax.qmd names them
+  cog <- glue("{atlas_dir('v9')}/native/ax_native/{st}.tif")
+  if (!file_exists(tif) || !file_exists(cog)) return(NA)
+  a <- native_raster_rows(rast(tif)[[1]], grid_g05); b <- native_raster_rows(rast(cog), grid_g05)
+  a <- a[order(a$cell_id), ]; b <- b[order(b$cell_id), ]
+  nrow(a) == nrow(b) && isTRUE(all(a$cell_id == b$cell_id)) && isTRUE(all(a$val == b$val))
+}, NA)
+cat(sprintf("ax_native COG rows == delivered TIF band-1 rows: %d of %d checked (%d source TIFs not on this machine)\n",
+            sum(ax_tif, na.rm = TRUE), sum(!is.na(ax_tif)), sum(is.na(ax_tif))))
+```
+
+### (b⁺) EVERY raster object against the rows it should hold
+
+The 20-per-folder sample above found a few percent of `am` COGs that differ from the current `dist/` rows by a
+handful of threshold cells. Cause: `dist/dataset=am` files were rewritten on 2026-07-13, two days **after**
+the COGs were painted (2026-07-11), and v9 inherited both. So the *current rows* (what scoring used, and what
+the key hashes) are not always the rows the existing object was painted from. This pass decides it for every
+object: decode the COG, hash its pixels; hash the same quantised current rows (`trunc` — what terra writes
+into INT1U — preceded by `round` for ax; pixels < 1 are nodata); an object is **consistent** when the two agree.
+An inconsistent object must be **repainted** from its current rows at M2, never copied under the new key.
+
+```{r}
+#| label: verify-all
+
+# ---- expected side: quantised current rows, hashed per (ver, folder, stem) ----
+q_sql <- function(round_first = FALSE) {
+  v <- if (round_first) "round_even(val, 0)" else "val"
+  glue("CAST(trunc(LEAST({v}, 255)) AS DOUBLE)")
+}
+hash_q <- function(con, from, by, round_first = FALSE)
+  msens::content_hashes(con, glue("(SELECT {by}, CAST(cell_id AS INTEGER) AS cell_id, {q_sql(round_first)} AS val FROM {from}
+                                    WHERE {q_sql(round_first)} >= 1) q"), by) |> as_tibble()
+exp_q <- cached("verify_expected", {
+  con <- new_con(); on.exit(dbDisconnect(con, shutdown = TRUE))
+  out <- list()
+  v_am <- tail(vers, 1)                                    # v8 and v9 am dist are byte-identical (same hashes in §3); verify once
+  for (v in vers) {
+    pq <- function(ds) glue("read_parquet('{atlas_dir(v)}/dist/dataset={ds}/*.parquet')")
+    if (v == v_am || !identical(h_dist$content_hash[h_dist$ver == v & h_dist$src == "dist_am"][order(h_dist$mdl_key[h_dist$ver == v & h_dist$src == "dist_am"])],
+                                h_dist$content_hash[h_dist$ver == v_am & h_dist$src == "dist_am"][order(h_dist$mdl_key[h_dist$ver == v_am & h_dist$src == "dist_am"])]))
+      out[[paste(v, "am")]] <- hash_q(con, pq("am"), "mdl_key") |> mutate(ver = v, grp = "am")
+    for (ds in intersect(c("ax", "dps_nmfs"), dist_ds)) if (dir_exists(glue("{atlas_dir(v)}/dist/dataset={ds}")))
+      out[[paste(v, ds)]] <- hash_q(con, pq(ds), "mdl_key", round_first = ds == "ax") |> mutate(ver = v, grp = ds)
+    out[[paste(v, "vec")]] <- map_dfr(vec_ds, function(ds) if (dir_exists(glue("{atlas_dir(v)}/dist/dataset={ds}")))
+      hash_q(con, pq(ds), "mdl_key")) |> mutate(ver = v, grp = "vec_grid")
+    out[[paste(v, "merged")]] <- hash_q(con, glue("read_parquet('{atlas_dir(v)}/dist_merged_global/**/*.parquet')"), "mdl_key") |>
+      mutate(ver = v, grp = "merged")
+    ms <- h_merged_s[h_merged_s$ver == v, ]
+    if (nrow(ms)) {
+      dbExecute(con, glue("ATTACH IF NOT EXISTS '{atlas_dir(v)}/merge.duckdb' AS m_{v} (READ_ONLY)"))
+      mk <- dbGetQuery(con, glue("SELECT ms_merge_key AS mdl_key, mkey_id FROM m_{v}.mkey_map")) |> as_tibble() |> filter(mdl_key %in% ms$mdl_key)
+      out[[paste(v, "msuit")]] <- map_dfr(split(mk, ceiling(seq_len(nrow(mk)) / 200)), function(b) {
+        q <- glue("(SELECT mkey_id, cell_id, trunc(round_even(max(val), 0)) AS val FROM read_parquet('{atlas_dir(v)}/mc_parts/mkey_id=*/*.parquet', hive_partitioning = true)
+                    WHERE mkey_id IN ({paste(b$mkey_id, collapse = ',')}) GROUP BY mkey_id, cell_id HAVING trunc(round_even(max(val), 0)) >= 1) q")
+        msens::content_hashes(con, q, "mkey_id") |> as_tibble() |> mutate(mkey_id = as.numeric(mkey_id)) |>
+          inner_join(b |> mutate(mkey_id = as.numeric(mkey_id)), by = "mkey_id") |> select(mdl_key, n, content_hash)
+      }) |> mutate(ver = v, grp = "merged")
+    }
+  }
+  # am_native: one table, both releases
+  con_a <- dbConnect(duckdb(path.expand(am_db), read_only = TRUE), config = list(threads = "6", memory_limit = "10GB"))
+  an <- hash_q(con_a, "(SELECT 'am|' || s.sp_key AS mdl_key, c.loiczid AS cell_id, s.probability * 100 AS val FROM spp_cells s JOIN cells c USING (cell_id)) z", "mdl_key")
+  dbDisconnect(con_a, shutdown = TRUE)
+  out[["am_native"]] <- tidyr::crossing(ver = vers, an) |> mutate(grp = "am_native")
+  bind_rows(out) |> transmute(ver, grp, mdl_key, stem = if_else(grp == "am", safe_key(mdl_key), safe_key(mdl_key)), n_exp = n, q_exp = content_hash)
+})
+# a release whose am dist was verified once shares the result
+if (!all(vers %in% exp_q$ver[exp_q$grp == "am"]))
+  exp_q <- bind_rows(exp_q, exp_q |> filter(grp == "am") |> select(-ver) |> tidyr::crossing(ver = setdiff(vers, exp_q$ver[exp_q$grp == "am"])))
+log_info("expected quantised hashes: {nrow(exp_q)}")
+
+# ---- observed side: decode each distinct object once (parallel, batched by rows) ----
+todo_v <- objects |> filter(resolved, !family %in% c("native_pmtiles", "native_ax")) |> arrange(desc(ver)) |>
+  distinct(grp, file, etag, .keep_all = TRUE) |>
+  transmute(grp, file, etag, stem, path = as.character(glue("{atlas_dir(ver)}/native/{rel}")))
+if (test_n > 0) todo_v <- todo_v |> group_by(grp) |> slice_head(n = test_n) |> ungroup()
+obs_q <- cached("verify_observed", {
+  library(furrr)
+  # RESUMABLE: every batch of objects writes its own parquet, so a killed or OOM-ed run (this laptop shares
+  # its RAM with a browser and other sessions) loses at most the batches in flight, never the whole pass
+  dir_obs <- glue("{dir_as}/verify_obs"); dir_create(dir_obs)
+  dec_batch <- function(b, id, dir_obs, grid_g05, grid_half) {
+    suppressMessages({library(terra); library(msens); library(arrow)})
+    rows <- lapply(seq_len(nrow(b)), function(i) {
+      r <- native_raster_rows(terra::rast(b$path[i]), if (b$grp[i] == "am_native") grid_half else grid_g05)
+      r$key <- paste(b$grp[i], b$file[i], b$etag[i], sep = "\r"); r })
+    h <- content_hashes_df(do.call(rbind, rows), by = "key")
+    arrow::write_parquet(h, file.path(dir_obs, paste0(id, ".parquet.tmp"))); file.rename(file.path(dir_obs, paste0(id, ".parquet.tmp")), file.path(dir_obs, paste0(id, ".parquet")))
+    invisible(id)
+  }
+  gh <- grid_spec(rast(nrows = 360, ncols = 720, xmin = -180, xmax = 180, ymin = -90, ymax = 90, crs = "EPSG:4326"))
+  bs  <- split(todo_v, paste(todo_v$grp, ceiling(seq_len(nrow(todo_v)) / 30), sep = "-"))
+  ids <- gsub("[^A-Za-z0-9-]", "_", names(bs))
+  # `am` (13 billion pixels, the heaviest family) is opt-in here: MAP_VERIFY_AM=1. It is the family with known
+  # inconsistent objects (see above), so M2 re-verifies it object by object as the gate on each copy; this
+  # notebook samples it (60 per release) and verifies every OTHER family exhaustively.
+  skip_b <- if (nzchar(Sys.getenv("MAP_VERIFY_AM"))) rep(FALSE, length(ids)) else grepl("^am-", ids)
+  left <- which(!file_exists(glue("{dir_obs}/{ids}.parquet")) & !skip_b)
+  log_info("decode: {length(bs)} batches of <= 30 objects; {length(bs) - length(left)} already done, {length(left)} to do (3 workers)")
+  plan(multisession, workers = 3); on.exit(plan(sequential), add = TRUE)
+  t0 <- Sys.time()
+  for (g in split(left, ceiling(seq_along(left) / 60))) {
+    future_walk2(bs[g], ids[g], dec_batch, dir_obs = dir_obs, grid_g05 = grid_g05, grid_half = gh,
+                 .options = furrr_options(seed = TRUE, packages = c("terra", "msens", "arrow")))
+    log_info("decode: {sum(file_exists(glue('{dir_obs}/{ids}.parquet')))} / {length(bs)} batches done, {round(as.numeric(Sys.time() - t0, units = 'mins'), 1)} min")
+  }
+  stopifnot("some decode batches did not finish" = all(file_exists(glue("{dir_obs}/{ids}.parquet")) | skip_b))
+  map_dfr(glue("{dir_obs}/{ids}.parquet")[file_exists(glue("{dir_obs}/{ids}.parquet"))], read_parquet) |>
+    transmute(grp = sapply(strsplit(key, "\r"), `[`, 1), file = sapply(strsplit(key, "\r"), `[`, 2), etag = sapply(strsplit(key, "\r"), `[`, 3), n_obs = n, q_obs = content_hash)
+})
+
+verify <- objects |> filter(resolved, !family %in% c("native_pmtiles", "native_ax")) |>
+  select(ver, grp, file, etag, stem, key, bytes, mdl_key) |>
+  left_join(obs_q, by = c("grp", "file", "etag")) |>
+  left_join(exp_q |> select(ver, grp, stem, n_exp, q_exp), by = c("ver", "grp", "stem")) |>
+  mutate(status = case_when(is.na(n_obs) ~ "not decoded", is.na(n_exp) ~ "no current rows",
+                            q_obs == q_exp & n_obs == n_exp ~ "consistent", TRUE ~ "inconsistent"))
+write_parquet(verify, glue("{dir_as}/verify_raster.parquet"), compression = "zstd")
+verify |> count(ver, grp, status) |> pivot_wider(names_from = status, values_from = n, values_fill = 0) |>
+  knitr::kable(caption = "every raster object: pixels == quantised current rows?")
+```
+
+### (b′) the local copies are the S3 objects
+
+```{r}
+#| label: check-local
+
+loc <- objects |> filter(resolved) |> mutate(path = as.character(glue("{atlas_dir(ver)}/native/{rel}")), has = file_exists(path))
+loc$size_ok <- ifelse(loc$has, file_size(loc$path) == loc$bytes, NA)
+loc |> group_by(grp) |> summarise(objects = n(), n_local = sum(has), n_size_equal = sum(size_ok, na.rm = TRUE),
+  n_size_differs = sum(!size_ok, na.rm = TRUE), n_s3_only = sum(!has), .groups = "drop") |> knitr::kable()
+set.seed(7)
+md <- loc |> filter(has, !multipart) |> group_by(grp) |> slice_sample(n = 20) |> ungroup()
+md$md5_ok <- vapply(md$path, function(p) msens::native_hash_file(p), "") == md$etag
+md |> group_by(grp) |> summarise(n_md5_checked = n(), n_md5_equals_etag = sum(md5_ok), .groups = "drop") |> knitr::kable()
+```
+
+### (b″) vector: PMTiles bounds agree with the source geometry (20 per dataset)
+
+```{r}
+#| label: check-vector
+
+pm_bounds <- function(f) {
+  j <- tryCatch(jsonlite::fromJSON(paste(system2("pmtiles", c("show", shQuote(f), "--header-json"), stdout = TRUE), collapse = "")),
+                error = function(e) NULL)
+  if (is.null(j)) rep(NA_real_, 4) else as.numeric(j$bounds)
+}
+src_cache <- new.env()
+src_bbox <- function(ds, k) {
+  if (ds == "rng_iucn") p <- st_read(iucn_gpkg, quiet = TRUE, query = sprintf("SELECT * FROM rng_iucn WHERE mdl_key = '%s'", k))
+  else {
+    if (is.null(src_cache[[ds]])) { x <- specs[[ds]](); x$mdl_key <- as.character(x$mdl_key); src_cache[[ds]] <- x }
+    p <- src_cache[[ds]][src_cache[[ds]]$mdl_key == k, ]
+  }
+  p <- st_zm(p, drop = TRUE); if (is.na(st_crs(p))) st_crs(p) <- 4326
+  as.numeric(st_bbox(st_transform(p, 4326)))
+}
+set.seed(11)
+vec_chk <- objects |> filter(resolved, family == "native_pmtiles", ver == "v9") |> group_by(grp) |> slice_sample(n = 20) |> ungroup() |>
+  mutate(path = as.character(glue("{atlas_dir(ver)}/native/{rel}")), has = file_exists(path))
+vec_chk$pm_bb  <- map2(vec_chk$path, vec_chk$has, ~ if (.y) pm_bounds(.x) else rep(NA_real_, 4))
+vec_chk$src_bb <- map2(vec_chk$ds_key, vec_chk$mdl_key, ~ src_bbox(.x, .y))
+vec_chk$bounds_agree <- map2_lgl(vec_chk$pm_bb, vec_chk$src_bb, ~ !anyNA(.x) && all(abs(.x - .y) < 0.5))
+vec_chk |> group_by(ds_key) |> summarise(sampled = n(), n_local = sum(has), n_bounds_agree = sum(bounds_agree), n_differ_or_missing = sum(!bounds_agree), .groups = "drop") |>
+  knitr::kable(caption = "PMTiles header bounds vs source bbox (tolerance 0.5 deg)")
+```
+
+### (c) no key names two contents
+
+```{r}
+#| label: check-c
+
+col <- asset_key_collisions(objects |> filter(resolved) |> transmute(key, content_hash, enc))
+cat(sprintf("keys with more than one distinct (content_hash, enc): %d\n", length(unique(col$key))))
+stopifnot("a store key maps to two different contents" = nrow(col) == 0)
+cat_try <- objects |> filter(resolved) |> arrange(desc(ver)) |> distinct(key, .keep_all = TRUE) |>
+  transmute(store, key, content_hash, enc, asset_type = if_else(ext == "pmtiles", "pmtiles", "cog"),
+            grid_id = if_else(store == "cog", scope, NA_character_), ds_key = if_else(store == "native", scope, NA_character_),
+            bytes, md5 = if_else(!multipart, etag, NA_character_), created = as.Date(NA), first_ver = ver)
+invisible(asset_catalog_check(cat_try))          # errors unless every key IS content_hash_encoded(content_hash, enc)
+cat(sprintf("proposed catalog: %d rows, passes asset_catalog_check()\n", nrow(cat_try)))
+```
+
+## 9 · Write `store_migration.parquet`
+
+```{r}
+#| label: write
+
+store_migration <- objects |> transmute(
+  old_url = as.character(old_url), ver, ds_key = coalesce(ds_key, ds_key_reg), mdl_key, grp, file,
+  representation = reps, asset_type = if_else(ext == "pmtiles", "pmtiles", "cog"),
+  store, key, content_hash, enc, bytes, md5_or_etag = etag, multipart, resolved, registered, n_pointers, last_modified)
+write_parquet(store_migration, glue("{dir_as}/store_migration.parquet"), compression = "zstd")
+write_parquet(cat_try, glue("{dir_as}/assets_proposed.parquet"), compression = "zstd")
+log_info("wrote {nrow(store_migration)} rows -> {dir_as}/store_migration.parquet ; proposed catalog {nrow(cat_try)} rows")
+objects |> filter(!resolved) |> count(ver, grp, name = "unresolved") |> knitr::kable(caption = "objects with no source content at hand (not mapped)")
+```
+
+## 10 · For M3: v7 `rng_iucn` inputs that can take an original
+
+v7 keys IUCN ranges by scientific NAME (`rng_iucn:Name`), v8/v9 by IUCN `id_no`, so there is no key join.
+The only honest link is an **exact** name match that is **unambiguous** (one v7 model, one v9 model of that
+name), kept only if the original agrees with the surface v7 already draws: every cell of the v7 gridded
+surface (US waters only, `usa05`, 0–360° longitude) must fall inside the original PMTiles' header bounds
+(± 0.5°, antimeridian-aware).
+
+```{r}
+#| label: v7-rng-iucn
+
+con7 <- dbConnect(duckdb(glue("{dir_big_x}/v7/sdm.duckdb"), read_only = TRUE), config = list(threads = "6", memory_limit = "8GB"))
+m7 <- dbGetQuery(con7, "SELECT mdl_seq, taxa FROM model WHERE ds_key = 'rng_iucn'") |> as_tibble() |>
+  mutate(name7 = sub("^rng_iucn:", "", taxa))
+conw <- new_con("2GB"); dbExecute(conw, "INSTALL httpfs; LOAD httpfs;")
+ma7 <- dbGetQuery(conw, glue("SELECT mdl_seq FROM read_parquet('{s3_http}/v7/tables/model_asset.parquet')")); dbDisconnect(conw, shutdown = TRUE)
+m7$has_cog <- m7$mdl_seq %in% ma7$mdl_seq
+m9 <- read_csv(glue("{atlas_dir('v9')}/dist/model_rng_iucn.csv"), show_col_types = FALSE)
+m9 <- m9 |> mutate(pmt = file_exists(glue("{atlas_dir('v9')}/native/pmtiles/rng_iucn/{id_no}.pmtiles")))
+j <- m7 |> left_join(count(m7, name7, name = "n7"), by = "name7") |>
+  left_join(count(m9, sci_name, name = "n9"), by = c(name7 = "sci_name")) |>
+  left_join(m9 |> select(sci_name, id_no, mdl_key_v9 = mdl_key, pmt), by = c(name7 = "sci_name"))
+u <- j |> filter(has_cog, n7 == 1, n9 %in% 1, pmt)
+g7 <- grid_spec_for("usa05")
+ex <- dbGetQuery(con7, glue("SELECT mdl_seq, min(((cell_id-1)//{g7$nc})) r0, max(((cell_id-1)//{g7$nc})) r1,
+    min(((cell_id-1)%{g7$nc})) k0, max(((cell_id-1)%{g7$nc})) k1 FROM model_cell
+    WHERE mdl_seq IN ({paste(u$mdl_seq, collapse = ',')}) GROUP BY 1")) |> as_tibble()
+dbDisconnect(con7, shutdown = TRUE)
+pm_b <- function(id) { f <- glue("{atlas_dir('v9')}/native/pmtiles/rng_iucn/{id}.pmtiles")
+  j <- tryCatch(jsonlite::fromJSON(paste(system2("pmtiles", c("show", shQuote(f), "--header-json"), stdout = TRUE), collapse = "")), error = function(e) NULL)
+  if (is.null(j)) rep(NA_real_, 4) else as.numeric(j$bounds) }
+b <- t(vapply(u$id_no, pm_b, numeric(4))); colnames(b) <- c("pw", "ps", "pe", "pn")
+u <- u |> left_join(ex, by = "mdl_seq") |> bind_cols(as_tibble(b)) |> mutate(
+  lat_n = g7$ymax - r0 * g7$resy, lat_s = g7$ymax - (r1 + 1) * g7$resy,
+  lon_a = g7$xmin + k0 * g7$resx, lon_b = g7$xmin + (k1 + 1) * g7$resx)
+lon_inside <- function(a, b, w, e, tol = 0.5) {            # v7 [a,b] (0-360 frame) inside the tiles' [w,e] (-180..180)
+  iv <- if (b <= 180) list(c(a, b)) else if (a >= 180) list(c(a - 360, b - 360)) else list(c(a, 180), c(-180, b - 360))
+  all(vapply(iv, function(z) z[1] >= w - tol && z[2] <= e + tol, NA)) }
+u$bbox_ok <- !is.na(u$pw) & pmap_lgl(list(u$lon_a, u$lon_b, u$pw, u$pe), lon_inside) & u$lat_s >= u$ps - 0.5 & u$lat_n <= u$pn + 0.5
+tibble(`v7 rng_iucn models` = nrow(m7), `with a published COG (the inputs the app shows)` = sum(m7$has_cog),
+       `exact name hit in v9` = sum(!is.na(j$n9)), `... unambiguous (1 v7 : 1 v9)` = sum(j$n7 == 1 & j$n9 %in% 1),
+       `... with a COG, unambiguous, original on disk` = nrow(u), `... and bbox agrees` = sum(u$bbox_ok),
+       `... bbox disagrees` = sum(!u$bbox_ok)) |> pivot_longer(everything()) |> knitr::kable(caption = "v7 rng_iucn → v9 original")
+write_parquet(u |> transmute(mdl_seq, name7, id_no, mdl_key_v9, bbox_ok, lon_a, lon_b, lat_s, lat_n, pw, ps, pe, pn),
+              glue("{dir_as}/v7_rng_iucn_match.parquet"))
+u |> filter(!bbox_ok) |> select(mdl_seq, name7, id_no, lon_a, lon_b, lat_s, lat_n, pw, pe, ps, pn) |> head(10) |> knitr::kable(caption = "first disagreements (all antimeridian-crossing Pacific ranges?)")
+```
