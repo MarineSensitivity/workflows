@@ -128,9 +128,10 @@ A *small edge* failure differs in < 1% of its pixels; a *gross* one in ≥ 1%.
 
 ```{r}
 #| label: diagnose
+#| results: asis
 
 fail <- ob |> filter(status == "inconsistent")
-cat(sprintf("%d inconsistent objects (%d distinct by folder+name+bytes)\n", nrow(fail), nrow(distinct(fail, grp, file, etag))))
+cat(sprintf("\n%d inconsistent objects (%d distinct by folder+name+bytes)\n\n", nrow(fail), nrow(distinct(fail, grp, file, etag))))
 
 # the rows that SHOULD be in the object, per folder -- a self-contained worker: DuckDB reads the model's own rows (max(val) per cell,
 # the value the merge consumes), the decoded COG is registered as a table, and ONE full outer join counts the differences
@@ -141,7 +142,12 @@ diag_worker <- function(o, atlas_root, grid) {
   ad <- file.path(atlas_root, o$ver, "marine-atlas")
   rows_sql <- if (o$grp %in% c("am", "ax", "dps_nmfs", "vec_grid")) {
     ds <- sub("\\|.*$", "", o$mdl_key); id <- sub("^[^|]*\\|", "", o$mdl_key)
-    sprintf("SELECT cell_id, max(val) AS val, count(*) AS reps FROM read_parquet('%s/dist/dataset=%s/%s.parquet') GROUP BY cell_id", ad, ds, id)   # the merge consumes max(val) per cell
+    dd <- file.path(ad, "dist", paste0("dataset=", ds))
+    # a model can span several files (rng_turtle_swot_dps: 14 files, 6 models; vec_grid painted ONE file per model): for a small
+    # dataset read the model's rows across ALL of them; for the big per-model ones the file named for the model is the model
+    src <- if (length(list.files(dd, "parquet$")) <= 200) sprintf("(SELECT cell_id, val FROM read_parquet('%s/*.parquet') WHERE mdl_key = '%s')", dd, o$mdl_key)
+           else sprintf("read_parquet('%s/%s.parquet')", dd, id)
+    sprintf("SELECT cell_id, max(val) AS val, count(*) AS reps FROM %s GROUP BY cell_id", src)   # the merge consumes max(val) per cell
   } else if (o$grp == "merged") {
     dbExecute(con, sprintf("ATTACH '%s/merge.duckdb' AS m (READ_ONLY)", ad))
     id <- dbGetQuery(con, sprintf("SELECT mkey_id FROM m.mkey_map WHERE ms_merge_key = '%s'", o$mdl_key))$mkey_id
@@ -168,6 +174,14 @@ if (nrow(fail)) {
   fd <- fail |> distinct(grp, file, etag, .keep_all = TRUE)
   if (test_n > 0) fd <- slice_head(fd, n = test_n)
   f <- glue("{dir_out}/diagnose.parquet")
+  multi <- grepl("^rng_turtle_swot_dps\\|", fd$mdl_key)                          # models whose rows span several files: always recomputed
+  if (!redo && file_exists(f) && any(multi)) {
+    cached_d <- as_tibble(read_parquet(f)); cached_d <- cached_d[!grepl("^rng_turtle_swot_dps\\|", cached_d$mdl_key), ]
+    plan(multisession, workers = n_workers)
+    x <- bind_rows(future_map(split(fd[multi, ], seq_len(sum(multi))), diag_worker, atlas_root = dir_big_x, grid = grid_g05,
+          .options = furrr_options(seed = TRUE, packages = c("terra", "msens", "DBI", "duckdb", "dplyr"))))
+    plan(sequential); write_parquet(bind_rows(cached_d, x), f)
+  }
   diag <- if (!redo && file_exists(f)) as_tibble(read_parquet(f)) else {
     plan(multisession, workers = n_workers); t0 <- Sys.time()
     x <- bind_rows(future_map(split(fd, seq_len(nrow(fd))), diag_worker, atlas_root = dir_big_x, grid = grid_g05,
@@ -184,12 +198,12 @@ if (nrow(fail)) {
     mutate(equals_other_model = !is.na(mdl_other) & mdl_other != mdl_key) |>
     group_by(across(-c(grp_o, mdl_other, equals_other_model))) |> summarise(equals_other_model = any(equals_other_model),
       other_model = first(mdl_other[equals_other_model]), .groups = "drop")
-  diag |> count(grp, class, equals_other_model) |> knitr::kable(caption = "failures by class (grp × class × is-it-another-model's-surface)")
+  diag |> count(grp, class, equals_other_model) |> knitr::kable(caption = "failures by class (grp × class × is-it-another-model's-surface)") |> print()
   diag |> group_by(grp, class) |> summarise(objects = n(), median_frac = median(frac), max_frac = max(frac),
     median_diff_px = median(diff_px), only_cog = sum(only_cog), only_rows = sum(only_rows), val_diff = sum(val_diff), .groups = "drop") |>
-    knitr::kable(caption = "pixel differences (fraction = differing pixels / larger of the two sets)")
+    knitr::kable(caption = "pixel differences (fraction = differing pixels / larger of the two sets)") |> print()
   diag |> filter(class == "gross") |> arrange(desc(frac)) |> select(ver, grp, mdl_key, n_cog, n_rows, only_cog, only_rows, val_diff, frac, equals_other_model, other_model) |>
-    head(25) |> knitr::kable(caption = "the worst (gross) failures")
+    head(25) |> knitr::kable(caption = "the worst (gross) failures") |> print()
 } else diag <- tibble()
 ```
 
@@ -203,6 +217,7 @@ same size (pixel count), i.e. the neighbour's rows moved since?
 
 ```{r}
 #| label: shift
+#| results: asis
 
 if (nrow(diag)) {
   am_pos <- map_dfr(unique(diag$ver), function(v) {
@@ -223,17 +238,17 @@ if (nrow(diag)) {
     mutate(explained = case_when(equals_other_model ~ "exact: equals another model's current surface",
                                  nzchar(coalesce(count_match_offsets, "")) ~ "same pixel count as a neighbour (its rows moved since)",
                                  TRUE ~ "not a shift"))
-  cat(sprintf("gross am failures: %d (distinct objects)\n", nrow(by_hash)))
-  by_hash |> count(explained) |> knitr::kable(caption = "gross am failures explained by a positional shift")
-  by_hash |> filter(equals_other_model) |> count(offset) |> arrange(desc(n)) |> head(20) |> knitr::kable(caption = "offset (other model's position - this model's position) in the sorted served-key order")
+  cat(sprintf("\ngross am failures: %d (distinct objects)\n\n", nrow(by_hash)))
+  by_hash |> count(explained) |> knitr::kable(caption = "gross am failures explained by a positional shift") |> print()
+  by_hash |> filter(equals_other_model) |> count(offset) |> arrange(desc(n)) |> head(20) |> knitr::kable(caption = "offset (other model's position - this model's position) in the sorted served-key order") |> print()
   by_hash |> filter(explained == "not a shift") |> select(ver, mdl_key, n_cog, n_rows, only_cog, only_rows, val_diff, frac) |> head(20) |>
-    knitr::kable(caption = "gross failures that are NOT a shift (characterised on their own)")
+    knitr::kable(caption = "gross failures that are NOT a shift (characterised on their own)") |> print()
   # the small class: where do the differing cells sit?
   small <- diag |> filter(grp == "am", class == "small edge")
   if (nrow(small)) tibble(objects = nrow(small), only_cog = sum(small$only_cog), only_cog_at_value1 = sum(small$only_cog_at1),
       only_rows = sum(small$only_rows), only_rows_at_value1 = sum(small$only_rows_at1), val_diff = sum(small$val_diff),
       val_diff_max = max(small$val_diff_max)) |> pivot_longer(everything()) |>
-    knitr::kable(caption = "small-edge class: how many differing cells sit exactly at the nodata threshold (value 1)")
+    knitr::kable(caption = "small-edge class: how many differing cells sit exactly at the nodata threshold (value 1)") |> print()
 }
 ```
 
@@ -247,6 +262,7 @@ pixel hash the key promises. A cell the rows repeat takes `max(val)` — what `t
 
 ```{r}
 #| label: repaint
+#| results: asis
 
 good_keys <- ob |> filter(status %in% c("consistent", "vector (source hash; bounds sampled in M1)")) |> pull(key) |> unique()
 need <- ob |> filter(status %in% c("inconsistent", "not decoded"), !key %in% good_keys) |> arrange(desc(ver)) |> distinct(key, .keep_all = TRUE)
@@ -259,7 +275,10 @@ paint_one <- function(o, dir_stage, atlas_root, grid, enc_cog) {
   ad <- file.path(atlas_root, o$ver, "marine-atlas")
   if (o$grp %in% c("am", "ax", "dps_nmfs", "vec_grid")) {
     ds <- sub("\\|.*$", "", o$mdl_key); id <- sub("^[^|]*\\|", "", o$mdl_key)
-    d <- dbGetQuery(con, sprintf("SELECT cell_id, max(val) AS val FROM read_parquet('%s/dist/dataset=%s/%s.parquet') GROUP BY cell_id", ad, ds, id))
+    dd <- file.path(ad, "dist", paste0("dataset=", ds))
+    src <- if (length(list.files(dd, "parquet$")) <= 200) sprintf("(SELECT cell_id, val FROM read_parquet('%s/*.parquet') WHERE mdl_key = '%s')", dd, o$mdl_key)
+           else sprintf("read_parquet('%s/%s.parquet')", dd, id)           # see diag_worker: a model can span several files
+    d <- dbGetQuery(con, sprintf("SELECT cell_id, max(val) AS val FROM %s GROUP BY cell_id", src))
     if (o$grp == "ax") d$val <- round(d$val)
   } else if (o$grp == "merged") {
     dbExecute(con, sprintf("ATTACH '%s/merge.duckdb' AS m (READ_ONLY)", ad))
@@ -279,7 +298,19 @@ paint_one <- function(o, dir_stage, atlas_root, grid, enc_cog) {
 }
 painted <- if (nrow(need)) {
   f <- glue("{dir_out}/repainted.parquet")
-  if (!redo && file_exists(f)) as_tibble(read_parquet(f)) else {
+  if (!redo && file_exists(f)) {
+    r0 <- as_tibble(read_parquet(f)); stale <- grepl("^rng_turtle_swot_dps\\|", r0$mdl_key)       # painted from ONE file of a multi-file model
+    if (any(stale)) {
+      unlink(r0$staged[stale]); r0 <- r0[!stale, ]
+      plan(multisession, workers = n_workers)
+      r1 <- bind_rows(future_map(split(need[grepl("^rng_turtle_swot_dps\\|", need$mdl_key), ], seq_len(sum(grepl("^rng_turtle_swot_dps\\|", need$mdl_key)))), paint_one,
+            dir_stage = as.character(dir_stage), atlas_root = dir_big_x, grid = grid_g05, enc_cog = enc_of[["cog_model"]],
+            .options = furrr_options(seed = TRUE, packages = c("terra", "msens", "DBI", "duckdb", "dplyr")))) |>
+        left_join(need |> select(old_key = key, ver, grp, mdl_key), by = "old_key")
+      plan(sequential); r0 <- bind_rows(r0, r1); write_parquet(r0, f)
+    }
+    r0
+  } else {
     plan(multisession, workers = n_workers); t0 <- Sys.time()
     r <- bind_rows(future_map(split(need, seq_len(nrow(need))), paint_one, dir_stage = as.character(dir_stage),
         atlas_root = dir_big_x, grid = grid_g05, enc_cog = enc_of[["cog_model"]],
@@ -289,7 +320,7 @@ painted <- if (nrow(need)) {
 } else tibble()
 if (nrow(painted)) {
   painted |> group_by(grp) |> summarise(repainted = n(), verified = sum(verified), GB = round(sum(bytes) / 1e9, 3),
-    key_changed_by_dedup = sum(key != old_key), .groups = "drop") |> knitr::kable(caption = "local repaints (decoded == the quantised rows)")
+    key_changed_by_dedup = sum(key != old_key), .groups = "drop") |> knitr::kable(caption = "local repaints (decoded == the quantised rows)") |> print()
   stopifnot("a repaint does not decode to its rows" = all(painted$verified))
 }
 ```
