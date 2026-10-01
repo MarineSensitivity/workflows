@@ -64,6 +64,13 @@ sm  <- read_parquet(glue("{dir_as}/store_migration.parquet")) |> as_tibble()
 ver_q <- read_parquet(glue("{dir_as}/verify_raster.parquet")) |> as_tibble()    # ver, grp, file, etag, stem, key(old), bytes, mdl_key, n_obs, q_obs, n_exp, q_exp, status
 exp_q <- read_parquet(glue("{dir_as}/verify_expected.parquet")) |> as_tibble()   # ver, grp, mdl_key, stem, n_exp, q_exp  (current rows, quantised, NO dedup)
 h_ax  <- read_parquet(glue("{dir_as}/h_ax_native_v9.parquet")) |> as_tibble()    # stem, n, content_hash  (decoded Float32 pixels)
+# v8 and v9 `dist/dataset=am` are byte-identical copies, so the quantised am rows were hashed once (M1 shares them in memory;
+# the cached parquet holds v9's). Share them here -- after PROVING the two releases' raw am hashes are equal for every model.
+h8 <- read_parquet(glue("{dir_as}/h_dist_am_v8.parquet")); h9 <- read_parquet(glue("{dir_as}/h_dist_am_v9.parquet"))
+stopifnot("v8 and v9 dist am differ: the quantised am rows must be hashed per release" =
+            identical(h8[order(h8$mdl_key), c("mdl_key", "content_hash")], h9[order(h9$mdl_key), c("mdl_key", "content_hash")]))
+miss <- setdiff(unique(sm$ver), exp_q$ver[exp_q$grp == "am"])
+if (length(miss)) exp_q <- bind_rows(exp_q, exp_q |> filter(grp == "am") |> select(-ver) |> tidyr::crossing(ver = miss))
 
 enc_of <- c(cog_model = asset_enc("cog_model"), native_am = asset_enc("native_am"),
             native_ax = asset_enc("native_ax"), native_pmtiles = asset_enc("native_pmtiles"))
@@ -125,48 +132,43 @@ A *small edge* failure differs in < 1% of its pixels; a *gross* one in ≥ 1%.
 fail <- ob |> filter(status == "inconsistent")
 cat(sprintf("%d inconsistent objects (%d distinct by folder+name+bytes)\n", nrow(fail), nrow(distinct(fail, grp, file, etag))))
 
-# the rows that SHOULD be in the object, per folder (the staging chunk paints from the same function)
-rows_for <- function(con, ver, grp, mdl_key) {
-  if (grp %in% c("am", "ax", "dps_nmfs", "vec_grid")) {
-    ds <- sub("\\|.*$", "", mdl_key); f <- glue("{atlas_dir(ver)}/dist/dataset={ds}/{sub('^[^|]*\\\\|', '', mdl_key)}.parquet")
-    d <- dbGetQuery(con, glue("SELECT cell_id, val, count(*) OVER (PARTITION BY cell_id) AS reps FROM read_parquet('{f}')"))
-    return(list(raw = d, painted = d |> group_by(cell_id) |> summarise(val = max(val), .groups = "drop")))      # the merge consumes max(val) per cell
-  }
-  if (grp == "merged") {
-    dbExecute(con, glue("ATTACH IF NOT EXISTS '{atlas_dir(ver)}/merge.duckdb' AS m_{ver} (READ_ONLY)"))
-    id <- dbGetQuery(con, glue("SELECT mkey_id FROM m_{ver}.mkey_map WHERE ms_merge_key = '{mdl_key}'"))$mkey_id
-    if (length(id)) {
-      d <- dbGetQuery(con, glue("SELECT cell_id, round_even(max(val), 0) AS val, 1 AS reps FROM read_parquet('{atlas_dir(ver)}/mc_parts/mkey_id={id}/*.parquet') GROUP BY cell_id"))
-      return(list(raw = d, painted = d))
-    }
-    d <- dbGetQuery(con, glue("SELECT cell_id, val, 1 AS reps FROM read_parquet('{atlas_dir(ver)}/dist_merged_global/**/*.parquet') WHERE mdl_key = '{mdl_key}'"))
-    return(list(raw = d, painted = d))
-  }
-  stop("no row source for ", grp)
-}
-quant <- function(v, grp) pmin(255, trunc(if (grp == "ax") round(v) else v))
-diag_one <- function(con, o) {
-  r <- rows_for(con, o$ver, o$grp, o$mdl_key)
-  dec <- native_raster_rows(rast(glue("{atlas_dir(o$ver)}/native/{o$rel}")), grid_g05)
-  x <- r$painted; x$q <- quant(x$val, o$grp); x <- x[x$q >= 1, ]
+# the rows that SHOULD be in the object, per folder -- a self-contained worker (own DuckDB connection, no glue/globals)
+diag_worker <- function(o, atlas_root, grid) {
+  suppressMessages({library(DBI); library(duckdb); library(terra); library(msens); library(dplyr)})
+  con <- dbConnect(duckdb(), config = list(threads = "2", memory_limit = "3GB")); on.exit(dbDisconnect(con, shutdown = TRUE))
+  ad <- file.path(atlas_root, o$ver, "marine-atlas")
+  if (o$grp %in% c("am", "ax", "dps_nmfs", "vec_grid")) {
+    ds <- sub("\\|.*$", "", o$mdl_key); id <- sub("^[^|]*\\|", "", o$mdl_key)
+    raw <- dbGetQuery(con, sprintf("SELECT cell_id, val, count(*) OVER (PARTITION BY cell_id) AS reps FROM read_parquet('%s/dist/dataset=%s/%s.parquet')", ad, ds, id))
+    painted <- raw |> group_by(cell_id) |> summarise(val = max(val), .groups = "drop")        # the merge consumes max(val) per cell
+  } else if (o$grp == "merged") {
+    dbExecute(con, sprintf("ATTACH '%s/merge.duckdb' AS m (READ_ONLY)", ad))
+    id <- dbGetQuery(con, sprintf("SELECT mkey_id FROM m.mkey_map WHERE ms_merge_key = '%s'", o$mdl_key))$mkey_id
+    raw <- if (length(id)) dbGetQuery(con, sprintf("SELECT cell_id, round_even(max(val), 0) AS val, 1 AS reps FROM read_parquet('%s/mc_parts/mkey_id=%d/*.parquet') GROUP BY cell_id", ad, id))
+           else dbGetQuery(con, sprintf("SELECT cell_id, val, 1 AS reps FROM read_parquet('%s/dist_merged_global/**/*.parquet') WHERE mdl_key = '%s'", ad, o$mdl_key))
+    painted <- raw
+  } else stop("no row source for ", o$grp)
+  dec <- native_raster_rows(terra::rast(file.path(ad, "native", o$rel)), grid)
+  x <- painted; x$q <- pmin(255, trunc(if (o$grp == "ax") round(x$val) else x$val)); x <- x[x$q >= 1, ]
   j <- merge(dec, x[, c("cell_id", "q")], by = "cell_id", all = TRUE)
-  tibble(n_cog = nrow(dec), n_rows = nrow(x), only_cog = sum(is.na(j$q)), only_rows = sum(is.na(j$val)),
-         val_diff = sum(!is.na(j$q) & !is.na(j$val) & j$q != j$val), dup_cells = sum(r$raw$reps > 1) / 2,
-         # a quantisation edge would put every differing cell AT the nodata threshold (value 1): count them
-         only_cog_at1 = sum(is.na(j$q) & j$val == 1, na.rm = TRUE), only_rows_at1 = sum(is.na(j$val) & j$q == 1, na.rm = TRUE),
-         val_diff_max = suppressWarnings(max(abs(j$val - j$q)[!is.na(j$q) & !is.na(j$val) & j$q != j$val], 0)))
+  dv <- !is.na(j$q) & !is.na(j$val) & j$q != j$val
+  tibble::tibble(ver = o$ver, grp = o$grp, file = o$file, etag = o$etag, mdl_key = o$mdl_key,
+    n_cog = nrow(dec), n_rows = nrow(x), only_cog = sum(is.na(j$q)), only_rows = sum(is.na(j$val)), val_diff = sum(dv),
+    dup_cells = sum(raw$reps > 1) / 2,
+    # a quantisation edge would put every differing cell AT the nodata threshold (value 1): count them
+    only_cog_at1 = sum(is.na(j$q) & j$val == 1, na.rm = TRUE), only_rows_at1 = sum(is.na(j$val) & j$q == 1, na.rm = TRUE),
+    val_diff_max = if (any(dv)) max(abs(j$val - j$q)[dv]) else 0)
 }
 if (nrow(fail)) {
   fd <- fail |> distinct(grp, file, etag, .keep_all = TRUE)
   if (test_n > 0) fd <- slice_head(fd, n = test_n)
-  con <- dbConnect(duckdb(), config = list(threads = "4", memory_limit = "6GB"))
-  diag <- cached_diag <- {
-    f <- glue("{dir_out}/diagnose.parquet")
-    if (!redo && file_exists(f)) as_tibble(read_parquet(f)) else {
-      x <- map_dfr(seq_len(nrow(fd)), function(i) bind_cols(fd[i, c("ver", "grp", "file", "etag", "mdl_key")], diag_one(con, fd[i, ])))
-      write_parquet(x, f); x }
-  }
-  dbDisconnect(con, shutdown = TRUE)
+  f <- glue("{dir_out}/diagnose.parquet")
+  diag <- if (!redo && file_exists(f)) as_tibble(read_parquet(f)) else {
+    plan(multisession, workers = n_workers); t0 <- Sys.time()
+    x <- bind_rows(future_map(split(fd, seq_len(nrow(fd))), diag_worker, atlas_root = dir_big_x, grid = grid_g05,
+          .options = furrr_options(seed = TRUE, packages = c("terra", "msens", "DBI", "duckdb", "dplyr"))))
+    plan(sequential); log_info("diagnosed {nrow(x)} failing objects in {round(as.numeric(Sys.time() - t0, units = 'mins'), 1)} min")
+    write_parquet(x, f); x }
   diag <- diag |> mutate(diff_px = only_cog + only_rows + val_diff, frac = diff_px / pmax(n_cog, n_rows, 1),
                          class = case_when(dup_cells > 0 & diff_px == 0 ~ "duplicate rows only",
                                            frac < 0.01 ~ "small edge", TRUE ~ "gross"))
@@ -211,6 +213,7 @@ if (nrow(diag)) {
       filter(n_exp == n_cog)
     tibble(ver = ver, mdl_key = mdl_key, count_match_offsets = paste(cand$mid - pos, collapse = ","))
   })
+  if (!nrow(nb)) nb <- tibble(ver = character(), mdl_key = character(), count_match_offsets = character())
   by_hash <- by_hash |> left_join(nb, by = c("ver", "mdl_key")) |>
     mutate(explained = case_when(equals_other_model ~ "exact: equals another model's current surface",
                                  nzchar(coalesce(count_match_offsets, "")) ~ "same pixel count as a neighbour (its rows moved since)",
@@ -286,39 +289,46 @@ if (nrow(painted)) {
 }
 ```
 
-## 5 · `rng_iucn` on v7: the 34 bbox failures, dateline-aware
+## 5 · `rng_iucn` on v7: the 34 bbox failures, tested cell by cell
 
-M1 compared the v7 surface's extent with the v9 PMTiles **header bounds**. A range crossing the antimeridian has header
-bounds clipped to ±180 (e.g. −179 … 173), which is not its footprint. Here each of the 34 is compared with the SOURCE
-geometry's longitude span, taken in whichever frame (−180..180 or 0..360) is narrower, against the v7 interval.
+M1 compared the v7 surface's *extent* with the v9 PMTiles *header bounds*. Both are envelopes: a range crossing the
+antimeridian has header bounds clipped to ±180 (e.g. −179 … 173), and a near-global deep-sea range has an envelope that
+says nothing. The question that matters is whether the cells v7 actually draws lie on the range. So for each of the 34:
+sample up to 300 of its v7 cells (`model_cell`, `usa05`, 0–360° longitude, wrapped to a point) and measure how many lie
+within 25 km of the SOURCE range polygon (the indexed IUCN GeoPackage). **Agree = at least 95% of the sampled cells.**
+The same test is run on 60 of the 1,426 that already passed, to show the criterion does not reject a good match.
 
 ```{r}
 #| label: v7-34
 
 m7 <- read_parquet(glue("{dir_as}/v7_rng_iucn_match.parquet")) |> as_tibble()
-bad <- m7 |> filter(!bbox_ok)
 iucn_gpkg <- glue("{atlas_dir('v9')}/native/src/rng_iucn.gpkg")
-span <- function(id) {
-  p <- st_read(iucn_gpkg, quiet = TRUE, query = sprintf("SELECT * FROM rng_iucn WHERE mdl_key = 'rng_iucn|%s'", id)) |> st_zm(drop = TRUE)
-  g <- st_geometry(p); a <- st_bbox(g); b <- st_bbox(st_shift_longitude(g))
-  w <- if ((b[["xmax"]] - b[["xmin"]]) < (a[["xmax"]] - a[["xmin"]])) c(b[["xmin"]], b[["xmax"]]) else c(a[["xmin"]], a[["xmax"]])   # narrower frame
-  c(lon_lo = w[1], lon_hi = w[2], lat_lo = a[["ymin"]], lat_hi = a[["ymax"]])
+g7 <- grid_spec_for("usa05")
+set.seed(1)
+chk <- bind_rows(m7 |> filter(!bbox_ok) |> mutate(set = "bbox failures"),
+                 m7 |> filter(bbox_ok) |> slice_sample(n = 60) |> mutate(set = "bbox passes (control)"))
+con7 <- dbConnect(duckdb(glue("{dir_big_x}/v7/sdm.duckdb"), read_only = TRUE), config = list(threads = "4", memory_limit = "6GB"))
+cells <- dbGetQuery(con7, glue("SELECT mdl_seq, cell_id FROM model_cell WHERE mdl_seq IN ({paste(chk$mdl_seq, collapse = ',')})
+   QUALIFY row_number() OVER (PARTITION BY mdl_seq ORDER BY hash(cell_id)) <= 300")) |> as_tibble()
+dbDisconnect(con7, shutdown = TRUE)
+sf_use_s2(TRUE)
+frac_near <- function(mdl_seq, id_no) {
+  p <- st_read(iucn_gpkg, quiet = TRUE, query = sprintf("SELECT * FROM rng_iucn WHERE mdl_key = 'rng_iucn|%s'", id_no)) |> st_zm(drop = TRUE)
+  poly <- st_union(st_make_valid(st_geometry(p))); st_crs(poly) <- 4326
+  cl <- cells[cells$mdl_seq == mdl_seq, ]; ll <- cell_lonlat(cl$cell_id, g7, wrap = TRUE)
+  pts <- st_as_sf(ll, coords = c("lon", "lat"), crs = 4326)
+  mean(lengths(st_is_within_distance(pts, poly, dist = 25000)) > 0)
 }
-sp <- t(vapply(bad$id_no, span, numeric(4))); bad <- bind_cols(bad, as_tibble(sp))
-# the source span may be expressed in -180..180 (lo > hi crossing is not representable) or 0..360; normalise both to 0..360 and compare
-to360 <- function(x) ifelse(x < 0, x + 360, x)
-bad$ok_dateline <- with(bad, {
-  lo <- to360(lon_lo); hi <- to360(lon_hi); hi <- ifelse(hi < lo, hi + 360, hi)       # a crossing span unrolled past 360
-  a <- lon_a; b <- lon_b                                                              # v7 interval, 0..360 frame (can exceed 360 never)
-  inside <- (a >= lo - 0.5 & b <= hi + 0.5) | (a + 360 >= lo - 0.5 & b + 360 <= hi + 0.5)
-  inside & lat_s >= lat_lo - 0.5 & lat_n <= lat_hi + 0.5 })
-cat(sprintf("v7 rng_iucn bbox failures re-checked against the source geometry: %d of %d now agree; %d remain\n",
-            sum(bad$ok_dateline), nrow(bad), sum(!bad$ok_dateline)))
-bad |> filter(!ok_dateline) |> select(mdl_seq, name7, id_no, lon_a, lon_b, lat_s, lat_n, lon_lo, lon_hi, lat_lo, lat_hi) |>
-  knitr::kable(caption = "remaining v7 rng_iucn disagreements (v7 extent vs source-geometry extent)")
-m7 <- m7 |> left_join(bad |> select(mdl_seq, ok_dateline), by = "mdl_seq") |> mutate(bbox_ok_final = bbox_ok | coalesce(ok_dateline, FALSE))
+chk$frac_cells_on_range <- map2_dbl(chk$mdl_seq, chk$id_no, ~ tryCatch(frac_near(.x, .y), error = function(e) NA_real_))
+chk$agrees <- !is.na(chk$frac_cells_on_range) & chk$frac_cells_on_range >= 0.95
+chk |> group_by(set) |> summarise(tested = n(), agree = sum(agrees), disagree = sum(!agrees),
+  median_frac = median(frac_cells_on_range, na.rm = TRUE), .groups = "drop") |> knitr::kable(caption = "cell-level test of v7 rng_iucn originals")
+chk |> filter(!agrees) |> select(mdl_seq, name7, id_no, frac_cells_on_range, set) |> knitr::kable(caption = "v7 rng_iucn inputs whose cells are NOT on the range")
+m7 <- m7 |> left_join(chk |> filter(set == "bbox failures") |> select(mdl_seq, cell_ok = agrees), by = "mdl_seq") |>
+  mutate(final_ok = if_else(bbox_ok, TRUE, coalesce(cell_ok, FALSE)))
 write_parquet(m7, glue("{dir_out}/v7_rng_iucn_match_final.parquet"))
-cat(sprintf("final: %d of %d exact+unambiguous v7 rng_iucn inputs with a COG have an original that agrees\n", sum(m7$bbox_ok_final), nrow(m7)))
+cat(sprintf("final: %d of %d exact+unambiguous v7 rng_iucn inputs with a COG have an original whose range holds the cells v7 draws (was 1,426 on the bbox test)\n",
+            sum(m7$final_ok), nrow(m7)))
 ```
 
 ## 6 · The execution manifest (written, NOT run)
@@ -352,7 +362,7 @@ plan_ <- bind_rows(copy_rows, up_rows |> filter(!key %in% copy_rows$key)) |> dis
 # keys the pointer tables need but no object/repaint provides = a hole in the plan
 holes <- setdiff(need_keys, plan_$key)
 cat(sprintf("keys the included objects need: %d; in the plan: %d; holes: %d\n", length(need_keys), nrow(plan_), length(holes)))
-stopifnot("the plan leaves keys without a source" = length(holes) == 0)
+if (test_n > 0) { if (length(holes)) log_warn("test mode: {length(holes)} keys have no source (repaint is truncated to {test_n})"); plan_ <- plan_ } else stopifnot("the plan leaves keys without a source" = length(holes) == 0)
 
 # md5 of every stored object: a single-part ETag is the MD5; a multipart source or a repaint is hashed from the local file
 need_md5 <- which(is.na(plan_$md5))
