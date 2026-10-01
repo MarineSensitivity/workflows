@@ -304,30 +304,36 @@ The same test is run on 60 of the 1,426 that already passed, to show the criteri
 m7 <- read_parquet(glue("{dir_as}/v7_rng_iucn_match.parquet")) |> as_tibble()
 iucn_gpkg <- glue("{atlas_dir('v9')}/native/src/rng_iucn.gpkg")
 g7 <- grid_spec_for("usa05")
-set.seed(1)
-chk <- bind_rows(m7 |> filter(!bbox_ok) |> mutate(set = "bbox failures"),
-                 m7 |> filter(bbox_ok) |> slice_sample(n = 60) |> mutate(set = "bbox passes (control)"))
+# the cell test is applied to ALL exact+unambiguous matches (the 1,426 that passed the bbox test included): the bbox test
+# turned out to be both too strict (dateline, near-global ranges) and too lenient (2 of a 60-control the cells reject)
+chk <- m7 |> mutate(set = if_else(bbox_ok, "passed the bbox test", "failed the bbox test"))
+if (test_n > 0) chk <- slice_head(chk, n = test_n * 5)
 con7 <- dbConnect(duckdb(glue("{dir_big_x}/v7/sdm.duckdb"), read_only = TRUE), config = list(threads = "4", memory_limit = "6GB"))
 cells <- dbGetQuery(con7, glue("SELECT mdl_seq, cell_id FROM model_cell WHERE mdl_seq IN ({paste(chk$mdl_seq, collapse = ',')})
    QUALIFY row_number() OVER (PARTITION BY mdl_seq ORDER BY hash(cell_id)) <= 300")) |> as_tibble()
 dbDisconnect(con7, shutdown = TRUE)
-sf_use_s2(TRUE)
-frac_near <- function(mdl_seq, id_no) {
-  p <- st_read(iucn_gpkg, quiet = TRUE, query = sprintf("SELECT * FROM rng_iucn WHERE mdl_key = 'rng_iucn|%s'", id_no)) |> st_zm(drop = TRUE)
-  poly <- st_union(st_make_valid(st_geometry(p))); st_crs(poly) <- 4326
-  cl <- cells[cells$mdl_seq == mdl_seq, ]; ll <- cell_lonlat(cl$cell_id, g7, wrap = TRUE)
-  pts <- st_as_sf(ll, coords = c("lon", "lat"), crs = 4326)
-  mean(lengths(st_is_within_distance(pts, poly, dist = 25000)) > 0)
+frac_worker <- function(o, cells, gpkg, g7) {
+  suppressMessages({library(sf); library(msens)}); sf_use_s2(TRUE)
+  tryCatch({
+    p <- st_read(gpkg, quiet = TRUE, query = sprintf("SELECT * FROM rng_iucn WHERE mdl_key = 'rng_iucn|%s'", o$id_no)) |> st_zm(drop = TRUE)
+    poly <- st_union(st_make_valid(st_geometry(p))); st_crs(poly) <- 4326
+    cl <- cells[cells$mdl_seq == o$mdl_seq, ]; ll <- cell_lonlat(cl$cell_id, g7, wrap = TRUE)
+    pts <- st_as_sf(ll, coords = c("lon", "lat"), crs = 4326)
+    mean(lengths(st_is_within_distance(pts, poly, dist = 25000)) > 0)
+  }, error = function(e) NA_real_)
 }
-chk$frac_cells_on_range <- map2_dbl(chk$mdl_seq, chk$id_no, ~ tryCatch(frac_near(.x, .y), error = function(e) NA_real_))
+plan(multisession, workers = n_workers); t0 <- Sys.time()
+chk$frac_cells_on_range <- unlist(future_map(split(chk, seq_len(nrow(chk))), frac_worker, cells = cells, gpkg = as.character(iucn_gpkg), g7 = g7,
+                                             .options = furrr_options(seed = TRUE, packages = c("sf", "msens"))), use.names = FALSE)
+plan(sequential); log_info("cell test on {nrow(chk)} v7 rng_iucn matches in {round(as.numeric(Sys.time() - t0, units = 'mins'), 1)} min")
 chk$agrees <- !is.na(chk$frac_cells_on_range) & chk$frac_cells_on_range >= 0.95
 chk |> group_by(set) |> summarise(tested = n(), agree = sum(agrees), disagree = sum(!agrees),
   median_frac = median(frac_cells_on_range, na.rm = TRUE), .groups = "drop") |> knitr::kable(caption = "cell-level test of v7 rng_iucn originals")
-chk |> filter(!agrees) |> select(mdl_seq, name7, id_no, frac_cells_on_range, set) |> knitr::kable(caption = "v7 rng_iucn inputs whose cells are NOT on the range")
-m7 <- m7 |> left_join(chk |> filter(set == "bbox failures") |> select(mdl_seq, cell_ok = agrees), by = "mdl_seq") |>
-  mutate(final_ok = if_else(bbox_ok, TRUE, coalesce(cell_ok, FALSE)))
+chk |> filter(!agrees) |> select(mdl_seq, name7, id_no, frac_cells_on_range, set) |> arrange(frac_cells_on_range) |> head(40) |>
+  knitr::kable(caption = "v7 rng_iucn inputs whose cells are NOT on the range (worst 40)")
+m7 <- m7 |> left_join(chk |> select(mdl_seq, frac_cells_on_range, cell_ok = agrees), by = "mdl_seq") |> mutate(final_ok = coalesce(cell_ok, FALSE))
 write_parquet(m7, glue("{dir_out}/v7_rng_iucn_match_final.parquet"))
-cat(sprintf("final: %d of %d exact+unambiguous v7 rng_iucn inputs with a COG have an original whose range holds the cells v7 draws (was 1,426 on the bbox test)\n",
+cat(sprintf("final: %d of %d exact+unambiguous v7 rng_iucn inputs with a COG have an original whose range holds the cells v7 draws (cell test; 1,426 passed the bbox test)\n",
             sum(m7$final_ok), nrow(m7)))
 ```
 
