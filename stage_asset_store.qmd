@@ -312,6 +312,10 @@ g7 <- grid_spec_for("usa05")
 # the cell test is applied to ALL exact+unambiguous matches (the 1,426 that passed the bbox test included): the bbox test
 # turned out to be both too strict (dateline, near-global ranges) and too lenient (2 of a 60-control the cells reject)
 chk <- m7 |> mutate(set = if_else(bbox_ok, "passed the bbox test", "failed the bbox test"))
+f_final <- glue("{dir_out}/v7_rng_iucn_match_final.parquet")
+if (!redo && test_n == 0 && file_exists(f_final)) {            # the cell test is 25 min: reuse a finished one (REDO_STAGE=1 repeats it)
+  chk <- chk |> left_join(read_parquet(f_final) |> select(mdl_seq, frac_cells_on_range), by = "mdl_seq")
+} else {
 if (test_n > 0) chk <- slice_head(chk, n = test_n * 5)
 con7 <- dbConnect(duckdb(glue("{dir_big_x}/v7/sdm.duckdb"), read_only = TRUE), config = list(threads = "4", memory_limit = "6GB"))
 cells <- dbGetQuery(con7, glue("SELECT mdl_seq, cell_id FROM model_cell WHERE mdl_seq IN ({paste(chk$mdl_seq, collapse = ',')})
@@ -331,6 +335,7 @@ plan(multisession, workers = n_workers); t0 <- Sys.time()
 chk$frac_cells_on_range <- unlist(future_map(split(chk, seq_len(nrow(chk))), frac_worker, cells = cells, gpkg = as.character(iucn_gpkg), g7 = g7,
                                              .options = furrr_options(seed = TRUE, packages = c("sf", "msens"))), use.names = FALSE)
 plan(sequential); log_info("cell test on {nrow(chk)} v7 rng_iucn matches in {round(as.numeric(Sys.time() - t0, units = 'mins'), 1)} min")
+}
 chk$agrees <- !is.na(chk$frac_cells_on_range) & chk$frac_cells_on_range >= 0.95
 chk |> group_by(set) |> summarise(tested = n(), agree = sum(agrees), disagree = sum(!agrees),
   median_frac = median(frac_cells_on_range, na.rm = TRUE), .groups = "drop") |> knitr::kable(caption = "cell-level test of v7 rng_iucn originals")
@@ -394,6 +399,8 @@ catalog <- plan_ |> transmute(store, key, content_hash, enc, asset_type = if_els
 # under cog/usa05 and the 286 v8/v9 score COGs under cog/global05 (their payload hash predates the catalog, hence NA)
 rd_legacy <- function(f, grid) {
   x <- read_tsv(glue("{dir_as}/inventory/{f}"), col_names = c("s3", "bytes", "etag", "lm"), col_types = "cdcc", show_col_types = FALSE)
+  n_other <- sum(!grepl("/[0-9a-f]{16}\\.tif$", x$s3)); if (n_other) log_info("{f}: {n_other} non-object file(s) ignored (generated index pages, not store objects)")
+  x <- x[grepl("/[0-9a-f]{16}\\.tif$", x$s3), ]
   stopifnot("a legacy store object is a multipart upload: its md5 is unknown" = !any(grepl("-", x$etag)))
   x |> transmute(store = "cog", key = sub("^marine-atlas/", "", s3), content_hash = NA_character_, enc = NA_character_, asset_type = "cog",
                  grid_id = grid, ds_key = NA_character_, bytes, md5 = gsub('"', "", etag), created = as.Date(substr(lm, 1, 10)), first_ver = NA_character_)

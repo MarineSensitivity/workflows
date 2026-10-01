@@ -30,6 +30,10 @@ list_prefix <- function(p) {
   x$key <- sub(sprintf("^%s/", root), "", x$key); x$etag <- gsub('"', "", x$etag); x
 }
 live <- do.call(rbind, lapply(prefixes, list_prefix))
+# generated pages (index.html from publish_storage_index.qmd) share these prefixes but are not store objects: list, never flag
+is_obj  <- grepl("/[0-9a-f]{16}\\.(tif|pmtiles)$", live$key)
+ignored <- live$key[!is_obj]; live <- live[is_obj, ]
+if (length(ignored)) cat(sprintf("ignored (not store objects): %s\n", paste(ignored, collapse = ", ")))
 cat(sprintf("catalog rows under %s: %d | objects listed: %d\n", paste(prefixes, collapse = ", "), nrow(cat_), nrow(live)))
 
 missing    <- setdiff(cat_$key, live$key)
