@@ -276,3 +276,53 @@ smry <- imap_dfr(na_stage, function(na, v) tibble(ver = v, pointer_rows = nrow(n
   left_join(cmp |> select(ver, taxa_with_changed_inputs, inputs_with_both_reps_published, inputs_with_both_reps_staged, largest_taxon_shard_gzip_bytes), by = "ver")
 write_parquet(smry, glue("{dir_ps}/m3_summary.parquet")); knitr::kable(smry, caption = "M3 dry run: what each release would publish")
 ```
+
+## 7 · Backup, then publish (flagged; NOT run in the dry run)
+
+Both chunks are off unless their flag is exactly `1`, and neither runs until Ben says go (`m2-m4-runbook.md`).
+
+**`PS_BACKUP=1`** — read-only. Copies what is published now for each release into `publish_stage/_backup/{ver}/`:
+`manifest.json`, `tables/native_asset.parquet` (v7/v7b have none), and the whole `app/` tree (an `aws s3 sync` *from* S3).
+With bucket versioning on (runbook step 1) every overwritten object also keeps its previous version for 30 days, so this
+is the second safety net, and the only one that lives outside the bucket.
+
+```{r}
+#| label: backup
+#| eval: !expr identical(Sys.getenv("PS_BACKUP"), "1")
+
+bk <- glue("{dir_ps}/_backup"); dir_create(bk)
+for (v in vers) {
+  d <- glue("{bk}/{v}"); dir_create(glue("{d}/tables"))
+  run <- function(args) { o <- system2("aws", args, stdout = TRUE, stderr = TRUE); st <- attr(o, "status"); if (!is.null(st) && st != 0) stop(paste(utils::tail(o, 3), collapse = "\n")); invisible(o) }
+  run(c("s3", "cp", glue("s3://oceanmetrics.io-public/marine-atlas/{v}/manifest.json"), glue("{d}/manifest.json"), "--only-show-errors"))
+  has_na <- identical(system2("aws", c("s3api", "head-object", "--bucket", "oceanmetrics.io-public", "--key", glue("marine-atlas/{v}/tables/native_asset.parquet")), stdout = FALSE, stderr = FALSE), 0L)
+  if (has_na) run(c("s3", "cp", glue("s3://oceanmetrics.io-public/marine-atlas/{v}/tables/native_asset.parquet"), glue("{d}/tables/native_asset.parquet"), "--only-show-errors"))
+  run(c("s3", "sync", glue("s3://oceanmetrics.io-public/marine-atlas/{v}/app/"), glue("{d}/app/"), "--only-show-errors"))
+  n <- length(dir_ls(glue("{d}/app"), recurse = TRUE, type = "file"))
+  log_info("{v}: backed up manifest.json, native_asset ({has_na}), {n} app objects -> {d}")
+}
+```
+
+**`PS_PUSH=1`** — uploads, per release, exactly two keys: `{ver}/tables/native_asset.parquet` and `{ver}/manifest.json`
+(plain JSON, `no-cache`, as every manifest is). It first runs `scripts/verify_asset_store.R` on the catalog and stops unless
+the store matches it, and refuses any key outside that allow-list. The shards are NOT pushed here: `build_app_bundle.qmd`
+(`APP_BUNDLE_NATIVE_ASSET_DIR=…/publish_stage APP_BUNDLE_VERS=<ver> APP_BUNDLE_S3=1`) builds them from the staged pointer table once
+the store objects exist (its gates HEAD every asset URL) and bumps `built_at`.
+
+```{r}
+#| label: push
+#| eval: !expr identical(Sys.getenv("PS_PUSH"), "1")
+
+st <- system2("Rscript", c(here("scripts/verify_asset_store.R"), glue("{dir_ps}/assets.parquet")))
+if (!identical(st, 0L)) stop("the store does not match the catalog: refusing to publish pointers that name it", call. = FALSE)
+allowed <- function(key, v) key %in% c(glue("{v}/tables/native_asset.parquet"), glue("{v}/manifest.json"))
+for (v in vers) {
+  for (spec in list(list(key = glue("{v}/tables/native_asset.parquet"), file = glue("{dir_ps}/{v}/tables/native_asset.parquet"), args = c("--content-type", "application/octet-stream")),
+                    list(key = glue("{v}/manifest.json"), file = glue("{dir_ps}/{v}/manifest.json"), args = c("--content-type", "application/json", "--cache-control", "no-cache")))) {
+    stopifnot("refusing a key outside the allow-list" = allowed(spec$key, v), file_exists(spec$file))
+    o <- system2("aws", c("s3", "cp", spec$file, glue("s3://oceanmetrics.io-public/marine-atlas/{spec$key}"), spec$args, "--only-show-errors"), stdout = TRUE, stderr = TRUE)
+    if (!is.null(attr(o, "status")) && attr(o, "status") != 0) stop(paste(o, collapse = "\n"))
+    log_info("pushed {spec$key}")
+  }
+}
+```

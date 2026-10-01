@@ -390,7 +390,7 @@ v7):
   invisible(TRUE)
 }
 
-app_bundle_open <- function(ver) {
+.app_bundle_open_raw <- function(ver) {
   v_row  <- versions_csv |> filter(ver == !!ver)
   access <- if (nrow(v_row)) v_row$access[1] else "restricted"
   db  <- path.expand(msens::sdm_db_path(ver))
@@ -430,6 +430,22 @@ app_bundle_open <- function(ver) {
     "model_asset/native_asset -- refusing to build a bundle whose merged COG urls and",
     "input assets would be silently empty"))
   list(con = NULL, db = db, ok = FALSE)
+}
+
+# asset-store M3 (default OFF): APP_BUNDLE_NATIVE_ASSET_DIR=<dir> makes the release read its pointer table from
+# <dir>/<ver>/tables/native_asset.parquet (stage_publish.qmd's publish_stage/) instead of sdm.duckdb / serve.duckdb / the cache
+# of the PUBLISHED tables, so the shards are built from the re-pointed registry BEFORE that table is the published one.
+# A temp view shadows the real table on this connection only; nothing in the database or on S3 changes. The store objects
+# the pointers name must already exist (the gates HEAD them), i.e. run it AFTER the M2 copies.
+app_bundle_open <- function(ver) {
+  res <- .app_bundle_open_raw(ver)
+  d <- Sys.getenv("APP_BUNDLE_NATIVE_ASSET_DIR")
+  if (!nzchar(d) || is.null(res$con)) return(res)
+  f <- file.path(path.expand(d), ver, "tables", "native_asset.parquet")
+  if (!file.exists(f)) stop(sprintf("APP_BUNDLE_NATIVE_ASSET_DIR is set but %s does not exist", f), call. = FALSE)
+  DBI::dbExecute(res$con, sprintf("CREATE OR REPLACE TEMP VIEW native_asset AS SELECT * FROM read_parquet('%s')", f))
+  log_warn("{ver}: native_asset is the STAGED pointer table {f} (APP_BUNDLE_NATIVE_ASSET_DIR), not the one in {res$db}")
+  res
 }
 
 # the gates below only need cell/cell_metric/zone*/taxon/metric -- always present
