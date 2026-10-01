@@ -376,6 +376,12 @@ log_info("hashing {length(need_md5)} local files for the catalog md5")
 plan_$md5[need_md5] <- ifelse(file_exists(plan_$src_local[need_md5]), vapply(plan_$src_local[need_md5], native_hash_file, ""), NA_character_)
 stopifnot("an object has no md5 (no local file for a multipart source)" = !anyNA(plan_$md5))
 
+# the object -> final store key map M3 uses to re-point every pointer table (a repainted object's key is the repaint's key)
+fin <- ob |> left_join(repaint_keys_by_old |> rename(final_key = key), by = c("key" = "old_key"), relationship = "many-to-one") |>
+  mutate(final_key = coalesce(final_key, key))
+write_parquet(fin |> transmute(ver, grp, rel, file, mdl_key, family, status, registered, old_url, raw_key = old_key, key = final_key),
+              glue("{dir_out}/object_keys.parquet"), compression = "zstd")
+stopifnot("an included object has no key in the plan" = all(fin$final_key[fin$registered | (fin$ver == "v9" & fin$grp == "vec_grid")] %in% plan_$key | test_n > 0))
 catalog <- plan_ |> transmute(store, key, content_hash, enc, asset_type = if_else(ext == "pmtiles", "pmtiles", "cog"),
   grid_id = if_else(store == "cog", scope, NA_character_), ds_key = if_else(store == "native", scope, NA_character_),
   bytes, md5, created = Sys.Date(), first_ver)
