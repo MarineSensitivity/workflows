@@ -151,7 +151,10 @@ diag_one <- function(con, o) {
   x <- r$painted; x$q <- quant(x$val, o$grp); x <- x[x$q >= 1, ]
   j <- merge(dec, x[, c("cell_id", "q")], by = "cell_id", all = TRUE)
   tibble(n_cog = nrow(dec), n_rows = nrow(x), only_cog = sum(is.na(j$q)), only_rows = sum(is.na(j$val)),
-         val_diff = sum(!is.na(j$q) & !is.na(j$val) & j$q != j$val), dup_cells = sum(r$raw$reps > 1) / 2)
+         val_diff = sum(!is.na(j$q) & !is.na(j$val) & j$q != j$val), dup_cells = sum(r$raw$reps > 1) / 2,
+         # a quantisation edge would put every differing cell AT the nodata threshold (value 1): count them
+         only_cog_at1 = sum(is.na(j$q) & j$val == 1, na.rm = TRUE), only_rows_at1 = sum(is.na(j$val) & j$q == 1, na.rm = TRUE),
+         val_diff_max = suppressWarnings(max(abs(j$val - j$q)[!is.na(j$q) & !is.na(j$val) & j$q != j$val], 0)))
 }
 if (nrow(fail)) {
   fd <- fail |> distinct(grp, file, etag, .keep_all = TRUE)
@@ -181,6 +184,49 @@ if (nrow(fail)) {
   diag |> filter(class == "gross") |> arrange(desc(frac)) |> select(ver, grp, mdl_key, n_cog, n_rows, only_cog, only_rows, val_diff, frac, equals_other_model, other_model) |>
     head(25) |> knitr::kable(caption = "the worst (gross) failures")
 } else diag <- tibble()
+```
+
+### 3a · Is a gross failure a shifted surface? (positional `mid`)
+
+`publish_native.qmd` addresses each AquaMaps model by `mid = seq_along(sorted served keys)` and persists the map beside
+the partitions (`_am_parts.map.csv`). If the served set changed after the partitions were built, `mid` moved and a COG was
+painted from a neighbour's cells. For each gross `am` failure: (1) does its COG decode to another model's CURRENT surface
+(pixel hash equal), and at what offset in the sorted key order; (2) if not exactly, is a neighbour within ±10 positions the
+same size (pixel count), i.e. the neighbour's rows moved since?
+
+```{r}
+#| label: shift
+
+if (nrow(diag)) {
+  am_pos <- map_dfr(unique(diag$ver), function(v) {
+    f <- glue("{atlas_dir(v)}/native/_am_parts.map.csv")
+    if (file_exists(f)) read_csv(f, show_col_types = FALSE) |> mutate(ver = v) else tibble() })
+  gross <- diag |> filter(grp == "am", class == "gross") |> left_join(am_pos |> select(ver, mdl_key, pos = mid), by = c("ver", "mdl_key"))
+  by_hash <- gross |> left_join(am_pos |> select(ver, other_model = mdl_key, pos_other = mid), by = c("ver", "other_model")) |>
+    mutate(offset = pos_other - pos)
+  # neighbours by pixel count, for those whose COG is not exactly another model's current surface
+  nb <- by_hash |> filter(!equals_other_model) |> select(ver, mdl_key, n_cog, pos) |> pmap_dfr(function(ver, mdl_key, n_cog, pos) {
+    cand <- am_pos |> filter(ver == !!ver, abs(mid - pos) <= 10, mid != pos) |>
+      left_join(exp_q |> filter(grp == "am") |> select(ver, mdl_key, n_exp), by = c("ver", "mdl_key")) |>
+      filter(n_exp == n_cog)
+    tibble(ver = ver, mdl_key = mdl_key, count_match_offsets = paste(cand$mid - pos, collapse = ","))
+  })
+  by_hash <- by_hash |> left_join(nb, by = c("ver", "mdl_key")) |>
+    mutate(explained = case_when(equals_other_model ~ "exact: equals another model's current surface",
+                                 nzchar(coalesce(count_match_offsets, "")) ~ "same pixel count as a neighbour (its rows moved since)",
+                                 TRUE ~ "not a shift"))
+  cat(sprintf("gross am failures: %d (distinct objects)\n", nrow(by_hash)))
+  by_hash |> count(explained) |> knitr::kable(caption = "gross am failures explained by a positional shift")
+  by_hash |> filter(equals_other_model) |> count(offset) |> arrange(desc(n)) |> head(20) |> knitr::kable(caption = "offset (other model's position - this model's position) in the sorted served-key order")
+  by_hash |> filter(explained == "not a shift") |> select(ver, mdl_key, n_cog, n_rows, only_cog, only_rows, val_diff, frac) |> head(20) |>
+    knitr::kable(caption = "gross failures that are NOT a shift (characterised on their own)")
+  # the small class: where do the differing cells sit?
+  small <- diag |> filter(grp == "am", class == "small edge")
+  if (nrow(small)) tibble(objects = nrow(small), only_cog = sum(small$only_cog), only_cog_at_value1 = sum(small$only_cog_at1),
+      only_rows = sum(small$only_rows), only_rows_at_value1 = sum(small$only_rows_at1), val_diff = sum(small$val_diff),
+      val_diff_max = max(small$val_diff_max)) |> pivot_longer(everything()) |>
+    knitr::kable(caption = "small-edge class: how many differing cells sit exactly at the nodata threshold (value 1)")
+}
 ```
 
 ## 4 · Repaint locally and verify
