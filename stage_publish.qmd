@@ -1,0 +1,278 @@
+---
+title: "Asset store · M3 · stage every release's pointer table and app shards (dry run)"
+subtitle: "Local mirror of the bucket layout; the published objects are only READ (anonymously)"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    embed-resources: false
+editor_options:
+  chunk_output_type: console
+---
+
+> **Not a pipeline stage** — milestone **M3** of
+> `.claude/plans_todo/2026-10-01 asset store — every distribution file stored once, referenced by every release.md`
+> as a **dry run**. For v9, v8, v7b and v7 it builds, into `~/_big/msens/derived/asset_store/publish_stage/{ver}/`,
+> what the release would publish once the store exists: `tables/native_asset.parquet` (every pointer on the store, with
+> `content_hash`; v9's lost vector `model` rows restored; v7/v7b's originals and the name-matched `rng_iucn` ranges),
+> the 512 app shards rebuilt from those tables, and the `manifest.json` patch. Each is diffed against what is **published
+> now** (fetched anonymously) to prove that only asset rows/URLs changed. Nothing is written to S3 or any remote.
+> Inputs: `stage/object_keys.parquet`, `stage/assets.parquet`, `stage/v7_rng_iucn_match_final.parquet` from
+> `stage_asset_store.qmd`. Flags: `PS_VERS` (default `v9,v8,v7b,v7`), `REDO_PS`.
+
+## Setup
+
+```{r}
+#| label: setup
+
+librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, purrr, readr, stringr, tibble, tidyr, arrow, quiet = T)
+library(msens)
+stopifnot("needs msens >= 0.49.0" = packageVersion("msens") >= "0.49.0",
+          "native_asset_restore_model" %in% getNamespaceExports("msens"))
+source(here("libs/paths.R"))
+vers   <- strsplit(Sys.getenv("PS_VERS", "v9,v8,v7b,v7"), ",")[[1]]
+redo   <- nzchar(Sys.getenv("REDO_PS"))
+dir_as <- path.expand(glue("{dir_derived}/asset_store")); dir_stage <- glue("{dir_as}/stage")
+dir_ps <- glue("{dir_as}/publish_stage"); dir_pub <- glue("{dir_ps}/_published")
+dir_create(c(dir_ps, dir_pub))
+base <- atlas_base_url()                                                   # https://s3.us-east-1.amazonaws.com/oceanmetrics.io-public/marine-atlas
+NA_COLS <- c("ms_merge_key", "mdl_key", "ds_key", "asset_type", "representation", "asset_url", "rescale_min", "rescale_max",
+             "colormap", "xmin", "xmax", "ymin", "ymax", "source_layer", "content_hash")
+ok  <- read_parquet(glue("{dir_stage}/object_keys.parquet")) |> as_tibble()
+cat_ <- read_parquet(glue("{dir_stage}/assets.parquet")) |> as_tibble(); invisible(asset_catalog_check(cat_))
+log_info("M3 dry run | releases {paste(vers, collapse = ' ')} | catalog {nrow(cat_)} keys | out {dir_ps}")
+
+# published tables / shards are fetched once, anonymously, read-only
+dl <- function(url, dest) {
+  if (file_exists(dest) && file_size(dest) > 0 && !redo) return(TRUE)
+  dir_create(path_dir(dest)); tmp <- paste0(dest, ".part")
+  r <- suppressWarnings(try(utils::download.file(url, tmp, mode = "wb", quiet = TRUE), silent = TRUE))
+  if (!inherits(r, "try-error") && identical(r, 0L) && file_exists(tmp) && file_size(tmp) > 0) { file_move(tmp, dest); TRUE } else { unlink(tmp); FALSE }
+}
+pub_tbl <- function(v, t) { f <- glue("{dir_pub}/{v}/tables/{t}.parquet"); if (dl(glue("{base}/{v}/tables/{t}.parquet"), f)) as_tibble(read_parquet(f)) else NULL }
+rel_of <- function(u) {                                                    # a pointer URL -> the object path under {ver}/native/ that the M1/M2 tables key on
+  u <- sub("\\?.*$", "", u)
+  case_when(str_detect(u, "/marine-atlas/v[0-9a-z]+/native/") ~ str_replace(u, "^.*/marine-atlas/v[0-9a-z]+/native/", ""),
+            str_detect(u, "file\\.marinesensitivity\\.org/pmtiles/v[0-9a-z]+/") ~ paste0("pmtiles/", str_replace(u, "^.*/pmtiles/v[0-9a-z]+/", "")),
+            TRUE ~ NA_character_)
+}
+store_url <- function(key) paste0(base, "/", key)
+hash_of   <- function(key) sub("^.*/([0-9a-f]{16})\\.[a-z]+$", "\\1", key)
+```
+
+## 1 · v9 and v8: re-point every pointer at the store
+
+Each `asset_url` (a versioned S3 path, or the file host's `pmtiles/{ver}/…?v=`) names an object; `object_keys` says which
+store key that object's pixels live under (a repainted object's key is the repaint's). v9 additionally gets its lost
+vector `model` rows back (`native_asset_restore_model`), pointing at the gridded `vec_grid` COGs, which are the same
+objects v8 references.
+
+```{r}
+#| label: repoint
+
+repoint <- function(v) {
+  na <- pub_tbl(v, "native_asset"); stopifnot(!is.null(na))
+  k  <- ok |> filter(ver == v) |> select(rel, key)
+  rel <- rel_of(na$asset_url); key <- k$key[match(rel, k$rel)]
+  stopifnot("a pointer names an object the migration map does not know" = !anyNA(key))
+  out <- na |> mutate(asset_url = store_url(key), content_hash = hash_of(key))
+  if (v == "v9") {
+    vg <- ok |> filter(ver == "v9", grp == "vec_grid")
+    mu <- tibble(mdl_key = vg$mdl_key, asset_url = store_url(vg$key), content_hash = hash_of(vg$key))
+    out <- native_asset_restore_model(as.data.frame(out), as.data.frame(mu)) |> as_tibble()
+  }
+  stopifnot("duplicate (mdl_key, representation)" = !anyDuplicated(out[c("mdl_key", "representation")]),
+            "unexpected columns" = identical(names(out), NA_COLS) || setequal(names(out), NA_COLS))
+  list(published = na, staged = out[, NA_COLS])
+}
+na_stage <- list()
+for (v in intersect(c("v9", "v8"), vers)) {
+  r <- repoint(v); na_stage[[v]] <- r$staged
+  dir_create(glue("{dir_ps}/{v}/tables")); write_parquet(r$staged, glue("{dir_ps}/{v}/tables/native_asset.parquet"), compression = "zstd")
+  cat(sprintf("%s: published %d rows -> staged %d rows (%d restored model rows); every url on the store: %s\n", v, nrow(r$published), nrow(r$staged),
+              nrow(r$staged) - nrow(r$published), all(!is.na(asset_key_from_url(r$staged$asset_url)))))
+}
+```
+
+## 2 · v7 and v7b: build `native_asset` (original next to interpolated)
+
+`msens::native_asset_backfill()` gives each v1–v7 input that has a published original (the same source object in v8, or v9
+where v8 lacks it and the source vintage matches) a `native` row next to its gridded `model` row (v7's own
+`cog/usa05/` COG). IUCN ranges key by scientific NAME in v7 and by `id_no` in v8+, so they are matched explicitly
+(`key_map`): an **exact, unambiguous** name, whose v7 cells lie on the range (`stage_asset_store.qmd` §5, cell test).
+That match is the evidence the vintage check cannot give, so `rng_iucn` is exempt from the vintage drop.
+
+```{r}
+#| label: backfill
+
+n8 <- na_stage[["v8"]]; n9 <- na_stage[["v9"]]
+stopifnot("v8 and v9 must be staged first (PS_VERS)" = !is.null(n8), !is.null(n9))
+km_all <- read_parquet(glue("{dir_stage}/v7_rng_iucn_match_final.parquet")) |> filter(final_ok) |> as_tibble()
+back <- function(v) {
+  ma <- pub_tbl(v, "model_asset"); ds <- pub_tbl(v, "dataset"); tx <- pub_tbl(v, "taxon"); stopifnot(!is.null(ma), !is.null(ds), !is.null(tx))
+  d8 <- pub_tbl("v8", "dataset"); d9 <- pub_tbl("v9", "dataset")
+  vc8 <- native_vintage_check(as.data.frame(ds), as.data.frame(d8)); vc9 <- native_vintage_check(as.data.frame(ds), as.data.frame(d9))
+  print(left_join(vc8, vc9, by = "ds_key", suffix = c("_v8", "_v9")))
+  nat8 <- n8 |> filter(representation == "native"); nat9 <- n9 |> filter(representation == "native")
+  ok8 <- setdiff(nat8$ds_key |> unique(), vc8$ds_key[which(vc8$same %in% FALSE)])
+  ok9 <- vc9$ds_key[which(vc9$same)]
+  ref <- bind_rows(nat8 |> filter(ds_key %in% c(ok8, "rng_iucn")),
+                   nat9 |> filter(!mdl_key %in% nat8$mdl_key, ds_key %in% ok9))
+  km <- km_all |> filter(as.character(mdl_seq) %in% as.character(ma$mdl_seq)) |> transmute(mdl_seq, ref_key = mdl_key_v9)
+  stopifnot("a name-matched original is not in the reference" = all(km$ref_key %in% ref$mdl_key))
+  store <- ref |> distinct(asset_url, hash = content_hash)
+  na <- native_asset_backfill(as.data.frame(ma), as.data.frame(ma[, c("mdl_seq", "mdl_key")]), as.data.frame(ref), as.data.frame(store),
+                              taxon_key = tx$mdl_seq[!is.na(tx$mdl_seq)], key_map = as.data.frame(km)) |> as_tibble()
+  stopifnot("unexpected columns" = setequal(names(na), NA_COLS), !anyDuplicated(na[c("mdl_key", "representation")]))
+  na
+}
+for (v in intersect(c("v7b", "v7"), vers)) {
+  na_stage[[v]] <- back(v)
+  dir_create(glue("{dir_ps}/{v}/tables")); write_parquet(na_stage[[v]], glue("{dir_ps}/{v}/tables/native_asset.parquet"), compression = "zstd")
+  na <- na_stage[[v]]
+  cat(sprintf("%s: native_asset %d rows (%d model, %d native: %d cog + %d pmtiles); every url on the store: %s\n", v, nrow(na),
+      sum(na$representation == "model"), sum(na$representation == "native"), sum(na$representation == "native" & na$asset_type == "cog"),
+      sum(na$representation == "native" & na$asset_type == "pmtiles"), all(!is.na(asset_key_from_url(na$asset_url)))))
+}
+```
+
+### Every staged pointer resolves to a catalog row
+
+```{r}
+#| label: resolve
+
+res <- imap_dfr(na_stage, function(na, v) {
+  k <- asset_key_from_url(na$asset_url)
+  tibble(ver = v, pointers = nrow(na), not_in_store = sum(is.na(k)), not_in_catalog = sum(!is.na(k) & !k %in% cat_$key),
+         distinct_keys = n_distinct(k), hash_matches_key = all(na$content_hash == hash_of(k) | is.na(na$content_hash)))
+})
+knitr::kable(res, caption = "pointer tables vs the catalog")
+stopifnot("a pointer is off the store or missing from the catalog" = all(res$not_in_store == 0, res$not_in_catalog == 0))
+```
+
+## 3 · Rebuild the app shards from the staged tables and diff against what is published
+
+`app_taxon_shards()` / `app_alias_shards()` are pure functions of the tables. First prove the builder reproduces the
+**published** shards from the **published** tables (the baseline), then rebuild from the staged pointer table and diff.
+
+```{r}
+#| label: shards
+
+TBL <- c("taxon", "taxon_model", "model", "dataset", "zone_taxon", "zone", "metric", "listing", "model_asset", "native_asset")
+mk_con <- function(v, native = c("published", "staged")) {
+  native <- match.arg(native); con <- dbConnect(duckdb())
+  for (t in setdiff(TBL, "native_asset")) { f <- glue("{dir_pub}/{v}/tables/{t}.parquet"); if (dl(glue("{base}/{v}/tables/{t}.parquet"), f)) dbExecute(con, glue("CREATE VIEW {t} AS SELECT * FROM read_parquet('{f}')")) }
+  if (native == "staged") dbExecute(con, glue("CREATE VIEW native_asset AS SELECT * FROM read_parquet('{dir_ps}/{v}/tables/native_asset.parquet')"))
+  else { f <- glue("{dir_pub}/{v}/tables/native_asset.parquet"); if (dl(glue("{base}/{v}/tables/native_asset.parquet"), f)) dbExecute(con, glue("CREATE VIEW native_asset AS SELECT * FROM read_parquet('{f}')")) }
+  con
+}
+canon <- function(x) toJSON(fromJSON(toJSON(x, auto_unbox = TRUE, null = "null", digits = NA), simplifyVector = FALSE), auto_unbox = TRUE, null = "null", digits = NA)
+rd_pub <- function(v, kind, k) { f <- glue("{dir_pub}/{v}/app/{kind}/{k}.json"); stopifnot(dl(glue("{base}/{v}/app/{kind}/{k}.json"), f)); fromJSON(gzfile(f), simplifyVector = FALSE) }
+gz_bytes <- function(txt) length(memCompress(charToRaw(txt), "gzip"))
+strip_assets <- function(card) { card$inputs <- lapply(card$inputs, function(i) { i$assets <- NULL; i }); card }
+assets_of <- function(card) unlist(lapply(card$inputs, function(i) lapply(i$assets, function(a) list(mdl = i$mdl_key, rep = a$rep, type = a$type, url = a$url))), recursive = FALSE)
+
+compare_release <- function(v) {
+  t0 <- Sys.time()
+  # published-table baseline: the builder must reproduce the published bundle
+  c0 <- mk_con(v, "published"); tx0 <- app_taxon_shards(c0, v); al0 <- app_alias_shards(c0, v); dbDisconnect(c0, shutdown = TRUE)
+  c1 <- mk_con(v, "staged");    tx1 <- app_taxon_shards(c1, v); al1 <- app_alias_shards(c1, v); dbDisconnect(c1, shutdown = TRUE)
+  stopifnot(setequal(names(tx0), names(tx1)))
+  out <- glue("{dir_ps}/{v}/app"); dir_create(c(glue("{out}/taxon"), glue("{out}/alias")))
+  for (k in names(tx1)) writeLines(app_json(tx1[[k]]), glue("{out}/taxon/{k}.json"))
+  for (k in names(al1)) writeLines(app_json(al1[[k]]), glue("{out}/alias/{k}.json"))
+  base_tx <- 0L; base_al <- 0L; n_taxa <- 0L; other_diff <- 0L; inputs_changed <- 0L
+  a_pub <- 0L; a_new <- 0L; a_added <- 0L; a_removed <- 0L; a_url <- 0L; a_other <- 0L; both_pub <- 0L; both_new <- 0L; sz <- numeric()
+  for (k in names(tx1)) {
+    p <- rd_pub(v, "taxon", k); a <- fromJSON(toJSON(tx1[[k]], auto_unbox = TRUE, null = "null", digits = NA), simplifyVector = FALSE)
+    if (identical(canon(tx0[[k]]), canon(p))) base_tx <- base_tx + 1L
+    sz <- c(sz, gz_bytes(app_json(tx1[[k]])))
+    stopifnot(setequal(names(p$taxa), names(a$taxa)))
+    for (nm in names(a$taxa)) {
+      n_taxa <- n_taxa + 1L
+      if (!identical(canon(strip_assets(a$taxa[[nm]])), canon(strip_assets(p$taxa[[nm]])))) other_diff <- other_diff + 1L
+      if (!identical(canon(a$taxa[[nm]]$inputs), canon(p$taxa[[nm]]$inputs))) inputs_changed <- inputs_changed + 1L
+      ap <- assets_of(p$taxa[[nm]]); an <- assets_of(a$taxa[[nm]])
+      kp <- vapply(ap, function(x) paste(x$mdl, x$rep, x$type), ""); kn <- vapply(an, function(x) paste(x$mdl, x$rep, x$type), "")
+      a_pub <- a_pub + length(ap); a_new <- a_new + length(an)
+      a_added <- a_added + sum(!kn %in% kp); a_removed <- a_removed + sum(!kp %in% kn)
+      both <- intersect(kp, kn); up <- vapply(ap, `[[`, "", "url"); un <- vapply(an, `[[`, "", "url")
+      a_url <- a_url + sum(up[match(both, kp)] != un[match(both, kn)])
+      for (i in p$taxa[[nm]]$inputs) both_pub <- both_pub + (length(i$assets) > 1)
+      for (i in a$taxa[[nm]]$inputs) both_new <- both_new + (length(i$assets) > 1)
+    }
+  }
+  for (k in names(al1)) if (identical(canon(al0[[k]]), canon(rd_pub(v, "alias", k)))) base_al <- base_al + 1L
+  alias_same <- all(vapply(names(al1), function(k) identical(canon(al1[[k]]), canon(rd_pub(v, "alias", k))), NA))
+  # schema: every staged shard validates
+  valid <- all(vapply(names(tx1), function(k) isTRUE(tryCatch({ app_validate(tx1[[k]], "taxon"); TRUE }, error = function(e) FALSE)), NA)) &&
+           all(vapply(names(al1), function(k) isTRUE(tryCatch({ app_validate(al1[[k]], "alias"); TRUE }, error = function(e) FALSE)), NA))
+  tibble(ver = v, taxon_shards = length(tx1), alias_shards = length(al1),
+         baseline_taxon_identical = base_tx, baseline_alias_identical = base_al,
+         taxa = n_taxa, taxa_differing_outside_input_assets = other_diff, taxa_with_changed_inputs = inputs_changed,
+         asset_rows_published = a_pub, asset_rows_staged = a_new, asset_rows_added = a_added, asset_rows_removed = a_removed, asset_urls_changed_same_row = a_url,
+         inputs_with_both_reps_published = both_pub, inputs_with_both_reps_staged = both_new,
+         alias_shards_identical = alias_same, shards_validate = valid, largest_taxon_shard_gzip_bytes = max(sz), contract_bytes = 25600L,
+         minutes = round(as.numeric(difftime(Sys.time(), t0, units = "mins")), 1))
+}
+cmp_f <- glue("{dir_ps}/shard_comparison.parquet")
+cmp <- if (!redo && file_exists(cmp_f) && all(vers %in% read_parquet(cmp_f)$ver)) as_tibble(read_parquet(cmp_f)) else {
+  r <- map_dfr(vers, compare_release); write_parquet(r, cmp_f); r }
+cmp |> pivot_longer(-ver) |> pivot_wider(names_from = ver, values_from = value) |> knitr::kable(caption = "staged app shards vs published (per release)")
+stopifnot("the builder does not reproduce a published bundle from its published tables" = all(cmp$baseline_taxon_identical == cmp$taxon_shards, cmp$baseline_alias_identical == cmp$alias_shards),
+          "taxa changed outside inputs[].assets" = all(cmp$taxa_differing_outside_input_assets == 0),
+          "alias shards changed" = all(cmp$alias_shards_identical), "a shard fails its schema" = all(cmp$shards_validate),
+          "a shard exceeds the gzip contract" = all(cmp$largest_taxon_shard_gzip_bytes <= cmp$contract_bytes))
+```
+
+## 4 · The manifest patch
+
+A manifest says how to render a release. v7/v7b have no `tables.native_asset` and `capabilities.native_representation = false`
+(so the app offers no Original|Interpolated toggle even though the shards now carry both). The patch is exactly those two
+keys for v7/v7b and **nothing** for v8/v9 (their manifests already list `native_asset`). `app.built_at` (the OPFS cache
+key) and the `app.probed` block are NOT touched here: they are re-measured by `build_app_bundle.qmd` AFTER the store exists.
+
+```{r}
+#| label: manifest
+
+patch_manifest <- function(v) {
+  f <- glue("{dir_pub}/{v}/manifest.json"); stopifnot(dl(glue("{base}/{v}/manifest.json"), f))
+  m0 <- fromJSON(f, simplifyVector = FALSE); m <- m0
+  if (v %in% c("v7", "v7b")) {
+    m$tables$native_asset <- glue("{base}/{v}/tables/native_asset.parquet") |> as.character()
+    m$capabilities$native_representation <- TRUE
+  }
+  dir_create(glue("{dir_ps}/{v}")); write_json(m, glue("{dir_ps}/{v}/manifest.json"), auto_unbox = TRUE, pretty = TRUE, null = "null", digits = NA)
+  # the patched manifest must still satisfy the manifest schema (checked only if the PUBLISHED one does: some predate it)
+  chk <- function(x) isTRUE(tryCatch({ app_validate(x, "manifest"); TRUE }, error = function(e) FALSE))
+  cat(sprintf("%s manifest schema: published %s, patched %s\n", v, chk(m0), chk(m)))
+  ch <- function(a, b, path = "") unlist(imap(b, function(x, n) {
+    p <- if (nzchar(path)) paste(path, n, sep = ".") else n
+    if (is.list(x) && is.list(a[[n]])) ch(a[[n]], x, p) else if (!identical(a[[n]], x)) p else NULL }))
+  tibble(ver = v, keys_changed = paste(ch(m0, m), collapse = ", "))
+}
+mf <- map_dfr(vers, patch_manifest); knitr::kable(mf, caption = "manifest.json: keys that differ from the published manifest")
+```
+
+## 5 · The root mirror: catalog and READMEs
+
+```{r}
+#| label: root
+
+dir_create(c(glue("{dir_ps}/cog"), glue("{dir_ps}/native")))
+file_copy(glue("{dir_stage}/assets.parquet"), glue("{dir_ps}/assets.parquet"), overwrite = TRUE)
+cat(sprintf("assets.parquet staged: %d keys (%d on cog/usa05, %d on cog/global05, %d on native/)\n", nrow(cat_),
+            sum(cat_$grid_id %in% "usa05"), sum(cat_$grid_id %in% "global05"), sum(cat_$store == "native")))
+```
+
+## 6 · Summary
+
+```{r}
+#| label: summary
+
+smry <- imap_dfr(na_stage, function(na, v) tibble(ver = v, pointer_rows = nrow(na), model_rows = sum(na$representation == "model"),
+  native_rows = sum(na$representation == "native"), distinct_store_keys = n_distinct(asset_key_from_url(na$asset_url)))) |>
+  left_join(cmp |> select(ver, taxa_with_changed_inputs, inputs_with_both_reps_published, inputs_with_both_reps_staged, largest_taxon_shard_gzip_bytes), by = "ver")
+write_parquet(smry, glue("{dir_ps}/m3_summary.parquet")); knitr::kable(smry, caption = "M3 dry run: what each release would publish")
+```
