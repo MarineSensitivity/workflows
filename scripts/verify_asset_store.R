@@ -7,6 +7,7 @@
 # Lists each store prefix with `aws s3api list-objects-v2` (one read per prefix) and checks, BOTH ways:
 #   * every catalog row exists under its key, with the catalogued size and (for a single-part object) ETag == md5
 #   * nothing exists under a store prefix that the catalog does not list (an unexpected object)
+# (--write-missing FILE writes the missing keys, one per line, so a failed copy/upload can be retried for just those)
 # then HEADs a random sample of the catalog's keys anonymously over HTTPS (public readability + content type).
 # Prints a summary and exits 0 only when there is no difference; exit 1 otherwise. Never writes anything.
 suppressMessages({library(arrow); library(dplyr)})
@@ -17,6 +18,7 @@ cat_path <- a[1]; stopifnot("usage: verify_asset_store.R <assets.parquet> [--pre
 bucket <- opt("--bucket", "oceanmetrics.io-public"); root <- opt("--root", "marine-atlas")
 prefixes <- many("--prefix"); if (!length(prefixes)) prefixes <- c("cog/usa05", "cog/global05", "native")
 n_sample <- as.integer(opt("--sample", "200"))
+write_missing <- opt("--write-missing")        # optional: write the catalog keys missing from the bucket here, one per line (a retry list)
 
 cat_ <- as.data.frame(read_parquet(cat_path))
 stopifnot("catalog needs key, bytes, md5" = all(c("key", "bytes", "md5") %in% names(cat_)), !anyDuplicated(cat_$key))
@@ -43,6 +45,7 @@ size_bad <- j$key[j$bytes != j$size]
 md5_bad  <- j$key[!grepl("-", j$etag, fixed = TRUE) & !is.na(j$md5) & j$md5 != j$etag]
 cat(sprintf("missing from the bucket: %d | unexpected in the bucket: %d | size differs: %d | single-part ETag != md5: %d\n",
             length(missing), length(unexpected), length(size_bad), length(md5_bad)))
+if (!is.null(write_missing)) { writeLines(missing, write_missing); cat(sprintf("wrote %d missing key(s) to %s\n", length(missing), write_missing)) }
 show <- function(label, x) if (length(x)) cat(sprintf("  %s (first 5): %s\n", label, paste(utils::head(x, 5), collapse = ", ")))
 show("missing", missing); show("unexpected", unexpected); show("size differs", size_bad); show("md5 differs", md5_bad)
 
