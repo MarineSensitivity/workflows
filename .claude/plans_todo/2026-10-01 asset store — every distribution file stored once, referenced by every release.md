@@ -163,6 +163,14 @@ Fold in as registered, unscored datasets (`dataset.is_scored = FALSE`), through 
 3. No change to `merge_models.qmd` or any score. The Atlas shows them as species inputs with both representations.
 Target release: the next one built (v10 bootstrap), not a re-issue of v8/v9.
 
+Status 2026-10-01: step 1 is done on a branch — msens `density-transforms` @ 234a543 = main (0.47.0) + the density
+work as **0.48.0** (`density_to_suit(d, method = cap|log|ud|qmap, …)`, `density_annual()`, `cells_from_raster(digits=)`;
+`devtools::test()` green; the stale copy in the main checkout has nothing the branch lacks). Not merged: `main` is in
+the release session's worktree — merge it there at a quiet point (its next bump is then 0.49.0). Still needed by the
+two ingest notebooks, in msens or in the notebooks: storing raw density as `val` with the dataset registered
+`is_scored = FALSE`; unit/legend metadata ("animals km⁻²") reaching the registry and the app bundle; season/month →
+annual averaging (two-tier keys).
+
 ## 6. Decisions (Ben, 2026-10-01)
 
 1. **`rng_iucn` on v7: accept exact, unambiguous scientific-name matches, logged**, plus a cheap check per match: the
