@@ -96,13 +96,14 @@ object, deliberately.
   (expect ≈ 39 GB across the v8+v9 trees → ≈ 20 GB unique) and three checks: same hash ⇒ same ETag between v8 and v9
   for a sample; a decoded sample COG equals its DB rows; no two different contents share a key. Include the 6,187
   unregistered `rng_iucn` PMTiles. **G1: Ben sees the numbers.**
-- **M2 · Copy.** Server-side `aws s3 cp` old key → store key, only for keys not in the catalog, PMTiles from the S3
+- **M2 · Copy.** First, with Ben's go, enable bucket versioning + the 30-day lifecycle rule (decision 3). Then server-side `aws s3 cp` old key → store key, only for keys not in the catalog, PMTiles from the S3
   mirror (file host untouched). Write `assets.parquet`. Verify: catalog row count = distinct keys; HEAD a sample.
   **G2.**
 - **M3 · Re-point.** v8, v9: rewrite `native_asset` URLs to the store (add `content_hash`), restore the `rng_iucn`
   native rows. v7 (and v7b): build `native_asset` — `model` rows = the `cog/usa05/` objects it already has, `native`
   rows = the store objects whose source key matches (crosswalk as in the dry run: 17,810 of 19,811; plus `rng_iucn` by
-  exact, unambiguous scientific-name match only, logged). Rebuild manifests, app bundles and STAC as DRY RUNS; diff
+  exact, unambiguous scientific-name match, logged, each match kept only if the original's bbox agrees with the
+  v7 gridded surface's extent — decision 1). Rebuild manifests, app bundles and STAC as DRY RUNS; diff
   against published: only asset URLs/rows may change. **G3.**
 - **M4 · Publish** the re-pointed tables, manifests and bundles under their named flags (v9, v8, then v7; never
   `PROMOTE_LATEST`). Verify in the Atlas: v7 public (incognito) and v9 on the preview host show Original |
@@ -136,9 +137,15 @@ Fold in as registered, unscored datasets (`dataset.is_scored = FALSE`), through 
 3. No change to `merge_models.qmd` or any score. The Atlas shows them as species inputs with both representations.
 Target release: the next one built (v10 bootstrap), not a re-issue of v8/v9.
 
-## 6. Open decisions for Ben
+## 6. Decisions (Ben, 2026-10-01)
 
-1. `rng_iucn` on v7: accept exact, unambiguous name matches (≈ 2,114) or leave all 1,518+ single-layer?
-2. PMTiles: S3 only from now on (file host copies pruned in M6) — yes?
-3. Prune timing (M6): how long a soak after M4?
-4. gm/nc target: v10 bootstrap (recommended) or a v9 re-issue?
+1. **`rng_iucn` on v7: accept exact, unambiguous scientific-name matches, logged**, plus a cheap check per match: the
+   original's bounding box against the v7 gridded surface's extent — drop any pair that clearly disagree (log those
+   too). Ambiguous names and non-matches stay single-layer. (M3)
+2. **PMTiles are served from S3 only.** Registry rows point at `native/{ds}/{hash}.pmtiles` on the bucket; the
+   file-host copies go in M6. (M2/M3/M5)
+3. **Prune (M6): first enable bucket versioning with a lifecycle rule that permanently removes noncurrent/deleted
+   objects after 30 days; soak two weeks after M4; then prune.** Enabling versioning is itself a bucket change: do it
+   under G2 (before the first store write), with Ben's go.
+4. **gm/nc go into the v10 bootstrap, displayed as raw density** (their own legend range, no 1–100 rescale),
+   registered with `is_scored = FALSE`. No v8/v9 re-issue.
