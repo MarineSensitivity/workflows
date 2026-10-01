@@ -132,33 +132,38 @@ A *small edge* failure differs in < 1% of its pixels; a *gross* one in ≥ 1%.
 fail <- ob |> filter(status == "inconsistent")
 cat(sprintf("%d inconsistent objects (%d distinct by folder+name+bytes)\n", nrow(fail), nrow(distinct(fail, grp, file, etag))))
 
-# the rows that SHOULD be in the object, per folder -- a self-contained worker (own DuckDB connection, no glue/globals)
+# the rows that SHOULD be in the object, per folder -- a self-contained worker: DuckDB reads the model's own rows (max(val) per cell,
+# the value the merge consumes), the decoded COG is registered as a table, and ONE full outer join counts the differences
+# (the base-R merge() version took 2-68 s per object; this takes 0.2-2 s and returns identical numbers, checked on 8 objects)
 diag_worker <- function(o, atlas_root, grid) {
-  suppressMessages({library(DBI); library(duckdb); library(terra); library(msens); library(dplyr)})
+  suppressMessages({library(DBI); library(duckdb); library(terra); library(msens)})
   con <- dbConnect(duckdb(), config = list(threads = "2", memory_limit = "3GB")); on.exit(dbDisconnect(con, shutdown = TRUE))
   ad <- file.path(atlas_root, o$ver, "marine-atlas")
-  if (o$grp %in% c("am", "ax", "dps_nmfs", "vec_grid")) {
+  rows_sql <- if (o$grp %in% c("am", "ax", "dps_nmfs", "vec_grid")) {
     ds <- sub("\\|.*$", "", o$mdl_key); id <- sub("^[^|]*\\|", "", o$mdl_key)
-    raw <- dbGetQuery(con, sprintf("SELECT cell_id, val, count(*) OVER (PARTITION BY cell_id) AS reps FROM read_parquet('%s/dist/dataset=%s/%s.parquet')", ad, ds, id))
-    painted <- raw |> group_by(cell_id) |> summarise(val = max(val), .groups = "drop")        # the merge consumes max(val) per cell
+    sprintf("SELECT cell_id, max(val) AS val, count(*) AS reps FROM read_parquet('%s/dist/dataset=%s/%s.parquet') GROUP BY cell_id", ad, ds, id)   # the merge consumes max(val) per cell
   } else if (o$grp == "merged") {
     dbExecute(con, sprintf("ATTACH '%s/merge.duckdb' AS m (READ_ONLY)", ad))
     id <- dbGetQuery(con, sprintf("SELECT mkey_id FROM m.mkey_map WHERE ms_merge_key = '%s'", o$mdl_key))$mkey_id
-    raw <- if (length(id)) dbGetQuery(con, sprintf("SELECT cell_id, round_even(max(val), 0) AS val, 1 AS reps FROM read_parquet('%s/mc_parts/mkey_id=%d/*.parquet') GROUP BY cell_id", ad, id))
-           else dbGetQuery(con, sprintf("SELECT cell_id, val, 1 AS reps FROM read_parquet('%s/dist_merged_global/**/*.parquet') WHERE mdl_key = '%s'", ad, o$mdl_key))
-    painted <- raw
+    if (length(id)) sprintf("SELECT cell_id, round_even(max(val), 0) AS val, 1 AS reps FROM read_parquet('%s/mc_parts/mkey_id=%d/*.parquet') GROUP BY cell_id", ad, id)
+    else sprintf("SELECT cell_id, val, 1 AS reps FROM read_parquet('%s/dist_merged_global/**/*.parquet') WHERE mdl_key = '%s'", ad, o$mdl_key)
   } else stop("no row source for ", o$grp)
+  q <- if (o$grp == "ax") "trunc(least(round_even(val, 0), 255))" else "trunc(least(val, 255))"
   dec <- native_raster_rows(terra::rast(file.path(ad, "native", o$rel)), grid)
-  x <- painted; x$q <- pmin(255, trunc(if (o$grp == "ax") round(x$val) else x$val)); x <- x[x$q >= 1, ]
-  j <- merge(dec, x[, c("cell_id", "q")], by = "cell_id", all = TRUE)
-  dv <- !is.na(j$q) & !is.na(j$val) & j$q != j$val
-  tibble::tibble(ver = o$ver, grp = o$grp, file = o$file, etag = o$etag, mdl_key = o$mdl_key,
-    n_cog = nrow(dec), n_rows = nrow(x), only_cog = sum(is.na(j$q)), only_rows = sum(is.na(j$val)), val_diff = sum(dv),
-    dup_cells = sum(raw$reps > 1) / 2,
-    # a quantisation edge would put every differing cell AT the nodata threshold (value 1): count them
-    only_cog_at1 = sum(is.na(j$q) & j$val == 1, na.rm = TRUE), only_rows_at1 = sum(is.na(j$val) & j$q == 1, na.rm = TRUE),
-    val_diff_max = if (any(dv)) max(abs(j$val - j$q)[dv]) else 0)
+  duckdb::duckdb_register(con, "dec", dec)
+  r <- dbGetQuery(con, sprintf("
+    WITH r AS (%s), x AS (SELECT cell_id, %s AS q FROM r WHERE %s >= 1),
+         j AS (SELECT d.cell_id AS dc, x.cell_id AS xc, d.val AS dv, x.q AS xq FROM dec d FULL OUTER JOIN x ON CAST(d.cell_id AS BIGINT) = x.cell_id)
+    SELECT (SELECT count(*) FROM dec) AS n_cog, (SELECT count(*) FROM x) AS n_rows,
+           count(*) FILTER (WHERE xc IS NULL) AS only_cog, count(*) FILTER (WHERE dc IS NULL) AS only_rows,
+           count(*) FILTER (WHERE dc IS NOT NULL AND xc IS NOT NULL AND dv <> xq) AS val_diff,
+           (SELECT count(*) FROM r WHERE reps > 1) AS dup_cells,
+           count(*) FILTER (WHERE xc IS NULL AND dv = 1) AS only_cog_at1, count(*) FILTER (WHERE dc IS NULL AND xq = 1) AS only_rows_at1,
+           coalesce(max(abs(dv - xq)) FILTER (WHERE dc IS NOT NULL AND xc IS NOT NULL AND dv <> xq), 0) AS val_diff_max
+    FROM j", rows_sql, q, q))
+  tibble::tibble(ver = o$ver, grp = o$grp, file = o$file, etag = o$etag, mdl_key = o$mdl_key, r)
 }
+
 if (nrow(fail)) {
   fd <- fail |> distinct(grp, file, etag, .keep_all = TRUE)
   if (test_n > 0) fd <- slice_head(fd, n = test_n)
