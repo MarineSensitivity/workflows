@@ -379,11 +379,23 @@ stopifnot("an object has no md5 (no local file for a multipart source)" = !anyNA
 catalog <- plan_ |> transmute(store, key, content_hash, enc, asset_type = if_else(ext == "pmtiles", "pmtiles", "cog"),
   grid_id = if_else(store == "cog", scope, NA_character_), ds_key = if_else(store == "native", scope, NA_character_),
   bytes, md5, created = Sys.Date(), first_ver)
+# the catalog is the registry of the WHOLE store, so it also lists what is already there: the 23,382 v1-v7 species/score COGs
+# under cog/usa05 and the 286 v8/v9 score COGs under cog/global05 (their payload hash predates the catalog, hence NA)
+rd_legacy <- function(f, grid) {
+  x <- read_tsv(glue("{dir_as}/inventory/{f}"), col_names = c("s3", "bytes", "etag", "lm"), col_types = "cdcc", show_col_types = FALSE)
+  stopifnot("a legacy store object is a multipart upload: its md5 is unknown" = !any(grepl("-", x$etag)))
+  x |> transmute(store = "cog", key = sub("^marine-atlas/", "", s3), content_hash = NA_character_, enc = NA_character_, asset_type = "cog",
+                 grid_id = grid, ds_key = NA_character_, bytes, md5 = gsub('"', "", etag), created = as.Date(substr(lm, 1, 10)), first_ver = NA_character_)
+}
+legacy <- bind_rows(rd_legacy("cog_usa05.tsv", "usa05"), rd_legacy("cog_global05.tsv", "global05"))
+stopifnot("a planned key is already a legacy store object (identical pixels? then it should be `skip`)" = !any(catalog$key %in% legacy$key))
+catalog <- bind_rows(legacy, catalog)
 invisible(asset_catalog_check(catalog))
 write_parquet(plan_ |> select(-src_local), glue("{dir_out}/store_plan.parquet"), compression = "zstd")
 write_parquet(catalog, glue("{dir_out}/assets.parquet"), compression = "zstd")
 plan_ |> group_by(action, family) |> summarise(keys = n(), GB = round(sum(bytes) / 1e9, 3), .groups = "drop") |>
   knitr::kable(caption = "store_plan: keys and GB by action")
+cat(sprintf("assets.parquet: %d rows = %d new (this plan) + %d existing (cog/usa05 + cog/global05 score COGs)\n", nrow(catalog), nrow(catalog) - nrow(legacy), nrow(legacy)))
 cat(sprintf("TOTAL: %d keys, %.2f GB (%d server-side copies = %.2f GB; %d uploads = %.2f GB)\n", nrow(plan_), sum(plan_$bytes) / 1e9,
             sum(plan_$action == "copy"), sum(plan_$bytes[plan_$action == "copy"]) / 1e9, sum(plan_$action == "upload"), sum(plan_$bytes[plan_$action == "upload"]) / 1e9))
 ```
