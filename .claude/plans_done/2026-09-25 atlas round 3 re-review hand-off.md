@@ -58,3 +58,7 @@ push, verified by the orchestrator from the fix agents' shots, not by a second O
 4. Write `plans_todo/atlas-refs/2026-09-25 eyes-on wave-1 re-review (Opus 5.5) on a7ba24a.md`: verdict, PASS/FAIL per
    ask, defects with fixes. Land the flower a11y fix and any FAIL fixes as small commits with gates, push, then resume
    W7 → W8 per their briefs (two fix rounds each, eyes-on + review before each push).
+
+**2026-09-25 (Opus 5.5 re-review session):** re-review written (`atlas-refs/2026-09-25 eyes-on wave-1 re-review (Opus 5.5) on a7ba24a.md`, HOLD on the leatherback toggle, now fixed). Pushed `844cfc8` (0.10.76): flower a11y (0.10.74), linux gallery baselines + installer suffix fix, D1′ leatherback toggle live on v7 (3 bugs) + phone framing + 4-way probes, export title, Selection row with `pl=`, releases.html link (0.10.75), selectZone idle retry + gpkg spec + two retargeted faults (0.10.76). Open: phone "Whole range" globe mostly under the sheet (product question: drop sheet to peek?). Next: W7 (bump to 0.10.77), then W8 (0.10.78). Ben asked for lean gating: fast gates + push, CI does the rest.
+
+**2026-09-25 (end of session):** W7 merged + pushed as `34990f4` (0.10.77; deferred UI-6/14/18/20). W8 stopped by Ben's request mid-build: branch `r3-w8-species-share` in worktree `r3-w8` may hold uncommitted, ungated edits — inspect before resuming (reserved 0.10.78). Phone "Whole range" question dropped.
