@@ -1,0 +1,377 @@
+---
+title: "Asset store · M2-prep · quantised keys, verdicts, local repaints, execution manifest"
+subtitle: "Local and read-only: repaints go to a staging directory; every S3 command is written out, none is run"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    embed-resources: false
+editor_options:
+  chunk_output_type: console
+---
+
+> **Not a pipeline stage** — preparation for milestone **M2** of
+> `.claude/plans_todo/2026-10-01 asset store — every distribution file stored once, referenced by every release.md`
+> (§3a: *an object enters the store under key K only if its decoded pixels equal the quantised rows K was computed
+> from; anything that fails is repainted from the current rows and uploaded under its key, never copied*).
+> Inputs are the M1 outputs of `map_asset_store.qmd` (`store_migration.parquet`, `verify_raster.parquet`,
+> `verify_expected.parquet`, the vector/ax hashes). Nothing here writes to S3, the file host or any release;
+> `store_plan.parquet`, `assets.parquet` and the command files under `commands/` are the **proposal Ben approves
+> at G2**. Flags: `STAGE_TEST_N` (smoke test), `REDO_STAGE=1` (repaint again).
+
+## Setup
+
+```{r}
+#| label: setup
+
+librarian::shelf(DBI, dplyr, duckdb, fs, furrr, glue, here, logger, purrr, readr, sf, stringr, terra,
+                 tibble, tidyr, arrow, jsonlite, quiet = T)
+library(msens)
+stopifnot("needs msens >= 0.47.0" = packageVersion("msens") >= "0.47.0", "pixel_hashes" %in% getNamespaceExports("msens"))
+source(here("libs/paths.R"))
+source(here("libs/native_sources.R"))
+
+test_n   <- as.integer(Sys.getenv("STAGE_TEST_N", "0"))
+redo     <- nzchar(Sys.getenv("REDO_STAGE"))
+dir_as   <- path.expand(glue("{dir_derived}/asset_store"))
+dir_out  <- if (test_n > 0) glue("{dir_as}/stage_test") else glue("{dir_as}/stage")
+dir_stage <- glue("{dir_out}/staging"); dir_cmd <- glue("{dir_out}/commands")
+dir_create(c(dir_out, dir_stage, dir_cmd))
+dir_big_x <- path.expand(dir_big)
+atlas_dir <- function(v) glue("{dir_big_x}/{v}/marine-atlas")
+bucket   <- "oceanmetrics.io-public"; s3_base <- atlas_base_url(); s3_root <- sub("/marine-atlas$", "", s3_base)
+safe_key <- function(k) gsub("[^A-Za-z0-9._-]", "_", k)
+grid_g05 <- grid_spec_for("global05", path.expand(cellid_tif))
+n_workers <- as.integer(Sys.getenv("STAGE_WORKERS", "3"))
+log_info("M2-prep | test_n {test_n} | out {dir_out} | workers {n_workers}")
+```
+
+## 1 · The key is the hash of the PIXELS the file holds
+
+M1 keyed the raster families by the hash of the raw source rows. That cannot tell `trunc` from `round`
+(v8's 192 suitability-only merged models were painted with `trunc(max)`, v9's with `round(max)`: the same rows,
+different files, one key) and gives two models whose rows differ below the quantum different keys for identical
+pixels. `msens::pixel_hashes()` (0.47.0) hashes the values **as the writer stores them** — `trunc` into INT1U
+(verified: every pixel of an AquaMaps model equals `trunc(val)`; 54% equal `round(val)`), sub-1 pixels dropped as
+NoData — which equals `content_hashes_df(native_raster_rows(<the painted COG>))`. The check "does this object hold
+the rows its key says" is then one equality, and the key is still known before any file is built.
+
+```{r}
+#| label: keys
+
+sm  <- read_parquet(glue("{dir_as}/store_migration.parquet")) |> as_tibble()
+ver_q <- read_parquet(glue("{dir_as}/verify_raster.parquet")) |> as_tibble()    # ver, grp, file, etag, stem, key(old), bytes, mdl_key, n_obs, q_obs, n_exp, q_exp, status
+exp_q <- read_parquet(glue("{dir_as}/verify_expected.parquet")) |> as_tibble()   # ver, grp, mdl_key, stem, n_exp, q_exp  (current rows, quantised, NO dedup)
+h_ax  <- read_parquet(glue("{dir_as}/h_ax_native_v9.parquet")) |> as_tibble()    # stem, n, content_hash  (decoded Float32 pixels)
+
+enc_of <- c(cog_model = asset_enc("cog_model"), native_am = asset_enc("native_am"),
+            native_ax = asset_enc("native_ax"), native_pmtiles = asset_enc("native_pmtiles"))
+ob <- sm |> mutate(
+  rel    = if_else(startsWith(grp, "pmtiles/"), paste0("pmtiles/", sub("^pmtiles/", "", grp), "/", file), paste0(grp, "/", file)),
+  stem   = tools::file_path_sans_ext(file),
+  ext    = tools::file_ext(file),
+  etag   = md5_or_etag,
+  family = case_when(grp %in% c("am", "ax", "dps_nmfs", "vec_grid", "merged") ~ "cog_model", grp == "am_native" ~ "native_am",
+                     grp == "ax_native" ~ "native_ax", startsWith(grp, "pmtiles/") ~ "native_pmtiles", TRUE ~ NA_character_),
+  scope  = case_when(family == "cog_model" ~ "global05", family == "native_am" ~ "am", family == "native_ax" ~ "ax",
+                     family == "native_pmtiles" ~ sub("^pmtiles/", "", grp)),
+  old_key = key) |>
+  filter(!is.na(family)) |>                                                   # drops the 17 unmapped gm objects
+  left_join(exp_q |> select(ver, grp, stem, pixel_exp = q_exp, n_exp), by = c("ver", "grp", "stem")) |>
+  left_join(h_ax |> transmute(stem, ax_decoded = content_hash), by = "stem") |>
+  mutate(pixel_hash = case_when(family %in% c("cog_model", "native_am") ~ pixel_exp,
+                                family == "native_ax" ~ ax_decoded,
+                                family == "native_pmtiles" ~ content_hash))      # PMTiles: the vector source hash from M1, unchanged
+stopifnot("every raster object needs a pixel hash (current rows missing?)" = !anyNA(ob$pixel_hash))
+mk_keys <- function(d) {
+  d$hash <- NA_character_
+  for (f in names(enc_of)) { i <- which(d$family == f); if (length(i)) d$hash[i] <- content_hash_encoded(d$pixel_hash[i], enc_of[[f]]) }
+  d$key <- NA_character_
+  for (st in c("cog", "native")) { i <- which(ifelse(d$family == "cog_model", "cog", "native") == st)
+    if (length(i)) d$key[i] <- asset_key(st, d$scope[i], d$hash[i], d$ext[i]) }
+  d
+}
+ob <- mk_keys(ob)
+bind_rows(ob |> group_by(family) |> summarise(basis = "M1 (raw rows)", objects = n(), distinct_keys = n_distinct(old_key), .groups = "drop"),
+          ob |> group_by(family) |> summarise(basis = "quantised pixels", objects = n(), distinct_keys = n_distinct(key), .groups = "drop")) |>
+  arrange(family, basis) |> knitr::kable(caption = "distinct store keys: raw-row keys (M1) vs pixel keys")
+```
+
+## 2 · Verdicts for every raster object
+
+```{r}
+#| label: verdicts
+
+ob <- ob |> left_join(ver_q |> select(ver, grp, file, etag, n_obs, q_obs, status), by = c("ver", "grp", "file", "etag")) |>
+  mutate(status = case_when(!is.na(status) ~ status,
+                            grp == "ax_native" ~ "consistent",              # the key IS the object's own decoded hash
+                            family == "native_pmtiles" ~ "vector (source hash; bounds sampled in M1)",
+                            TRUE ~ "not decoded"))
+ob |> count(family, grp, status) |> pivot_wider(names_from = status, values_from = n, values_fill = 0) |>
+  knitr::kable(caption = "verdict per folder (objects across v8+v9)")
+```
+
+## 3 · Why the failures fail
+
+For every inconsistent object: the cell-level difference against the current rows (cells only in the COG, cells only in
+the rows, shared cells with another value), whether the rows repeat a cell, and whether the COG is **another model's**
+current surface (the positional-`mid` bug in `publish_native.qmd` painted 1,054 COGs from another species' partition).
+A *small edge* failure differs in < 1% of its pixels; a *gross* one in ≥ 1%.
+
+```{r}
+#| label: diagnose
+
+fail <- ob |> filter(status == "inconsistent")
+cat(sprintf("%d inconsistent objects (%d distinct by folder+name+bytes)\n", nrow(fail), nrow(distinct(fail, grp, file, etag))))
+
+# the rows that SHOULD be in the object, per folder (the staging chunk paints from the same function)
+rows_for <- function(con, ver, grp, mdl_key) {
+  if (grp %in% c("am", "ax", "dps_nmfs", "vec_grid")) {
+    ds <- sub("\\|.*$", "", mdl_key); f <- glue("{atlas_dir(ver)}/dist/dataset={ds}/{sub('^[^|]*\\\\|', '', mdl_key)}.parquet")
+    d <- dbGetQuery(con, glue("SELECT cell_id, val, count(*) OVER (PARTITION BY cell_id) AS reps FROM read_parquet('{f}')"))
+    return(list(raw = d, painted = d |> group_by(cell_id) |> summarise(val = max(val), .groups = "drop")))      # the merge consumes max(val) per cell
+  }
+  if (grp == "merged") {
+    dbExecute(con, glue("ATTACH IF NOT EXISTS '{atlas_dir(ver)}/merge.duckdb' AS m_{ver} (READ_ONLY)"))
+    id <- dbGetQuery(con, glue("SELECT mkey_id FROM m_{ver}.mkey_map WHERE ms_merge_key = '{mdl_key}'"))$mkey_id
+    if (length(id)) {
+      d <- dbGetQuery(con, glue("SELECT cell_id, round_even(max(val), 0) AS val, 1 AS reps FROM read_parquet('{atlas_dir(ver)}/mc_parts/mkey_id={id}/*.parquet') GROUP BY cell_id"))
+      return(list(raw = d, painted = d))
+    }
+    d <- dbGetQuery(con, glue("SELECT cell_id, val, 1 AS reps FROM read_parquet('{atlas_dir(ver)}/dist_merged_global/**/*.parquet') WHERE mdl_key = '{mdl_key}'"))
+    return(list(raw = d, painted = d))
+  }
+  stop("no row source for ", grp)
+}
+quant <- function(v, grp) pmin(255, trunc(if (grp == "ax") round(v) else v))
+diag_one <- function(con, o) {
+  r <- rows_for(con, o$ver, o$grp, o$mdl_key)
+  dec <- native_raster_rows(rast(glue("{atlas_dir(o$ver)}/native/{o$rel}")), grid_g05)
+  x <- r$painted; x$q <- quant(x$val, o$grp); x <- x[x$q >= 1, ]
+  j <- merge(dec, x[, c("cell_id", "q")], by = "cell_id", all = TRUE)
+  tibble(n_cog = nrow(dec), n_rows = nrow(x), only_cog = sum(is.na(j$q)), only_rows = sum(is.na(j$val)),
+         val_diff = sum(!is.na(j$q) & !is.na(j$val) & j$q != j$val), dup_cells = sum(r$raw$reps > 1) / 2)
+}
+if (nrow(fail)) {
+  fd <- fail |> distinct(grp, file, etag, .keep_all = TRUE)
+  if (test_n > 0) fd <- slice_head(fd, n = test_n)
+  con <- dbConnect(duckdb(), config = list(threads = "4", memory_limit = "6GB"))
+  diag <- cached_diag <- {
+    f <- glue("{dir_out}/diagnose.parquet")
+    if (!redo && file_exists(f)) as_tibble(read_parquet(f)) else {
+      x <- map_dfr(seq_len(nrow(fd)), function(i) bind_cols(fd[i, c("ver", "grp", "file", "etag", "mdl_key")], diag_one(con, fd[i, ])))
+      write_parquet(x, f); x }
+  }
+  dbDisconnect(con, shutdown = TRUE)
+  diag <- diag |> mutate(diff_px = only_cog + only_rows + val_diff, frac = diff_px / pmax(n_cog, n_rows, 1),
+                         class = case_when(dup_cells > 0 & diff_px == 0 ~ "duplicate rows only",
+                                           frac < 0.01 ~ "small edge", TRUE ~ "gross"))
+  # wrong-species test: is this COG's pixel hash another model's CURRENT surface?
+  other <- exp_q |> select(ver, grp_o = grp, mdl_other = mdl_key, q_exp)
+  diag <- diag |> left_join(fail |> distinct(grp, file, etag, q_obs), by = c("grp", "file", "etag")) |>
+    left_join(other, by = c("ver", "q_obs" = "q_exp"), relationship = "many-to-many") |>
+    mutate(equals_other_model = !is.na(mdl_other) & mdl_other != mdl_key) |>
+    group_by(across(-c(grp_o, mdl_other, equals_other_model))) |> summarise(equals_other_model = any(equals_other_model),
+      other_model = first(mdl_other[equals_other_model]), .groups = "drop")
+  diag |> count(grp, class, equals_other_model) |> knitr::kable(caption = "failures by class (grp × class × is-it-another-model's-surface)")
+  diag |> group_by(grp, class) |> summarise(objects = n(), median_frac = median(frac), max_frac = max(frac),
+    median_diff_px = median(diff_px), only_cog = sum(only_cog), only_rows = sum(only_rows), val_diff = sum(val_diff), .groups = "drop") |>
+    knitr::kable(caption = "pixel differences (fraction = differing pixels / larger of the two sets)")
+  diag |> filter(class == "gross") |> arrange(desc(frac)) |> select(ver, grp, mdl_key, n_cog, n_rows, only_cog, only_rows, val_diff, frac, equals_other_model, other_model) |>
+    head(25) |> knitr::kable(caption = "the worst (gross) failures")
+} else diag <- tibble()
+```
+
+## 4 · Repaint locally and verify
+
+Every store key that has **no consistent object** is painted from the current rows with the family's encoding
+(`publish_cog`: INT1U, nodata 0, DEFLATE, overviews) into `staging/`, decoded again and compared with the
+pixel hash the key promises. A cell the rows repeat takes `max(val)` — what `turtle_sql()`/`merge_sql()` consume
+(`er`/`suit` CTEs: `max(val) … GROUP BY ms_merge_key, cell_id`); the repeated rows are a defect of the
+`ingest_turtles-swot-dps.qmd` ingest to fix in v10, not a rule the store should inherit.
+
+```{r}
+#| label: repaint
+
+good_keys <- ob |> filter(status %in% c("consistent", "vector (source hash; bounds sampled in M1)")) |> pull(key) |> unique()
+need <- ob |> filter(status %in% c("inconsistent", "not decoded"), !key %in% good_keys) |> arrange(desc(ver)) |> distinct(key, .keep_all = TRUE)
+stopifnot("an undecoded object has no verdict: finish the am decode (MAP_VERIFY_AM=1 on map_asset_store.qmd)" = !any(need$status == "not decoded"))
+if (test_n > 0) need <- slice_head(need, n = test_n)
+log_info("keys with no consistent object: {nrow(need)} (to repaint)")
+paint_one <- function(o, dir_stage, atlas_root, grid, enc_cog) {
+  suppressMessages({library(DBI); library(duckdb); library(terra); library(msens); library(dplyr)})
+  con <- dbConnect(duckdb(), config = list(threads = "2", memory_limit = "3GB")); on.exit(dbDisconnect(con, shutdown = TRUE))
+  ad <- file.path(atlas_root, o$ver, "marine-atlas")
+  if (o$grp %in% c("am", "ax", "dps_nmfs", "vec_grid")) {
+    ds <- sub("\\|.*$", "", o$mdl_key); id <- sub("^[^|]*\\|", "", o$mdl_key)
+    d <- dbGetQuery(con, sprintf("SELECT cell_id, max(val) AS val FROM read_parquet('%s/dist/dataset=%s/%s.parquet') GROUP BY cell_id", ad, ds, id))
+    if (o$grp == "ax") d$val <- round(d$val)
+  } else if (o$grp == "merged") {
+    dbExecute(con, sprintf("ATTACH '%s/merge.duckdb' AS m (READ_ONLY)", ad))
+    id <- dbGetQuery(con, sprintf("SELECT mkey_id FROM m.mkey_map WHERE ms_merge_key = '%s'", o$mdl_key))$mkey_id
+    d <- dbGetQuery(con, sprintf("SELECT cell_id, round_even(max(val), 0) AS val FROM read_parquet('%s/mc_parts/mkey_id=%d/*.parquet') GROUP BY cell_id", ad, id))
+  } else stop("no repaint rule for ", o$grp)
+  q <- d; q$val <- pmin(255, trunc(q$val)); q <- q[q$val >= 1, ]                 # the pixels the rows promise
+  want <- content_hashes_df(cbind(mdl_key = "x", q))$content_hash
+  tmp <- tempfile(tmpdir = dir_stage, fileext = ".tif")
+  msens::publish_cog(d$cell_id, d$val, tmp, grid)                                 # INT1U (terra truncates), as every v8/v9 COG
+  dec <- native_raster_rows(terra::rast(tmp), grid)
+  got <- content_hashes_df(cbind(mdl_key = "x", dec))$content_hash
+  key <- asset_key("cog", "global05", content_hash_encoded(got, enc_cog), "tif")
+  dest <- file.path(dir_stage, gsub("/", "__", key)); file.rename(tmp, dest)
+  tibble::tibble(old_key = o$key, key = key, staged = dest, bytes = file.size(dest), pixel_hash = got, n_pixels = nrow(dec),
+                 verified = identical(got, want) && nrow(dec) == nrow(q), pixel_hash_rows_nodedup = o$pixel_hash)
+}
+painted <- if (nrow(need)) {
+  f <- glue("{dir_out}/repainted.parquet")
+  if (!redo && file_exists(f)) as_tibble(read_parquet(f)) else {
+    plan(multisession, workers = n_workers); t0 <- Sys.time()
+    r <- bind_rows(future_map(split(need, seq_len(nrow(need))), paint_one, dir_stage = as.character(dir_stage),
+        atlas_root = dir_big_x, grid = grid_g05, enc_cog = enc_of[["cog_model"]],
+        .options = furrr_options(seed = TRUE, packages = c("terra", "msens", "DBI", "duckdb", "dplyr"))))
+    plan(sequential); log_info("repainted {nrow(r)} objects in {round(as.numeric(Sys.time() - t0, units = 'mins'), 1)} min")
+    r <- r |> left_join(need |> select(old_key = key, ver, grp, mdl_key), by = "old_key"); write_parquet(r, f); r }
+} else tibble()
+if (nrow(painted)) {
+  painted |> group_by(grp) |> summarise(repainted = n(), verified = sum(verified), GB = round(sum(bytes) / 1e9, 3),
+    key_changed_by_dedup = sum(key != old_key), .groups = "drop") |> knitr::kable(caption = "local repaints (decoded == the quantised rows)")
+  stopifnot("a repaint does not decode to its rows" = all(painted$verified))
+}
+```
+
+## 5 · `rng_iucn` on v7: the 34 bbox failures, dateline-aware
+
+M1 compared the v7 surface's extent with the v9 PMTiles **header bounds**. A range crossing the antimeridian has header
+bounds clipped to ±180 (e.g. −179 … 173), which is not its footprint. Here each of the 34 is compared with the SOURCE
+geometry's longitude span, taken in whichever frame (−180..180 or 0..360) is narrower, against the v7 interval.
+
+```{r}
+#| label: v7-34
+
+m7 <- read_parquet(glue("{dir_as}/v7_rng_iucn_match.parquet")) |> as_tibble()
+bad <- m7 |> filter(!bbox_ok)
+iucn_gpkg <- glue("{atlas_dir('v9')}/native/src/rng_iucn.gpkg")
+span <- function(id) {
+  p <- st_read(iucn_gpkg, quiet = TRUE, query = sprintf("SELECT * FROM rng_iucn WHERE mdl_key = 'rng_iucn|%s'", id)) |> st_zm(drop = TRUE)
+  g <- st_geometry(p); a <- st_bbox(g); b <- st_bbox(st_shift_longitude(g))
+  w <- if ((b[["xmax"]] - b[["xmin"]]) < (a[["xmax"]] - a[["xmin"]])) c(b[["xmin"]], b[["xmax"]]) else c(a[["xmin"]], a[["xmax"]])   # narrower frame
+  c(lon_lo = w[1], lon_hi = w[2], lat_lo = a[["ymin"]], lat_hi = a[["ymax"]])
+}
+sp <- t(vapply(bad$id_no, span, numeric(4))); bad <- bind_cols(bad, as_tibble(sp))
+# the source span may be expressed in -180..180 (lo > hi crossing is not representable) or 0..360; normalise both to 0..360 and compare
+to360 <- function(x) ifelse(x < 0, x + 360, x)
+bad$ok_dateline <- with(bad, {
+  lo <- to360(lon_lo); hi <- to360(lon_hi); hi <- ifelse(hi < lo, hi + 360, hi)       # a crossing span unrolled past 360
+  a <- lon_a; b <- lon_b                                                              # v7 interval, 0..360 frame (can exceed 360 never)
+  inside <- (a >= lo - 0.5 & b <= hi + 0.5) | (a + 360 >= lo - 0.5 & b + 360 <= hi + 0.5)
+  inside & lat_s >= lat_lo - 0.5 & lat_n <= lat_hi + 0.5 })
+cat(sprintf("v7 rng_iucn bbox failures re-checked against the source geometry: %d of %d now agree; %d remain\n",
+            sum(bad$ok_dateline), nrow(bad), sum(!bad$ok_dateline)))
+bad |> filter(!ok_dateline) |> select(mdl_seq, name7, id_no, lon_a, lon_b, lat_s, lat_n, lon_lo, lon_hi, lat_lo, lat_hi) |>
+  knitr::kable(caption = "remaining v7 rng_iucn disagreements (v7 extent vs source-geometry extent)")
+m7 <- m7 |> left_join(bad |> select(mdl_seq, ok_dateline), by = "mdl_seq") |> mutate(bbox_ok_final = bbox_ok | coalesce(ok_dateline, FALSE))
+write_parquet(m7, glue("{dir_out}/v7_rng_iucn_match_final.parquet"))
+cat(sprintf("final: %d of %d exact+unambiguous v7 rng_iucn inputs with a COG have an original that agrees\n", sum(m7$bbox_ok_final), nrow(m7)))
+```
+
+## 6 · The execution manifest (written, NOT run)
+
+One row per **store key**. `copy` = server-side S3→S3 from an existing object whose pixels equal the key's
+(the source is a *consistent* object, newest release first); `upload` = a verified local repaint from `staging/`;
+`skip` = already in the store (nothing is, today). Orphans (on S3, in no release's pointer table) are excluded — they go
+at M6 — except v9's `vec_grid`, which are the same objects as v8's registered ones.
+
+```{r}
+#| label: plan
+
+ok_status <- c("consistent", "vector (source hash; bounds sampled in M1)")
+# objects that are POINTED AT (registered), plus v9 vec_grid, which shares v8's keys
+inc <- ob |> filter(registered | (ver == "v9" & grp == "vec_grid"))
+# keys the pointer tables need = the keys of the included objects, with a repainted object's key replaced by its repaint's key
+need_keys <- inc |> pull(key) |> unique()
+repaint_keys_by_old <- if (nrow(painted)) painted |> select(old_key, key) else tibble(old_key = character(), key = character())
+need_keys <- unique(c(setdiff(need_keys, repaint_keys_by_old$old_key), repaint_keys_by_old$key))
+# a copy source is ANY consistent object with that key (an orphan is a fine source: it is never deleted before M6), newest release first, single-part first
+cand <- ob |> filter(status %in% ok_status, key %in% need_keys) |> arrange(desc(ver), multipart) |> distinct(key, .keep_all = TRUE)
+copy_rows <- cand |> transmute(key, action = "copy", src_key = sub(paste0("^", s3_root, "/"), "", old_url), bytes, md5 = if_else(!multipart, md5_or_etag, NA_character_),
+                               store = if_else(family == "cog_model", "cog", "native"), scope, enc = enc_of[family], content_hash = pixel_hash,
+                               ext, family, first_ver = ver, src_multipart = multipart,
+                               src_local = as.character(glue("{atlas_dir(ver)}/native/{rel}")))
+up_rows <- if (nrow(painted)) painted |> transmute(key, action = "upload", src_key = NA_character_, bytes, md5 = NA_character_, store = "cog", scope = "global05",
+                               enc = enc_of[["cog_model"]], content_hash = pixel_hash, ext = "tif", family = "cog_model", first_ver = ver,
+                               src_multipart = FALSE, src_local = staged) else tibble()
+# a key a repaint produced can also be needed by an included object (e.g. a repaint that coincides with another model's surface)
+plan_ <- bind_rows(copy_rows, up_rows |> filter(!key %in% copy_rows$key)) |> distinct(key, .keep_all = TRUE)
+# keys the pointer tables need but no object/repaint provides = a hole in the plan
+holes <- setdiff(need_keys, plan_$key)
+cat(sprintf("keys the included objects need: %d; in the plan: %d; holes: %d\n", length(need_keys), nrow(plan_), length(holes)))
+stopifnot("the plan leaves keys without a source" = length(holes) == 0)
+
+# md5 of every stored object: a single-part ETag is the MD5; a multipart source or a repaint is hashed from the local file
+need_md5 <- which(is.na(plan_$md5))
+log_info("hashing {length(need_md5)} local files for the catalog md5")
+plan_$md5[need_md5] <- ifelse(file_exists(plan_$src_local[need_md5]), vapply(plan_$src_local[need_md5], native_hash_file, ""), NA_character_)
+stopifnot("an object has no md5 (no local file for a multipart source)" = !anyNA(plan_$md5))
+
+catalog <- plan_ |> transmute(store, key, content_hash, enc, asset_type = if_else(ext == "pmtiles", "pmtiles", "cog"),
+  grid_id = if_else(store == "cog", scope, NA_character_), ds_key = if_else(store == "native", scope, NA_character_),
+  bytes, md5, created = Sys.Date(), first_ver)
+invisible(asset_catalog_check(catalog))
+write_parquet(plan_ |> select(-src_local), glue("{dir_out}/store_plan.parquet"), compression = "zstd")
+write_parquet(catalog, glue("{dir_out}/assets.parquet"), compression = "zstd")
+plan_ |> group_by(action, family) |> summarise(keys = n(), GB = round(sum(bytes) / 1e9, 3), .groups = "drop") |>
+  knitr::kable(caption = "store_plan: keys and GB by action")
+cat(sprintf("TOTAL: %d keys, %.2f GB (%d server-side copies = %.2f GB; %d uploads = %.2f GB)\n", nrow(plan_), sum(plan_$bytes) / 1e9,
+            sum(plan_$action == "copy"), sum(plan_$bytes[plan_$action == "copy"]) / 1e9, sum(plan_$action == "upload"), sum(plan_$bytes[plan_$action == "upload"]) / 1e9))
+```
+
+### The command files (read, do not run)
+
+```{r}
+#| label: commands
+
+ct <- function(ext) if (ext == "tif") "image/tiff" else "binary/octet-stream"      # what the existing objects carry
+cp <- plan_ |> filter(action == "copy")
+write_tsv(cp |> transmute(src = glue("s3://{bucket}/{src_key}"), dst = glue("s3://{bucket}/marine-atlas/{key}")), glue("{dir_cmd}/copy.tsv"), col_names = FALSE)
+up <- plan_ |> filter(action == "upload")
+write_tsv(up |> transmute(local = src_local, dst = glue("s3://{bucket}/marine-atlas/{key}"), type = vapply(ext, ct, "")), glue("{dir_cmd}/upload.tsv"), col_names = FALSE)
+writeLines(c("#!/bin/sh", "# M2 step A (bucket protection) -- NOT RUN. Versioning is bucket-wide; the lifecycle keeps the cost bounded.",
+  "# the bucket has no lifecycle configuration today (get-bucket-lifecycle-configuration -> NoSuchLifecycleConfiguration), so this replaces nothing.",
+  "set -eu", glue("aws s3api get-bucket-versioning --bucket {bucket}"),
+  glue("aws s3api put-bucket-versioning --bucket {bucket} --versioning-configuration Status=Enabled"),
+  glue("aws s3api put-bucket-lifecycle-configuration --bucket {bucket} --lifecycle-configuration file://lifecycle.json"),
+  glue("aws s3api get-bucket-versioning --bucket {bucket}"), glue("aws s3api get-bucket-lifecycle-configuration --bucket {bucket}")),
+  glue("{dir_cmd}/00_bucket_versioning.sh"))
+writeLines(toJSON(list(Rules = list(list(ID = "expire-noncurrent-and-delete-markers-30d", Status = "Enabled", Filter = list(Prefix = ""),
+  NoncurrentVersionExpiration = list(NoncurrentDays = 30), Expiration = list(ExpiredObjectDeleteMarker = TRUE),
+  AbortIncompleteMultipartUpload = list(DaysAfterInitiation = 7)))), auto_unbox = TRUE, pretty = TRUE), glue("{dir_cmd}/lifecycle.json"))
+writeLines(c("#!/bin/sh", "# M2 step B (server-side copies, no download) -- NOT RUN.", "set -eu", "cd \"$(dirname \"$0\")\"",
+  glue("mkdir -p {here('_output/logs')}"),
+  "# 16 parallel `aws s3 cp` s3->s3; metadata (content-type, SSE) is copied with the object",
+  glue("xargs -P 16 -L 1 sh -c 'aws s3 cp \"$0\" \"$1\" --only-show-errors || echo \"FAILED $0 $1\"' < copy.tsv 2>&1 | tee {here('_output/logs/store_copy.log')}"),
+  glue("test \"$(grep -c FAILED {here('_output/logs/store_copy.log')} || true)\" = 0")), glue("{dir_cmd}/10_copy.sh"))
+writeLines(c("#!/bin/sh", "# M2 step C (verified local repaints -> S3) -- NOT RUN.", "set -eu", "cd \"$(dirname \"$0\")\"",
+  glue("xargs -P 8 -L 1 sh -c 'aws s3 cp \"$0\" \"$1\" --content-type \"$2\" --only-show-errors || echo \"FAILED $0 $1\"' < upload.tsv 2>&1 | tee {here('_output/logs/store_upload.log')}"),
+  glue("test \"$(grep -c FAILED {here('_output/logs/store_upload.log')} || true)\" = 0")), glue("{dir_cmd}/20_upload.sh"))
+writeLines(c("#!/bin/sh", "# M2 step D (publish the catalog LAST, after the HEAD sweep passes) -- NOT RUN.", "set -eu",
+  glue("aws s3 cp {glue('{dir_out}/assets.parquet')} s3://{bucket}/marine-atlas/assets.parquet --content-type application/octet-stream --only-show-errors"),
+  glue("aws s3api head-object --bucket {bucket} --key marine-atlas/assets.parquet")), glue("{dir_cmd}/30_catalog.sh"))
+Sys.chmod(dir_ls(dir_cmd, glob = "*.sh"), "755")
+dir_info(dir_cmd) |> transmute(file = path_file(path), KB = round(as.numeric(size) / 1024)) |> knitr::kable(caption = "command files (none executed)")
+```
+
+## 7 · Dry-run estimate
+
+```{r}
+#| label: estimate
+
+n_cp <- sum(plan_$action == "copy"); n_up <- sum(plan_$action == "upload")
+gb_cp <- sum(plan_$bytes[plan_$action == "copy"]) / 1e9; gb_up <- sum(plan_$bytes[plan_$action == "upload"]) / 1e9
+# measured READ-ONLY: HEAD round trips (latency of the API a server-side copy also pays) and download throughput of one object
+t_head <- system.time(for (i in 1:20) system2("curl", c("-sI", "-o", "/dev/null", shQuote(glue("{s3_base}/{plan_$key[1]}"))), stdout = FALSE, stderr = FALSE))[["elapsed"]] / 20
+cat(sprintf("%d server-side copies (%.2f GB, no bandwidth used) + %d uploads (%.2f GB)\n", n_cp, gb_cp, n_up, gb_up))
+cat(sprintf("HEAD round trip from this laptop: %.2f s. Copy estimate: %d objects at ~16 parallel x ~3 objects/s each = ~%.0f min (the S3 copy of a 1 MB object is dominated by request latency).\n",
+            t_head, n_cp, n_cp / 48 / 60))
+cat(sprintf("Upload estimate: %.2f GB at an ASSUMED 10-20 MB/s uplink = ~%.0f-%.0f min (not measured: measuring means writing).\n", gb_up, gb_up * 1e3 / 20 / 60, gb_up * 1e3 / 10 / 60))
+```
