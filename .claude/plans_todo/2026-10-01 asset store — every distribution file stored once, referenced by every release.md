@@ -22,7 +22,7 @@ coverage numbers stand).
 | `v8/native/vec_grid/` · `v9/…` | 6,753 · 6,753 | 0.15 GB each | vector ranges gridded ("model") |
 | `v8/native/merged/` · `v9/…` | 6,785 · 15,674 | 0.54 · 3.77 GB | merged models |
 | `v9/native/ax/` · `ax_native/` · `dps_nmfs/` | 10,527 · 10,536 · 19 | 0.50 · 1.79 GB · 1 MB | AquaX, DPS |
-| file host `pmtiles/{v8,v9}/` | 13,552 | (third copy) | what `native_asset` URLs point at; 6,187 `rng_iucn` files are unregistered |
+| file host `pmtiles/{v8,v9}/` | 13,552 | (third copy) | what `native_asset` URLs point at (all registered, incl. 6,187 `rng_iucn` — corrected at G1) |
 
 - v8 and v9 each carry a full per-release tree (~20 GB each, mostly identical). The bucket README's promise ("`cog/`
   is shared by every release … a surface that did not change between releases is stored once") is false for v8+.
@@ -94,8 +94,9 @@ object, deliberately.
   per-model object from the release DB / sources (not from bytes), list every existing object with size + ETag, and
   write `store_migration.parquet`: `old_url → store, key, hash, enc, bytes, md5, n_releases`. Report the collapse
   (expect ≈ 39 GB across the v8+v9 trees → ≈ 20 GB unique) and three checks: same hash ⇒ same ETag between v8 and v9
-  for a sample; a decoded sample COG equals its DB rows; no two different contents share a key. Include the 6,187
-  unregistered `rng_iucn` PMTiles. **G1: Ben sees the numbers.**
+  for a sample; a decoded sample COG equals its DB rows; no two different contents share a key. **G1: Ben sees the
+  numbers.** DONE 2026-10-01: `atlas-refs/round4-session/m1-g1-report.md` — 145,452 objects / 33.08 GB → 86,421 keys /
+  19.63 GB; see section 3a.
 - **M2 · Copy.** First, with Ben's go, enable bucket versioning + the 30-day lifecycle rule (decision 3). Then server-side `aws s3 cp` old key → store key, only for keys not in the catalog, PMTiles from the S3
   mirror (file host untouched). Write `assets.parquet`. Verify: catalog row count = distinct keys; HEAD a sample.
   **G2.**
@@ -114,6 +115,31 @@ object, deliberately.
 - **M6 · Prune (destructive, explicit go, after a soak).** Delete `v8/native/`, `v9/native/` and file-host
   `pmtiles/{v8,v9}/` only when `store_unreferenced()` and a full pointer-URL HEAD sweep are clean. **G5: Ben's
   explicit go; bucket versioning is off, so this is not undoable.**
+
+## 3a. What M1 found, and the rules it adds to M2 (2026-10-01)
+
+- v8 and v9 are byte-identical for `am`, `am_native`, `vec_grid` and every PMTiles (0 differences over the full
+  population); only `merged` differs (1,634 of 6,785 same-name pairs: v9's AquaX supersession) plus v9-only `ax`/`dps`.
+- **The store admits an object under key K only if its decoded pixels equal the quantised rows K was computed from.**
+  M1 decoded every object except most of `am` and found three families where the published file is NOT what the
+  release's rows (what scoring used) say:
+  1. `am` gridded: 898 of 6,240 decoded (14%; ≈ 2,600 extrapolated) — the `dist/dataset=am` rows were rewritten after
+     the COGs were painted. Mostly a handful of pixels, some gross (`am|Fis-31618`: 392,627 px painted vs 3,311 rows).
+     The v8/v9 preview map therefore shows, for those models, a surface the scoring did not use.
+  2. v8 `merged`: 192 (painted `trunc(max)`, rows are `round(max)`; ≤ 1 level).
+  3. `vec_grid`: the 6 `rng_turtle_swot_dps` models (two rows per cell in `dist`; painted "last row wins").
+  **Rule: verify every object before it is copied; a failing object is repainted from the current rows and uploaded
+  under its key, never copied.** For (3) the surface is the value the merge consumed for that cell (state the rule,
+  apply it to the painted surface, and record the duplicate-row defect for the v10 ingest).
+- 48 `merged` pairs share a key but not bytes: v8's file is the stale one; the store takes the consistent bytes.
+- Orphans (on S3, in no release's pointer table: a few `am`/`am_native`/`ax_native`/`ch_fws`/`rng_fws` objects) are not
+  migrated; they go at M6. **Exception: v9's 6,753 `vec_grid` objects are orphans only because v9's `native_asset`
+  lost its `model` rows for vector ranges** — M3 restores those rows (same store objects as v8's).
+- v7 `rng_iucn`: 1,518 inputs with a COG; 1,460 have an unambiguous exact-name match with the original on disk; 1,426
+  pass the bbox check; 34 fail it where the PMTiles header bounds stop short of the dateline — re-check those with
+  dateline-aware bounds before dropping any.
+- All hashing and painting runs on the laptop (the server has no `dist/` or `merge.duckdb`). Hashing both releases
+  took ≈ 49 min.
 
 ## 4. Atlas, docs, apps
 
