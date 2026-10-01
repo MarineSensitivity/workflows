@@ -471,12 +471,19 @@ cp <- plan_ |> filter(action == "copy")
 write_tsv(cp |> transmute(src = glue("s3://{bucket}/{src_key}"), dst = glue("s3://{bucket}/marine-atlas/{key}")), glue("{dir_cmd}/copy.tsv"), col_names = FALSE)
 up <- plan_ |> filter(action == "upload")
 write_tsv(up |> transmute(local = src_local, dst = glue("s3://{bucket}/marine-atlas/{key}"), type = vapply(ext, ct, "")), glue("{dir_cmd}/upload.tsv"), col_names = FALSE)
-writeLines(c("#!/bin/sh", "# M2 step A (bucket protection) -- NOT RUN. Versioning is bucket-wide; the lifecycle keeps the cost bounded.",
-  "# the bucket has no lifecycle configuration today (get-bucket-lifecycle-configuration -> NoSuchLifecycleConfiguration), so this replaces nothing.",
-  "set -eu", glue("aws s3api get-bucket-versioning --bucket {bucket}"),
+writeLines(c("#!/bin/sh", "# M2 step A (bucket protection) -- NOT RUN.",
+  "# THE BUCKET IS SHARED: besides marine-atlas/ it holds backups/, gazetteer/, issues/ and root files (calcofi.duckdb, ...).",
+  "# Versioning is BUCKET-WIDE (it cannot be scoped to a prefix) and can later be SUSPENDED but never removed; the lifecycle rule below",
+  "# (empty prefix) expires noncurrent versions and delete markers after 30 days for EVERY project's prefix. Read the runbook first.",
+  "set -eu", "cd \"$(dirname \"$0\")\"",
+  ": \"${CONFIRM_BUCKET_WIDE_VERSIONING:?set CONFIRM_BUCKET_WIDE_VERSIONING=yes only after reading m2-m4-runbook.md step 1}\"",
+  "[ \"$CONFIRM_BUCKET_WIDE_VERSIONING\" = yes ] || { echo 'not confirmed'; exit 1; }",
+  glue("echo '--- before:'; aws s3api get-bucket-versioning --bucket {bucket}"),
+  "# never overwrite someone else's lifecycle rules: put-bucket-lifecycle-configuration REPLACES the whole configuration",
+  glue("if aws s3api get-bucket-lifecycle-configuration --bucket {bucket} >/dev/null 2>&1; then echo 'a lifecycle configuration already exists: merge the rule into it by hand (see the runbook)'; exit 1; fi"),
   glue("aws s3api put-bucket-versioning --bucket {bucket} --versioning-configuration Status=Enabled"),
   glue("aws s3api put-bucket-lifecycle-configuration --bucket {bucket} --lifecycle-configuration file://lifecycle.json"),
-  glue("aws s3api get-bucket-versioning --bucket {bucket}"), glue("aws s3api get-bucket-lifecycle-configuration --bucket {bucket}")),
+  glue("echo '--- after:'; aws s3api get-bucket-versioning --bucket {bucket}"), glue("aws s3api get-bucket-lifecycle-configuration --bucket {bucket}")),
   glue("{dir_cmd}/00_bucket_versioning.sh"))
 writeLines(toJSON(list(Rules = list(list(ID = "expire-noncurrent-and-delete-markers-30d", Status = "Enabled", Filter = list(Prefix = ""),
   NoncurrentVersionExpiration = list(NoncurrentDays = 30), Expiration = list(ExpiredObjectDeleteMarker = TRUE),
@@ -486,7 +493,7 @@ writeLines(c("#!/bin/sh", "# M2 step B (server-side copies, no download) -- NOT 
   "# 16 parallel `aws s3 cp` s3->s3; metadata (content-type, SSE) is copied with the object",
   glue("xargs -P 16 -L 1 sh -c 'aws s3 cp \"$0\" \"$1\" --only-show-errors || echo \"FAILED $0 $1\"' < copy.tsv 2>&1 | tee {here('_output/logs/store_copy.log')}"),
   glue("test \"$(grep -c FAILED {here('_output/logs/store_copy.log')} || true)\" = 0")), glue("{dir_cmd}/10_copy.sh"))
-writeLines(c("#!/bin/sh", "# M2 step C (verified local repaints -> S3) -- NOT RUN.", "set -eu", "cd \"$(dirname \"$0\")\"",
+writeLines(c("#!/bin/sh", "# M2 step C (verified local repaints -> S3) -- NOT RUN.", "set -eu", "cd \"$(dirname \"$0\")\"", glue("mkdir -p {here('_output/logs')}"),
   glue("xargs -P 8 -L 1 sh -c 'aws s3 cp \"$0\" \"$1\" --content-type \"$2\" --only-show-errors || echo \"FAILED $0 $1\"' < upload.tsv 2>&1 | tee {here('_output/logs/store_upload.log')}"),
   glue("test \"$(grep -c FAILED {here('_output/logs/store_upload.log')} || true)\" = 0")), glue("{dir_cmd}/20_upload.sh"))
 writeLines(c("#!/bin/sh", "# M2 step D (publish the catalog LAST, after the HEAD sweep passes) -- NOT RUN.", "set -eu",
