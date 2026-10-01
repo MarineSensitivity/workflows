@@ -183,3 +183,12 @@ annual averaging (two-tier keys).
    under G2 (before the first store write), with Ben's go.
 4. **gm/nc go into the v10 bootstrap, displayed as raw density** (their own legend range, no 1–100 rescale),
    registered with `is_scored = FALSE`. No v8/v9 re-issue.
+5. **Repaint** every object whose decoded pixels do not equal its rows (the failing `am`, the 192 v8 `merged`, the
+   6 turtle DPS `vec_grid`) from the model's own current rows; never copy them. (2026-10-01, after G1)
+6. **Restore** v9's `model` rows for vector ranges (`vec_grid`) when M3 re-points v9.
+7. **Deduplicate** the turtle DPS rows: the painted value is the one the merge consumed for that cell; the duplicate
+   rows are logged as a defect for the v10 ingest.
+
+Confirmed cause of the gross `am` failures (one example checked by the orchestrator): the positional-`mid` bug —
+`am_Fis-31618.tif` holds `Fis-31621`'s 392,627 cells (two positions on in sorted order); not a US clip (`dist` rows
+are whole-range; the US restriction happens in the merge).
