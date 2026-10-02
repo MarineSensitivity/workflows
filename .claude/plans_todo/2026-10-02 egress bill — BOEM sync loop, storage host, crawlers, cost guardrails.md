@@ -343,3 +343,19 @@ Open, in order:
 5. gm/nc ingests (handoff §7): independent, but heavy on the laptop; do not run alongside the runbook.
 6. Not pushed: `workflows` (now 35 ahead), `msens` (13 ahead). The server container converges msens from
    its `/share` checkout, so 0.51.0 reaches the server only after a push and a pull there.
+
+## 10. P1, P4, P5 closed (2026-10-02, 14:00 local)
+
+- `DEPLOY_CADDY=1` ran at 11:07 UTC (`server` `1686536`): storage objects 302 to S3 (Range included), all 18
+  access logs exist, data hosts answer 403 to GPTBot and 200/`Disallow: /` on `robots.txt`, browsers and
+  `Claude-User` pass; titiler `/cog/info`, file-host PMTiles (206), apps, STAC and the API all still answer.
+  `tile.marinesensitivity.org` is 502 to a browser — its upstream container is not running (pre-existing).
+- `aws/guardrails.sh --apply` converged all six guardrails; `--check` exits 0; a `--test-alarm` email arrived.
+  Lesson recorded in `server` `49576de`/`76c11b6`: the SNS subscription was unsubscribed twice within minutes of
+  a browser confirmation (something followed the "unsubscribe" link on AWS's confirmation page) and the first
+  check still printed `ok`. Only a CONFIRMED subscription counts now, and it was confirmed with
+  `--confirm` (AuthenticateOnUnsubscribe), so a link can no longer remove it.
+- The daily network alarm and the $10 data-transfer budget are in ALARM for leftovers of Oct 1–2 (197 GB,
+  ~$18); the monthly forecast email ($506) is the same two days extrapolated.
+- Next for Ben: file the AWS credit case (`egress-refs/aws_credit_request.md`, ~$471); optional: delete the
+  old $20 budget (`server/aws/README.md`).

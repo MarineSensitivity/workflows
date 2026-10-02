@@ -13,12 +13,11 @@ this cannot be filed from the CLI on a Basic plan).
    `DataTransfer-Out-Bytes` (Cost Explorer → Group by: Usage type → filter Service = EC2-Instances, daily,
    2026-08-20 to today). The flat step on Aug 27 makes the case by itself.
 
-Send it **after** everything under "What I have done" is true, because the reviewer will ask what was fixed
-and what prevents a repeat: the Caddy deploy has stopped the transfer (a full day of CloudWatch `NetworkOut`
-under 2 GB), the mirror's key is disabled, and the plan's P1 guardrails exist (the NetworkOut alarms, the cost
-anomaly monitor, the two budgets). Until P1 is applied, items 2 and 3 below are not yet true: delete them or
-wait. A credit is at AWS's discretion; a first-time, clearly accidental, already-fixed charge is the kind they
-usually consider. Update the October figure to the day the transfer stopped.
+Everything under "What I have done" is now true (2026-10-02): the transfer stopped at 10:05 UTC, the mirror's
+key was disabled at 10:18 UTC, and `aws/guardrails.sh --apply` created the alarms, the anomaly monitor and the
+two budgets (`--check` reports all six ok). The October figure is measured from CloudWatch (137.6 GB on Oct 1,
+59.5 GB on Oct 2). A credit is at AWS's discretion; a first-time, clearly accidental, already-fixed charge is the
+kind they usually consider.
 
 ## Subject
 
@@ -36,7 +35,7 @@ What was charged (usage type `DataTransfer-Out-Bytes`, service EC2-Instances):
 - August 2026: 702.8 GB, $55.60. Usage was 0.1 to 0.2 GB per day until August 26, then 55.8 GB on August 27
   and about 153 GB per day from August 28.
 - September 2026: 4,518.9 GB, $397.70. About 153 GB every day.
-- October 1 to 2, 2026: about 280 GB, roughly $25 (until the fix below).
+- October 1 to 2, 2026: 197 GB, about $18 (the transfers stopped at 10:05 UTC on October 2).
 
 Before August 27 this account's data transfer out stayed inside the free allowance.
 
@@ -57,7 +56,7 @@ What I have done:
    transfer.
 
 Request: a one-time credit for the EC2 `DataTransfer-Out-Bytes` charges for August 27, 2026 through October 2,
-2026 (about $475: $55.60 in August, $397.70 in September, and October to date). I can provide the CloudWatch
+2026 (about $471: $55.60 in August, $397.70 in September, and about $18 in October). I can provide the CloudWatch
 series, the Cost Explorer export, or the client's own log showing the failed retries.
 
 Thank you.
