@@ -260,6 +260,21 @@ Because the old `{ver}/native/` files and file-host PMTiles are never removed be
 | 5 | `VERIFIED`: 110,017 listed = 110,017 catalogued; 0 missing / unexpected / size / md5; 200 HEADs ok |
 | 6 | `assets.parquet` public (110,017 rows); three READMEs; old ones in `_backup/*.old` |
 | 7 v9 | 7b pushed `native_asset` + manifest (gate: 93,610 store, 0 vm_bulk); 7c 21 min, shards gate 84,780 store / 0 vm_bulk / 11 external, `built_at` 2026-10-02T13:58:32Z; 7d `PASS` (200/200 HEADs, 20/20 shards, 2,691 of 2,694 sampled inputs with both representations). **Paused for Ben's look (7e) before v8, v7b, v7.** |
+| 7e v9 | Ben looked at v9 on the review host: "Looks great"; go for v8, v7b, v7 without further pauses |
+| 7 v8 | 7b pushed `native_asset` + manifest (gate: 72,484 store, 0 vm_bulk); 7c 21 min, shards gate 54,864 store / 0 vm_bulk / 10 external, `built_at` 2026-10-02T15:35:11Z; 7d `PASS` (200/200 HEADs, 20/20 shards, 2,005 of 2,005 sampled inputs with both representations) |
+| 7 v7b | 7b pushed `native_asset` + manifest (`tables.native_asset` set, `native_representation` true); 7c **first attempt died mid-push** on a network drop (`aws s3 cp … Could not connect to the endpoint URL`, `cell/tile=1052`), `boot.json` not yet replaced so the old contract stayed live; **re-run clean** (shards gate 26,879 store / 0 vm_bulk / 10 external, `built_at` 2026-10-02T16:31:35Z); 7d `PASS` (49,331 pointers, 200/200 HEADs, 20/20 shards, 785 of 945 sampled inputs with both representations) |
+| 7 v7 | 7b pushed `native_asset` + manifest (`tables.native_asset` set, `native_representation` true); 7c 22 min, shards gate 26,879 store / 0 vm_bulk / 10 external, `built_at` 2026-10-02T17:00:43Z; 7d `PASS` (49,331 pointers, 200/200 HEADs, 20/20 shards, 785 of 945 sampled inputs with both representations). `latest.txt` untouched (`v7`) |
+| 7e v7 | public Atlas, browser (`atlas/scripts/prepublish-check.mjs --live`, new): **before** the shards landed the check failed (no switch; legend "on the 0.05° scoring grid"); **after**: Marbled Murrelet `in=bl` and `in=ch_fws` show "Show … as Original Interpolated", Original pressed, `206 native/bl/515106b50566cc7a.pmtiles` / `206 native/ch_fws/fa5e942269294d60.pmtiles`, range drawn in the screenshot; rosylip sculpin `in=am_0.05` shows the switch, "as delivered" |
+
+**M2–M4 are complete: all four releases point only at the store.** Step 8 holds: the old `v8/native/`, `v9/native/` and file-host
+`pmtiles/{v8,v9}/` copies stay until M6 (earliest 2026-10-16, with Ben's explicit go).
+
+Follow-ups made the same day (code only, nothing published): `libs/app_bundle.R` `app_bundle_aws_retry()` (the v7b mid-push
+failure: a dropped connection is retried, an answer from S3 is not; self-test in `guard-selftest`); msens 0.52.0 (STAC dataset
+Items link `tables/native_asset.parquet` in place of four directory hrefs that never answered; `backfill_versions.qmd` asks the
+bucket whether a legacy release has one). **Not done:** rebuild + deploy the STAC trees with 0.52.0 and re-run
+`publish_stac_api.qmd` (Item hrefs still name the old `{ver}/native/` files, which answer until M6); M5 (`publish_native.qmd`
+writes only to the store; publish gate); the docs `asset-store` branch (three of its sentences wait on M5 and the STAC rebuild).
 
 Also on the bucket today: root `calcofi.duckdb` deleted at Ben's request after step 1 (recoverable for 30 days as a
 noncurrent version); S3 access logging and request metrics enabled by `server/aws/guardrails.sh`.

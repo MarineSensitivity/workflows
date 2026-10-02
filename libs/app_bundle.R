@@ -783,6 +783,67 @@ app_bundle_head_check_retry_selftest <- function() {
   invisible(TRUE)
 }
 
+#' Run one `aws` CLI call, retrying a failure that never reached S3
+#'
+#' One `aws s3 cp` per object means a 945-object push dies on a single dropped
+#' connection (2026-10-02, v7b: `Could not connect to the endpoint URL` on object
+#' ~600; `boot.json` is pushed last, so the old contract stayed live and a re-run
+#' finished it). A failure whose output shows the request never got an answer is
+#' retried after a pause; anything S3 actually said (AccessDenied, NoSuchBucket,
+#' a bad argument) is returned at once, never retried into a pass.
+#'
+#' @param args `aws` arguments, already shell-quoted where needed
+#' @param backoff_s sleep before each retry, in order; its length is the number
+#'   of retries (default `c(5, 20, 60)`)
+#' @param run the runner (default `system2`); injected by the self-test
+#' @return the runner's output (character, with a `status` attribute when the
+#'   last attempt failed) -- the caller's own status check is unchanged
+app_bundle_aws_retry <- function(args, backoff_s = c(5, 20, 60), run = system2) {
+  no_answer <- "Could not connect to the endpoint URL|Connection (was closed|reset)|Read timeout|Connect timeout|RequestTimeout|SlowDown|ServiceUnavailable|InternalError"
+  for (i in seq_len(length(backoff_s) + 1L)) {
+    out    <- run("aws", args, stdout = TRUE, stderr = TRUE)
+    status <- attr(out, "status")
+    failed <- !is.null(status) && status != 0
+    if (!failed || i > length(backoff_s) || !any(grepl(no_answer, out))) return(out)
+    Sys.sleep(backoff_s[i])
+  }
+}
+
+#' Self-test for [app_bundle_aws_retry()] — a fake runner, no network
+#'
+#' @return `TRUE`, invisibly; stops on the first failed expectation
+app_bundle_aws_retry_selftest <- function() {
+  stopifnot(requireNamespace("testthat", quietly = TRUE))
+  fake <- function(outs) {
+    n <- 0L
+    list(run = function(...) { n <<- n + 1L; outs[[min(n, length(outs))]] }, calls = function() n)
+  }
+  drop   <- structure("upload failed: x to s3://b/k Could not connect to the endpoint URL: \"https://s3…\"", status = 1L)
+  denied <- structure("upload failed: x to s3://b/k An error occurred (AccessDenied) when calling the PutObject operation", status = 1L)
+  ok     <- "upload: x to s3://b/k"
+
+  testthat::test_that("a dropped connection is retried and the eventual success is returned", {
+    f   <- fake(list(drop, drop, ok))
+    out <- app_bundle_aws_retry("s3", backoff_s = c(0, 0, 0), run = f$run)
+    testthat::expect_null(attr(out, "status")); testthat::expect_equal(f$calls(), 3L)
+  })
+  testthat::test_that("RED: a connection that never comes back still FAILS, after every retry", {
+    f   <- fake(list(drop))
+    out <- app_bundle_aws_retry("s3", backoff_s = c(0, 0), run = f$run)
+    testthat::expect_equal(attr(out, "status"), 1L); testthat::expect_equal(f$calls(), 3L)
+  })
+  testthat::test_that("RED: an answer from S3 (AccessDenied) is never retried", {
+    f   <- fake(list(denied, ok))
+    out <- app_bundle_aws_retry("s3", backoff_s = c(0, 0), run = f$run)
+    testthat::expect_equal(attr(out, "status"), 1L); testthat::expect_equal(f$calls(), 1L)
+  })
+  testthat::test_that("a first-try success makes one call", {
+    f <- fake(list(ok)); app_bundle_aws_retry("s3", backoff_s = c(0, 0), run = f$run)
+    testthat::expect_equal(f$calls(), 1L)
+  })
+  invisible(TRUE)
+}
+
 #' Self-test for [app_bundle_head_check()] — real network, tiny sample
 #'
 #' No mocking: one known-anonymous-readable URL (this bucket's `latest.txt`,

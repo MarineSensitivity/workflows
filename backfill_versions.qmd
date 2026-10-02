@@ -554,7 +554,15 @@ do_reload <- Sys.getenv("BACKFILL_NO_RELOAD") == "" && on_server && do_s3
 if (do_stac) {
   stac_root <- if (on_server) "/share/data/derived/stac" else file.path(dir_v, "stac")
   tmp       <- tempfile("stac_")
-  msens::stac_build(bver, dir_out = tmp, con = con, model_asset = model_asset)
+  # a legacy release's local database has no native_asset table even when the pointer table is
+  # published (v7, v7b since the asset-store migration), so ask the bucket, as a client would
+  u_na   <- glue("{msens::atlas_bases()$atlas}/{bver}/tables/native_asset.parquet")
+  has_na <- tryCatch(
+    httr2::request(u_na) |> httr2::req_method("HEAD") |> httr2::req_error(is_error = \(r) FALSE) |>
+      httr2::req_perform() |> httr2::resp_status() == 200L,
+    error = function(e) FALSE)
+  log_info("STAC: {bver} publishes tables/native_asset.parquet: {has_na}")
+  msens::stac_build(bver, dir_out = tmp, con = con, model_asset = model_asset, has_native_asset = has_na)
   # publish gate (libs/url_gate.R): no bulk file (.tif/.pmtiles/...) of the tree just built may be
   # fetched from a VM host -- checked BEFORE it is copied into the deployed root. URL_AUDIT_ALLOW = escape hatch
   source(here::here("libs/url_gate.R"))
