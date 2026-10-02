@@ -247,3 +247,19 @@ Because the old `{ver}/native/` files and file-host PMTiles are never removed be
 | notebooks (rendered records in `_output/`) | `map_asset_store.qmd` (M1), `stage_asset_store.qmd` (M2-prep), `stage_publish.qmd` (M3 dry run + flagged backup/push) |
 | scripts | `scripts/verify_asset_store.R`, `scripts/check_release_pointers.R` |
 | G1 report | `.claude/plans_todo/atlas-refs/round4-session/m1-g1-report.md` |
+
+## 7 · Run log (2026-10-02, oversight session, with Ben's go; D1 = A, D2 = none)
+
+| step | result |
+|---|---|
+| P0 | account, disk (189 GB), 2,934 staged, 86,351 plan rows ok; msens 0.51.0 (superset of 0.50.0); laptop load 12–19 and swap 10.6 GB at the start (another session's R jobs), ~3.6 by step 7 |
+| 1 | versioning `Enabled`; rule `expire-noncurrent-and-delete-markers-30d` |
+| 2 | backups: app objects v9 940, v8 940, v7b 945, v7 945; manifests 4; `native_asset` v9, v8 |
+| 3 | **deviation in method, not content:** `10_copy.sh` (one `aws s3 cp` process per object) made 365 copies/min = 3.8 h; stopped after 1,062. `scripts/store_copy.py` made the same CopyObject calls from one process: 82,313 in 374 s, 0 failed; the 42 multipart sources (> 8 MiB) went through `aws s3 cp` as the runbook had them. A second pass: 83,417 present at the planned size, 0 conflicts |
+| 4 | 2,934 uploads, 0 failed |
+| 5 | `VERIFIED`: 110,017 listed = 110,017 catalogued; 0 missing / unexpected / size / md5; 200 HEADs ok |
+| 6 | `assets.parquet` public (110,017 rows); three READMEs; old ones in `_backup/*.old` |
+| 7 v9 | 7b pushed `native_asset` + manifest (gate: 93,610 store, 0 vm_bulk); 7c 21 min, shards gate 84,780 store / 0 vm_bulk / 11 external, `built_at` 2026-10-02T13:58:32Z; 7d `PASS` (200/200 HEADs, 20/20 shards, 2,691 of 2,694 sampled inputs with both representations). **Paused for Ben's look (7e) before v8, v7b, v7.** |
+
+Also on the bucket today: root `calcofi.duckdb` deleted at Ben's request after step 1 (recoverable for 30 days as a
+noncurrent version); S3 access logging and request metrics enabled by `server/aws/guardrails.sh`.
