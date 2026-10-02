@@ -9,6 +9,23 @@ was verified on 2026-10-01/02 unless marked "not verified". Read this file, then
    release session, reviewed by the orchestrator).
 3. `plans_todo/atlas-refs/round4-session/m1-g1-report.md` — what the mapping pass measured.
 
+## Status update, 2026-10-02 evening (egress session, with Ben's go)
+
+**§5 A is DONE: the runbook ran end to end; v9, v8, v7b and v7 are published from the store and each passes
+`scripts/check_release_pointers.R`** (run log: `atlas-refs/round4-session/m2-m4-runbook.md` §7). §5 B: v7 verified in a
+browser on the public Atlas (`atlas/scripts/prepublish-check.mjs --live`); Ben looked at v9 on the review host; v8 and
+v7b were not looked at by a person. §6 items 1–4 shipped as atlas 0.10.87. What remains, in order:
+
+1. **STAC** — msens 0.52.0 (local `main`, not pushed) replaces the dataset Items' four directory hrefs with one link
+   to `{ver}/tables/native_asset.parquet`. Still to run: the STAC rebuild + deploy per release and
+   `publish_stac_api.qmd` (per-model Item hrefs still name the old `{ver}/native/` files). Needs msens 0.52.0 on the
+   server (push + pull + `03_msens_from_share`), so it waits on Ben's go to push msens. Two other directory hrefs
+   remain by design for now (`dist_merged/`, legacy `tables/`).
+2. **M5** (§5 D) — not started. `publish_native.qmd` must not be run until then.
+3. **Docs** (§5 C) — branch `asset-store` unchanged; three of its sentences wait on 1 and 2.
+4. **M6 prune** — earliest 2026-10-16, Ben's explicit go.
+5. Cleanup (§7), gm/nc (§7) — not started.
+
 ## 0. One-paragraph state
 
 The Atlas (static app, `atlas/`) finished round 4 and is live at **0.10.86** (`main` = `83b4839`, clean, one branch,
