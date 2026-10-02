@@ -28,7 +28,7 @@ editor_options:
 
 librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, purrr, readr, stringr, tibble, tidyr, arrow, quiet = T)
 library(msens)
-stopifnot("needs msens >= 0.49.0" = packageVersion("msens") >= "0.49.0",
+stopifnot("needs msens >= 0.50.0 (source_key)" = packageVersion("msens") >= "0.50.0",
           "native_asset_restore_model" %in% getNamespaceExports("msens"))
 source(here("libs/paths.R"))
 vers   <- strsplit(Sys.getenv("PS_VERS", "v9,v8,v7b,v7"), ",")[[1]]
@@ -38,7 +38,7 @@ dir_ps <- glue("{dir_as}/publish_stage"); dir_pub <- glue("{dir_ps}/_published")
 dir_create(c(dir_ps, dir_pub))
 base <- atlas_base_url()                                                   # https://s3.us-east-1.amazonaws.com/oceanmetrics.io-public/marine-atlas
 NA_COLS <- c("ms_merge_key", "mdl_key", "ds_key", "asset_type", "representation", "asset_url", "rescale_min", "rescale_max",
-             "colormap", "xmin", "xmax", "ymin", "ymax", "source_layer", "content_hash")
+             "colormap", "xmin", "xmax", "ymin", "ymax", "source_layer", "content_hash", "source_key")
 ok  <- read_parquet(glue("{dir_stage}/object_keys.parquet")) |> as_tibble()
 cat_ <- read_parquet(glue("{dir_stage}/assets.parquet")) |> as_tibble(); invisible(asset_catalog_check(cat_))
 log_info("M3 dry run | releases {paste(vers, collapse = ' ')} | catalog {nrow(cat_)} keys | out {dir_ps}")
@@ -76,7 +76,9 @@ repoint <- function(v) {
   k  <- ok |> filter(ver == v) |> select(rel, key)
   rel <- rel_of(na$asset_url); key <- k$key[match(rel, k$rel)]
   stopifnot("a pointer names an object the migration map does not know" = !anyNA(key))
-  out <- na |> mutate(asset_url = store_url(key), content_hash = hash_of(key))
+  # source_key = the key the PMTiles features carry: v8+ stamps the input's own mdl_key, so for v8/v9 it IS the row's mdl_key
+  out <- na |> mutate(asset_url = store_url(key), content_hash = hash_of(key),
+                      source_key = if_else(asset_type == "pmtiles", as.character(mdl_key), NA_character_))
   if (v == "v9") {
     vg <- ok |> filter(ver == "v9", grp == "vec_grid")
     mu <- tibble(mdl_key = vg$mdl_key, asset_url = store_url(vg$key), content_hash = hash_of(vg$key))
@@ -175,7 +177,7 @@ rd_pub <- function(v, kind, k) { f <- glue("{dir_pub}/{v}/app/{kind}/{k}.json");
 gz_bytes <- function(txt) length(memCompress(charToRaw(txt), "gzip"))
 # everything in a card that is a POINTER at a file: each input's assets, and the taxon's own merged-surface url. All else must not move.
 strip_assets <- function(card) { card$inputs <- lapply(card$inputs, function(i) { i$assets <- NULL; i }); if (!is.null(card$merged)) card$merged$url <- NULL; card }
-assets_of <- function(card) unlist(lapply(card$inputs, function(i) lapply(i$assets, function(a) list(mdl = i$mdl_key, rep = a$rep, type = a$type, url = a$url))), recursive = FALSE)
+assets_of <- function(card) unlist(lapply(card$inputs, function(i) lapply(i$assets, function(a) list(mdl = i$mdl_key, rep = a$rep, type = a$type, url = a$url, sk = a$source_key))), recursive = FALSE)
 
 compare_release <- function(v) {
   t0 <- Sys.time()
@@ -187,7 +189,7 @@ compare_release <- function(v) {
   for (k in names(tx1)) writeLines(app_json(tx1[[k]]), glue("{out}/taxon/{k}.json"))
   for (k in names(al1)) writeLines(app_json(al1[[k]]), glue("{out}/alias/{k}.json"))
   base_tx <- 0L; base_al <- 0L; n_taxa <- 0L; other_diff <- 0L; inputs_changed <- 0L
-  merged_url <- 0L; a_pub <- 0L; a_new <- 0L; a_added <- 0L; a_removed <- 0L; a_url <- 0L; a_other <- 0L; both_pub <- 0L; both_new <- 0L; sz <- numeric()
+  merged_url <- 0L; pm_n <- 0L; pm_sk <- 0L; sk_cog <- 0L; a_pub <- 0L; a_new <- 0L; a_added <- 0L; a_removed <- 0L; a_url <- 0L; a_other <- 0L; both_pub <- 0L; both_new <- 0L; sz <- numeric()
   for (k in names(tx1)) {
     p <- rd_pub(v, "taxon", k); a <- fromJSON(toJSON(tx1[[k]], auto_unbox = TRUE, null = "null", digits = NA), simplifyVector = FALSE)
     if (identical(canon(tx0[[k]]), canon(p))) base_tx <- base_tx + 1L
@@ -202,6 +204,7 @@ compare_release <- function(v) {
       ap <- assets_of(p$taxa[[nm]]); an <- assets_of(a$taxa[[nm]])
       kp <- vapply(ap, function(x) paste(x$mdl, x$rep, x$type), ""); kn <- vapply(an, function(x) paste(x$mdl, x$rep, x$type), "")
       a_pub <- a_pub + length(ap); a_new <- a_new + length(an)
+      for (x in an) { if (x$type == "pmtiles") { pm_n <- pm_n + 1L; pm_sk <- pm_sk + (is.character(x$sk) && nzchar(x$sk)) } else sk_cog <- sk_cog + (!is.null(x$sk)) }
       a_added <- a_added + sum(!kn %in% kp); a_removed <- a_removed + sum(!kp %in% kn)
       both <- intersect(kp, kn); up <- vapply(ap, `[[`, "", "url"); un <- vapply(an, `[[`, "", "url")
       a_url <- a_url + sum(up[match(both, kp)] != un[match(both, kn)])
@@ -217,6 +220,7 @@ compare_release <- function(v) {
   tibble(ver = v, taxon_shards = length(tx1), alias_shards = length(al1),
          baseline_taxon_identical = base_tx, baseline_alias_identical = base_al,
          taxa = n_taxa, taxa_differing_outside_pointers = other_diff, taxa_with_changed_inputs = inputs_changed, taxa_with_changed_merged_url = merged_url,
+         pmtiles_assets_staged = pm_n, pmtiles_assets_with_source_key = pm_sk, cog_assets_with_source_key = sk_cog,
          asset_rows_published = a_pub, asset_rows_staged = a_new, asset_rows_added = a_added, asset_rows_removed = a_removed, asset_urls_changed_same_row = a_url,
          inputs_with_both_reps_published = both_pub, inputs_with_both_reps_staged = both_new,
          alias_shards_identical = alias_same, shards_validate = valid, largest_taxon_shard_gzip_bytes = max(sz), contract_bytes = 25600L,
