@@ -33,6 +33,9 @@ Publish the **v8 marine-atlas** and stand up its serving, reproducibly:
    Parquet + views), `DEPLOY_API=1` (plumber image), `DEPLOY_CADDY=1` (URL routing alone),
    `DEPLOY_TITILER=1` (restart the tiler so it drops GDAL's cached headers for COGs
    repainted at their existing URLs — run it after any `publish_native` that rebuilt them).
+   The `deploy` chunk ends by comparing the main site's alias of the root STAC catalog
+   (`marinesensitivity.org/stac/catalog.json`) with the root it just deployed (`libs/stac_alias.R`):
+   a lagging alias WARNs, `STAC_ALIAS_PUSH=1` commits + pushes it to the site repo and waits for Pages.
    Before the first `DEPLOY_CADDY=1` that adds the atlas-preview service: `sudo mkdir -p
    /share/atlas_preview && sudo chown 1000:1000 /share/atlas_preview` on the server.
 
@@ -409,6 +412,10 @@ if (length(cog_u)) {
   log_info("{titiler_svc} /cog/info on {basename(cog_u)}: HTTP {code} (expect 200)")
   if (!identical(code, "200")) log_warn("{titiler_svc} cannot read this release's merged COG — check S3 + the service")
 } else log_warn("no merged COG in native_asset to smoke-test (run publish_native with PUBLISH_MERGED_COG=1)")
+# 4. the root catalog was just (re)deployed: compare the main site's alias of it
+# (marinesensitivity.org/stac) -- WARNs while it lags, STAC_ALIAS_PUSH=1 publishes it
+source(here("libs/stac_alias.R"))
+stac_alias_sync()
 }
 ```
 
@@ -605,12 +612,19 @@ if (!do_caddy) {
   # than restart caddy onto the config it was already running.
   out_caddy <- system2("ssh", c("msens", shQuote(glue(
     "set -e; cd {srv_repo} && git fetch --quiet origin && git merge --ff-only origin/main && ",
+    # the v8/v9 per-model PMTiles are served from OUTSIDE /share/data/derived (server
+    # host/pmtiles_native.sh: the BOEM mirror's hourly rclone of derived/ looped on them for five
+    # weeks, ~150 GB/day of egress). `link` hardlinks them to the root the Caddyfile now names
+    # BEFORE caddy restarts onto it; `retire` (below) removes the old trees only once the public
+    # URL answers from the new one, and puts them back if it stops. Both are no-ops afterwards.
+    "host/pmtiles_native.sh link && ",
     "docker compose build --quiet caddy && ",
     "docker compose run --rm --no-deps -T caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null && ",
     # `atlas-preview` is the sidecar that clones the atlas `gh-pages` build into /share/atlas_preview
     # (the review host's /{ver}/atlas/ file_server root); `--no-deps caddy` alone never starts it,
     # so the route would serve an empty directory (404 with a valid token). Idempotent when running.
     "docker compose up -d --no-deps caddy atlas-preview && docker compose restart caddy && ",
+    "host/pmtiles_native.sh retire && ",
     "echo CADDY_OK $(git rev-parse --short HEAD)"))),
     stdout = TRUE, stderr = TRUE)
   if (!any(grepl("CADDY_OK", out_caddy))) stop(paste(tail(out_caddy, 15), collapse = "\n"))

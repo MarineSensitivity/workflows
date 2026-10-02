@@ -533,6 +533,12 @@ Shiny instance answered HTTP 500** for it until someone happened to reload the a
 worker memoizes the registry and manifests it read before the data existed. Both now happen here,
 on every run that publishes — `BACKFILL_NO_STAC=1` / `BACKFILL_NO_RELOAD=1` opt out.
 
+A third thing follows the STAC registration: the **alias of the root catalog on the main site**
+(`marinesensitivity.org/stac/catalog.json`, repo `MarineSensitivity.github.io`) is compared with the
+root just deployed (`libs/stac_alias.R`). A lagging alias is a WARN naming the missing children —
+it legitimately lags at this moment — and `STAC_ALIAS_PUSH=1` writes, commits and pushes it, then
+waits for GitHub Pages to serve it.
+
 Rendered on the server (`scripts/srv_render.sh`), the catalog directory *is* the deployed one
 (`/share/data/derived/stac`, served at `file.marinesensitivity.org/stac`), so there is nothing to
 rsync; on a laptop the tree is staged beside the release and not deployed.
@@ -549,6 +555,14 @@ if (do_stac) {
   stac_root <- if (on_server) "/share/data/derived/stac" else file.path(dir_v, "stac")
   tmp       <- tempfile("stac_")
   msens::stac_build(bver, dir_out = tmp, con = con, model_asset = model_asset)
+  # publish gate (libs/url_gate.R): no bulk file (.tif/.pmtiles/...) of the tree just built may be
+  # fetched from a VM host -- checked BEFORE it is copied into the deployed root. URL_AUDIT_ALLOW = escape hatch
+  source(here::here("libs/url_gate.R"))
+  tree_urls <- unlist(lapply(
+    list.files(file.path(tmp, bver), "\\.json$", recursive = TRUE, full.names = TRUE),
+    function(f) { txt <- paste(readLines(f, warn = FALSE), collapse = "\n")
+                  regmatches(txt, gregexpr("https?://[^\"\\\\ ]+", txt))[[1]] }))
+  url_gate(unique(tree_urls), glue("{bver} STAC tree"))
   # replace this version's tree whole (a dropped dataset must not leave a stale node), then
   # REGISTER it in the deployed root: stac_build()'s own root knows only this one version
   dir.create(stac_root, recursive = TRUE, showWarnings = FALSE)
@@ -574,6 +588,11 @@ if (do_stac) {
       "the published root catalog does not list this version" =
         glue("./{bver}/collection.json") %in% hrefs)
     log_info("verified {u} and its entry in the root catalog")
+
+    # the root was just (re)deployed: compare the main site's alias of it
+    # (marinesensitivity.org/stac) -- WARNs while it lags, STAC_ALIAS_PUSH=1 publishes it
+    source(here::here("libs/stac_alias.R"))
+    stac_alias_sync()
   }
 } else log_info("BACKFILL_NO_STAC set - STAC left as it is")
 

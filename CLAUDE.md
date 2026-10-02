@@ -221,6 +221,8 @@ the AquaX COGs in `ingest_aquax`), `AX_TEST_N=<n>` (ingest smoke test: nothing w
 only under `PROMOTE_LATEST=1` — without rebuilding or re-pushing any manifest; how a legacy release is
 registered), `TURTLE_SUIT_MIN` / `TURTLE_FILL` / `COVERAGE_FLOOR` / `REDO_BUILD=1` / `BUILD_REFERENCE=1`
 (`build_v7b`), `BACKFILL_NO_STAC=1` / `BACKFILL_NO_RELOAD=1` / `BACKFILL_NO_INDEX=1` (backfill opt-outs),
+`STAC_ALIAS_PUSH=1` (`libs/stac_alias.R`, called where the root STAC catalog was just deployed — `backfill_versions`, `release_marine-atlas` `deploy`: without it a lagging alias at `marinesensitivity.org/stac/catalog.json` is only a WARN naming the missing children; with it the alias is committed + pushed to the `MarineSensitivity.github.io` `main` and verified live, refusing a checkout that is missing, off `main` or has other staged changes),
+`URL_AUDIT_ALLOW=<regex>[,<regex>…]` (`libs/url_gate.R`, the publish gate in `stage_publish`, `build_app_bundle`, `publish_native`, `publish_stac_api`, `backfill_versions`: bulk files — `.tif .pmtiles .parquet …` — must be fetched from the object store, never a VM host, so any `vm_bulk` URL stops the render; this logged-at-WARN escape hatch lets URLs matching a regex through, default none),
 `BUILD_MEMORY_GB` / `BUILD_THREADS` (`libs/duckdb_budget.R`), `SRV_MIN_AVAIL_MB` (`srv_render.sh` watchdog).
 
 **The pre-release review gate (`preview.marinesensitivity.org`, 2026-08-15).** A release has
