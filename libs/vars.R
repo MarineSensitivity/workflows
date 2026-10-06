@@ -29,7 +29,7 @@ redo_ingest    <- .flag("REDO_INGEST")
 ax_workers          <- as.integer(Sys.getenv("AX_WORKERS", "6"))   # furrr workers for TIF->Parquet / COGs
 ax_test_n           <- as.integer(Sys.getenv("AX_TEST_N", "0"))    # smoke test: only the first n models
 ax_cog              <- .flag("AX_COG")                # build the two COG representations
-ax_cog_s3           <- .flag("AX_COG_S3")             # ...and upload them to the marine-atlas
+ax_cog_s3           <- .flag("AX_COG_S3")             # RETIRED 2026-10: the ingest refuses it; publish_native.qmd uploads
 ax_apply_cutoff     <- .flag("AX_APPLY_CUTOFF")       # zero CUR_NR below the model's TSS cutoff (D2; default off)
 ax_absent_supersedes<- .flag("AX_ABSENT_SUPERSEDES")  # AquaX "modeled, absent in US" also supersedes am (D4; default off)
 ax_supersede        <- .flag("AX_SUPERSEDE", default = TRUE)  # AX_SUPERSEDE=0 = control run (ax registered, nothing superseded)

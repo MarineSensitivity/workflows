@@ -1,5 +1,5 @@
 ---
-title: "Publish native-format input surfaces — range PMTiles + AquaMaps COGs"
+title: "Publish input + merged surfaces to the asset store, and the release's pointer table"
 msens:
   target_name: publish_native
   workflow_type: release
@@ -9,93 +9,71 @@ editor_options:
   chunk_output_type: console
 ---
 
-Phase 4b: publish each **raw input** model in a cloud-native, pyramided format so the
-species app can overlay the whole (often global) range a source contributes — surfaces
-far too large (up to ~19M cells) for the dense per-cell SQL tiler:
-
-- **vector ranges** (`rng_iucn`, `rng_fws`, `ca_nmfs`, `ch_fws`, `ch_nmfs`, `bl`,
-  `rng_turtle_swot_dps`) → **one PMTiles per dataset**, features tagged with `mdl_key`
-  (client filters by it), served from the file host `/pmtiles`.
-- **AquaMaps** (`am`, raster) → **one COG per model** (bbox-cropped, overviews), served
-  from S3 by titiler-v8 `/cog`.
-- **AquaX** (`ax`, raster, v9) → COGs are built + uploaded by `ingest_aquax.qmd`; this notebook
-  only **registers** them from `model_ax.csv`. AquaX is delivered ON the analysis grid, so its two
-  representations are not original-vs-interpolated: `native` = the band **as delivered** (Float32
-  0–1000, every modeled pixel), `model` = the surface **as ingested** (÷10, INT1U 1–100, the ≥ 1
-  threshold applied — what the merge consumes). The `dataset.on_grid` flag tells the app to label
-  the toggle *Delivered / As ingested*.
-
-Both drive a `native_asset` registry (`mdl_key → asset_type + url`) that STAC + the app read.
-We publish inputs for every taxon the toolkit considers valid in EITHER surface
-(`(is_valid_usa OR is_valid_global) & is_marine`, non reptile/amphibian). **Neither flag alone
-is a superset of the other**: v8 merges two surfaces (a global one and a US-scoped scoring one),
-so 4,473 taxa are global-only and **46 are US-only** — valid and scored in the US, absent from
-the global surface. Building for `is_valid_usa` alone left every non-US species' inputs
-unpublished; building for `is_valid_global` alone silently dropped those 46. The union is
-21,581 taxa / 25,450 input edges.
-
-**Flags:** `REDO_NATIVE=1` (rebuild PMTiles + IUCN gpkg + re-sort am), `REDO_PMTILES=1` (rebuild
-just the vector tiles), `REDO_MERGED_COG=1` (repaint just the merged whole-range COGs — what a
-re-merge invalidates), `NATIVE_SKIP_AM` / `NATIVE_SKIP_PMTILES`,
-`NATIVE_TEST_N=<n>` (only first n am COGs, smoke test), `NATIVE_NO_S3` (stage locally, skip upload),
-`NATIVE_WORKERS=<n>`, `NATIVE_VEC_COG=1` / `PUBLISH_MERGED_COG=1` (opt-in COG classes),
-`NATIVE_REGISTRY_REBUILD=1` (publish ONLY what this run built — see the registry chunk; without it
-a skipped class is carried forward rather than deleted).
-
-> **`NATIVE_SKIP_AM` cannot be combined with a merged rebuild.** The am-only *aliases* — ~14,799
-> `ms_merge` registry rows pointing at an existing `native/am` COG — are derived from `am_reg`,
-> so skipping am empties their source and the `ms_merge` class comes out 21,584 → 6,785 rows.
-> `registry_merge()` refuses that as a shrink, which is the guard working, but the run has already
-> spent its time by then. Repaint merged COGs with `REDO_MERGED_COG=1` and leave am unskipped: am
-> is resumable by file existence, so an existing set costs one `file_exists` sweep.
-
-
-## Where the ORIGINAL surfaces live: the content-addressed native store (R4-F design)
-
-Original (`representation = "native"`) objects live OUTSIDE any versioned path, exactly as the
-model/merged COGs already do at `marine-atlas/cog/{grid_id}/{content_hash}.tif`:
+A release **owns pointers, never files** (asset store, 2026-10). Every distribution file this notebook
+produces — the per-model COGs, the per-model range PMTiles, the merged whole-range COGs — goes into the
+**content-addressed store** shared by every release, and the release gets a **pointer table**
+(`native_asset`: `mdl_key × representation → asset_url`) that names those objects. Nothing is ever
+written under `{ver}/`.
 
 ```
-S3 (mirror of everything)  marine-atlas/native/{ds_key}/{hash}.tif        native COGs (am, ax)
-                           marine-atlas/native/{ds_key}/{hash}.pmtiles    PMTiles (mirror)
-file host (PMTiles served) https://file.marinesensitivity.org/pmtiles/native/{ds_key}/{hash}.pmtiles
-                           (= /share/data/derived/pmtiles/native/{ds_key}/{hash}.pmtiles on `msens`)
+marine-atlas/cog/global05/{hash}.tif        rasters ON the analysis grid: per-input "model", merged, score
+marine-atlas/native/{ds_key}/{hash}.tif     source-resolution originals (AquaMaps 0.5°, AquaX as delivered)
+marine-atlas/native/{ds_key}/{hash}.pmtiles source polygons of a vector range, one PMTiles per model
+marine-atlas/assets.parquet                 the catalog: one row per stored object
+{ver}/tables/native_asset.parquet           the release's pointers (pushed by release_marine-atlas.qmd)
 ```
 
-- **Key helpers:** `msens::native_url(ds_key, hash, type)` / `native_key()` (twins of `content_url()`),
-  `msens::native_store_index()` (twin of `cog_store_index()`: one listing -> "already published?").
-- **The hash** identifies the object, never the release. Prefer the SOURCE content, the way
-  `content_hashes()` fingerprints `model_cell` (16 hex; folded with an encoding tag through
-  `content_hash_encoded()` so a tiling/overview change gets a new key):
-  `am` = hash of the `(cell_id, val)` rows of the 0.5 deg source (`spp_cells`), encoding
-  `flt4-0.5deg-cog`; `bl`, `rng_fws`, `ca_nmfs`, `ch_fws`, `ch_nmfs`, `rng_turtle_swot_dps` = hash of the
-  source geometry (WKB) + attributes per model, encoding `mvt-z0-10-simp10`. FALLBACK, the MD5 of the
-  object's bytes (32 hex, cannot collide with a 16-hex key): `rng_iucn` (its ~7 GB source is read per
-  species from the indexed gpkg, so the built file is the only cheap thing to hash) and every already
-  existing v8/v9 object (source not at hand; see `backfill_versions.qmd`'s mapping table).
-- **A release's `native_asset` row** stores the absolute store URL in `asset_url` (no `?v=`: the key
-  IS the version). `representation = "model"` rows are unchanged.
-- **Re-publish:** same content -> same hash -> same key -> `native_store_index()` already lists it ->
-  nothing is uploaded; only the new release's `native_asset` rows are written. Changed content -> a new
-  key; old releases keep pointing at the old, still-present object.
+**The key is known before the file is built.** It is the hash of the content the file will hold — the
+pixels a COG stores (`msens::pixel_hashes()`: the rows quantised as the writer quantises them, repeated
+cells collapsed by `max()` as the merge consumes them) or the source geometry of a range
+(`msens::native_vector_hash()`) — folded with the file family's encoding tag
+(`msens::asset_store_key()`). So a surface the catalog already lists costs neither a build nor an
+upload; a changed surface gets a new key, and older releases keep pointing at the old, still-present
+object. The object's MD5 is an integrity column of the catalog, never a key.
+
+**Order of operations (and why).** Keys → build only what the catalog lacks → decode-verify every new COG
+against its key → upload → catalogue → **gate** (`msens::store_publish_gate()`: every pointer is a
+catalogued store object; nothing bulk under `{ver}/`) → write the pointer table. A pointer is written
+only after its object is catalogued, so a reader can never follow one into a 404.
+
+Two representations per input where the source has one of its own: `native` (the original: polygons,
+the 0.5° AquaMaps cells, the AquaX band as delivered) and `model` (the 0.05° gridded surface the merge
+consumed). AquaX is delivered ON the grid, so its pair is *Delivered / As ingested* (`dataset.on_grid`).
+The served set is every taxon valid in EITHER surface (`(is_valid_usa OR is_valid_global) & is_marine`,
+non reptile/amphibian): neither flag alone is a superset of the other.
+
+**Flags:** `NATIVE_NO_S3=1` (dry run: keys, builds and the upload plan; no upload, no catalog, no
+pointer table), `NATIVE_TEST_N=<n>` (first n keys per class), `NATIVE_SKIP_AM` / `NATIVE_SKIP_PMTILES`,
+`NATIVE_PMT_DS=a,b` (vector datasets to tile), `NATIVE_VEC_COG=1` / `PUBLISH_MERGED_COG=1` (opt-in
+classes), `REDO_MERGED_COG=1` / `REDO_MERGED_COG_KEYS` / `REDO_MERGED_COG_SPATIAL=1` (repartition the
+merged surface; the key then decides whether anything is new), `REDO_IUCN_SRC=1`, `REDO_KEYS=1`
+(recompute the cached content hashes), `NATIVE_NO_VERIFY=1` (skip the decode check of new COGs),
+`NATIVE_LEGACY_OK=1` (before the M6 prune: v8/v9 still carry pre-store copies under `{ver}/native/`;
+the gate then warns instead of stopping), `NATIVE_REGISTRY_REBUILD=1` (publish ONLY what this run
+built; otherwise a class this run did not build is carried forward from the published table),
+`NATIVE_WORKERS=<n>`, `NATIVE_CATALOG=<assets.parquet>` (read the catalog from a file instead of the
+bucket — tests).
+
+> **`NATIVE_SKIP_AM` cannot be combined with a merged rebuild.** The am-only *aliases* — `ms_merge`
+> pointer rows at an existing AquaMaps `model` object — are derived from the am rows, so skipping am
+> empties their source and the `ms_merge` class shrinks; `registry_merge()` refuses that, but the run
+> has spent its time by then.
 
 ## Design
 
 ```{mermaid}
 %%| label: fig-design
-%%| fig-cap: "Per-model native inputs: vector ranges → PMTiles, AquaMaps cells → COGs, unified in a native_asset registry"
+%%| fig-cap: "Keys from content → build only what the catalog lacks → verify → upload → catalogue → gate → pointers"
 flowchart LR
-  srv["merge.duckdb<br/>served taxa"] --> vec["vector ranges"]
-  srv --> am["AquaMaps"]
-  vec --> vn["PMTiles polygons<br/>representation=native"]
-  vec --> vm["0.05° gridded COG (opt-in)<br/>representation=model"]
-  am --> an["0.5° HCAF COG<br/>representation=native"]
-  am --> amm["0.05° resampled COG<br/>representation=model"]
-  vn --> reg[("native_asset<br/>mdl_key × representation → url, bbox")]
-  vm --> reg
-  an --> reg
-  amm --> reg
-  reg --> mf["hash_query → content-addressed manifest"]
+  src["dist / merge.duckdb / am.duckdb<br/>source polygons"] --> keys["content hash ⊕ encoding<br/>= store key"]
+  cat[("assets.parquet<br/>(catalog)")] --> keys
+  keys -->|"not catalogued"| build["paint COG / tile PMTiles<br/>into the local store mirror"]
+  build --> verify["decode == key?"]
+  verify --> up["upload cog/… native/…"]
+  up --> cat2[("catalog + new rows")]
+  cat2 --> gate{"store_publish_gate"}
+  keys -->|"catalogued"| gate
+  gate --> ptr[("native_asset<br/>{ver}/tables/")]
 ```
 
 ## Setup
@@ -103,32 +81,65 @@ flowchart LR
 ```{r}
 #| label: setup
 
-librarian::shelf(DBI, dplyr, duckdb, fs, furrr, glue, here, jsonlite, logger, purrr,
-                 readr, sf, stringr, terra, MarineSensitivity/msens, quiet = T)
+librarian::shelf(arrow, DBI, dplyr, duckdb, fs, furrr, glue, here, jsonlite, logger, purrr,
+                 readr, sf, stringr, terra, tibble, MarineSensitivity/msens, quiet = T)
+library(msens)
+stopifnot("needs msens >= 0.53.0 (asset_store_key, store_publish_gate)" = packageVersion("msens") >= "0.53.0")
 source(here("libs/paths.R"))
-source(here("../msens/R/publish.R"))   # override any stale install
+source(here("libs/url_gate.R"))
+source(here("libs/app_bundle.R"))      # app_bundle_aws_retry(): one `aws` call, retried only when S3 never answered
 
-dir_atlas  <- glue("{dir_big_v}/marine-atlas")
+dir_atlas  <- path.expand(glue("{dir_big_v}/marine-atlas"))
 merge_db   <- glue("{dir_atlas}/merge.duckdb")
-dir_native <- glue("{dir_atlas}/native"); dir_create(dir_native)
-dir_cog    <- glue("{dir_native}/am");     dir_create(dir_cog)
-dir_pmt    <- glue("{dir_native}/pmtiles"); dir_create(dir_pmt)
+dir_native <- glue("{dir_atlas}/native"); dir_create(dir_native)         # intermediates: partitions, tile work dirs, the IUCN gpkg
+dir_as     <- path.expand(glue("{dir_derived}/asset_store"))              # shared by every release, like the store itself
+dir_store  <- glue("{dir_as}/store")                                      # local mirror of the store: {dir_store}/{key}
+test_n     <- as.integer(Sys.getenv("NATIVE_TEST_N", "0"))
+dir_keys   <- glue("{dir_as}/keys/{ver}{if (test_n > 0) '_test' else ''}")  # a test subset must never feed a full run's cache
+dir_create(c(dir_store, dir_keys, glue("{dir_as}/duckdb_tmp")))
 manifest   <- here("data/manifests/publish_native.json"); dir_create(path_dir(manifest))
 stopifnot(all(file_exists(c(sdm_db, merge_db, cellid_tif))))
 
-redo        <- nzchar(Sys.getenv("REDO_NATIVE"))
 do_s3       <- !nzchar(Sys.getenv("NATIVE_NO_S3"))
 skip_am     <- nzchar(Sys.getenv("NATIVE_SKIP_AM"))
 skip_pmt    <- nzchar(Sys.getenv("NATIVE_SKIP_PMTILES"))
-# narrower than REDO_NATIVE, which also rebuilds the ~7 GB IUCN gpkg and re-sorts am
-redo_pmt    <- redo || nzchar(Sys.getenv("REDO_PMTILES"))
-test_n      <- as.integer(Sys.getenv("NATIVE_TEST_N", "0"))
+redo_keys   <- nzchar(Sys.getenv("REDO_KEYS"))
+do_verify   <- !nzchar(Sys.getenv("NATIVE_NO_VERIFY"))
+legacy_ok   <- nzchar(Sys.getenv("NATIVE_LEGACY_OK"))
 n_workers   <- as.integer(Sys.getenv("NATIVE_WORKERS", "6"))
-s3_ver      <- glue("{s3_atlas}/{ver}")
-s3_http     <- glue("https://s3.us-east-1.amazonaws.com/{sub('^s3://', '', s3_ver)}")
-pmt_base    <- glue("https://file.marinesensitivity.org/pmtiles/{ver}")
+base        <- atlas_base_url()                                           # https://s3.us-east-1.amazonaws.com/oceanmetrics.io-public/marine-atlas
+bucket_root <- "s3://oceanmetrics.io-public/marine-atlas"
+grid        <- grid_spec_for("global05", path.expand(cellid_tif))
+if (test_n > 0 && do_s3) { log_warn("NATIVE_TEST_N={test_n}: a subset is never published -- forcing NATIVE_NO_S3"); do_s3 <- FALSE }
 
-safe_key <- function(k) gsub("[^A-Za-z0-9._-]", "_", k)   # mdl_key -> filesystem/URL-safe
+safe_key   <- function(k) gsub("[^A-Za-z0-9._-]", "_", k)                  # mdl_key -> filesystem-safe stem (work dirs only)
+store_path <- function(key) { p <- as.character(glue("{dir_store}/{key}")); dir_create(unique(path_dir(p))); p }
+store_url  <- function(key) as.character(glue("{base}/{key}"))
+new_con <- function(mem = "10GB", threads = "6") {
+  con <- dbConnect(duckdb(), config = list(threads = threads, memory_limit = mem))
+  dbExecute(con, glue("SET temp_directory='{dir_as}/duckdb_tmp'"))
+  con
+}
+# a content-hash table is cached per (release, class) and recomputed when its source changed (file count,
+# bytes, newest mtime) or REDO_KEYS=1 -- hashing dist/am is minutes, not seconds
+src_sig <- function(paths) {
+  fi <- file_info(dir_ls(paths[dir_exists(paths)], recurse = TRUE, type = "file"))
+  paste(nrow(fi), sum(as.numeric(fi$size)), as.integer(max(c(fi$modification_time, as.POSIXct(0, origin = "1970-01-01")))), sep = "-")
+}
+cached_keys <- function(name, src_dirs, expr) {
+  f <- glue("{dir_keys}/{name}.parquet"); sig <- src_sig(src_dirs)
+  if (!redo_keys && file_exists(f)) {
+    x <- as_tibble(read_parquet(f))
+    if (identical(x$src_sig[1], sig)) return(select(x, -src_sig))
+    log_info("keys {name}: source changed, recomputing")
+  }
+  t0 <- Sys.time(); x <- as_tibble(expr); x$src_sig <- sig
+  write_parquet(x, f, compression = "zstd")
+  log_info("keys {name}: {nrow(x)} models in {round(as.numeric(Sys.time() - t0, units = 'mins'), 1)} min")
+  select(x, -src_sig)
+}
+take_n <- function(x) if (test_n > 0) head(x, test_n) else x
+log_info("publish_native {ver} | s3 {do_s3} | test_n {test_n} | store mirror {dir_store}")
 ```
 
 ## Served raw mdl_keys (the set the app lists)
@@ -136,13 +147,10 @@ safe_key <- function(k) gsub("[^A-Za-z0-9._-]", "_", k)   # mdl_key -> filesyste
 ```{r}
 #| label: served
 
-con <- dbConnect(duckdb(), config = list(threads = "6", memory_limit = "10GB"))
-dbExecute(con, glue("SET temp_directory='{dir_atlas}/duckdb_tmp'"))
+con <- new_con()
 dbExecute(con, glue("ATTACH '{merge_db}' AS m (READ_ONLY)"))
-# the UNION of the two validity flags. is_valid_global is NOT a superset of is_valid_usa --
-# 46 taxa are US-valid but absent from the global merged surface (n_cells == n_usa), and
-# scoping to is_valid_global alone dropped their merged-COG aliases, which is what
-# registry_merge() refused to publish as a shrink.
+# the UNION of the two validity flags: 46 taxa are US-valid but absent from the global merged surface,
+# 4,473 are global-only; scoping to either flag alone dropped the other's inputs
 served <- dbGetQuery(con, "
   SELECT DISTINCT tm.mdl_key, split_part(tm.mdl_key,'|',1) AS ds_key
   FROM m.taxon_model tm
@@ -154,113 +162,101 @@ served_by_ds <- split(served$mdl_key, served$ds_key)
 knitr::kable(served |> count(ds_key, name = "n_mdl") |> arrange(desc(n_mdl)))
 ```
 
-## Vector ranges → per-model PMTiles
+## The catalog
 
-Each dataset's source polygons are read, `mdl_key` derived from the documented source id,
-then **inner-joined to the served set** (reproducing each ingest's presence/marine/category
-filter — only ingested-and-served models survive the join) and split into **one PMTiles per
-model** at `{ds}/{sp_id}.pmtiles`. A per-model file — like the per-model AquaMaps COGs — needs
-no client-side filter and its low-zoom tiles stay a few KB. Packing thousands of overlapping
-global ranges into one per-dataset archive overflowed the z0–z2 world tiles past maplibre's
-per-tile budget, so a selected range silently failed to draw at global zoom.
+Read anonymously from the bucket (the bucket denies anonymous *listing*, so "already stored?" is an
+anti-join against this file). Every class below asks `in_cat()` before building anything.
 
-IUCN's thousands of ranges are read from a **v8 indexed GeoPackage** (`native/src/rng_iucn.gpkg`,
-built once from the source shapefiles with the ingest's presence/marine/category filter,
-dissolved per `id_no`, indexed) — the derived per-group gpkgs are stale v7 artifacts (410 served
-species short).
+```{r}
+#| label: catalog
+
+cat_src <- Sys.getenv("NATIVE_CATALOG")
+fetch <- function(url) { f <- tempfile(fileext = ".parquet"); utils::download.file(url, f, mode = "wb", quiet = TRUE); f }
+catalog <- as_tibble(asset_catalog_check(as.data.frame(read_parquet(
+  if (nzchar(cat_src)) cat_src else fetch(glue("{base}/assets.parquet"))))))
+in_cat <- function(key) key %in% catalog$key
+log_info("catalog: {nrow(catalog)} objects ({sum(catalog$store == 'cog')} cog, {sum(catalog$store == 'native')} native)")
+
+# plan rows accumulate here: one per (mdl_key, representation) this run can point at
+plan <- list()
+add_plan <- function(d, class) {                                             # d: mdl_key, key, hash, content_hash, enc, file (local, may be NA when catalogued)
+  stopifnot(all(c("mdl_key", "key", "hash", "content_hash", "enc") %in% names(d)))
+  d$class <- class; d$catalogued <- in_cat(d$key)
+  plan[[class]] <<- d
+  log_info("{class}: {nrow(d)} models -> {n_distinct(d$key)} keys; {sum(d$catalogued)} catalogued, {sum(!d$catalogued)} new")
+  invisible(d)
+}
+```
+
+## Vector ranges → per-model PMTiles (the *original* representation)
+
+Each dataset's source polygons are read, `mdl_key` derived from the documented source id, inner-joined
+to the served set, and hashed per model (`native_vector_hash()`: the same readers and normalisation M1
+used, so an unchanged range resolves to the key already in the store). Only models whose key the
+catalog lacks are tiled — one PMTiles per model (z0–10; packing thousands of ranges into one archive
+overflowed maplibre's per-tile budget at low zoom).
 
 ```{r}
 #| label: pmtiles-specs
 
-# reader per dataset: returns an sf with a `mdl_key` column (unfiltered -- the served
-# inner-join happens after). The readers live in libs/native_sources.R, shared with
-# map_asset_store.qmd (which hashes the SAME geometry for the store key).
-source(here("libs/native_sources.R"))
-iucn_gpkg_src <- glue("{dir_native}/src/rng_iucn.gpkg")
-pmt_specs <- native_pmt_specs(dir_raw, dir_big, iucn_gpkg_src, bl_sisids = served_by_ds[["bl"]])
+source(here("libs/native_sources.R"))       # readers shared with map_asset_store.qmd (same geometry -> same key)
+iucn_gpkg <- glue("{dir_native}/src/rng_iucn.gpkg")
+pmt_specs <- native_pmt_specs(dir_raw, dir_big, iucn_gpkg, bl_sisids = served_by_ds[["bl"]])
 ```
 
-### IUCN v8 indexed ranges GeoPackage
+### IUCN indexed ranges GeoPackage
 
-Built once from the source shapefiles with the ingest's presence/marine/category filter,
-dissolved to one feature per served `id_no`, indexed on `id_no`. `read_iucn()` then reads it
-in one fast, off-Drive query (the derived per-group gpkgs are stale v7 and miss 410 species).
+Built once from the ingest's own filtered output (presence 1:3 / marine / category already applied),
+one feature set per served `id_no`, indexed on `mdl_key`, so every per-species read is an index hit.
 
 ```{r}
 #| label: iucn-src
 
-iucn_gpkg <- glue("{dir_native}/src/rng_iucn.gpkg"); dir_create(path_dir(iucn_gpkg))
-# REDO_IUCN_SRC exists separately from REDO_NATIVE for the same reason REDO_PMTILES does: this
-# gpkg is filtered to the SERVED ids, so widening the served set (e.g. is_valid_usa ->
-# is_valid_global) silently leaves the new species out of it — publish_pmtiles_from_gpkg then
-# finds no features and skips them, with no error. REDO_NATIVE would also re-sort am and rebuild
-# every existing tile, which is hours of work to add species that need only this one step.
-redo_src  <- redo || nzchar(Sys.getenv("REDO_IUCN_SRC"))
-# The INGEST's own filtered output is the source of truth: presence 1:3 / marine / category are
-# already applied in it, and it is indexed on id_no. Reading the raw shapefiles reproduces that
-# filter from scratch and needs ~20 GB of source this machine may not hold — keep it only as the
-# fallback for a box that has the shapefiles but not the derived gpkg.
+dir_create(path_dir(iucn_gpkg))
+# REDO_IUCN_SRC: this gpkg is filtered to the SERVED ids, so widening the served set silently leaves the
+# new species out of it -- the per-model reader then finds no features and skips them, with no error
+redo_src <- nzchar(Sys.getenv("REDO_IUCN_SRC"))
 iucn_all <- glue("{dir_derived}/iucnredlist.org/rng_iucn_all.gpkg")
 if (!file_exists(iucn_gpkg) || redo_src) {
   iucn_ok <- c("CR","EN","VU","NT","LC","DD")
   ids_srv <- as.integer(sub("^rng_iucn\\|", "", served_by_ds[["rng_iucn"]]))
   if (file_exists(iucn_all)) {
     log_info("building {path_file(iucn_gpkg)} for {length(ids_srv)} served ids from {path_file(iucn_all)} …")
-    # ogr2ogr streams: the source is ~9 GB, far too large to hold as an sf. mdl_key is derived
-    # here so publish_pmtiles_from_gpkg can index-seek on it, exactly as before.
+    # ogr2ogr streams (the source is ~9 GB). `geom` MUST be in the SELECT list: a GPKG without a geometry
+    # column still reads back as a plain data.frame with the right row count, and fails much later.
     ids_sql <- paste(ids_srv, collapse = ",")
     if (file_exists(iucn_gpkg)) file_delete(iucn_gpkg)
-    # system2() goes through a shell, so every argument that contains SQL punctuation
-    # ( ( ) | ' ) must be shQuote'd, and `~` must be expanded here rather than left for a
-    # shell that will not see it inside quotes.
-    # `geom` MUST be in the SELECT list. ogr2ogr carries the geometry only if you ask for it,
-    # and a GPKG without a geometry column still reads back cleanly as a plain data.frame with
-    # the right row count and column names — so a check on nrow()/names() passes on a file that
-    # has no geometry at all. It surfaces much later, as st_zm() on a data.frame.
     sql_i <- glue("SELECT id_no, ('rng_iucn|' || CAST(id_no AS TEXT)) AS mdl_key, ",
                   "'rng_iucn' AS ds_key, geom FROM rng_iucn WHERE id_no IN ({ids_sql})")
     st <- system2("ogr2ogr", c(
       "-f", "GPKG", shQuote(path.expand(iucn_gpkg)), shQuote(path.expand(iucn_all)),
       "-nln", "rng_iucn", "-nlt", "PROMOTE_TO_MULTI", "-sql", shQuote(sql_i)),
       stdout = TRUE, stderr = TRUE)
-    if (!is.null(attr(st, "status")) && attr(st, "status") != 0)
-      stop(paste(tail(st, 20), collapse = "\n"))
-    system2("ogrinfo", c(shQuote(path.expand(iucn_gpkg)), "-sql",
-                         shQuote("CREATE INDEX idx_mdlkey ON rng_iucn(mdl_key)")))
-    # assert it is REALLY spatial, the same way the consumer reads it (st_read + query), not
-    # merely that rows exist -- see the geom note above
+    if (!is.null(attr(st, "status")) && attr(st, "status") != 0) stop(paste(tail(st, 20), collapse = "\n"))
+    system2("ogrinfo", c(shQuote(path.expand(iucn_gpkg)), "-sql", shQuote("CREATE INDEX idx_mdlkey ON rng_iucn(mdl_key)")))
     chk <- st_read(iucn_gpkg, quiet = TRUE, as_tibble = FALSE,
                    query = glue("SELECT * FROM \"rng_iucn\" WHERE id_no = {ids_srv[1]}"))
-    stopifnot(
-      "iucn src gpkg has no geometry column (geom missing from the ogr2ogr SELECT?)" =
-        inherits(chk, "sf"),
-      "iucn src gpkg geometry is empty" = nrow(chk) > 0 && !all(st_is_empty(chk)))
+    stopifnot("iucn src gpkg has no geometry column (geom missing from the ogr2ogr SELECT?)" = inherits(chk, "sf"),
+              "iucn src gpkg geometry is empty" = nrow(chk) > 0 && !all(st_is_empty(chk)))
     log_info("wrote {path_file(iucn_gpkg)} — geometry verified via st_read(query=)")
   } else {
-  log_info("building {path_file(iucn_gpkg)} for {length(ids_srv)} served ids (source shapefiles) …")
-  shps <- dir_ls(glue("{dir_raw}/iucnredlist.org"), glob = "*.shp", recurse = TRUE)
-  gi <- map_dfr(shps, function(s) {
-    y <- tryCatch(st_read(s, quiet = TRUE), error = function(e) NULL)
-    if (is.null(y)) return(NULL); names(y) <- tolower(names(y))
-    if (!all(c("id_no","presence","marine","category") %in% names(y))) return(NULL)
-    y |> filter(presence %in% 1:3, tolower(marine) == "true", category %in% iucn_ok,
-                id_no %in% ids_srv) |>
-      transmute(id_no = as.integer(id_no)) |> st_zm(drop = TRUE)
-  })
-  # keep each presence polygon as its own feature (same mdl_key) — publish_pmtiles_models
-  # groups a model's features into one file; dissolving would trip s2 on invalid rings.
-  gi <- gi |> mutate(mdl_key = as.character(glue("rng_iucn|{id_no}")), ds_key = "rng_iucn")
-  gi <- gi[!st_is_empty(gi), ]
-  st_write(gi, iucn_gpkg, layer = "rng_iucn", quiet = TRUE, delete_dsn = TRUE)
-  system2("ogrinfo", c(shQuote(iucn_gpkg), "-sql",
-                       shQuote("CREATE INDEX idx_mdlkey ON rng_iucn(mdl_key)")))
-  log_info("wrote {path_file(iucn_gpkg)}: {nrow(gi)} species")
+    log_info("building {path_file(iucn_gpkg)} for {length(ids_srv)} served ids (source shapefiles) …")
+    shps <- dir_ls(glue("{dir_raw}/iucnredlist.org"), glob = "*.shp", recurse = TRUE)
+    gi <- map_dfr(shps, function(s) {
+      y <- tryCatch(st_read(s, quiet = TRUE), error = function(e) NULL)
+      if (is.null(y)) return(NULL); names(y) <- tolower(names(y))
+      if (!all(c("id_no","presence","marine","category") %in% names(y))) return(NULL)
+      y |> filter(presence %in% 1:3, tolower(marine) == "true", category %in% iucn_ok, id_no %in% ids_srv) |>
+        transmute(id_no = as.integer(id_no)) |> st_zm(drop = TRUE)
+    })
+    gi <- gi |> mutate(mdl_key = as.character(glue("rng_iucn|{id_no}")), ds_key = "rng_iucn")
+    gi <- gi[!st_is_empty(gi), ]
+    st_write(gi, iucn_gpkg, layer = "rng_iucn", quiet = TRUE, delete_dsn = TRUE)
+    system2("ogrinfo", c(shQuote(iucn_gpkg), "-sql", shQuote("CREATE INDEX idx_mdlkey ON rng_iucn(mdl_key)")))
+    log_info("wrote {path_file(iucn_gpkg)}: {nrow(gi)} species")
   }
-  # the src gpkg must cover the served set, or publish_pmtiles_from_gpkg silently skips the
-  # species it cannot find — the failure mode that left every widened run short
-  n_src <- as.integer(DBI::dbGetQuery(
-    DBI::dbConnect(RSQLite::SQLite(), path.expand(iucn_gpkg)),
-    "SELECT count(DISTINCT id_no) n FROM rng_iucn")$n)
+  n_src <- as.integer(DBI::dbGetQuery(DBI::dbConnect(RSQLite::SQLite(), path.expand(iucn_gpkg)),
+                                      "SELECT count(DISTINCT id_no) n FROM rng_iucn")$n)
   if (n_src < length(ids_srv))
     log_warn("iucn src gpkg holds {n_src} of {length(ids_srv)} served ids — {length(ids_srv) - n_src} will have no PMTiles")
 } else log_info("{path_file(iucn_gpkg)} exists — skip (REDO_IUCN_SRC=1 to rebuild)")
@@ -269,764 +265,681 @@ if (!file_exists(iucn_gpkg) || redo_src) {
 ```{r}
 #| label: pmtiles-build
 
-pmt_only <- Sys.getenv("NATIVE_PMT_DS")                    # optional comma-list to restrict (partial reruns/tests)
+pmt_only <- Sys.getenv("NATIVE_PMT_DS")
 pmt_ds   <- if (nzchar(pmt_only)) intersect(names(pmt_specs), strsplit(pmt_only, ",")[[1]]) else names(pmt_specs)
 pmt_rows <- list()
-# source-content hash of one model's polygons (store design, above): WKB + attributes, xxhash64 = 16 hex,
-# folded with the tiling encoding so a re-tile with other settings gets a new key
-pmt_src_hash <- function(part)
-  msens::content_hash_encoded(
-    digest::digest(list(sf::st_as_binary(sf::st_geometry(part)), sf::st_drop_geometry(part)), algo = "xxhash64"),
-    "mvt-z0-10-simp10")
 if (!skip_pmt) for (ds in pmt_ds) {
   keys <- served_by_ds[[ds]]
   if (is.null(keys)) { log_warn("no served keys for {ds} — skip PMTiles"); next }
-  dir_ds <- glue("{dir_pmt}/{ds}"); dir_create(dir_ds)
-  # one PMTiles per model (resumable — skips existing unless REDO_PMTILES/REDO_NATIVE).
-  # Built to z10 so the deepest tiles carry full source resolution: every higher zoom
-  # overzooms from maxzoom, so tiles built at z6 were coarser than the source everywhere
-  # above it. A single range still tiles to a few KB, so there is no density blowup.
-  #
-  # REDO_PMTILES exists separately from REDO_NATIVE because the latter also rebuilds the
-  # ~7 GB IUCN gpkg and re-sorts AquaMaps. Forcing a tile rebuild used to mean moving the
-  # output directory aside by hand, which leaves no record of what was rebuilt or why.
-  src_hash <- NULL   # rng_iucn: bytes-MD5 fallback (below)
+  work <- glue("{dir_native}/pmtiles/{ds}"); dir_create(work)              # per-model work files, {slug}.pmtiles (resumable)
+
+  # 1. keys from the SOURCE geometry (not from the built file: a re-tile of the same range is the same object)
   if (ds == "rng_iucn") {
-    # IUCN's full-res source is ~7 GB — read each model on demand from the indexed gpkg
-    # (never load it all into memory), one index hit per species.
-    log_info("{ds}: {length(keys)} models -> per-model PMTiles from indexed gpkg ({n_workers} workers)")
-    built <- publish_pmtiles_from_gpkg(iucn_gpkg, "rng_iucn", keys, dir_ds,
-                                       workers = n_workers, redo = redo_pmt, minzoom = 0, maxzoom = 10)
+    h <- cached_keys(glue("pmtiles_{ds}"), path_dir(iucn_gpkg), {
+      map_dfr(keys, function(k) {
+        part <- st_read(iucn_gpkg, quiet = TRUE, query = sprintf("SELECT * FROM \"rng_iucn\" WHERE mdl_key = '%s'", k))
+        if (!nrow(part)) return(NULL)
+        part$mdl_key <- k; part <- st_zm(part, drop = TRUE)
+        tibble(mdl_key = k, n_features = nrow(part), content_hash = native_vector_hash(part))
+      })
+    })
+    x <- NULL
   } else {
     log_info("reading source polygons for {ds} ({length(keys)} served models) …")
     x <- pmt_specs[[ds]]()
-    x <- x |> mutate(mdl_key = as.character(mdl_key)) |>
-      filter(mdl_key %in% keys) |> mutate(ds_key = ds)
+    x <- x |> mutate(mdl_key = as.character(mdl_key)) |> filter(mdl_key %in% keys) |> mutate(ds_key = ds)
     x <- x[!st_is_empty(x), ]
     if (!nrow(x)) { log_warn("{ds}: 0 features after served-join — skip"); next }
-    log_info("{ds}: {nrow(x)} features, {n_distinct(x$mdl_key)} models -> per-model PMTiles ({n_workers} workers)")
-    built <- publish_pmtiles_models(x, dir_ds, layer = ds, workers = n_workers,
-                                    redo = redo_pmt, minzoom = 0, maxzoom = 10)
-    src_hash <- vapply(split(x, x$mdl_key), pmt_src_hash, "")
+    h <- as_tibble(native_vector_hashes(x))
   }
-  if (is.null(built) || !nrow(built)) { log_warn("{ds}: no PMTiles built"); next }
-  built$hash <- if (is.null(src_hash)) msens::native_hash_file(built$file) else unname(src_hash[built$mdl_key])
-  pmt_rows[[ds]] <- built |> transmute(
-    mdl_key, ds_key = ds, asset_type = "pmtiles", representation = "native",   # source polygons = original
-    # per-model URL; ?v={mtime} busts the browser/PMTiles-protocol cache on rebuild
-    # (Caddy ignores the query and serves the file).
-    asset_url = glue("{pmt_base}/{ds}/{path_file(file)}?v={as.integer(file_info(file)$modification_time)}"),
-    source_layer = ds, hash, file)   # asset_url is REWRITTEN to the store URL in "native-store" below
+  h <- take_n(h)
+  k <- asset_store_key("native_pmtiles", ds, h$content_hash) |> mutate(mdl_key = h$mdl_key)
+  k$file <- store_path(k$key)
+  todo <- k |> filter(!in_cat(key), !file_exists(file))
+
+  # 2. tile only the models whose key is neither catalogued nor already staged
+  todo <- todo[!duplicated(todo$key), ]                                    # two models with identical geometry = one object
+  if (nrow(todo)) {
+    log_info("{ds}: tiling {nrow(todo)} of {nrow(k)} models ({n_workers} workers)")
+    built <- if (ds == "rng_iucn")
+      publish_pmtiles_from_gpkg(iucn_gpkg, "rng_iucn", todo$mdl_key, work, workers = n_workers, minzoom = 0, maxzoom = 10)
+    else
+      publish_pmtiles_models(x[x$mdl_key %in% todo$mdl_key, ], work, layer = ds, workers = n_workers, minzoom = 0, maxzoom = 10)
+    if (!is.null(built) && nrow(built)) {
+      j <- match(built$mdl_key, todo$mdl_key)
+      for (i in which(!file_exists(todo$file[j]))) file_copy(built$file[i], todo$file[j][i])
+    }
+    miss <- todo$mdl_key[!file_exists(todo$file)]
+    if (length(miss)) log_warn("{ds}: {length(miss)} models produced no PMTiles (e.g. {miss[1]})")
+  }
+  k <- k |> filter(in_cat(key) | file_exists(file))
+  pmt_rows[[ds]] <- add_plan(k |> mutate(ds_key = ds), glue("pmtiles_{ds}"))
 }
-pmt_reg <- bind_rows(pmt_rows)   # now ONE ROW PER MODEL (mdl_key, asset_url)
-if (nrow(pmt_reg)) knitr::kable(pmt_reg |> count(ds_key, name = "n_models"))
+pmt_reg <- bind_rows(pmt_rows)
+if (nrow(pmt_reg)) knitr::kable(pmt_reg |> count(ds_key, catalogued, name = "n_models"))
 ```
 
-## AquaMaps → per-model COGs
+## AquaMaps → per-model COGs (the *model* representation, 0.05°)
 
-Consolidate the served `am` cells by **integer** key (`mid`) via `PARTITION_BY` — one small
-Parquet dir per model (`_am_parts/mid={mid}/`, columns `cell_id,val` only). This drops the
-40-byte `mdl_key` string from the ~12B-row intermediate and needs no global sort (a plain
-ORDER BY would spill ~500GB), so each per-model read is a direct partition scan. Then paint
-each model onto the global grid, cropped to its bbox, as a COG with overviews. Parallel +
-resumable (skip existing COGs).
+Keys first: the pixel hash of each served model's `dist` rows (truncated into INT1U, sub-1 pixels
+dropped, repeated cells collapsed by `max`). Then consolidate the served cells by **integer** key
+(`mid`) via `PARTITION_BY` — one small Parquet dir per model, no global sort (a plain `ORDER BY` would
+spill ~500 GB) — and paint only the models whose key is new.
+
+```{r}
+#| label: am-keys
+
+am_keys <- if (length(served_by_ds[["am"]])) sort(served_by_ds[["am"]]) else character(0)
+am_take <- take_n(am_keys)
+am_reg  <- tibble()
+if (!skip_am && length(am_take)) {
+  h <- cached_keys("cog_am", glue("{dir_atlas}/dist/dataset=am"), {
+    con <- new_con(); on.exit(dbDisconnect(con, shutdown = TRUE))
+    dbWriteTable(con, "served_k", tibble(mdl_key = am_take), overwrite = TRUE)
+    pixel_hashes(con, glue("(SELECT p.mdl_key, p.cell_id, p.val FROM read_parquet('{dir_atlas}/dist/dataset=am/*.parquet') p ",
+                           "SEMI JOIN served_k USING (mdl_key)) s"), "mdl_key", quant = "trunc", dedup = "max")
+  })
+  h <- h |> filter(mdl_key %in% am_take)
+  am_reg <- asset_store_key("cog_model", "global05", h$content_hash) |> mutate(mdl_key = h$mdl_key, ds_key = "am")
+  am_reg$file <- store_path(am_reg$key)
+}
+```
 
 ```{r}
 #| label: am-partition
 
-# test mode uses a separate parts dir + only the test subset, so it never poisons a full run
-am_keys <- if (length(served_by_ds[["am"]])) sort(served_by_ds[["am"]]) else character(0)
-am_take <- if (test_n > 0) head(am_keys, test_n) else am_keys
-# `mid` is POSITIONAL — seq_along over the sorted served keys — so it is a function of the
-# whole served SET, not of the model. Widening the served set (is_valid_usa -> is_valid_global)
-# moved 16,815 of 16,818 positions: mid=4 stopped meaning `am|Chn-0e47…` and started meaning
-# `am|Chn-08d9…`. The partitions were skipped because the DIRECTORY existed, so every COG built
-# afterwards read another species' cells and wrote them under the right filename. 1,054 COGs
-# came out that way, each internally consistent and silently wrong (am|Fis-112180: 6,469 cells
-# in dist, 100,981 in its COG).
-#
-# So the map is PERSISTED beside the partitions and the partitions are rebuilt whenever it
-# changes. Existence is not evidence of correctness; matching the map is. Same lesson as
-# msens::assign_mdl_id(), which exists because dense_rank() renumbers published partitions.
+# `mid` is POSITIONAL -- seq_along over the sorted served keys -- so it is a function of the whole served
+# SET. Widening the set once moved 16,815 of 16,818 positions while the partitions were kept because the
+# DIRECTORY existed, and 1,054 COGs were painted from another species' cells. So the map is PERSISTED beside
+# the partitions and the partitions are rebuilt whenever it changes. Existence is not evidence of
+# correctness; matching the map is.
 am_map  <- tibble(mdl_key = am_take, mid = seq_along(am_take))
 am_parts<- glue("{dir_native}/_am_parts{if (test_n > 0) '_test' else ''}")
 am_map_csv <- glue("{am_parts}.map.csv")
-if (!skip_am && length(am_take)) {
-  map_ok <- file_exists(am_map_csv) && dir_exists(am_parts) && {
-    prev <- suppressMessages(readr::read_csv(am_map_csv, show_col_types = FALSE))
-    nrow(prev) == nrow(am_map) && all(prev$mdl_key == am_map$mdl_key) && all(prev$mid == am_map$mid)
-  }
-  if (!map_ok || redo) {
+am_todo <- if (nrow(am_reg)) am_reg |> filter(!in_cat(key), !file_exists(file)) else tibble()
+am_map_ok <- file_exists(am_map_csv) && dir_exists(am_parts) && {
+  prev <- suppressMessages(readr::read_csv(am_map_csv, show_col_types = FALSE))
+  nrow(prev) == nrow(am_map) && all(prev$mdl_key == am_map$mdl_key) && all(prev$mid == am_map$mid)
+}
+if (!skip_am && length(am_take) && nrow(am_todo)) {
+  if (!am_map_ok) {
     if (dir_exists(am_parts)) {
-      log_warn("_am_parts does not match the current served set — repartitioning ",
-               "(mid is positional; reusing it would paint the wrong species)")
+      log_warn("_am_parts does not match the current served set — repartitioning (mid is positional)")
       dir_delete(am_parts)
     }
     log_info("partitioning {length(am_take)} served am models by mid -> _am_parts …")
-    con <- dbConnect(duckdb(), config = list(threads = "6", memory_limit = "10GB"))
-    dbExecute(con, glue("SET temp_directory='{dir_atlas}/duckdb_tmp'"))
+    con <- new_con()
     dbExecute(con, "SET partitioned_write_max_open_files=400")
     dbWriteTable(con, "am_map", am_map, overwrite = TRUE)
-    msens::copy_atlas_parquet(con, glue("
+    copy_atlas_parquet(con, glue("
       SELECT map.mid, p.cell_id, p.val
       FROM read_parquet('{dir_atlas}/dist/dataset=am/*.parquet') p
       JOIN am_map map ON p.mdl_key = map.mdl_key"),
       am_parts, partition_by = "mid")
     dbDisconnect(con, shutdown = TRUE)
-    readr::write_csv(am_map, am_map_csv)
-    log_info("_am_parts: {length(dir_ls(am_parts))} partitions, {round(sum(file_size(dir_ls(am_parts, recurse=TRUE, type='file')))/1e9,1)} GB")
+    readr::write_csv(am_map, am_map_csv); am_map_ok <- TRUE
+    log_info("_am_parts: {length(dir_ls(am_parts))} partitions")
   } else log_info("_am_parts matches the served set ({nrow(am_map)} models) — skip repartition")
-}
+} else if (!skip_am && length(am_take)) log_info("am: every served model's key is catalogued or staged — no partition needed")
 ```
 
 ```{r}
 #| label: am-cogs
 
-am_reg <- tibble()
-if (!skip_am && length(am_take) && dir_exists(am_parts)) {
-  todo <- am_map[!file_exists(glue("{dir_cog}/{safe_key(am_map$mdl_key)}.tif")), ]
-  log_info("am COGs: {nrow(am_map)} target, {nrow(todo)} to build ({nrow(am_map)-nrow(todo)} exist)")
-
-  # PROVE mid still addresses the model it names, on the DATA rather than on the map file.
-  # A COG painted from the wrong partition is internally valid — right filename, plausible
-  # raster — so nothing downstream can detect it; the only moment it is cheap to catch is
-  # here, by asking whether partition mid=N holds the cells `dist` records for that mdl_key.
-  if (nrow(todo)) {
-    conv <- dbConnect(duckdb(), config = list(threads = "4"))
-    smp  <- am_map[unique(round(seq(1, nrow(am_map), length.out = min(8, nrow(am_map))))), ]
-    bad  <- 0L
-    for (i in seq_len(nrow(smp))) {
-      pf <- glue("{am_parts}/mid={smp$mid[i]}")
-      if (!dir_exists(pf)) next
-      n_part <- dbGetQuery(conv, glue("SELECT count(*) n FROM read_parquet('{pf}/*.parquet')"))$n
-      n_dist <- dbGetQuery(conv, glue("
-        SELECT count(*) n FROM read_parquet('{dir_atlas}/dist/dataset=am/*.parquet')
-        WHERE mdl_key = '{smp$mdl_key[i]}'"))$n
-      if (n_part != n_dist) {
-        bad <- bad + 1L
-        log_error("mid={smp$mid[i]} ({smp$mdl_key[i]}): partition has {n_part} cells, dist has {n_dist}")
-      }
-    }
-    dbDisconnect(conv, shutdown = TRUE)
-    if (bad > 0)
-      stop(sprintf(paste0("_am_parts does not address the models am_map names (%d of %d sampled ",
-                          "disagree). Building COGs now would publish other species' surfaces ",
-                          "under these names — delete %s and re-run to repartition."),
-                   bad, nrow(smp), am_parts), call. = FALSE)
-    log_info("am partition addressing verified on {nrow(smp)} sampled models")
-  }
-
-  grid <- grid_spec(rast(cellid_tif))
-  build_batch <- function(rows) {
+# a painter shared by every gridded class: rows (mdl_key, out, sql) -> publish_cog() into the store mirror.
+# `sql` selects (cell_id, val) for the model; `round_first` applies the writer's own rounding (ax, merged-suit)
+paint_rows <- function(rows, grid, round_first = FALSE, workers = n_workers) {
+  rows <- rows[!file_exists(rows$out), ]
+  rows <- rows[!duplicated(rows$out), ]                                    # two models with identical pixels = one object
+  if (!nrow(rows)) return(invisible(0L))
+  one_batch <- function(b) {
     suppressMessages({library(DBI); library(duckdb); library(terra)})
-    con <- dbConnect(duckdb())
+    con <- dbConnect(duckdb(), config = list(threads = "2", memory_limit = "3GB"))
     on.exit(dbDisconnect(con, shutdown = TRUE))
-    for (i in seq_len(nrow(rows))) {
-      k <- rows$mdl_key[i]; f <- sprintf("%s/%s.tif", dir_cog, safe_key(k))
-      if (file.exists(f)) next
-      pf <- sprintf("%s/mid=%d", am_parts, rows$mid[i])
-      if (!dir.exists(pf)) next
-      d <- dbGetQuery(con, sprintf("SELECT cell_id, val FROM read_parquet('%s/*.parquet')", pf))
-      if (nrow(d)) msens::publish_cog(d$cell_id, d$val, f, grid)
+    for (i in seq_len(nrow(b))) {
+      if (file.exists(b$out[i])) next
+      d <- dbGetQuery(con, b$sql[i])
+      if (round_first) d$val <- round(d$val)
+      if (nrow(d)) msens::publish_cog(d$cell_id, d$val, b$out[i], grid)
     }
-    nrow(rows)
+    nrow(b)
   }
+  if (workers > 1 && nrow(rows) > 1) {
+    plan(multisession, workers = workers); on.exit(plan(sequential), add = TRUE)
+    future_map(split(rows, (seq_len(nrow(rows)) - 1) %% workers), one_batch,
+               .options = furrr_options(packages = c("msens"), seed = TRUE))
+  } else one_batch(rows)
+  invisible(sum(file_exists(rows$out)))
+}
 
-  if (nrow(todo)) {
-    plan(multisession, workers = n_workers)
-    batches <- split(todo, (seq_len(nrow(todo)) - 1) %% n_workers)
-    future_map(batches, build_batch,
-               .options = furrr_options(globals = c("am_parts","dir_cog","grid","safe_key"),
-                                        packages = c("msens"), seed = TRUE))
-    plan(sequential)
+if (nrow(am_todo) && dir_exists(am_parts)) {
+  todo <- am_todo |> inner_join(am_map, by = "mdl_key")
+  # PROVE mid still addresses the model it names, on the DATA rather than on the map file: a COG painted
+  # from the wrong partition is internally valid, so this is the only cheap moment to catch it
+  conv <- new_con("2GB", "4")
+  smp  <- am_map[unique(round(seq(1, nrow(am_map), length.out = min(8, nrow(am_map))))), ]
+  bad  <- 0L
+  for (i in seq_len(nrow(smp))) {
+    pf <- glue("{am_parts}/mid={smp$mid[i]}"); if (!dir_exists(pf)) next
+    n_part <- dbGetQuery(conv, glue("SELECT count(*) n FROM read_parquet('{pf}/*.parquet')"))$n
+    n_dist <- dbGetQuery(conv, glue("SELECT count(*) n FROM read_parquet('{dir_atlas}/dist/dataset=am/*.parquet') WHERE mdl_key = '{smp$mdl_key[i]}'"))$n
+    if (n_part != n_dist) { bad <- bad + 1L; log_error("mid={smp$mid[i]} ({smp$mdl_key[i]}): partition {n_part} cells, dist {n_dist}") }
   }
-  built <- glue("{dir_cog}/{safe_key(am_map$mdl_key)}.tif")
-  # representation = "model": these COGs are painted from dist/dataset=am (the 0.05° bilinear-
-  # RESAMPLED suitability actually used in scoring) — NOT AquaMaps' native 0.5° cells. The native
-  # surface is published separately below (representation = "native").
-  am_reg <- tibble(
-    mdl_key = am_map$mdl_key, ds_key = "am", asset_type = "cog", representation = "model",
-    asset_url = glue("{s3_http}/native/am/{safe_key(am_map$mdl_key)}.tif"),
-    rescale_min = 1L, rescale_max = 100L, colormap = "spectral_r")[file_exists(built), ]
-  log_info("am model COGs (0.05° resampled) on disk: {nrow(am_reg)} / {nrow(am_map)}")
+  dbDisconnect(conv, shutdown = TRUE)
+  if (bad > 0) stop(sprintf("_am_parts does not address the models am_map names (%d of %d sampled disagree); delete %s and re-run",
+                            bad, nrow(smp), am_parts), call. = FALSE)
+  log_info("am partition addressing verified on {nrow(smp)} sampled models; painting {nrow(todo)} model COGs")
+  # max(val) per cell: what the merge consumes (and what the key hashed); a no-op where cells do not repeat
+  todo$sql <- sprintf("SELECT cell_id, max(val) AS val FROM read_parquet('%s/mid=%d/*.parquet') GROUP BY 1", am_parts, todo$mid)
+  todo$out <- todo$file
+  paint_rows(todo, grid)
+}
+if (nrow(am_reg)) {
+  am_reg <- am_reg |> filter(in_cat(key) | file_exists(file))
+  add_plan(am_reg, "cog_am")
 }
 ```
 
-## AquaMaps native 0.5° COGs (the *original* surface)
+## AquaMaps native 0.5° COGs (the *original* representation)
 
-Publish each served AquaMaps model at its **true native 0.5°** resolution — the HCAF `probability`
-painted by `loiczid` onto the 720×360 half-degree grid (`publish_cog` is grid-agnostic; `loiczid`
-is its row-major top-left index, verified against the ingest). This is the **original**
-representation, distinct from the 0.05°-resampled model COGs above; `probability×100` shares the
-[0,100] rescale. Parallel + resumable.
+Each served model at its true native resolution: the HCAF `probability × 100` painted by `loiczid` onto
+the 720 × 360 grid (`loiczid` is its row-major top-left index, verified against the ingest). Keyed by the
+same pixel rule (`trunc` into INT1U) as every COG `publish_cog()` writes.
 
 ```{r}
 #| label: am-native-cogs
 
-dir_cog_native <- glue("{dir_native}/am_native"); dir_create(dir_cog_native)
-am_native_reg  <- tibble()
+am_native_reg <- tibble()
 if (!skip_am && length(am_take) && file_exists(am_db)) {
-  native_grid <- grid_spec(rast(nrows = 360, ncols = 720, xmin = -180, xmax = 180,
-                                ymin = -90, ymax = 90, crs = "EPSG:4326"))
-  todo_n <- am_map[!file_exists(glue("{dir_cog_native}/{safe_key(am_map$mdl_key)}.tif")), ]
-  log_info("am native 0.5° COGs: {nrow(am_map)} target, {nrow(todo_n)} to build")
-
-  build_native <- function(rows) {
-    suppressMessages({library(DBI); library(duckdb); library(terra)})
-    con <- dbConnect(duckdb(am_db, read_only = TRUE)); on.exit(dbDisconnect(con, shutdown = TRUE))
-    for (i in seq_len(nrow(rows))) {
-      k <- rows$mdl_key[i]; sp <- sub("^am\\|", "", k)
-      f <- sprintf("%s/%s.tif", dir_cog_native, safe_key(k))
-      if (file.exists(f)) next
-      d <- dbGetQuery(con, sprintf(
-        "SELECT c.loiczid AS cell_id, s.probability*100 AS val
-           FROM spp_cells s JOIN cells c USING (cell_id) WHERE s.sp_key = '%s'", sp))
-      if (nrow(d)) msens::publish_cog(d$cell_id, d$val, f, native_grid)
+  native_grid <- grid_spec(rast(nrows = 360, ncols = 720, xmin = -180, xmax = 180, ymin = -90, ymax = 90, crs = "EPSG:4326"))
+  h <- cached_keys("native_am", path_dir(am_db), {
+    con <- dbConnect(duckdb(path.expand(am_db), read_only = TRUE), config = list(threads = "6", memory_limit = "10GB"))
+    on.exit(dbDisconnect(con, shutdown = TRUE))
+    duckdb_register(con, "served_k", tibble(sp_key = sub("^am\\|", "", am_take)))   # a VIEW over the df: the db is read-only
+    pixel_hashes(con, "(SELECT 'am|' || s.sp_key AS mdl_key, c.loiczid AS cell_id, s.probability * 100 AS val
+                        FROM spp_cells s JOIN cells c USING (cell_id) SEMI JOIN served_k USING (sp_key)) z",
+                 "mdl_key", quant = "trunc", dedup = "max")
+  })
+  h <- h |> filter(mdl_key %in% am_take)
+  am_native_reg <- asset_store_key("native_am", "am", h$content_hash) |> mutate(mdl_key = h$mdl_key, ds_key = "am")
+  am_native_reg$file <- store_path(am_native_reg$key)
+  todo <- am_native_reg |> filter(!in_cat(key), !file_exists(file))
+  if (nrow(todo)) {
+    log_info("am native 0.5° COGs: {nrow(am_native_reg)} served, {nrow(todo)} to paint")
+    todo$sql <- sprintf("SELECT c.loiczid AS cell_id, max(s.probability * 100) AS val FROM spp_cells s JOIN cells c USING (cell_id) WHERE s.sp_key = '%s' GROUP BY 1",
+                        sub("^am\\|", "", todo$mdl_key))
+    todo <- todo[!duplicated(todo$key), ]
+    todo$out <- todo$file
+    paint_native <- function(rows, grid) {
+      suppressMessages({library(DBI); library(duckdb); library(terra)})
+      con <- dbConnect(duckdb(path.expand(am_db), read_only = TRUE)); on.exit(dbDisconnect(con, shutdown = TRUE))
+      for (i in seq_len(nrow(rows))) {
+        if (file.exists(rows$out[i])) next
+        d <- dbGetQuery(con, rows$sql[i])
+        if (nrow(d)) msens::publish_cog(d$cell_id, d$val, rows$out[i], grid)
+      }
+      nrow(rows)
     }
-    nrow(rows)
-  }
-  if (nrow(todo_n)) {
     plan(multisession, workers = n_workers)
-    batches <- split(todo_n, (seq_len(nrow(todo_n)) - 1) %% n_workers)
-    future_map(batches, build_native,
-               .options = furrr_options(globals = c("am_db","dir_cog_native","native_grid","safe_key"),
-                                        packages = c("msens"), seed = TRUE))
+    future_map(split(todo, (seq_len(nrow(todo)) - 1) %% n_workers), paint_native, grid = native_grid,
+               .options = furrr_options(packages = c("msens"), seed = TRUE))
     plan(sequential)
   }
-  built_n <- glue("{dir_cog_native}/{safe_key(am_map$mdl_key)}.tif")
-  am_native_reg <- tibble(
-    mdl_key = am_map$mdl_key, ds_key = "am", asset_type = "cog", representation = "native",
-    asset_url = glue("{s3_http}/native/am_native/{safe_key(am_map$mdl_key)}.tif"),
-    rescale_min = 1L, rescale_max = 100L, colormap = "spectral_r")[file_exists(built_n), ]
-  log_info("am native 0.5° COGs on disk: {nrow(am_native_reg)} / {nrow(am_map)}")
-  # store hash = source content of the 0.5 deg cells (same fingerprint as content_hashes() on model_cell)
-  con_h <- dbConnect(duckdb(am_db, read_only = TRUE))
-  dbExecute(con_h, "CREATE OR REPLACE TEMP VIEW am_native_src AS
-    SELECT s.sp_key, c.loiczid AS cell_id, s.probability*100 AS val
-      FROM spp_cells s JOIN cells c USING (cell_id)")
-  am_h <- msens::content_hashes(con_h, "am_native_src", "sp_key")
-  dbDisconnect(con_h, shutdown = TRUE)
-  am_native_reg <- am_native_reg |>
-    mutate(hash = msens::content_hash_encoded(am_h$content_hash[match(sub("^am\\|", "", mdl_key), am_h$sp_key)],
-                                              "flt4-0.5deg-cog"),
-           file = glue("{dir_cog_native}/{safe_key(mdl_key)}.tif"))
+  am_native_reg <- am_native_reg |> filter(in_cat(key) | file_exists(file))
+  add_plan(am_native_reg, "native_am")
 }
 ```
 
-## Vector inputs → 0.05° gridded COGs (the *interpolated* surface, opt-in)
+## Vector inputs → 0.05° gridded COGs (the *model* representation, opt-in)
 
-Each vector input's dist surface (`(cell_id, val)` on the 0.05° grid) painted as a COG — the
-**model/interpolated** representation of a vector range, complementing its native PMTiles polygons
-(so both representations exist per `mdl_key`). Opt-in (`NATIVE_VEC_COG=1`) since there are
-thousands; iterates each dist file once (each holds one model) and `publish_cog`s the served ones.
+Each vector input's `dist` surface painted as a COG, so both representations exist per `mdl_key`.
+Opt-in (`NATIVE_VEC_COG=1`): thousands of objects, and the key decides what is new. A model whose rows
+span several files (`rng_turtle_swot_dps`) is read across all of them with `max(val)` per cell.
 
 ```{r}
 #| label: vec-grid-cogs
 
-do_vec_cog  <- nzchar(Sys.getenv("NATIVE_VEC_COG"))
 vec_cog_reg <- tibble()
-if (do_vec_cog && nrow(pmt_reg)) {
-  dir_vcog <- glue("{dir_native}/vec_grid"); dir_create(dir_vcog)
-  keys_by_ds <- split(pmt_reg$mdl_key, pmt_reg$ds_key)          # served vector models per dataset
-  grid <- grid_spec(rast(cellid_tif))
-
-  build_ds <- function(ds, keys) {
-    suppressMessages({library(DBI); library(duckdb); library(terra); library(arrow)})
-    files <- fs::dir_ls(file.path(dir_atlas, paste0("dist/dataset=", ds)), glob = "*.parquet")
-    con <- dbConnect(duckdb()); on.exit(dbDisconnect(con, shutdown = TRUE))
-    for (fp in files) {
-      k <- dbGetQuery(con, sprintf("SELECT DISTINCT mdl_key FROM read_parquet('%s') LIMIT 1", fp))$mdl_key
-      if (length(k) != 1 || !k %in% keys) next
-      f <- sprintf("%s/%s.tif", dir_vcog, safe_key(k))
-      if (file.exists(f)) next
-      d <- dbGetQuery(con, sprintf("SELECT cell_id, val FROM read_parquet('%s')", fp))
-      if (nrow(d)) msens::publish_cog(d$cell_id, d$val, f, grid)
+if (nzchar(Sys.getenv("NATIVE_VEC_COG")) && nrow(pmt_reg)) {
+  keys_by_ds <- split(pmt_reg$mdl_key, pmt_reg$ds_key)
+  vec_cog_reg <- map_dfr(names(keys_by_ds), function(ds) {
+    dd <- glue("{dir_atlas}/dist/dataset={ds}")
+    if (!dir_exists(dd)) return(NULL)
+    h <- cached_keys(glue("cog_{ds}"), dd, {
+      con <- new_con(); on.exit(dbDisconnect(con, shutdown = TRUE))
+      pixel_hashes(con, glue("read_parquet('{dd}/*.parquet')"), "mdl_key", quant = "trunc", dedup = "max")
+    }) |> filter(mdl_key %in% keys_by_ds[[ds]])
+    k <- asset_store_key("cog_model", "global05", h$content_hash) |> mutate(mdl_key = h$mdl_key, ds_key = ds)
+    k$file <- store_path(k$key)
+    todo <- k |> filter(!in_cat(key), !file_exists(file))
+    if (nrow(todo)) {
+      # one file per model where the ingest wrote one (most datasets); every file otherwise (turtles: 14 files, 6 models)
+      con <- new_con("2GB", "4")
+      fpm <- dbGetQuery(con, glue("SELECT mdl_key, count(DISTINCT filename) n_files, min(filename) f FROM read_parquet('{dd}/*.parquet', filename = true) GROUP BY 1"))
+      dbDisconnect(con, shutdown = TRUE)
+      todo <- todo |> inner_join(fpm, by = "mdl_key")
+      todo$sql <- ifelse(todo$n_files == 1L,
+        sprintf("SELECT cell_id, max(val) AS val FROM read_parquet('%s') WHERE mdl_key = '%s' GROUP BY 1", todo$f, gsub("'", "''", todo$mdl_key)),
+        sprintf("SELECT cell_id, max(val) AS val FROM read_parquet('%s/*.parquet') WHERE mdl_key = '%s' GROUP BY 1", dd, gsub("'", "''", todo$mdl_key)))
+      todo$out <- todo$file
+      log_info("{ds}: painting {nrow(todo)} gridded COGs")
+      paint_rows(todo, grid)
     }
-    length(files)
-  }
-  plan(multisession, workers = n_workers)
-  future_map2(names(keys_by_ds), keys_by_ds, build_ds,
-              .options = furrr_options(globals = c("dir_vcog","dir_atlas","grid","safe_key"),
-                                       packages = c("msens"), seed = TRUE))
-  plan(sequential)
-
-  vec_cog_reg <- pmt_reg |> distinct(mdl_key, ds_key) |> mutate(
-    asset_type = "cog", representation = "model",
-    asset_url = glue("{s3_http}/native/vec_grid/{safe_key(mdl_key)}.tif"),
-    rescale_min = 1L, rescale_max = 100L, colormap = "spectral_r")
-  vec_cog_reg <- vec_cog_reg[file_exists(glue("{dir_vcog}/{safe_key(vec_cog_reg$mdl_key)}.tif")), ]
-  log_info("vector grid COGs on disk: {nrow(vec_cog_reg)}")
+    k |> filter(in_cat(key) | file_exists(file))
+  })
+  if (nrow(vec_cog_reg)) add_plan(vec_cog_reg, "cog_vec")
 }
 ```
 
 ## NMFS DPS extinction-risk surfaces → per-species COGs
 
-The `dps_nmfs` surfaces (per-cell extinction risk: each listed entity's habitat at its status, the
-species' baseline elsewhere) are *gridded from the start* — built by `ingest_nmfs-dps.qmd` from the
-NMFS critical-habitat service + the IUCN range — so their one representation is the model grid
-itself, painted as a COG per species. Without these rows the species app listed the input as
-*NMFS DPS extinction risk* but struck it through: an input with no published surface is disabled.
-Resumable by file existence; `REDO_DPS_COG=1` (or `REDO_NATIVE`) repaints.
+Gridded from the start (`ingest_nmfs-dps.qmd`), so their one representation is the model grid itself.
+Without these rows the species app lists the input struck through.
 
 ```{r}
 #| label: dps-cogs
 
 dps_reg  <- tibble()
 dps_keys <- if (length(served_by_ds[["dps_nmfs"]])) sort(served_by_ds[["dps_nmfs"]]) else character(0)
-if (length(dps_keys)) {
-  dir_dps <- glue("{dir_native}/dps_nmfs")
-  if ((redo || nzchar(Sys.getenv("REDO_DPS_COG"))) && dir_exists(dir_dps)) dir_delete(dir_dps)
-  dir_create(dir_dps)
-  grid <- grid_spec(rast(cellid_tif))
-  con  <- dbConnect(duckdb())
-  for (k in dps_keys) {
-    f <- glue("{dir_dps}/{safe_key(k)}.tif"); if (file_exists(f)) next
-    d <- dbGetQuery(con, glue("SELECT cell_id, val FROM read_parquet('{dir_atlas}/dist/dataset=dps_nmfs/*.parquet') WHERE mdl_key = '{k}'"))
-    if (nrow(d)) msens::publish_cog(d$cell_id, d$val, f, grid)
+dd_dps   <- glue("{dir_atlas}/dist/dataset=dps_nmfs")
+if (length(dps_keys) && dir_exists(dd_dps)) {
+  h <- cached_keys("cog_dps_nmfs", dd_dps, {
+    con <- new_con("2GB", "4"); on.exit(dbDisconnect(con, shutdown = TRUE))
+    pixel_hashes(con, glue("read_parquet('{dd_dps}/*.parquet')"), "mdl_key", quant = "trunc", dedup = "max")
+  }) |> filter(mdl_key %in% dps_keys)
+  dps_reg <- asset_store_key("cog_model", "global05", h$content_hash) |> mutate(mdl_key = h$mdl_key, ds_key = "dps_nmfs")
+  dps_reg$file <- store_path(dps_reg$key)
+  todo <- dps_reg |> filter(!in_cat(key), !file_exists(file))
+  if (nrow(todo)) {
+    todo$sql <- sprintf("SELECT cell_id, max(val) AS val FROM read_parquet('%s/*.parquet') WHERE mdl_key = '%s' GROUP BY 1", dd_dps, gsub("'", "''", todo$mdl_key))
+    todo$out <- todo$file
+    paint_rows(todo, grid, workers = 1)
   }
-  dbDisconnect(con, shutdown = TRUE)
-  dps_reg <- tibble(
-    mdl_key = dps_keys, ds_key = "dps_nmfs", asset_type = "cog", representation = "model",
-    asset_url = glue("{s3_http}/native/dps_nmfs/{safe_key(dps_keys)}.tif"),
-    rescale_min = 1L, rescale_max = 100L, colormap = "spectral_r")
-  dps_reg <- dps_reg[file_exists(glue("{dir_dps}/{safe_key(dps_reg$mdl_key)}.tif")), ]
-  log_info("dps_nmfs COGs on disk: {nrow(dps_reg)} / {length(dps_keys)}")
+  dps_reg <- dps_reg |> filter(in_cat(key) | file_exists(file))
+  add_plan(dps_reg, "cog_dps_nmfs")
 }
 ```
 
-## Merged taxon surface → per-taxon whole-range COGs
+## AquaX: both representations from the COGs the ingest built
 
-Publish the **merged model itself** (`ds_key = "ms_merge"`, `representation = "model"`) as a
-whole-range COG per taxon, painted from `dist_merged_global` — so the species app renders the merged
-layer (and non-US species' global range) via titiler `/cog` (anonymous, clickable) instead of the
-creds-gated `model_cell` glob. Partition the global surface by an integer key (`mmid`) — no global
-sort — then paint each per-taxon slice. Opt-in (`PUBLISH_MERGED_COG=1`); parallel + resumable.
+`ingest_aquax.qmd` (`AX_COG=1`) paints the two COGs per model locally and never uploads them (its
+`AX_COG_S3` was retired with the store). `native` is the band **as delivered** (Float32, every modeled
+pixel; keyed by its decoded pixels, which equal the source TIF's), `model` the surface **as ingested**
+(÷10, rounded into INT1U; keyed by the `dist` rows rounded the same way). Both go to the store from here.
+
+```{r}
+#| label: ax-cogs
+
+ax_reg   <- tibble()
+ax_keys  <- if (length(served_by_ds[["ax"]])) sort(served_by_ds[["ax"]]) else character(0)
+dd_ax    <- glue("{dir_atlas}/dist/dataset=ax")
+dir_axn  <- glue("{dir_native}/ax_native"); dir_axm <- glue("{dir_native}/ax")
+if (length(ax_keys) && dir_exists(dd_ax)) {
+  ax_take <- take_n(ax_keys)
+  # model: dist rows, rounded half-to-even then truncated (ingest_aquax rounds before publish_cog())
+  hm <- cached_keys("cog_ax", dd_ax, {
+    con <- new_con(); on.exit(dbDisconnect(con, shutdown = TRUE))
+    pixel_hashes(con, glue("read_parquet('{dd_ax}/*.parquet')"), "mdl_key", quant = "round_trunc", dedup = "max")
+  }) |> filter(mdl_key %in% ax_take)
+  km <- asset_store_key("cog_model", "global05", hm$content_hash) |> mutate(mdl_key = hm$mdl_key, ds_key = "ax", representation = "model")
+  km$file <- store_path(km$key)
+  todo <- km |> filter(!in_cat(key), !file_exists(file))
+  if (nrow(todo)) {
+    # paint from the rows (never copy the ingest's file blind: the key promises these pixels)
+    con <- new_con("2GB", "4")
+    fpm <- dbGetQuery(con, glue("SELECT mdl_key, min(filename) f FROM read_parquet('{dd_ax}/*.parquet', filename = true) GROUP BY 1"))
+    dbDisconnect(con, shutdown = TRUE)
+    todo <- todo |> inner_join(fpm, by = "mdl_key")
+    todo$sql <- sprintf("SELECT cell_id, max(val) AS val FROM read_parquet('%s') WHERE mdl_key = '%s' GROUP BY 1", todo$f, gsub("'", "''", todo$mdl_key))
+    todo$out <- todo$file
+    log_info("ax model COGs: painting {nrow(todo)}")
+    paint_rows(todo, grid, round_first = TRUE)
+  }
+  # native: the ingest's as-delivered COG, keyed by its decoded pixels (a bit-exact copy of the source band)
+  f_nat <- glue("{dir_axn}/{safe_key(ax_take)}.tif"); have <- file_exists(f_nat)
+  if (!all(have)) log_warn("ax native: {sum(!have)} served models have no as-delivered COG under {dir_axn} (run ingest_aquax with AX_COG=1)")
+  hn <- cached_keys("native_ax", dir_axn, {
+    fl <- f_nat[have]
+    plan(multisession, workers = n_workers); on.exit(plan(sequential), add = TRUE)
+    bind_rows(future_map(split(fl, ceiling(seq_along(fl) / 100)), function(b) {
+      suppressMessages({library(terra); library(msens)})
+      rows <- purrr::map_dfr(b, function(f) msens::native_raster_rows(terra::rast(f), grid) |> dplyr::mutate(file = f))
+      msens::content_hashes_df(rows, by = "file")
+    }, .options = furrr_options(packages = c("msens", "terra", "dplyr", "purrr"), seed = TRUE)))
+  }) |> mutate(mdl_key = ax_take[match(file, as.character(f_nat))]) |> filter(!is.na(mdl_key))
+  kn <- asset_store_key("native_ax", "ax", hn$content_hash) |> mutate(mdl_key = hn$mdl_key, ds_key = "ax", representation = "native", src = hn$file)
+  kn$file <- store_path(kn$key)
+  todo <- kn |> filter(!in_cat(key), !file_exists(file))
+  todo <- todo[!duplicated(todo$key), ]
+  if (nrow(todo)) file_copy(todo$src, todo$file)
+  ax_reg <- bind_rows(km, kn |> select(-src)) |> filter(in_cat(key) | file_exists(file))
+  add_plan(ax_reg, "cog_ax")
+  if (nrow(ax_reg) < 2 * length(ax_take))
+    log_warn("ax: {length(ax_take)} served models but {nrow(ax_reg)} pointer rows")
+}
+```
+
+## Merged taxon surface → per-taxon whole-range COGs (opt-in)
+
+The merged model itself (`ds_key = "ms_merge"`), painted from `dist_merged_global` (range-derived taxa)
+and, for **suitability-only** taxa the global surface never holds (2+ AquaMaps models, or any AquaX
+model), from the post-supersession merge input `mc_parts` as `round(max(val))` per cell. The am-only
+taxa with ONE AquaMaps model and nothing else alias that model's own `model` object (registry chunk).
 
 ```{r}
 #| label: merged-cogs
 
 do_merged_cog <- nzchar(Sys.getenv("PUBLISH_MERGED_COG"))
-# REDO_MERGED_COG exists separately from REDO_NATIVE for the same reason REDO_PMTILES does: the
-# merged COGs are a pure function of dist_merged_global, so a re-merge invalidates every one of them
-# while the ~7 GB IUCN gpkg and the am re-sort REDO_NATIVE would also redo are untouched. The build
-# below is resumable by file existence, so repainting means clearing the outputs -- as a FLAG, never
-# a hand-`mv`, so the HTML records which run rebuilt them (apps#8 masking fix).
-redo_mcog   <- redo || nzchar(Sys.getenv("REDO_MERGED_COG"))
-# REDO_MERGED_COG_KEYS="ms_merge|WORMS:137092,..." repaints ONLY those taxa (a rule change for the
-# ~25 spatial-ER taxa need not repaint 21,000 COGs); their partitions are refreshed from the global
-# surface and their tifs cleared, everything else is kept
-redo_keys   <- trimws(strsplit(Sys.getenv("REDO_MERGED_COG_KEYS"), ",")[[1]]); redo_keys <- redo_keys[nzchar(redo_keys)]
-# REDO_MERGED_COG_SPATIAL=1 names them for you: every taxon merged through the spatial-ER branches
-# (sea turtles + NMFS DPS species), resolved from the crosswalk so no key list is pasted by hand
+redo_mcog   <- nzchar(Sys.getenv("REDO_MERGED_COG"))
+redo_keys_m <- trimws(strsplit(Sys.getenv("REDO_MERGED_COG_KEYS"), ",")[[1]]); redo_keys_m <- redo_keys_m[nzchar(redo_keys_m)]
 if (nzchar(Sys.getenv("REDO_MERGED_COG_SPATIAL"))) {
-  conk <- dbConnect(duckdb(), config = list(threads = "2")); dbExecute(conk, glue("ATTACH '{merge_db}' AS m (READ_ONLY)"))
-  redo_keys <- union(redo_keys, dbGetQuery(conk, "SELECT DISTINCT ms_merge_key FROM m.taxon_model
+  conk <- new_con("2GB", "2"); dbExecute(conk, glue("ATTACH '{merge_db}' AS m (READ_ONLY)"))
+  redo_keys_m <- union(redo_keys_m, dbGetQuery(conk, "SELECT DISTINCT ms_merge_key FROM m.taxon_model
     WHERE mdl_key LIKE 'rng_turtle_swot_dps|%' OR mdl_key LIKE 'dps_nmfs|%'")$ms_merge_key)
   dbDisconnect(conk, shutdown = TRUE)
-  log_info("REDO_MERGED_COG_SPATIAL: {length(redo_keys)} spatial-ER taxa to repaint")
+  log_info("REDO_MERGED_COG_SPATIAL: {length(redo_keys_m)} spatial-ER taxa")
 }
-merged_reg  <- tibble()
-merged_map  <- tibble()
+merged_reg  <- tibble(); merged_map <- tibble()
 mparts      <- glue("{dir_native}/_merged_parts{if (test_n > 0) '_test' else ''}")
 dir_gmerged <- glue("{dir_atlas}/dist_merged_global/dataset=ms_merge")
 if (do_merged_cog && dir_exists(dir_gmerged)) {
-  dir_mcog <- glue("{dir_native}/merged")
-  if (redo_mcog && dir_exists(dir_mcog)) {
-    log_info("REDO_MERGED_COG: clearing {length(dir_ls(dir_mcog, glob = '*.tif'))} merged COGs")
-    dir_delete(dir_mcog)
-  }
-  dir_create(dir_mcog)
-  if (length(redo_keys)) {
-    rm_tif <- glue("{dir_mcog}/{safe_key(redo_keys)}.tif"); rm_tif <- rm_tif[file_exists(rm_tif)]
-    if (length(rm_tif)) file_delete(rm_tif)
-    log_info("REDO_MERGED_COG_KEYS: cleared {length(rm_tif)} of {length(redo_keys)} named merged COGs")
-  }
-  con <- dbConnect(duckdb(), config = list(threads = "6", memory_limit = "10GB"))
-  dbExecute(con, glue("SET temp_directory='{dir_atlas}/duckdb_tmp'"))
-  dbExecute(con, glue("ATTACH '{merge_db}' AS m (READ_ONLY)"))
-  # served merged taxa (the set the app lists) present in the global surface
+  con <- new_con(); dbExecute(con, glue("ATTACH '{merge_db}' AS m (READ_ONLY)"))
   mkeys <- dbGetQuery(con, glue("
     SELECT DISTINCT g.mdl_key FROM read_parquet('{dir_gmerged}/**/*.parquet') g
     SEMI JOIN (SELECT DISTINCT ms_merge_key AS mdl_key FROM m.taxon
-               WHERE is_marine AND ms_merge_key IS NOT NULL AND sp_cat NOT IN ('reptile','amphibian')) s
-      USING (mdl_key)"))$mdl_key
-  mkeys <- sort(mkeys); if (test_n > 0) mkeys <- head(mkeys, test_n)
+               WHERE is_marine AND ms_merge_key IS NOT NULL AND sp_cat NOT IN ('reptile','amphibian')) s USING (mdl_key)"))$mdl_key
+  mkeys <- take_n(sort(mkeys))
+  h <- cached_keys("cog_merged", dir_gmerged, {
+    dbWriteTable(con, "served_m", tibble(mdl_key = mkeys), overwrite = TRUE)
+    pixel_hashes(con, glue("(SELECT g.mdl_key, g.cell_id, g.val FROM read_parquet('{dir_gmerged}/**/*.parquet') g SEMI JOIN served_m USING (mdl_key)) s"),
+                 "mdl_key", quant = "trunc", dedup = "max")
+  }) |> filter(mdl_key %in% mkeys)
+  merged_reg <- asset_store_key("cog_model", "global05", h$content_hash) |> mutate(mdl_key = h$mdl_key, ds_key = "ms_merge")
+  merged_reg$file <- store_path(merged_reg$key)
+  if (length(redo_keys_m)) {                                               # a named repaint: drop the staged file so the key is re-examined
+    rm_f <- merged_reg$file[merged_reg$mdl_key %in% redo_keys_m & !in_cat(merged_reg$key)]
+    if (length(rm_f <- rm_f[file_exists(rm_f)])) file_delete(rm_f)
+  }
+  todo <- merged_reg |> filter(!in_cat(key), !file_exists(file))
   merged_map <- tibble(mdl_key = mkeys, mmid = seq_along(mkeys))
-  if (length(mkeys) && (!dir_exists(mparts) || redo_mcog)) {
-    if (dir_exists(mparts)) dir_delete(mparts)
-    dbExecute(con, "SET partitioned_write_max_open_files=400")
-    dbWriteTable(con, "merged_map", merged_map, overwrite = TRUE)
-    msens::copy_atlas_parquet(con, glue("
-      SELECT mm.mmid, g.cell_id, g.val
-      FROM read_parquet('{dir_gmerged}/**/*.parquet') g JOIN merged_map mm ON g.mdl_key = mm.mdl_key"),
-      mparts, partition_by = "mmid")
-    log_info("_merged_parts: {length(dir_ls(mparts))} partitions")
-  } else if (length(redo_keys) && dir_exists(mparts)) {
-    # mmid is POSITIONAL in the served set (see the am `mid` lesson above): refreshing a few
-    # partitions in place is only valid while the set -- and so every position -- is unchanged
-    stopifnot("_merged_parts partition count != served merged taxa: the map moved, REDO_MERGED_COG=1" =
-                length(dir_ls(mparts)) == nrow(merged_map))
-    rk <- merged_map[merged_map$mdl_key %in% redo_keys, ]
-    for (id in rk$mmid) { pd <- glue("{mparts}/mmid={id}"); if (dir_exists(pd)) dir_delete(pd) }
-    dbWriteTable(con, "merged_map_redo", rk, overwrite = TRUE)
-    msens::copy_atlas_parquet(con, glue("
-      SELECT mm.mmid, g.cell_id, g.val
-      FROM read_parquet('{dir_gmerged}/**/*.parquet') g JOIN merged_map_redo mm ON g.mdl_key = mm.mdl_key"),
-      mparts, partition_by = "mmid")
-    log_info("REDO_MERGED_COG_KEYS: re-partitioned {nrow(rk)} taxa from the global surface")
+  if (nrow(todo)) {
+    if (!dir_exists(mparts) || redo_mcog || length(dir_ls(mparts)) != nrow(merged_map)) {
+      # mmid is POSITIONAL in the served set (the am `mid` lesson): rebuild the partitions whenever the set moved
+      if (dir_exists(mparts)) dir_delete(mparts)
+      dbExecute(con, "SET partitioned_write_max_open_files=400")
+      dbWriteTable(con, "merged_map", merged_map, overwrite = TRUE)
+      copy_atlas_parquet(con, glue("
+        SELECT mm.mmid, g.cell_id, g.val
+        FROM read_parquet('{dir_gmerged}/**/*.parquet') g JOIN merged_map mm ON g.mdl_key = mm.mdl_key"),
+        mparts, partition_by = "mmid")
+      log_info("_merged_parts: {length(dir_ls(mparts))} partitions")
+    }
+    todo <- todo |> inner_join(merged_map, by = "mdl_key")
+    todo$sql <- sprintf("SELECT cell_id, max(val) AS val FROM read_parquet('%s/mmid=%d/*.parquet') GROUP BY 1", mparts, todo$mmid)
+    todo$out <- todo$file
+    log_info("merged COGs: {nrow(merged_reg)} served, painting {nrow(todo)}")
+    paint_rows(todo, grid)
   }
   dbDisconnect(con, shutdown = TRUE)
-
-  grid <- grid_spec(rast(cellid_tif))
-  todo <- merged_map[!file_exists(glue("{dir_mcog}/{safe_key(merged_map$mdl_key)}.tif")), ]
-  log_info("merged COGs: {nrow(merged_map)} target, {nrow(todo)} to build")
-  build_merged <- function(rows) {
-    suppressMessages({library(DBI); library(duckdb); library(terra)})
-    con <- dbConnect(duckdb()); on.exit(dbDisconnect(con, shutdown = TRUE))
-    for (i in seq_len(nrow(rows))) {
-      k <- rows$mdl_key[i]; f <- sprintf("%s/%s.tif", dir_mcog, safe_key(k))
-      if (file.exists(f)) next
-      pf <- sprintf("%s/mmid=%d", mparts, rows$mmid[i]); if (!dir.exists(pf)) next
-      d <- dbGetQuery(con, sprintf("SELECT cell_id, val FROM read_parquet('%s/*.parquet')", pf))
-      if (nrow(d)) msens::publish_cog(d$cell_id, d$val, f, grid)
-    }
-    nrow(rows)
-  }
-  if (nrow(todo)) {
-    plan(multisession, workers = n_workers)
-    future_map(split(todo, (seq_len(nrow(todo)) - 1) %% n_workers), build_merged,
-               .options = furrr_options(globals = c("mparts","dir_mcog","grid","safe_key"),
-                                        packages = c("msens"), seed = TRUE))
-    plan(sequential)
-  }
-  built <- glue("{dir_mcog}/{safe_key(merged_map$mdl_key)}.tif")
-  merged_reg <- tibble(
-    mdl_key = merged_map$mdl_key, ds_key = "ms_merge", asset_type = "cog", representation = "model",
-    asset_url = glue("{s3_http}/native/merged/{safe_key(merged_map$mdl_key)}.tif"),
-    rescale_min = 1L, rescale_max = 100L, colormap = "spectral_r")[file_exists(built), ]
-  log_info("merged model COGs on disk: {nrow(merged_reg)} / {nrow(merged_map)}")
+  merged_reg <- merged_reg |> filter(in_cat(key) | file_exists(file))
+  add_plan(merged_reg, "cog_merged")
 }
 ```
-
-## Native store: stage + register the ORIGINAL surfaces by content hash
-
-Code only here; nothing is uploaded until the sync chunk runs with `do_s3`. Rewrites the `native`
-rows' `asset_url` to the store URL (`msens::native_url()`), so the registry below and every later
-release reference the unversioned objects.
 
 ```{r}
-#| label: native-store
+#| label: merged-suit
 
-store_rows <- bind_rows(
-  if (exists("am_native_reg") && nrow(am_native_reg)) am_native_reg |> mutate(type = "cog"),
-  if (nrow(pmt_reg)) pmt_reg |> mutate(type = "pmtiles"))
-native_store_todo <- tibble()
-if (nrow(store_rows)) {
-  stopifnot("every native object needs a hash" = !anyNA(store_rows$hash))
-  store_rows <- store_rows |> mutate(
-    asset_url = mapply(msens::native_url, ds_key, hash, type, USE.NAMES = FALSE))
-  have <- if (do_s3) msens::native_store_index() else character()
-  native_store_todo <- store_rows |> filter(!hash %in% have) |> distinct(ds_key, hash, type, .keep_all = TRUE)
-  log_info("native store: {nrow(store_rows)} originals, {nrow(native_store_todo)} new object(s) to upload, ",
-           "{nrow(store_rows) - nrow(native_store_todo)} already present (same content -> same key)")
-  if (exists("am_native_reg") && nrow(am_native_reg))
-    am_native_reg <- store_rows |> filter(type == "cog") |> select(-type, -hash, -file)
-  if (nrow(pmt_reg)) pmt_reg <- store_rows |> filter(type == "pmtiles") |> select(-type, -hash, -file)
+# suitability-only taxa: 2+ AquaMaps models, or any AquaX model -- absent from dist_merged_global (range-derived
+# surfaces only). Their whole-range merged surface is max over the surviving models per cell of the
+# post-supersession merge input (`mc_parts`, partitioned by mkey_id), rounded as the writer rounds.
+mm_reg <- tibble()
+dir_parts <- glue("{dir_atlas}/mc_parts")
+if (do_merged_cog && dir_exists(dir_parts)) {
+  con <- new_con(); dbExecute(con, glue("ATTACH '{merge_db}' AS mrg (READ_ONLY)"))
+  suitonly <- dbGetQuery(con, "
+    SELECT t.ms_merge_key, mm.mkey_id, count(*) AS n_models,
+           count(*) FILTER (WHERE split_part(tm.mdl_key,'|',1) = 'ax') AS n_ax
+    FROM mrg.taxon t JOIN mrg.taxon_model tm USING (ms_merge_key) JOIN mrg.mkey_map mm USING (ms_merge_key)
+    WHERE t.is_marine AND t.ms_merge_key IS NOT NULL AND t.sp_cat NOT IN ('reptile','amphibian')
+    GROUP BY 1, 2
+    HAVING bool_and(split_part(tm.mdl_key,'|',1) IN ('am', 'ax'))
+       AND NOT (count(*) = 1 AND max(split_part(tm.mdl_key,'|',1)) = 'am')") |> as_tibble()
+  suitonly <- suitonly |> filter(!ms_merge_key %in% merged_reg$mdl_key) |> arrange(ms_merge_key)
+  if (test_n > 0) suitonly <- head(suitonly, test_n)
+  log_info("suitability-only taxa needing a painted merged COG: {nrow(suitonly)} ({sum(suitonly$n_ax > 0)} with AquaX, {sum(suitonly$n_ax == 0)} multi-AquaMaps)")
+  if (nrow(suitonly)) {
+    h <- cached_keys("cog_merged_suit", dir_parts, {
+      dbWriteTable(con, "suit_k", suitonly |> select(ms_merge_key, mkey_id), overwrite = TRUE)
+      hh <- pixel_hashes(con, glue("(SELECT k.ms_merge_key AS mdl_key, p.cell_id, p.val
+                                    FROM read_parquet('{dir_parts}/mkey_id=*/*.parquet', hive_partitioning = true) p
+                                    JOIN suit_k k USING (mkey_id)) s"), "mdl_key", quant = "round_trunc", dedup = "max")
+      hh
+    }) |> filter(mdl_key %in% suitonly$ms_merge_key)
+    mm_reg <- asset_store_key("cog_model", "global05", h$content_hash) |> mutate(mdl_key = h$mdl_key, ds_key = "ms_merge")
+    mm_reg$file <- store_path(mm_reg$key)
+    todo <- mm_reg |> filter(!in_cat(key), !file_exists(file)) |> inner_join(suitonly |> select(mdl_key = ms_merge_key, mkey_id), by = "mdl_key")
+    if (nrow(todo)) {
+      todo$sql <- sprintf("SELECT cell_id, max(val) AS val FROM read_parquet('%s/mkey_id=%d/*.parquet') GROUP BY 1", dir_parts, todo$mkey_id)
+      todo$out <- todo$file
+      log_info("suitability-only merged COGs: painting {nrow(todo)}")
+      paint_rows(todo, grid, round_first = TRUE)
+    }
+    mm_reg <- mm_reg |> filter(in_cat(key) | file_exists(file))
+    add_plan(mm_reg, "cog_merged_suit")
+  }
+  dbDisconnect(con, shutdown = TRUE)
 }
 ```
 
-## native_asset registry → sdm.duckdb
+## Verify every new COG against its key
+
+The key promises the pixels; before anything leaves this machine, each newly staged COG is decoded and
+hashed the same way (`native_raster_rows()` + `content_hashes_df()`), and the result must equal the
+key's payload hash. A mismatch is a bug in a painter, never something to upload.
+
+```{r}
+#| label: verify
+
+plan_df <- bind_rows(plan)
+stopifnot("nothing to publish: every class was skipped" = nrow(plan_df) > 0)
+if (!"representation" %in% names(plan_df)) plan_df$representation <- NA_character_
+new_cogs <- plan_df |> filter(!catalogued, endsWith(key, ".tif")) |> distinct(key, .keep_all = TRUE)
+if (nrow(new_cogs) && do_verify) {
+  grids <- list(cog_model = grid,
+                native_am = grid_spec(rast(nrows = 360, ncols = 720, xmin = -180, xmax = 180, ymin = -90, ymax = 90, crs = "EPSG:4326")),
+                native_ax = grid)
+  fam_of <- function(key) ifelse(startsWith(key, "cog/"), "cog_model", ifelse(startsWith(key, "native/am/"), "native_am", "native_ax"))
+  new_cogs$family <- fam_of(new_cogs$key)
+  dec <- function(rows, grids) {
+    suppressMessages({library(terra); library(msens)})
+    rows$decoded <- vapply(seq_len(nrow(rows)), function(i) {
+      r <- msens::native_raster_rows(terra::rast(rows$file[i]), grids[[rows$family[i]]])
+      if (!nrow(r)) return(NA_character_)
+      msens::content_hashes_df(cbind(mdl_key = "x", r))$content_hash
+    }, "")
+    rows[c("key", "decoded")]
+  }
+  plan(multisession, workers = n_workers)
+  got <- bind_rows(future_map(split(new_cogs, (seq_len(nrow(new_cogs)) - 1) %% max(1, min(n_workers, nrow(new_cogs)))), dec, grids = grids,
+                              .options = furrr_options(packages = c("msens", "terra"), seed = TRUE)))
+  plan(sequential)
+  new_cogs <- new_cogs |> left_join(got, by = "key")                       # by key, never by position: the split interleaves rows
+  bad <- new_cogs |> filter(is.na(decoded) | decoded != content_hash)
+  if (nrow(bad)) {
+    print(bad |> select(class, mdl_key, key, content_hash, decoded) |> head(20))
+    stop(sprintf("%d of %d new COGs do not decode to the pixels their key promises — not uploading", nrow(bad), nrow(new_cogs)), call. = FALSE)
+  }
+  log_info("verified {nrow(new_cogs)} new COGs: decoded pixels == key")
+} else if (nrow(new_cogs)) log_warn("NATIVE_NO_VERIFY: {nrow(new_cogs)} new COGs uploaded without the decode check")
+```
+
+## Pointer rows: bbox, taxon key, aliases
 
 ```{r}
 #| label: registry
 
-# per-model asset rows across representations:
-#   original/native  = vector PMTiles (source polygons) + am native 0.5° COGs
-#   model/interpolated = am 0.05° resampled COGs + vector 0.05° gridded COGs + merged whole-range COGs
-# each keyed on the STABLE mdl_key; the `representation` column distinguishes them. Merged rows carry
-# mdl_key == ms_merge_key, so they skip the input→taxon join and are bound in directly below.
-pmt_model_rows <- if (nrow(pmt_reg)) pmt_reg else tibble()
-vec_cog_rows   <- if (exists("vec_cog_reg") && nrow(vec_cog_reg)) vec_cog_reg else tibble()
+rep_of <- c(cog_am = "model", native_am = "native", cog_vec = "model", cog_dps_nmfs = "model", cog_merged = "model", cog_merged_suit = "model")
+rows <- plan_df |> mutate(
+  asset_type     = if_else(endsWith(key, ".pmtiles"), "pmtiles", "cog"),
+  representation = coalesce(representation, if_else(startsWith(class, "pmtiles_"), "native", unname(rep_of[class]))),
+  asset_url      = store_url(key),
+  content_hash   = hash,                                                  # the key's 16 hex (what every published pointer table carries)
+  rescale_min    = if_else(ds_key == "ax" & representation == "native", 0L, 1L),
+  rescale_max    = if_else(ds_key == "ax" & representation == "native", 1000L, 100L),
+  colormap       = "spectral_r",
+  source_layer   = if_else(asset_type == "pmtiles", ds_key, NA_character_),
+  source_key     = if_else(asset_type == "pmtiles", mdl_key, NA_character_))   # the key the tile's FEATURES carry
+stopifnot(!anyNA(rows$representation))
 
-# AquaX (v9, `ax`): the COGs are built and uploaded by ingest_aquax.qmd (the native IS the model
-# grid, so there is nothing to repaint here) and recorded in model_ax.csv with their bbox. This
-# chunk only REGISTERS them, in both representations, mirroring am/am_native so the species
-# app's Original/Interpolated toggle needs no change. Scoped to the served set like every other
-# class. Rows are skipped (not the whole class) when a model's COG url is missing.
-ax_csv <- glue("{dir_atlas}/dist/model_ax.csv")
-ax_reg <- if (file_exists(ax_csv) && length(served_by_ds[["ax"]])) {
-  ax_m <- readr::read_csv(ax_csv, show_col_types = FALSE, col_types = readr::cols(.default = "c")) |>
-    filter(mdl_key %in% served_by_ds[["ax"]]) |>
-    mutate(across(any_of(c("xmin","xmax","ymin","ymax")), as.numeric))
-  bind_rows(
-    ax_m |> filter(!is.na(cog_url)) |>
-      transmute(mdl_key, ds_key = "ax", asset_type = "cog", representation = "model",
-                asset_url = cog_url, rescale_min = 1L, rescale_max = 100L, colormap = "spectral_r",
-                xmin, xmax, ymin, ymax),
-    ax_m |> filter(!is.na(cog_native_url)) |>
-      transmute(mdl_key, ds_key = "ax", asset_type = "cog", representation = "native",
-                asset_url = cog_native_url, rescale_min = 0L, rescale_max = 1000L, colormap = "spectral_r",
-                xmin, xmax, ymin, ymax))
-} else tibble()
-if (nrow(ax_reg)) log_info("ax COG registry rows: {nrow(ax_reg)} ({n_distinct(ax_reg$mdl_key)} models, ",
-                           "{sum(ax_reg$representation=='model')} model / {sum(ax_reg$representation=='native')} native)")
-if (length(served_by_ds[["ax"]]) && nrow(ax_reg) < 2 * length(served_by_ds[["ax"]]))
-  log_warn("ax: {length(served_by_ds[['ax']])} served models but only {nrow(ax_reg)} registry rows — run ingest_aquax with AX_COG=1 AX_COG_S3=1")
-
-dps_rows <- if (exists("dps_reg") && nrow(dps_reg)) dps_reg else tibble()   # NMFS DPS per-cell ER COGs
-asset_info <- bind_rows(am_reg, am_native_reg, pmt_model_rows, vec_cog_rows, ax_reg, dps_rows) |>
-  mutate(across(everything(), ~ if (is.factor(.)) as.character(.) else .))
-
-# per-model geographic bbox (cell_id row/col arithmetic on the global grid) so the app fits
-# to each input's actual extent — NOT the whole world (lands on the globe antipode). am from
-# the compact _am_parts (mid->mdl_key); vector ranges from their small dist partitions.
+# per-model geographic bbox so the app fits to each input's extent, not the world. am from _am_parts (mid ->
+# mdl_key), vector/dps/ax from their dist partitions, merged from _merged_parts, suit-only from the painted raster
 bbox_cols <- c("xmin","xmax","ymin","ymax")
-bb_am <- tibble()
-if (nrow(am_reg) && exists("am_parts") && dir_exists(am_parts)) {
-  con <- dbConnect(duckdb(), config = list(threads = "6"))
-  bb_am <- dbGetQuery(con, glue("
-    WITH rc AS (SELECT mid, (cell_id-1) % 7200 AS col, (cell_id-1) // 7200 AS row
-                FROM read_parquet('{am_parts}/**/*.parquet', hive_partitioning=true))
-    SELECT mid,
-      -180 + min(col)*0.05       AS xmin, -180 + (max(col)+1)*0.05 AS xmax,
-       90 - (max(row)+1)*0.05    AS ymin,   90 - min(row)*0.05     AS ymax
-    FROM rc GROUP BY mid")) |>
-    dplyr::left_join(am_map, by = "mid") |> dplyr::select(-mid)
-  dbDisconnect(con, shutdown = TRUE)
-}
-bb_vec <- tibble()
-vec_ds <- unique(c(pmt_model_rows$ds_key, dps_rows$ds_key))     # the pmtiles datasets + the gridded dps surfaces
+bb_sql <- function(src, by) glue("
+  WITH rc AS (SELECT {by}, (cell_id-1) % 7200 AS col, (cell_id-1) // 7200 AS row FROM {src})
+  SELECT {by}, -180 + min(col)*0.05 AS xmin, -180 + (max(col)+1)*0.05 AS xmax,
+         90 - (max(row)+1)*0.05 AS ymin, 90 - min(row)*0.05 AS ymax FROM rc GROUP BY {by}")
+con <- new_con()
+bb <- list()
+am_from_parts <- nrow(am_reg) && exists("am_map_ok") && isTRUE(am_map_ok)
+if (am_from_parts)
+  bb$am <- dbGetQuery(con, bb_sql(glue("read_parquet('{am_parts}/**/*.parquet', hive_partitioning=true)"), "mid")) |>
+    inner_join(am_map, by = "mid") |> select(-mid)
+vec_ds <- unique(c(pmt_reg$ds_key, dps_reg$ds_key, ax_reg$ds_key, if (nrow(am_reg) && !am_from_parts) "am"))
 if (length(vec_ds)) {
-  con   <- dbConnect(duckdb(), config = list(threads = "6"))
   globs <- paste0("'", dir_atlas, "/dist/dataset=", vec_ds, "/*.parquet'", collapse = ", ")
-  dbWriteTable(con, "vk", tibble(mdl_key = unique(c(pmt_model_rows$mdl_key, dps_rows$mdl_key))), overwrite = TRUE)
-  bb_vec <- dbGetQuery(con, glue("
-    WITH rc AS (SELECT p.mdl_key, (p.cell_id-1) % 7200 AS col, (p.cell_id-1) // 7200 AS row
-                FROM read_parquet([{globs}]) p SEMI JOIN vk USING(mdl_key))
-    SELECT mdl_key,
-      -180 + min(col)*0.05       AS xmin, -180 + (max(col)+1)*0.05 AS xmax,
-       90 - (max(row)+1)*0.05    AS ymin,   90 - min(row)*0.05     AS ymax
-    FROM rc GROUP BY mdl_key"))
-  dbDisconnect(con, shutdown = TRUE)
+  dbWriteTable(con, "vk", tibble(mdl_key = unique(c(pmt_reg$mdl_key, dps_reg$mdl_key, ax_reg$mdl_key, if (!am_from_parts) am_reg$mdl_key))), overwrite = TRUE)
+  bb$vec <- dbGetQuery(con, bb_sql(glue("(SELECT p.mdl_key, p.cell_id FROM read_parquet([{globs}]) p SEMI JOIN vk USING(mdl_key))"), "mdl_key"))
 }
-bb_all <- bind_rows(bb_am, bb_vec)
-if (nrow(bb_all) && "mdl_key" %in% names(asset_info)) {
-  # ax rows already carry their bbox (from model_ax.csv); keep it where the join has none
-  asset_info <- asset_info |> left_join(bb_all, by = "mdl_key", suffix = c("", ".j"))
-  for (b in bbox_cols) if (paste0(b, ".j") %in% names(asset_info)) {
-    asset_info[[b]] <- if (b %in% names(asset_info)) coalesce(asset_info[[b]], asset_info[[paste0(b, ".j")]]) else asset_info[[paste0(b, ".j")]]
-    asset_info[[paste0(b, ".j")]] <- NULL
-  }
+if (nrow(merged_reg) && dir_exists(mparts))
+  bb$merged <- dbGetQuery(con, bb_sql(glue("read_parquet('{mparts}/**/*.parquet', hive_partitioning = true)"), "mmid")) |>
+    inner_join(merged_map, by = "mmid") |> select(-mmid)
+if (nrow(mm_reg)) {                                                        # the painted window = the partition's cells (publish_cog crops to them)
+  dbWriteTable(con, "suit_bb", suitonly |> filter(ms_merge_key %in% mm_reg$mdl_key) |> select(mdl_key = ms_merge_key, mkey_id), overwrite = TRUE)
+  bb$mm <- dbGetQuery(con, bb_sql(glue("(SELECT k.mdl_key, p.cell_id FROM read_parquet('{dir_parts}/mkey_id=*/*.parquet', hive_partitioning = true) p JOIN suit_bb k USING (mkey_id))"), "mdl_key"))
 }
+dbDisconnect(con, shutdown = TRUE)
+bb_all <- bind_rows(bb) |> distinct(mdl_key, .keep_all = TRUE)
+rows <- rows |> left_join(bb_all, by = "mdl_key")
+# an am-native (0.5 deg) row shares its model's bbox; same for ax native vs model
+log_info("bbox: {sum(!is.na(rows$xmin))} of {nrow(rows)} pointer rows framed")
 
-# attach ms_merge_key (the merged taxon key) so the species app can join a taxon
-# directly to its input surfaces. A raw model may feed >1 merged taxon -> one row each.
-con <- dbConnect(duckdb(sdm_db))
+# attach ms_merge_key (the merged taxon key): a raw model may feed >1 merged taxon -> one row each
+con <- dbConnect(duckdb(sdm_db, read_only = TRUE))
 dbExecute(con, glue("ATTACH '{merge_db}' AS m (READ_ONLY)"))
-# same scope as `served` above — an asset built for a taxon must be able to find that taxon
 tm <- dbGetQuery(con, "SELECT DISTINCT tm.mdl_key, tm.ms_merge_key
   FROM m.taxon_model tm JOIN m.taxon t USING(ms_merge_key)
-  WHERE (t.is_valid_usa OR t.is_valid_global) AND t.is_marine
-    AND t.sp_cat NOT IN ('reptile','amphibian')")
-dbExecute(con, "DETACH m")
+  WHERE (t.is_valid_usa OR t.is_valid_global) AND t.is_marine AND t.sp_cat NOT IN ('reptile','amphibian')")
+inputs <- rows |> filter(ds_key != "ms_merge") |> inner_join(tm, by = "mdl_key", relationship = "many-to-many")
+merged <- rows |> filter(ds_key == "ms_merge") |> mutate(ms_merge_key = mdl_key)
 
-native_asset <- if (nrow(asset_info) && "mdl_key" %in% names(asset_info)) {
-  asset_info |>
-    inner_join(tm, by = "mdl_key", relationship = "many-to-many") |>
-    relocate(ms_merge_key)
-} else tibble()   # no input-model rows this run (e.g. am+pmtiles skipped) — merged rows bound below
-
-# merged whole-range COGs: mdl_key IS the taxon key -> skip the input->taxon join, bind directly
-# (built for ALL valid marine taxa incl non-US, so the app can show a non-US species' global range)
-if (exists("merged_reg") && nrow(merged_reg)) {
-  bb_merged <- tibble()
-  if (exists("mparts") && dir_exists(mparts)) {
-    conb <- dbConnect(duckdb(), config = list(threads = "6"))
-    bb_merged <- dbGetQuery(conb, glue("
-      WITH rc AS (SELECT mmid, (cell_id-1) % 7200 AS col, (cell_id-1) // 7200 AS row
-                  FROM read_parquet('{mparts}/**/*.parquet', hive_partitioning = true))
-      SELECT mmid, -180 + min(col)*0.05 AS xmin, -180 + (max(col)+1)*0.05 AS xmax,
-                    90 - (max(row)+1)*0.05 AS ymin, 90 - min(row)*0.05 AS ymax
-      FROM rc GROUP BY mmid")) |> left_join(merged_map, by = "mmid") |> select(-mmid)
-    dbDisconnect(conb, shutdown = TRUE)
-  }
-  merged_rows <- merged_reg |> mutate(ms_merge_key = mdl_key)
-  if (nrow(bb_merged)) merged_rows <- left_join(merged_rows, bb_merged, by = "mdl_key")
-  native_asset <- bind_rows(native_asset, relocate(merged_rows, ms_merge_key))
-}
-
-# am-only taxa: the merged surface IS the AquaMaps surface ----
-# For a taxon whose only source is AquaMaps there is nothing to merge, so the
-# pipeline never writes it to dist_merged_global and it gets no merged COG --
-# 19,699 served taxa, for which the species app fell back to the custom SQL tile
-# factory. Verified on a 150-taxon sample: the merged surface is byte-identical
-# to the am surface (same count + bit_xor over (cell_id, val)), so the existing
-# native/am COG already IS their merged raster.
-#
-# Alias rather than duplicate: same asset_url, same bbox, zero new bytes.
-have_merged <- native_asset$ms_merge_key[native_asset$ds_key == "ms_merge"]
-dbExecute(con, glue("ATTACH IF NOT EXISTS '{merge_db}' AS mrg (READ_ONLY)"))
-amonly_keys <- dbGetQuery(con, "
+# am-only taxa: the merged surface IS the AquaMaps surface (verified byte-identical on a 150-taxon sample) ->
+# alias the model object: same asset_url, same bbox, zero new bytes
+have_merged <- merged$ms_merge_key
+amonly <- dbGetQuery(con, "
   SELECT ms_merge_key, max(mdl_key) AS am_key FROM (
-    SELECT t.ms_merge_key, tm.mdl_key
-    FROM mrg.taxon t JOIN mrg.taxon_model tm USING (ms_merge_key)
-    WHERE t.is_marine AND t.ms_merge_key IS NOT NULL
-      AND t.sp_cat NOT IN ('reptile','amphibian'))
+    SELECT t.ms_merge_key, tm.mdl_key FROM m.taxon t JOIN m.taxon_model tm USING (ms_merge_key)
+    WHERE t.is_marine AND t.ms_merge_key IS NOT NULL AND t.sp_cat NOT IN ('reptile','amphibian'))
   GROUP BY 1 HAVING count(*) = 1 AND max(split_part(mdl_key,'|',1)) = 'am'")
-
-am_src <- native_asset |>
-  filter(ds_key == "am", representation == "model", asset_type == "cog") |>
-  select(am_key = mdl_key, asset_url, any_of(bbox_cols), rescale_min, rescale_max, colormap) |>
-  distinct(am_key, .keep_all = TRUE)
-
-alias_rows <- amonly_keys |>
-  filter(!ms_merge_key %in% have_merged) |>
-  inner_join(am_src, by = "am_key") |>
-  mutate(mdl_key = ms_merge_key, ds_key = "ms_merge",
-         asset_type = "cog", representation = "model") |>
-  select(-am_key)
-
-if (nrow(alias_rows)) {
-  native_asset <- bind_rows(native_asset, relocate(alias_rows, ms_merge_key))
-  log_info("am-only merged aliases: {nrow(alias_rows)} taxa now have a merged COG (0 new objects)")
-}
-
-# suitability-only taxa that CANNOT be aliased: more than one model, or any AquaX model.
-#
-# The alias above is a pass-through, and that is only sound when a taxon has exactly one
-# contributing model and it is AquaMaps. Two classes fall outside it, and both are absent from
-# dist_merged_global (which holds RANGE-derived surfaces only):
-#   - am-only taxa with 2+ AquaMaps models (192 in v8): the merged surface is a max across them;
-#   - from v9, taxa with an AquaX model and no range (~8,800): inside the AquaX mask AquaMaps
-#     was superseded, so their whole-range merged surface is AquaMaps OUTSIDE the mask plus
-#     AquaX inside it -- a raster that exists nowhere else. Without this chunk the alias count
-#     fell 14,799 -> 5,957 and those taxa had NO merged COG (the app draws nothing).
-#
-# The post-supersession merge INPUT (`mc_parts`, partitioned by mkey_id) is exactly that
-# surface, so paint one COG per taxon from its partition: max over the surviving models per cell.
-dir_parts <- glue("{dir_atlas}/mc_parts")
-suit_ds   <- c("am", "ax")
-suit_sql  <- paste(sprintf("'%s'", suit_ds), collapse = ", ")
-suitonly <- dbGetQuery(con, glue("
-  SELECT t.ms_merge_key, mm.mkey_id, count(*) AS n_models,
-         count(*) FILTER (WHERE split_part(tm.mdl_key,'|',1) = 'ax') AS n_ax
-  FROM mrg.taxon t JOIN mrg.taxon_model tm USING (ms_merge_key) JOIN mrg.mkey_map mm USING (ms_merge_key)
-  WHERE t.is_marine AND t.ms_merge_key IS NOT NULL AND t.sp_cat NOT IN ('reptile','amphibian')
-  GROUP BY 1, 2
-  HAVING bool_and(split_part(tm.mdl_key,'|',1) IN ({suit_sql}))
-     AND NOT (count(*) = 1 AND max(split_part(tm.mdl_key,'|',1)) = 'am')"))
-suitonly <- suitonly |> filter(!ms_merge_key %in% native_asset$ms_merge_key[
-  native_asset$ds_key == "ms_merge" & native_asset$asset_type == "cog"])
-log_info("suitability-only taxa needing a painted merged COG: {nrow(suitonly)} ({sum(suitonly$n_ax > 0)} with AquaX, {sum(suitonly$n_ax == 0)} multi-AquaMaps)")
-
-if (nrow(suitonly)) {
-  stopifnot("mc_parts (the partitioned merge input) is missing — run merge_models first" = dir_exists(dir_parts))
-  dir_mm <- glue("{dir_native}/merged"); dir_create(dir_mm)
-  grid_mm <- grid_spec(rast(cellid_tif))
-  suitonly <- suitonly |> mutate(out = as.character(glue("{dir_mm}/{safe_key(ms_merge_key)}.tif")))
-  todo_mm <- suitonly |> filter(!file_exists(out))
-  log_info("suitability-only merged COGs: {nrow(suitonly)} target, {nrow(todo_mm)} to build")
-  paint_batch <- function(rows, dir_parts, grid) {
-    suppressMessages({library(DBI); library(duckdb); library(terra)})
-    cx <- dbConnect(duckdb()); on.exit(dbDisconnect(cx, shutdown = TRUE))
-    for (i in seq_len(nrow(rows))) {
-      d <- dbGetQuery(cx, sprintf("SELECT cell_id, max(val) AS val FROM read_parquet('%s/mkey_id=%d/*.parquet') GROUP BY 1",
-                                  dir_parts, rows$mkey_id[i]))
-      if (nrow(d)) msens::publish_cog(d$cell_id, round(d$val), rows$out[i], grid)
-    }
-    nrow(rows)
-  }
-  if (nrow(todo_mm)) {
-    plan(multisession, workers = n_workers)
-    future_map(split(todo_mm, (seq_len(nrow(todo_mm)) - 1) %% n_workers), paint_batch,
-               dir_parts = dir_parts, grid = grid_mm,
-               .options = furrr_options(seed = TRUE, packages = c("msens", "terra", "DBI", "duckdb")))
-    plan(sequential)
-  }
-  built <- suitonly |> filter(file_exists(out))
-  # bbox off the PUBLISHED raster, so the registry describes the artifact a client will fetch
-  bb <- do.call(rbind, lapply(built$out, function(f) { e <- terra::ext(terra::rast(f)); c(e$xmin, e$xmax, e$ymin, e$ymax) }))
-  mm_rows <- tibble(
-    ms_merge_key = built$ms_merge_key, mdl_key = built$ms_merge_key, ds_key = "ms_merge",
-    asset_type = "cog", representation = "model",
-    asset_url = glue("{s3_http}/native/merged/{safe_key(built$ms_merge_key)}.tif"),
-    xmin = bb[, 1], xmax = bb[, 2], ymin = bb[, 3], ymax = bb[, 4],
-    rescale_min = 1L, rescale_max = 100L, colormap = "spectral_r")
-  native_asset <- bind_rows(native_asset, mm_rows)
-  log_info("suitability-only merged COGs registered: {nrow(mm_rows)} taxa ({nrow(todo_mm)} newly built)")
-  # merged_reg drives the S3 sync of native/merged below; make sure these ride along
-  merged_reg <- if (exists("merged_reg") && nrow(merged_reg)) bind_rows(merged_reg, mm_rows |> select(any_of(names(merged_reg)))) else mm_rows
-}
-
-# the registry is CUMULATIVE: a run may not delete an asset class it did not rebuild ----
-#
-# Everything above assembles `native_asset` from what THIS run built, and the write below is
-# an overwrite — so a run that skips a build chunk (NATIVE_SKIP_PMTILES, or an opt-in class
-# like PUBLISH_MERGED_COG left off) used to publish a registry missing every class it never
-# touched, while those assets sat published and unreferenced. That is how all 2,234 vector-range
-# PMTiles rows vanished: the species app then showed AquaMaps as each taxon's only input, and the
-# content-hash checkpoint below faithfully fingerprinted the truncated table (n_pmtiles_native: 0).
-#
-# msens::registry_merge() carries forward any class this run produced no rows for and ERRORS on a
-# class that came back smaller (a partial build must not publish as a complete one). The rule lives
-# in the package so testthat asserts it — see msens/tests/testthat/test-publish.R.
-prior_asset  <- if (dbExistsTable(con, "native_asset")) dbReadTable(con, "native_asset") else NULL
-native_asset <- msens::registry_merge(
-  native_asset, prior_asset,
-  allow_shrink = nzchar(Sys.getenv("NATIVE_REGISTRY_REBUILD")))
-carried <- attr(native_asset, "carried")
-if (length(carried))
-  log_warn("registry: carried forward {length(carried)} class(es) not built this run: {paste(carried, collapse='; ')}")
-
-# publish gate (libs/url_gate.R): the registry rows are final -- none may point a bulk file
-# (.tif/.pmtiles/...) at a VM host; bulk bytes come from the object store. URL_AUDIT_ALLOW = escape hatch
-source(here("libs/url_gate.R"))
-url_gate(native_asset$asset_url, glue("{ver} native_asset registry (asset_url)"))
-
-dbWriteTable(con, "native_asset", native_asset, overwrite = TRUE)
-smry <- dbGetQuery(con, "SELECT representation, asset_type, count(*) n_rows,
-  count(DISTINCT mdl_key) n_models, count(DISTINCT ms_merge_key) n_taxa, count(DISTINCT ds_key) n_ds
-  FROM native_asset GROUP BY 1, 2 ORDER BY 1, 2")
+alias_rows <- amonly |> filter(!ms_merge_key %in% have_merged) |>
+  inner_join(rows |> filter(ds_key == "am", representation == "model") |> rename(am_key = mdl_key), by = "am_key") |>
+  mutate(mdl_key = ms_merge_key, ds_key = "ms_merge") |> select(-am_key)
+if (nrow(alias_rows)) log_info("am-only merged aliases: {nrow(alias_rows)} taxa point at their AquaMaps model object (0 new objects)")
 dbDisconnect(con, shutdown = TRUE)
-msens::report_table(smry, caption = "native_asset registry by representation × asset type")
+
+native_asset <- bind_rows(inputs, merged, alias_rows) |>
+  select(any_of(msens:::.NATIVE_ASSET_COLS), key, catalogued, class) |>
+  relocate(ms_merge_key)
+for (cc in setdiff(msens:::.NATIVE_ASSET_COLS, names(native_asset))) native_asset[[cc]] <- NA
+native_asset <- native_asset |> relocate(all_of(msens:::.NATIVE_ASSET_COLS))
+
+# the registry is CUMULATIVE: a run may not delete a class it did not rebuild. The PUBLISHED pointer table
+# is the prior (what readers see today); the local sdm.duckdb copy only when the release is not yet published.
+pub_na <- tryCatch(as_tibble(read_parquet(fetch(glue("{base}/{ver}/tables/native_asset.parquet")))), error = function(e) NULL)
+prior_asset <- if (!is.null(pub_na)) { log_info("prior = published {ver}/tables/native_asset.parquet ({nrow(pub_na)} rows)"); pub_na } else {
+  c0 <- dbConnect(duckdb(sdm_db, read_only = TRUE))
+  p0 <- if (dbExistsTable(c0, "native_asset")) { log_info("prior = local sdm.duckdb native_asset (release not published)"); dbReadTable(c0, "native_asset") } else NULL
+  dbDisconnect(c0, shutdown = TRUE); p0
+}
+if (!is.null(prior_asset) && "mdl_seq" %in% names(prior_asset) && !"mdl_key" %in% names(prior_asset)) prior_asset <- NULL   # a legacy-shaped table is not a prior for a v8+ build
+native_asset <- registry_merge(native_asset |> select(all_of(msens:::.NATIVE_ASSET_COLS)), prior_asset,
+                               allow_shrink = nzchar(Sys.getenv("NATIVE_REGISTRY_REBUILD")) || test_n > 0)   # a test subset is never written
+carried <- attr(native_asset, "carried")
+if (length(carried)) log_warn("registry: carried forward {length(carried)} class(es) not built this run: {paste(carried, collapse = '; ')}")
+native_asset <- as_tibble(native_asset)
+smry <- native_asset |> count(representation, asset_type, name = "n_rows") |> arrange(representation, asset_type)
+report_table(smry, caption = "pointer rows by representation × asset type")
 ```
 
-## Sync → S3 (COGs) + file host (PMTiles)
+## Upload → store, then catalogue
+
+Only keys the catalog lacks are uploaded, each with its local store-mirror path; a key that already
+exists on S3 but not in the catalog is an error (something wrote to the store outside it). After every
+upload, the listing is re-read to prove each object is there, and only then are the rows appended to
+`assets.parquet` and the catalog pushed.
 
 ```{r}
-#| label: sync
+#| label: upload
 
-aws_sync <- function(local, prefix) {
-  st <- system2("aws", c("s3","sync", local, glue("{s3_ver}/{prefix}"),
-                         "--only-show-errors","--no-progress"), stdout=TRUE, stderr=TRUE)
-  if (!is.null(attr(st,"status")) && attr(st,"status")!=0) stop(paste(st, collapse="\n"))
-  log_info("synced {path_file(local)} -> {s3_ver}/{prefix}")
-}
+up <- plan_df |> filter(!catalogued) |> distinct(key, .keep_all = TRUE)
+up$file <- store_path(up$key)
+stopifnot("every new key needs its staged file" = all(file_exists(up$file)))
+log_info("upload plan: {nrow(up)} new objects, {round(sum(file_size(up$file)) / 1e9, 2)} GB ({sum(endsWith(up$key, '.tif'))} COGs, {sum(endsWith(up$key, '.pmtiles'))} PMTiles)")
+if (nrow(up)) knitr::kable(up |> count(class, name = "new_objects"))
+
+if (do_s3 && nrow(up)) {
+  hash_of <- function(k) sub("^.*/([0-9a-f]{16})\\.[a-z]+$", "\\1", k)
+  have_s3 <- c(cog_store_index("global05"), native_store_index())
+  clash <- up$key[hash_of(up$key) %in% have_s3]
+  if (length(clash)) stop(sprintf("%d object(s) exist on S3 but not in the catalog (e.g. %s): the store was written outside the catalog; reconcile first (scripts/verify_asset_store.R)",
+                                  length(clash), clash[1]), call. = FALSE)
+  t0 <- Sys.time()
+  for (i in seq_len(nrow(up))) {
+    ct  <- if (endsWith(up$key[i], ".tif")) "image/tiff" else "binary/octet-stream"
+    out <- app_bundle_aws_retry(c("s3", "cp", shQuote(up$file[i]), shQuote(glue("{bucket_root}/{up$key[i]}")),
+                                  "--content-type", ct, "--only-show-errors"))
+    if (!is.null(attr(out, "status")) && attr(out, "status") != 0) stop(sprintf("upload failed for %s: %s", up$key[i], paste(out, collapse = " ")), call. = FALSE)
+    if (i %% 500 == 0) log_info("uploaded {i}/{nrow(up)} ({round(as.numeric(Sys.time() - t0, units = 'mins'), 1)} min)")
+  }
+  have_s3 <- c(cog_store_index("global05"), native_store_index())
+  missing <- up$key[!hash_of(up$key) %in% have_s3]
+  stopifnot("objects missing from the store after upload" = length(missing) == 0)
+  log_info("uploaded {nrow(up)} objects in {round(as.numeric(Sys.time() - t0, units = 'mins'), 1)} min; all present in the listing")
+
+  new_rows <- asset_catalog_rows(up$key, up$content_hash, up$enc, up$file, first_ver = ver)
+  catalog  <- asset_catalog_add(catalog, new_rows)
+  f_cat <- glue("{dir_as}/assets.parquet")
+  asset_catalog_write(catalog, f_cat)
+  out <- app_bundle_aws_retry(c("s3", "cp", shQuote(f_cat), shQuote(glue("{bucket_root}/assets.parquet")),
+                                "--content-type", "application/octet-stream", "--only-show-errors"))
+  if (!is.null(attr(out, "status")) && attr(out, "status") != 0) stop(paste(out, collapse = "\n"))
+  log_info("catalog: +{length(attr(catalog, 'added'))} rows -> {nrow(catalog)} objects, pushed assets.parquet")
+  catalog <- as_tibble(catalog)
+} else if (nrow(up)) log_info("NATIVE_NO_S3: nothing uploaded; {nrow(up)} objects staged under {dir_store}")
+```
+
+## Gate, then write the pointer table
+
+```{r}
+#| label: gate
+
+url_gate(native_asset$asset_url, glue("{ver} native_asset (asset_url)"))
+listed <- if (do_s3) {
+  o <- suppressWarnings(system2("aws", c("s3", "ls", "--recursive", shQuote(glue("{bucket_root}/{ver}/"))), stdout = TRUE, stderr = TRUE))
+  sub("^.*\\s+", "", o[nzchar(o)])
+} else NULL
+cat_gate <- if (do_s3 || !nrow(up)) catalog else                        # dry run: the catalog this run would have written
+  as_tibble(asset_catalog_add(catalog, asset_catalog_rows(up$key, up$content_hash, up$enc, up$file, first_ver = ver)))
+g <- withCallingHandlers(
+  store_publish_gate(native_asset$asset_url, cat_gate, ver, listed = listed, legacy_ok = legacy_ok),
+  warning = function(w) { log_warn(conditionMessage(w)); invokeRestart("muffleWarning") })
+log_info("store gate: {g$n_urls} pointer URLs -> {g$n_keys} catalogued store keys; bulk files under {ver}/: {length(g$legacy)}")
+
 if (do_s3) {
-  if (nrow(am_reg))        aws_sync(dir_cog,        "native/am")         # model (0.05° resampled)
-  # originals -> the content-addressed native store (see "native-store"): only NEW hashes are copied
-  for (i in seq_len(nrow(native_store_todo))) {
-    r <- native_store_todo[i, ]
-    st <- system2("aws", c("s3", "cp", r$file, glue("s3://oceanmetrics.io-public/marine-atlas/{msens::native_key(r$ds_key, r$hash, r$type)}"),
-                           "--only-show-errors"), stdout = TRUE, stderr = TRUE)
-    if (!is.null(attr(st, "status")) && attr(st, "status") != 0) stop(paste(st, collapse = "\n"))
-  }
-  if (exists("vec_cog_reg") && nrow(vec_cog_reg))
-                           aws_sync(glue("{dir_native}/vec_grid"), "native/vec_grid")  # vector model grid
-  if (exists("merged_reg") && nrow(merged_reg))
-                           aws_sync(glue("{dir_native}/merged"),   "native/merged")    # merged whole-range COGs
-  if (exists("dps_reg") && nrow(dps_reg))
-                           aws_sync(glue("{dir_native}/dps_nmfs"), "native/dps_nmfs")  # NMFS DPS per-cell ER surfaces
-  # PMTiles -> server file host, same content-addressed layout (S3 mirror was copied above)
-  pm <- native_store_todo[native_store_todo$type == "pmtiles", ]
-  if (nrow(pm)) for (d in unique(pm$ds_key)) {
-    f <- pm[pm$ds_key == d, ]
-    stage <- glue("{dir_native}/store/{d}"); dir_create(stage)              # {hash}.pmtiles, the served name
-    file_copy(f$file, glue("{stage}/{f$hash}.pmtiles"), overwrite = TRUE)
-    system2("ssh", c("msens", glue("mkdir -p /share/data/derived/pmtiles/native/{d}")))
-    system2("rsync", c("-aq", "--ignore-existing", glue("{stage}/"), glue("msens:/share/data/derived/pmtiles/native/{d}/")))
-  }
-} else log_info("NATIVE_NO_S3 set — staged locally only ({dir_native})")
+  con <- dbConnect(duckdb(sdm_db))
+  dbWriteTable(con, "native_asset", as.data.frame(native_asset), overwrite = TRUE)
+  dbDisconnect(con, shutdown = TRUE)
+  log_info("wrote native_asset ({nrow(native_asset)} rows) to {path_file(sdm_db)}; release_marine-atlas.qmd (RELEASE_S3_TABLES=1) publishes {ver}/tables/native_asset.parquet")
+} else log_info("NATIVE_NO_S3: pointer table NOT written ({nrow(native_asset)} rows would be; {sum(!plan_df$catalogued)} of their objects are not yet catalogued)")
 ```
 
 ## Manifest
@@ -1034,22 +947,21 @@ if (do_s3) {
 ```{r}
 #| label: manifest
 
-# content-addressed: fingerprint the native_asset registry table (reopen sdm.duckdb
-# read-only — the registry chunk already disconnected). Deterministic: no wall-clock,
-# no machine paths, no run-mode flags.
-con <- dbConnect(duckdb(sdm_db, read_only = TRUE))
-h   <- msens::hash_query(con, "native_asset")
-dbDisconnect(con, shutdown = TRUE)
-
-msens::write_manifest(
-  manifest, target = "publish_native", content_hash = h,
-  stats = list(
-    ver = ver,
-    pmtiles_datasets = if (nrow(pmt_reg)) paste(sort(unique(pmt_reg$ds_key)), collapse = ",") else "",
-    n_pmtiles_native = nrow(pmt_reg),                                    # vector original polygons
-    am_cogs_model    = nrow(am_reg),                                     # am 0.05° resampled
-    am_cogs_native   = if (exists("am_native_reg")) nrow(am_native_reg) else 0L,  # am 0.5° original
-    vec_cogs_model   = if (exists("vec_cog_reg")) nrow(vec_cog_reg) else 0L,      # vector 0.05° gridded
-    native_assets    = nrow(native_asset)),
-  force = msens::force_target("publish_native"))
+if (do_s3) {
+  con <- dbConnect(duckdb(sdm_db, read_only = TRUE))
+  h   <- hash_query(con, "native_asset")
+  dbDisconnect(con, shutdown = TRUE)
+  write_manifest(
+    manifest, target = "publish_native", content_hash = h,
+    stats = list(
+      ver = ver,
+      pmtiles_datasets = if (nrow(pmt_reg)) paste(sort(unique(pmt_reg$ds_key)), collapse = ",") else "",
+      n_pmtiles_native = nrow(pmt_reg),
+      am_cogs_model    = nrow(am_reg),
+      am_cogs_native   = nrow(am_native_reg),
+      vec_cogs_model   = nrow(vec_cog_reg),
+      new_objects      = nrow(up),
+      native_assets    = nrow(native_asset)),
+    force = force_target("publish_native"))
+} else log_info("NATIVE_NO_S3: manifest not written (dry run)")
 ```

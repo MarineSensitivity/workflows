@@ -36,7 +36,8 @@ COG representations — for an on-grid dataset these are **as delivered** (`nati
 merge consumes), NOT original vs interpolated; `dataset.on_grid = TRUE` (front-matter `on_grid: true`)
 makes the species app label the toggle *Delivered / As ingested* — and records the
 per-species AquaX-vs-AquaMaps comparison (`data/ax_vs_am_summary.csv`; 20 least/most different
-with preview deep links). `publish_native.qmd` only *registers* the ax COGs from `model_ax.csv`.
+with preview deep links). `publish_native.qmd` keys the two ax COGs by content and uploads them to the store
+(`AX_COG_S3` is retired).
 
 **v9: extinction risk is SPATIAL for NMFS DPS-listed species (`dps_nmfs`, `ingest_nmfs-dps.qmd`) — and
 their merged model is the DISTRIBUTION, not the risk.** `listing` flattens NOAA's species page to its highest
@@ -206,10 +207,11 @@ one application + reviewer policy per restricted version, `server/cloudflare/acc
 runbook in `server/cloudflare/README.md`), `CHECK_PREVIEW=1` (curl-prove the review gate: public
 host never renders a restricted version, preview host is closed without a Cloudflare Access
 token and open with one, origin-direct is 401, restricted docs are off GitHub Pages),
-`DEPLOY_TITILER=1` (restart `titiler-v8` alone — **required after any `REDO_MERGED_COG` /
-`publish_native` run that repaints COGs**, because `native/*` keys are STABLE, so new bytes land
-under a URL whose header GDAL's `/vsicurl` has cached in-process; a shrunken COG then reads past
-EOF and z2–z4 return HTTP 500 while z5+ look fine),
+`DEPLOY_TITILER=1` (restart `titiler-v8` alone — it was required after every COG repaint while
+`{ver}/native/*` keys were STABLE: new bytes landed under a URL whose header GDAL's `/vsicurl` had
+cached in-process, and a shrunken COG read past EOF so z2–z4 returned HTTP 500 while z5+ looked
+fine. Since the asset store (2026-10) a repaint is a NEW key, so this is only for the titiler image
+itself),
 `REDO_MERGED_COG=1` (repaint just the merged whole-range COGs — what a re-merge invalidates,
 without `REDO_NATIVE`'s 7 GB IUCN gpkg rebuild and am re-sort), `REDO_MERGED_COG_SPATIAL=1` /
 `REDO_MERGED_COG_KEYS=k1,k2` (repaint only the spatial-ER taxa / named taxa), `REDO_MC_PARTS_SPATIAL=1` /
@@ -223,6 +225,7 @@ registered), `TURTLE_SUIT_MIN` / `TURTLE_FILL` / `COVERAGE_FLOOR` / `REDO_BUILD=
 (`build_v7b`), `BACKFILL_NO_STAC=1` / `BACKFILL_NO_RELOAD=1` / `BACKFILL_NO_INDEX=1` (backfill opt-outs),
 `STAC_ALIAS_PUSH=1` (`libs/stac_alias.R`, called where the root STAC catalog was just deployed — `backfill_versions`, `release_marine-atlas` `deploy`: without it a lagging alias at `marinesensitivity.org/stac/catalog.json` is only a WARN naming the missing children; with it the alias is committed + pushed to the `MarineSensitivity.github.io` `main` and verified live, refusing a checkout that is missing, off `main` or has other staged changes),
 `URL_AUDIT_ALLOW=<regex>[,<regex>…]` (`libs/url_gate.R`, the publish gate in `stage_publish`, `build_app_bundle`, `publish_native`, `publish_stac_api`, `backfill_versions`: bulk files — `.tif .pmtiles .parquet …` — must be fetched from the object store, never a VM host, so any `vm_bulk` URL stops the render; this logged-at-WARN escape hatch lets URLs matching a regex through, default none),
+`NATIVE_NO_S3=1` / `NATIVE_TEST_N=<n>` / `NATIVE_LEGACY_OK=1` / `REDO_KEYS=1` / `NATIVE_NO_VERIFY=1` / `NATIVE_CATALOG=<assets.parquet>` (`publish_native`: dry run; first n keys per class, which also forces the dry run; let the store gate WARN rather than stop on the pre-store copies v8/v9 still carry under `{ver}/native/` until the M6 prune; recompute the cached content hashes; skip the decode check of new COGs; read the catalog from a file),
 `BUILD_MEMORY_GB` / `BUILD_THREADS` (`libs/duckdb_budget.R`), `SRV_MIN_AVAIL_MB` (`srv_render.sh` watchdog).
 
 **The pre-release review gate (`preview.marinesensitivity.org`, 2026-08-15).** A release has
@@ -443,6 +446,34 @@ version-independent registries replace that:
 - **The object key includes the ENCODING, not just the payload** (`content_hash_encoded()`).
   Rewriting objects at a stable URL left GDAL's `/vsicurl` serving a cached header for bytes that no
   longer existed: z5+ fine, z2–z4 HTTP 500.
+
+### The asset store: a release owns pointers, never files (2026-10-02, M5 2026-10-06)
+
+Every distribution file of every release lives ONCE in a content-addressed store the releases share —
+`marine-atlas/cog/{grid_id}/{hash}.tif` (rasters on an analysis grid: per-input `model`, merged, score),
+`marine-atlas/native/{ds_key}/{hash}.tif|.pmtiles` (source-resolution originals) — with a catalog,
+`marine-atlas/assets.parquet` (one row per object: `key`, `content_hash`, `enc`, `bytes`, `md5`,
+`first_ver`). A release owns only POINTERS: `{ver}/tables/native_asset.parquet` (`asset_url`,
+`content_hash`, `source_key`) and the app shards built from it. v9, v8, v7b and v7 were re-pointed on
+2026-10-02 (runbook in the notes vault, `plans_todo/atlas-refs/round4-session/m2-m4-runbook.md`);
+their pre-store copies under `{ver}/native/` and the file host's `pmtiles/{v8,v9}/` stay until the
+M6 prune (earliest 2026-10-16, Ben's explicit go). **The key is known before the file is built**:
+`msens::asset_store_key(family, scope, content_hash)` folds the payload hash — `pixel_hashes()` (the
+rows quantised as the writer quantises them, `trunc` into INT1U, `round_trunc` for AquaX and the
+suitability-only merged paint, repeated cells collapsed by `max` as the merge consumes them) or
+`native_vector_hash()` (source geometry) — with the family's encoding tag (`asset_enc()`), so an
+unchanged surface costs neither a build nor an upload and a changed one is a NEW key (older releases
+keep pointing at the old object; GDAL's `/vsicurl` header cache can no longer serve stale bytes).
+`publish_native.qmd` (rewritten at M5) is the only writer: keys → build only what the catalog lacks
+into the local store mirror (`{dir_derived}/asset_store/store/{key}`) → decode-verify every new COG
+against its key → upload → `asset_catalog_add()` + push `assets.parquet` → `store_publish_gate()`
+(every pointer URL is a catalogued store object AND nothing `.tif`/`.pmtiles` is listed under
+`{ver}/`; `NATIVE_LEGACY_OK=1` turns the second check into a WARN before M6) → only then the pointer
+table into `sdm.duckdb` (`release_marine-atlas.qmd` `RELEASE_S3_TABLES=1` publishes it). The PUBLISHED
+pointer table is the prior for `registry_merge()`, never the local copy. A dry run (`NATIVE_NO_S3=1`,
+or any `NATIVE_TEST_N`) stages and gates but writes nothing. `ingest_aquax.qmd` no longer uploads
+(`AX_COG_S3` refuses); `scripts/verify_asset_store.R` (bucket ⇄ catalog) and
+`scripts/check_release_pointers.R <ver>` (published pointers answer) are the read-only checks.
 
 ### A release that lands registers itself (2026-09-21)
 

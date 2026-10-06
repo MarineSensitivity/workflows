@@ -37,7 +37,8 @@ AquaMaps, also the place where **what it replaces is decided and measured**:
    `cell.in_usa` (634,208), and the `in_usa` cells no model reaches are where AquaMaps continues.
    Supersession (`merge_models.qmd`, `msens::supersede_sql()`) drops a taxon's AquaMaps cells
    **inside this mask only** (D3), on both merged surfaces (D5).
-3. **COGs are built here** (`AX_COG=1`, uploaded with `AX_COG_S3=1`), in the two representations
+3. **COGs are built here** (`AX_COG=1`; `publish_native.qmd` keys and uploads them to the content-addressed
+   store — `AX_COG_S3` is retired, a release owns pointers, not files), in the two representations
    every input carries — but for AquaX they are **not** original vs interpolated, because the
    delivery already sits on the analysis grid. They differ in *content*, not topology (D6, confirmed
    2026-08-27):
@@ -58,7 +59,7 @@ AquaMaps, also the place where **what it replaces is decided and measured**:
    the 20 least and 20 most different species, each linking to the species app on the preview host.
 
 Flags (`libs/vars.R`): `REDO_INGEST`, `AX_WORKERS` (6), `AX_TEST_N` (smoke test on the first *n*
-models: nothing is written to `data/`, no manifest), `AX_COG`, `AX_COG_S3`, `AX_APPLY_CUTOFF`,
+models: nothing is written to `data/`, no manifest), `AX_COG`, `AX_APPLY_CUTOFF`,
 `AX_ABSENT_SUPERSEDES`. Runs on the **laptop** (the only host with the TIFs); the server needs
 nothing from them.
 
@@ -73,7 +74,7 @@ flowchart LR
   pq --> mask[("dist/ax_mask.parquet<br/>every AquaX-modeled cell")]
   tif -->|"cog_from_tif (bit-exact)"| cogn["native/ax_native/"]
   pq -->|"publish_cog (1–100)"| cogm["native/ax/"]
-  cogn & cogm -.->|"AX_COG_S3"| s3[["s3://…/marine-atlas/v9/native/"]]
+  cogn & cogm -.->|"publish_native.qmd"| s3[["marine-atlas/native/ax/ · cog/global05/"]]
   xw["summary.csv + xlsx + WoRMS"] --> csv["model_ax.csv<br/>ax|{AphiaID} · sp_cat · AUC/TSS/cutoff · COG urls"]
   v8[("v8 taxon_model / taxon")] --> sup["data/ax_supersedes_am.csv"]
   pq & am[("dist/dataset=am")] & sup --> cmp["ax vs am on shared cells<br/>× subregion → data/ax_vs_am_summary.csv"]
@@ -132,7 +133,10 @@ if (redo_ingest && dir_exists(dir_dist)) {
 is_test <- ax_test_n > 0
 if (is_test) log_warn("AX_TEST_N={ax_test_n}: smoke test — nothing written to data/, no manifest")
 safe_key <- function(k) gsub("[^A-Za-z0-9._-]", "_", k)   # mdl_key -> filesystem/URL-safe (as publish_native)
-log_info("ax ingest: workers={ax_workers} cog={ax_cog} s3={ax_cog_s3} cutoff={ax_apply_cutoff} absent_supersedes={ax_absent_supersedes} supersede={ax_supersede}")
+log_info("ax ingest: workers={ax_workers} cog={ax_cog} cutoff={ax_apply_cutoff} absent_supersedes={ax_absent_supersedes} supersede={ax_supersede}")
+# retired 2026-10 (asset store): this notebook wrote the COGs under {ver}/native/, a versioned path no release may
+# own any more. publish_native.qmd keys them by content and uploads them to the store; nothing is pushed from here.
+if (ax_cog_s3) stop("AX_COG_S3 is retired: AquaX COGs reach S3 only through publish_native.qmd (the content-addressed store)", call. = FALSE)
 ```
 
 ## Source inventory + the position-map premise
@@ -464,23 +468,8 @@ if (ax_cog) {
   stopifnot("COG round-trip mismatch (see log)" = bad == 0)
   log_info("COG round trip verified on {nrow(smp)} models")
 
-  if (ax_cog_s3) {
-    aws_sync <- function(local, prefix) {
-      local <- path.expand(local)   # the aws CLI does not expand `~` (nor does GDAL -- see cog_from_tif)
-      st <- system2("aws", c("s3", "sync", shQuote(local), shQuote(glue("{s3_ver}/{prefix}")),
-                             "--only-show-errors", "--no-progress"), stdout = TRUE, stderr = TRUE)
-      if (!is.null(attr(st, "status")) && attr(st, "status") != 0) stop(paste(st, collapse = "\n"))
-      log_info("synced {path_file(local)} -> {s3_ver}/{prefix}")
-    }
-    aws_sync(dir_cog_native, "native/ax_native")
-    aws_sync(dir_cog_model,  "native/ax")
-    # read one back through the public URL: a zero exit is not proof the objects are there
-    u <- cog_rows$cog_url[!is.na(cog_rows$cog_url)][1]
-    code <- system2("curl", c("-s", "-o", "/dev/null", "-w", "%{http_code}", "-r", "0-1023", shQuote(u)), stdout = TRUE)
-    stopifnot("published ax COG not readable over HTTPS" = code %in% c("200", "206"))
-    log_info("S3 read-back {u}: HTTP {code}")
-  } else log_info("AX_COG_S3 unset — COGs staged locally only")
-} else log_info("AX_COG unset — no COGs built (set AX_COG=1; AX_COG_S3=1 to upload)")
+  log_info("ax COGs staged locally under {dir_native}; publish_native.qmd keys + uploads them to the store")
+} else log_info("AX_COG unset — no COGs built (set AX_COG=1; publish_native.qmd uploads)")
 model_ax <- model_ax |> select(-any_of(c("cog_url", "cog_native_url", "xmin", "xmax", "ymin", "ymax"))) |>
   left_join(cog_rows, by = "mdl_key")
 if (!is_test) write_csv(model_ax |> select(-tif), mdl_csv)
