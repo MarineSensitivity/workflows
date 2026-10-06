@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ben Best <ben@ecoquants.com>
+Date: Tue, 6 Oct 2026 15:28:19 +0200
+Subject: [PATCH 2/4] msens: pin hypothesis / fit points to the published run
+ (controls), progressr off by default
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01H6zetzjywCQX7iXJC33wMu
+---
+ codes/model_fit.R         |  4 +++-
+ codes/post_bootstrap.R    |  4 +++-
+ functions/model_species.R | 22 ++++++++++++++++++++++
+ 3 files changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/codes/model_fit.R b/codes/model_fit.R
+index 8f2436d..c287bcf 100644
+--- a/codes/model_fit.R
++++ b/codes/model_fit.R
+@@ -23,7 +23,9 @@ source("functions/components_model_species.R")
+ source("functions/auxiliary_modelfit.R")
+ set.seed(2023)
+ handlers("cli")
+-options("progressr.enable" = TRUE)
++# msens patch: progressr's stdout sink is knocked out of sync by a sink() inside the species fit (sequential runs die with
++# "current sink index (0) is out of sync" AFTER the model finished) -> progress off unless OG_PROGRESS=1
++options("progressr.enable" = identical(Sys.getenv("OG_PROGRESS"), "1"))
+ if (interactive()) { cat("\014") } else { system("clear") }
+ start_time <- Sys.time()
+ 
+diff --git a/codes/post_bootstrap.R b/codes/post_bootstrap.R
+index ab6cda2..b5e1931 100644
+--- a/codes/post_bootstrap.R
++++ b/codes/post_bootstrap.R
+@@ -16,7 +16,9 @@ library(furrr)
+ set.seed(2023)
+ source("functions/bootstrap.R")
+ handlers("cli")
+-options("progressr.enable" = TRUE)
++# msens patch: progressr's stdout sink is knocked out of sync by a sink() inside the species fit (sequential runs die with
++# "current sink index (0) is out of sync" AFTER the model finished) -> progress off unless OG_PROGRESS=1
++options("progressr.enable" = identical(Sys.getenv("OG_PROGRESS"), "1"))
+ if (interactive()) {
+     cat("\014")
+ } else {
+diff --git a/functions/model_species.R b/functions/model_species.R
+index 2aa6571..73f7660 100644
+--- a/functions/model_species.R
++++ b/functions/model_species.R
+@@ -189,6 +189,19 @@ model_species <- function(species,
+     
+     # Check if species is from shallow/coastal areas and remove distcoast/bathymetry
+     env <- .cm_check_shallow(bath_pts, env, verb_1)
++
++    # msens patch (control runs): pin the habitat hypothesis (layer set) to the one OBIS's published run selected,
++    # so the stochastic sdm_multhypo() step cannot change the layers. OG_HYP_FROM = root of the published species
++    # folders (e.g. ~/_big/sdm/obis/species). Unset = the pipeline chooses, as in OBIS.
++    hyp_from <- Sys.getenv("OG_HYP_FROM")
++    if (nzchar(hyp_from)) {
++      pub_log <- jsonlite::read_json(file.path(hyp_from, paste0("taxonid=", species), "model=mpaeu",
++                                               paste0("taxonid=", species, "_model=mpaeu_what=log.json")))
++      pub_hyp <- unlist(pub_log$model_details$best_hypothesis)[1]
++      stopifnot("published hypothesis not among this run's hypotheses" = pub_hyp %in% names(env$hypothesis))
++      env$hypothesis <- env$hypothesis[pub_hyp]
++      model_log$other_details <- c(model_log$other_details, paste("hypothesis pinned to published:", pub_hyp))
++    }
+     
+     # Assess SAC
+     fit_pts_sac <- try(obissdm::outqc_sac_mantel(fit_pts, 
+@@ -200,6 +213,15 @@ model_species <- function(species,
+       fit_pts_sac <- fit_pts
+     } 
+ 
++    # msens patch (control runs, optional): use OBIS's published fit presences instead of re-drawing the
++    # (random, seed-dependent) spatial thinning. OG_FITOCC_FROM = root of the published species folders.
++    fo_from <- Sys.getenv("OG_FITOCC_FROM")
++    if (nzchar(fo_from)) {
++      fit_pts_sac <- as.data.frame(arrow::read_parquet(file.path(
++        fo_from, paste0("taxonid=", species), "model=mpaeu",
++        paste0("taxonid=", species, "_model=mpaeu_what=fitocc.parquet"))))[, coord_names]
++    }
++
+     # Make data object
+     quad_n <- .cm_calc_quad(env, quad_samp, fit_pts_sac)
+     model_log$model_details$background_size <- quad_n 

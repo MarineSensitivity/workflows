@@ -1,0 +1,202 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ben Best <ben@ecoquants.com>
+Date: Tue, 6 Oct 2026 16:11:07 +0200
+Subject: [PATCH 3/4] msens: OG_HAB_DEPTH override, OG_BG_FROM target-group
+ background (fit, eval absences, bootstrap), seed pinned to Mersenne-Twister
+ so batch == single
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01H6zetzjywCQX7iXJC33wMu
+---
+ functions/bootstrap.R                | 14 +++++-
+ functions/components_model_species.R | 65 +++++++++++++++++++++++++++-
+ functions/model_species.R            | 40 ++++++++++++++++-
+ 3 files changed, 113 insertions(+), 6 deletions(-)
+
+diff --git a/functions/bootstrap.R b/functions/bootstrap.R
+index 49b1f99..1070495 100644
+--- a/functions/bootstrap.R
++++ b/functions/bootstrap.R
+@@ -91,7 +91,16 @@ bootstrap_model <- function(species, iterations = 20,
+     }
+ 
+     # msens patch: seed = AphiaID for the background draw, AphiaID + iteration for each refit
+-    set.seed(as.integer(species))
++    .cm_seed(species)
++    # msens patch: a target-group fit keeps its target-group background in the refits
++    # (log.json background_type/background_file); otherwise the uniform draw below, as in OBIS
++    bg_type <- unlist(log_file[["model_details"]][["background_type"]])
++    if (identical(bg_type, "target-group")) {
++        bg_pool <- .cm_bg_pool(unlist(log_file[["model_details"]][["background_file"]]), env_masked)
++        if (nrow(bg_pool) < 1) stop("no target-group cell inside the fit region for bootstrap")
++        sampled_quad <- bg_pool[if (nrow(bg_pool) > quad_n) sample(nrow(bg_pool), quad_n) else seq_len(nrow(bg_pool)), ]
++        rownames(sampled_quad) <- NULL
++    } else {
+     env_xy <- terra::as.data.frame(prod(env_masked), xy = T)[, 1:2]
+     env_xy_samp <- sample(seq_len(nrow(env_xy)), size = quad_n)
+     env_xy <- env_xy[env_xy_samp, ]
+@@ -102,9 +111,10 @@ bootstrap_model <- function(species, iterations = 20,
+         presence = 0,
+         terra::extract(env_masked, env_xy, ID = F)
+     )
++    }
+ 
+     for (i in seq_len(iterations)) {
+-        set.seed(as.integer(species) + i)  # msens patch
++        .cm_seed(as.integer(species) + i)  # msens patch
+         if (verbose) cli::cat_line(cli::bg_cyan(glue::glue("Running iteration {i} out of {iterations}")))
+         samp_pts <- sample(seq_len(nrow(pts)), nrow(pts), replace = T)
+         samp_quad <- sample(seq_len(nrow(sampled_quad)), nrow(sampled_quad), replace = T)
+diff --git a/functions/components_model_species.R b/functions/components_model_species.R
+index 573124d..8d58116 100644
+--- a/functions/components_model_species.R
++++ b/functions/components_model_species.R
+@@ -1479,12 +1479,19 @@ split_ds <- function(sp_occ,
+     hab_depth = hab_depth,
+     layers = list(names = names(lyr), files = terra::sources(lyr),
+                   hypothesis = multi_mod$best_model),
+-    background = list(type = "uniform random cells of the masked env stack (realms of occurrence + adjacent, depth range +/- buffer); mp_prepare_data(), sample() without replacement",
++    background = list(type = unlist(model_log$model_details$background_type),
++                      description = if (identical(unlist(model_log$model_details$background_type), "target-group"))
++                        "target-group locations on non-NA cells of the masked env stack (realms + depth); sampled without replacement; evaluation absences from the same pool"
++                      else "uniform random cells of the masked env stack (realms of occurrence + adjacent, depth range +/- buffer); mp_prepare_data(), sample() without replacement",
++                      file = unlist(model_log$model_details$background_file),
++                      n_available = unlist(model_log$model_details$background_n_available),
++                      n_requested = unlist(model_log$model_details$background_n_requested),
+                       size = unlist(model_log$model_details$background_size),
+                       n_presence = sum(sp_data$training$presence),
+                       n_background = sum(sp_data$training$presence == 0)),
+     algorithms = algorithms,
+-    options = list(scenarios = if (identical(Sys.getenv("OG_SCENARIOS"), "all")) "all" else "current",
++    options = list(hab_depth_override = Sys.getenv("OG_HAB_DEPTH"), bg_from = Sys.getenv("OG_BG_FROM"),
++                   scenarios = if (identical(Sys.getenv("OG_SCENARIOS"), "all")) "all" else "current",
+                    cvpred = isTRUE(getOption("obissdm.cvpred", TRUE))),
+     packages = lapply(pk, function(x) x$Version)
+   )
+@@ -1493,3 +1500,57 @@ split_ds <- function(sp_occ,
+   jsonlite::write_json(manifest, outf, auto_unbox = TRUE, pretty = TRUE, null = "null", na = "null")
+   invisible(outf)
+ }
++
++
++# msens patch: target-group background ----
++# OG_BG_FROM = a parquet (cell_id, lon, lat) of target-group record locations, optionally with an {id} placeholder
++# (replaced by the AphiaID), or a .csv map (taxonid,file) for a different file per species. Unset = random background.
++.cm_bg_file <- function(species) {
++  f <- Sys.getenv("OG_BG_FROM")
++  if (!nzchar(f)) return(NULL)
++  f <- path.expand(f)
++  if (grepl("\\.csv$", f)) {
++    m <- utils::read.csv(f, stringsAsFactors = FALSE)
++    hit <- m$file[m$taxonid == as.numeric(species)]
++    stopifnot("OG_BG_FROM map has no single row for this species" = length(hit) == 1)
++    f <- path.expand(hit)
++  } else {
++    f <- gsub("{id}", species, f, fixed = TRUE)
++  }
++  stopifnot("target-group file not found" = file.exists(f))
++  f
++}
++
++# target-group locations that sit on non-NA cells of `env_layers` (the species' masked stack), shaped exactly like the
++# training table mp_prepare_data builds (so it can be passed as pred_quad)
++.cm_bg_pool <- function(file, env_layers) {
++  d <- as.data.frame(arrow::read_parquet(file, col_select = c("lon", "lat")))
++  v <- terra::extract(env_layers, d[, c("lon", "lat")], ID = FALSE)
++  ok <- stats::complete.cases(v)
++  out <- cbind(decimalLongitude = d$lon[ok], decimalLatitude = d$lat[ok], presence = 0, v[ok, , drop = FALSE])
++  rownames(out) <- NULL
++  out
++}
++
++
++# msens patch: seeding that does not depend on how the species is run ----
++# furrr(seed = TRUE) switches the worker's RNG kind to L'Ecuyer-CMRG, and set.seed(x) keeps the CURRENT kind, so the same
++# seed gives a different stream in a batch than in a single-species (Mersenne-Twister) run. Pin the kind explicitly.
++.cm_seed <- function(x) {
++  set.seed(as.integer(x), kind = "Mersenne-Twister", normal.kind = "Inversion", sample.kind = "Rejection")
++}
++
++
++# msens patch: OG_HAB_DEPTH (depthsurf | depthmean | depthmax) overrides the habitat-derived layer depth for loading,
++# prediction, post-evaluation and (through log.json hab_depth) bootstrap. Unset = OBIS behaviour (hab_to_depth()).
++.cm_hab_depth <- function(hab) {
++  hab_depth <- hab_to_depth(hab)
++  ov <- Sys.getenv("OG_HAB_DEPTH")
++  note <- NULL
++  if (nzchar(ov)) {
++    stopifnot("OG_HAB_DEPTH must be depthsurf, depthmean or depthmax" = ov %in% c("depthsurf", "depthmean", "depthmax"))
++    note <- paste0("hab_depth overridden by OG_HAB_DEPTH: ", hab_depth, " (mode_life ", hab, ") -> ", ov)
++    hab_depth <- ov
++  }
++  list(hab_depth = hab_depth, note = note)
++}
+diff --git a/functions/model_species.R b/functions/model_species.R
+index 73f7660..a315fe2 100644
+--- a/functions/model_species.R
++++ b/functions/model_species.R
+@@ -88,7 +88,7 @@ model_species <- function(species,
+   # the species list or on the worker; xgboost 1.7 (R) and randomForest/maxnet draw from R's RNG
+   t_start <- Sys.time()
+   species_seed <- as.integer(species)
+-  set.seed(species_seed)
++  .cm_seed(species_seed)
+ 
+   # Check verbosity
+   verb_1 <- verb_2 <- FALSE
+@@ -149,7 +149,9 @@ model_species <- function(species,
+     
+     # Load and select ecological information for the species
+     hab <- .cm_check_habitat(species)
+-    hab_depth <- hab_to_depth(hab)
++    hd <- .cm_hab_depth(hab)
++    hab_depth <- hd$hab_depth
++    if (!is.null(hd$note)) model_log$other_details <- c(model_log$other_details, hd$note)
+     model_log$hab_depth <- hab_depth
+     
+     # Load environmental data
+@@ -226,10 +228,44 @@ model_species <- function(species,
+     quad_n <- .cm_calc_quad(env, quad_samp, fit_pts_sac)
+     model_log$model_details$background_size <- quad_n 
+ 
++    # msens patch: background. default = uniform random cells of the masked stack (mp_prepare_data draws them).
++    # OG_BG_FROM = target-group locations: the background is drawn from those locations that sit on non-NA cells of
++    # THIS species' masked stack (realms + depth), quad_n of them without replacement (all if fewer). The same pool
++    # also supplies the evaluation absences (otherwise mp_prepare_data re-draws those uniformly). Fit presences that
++    # coincide with a target-group cell stay in the background (standard target-group background).
++    bg_file <- .cm_bg_file(species)
++    bg_info <- list(type = "random", file = "none", n_available = NA_integer_, n_used = quad_n)
++    pred_quad <- NULL
++    if (!is.null(bg_file)) {
++      bg_pool <- .cm_bg_pool(bg_file, env$layers)
++      stopifnot("no target-group cell on the species' masked stack" = nrow(bg_pool) > 0)
++      n_use <- min(quad_n, nrow(bg_pool))
++      pred_quad <- bg_pool[if (nrow(bg_pool) > quad_n) sample(nrow(bg_pool), quad_n) else seq_len(nrow(bg_pool)), ]
++      rownames(pred_quad) <- NULL
++      bg_info <- list(type = "target-group", file = bg_file, n_available = nrow(bg_pool), n_used = n_use)
++      if (n_use < quad_n) {
++        model_log$other_details <- c(model_log$other_details,
++          paste0("target-group background shortfall: ", n_use, " available < ", quad_n, " requested"))
++      }
++      if (!is.null(eval_pts)) {
++        n_ev <- min(nrow(eval_pts) * 10, nrow(bg_pool))
++        eval_abs <- bg_pool[sample(nrow(bg_pool), n_ev), c("decimalLongitude", "decimalLatitude")]
++        eval_pts$presence <- 1
++        eval_abs$presence <- 0
++        eval_pts <- rbind(eval_pts, eval_abs)
++      }
++    }
++    model_log$model_details$background_size <- bg_info$n_used
++    model_log$model_details$background_type <- bg_info$type
++    model_log$model_details$background_file <- bg_info$file
++    model_log$model_details$background_n_available <- bg_info$n_available
++    model_log$model_details$background_n_requested <- quad_n
++
+     sp_data <- mp_prepare_data(fit_pts_sac, eval_data = eval_pts,
+                                species_id = species_name,
+                                env_layers = env$layers,
+                                quad_number = quad_n,
++                               pred_quad = pred_quad,
+                                verbose = verb_2)
+ 
+     block_grid <- get_block_grid(sp_data, env$layers,

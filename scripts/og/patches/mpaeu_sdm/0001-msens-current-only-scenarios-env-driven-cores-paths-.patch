@@ -1,0 +1,306 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ben Best <ben@ecoquants.com>
+Date: Tue, 6 Oct 2026 15:17:16 +0200
+Subject: [PATCH 1/4] msens: current-only scenarios, env-driven cores/paths,
+ per-species seed, cvpred + manifest outputs, drop polars
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01H6zetzjywCQX7iXJC33wMu
+---
+ codes/model_fit.R                    | 10 ++--
+ codes/post_bootstrap.R               | 14 +++--
+ functions/bootstrap.R                | 20 +++++--
+ functions/components_model_species.R | 89 +++++++++++++++++++++++++---
+ functions/model_species.R            | 15 +++++
+ 5 files changed, 123 insertions(+), 25 deletions(-)
+
+diff --git a/codes/model_fit.R b/codes/model_fit.R
+index 83c57f5..8f2436d 100644
+--- a/codes/model_fit.R
++++ b/codes/model_fit.R
+@@ -14,7 +14,7 @@ library(obissdm)
+ library(furrr)
+ library(progressr)
+ library(storr)
+-library(polars)
++# msens patch: polars dropped (only read by .cm_load_species for a parquet *file* dataset, not the key=*.parquet folder used here)
+ library(arrow)
+ library(dplyr)
+ library(terra)
+@@ -61,13 +61,14 @@ species_list <- recent_file("data", "all_splist")
+ # Run in parallel? For avoiding parallel, change both to FALSE
+ run_parallel <- ifelse(length(sel_species) > 1 | sel_species == "all", TRUE, FALSE)[1]
+ # Number of cores for parallel processing
+-n_cores <- 40
++# msens patch: cores from the environment (default 8)
++n_cores <- as.integer(Sys.getenv("OG_CORES", "8"))
+ # Maximum memory used by `terra`
+ max_mem <- (0.9/n_cores)
+ 
+ # Modelling
+ # Algorithms to be used
+-algos <- c("maxent", "rf", "xgboost")
++algos <- strsplit(Sys.getenv("OG_ALGOS", "maxent,rf,xgboost"), ",")[[1]]  # msens patch: OG_ALGOS only for smoke tests
+ # Personalized options
+ algo_opts <- obissdm::sdm_options()[algos]
+ algo_opts$maxent$features <- c("lq", "h")
+@@ -89,7 +90,8 @@ tg_metric <- "cbi"
+ tg_threshold <- 0.3
+ 
+ # Create storr to hold results
+-st <- storr_rds(paste0(outacro, "_storr"))
++# msens patch: storr lives with the outputs, not in the clone
++st <- storr_rds(file.path(outfolder, paste0(outacro, "_storr")))
+ # If does not exist, add start date
+ if (!st$exists("startdate")) {
+   st$set("startdate", format(Sys.Date(), "%Y%m%d"))
+diff --git a/codes/post_bootstrap.R b/codes/post_bootstrap.R
+index 140ff0b..ab6cda2 100644
+--- a/codes/post_bootstrap.R
++++ b/codes/post_bootstrap.R
+@@ -25,8 +25,9 @@ if (interactive()) {
+ start_time <- Sys.time()
+ 
+ # Model acronym
+-acro <- "mpaeu"
+-results_folder <- "/data/scps/v5/results"
++# msens patch: acro / results folder / cores from the environment (set by scripts/og/run_og.R, OG_STEP=bootstrap)
++acro <- if (exists("acro")) acro else Sys.getenv("OG_ACRO", "mpaeu")
++results_folder <- if (exists("results_folder")) results_folder else Sys.getenv("OG_OUT", "results")
+ # Change temporary folder for terra - only necessary if working with large number
+ # of files and not enough space on the main drive
+ # First do fs::dir_create("/data/scps/tmp_folder")
+@@ -38,16 +39,17 @@ results_folder <- "/data/scps/v5/results"
+ # To run specific species, uncomment below and comment the others
+ # sel_species <- c(107381)
+ # Otherwise, use species that were effectively modeled
+-st_sdm <- storr_rds(paste0(acro, "_storr"))
++st_sdm <- storr_rds(file.path(results_folder, paste0(acro, "_storr")))
+ st_sdm_done <- st_sdm$list()
+ st_sdm_status <- st_sdm$mget(st_sdm_done)
+ st_sdm_done <- st_sdm_done[unlist(lapply(st_sdm_status, function(x) x[[1]])) == "succeeded"]
+ sel_species <- as.numeric(st_sdm_done)
++if (nzchar(Sys.getenv("OG_SPECIES"))) sel_species <- intersect(sel_species, as.numeric(strsplit(Sys.getenv("OG_SPECIES"), ",")[[1]]))
+ 
+ # Run in parallel? For avoiding parallel, change both to FALSE
+ run_parallel <- ifelse(length(sel_species) > 1 | sel_species == "all", TRUE, FALSE)[1]
+ # Number of cores for parallel processing
+-n_cores <- 80
++n_cores <- as.integer(Sys.getenv("OG_CORES", "8"))
+ # Maximum memory used by `terra` - only when in parallel
+ max_mem <- (0.9/n_cores)
+ # Bootstrap target ("all", "best" or a particular algorithm)
+@@ -56,7 +58,7 @@ boot_mode <- "all"
+ max_retry <- 20
+ 
+ # Create storr to hold results
+-st <- storr_rds(paste0(acro, "_boot_storr"))
++st <- storr_rds(file.path(results_folder, paste0(acro, "_boot_storr")))
+ # If does not exist, add start date
+ if (!st$exists("startdate")) {
+     st$set("startdate", format(Sys.Date(), "%Y%m%d"))
+@@ -123,7 +125,7 @@ pmod <- function(species,
+ 
+         fit_result <- try(
+             bootstrap_sp(species = species, target = boot_mode,
+-                         results_folder = results_folder, retry_max = max_retry),
++                         results_folder = results_folder, acro = acro, retry_max = max_retry),
+             silent = T
+         )
+ 
+diff --git a/functions/bootstrap.R b/functions/bootstrap.R
+index 25eafb5..49b1f99 100644
+--- a/functions/bootstrap.R
++++ b/functions/bootstrap.R
+@@ -90,6 +90,8 @@ bootstrap_model <- function(species, iterations = 20,
+         quad_n <- ifelse(quad_n > n_back_max, n_back_max, quad_n)
+     }
+ 
++    # msens patch: seed = AphiaID for the background draw, AphiaID + iteration for each refit
++    set.seed(as.integer(species))
+     env_xy <- terra::as.data.frame(prod(env_masked), xy = T)[, 1:2]
+     env_xy_samp <- sample(seq_len(nrow(env_xy)), size = quad_n)
+     env_xy <- env_xy[env_xy_samp, ]
+@@ -102,6 +104,7 @@ bootstrap_model <- function(species, iterations = 20,
+     )
+ 
+     for (i in seq_len(iterations)) {
++        set.seed(as.integer(species) + i)  # msens patch
+         if (verbose) cli::cat_line(cli::bg_cyan(glue::glue("Running iteration {i} out of {iterations}")))
+         samp_pts <- sample(seq_len(nrow(pts)), nrow(pts), replace = T)
+         samp_quad <- sample(seq_len(nrow(sampled_quad)), nrow(sampled_quad), replace = T)
+@@ -194,12 +197,17 @@ predict_bootstrap <- function(fit, sdm_data, species, group, hab_depth,
+                               pred_out, outacro, iteration, type = "normal",
+                               aggregate, verbose = FALSE) {
+ 
+-    scenarios <- data.frame(
+-        scenario = c("current", rep(c("ssp126", "ssp245", "ssp370", "ssp460", "ssp585"),
+-            each = 2
+-        )),
+-        year = c(NA, rep(c("dec50", "dec100"), 5))
+-    )
++    # msens patch: current period only unless OG_SCENARIOS=all
++    if (identical(Sys.getenv("OG_SCENARIOS"), "all")) {
++        scenarios <- data.frame(
++            scenario = c("current", rep(c("ssp126", "ssp245", "ssp370", "ssp460", "ssp585"),
++                each = 2
++            )),
++            year = c(NA, rep(c("dec50", "dec100"), 5))
++        )
++    } else {
++        scenarios <- data.frame(scenario = "current", year = NA_character_)
++    }
+ 
+     if (type == "esm") {
+         model_name <- "esm"
+diff --git a/functions/components_model_species.R b/functions/components_model_species.R
+index 5516d7d..573124d 100644
+--- a/functions/components_model_species.R
++++ b/functions/components_model_species.R
+@@ -393,15 +393,17 @@
+       do_shape <- do_mess <- FALSE
+     }
+ 
+-    scenarios <- data.frame(
+-      scenario = c("current", rep(c("ssp126", "ssp245", "ssp370", "ssp460", "ssp585"),
+-        each = 2
+-      )),
+-      year = c(NA, rep(c("dec50", "dec100"), 5))
+-    )
+-    # Reduced for testings
+-    # scenarios <- data.frame(scenario = c("current", "ssp126"), year = c(NA,"dec50"))
+-    # scenarios <- data.frame(scenario = c("current"), year = c(NA))
++    # msens patch: current period only (no ssp scenarios); OG_SCENARIOS=all restores OBIS's full set
++    if (identical(Sys.getenv("OG_SCENARIOS"), "all")) {
++      scenarios <- data.frame(
++        scenario = c("current", rep(c("ssp126", "ssp245", "ssp370", "ssp460", "ssp585"),
++          each = 2
++        )),
++        year = c(NA, rep(c("dec50", "dec100"), 5))
++      )
++    } else {
++      scenarios <- data.frame(scenario = "current", year = NA_character_)
++    }
+ 
+     for (k in seq_len(nrow(scenarios))) {
+       if (is.na(scenarios$year[k])) {
+@@ -1307,6 +1309,9 @@
+   lapply(good_models, function(id) {
+     model_name <- model_fits[[id]]$name
+ 
++    # msens patch: held-out predictions go to their own parquet, not into the model .rds
++    model_fits[[id]]$cvpred <- NULL
++    model_fits[[id]]$cvpredtrain <- NULL
+     reduced_model <- try(.reduce_model_file(model_fits[[id]]))
+ 
+     if (!inherits(reduced_model, "try-error")) {
+@@ -1422,3 +1427,69 @@ split_ds <- function(sp_occ,
+ #   return(list(prediction = pred,
+ #               range = range))
+ # }
++
++
++# msens patch: held-out fold predictions + run manifest ----
++# cvpred: held-out (test-fold) predictions of the SELECTED tune of each fitted algorithm;
++# cvpredtrain: the same fold-models' predictions on their own training rows.
++# columns: species, method, fold, idx (row in the fit table, aligns methods), presence, lon, lat, pred (0-1)
++.cm_save_cvpred <- function(model_fits, metric_out, species, outacro, good_models, sp_data) {
++  coords <- sp_data$coord_training
++  fs::dir_create(metric_out)
++  for (id in good_models) {
++    fit <- model_fits[[id]]
++    for (what in c("cvpred", "cvpredtrain")) {
++      d <- fit[[what]]
++      if (is.null(d)) next
++      d$species <- species
++      d$method <- fit$name
++      d$lon <- coords[[1]][d$idx]
++      d$lat <- coords[[2]][d$idx]
++      d <- d[, c("species", "method", "fold", "idx", "presence", "lon", "lat", "pred")]
++      arrow::write_parquet(d, paste0(metric_out, "taxonid=", species, "_model=", outacro,
++                                     "_method=", fit$name, "_what=", what, ".parquet"))
++    }
++  }
++  invisible(NULL)
++}
++
++.cm_git_info <- function(repo) {
++  g <- function(...) tryCatch(
++    trimws(system2("git", c("-C", shQuote(repo), ...), stdout = TRUE, stderr = FALSE)[1]),
++    error = function(e) NA_character_, warning = function(w) NA_character_)
++  list(repo = repo, sha = g("rev-parse", "HEAD"), branch = g("rev-parse", "--abbrev-ref", "HEAD"),
++       dirty = length(tryCatch(system2("git", c("-C", shQuote(repo), "status", "--porcelain"),
++                                       stdout = TRUE, stderr = FALSE), error = function(e) "?")) > 0)
++}
++
++.cm_write_manifest <- function(species, outfolder, outacro, group, hab_depth, env, multi_mod,
++                               sp_data, model_log, algorithms, t_start, seed) {
++  lyr <- terra::subset(env$layers, multi_mod$best_variables)
++  inst <- file.path(Sys.getenv("OG_DATA", file.path(path.expand("~"), "_big/sdm/mpaeu")), "obissdm_install.json")
++  si <- sessionInfo()
++  pk <- c(si$otherPkgs, si$loadedOnly)
++  manifest <- list(
++    species = species, model_acro = outacro, group = group, seed = seed,
++    start = format(t_start, "%Y-%m-%d %H:%M:%S %Z"), end = format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z"),
++    host = Sys.info()[["nodename"]], n_cores = as.integer(Sys.getenv("OG_CORES", "NA")),
++    r_version = R.version.string,
++    git = list(mpaeu_sdm = .cm_git_info(getwd()),
++               mpaeu_msdm = .cm_git_info(Sys.getenv("OG_MSDM_REPO", file.path(path.expand("~"), "Github/iobis/mpaeu_msdm"))),
++               obissdm_install = if (file.exists(inst)) jsonlite::read_json(inst) else NA),
++    hab_depth = hab_depth,
++    layers = list(names = names(lyr), files = terra::sources(lyr),
++                  hypothesis = multi_mod$best_model),
++    background = list(type = "uniform random cells of the masked env stack (realms of occurrence + adjacent, depth range +/- buffer); mp_prepare_data(), sample() without replacement",
++                      size = unlist(model_log$model_details$background_size),
++                      n_presence = sum(sp_data$training$presence),
++                      n_background = sum(sp_data$training$presence == 0)),
++    algorithms = algorithms,
++    options = list(scenarios = if (identical(Sys.getenv("OG_SCENARIOS"), "all")) "all" else "current",
++                   cvpred = isTRUE(getOption("obissdm.cvpred", TRUE))),
++    packages = lapply(pk, function(x) x$Version)
++  )
++  outf <- paste0(outfolder, "/taxonid=", species, "/model=", outacro, "/taxonid=", species,
++                 "_model=", outacro, "_what=manifest.json")
++  jsonlite::write_json(manifest, outf, auto_unbox = TRUE, pretty = TRUE, null = "null", na = "null")
++  invisible(outf)
++}
+diff --git a/functions/model_species.R b/functions/model_species.R
+index 127ad16..2aa6571 100644
+--- a/functions/model_species.R
++++ b/functions/model_species.R
+@@ -84,6 +84,12 @@ model_species <- function(species,
+   
+   terra::terraOptions(memfrac = max_mem)
+ 
++  # msens patch: per-species seed (AphiaID) so the species' draws do not depend on its position in
++  # the species list or on the worker; xgboost 1.7 (R) and randomForest/maxnet draw from R's RNG
++  t_start <- Sys.time()
++  species_seed <- as.integer(species)
++  set.seed(species_seed)
++
+   # Check verbosity
+   verb_1 <- verb_2 <- FALSE
+   if (is.numeric(verbose)) {
+@@ -381,6 +387,10 @@ model_species <- function(species,
+         # Save metrics
+         .cm_save_metrics(model_fits, metric_out, species,
+                          outacro, good_models)
++
++        # msens patch: held-out fold predictions of the selected tune of each algorithm
++        .cm_save_cvpred(model_fits, metric_out, species, outacro,
++                        good_models, sp_data)
+         
+         # Update log with best parameters
+         for (al in seq_along(algorithms)) {
+@@ -406,6 +416,11 @@ model_species <- function(species,
+         outfile <- paste0(outpath,
+                           "taxonid=", species, "_model=", outacro, "_what=log.json")
+         save_log(model_log, outfile)
++
++        # msens patch: run manifest beside log.json
++        try(.cm_write_manifest(species, outfolder, outacro, group, hab_depth,
++                               env, multi_mod, sp_data, model_log, algorithms,
++                               t_start, species_seed))
+         
+         cli::cli_alert_success("Model concluded for species {species}.")
+         
