@@ -1,0 +1,1196 @@
+---
+title: "Density models (gm, nc) → the merged species surface"
+subtitle: "Transforms onto the [0,100] scale, mosaic rules against AquaMaps/AquaX, and what each does to the scores"
+bibliography: [msens.bib, compare_density_methods.bib]
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    embed-resources: true
+    lightbox: true
+editor_options:
+  chunk_output_type: console
+---
+
+> **Not a pipeline stage** — an evaluation workbook rendered from the v9 build (`dist/`, `mc_parts/`,
+> `merge.duckdb`, `sdm.duckdb`) plus the raw density sources, to settle *how* the two
+> density-response datasets should enter the merge before any release does it. Everything it
+> computes is reproducible from `quarto render compare_density_methods.qmd` (the derived density
+> surfaces and per-method merges are cached under `marine-atlas/density_eval/`; `REDO_DENSITY=1` /
+> `REDO_DENSITY_MERGE=1` rebuild them). The transforms are `msens::density_to_suit()` and the annual
+> mean is `msens::density_annual()` — both unit-tested in `test-density.R` — so the ingest that
+> eventually adopts one calls the same code this page evaluated.
+
+## Why this page exists
+
+Two ingested datasets respond in **density** (individuals km^-2^), not habitat suitability:
+
+- **`gm`** — NOAA SEFSC Gulf of America cetacean and sea-turtle spatial density models
+  [@litzCetaceanSeaTurtle2022; @garrisonGulfMexicoMarine2023; @rappucciGulfMexicoMarine2023]: 19
+  monthly GAM/distance-sampling surfaces on a 40 km² hexagon grid (2003–2019 line-transect surveys,
+  predictions on 2015–2019 monthly oceanography).
+- **`nc`** — NOAA NCCOS at-sea marine bird density models, Atlantic [@winship2018] and Pacific
+  [@leirness2021]: seasonal 2 km surfaces from decades of boat and aerial transects (boosted
+  zero-inflated GAMs).
+
+Both are registered, published natively and drawn in the species app, but since v8 the docs carry
+them as *"Registered but not scored"*: the merge takes one surface per taxon on AquaMaps' relative
+suitability scale ([0,100]; `msens::merge_sql()`), and density has had no agreed mapping onto it. These
+are also, arguably, the highest-value inputs the atlas holds for the uses BOEM and NOAA care about
+most — survey-based density is what NMFS itself uses to estimate exposure and take for incidental-take
+authorizations (the 2026 Gulf geophysical-survey rule is built on exactly these SEFSC surfaces
+[@nmfsTakingMarineMammalsGulf2026]; Atlantic authorizations use the Duke habitat-based models
+[@robertsHabitatbasedCetaceanDensity2016; @robertsHabitatbasedMarineMammal2022; @nmfsBluepointWindIHA2023]).
+
+Four things block a naive fold-in, and this page works through each with numbers:
+
+1. **Units.** A suitability of 100 means "environmentally ideal"; a density of 100 means nothing until
+   a species-specific scale is chosen. The transform decides how the heavy-tailed density is
+   distributed over [0,100] (§ @sec-transforms).
+2. **The merge's fitting point erases density for the species that matter most.** The plain rule values
+   every range cell at `max(er, suit)`, so a species whose governing extinction-risk score is 100
+   (`NMFS:EN`: sperm whale, Rice's whale) is a flat 100 wherever it has a range, whatever its density.
+   The NMFS-DPS rule (`msens::dps_sql()`, v9) already solves this for 19 species by keeping the
+   merged value as the *distribution* and carrying ER beside it; the same choice is one of the methods
+   here (§ @sec-mosaic).
+3. **Regional surfaces inside global ones.** Each density model covers one region; the taxon's
+   AquaMaps/AquaX surface covers its whole range. How the two meet at the model boundary — `max`, or
+   replacement inside the domain as AquaX replaces AquaMaps in v9 (`msens::supersede_sql()`) — and
+   whether the density is *calibrated* to the incumbent's distribution decides whether a seam appears
+   (§ @sec-mosaic, § @sec-boundary).
+4. **Crosswalk and guilds.** Seven of the 19 SEFSC surfaces and a fifth of the NCCOS codes are species
+   *groups* (beaked whales, blackfish, "scoter spp."), and NCCOS names follow an older taxonomy than
+   BirdLife's (§ @sec-crosswalk).
+
+The page then shows a few species from each dataset before and after inclusion under each method
+(§ @sec-maps), tabulates how the Program-Area, ecoregion and subregion scores move (§ @sec-scores), and
+closes with the caveats the literature raises and a recommendation (§ @sec-caveats, § @sec-recommendation).
+Along the way it also audits the v8/v9 ingests themselves and finds two faults worth fixing regardless
+of the method chosen (§ @sec-audit).
+
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "Raw density → grid → annual mean → transform → mosaic with the v9 merge inputs → re-score; every branch is compared against the v9 status quo reproduced from the same inputs"
+flowchart LR
+  raw["raw sources<br/>gm hexagons (monthly)<br/>nc COGs (seasonal)"] --> grid["density on the 0.05° grid<br/>(all intervals; absent = 0)"]
+  grid --> ann["annual mean<br/>msens::density_annual()"]
+  ann --> tf["transform → [0,100]<br/>msens::density_to_suit()<br/>cap · log · ud · qmap"]
+  mc["v9 merge inputs<br/>mc_parts (am/ax/ranges)"] --> mos["mosaic per taxon<br/>max | replace (supersede_sql)<br/>fit | dist (dps_sql)"]
+  tf --> mos
+  mos --> us["US surface per method<br/>(M0 = v9 reproduced, asserted)"]
+  us --> sc["Δ extrisk_{cat} → ecoregion rescale<br/>→ composite → zones"]
+  sc --> tbl["zone table by method<br/>+ species maps"]
+```
+
+## Setup
+
+```{r}
+#| label: setup
+#| message: false
+
+librarian::shelf(arrow, DBI, dplyr, duckdb, fs, ggplot2, glue, here, knitr, logger, patchwork,
+                 purrr, readr, readxl, rnaturalearth, scales, sf, stringr, terra, tibble, tidyr,
+                 tidyterra, MarineSensitivity/msens, quiet = TRUE)
+source(here("libs/paths.R")); source(here("libs/vars.R")); source(here("libs/duckdb_budget.R"))
+options(readr.show_col_types = FALSE, scipen = 999, knitr.kable.NA = "")
+sf_use_s2(FALSE)
+# the transforms are msens functions (R/density.R, unit-tested in test-density.R); a stale library
+# would run without them, so the version is asserted rather than assumed
+stopifnot("msens >= 0.45.0 with density_to_suit() is required: devtools::install('../msens')" =
+            packageVersion("msens") >= "0.45.0" && exists("density_to_suit", asNamespace("msens")))
+
+dir_atlas    <- path.expand(glue("{dir_big_v}/marine-atlas"))
+dir_dist     <- glue("{dir_atlas}/dist")
+dir_parts    <- glue("{dir_atlas}/mc_parts")
+merge_db     <- glue("{dir_atlas}/merge.duckdb")
+dir_eval     <- glue("{dir_atlas}/density_eval"); dir_create(dir_eval)   # this notebook's cache; not a release artifact
+redo_density <- .flag("REDO_DENSITY")         # re-derive the density surfaces from the raw sources
+redo_merge   <- .flag("REDO_DENSITY_MERGE")   # re-run the per-method merges + rescoring
+gm_shp_dir   <- path.expand(Sys.getenv("GM_SHP_DIR", unset = paste0(
+  "~/My Drive/projects/msens/data/raw/ncei.noaa.gov - GoMex cetacean & sea turtle SDMs/0256800/2.2/",
+  "data/0-data/NOAA_SEFSC_Cetacean_SeaTurtle_SDM_shapefiles")))
+stopifnot(file_exists(sdm_db), file_exists(merge_db), dir_exists(dir_parts), file_exists(cellid_tif),
+          dir_exists(glue("{dir_dist}/dataset=gm")), dir_exists(glue("{dir_dist}/dataset=nc")),
+          "gm inputs: set GM_SHP_DIR to the SEFSC shapefile folder" = dir_exists(gm_shp_dir))
+
+suit_ds   <- c("am", "ax")                      # v9 suitability datasets (merge_models.qmd)
+suit_in   <- paste(sprintf("'%s'", suit_ds), collapse = ", ")
+turtle_ds <- "rng_turtle_swot_dps"
+ch_ds     <- c("ch_nmfs", "ch_fws", "ca_nmfs")
+sp_cats   <- c("bird", "coral", "fish", "invertebrate", "mammal", "primary_producer", "turtle")
+
+eval_db <- glue("{dir_eval}/eval.duckdb")
+if (redo_merge && file_exists(eval_db)) file_delete(eval_db)
+con <- dbConnect(duckdb(eval_db))
+duckdb_tune(con, glue("{dir_eval}/duckdb_tmp"))
+dbExecute(con, glue("ATTACH '{sdm_db}' AS sdm (READ_ONLY)"))
+dbExecute(con, glue("ATTACH '{merge_db}' AS mrg (READ_ONLY)"))
+dbExecute(con, glue("ATTACH '{path.expand(spp_db)}' AS spp (READ_ONLY)"))
+
+grid   <- msens::grid_spec_for("global05", cellid_tif)
+land   <- ne_countries(scale = "medium", returnclass = "sf")
+ply_pa <- read_sf(path.expand(glue("{dir_derived}/v2/ply_programareas_2026.gpkg")))
+ply_er <- read_sf(path.expand(glue("{dir_derived}/v1/ply_ecoregions_2025.gpkg")))
+```
+
+## Density on the grid, from the raw sources {#sec-density}
+
+Both ingests already wrote a `dist/dataset={gm,nc}` surface on the grid, but that surface is the
+*transformed* value (`cap`, see below) with cells below 1 dropped, and its annual layer averages only
+the intervals a cell was present in. To evaluate transforms the density itself is needed, over the
+whole model domain and every interval — so it is re-derived here from the raw sources, and the
+ingested surfaces are audited against it in § @sec-audit.
+
+### NCCOS seabirds (`nc`): seasonal 2 km COGs → cells
+
+Each COG (band 1 = `n_per_km2`) is projected from its oblique-Mercator grid to a 0.02° geographic
+grid (bilinear) and *averaged* into the 0.05° cells — an area-weighted mean that conserves the
+model's abundance rather than the point-sampling bilinear pull the ingest used. The two regions are
+spatially disjoint and are unioned per species.
+
+```{r}
+#| label: density-nc
+
+nc_models <- read_csv(here("data/nc_models.csv")) |> filter(var == "n_per_km2") |>
+  transmute(region_ds = ds_key, region, sp_code, season)
+nc_multi <- read_csv(here("data/sdm/derived/nc_pac_birds_dens/m_spp-multiple.csv"))$sp_code
+nc_xw <- bind_rows(
+  read_csv(here("data/sdm/derived/nc_atl_birds_dens/mw_spp.csv")),
+  read_csv(here("data/sdm/derived/nc_pac_birds_dens/m_spp.csv")),
+  read_csv(here("data/sdm/derived/nc_pac_birds_dens/m_spp-multiple.csv"))) |>
+  transmute(sp_code, sp_common, sp_scientific, gbif_id = as.character(sp_id)) |>
+  distinct(sp_code, .keep_all = TRUE)
+
+f_nc <- glue("{dir_eval}/nc_cells.parquet")
+if (redo_density || !file_exists(f_nc)) {
+  t0 <- Sys.time()
+  nc_cells <- pmap_dfr(nc_models, function(region_ds, region, sp_code, season) {
+    f <- here(glue("data/sdm/raw/{region_ds}/{sp_code}_{season}.tif"))
+    if (!file_exists(f)) return(NULL)
+    r <- rast(f, lyrs = 1)                                               # n_per_km2 on 2 km pixels
+    src_total <- as.numeric(global(r, "sum", na.rm = TRUE)) * prod(res(r)) / 1e6   # individuals
+    p <- project(r, "EPSG:4326", method = "bilinear", res = 0.02)        # ~2 km, finer than the cell
+    d <- msens::cells_from_raster(p, cellid_tif, method = "average", min_value = 0,
+                                  zero_fill = FALSE, digits = 6)
+    tibble(region, sp_code, season, cell_id = d$cell_id, dens = d$val, src_total = src_total)
+  })
+  write_parquet(nc_cells, f_nc)
+  log_info("nc: {nrow(nc_cells)} model-cell rows from {nrow(nc_models)} COGs in ",
+           "{round(as.numeric(Sys.time() - t0, units = 'mins'), 1)} min")
+}
+nc_cells <- read_parquet(f_nc)
+
+# annual mean: the mean over the 4 seasons of the year, an UNMODELLED season counting as zero
+# (NCCOS fits a season only where the species was sighted enough to model); the present-only mean
+# the ingest used is kept beside it for the audit
+nc_annual <- nc_cells |> group_by(sp_code, region) |>
+  group_modify(~ density_annual(.x, n_intervals = 4)) |> ungroup() |>
+  left_join(nc_cells |> group_by(sp_code, region, cell_id) |>
+              summarise(dens_present = mean(dens), n_ssn = n(), .groups = "drop"),
+            by = c("sp_code", "region", "cell_id"))
+nc_dom <- nc_cells |> distinct(region, cell_id)
+
+# mass conservation per (species, region, season): Σ cell density × ocean-cell area vs the COG's own
+# integral; < 1 where the domain touches land cells the grid does not carry
+duckdb_register(con, "nc_cells_r", nc_cells)
+nc_mass <- dbGetQuery(con, "
+  SELECT region, sp_code, season, any_value(src_total) AS src_total,
+         sum(n.dens * c.area_km2) AS cell_total, count(*) AS n_cells
+  FROM nc_cells_r n JOIN sdm.cell c USING (cell_id) GROUP BY 1, 2, 3") |>
+  mutate(ratio = cell_total / src_total)
+duckdb_unregister(con, "nc_cells_r")
+kable(nc_mass |> group_by(region) |> summarise(n_models = n(), ratio_min = round(min(ratio), 3),
+        ratio_median = round(median(ratio), 3), ratio_max = round(max(ratio), 3),
+        cells_median = median(n_cells)),
+      caption = "nc: abundance conserved from COG to grid (Σ density × area over ocean cells / the COG's own integral). Above 1 where a partly covered edge cell takes the mean of its covered part over its full area; below 1 where the domain touches land cells the grid does not carry")
+```
+
+### SEFSC Gulf cetaceans and turtles (`gm`): monthly 40 km² hexagons → cells
+
+`{Mon}_n` is the number of animals per 40 km² hexagon [@litzCetaceanSeaTurtle2022], so density is
+`n / 40`; `-9999` marks a hexagon outside a model's domain (a shelf model over oceanic water, and
+vice versa). The two split-population species (Atlantic spotted and common bottlenose dolphins,
+Oceanic + Shelf) are summed per hexagon. Each cell takes the hexagon under its centre — a 40 km²
+hexagon covers ~1.5 cells at this latitude, so no hexagon is skipped.
+
+```{r}
+#| label: density-gm
+
+gm_taxa  <- read_excel(glue("{gm_shp_dir}/../spp_gmx.xlsx")) |>
+  select(taxa_shp, taxa_sci, taxa_common, taxa_doc)
+gm_files <- tibble(path = dir_ls(gm_shp_dir, glob = "*.shp")) |>
+  mutate(base       = path_ext_remove(path_file(path)),
+         taxa_shp   = str_replace(base, "_Monthly_.*$", ""),
+         population = if_else(str_detect(base, "^(Oceanic|Shelf)_"),
+                              str_extract(base, "^(Oceanic|Shelf)"), NA_character_)) |>
+  left_join(gm_taxa, by = "taxa_shp")
+stopifnot("every gm shapefile resolves in spp_gmx.xlsx" = !any(is.na(gm_files$taxa_sci)))
+
+f_gm <- glue("{dir_eval}/gm_cells.parquet"); f_gm_hex <- glue("{dir_eval}/gm_hex_months.parquet")
+if (redo_density || !file_exists(f_gm)) {
+  t0 <- Sys.time()
+  r_gulf <- crop(rast(cellid_tif), ext(-98.5, -79.5, 17.5, 31.5))
+  out <- list(); hexm <- list()
+  for (sci in unique(gm_files$taxa_sci)) {
+    fi <- gm_files |> filter(taxa_sci == sci)
+    hx <- bind_rows(lapply(fi$path, function(p)
+      read_sf(p) |> st_transform(4326) |> select(hexid = HEXID, any_of(paste0(month.abb, "_n")))))   # some surfaces carry fewer than 12 months
+    long <- hx |> st_drop_geometry() |>
+      pivot_longer(-hexid, names_to = "mo", values_to = "n") |>
+      filter(n != -9999) |>
+      mutate(mm = sprintf("%02d", match(str_remove(mo, "_n"), month.abb))) |>
+      group_by(hexid, mm) |> summarise(n = sum(n), .groups = "drop")      # Oceanic + Shelf summed
+    geoms <- hx[!duplicated(hx$hexid), "hexid"]
+    r_hex <- rasterize(vect(geoms), r_gulf, field = "hexid")
+    xw    <- as.data.frame(c(r_hex, r_gulf), na.rm = TRUE); names(xw) <- c("hexid", "cell_id")
+    out[[sci]]  <- long |> inner_join(xw, by = "hexid", relationship = "many-to-many") |>
+      transmute(taxa_sci = sci, mm, cell_id = as.integer(cell_id), dens = n / 40)   # individuals km^-2
+    hexm[[sci]] <- long |> mutate(taxa_sci = sci)
+  }
+  write_parquet(bind_rows(out), f_gm); write_parquet(bind_rows(hexm), f_gm_hex)
+  log_info("gm: {nrow(bind_rows(out))} model-cell rows from {nrow(gm_files)} shapefiles in ",
+           "{round(as.numeric(Sys.time() - t0, units = 'mins'), 1)} min")
+}
+gm_cells <- read_parquet(f_gm); gm_hex <- read_parquet(f_gm_hex)
+
+# annual mean over the months the taxon's MODEL provides (all 12 but for Kogia, Apr-Nov): a month the
+# model does not cover is not a zero, while within a covered month a hexagon without a value is
+# outside the domain (not a zero either -- the -9999 month inside a domain is rare, see the table)
+gm_annual <- gm_cells |> group_by(taxa_sci) |>
+  group_modify(~ density_annual(.x, n_intervals = n_distinct(.x$mm))) |> ungroup() |>
+  left_join(gm_cells |> group_by(taxa_sci, cell_id) |>
+              summarise(dens_present = mean(dens), n_mo = n(), .groups = "drop"),
+            by = c("taxa_sci", "cell_id"))
+gm_dom <- gm_cells |> distinct(cell_id)
+
+# how complete is the monthly record per hexagon? (a -9999 month inside a model's domain is rare)
+gm_months <- gm_hex |> count(taxa_sci, hexid, name = "n_mo") |>
+  group_by(taxa_sci) |> summarise(n_hex = n(), pct_12_months = round(100 * mean(n_mo == 12), 1),
+                                  months_median = median(n_mo), .groups = "drop")
+
+# mass conservation per (taxon, month): Σ cell density × ocean-cell area vs Σ hexagon abundance
+duckdb_register(con, "gm_cells_r", gm_cells)
+duckdb_register(con, "gm_hex_r", gm_hex)
+gm_share_usa <- dbGetQuery(con, "SELECT round(100.0 * count(*) FILTER (WHERE c.in_usa) / count(*), 1) AS pct
+  FROM (SELECT DISTINCT cell_id FROM gm_cells_r) d JOIN sdm.cell c USING (cell_id)")$pct
+gm_mass <- dbGetQuery(con, "
+  WITH src AS (SELECT taxa_sci, mm, sum(n) AS src_total FROM gm_hex_r GROUP BY 1, 2),
+       cel AS (SELECT g.taxa_sci, g.mm, sum(g.dens * c.area_km2) AS cell_total,
+                      sum(g.dens * c.area_km2) FILTER (WHERE c.in_usa) AS cell_total_usa
+               FROM gm_cells_r g JOIN sdm.cell c USING (cell_id) GROUP BY 1, 2)
+  SELECT * FROM src JOIN cel USING (taxa_sci, mm)") |>
+  mutate(ratio = cell_total / src_total, share_usa = cell_total_usa / cell_total)
+duckdb_unregister(con, "gm_cells_r"); duckdb_unregister(con, "gm_hex_r")
+kable(gm_mass |> group_by(taxa_sci) |> summarise(ratio_min = round(min(ratio), 3), ratio_median = round(median(ratio), 3),
+        ratio_max = round(max(ratio), 3), share_usa = round(median(share_usa), 2), .groups = "drop") |>
+        left_join(gm_months, by = "taxa_sci"),
+      caption = glue("gm: abundance conserved from hexagons to grid (ratio), the share of each model's ",
+                     "abundance inside the US study area (the rest is the extrapolation beyond US waters ",
+                     "the dataset warns about; {gm_share_usa} % of the domain's ocean cells are in_usa), ",
+                     "and the completeness of the monthly record per hexagon"))
+```
+
+## Taxon crosswalk and eligibility {#sec-crosswalk}
+
+A density model contributes to a score only if it lands on a taxon the atlas already scores. `gm` keys
+by WoRMS AphiaID, but four of its 17 ids are a genus or family (beaked whales, blackfish, pilot whales,
+*Kogia*). `nc` keys by GBIF id under an older taxonomy: 20 of 79 codes fail to match a BirdLife name
+(`Puffinus gravis` vs *Ardenna gravis*, `Sterna maxima` vs *Thalasseus maximus*, …), three match the
+*wrong* BirdLife species (Cory's shearwater → *Calonectris diomedea*, the Mediterranean Scopoli's;
+herring gull → the European *L. argentatus*; white-winged scoter → the European velvet scoter), and
+nine codes are species groups. The crosswalk here matches on **common name first** (the AOU codes are
+defined by them), then scientific name, with a curated override, and is written to
+`data/nc_taxon_crosswalk.csv`.
+
+```{r}
+#| label: crosswalk
+
+# --- gm: WoRMS id from the ingest's registry; rank from the WoRMS snapshot flags the guilds
+model_gm <- read_csv(glue("{dir_dist}/model_gm.csv")) |> filter(interval == "annual") |>
+  transmute(sp_id, scientific_name)
+gm_ids   <- str_remove(model_gm$sp_id, "^WORMS:")
+worms_rank <- dbGetQuery(con, glue("SELECT CAST(scientificNameID AS VARCHAR) AS id, taxonRank AS rank
+  FROM spp.worms WHERE scientificNameID IN ({paste(gm_ids, collapse = ',')})"))
+gm_tx <- gm_files |>
+  mutate(taxa_common = str_remove(taxa_common, "^(Oceanic|Shelf) ")) |>   # one taxon for a split-population pair
+  distinct(taxa_sci, .keep_all = TRUE) |> select(taxa_sci, taxa_common, taxa_doc) |>
+  left_join(model_gm, by = c("taxa_sci" = "scientific_name")) |>
+  mutate(id = str_remove(sp_id, "^WORMS:")) |>
+  left_join(worms_rank, by = "id") |>
+  transmute(ds_key = "gm", sp_id, ingest_sp_id = sp_id, sp_label = taxa_sci, scientific_name = taxa_sci,
+            common_name_src = taxa_common, is_guild = rank != "Species",
+            guild_note = if_else(rank != "Species", str_remove(taxa_doc, ";$"), NA_character_),
+            ms_merge_key = if_else(rank == "Species", paste0("ms_merge|", sp_id), NA_character_),
+            match_by = if_else(rank == "Species", "worms id", NA_character_))
+
+# --- nc: common name → BirdLife, then scientific name, then a curated override
+bl <- read_csv(glue("{dir_dist}/model_bl.csv")) |>
+  transmute(sisid = as.character(sisid), bl_sci = sci_name, bl_common = common)
+norm <- function(x) str_to_lower(str_replace_all(x, "[^A-Za-z]", ""))
+nc_override <- tribble(
+  ~sp_code, ~sisid,     ~note,
+  "HERG",   "62030590", "American herring gull = BirdLife Larus smithsonianus (the GBIF name L. argentatus is the European species)")
+nc_tx <- nc_xw |> filter(sp_code %in% nc_models$sp_code) |>
+  mutate(is_guild = sp_code %in% nc_multi | str_detect(sp_code, "-") | !str_detect(sp_scientific, " ") |
+                    str_detect(sp_common, "spp\\.|/"),
+         k_common = norm(sp_common), k_sci = norm(sp_scientific)) |>
+  left_join(bl |> mutate(k_common = norm(bl_common)) |> select(k_common, sis_common = sisid), by = "k_common") |>
+  left_join(bl |> mutate(k_sci = norm(bl_sci)) |> select(k_sci, sis_sci = sisid), by = "k_sci") |>
+  left_join(nc_override, by = "sp_code") |>
+  mutate(match_by = case_when(!is.na(sisid) ~ "override", !is.na(sis_common) ~ "common name",
+                              !is.na(sis_sci) ~ "scientific name", TRUE ~ NA_character_),
+         sisid = coalesce(sisid, sis_common, sis_sci)) |>
+  left_join(bl, by = "sisid") |>
+  transmute(ds_key = "nc", sp_id = sp_code, ingest_sp_id = gbif_id, sp_label = sp_code, scientific_name = sp_scientific,
+            common_name_src = sp_common, is_guild,
+            guild_note = if_else(is_guild, sp_common, NA_character_),
+            ms_merge_key = if_else(!is_guild & !is.na(sisid), paste0("ms_merge|BOTW:", sisid), NA_character_),
+            match_by = if_else(is_guild, NA_character_, match_by), gbif_id, sisid, bl_sci, bl_common, note)
+write_csv(nc_tx |> select(sp_code = sp_id, sp_common = common_name_src, nc_scientific = scientific_name,
+                          gbif_id, is_guild, match_by, sisid, botw_scientific = bl_sci,
+                          botw_common = bl_common, ms_merge_key, note),
+          here("data/nc_taxon_crosswalk.csv"), na = "")
+
+# --- the atlas side: scoring attributes, merge id, input datasets
+taxa0 <- bind_rows(gm_tx, nc_tx |> select(-gbif_id, -sisid, -bl_sci, -bl_common, -note))
+duckdb_register(con, "taxa0", taxa0)
+taxa <- dbGetQuery(con, "
+  SELECT x.*, t.scientific_name AS atlas_name, t.common_name, t.sp_cat, t.extrisk_code, t.er_score,
+         t.er_mode, t.is_valid_usa, t.is_marine, t.n_usa, m.mkey_id, f.has_range, f.has_suit,
+         (SELECT string_agg(DISTINCT ds_key, ',' ORDER BY ds_key) FROM sdm.taxon_model tm
+            WHERE tm.ms_merge_key = x.ms_merge_key) AS datasets
+  FROM taxa0 x
+  LEFT JOIN sdm.taxon t      ON t.ms_merge_key = x.ms_merge_key
+  LEFT JOIN mrg.mkey_map m   ON m.ms_merge_key = x.ms_merge_key
+  LEFT JOIN mrg.taxon_flags f ON f.ms_merge_key = x.ms_merge_key") |>
+  mutate(eligible = !is_guild & !is.na(mkey_id) & coalesce(is_valid_usa, FALSE) & coalesce(is_marine, FALSE),
+         status = case_when(is_guild ~ "guild / species group",
+                            is.na(ms_merge_key) ~ "no BirdLife match",
+                            is.na(mkey_id) ~ "not a v9 taxon",
+                            !coalesce(is_valid_usa, FALSE) ~ "not valid in US",
+                            !coalesce(is_marine, FALSE) ~ "culled as non-marine",
+                            TRUE ~ "eligible")) |>
+  arrange(ds_key, scientific_name)
+duckdb_unregister(con, "taxa0")
+# the NMFS-DPS taxa merge through dps_sql() with a per-cell ER; none of these should be one
+stopifnot("a density taxon is also an NMFS-DPS taxon (er_mode = 'cell'): extend the dist branch first" =
+            !any(taxa$er_mode[taxa$eligible] == "cell", na.rm = TRUE))
+
+kable(taxa |> count(ds_key, status) |> pivot_wider(names_from = ds_key, values_from = n, values_fill = 0),
+      caption = "Density-model taxa by dataset and eligibility for the fold-in")
+kable(taxa |> filter(!eligible) |> select(ds_key, sp_label, scientific_name, atlas_name, status, guild_note, datasets),
+      caption = "The taxa that cannot fold in as they stand — a species group needs an attribution rule (exclude, share, or duplicate across members); an unmatched name needs a crosswalk row")
+```
+
+```{r}
+#| label: taxa-eligible
+
+tx <- taxa |> filter(eligible)
+kable(tx |> transmute(ds_key, sp_label, atlas_name, common_name, sp_cat, extrisk_code, er_score, er_mode,
+                      datasets, n_usa, match_by),
+      caption = "Eligible taxa: the v9 governing extinction-risk score (er_score; MMPA floor 20 for marine mammals, MBTA floor 10 for birds), how their ER enters the score (er_mode), and the datasets already feeding their merged surface")
+```
+
+## Methods {#sec-methods}
+
+### Transforms onto [0,100] {#sec-transforms}
+
+Four monotone transforms of the annual mean density, all from `msens::density_to_suit()`:
+
+| transform | rule | keeps | precedent |
+|---|---|---|---|
+| **cap** | `100 · min(d / q₀.₉₉₅, 1)` — linear, 100 at the 99.5th percentile of positive density | proportionality: Σ val ∝ abundance below the cap | the v8 ingests; percentile ceilings in cumulative-impact mapping [@halpernRecentPaceChange2019] |
+| **log** | linear in log d between the 1st and 99.5th percentiles | the ordering; compresses the tail | `ln(density)` before combining species [@bradburyMappingSeabirdSensitivity2014]; `log(x+1)` then rescale [@halpernSpatialTemporalChanges2015] |
+| **ud** | 100 − % of the modelled population in cells strictly denser than this one | the population percentile: `val ≥ 100 − p` is exactly the p % core | utilization-distribution isopleths [@fiebergQuantifyingHomerangeOverlap2005; @laverCriticalReviewHome2008]; MDAT's 50 % cumulative-abundance core areas on these same Duke/NCCOS surfaces [@curticeMarinelifeDataAnalysis2019]; percentile ranks of density [@kelseyCollisionDisplacementVulnerability2018] |
+| **qmap** | quantile-map the density distribution onto the taxon's own AquaMaps/AquaX values over the same cells | the ordering *and* the incumbent's marginal, so the fold-in redistributes rather than re-levels | quantile mapping / histogram matching [@cannonBiasCorrectionGCM2015; @gudmundssonTechnicalNoteDownscaling2012], with its known limits [@maraunBiasCorrectingClimate2016; @maraunBiasCorrectionQuantile2013] |
+
+`qmap` needs an incumbent suitability surface inside the domain. All 13 species-level `gm` taxa have
+one (AquaMaps and AquaX); the `nc` birds have none — the atlas' bird surfaces are BirdLife ranges valued
+at the MBTA floor — so for them `qmap` falls back to `cap` and the table says so. The transforms are
+computed over each model's **domain**: for `nc` every modelled cell, for `gm` the modelled hexagons
+inside the US study area (the dataset's own metadata warns that its extrapolation beyond US waters
+should be "interpreted with caution").
+
+```{r}
+#| label: transforms
+
+# density per eligible taxon on the grid's ocean cells (the merge and the score never see land
+# cells); gm restricted to in_usa, nc to its modelled cells
+dens_tx <- bind_rows(
+  gm_annual |> inner_join(tx |> filter(ds_key == "gm") |> select(taxa_sci = scientific_name, ms_merge_key), by = "taxa_sci") |>
+    transmute(ms_merge_key, ds_key = "gm", cell_id, dens),
+  nc_annual |> inner_join(tx |> filter(ds_key == "nc") |> select(sp_code = sp_id, ms_merge_key), by = "sp_code") |>
+    transmute(ms_merge_key, ds_key = "nc", cell_id, dens))
+duckdb_register(con, "dens_tx_r", dens_tx)
+dbExecute(con, "CREATE OR REPLACE TABLE dens AS
+  SELECT d.ms_merge_key, d.ds_key, d.cell_id, d.dens, c.area_km2, c.in_usa
+  FROM dens_tx_r d JOIN sdm.cell c USING (cell_id)
+  WHERE d.ds_key = 'nc' OR c.in_usa")
+duckdb_unregister(con, "dens_tx_r")
+dbExecute(con, "CREATE OR REPLACE TABLE tx_dom AS SELECT DISTINCT ms_merge_key, cell_id FROM dens")
+dbExecute(con, "CREATE OR REPLACE TABLE us_cells AS SELECT cell_id FROM sdm.cell WHERE in_usa")
+
+# the v9 merge inputs of these taxa (post-supersession: am is already gone inside the AquaX mask),
+# trimmed to the US cells up front: every rule below is per cell and the surface compared is the
+# US scoring surface, so the trim changes nothing and spares scanning the birds' global ranges
+parts <- paste0("'", dir_parts, "/mkey_id=", tx$mkey_id, "/*.parquet'", collapse = ", ")
+dbExecute(con, glue("CREATE OR REPLACE TABLE inputs AS
+  SELECT i.ms_merge_key, i.ds_key, i.cell_id, i.val
+  FROM read_parquet([{parts}], hive_partitioning = true) i JOIN us_cells u USING (cell_id)"))
+dbExecute(con, glue("CREATE OR REPLACE TABLE taxon AS
+  SELECT ms_merge_key, er_score FROM sdm.taxon WHERE ms_merge_key IN ({paste(sprintf(\"'%s'\", tx$ms_merge_key), collapse = ',')})"))
+dbExecute(con, glue("CREATE OR REPLACE TABLE taxon_flags AS
+  SELECT * FROM mrg.taxon_flags WHERE ms_merge_key IN ({paste(sprintf(\"'%s'\", tx$ms_merge_key), collapse = ',')})"))
+
+# reference distribution for qmap: the taxon's own suitability inside its domain
+ref_df  <- dbGetQuery(con, glue("SELECT i.ms_merge_key, i.cell_id, max(i.val) AS val
+  FROM inputs i JOIN tx_dom t USING (ms_merge_key, cell_id) WHERE i.ds_key IN ({suit_in}) GROUP BY 1, 2"))
+dens_df <- dbGetQuery(con, "SELECT ms_merge_key, ds_key, cell_id, dens, area_km2 FROM dens ORDER BY 1, 3")
+transforms <- c("cap", "log", "ud", "qmap")
+tf <- dens_df |> group_by(ms_merge_key, ds_key) |>
+  group_modify(function(x, k) {
+    ref   <- ref_df$val[ref_df$ms_merge_key == k$ms_merge_key]
+    qm_ok <- length(ref) >= 100
+    bind_rows(lapply(transforms, function(m) tibble(
+      cell_id = x$cell_id, transform = m,
+      val = switch(m,
+        cap  = density_to_suit(x$dens, "cap"),
+        log  = density_to_suit(x$dens, "log"),
+        ud   = density_to_suit(x$dens, "ud", area = x$area_km2),
+        qmap = if (qm_ok) density_to_suit(x$dens, "qmap", ref = ref) else density_to_suit(x$dens, "cap")),
+      qmap_ref_n = length(ref))))
+  }) |> ungroup() |> filter(val > 0)
+duckdb_register(con, "tf_r", tf)
+dbExecute(con, "CREATE OR REPLACE TABLE dens_suit AS SELECT ms_merge_key, ds_key, cell_id, transform, val FROM tf_r")
+duckdb_unregister(con, "tf_r")
+
+# per-taxon transform diagnostics
+tf_diag <- tf |> group_by(ms_merge_key, transform) |>
+  summarise(n = n(), mean_val = round(mean(val), 1), median_val = round(median(val), 1),
+            pct_ge50 = round(100 * mean(val >= 50), 1), qmap_ref_n = first(qmap_ref_n), .groups = "drop") |>
+  left_join(tx |> select(ms_merge_key, ds_key, sp_label, common_name), by = "ms_merge_key")
+kable(tf_diag |> group_by(ds_key, transform) |>
+        summarise(taxa = n(), mean_val = round(median(mean_val), 1), median_val = round(median(median_val), 1),
+                  pct_ge50 = round(median(pct_ge50), 1), qmap_fallback = sum(qmap_ref_n < 100), .groups = "drop"),
+      caption = "How each transform distributes a taxon's domain over [0,100] (medians across taxa of the per-taxon mean, median and share of cells ≥ 50); qmap_fallback = taxa with no incumbent suitability inside the domain, mapped with cap instead")
+```
+
+```{r}
+#| label: fig-transforms
+#| fig-cap: "The four transforms on two species: value against annual density (log axis) and the resulting distribution of values across the domain, beside the incumbent v9 suitability at the same cells. cap keeps proportionality and leaves most cells low; ud is as bottom-heavy in cell counts (the population lives in few cells) but ranks the top cells by the share they hold; log alone spreads the bulk of the domain across the scale; qmap reproduces the incumbent's marginal (AquaX paints the Gulf dolphins at a mean near 90). The gannet has no incumbent surface, so its qmap is cap."
+#| fig-width: 11
+#| fig-height: 7
+
+show <- tx |> filter(sp_label %in% c("Tursiops truncatus", "NOGA")) |> select(ms_merge_key, common_name)
+pd <- tf |> inner_join(show, by = "ms_merge_key") |>
+  inner_join(dens_df |> select(ms_merge_key, cell_id, dens), by = c("ms_merge_key", "cell_id"))
+pr <- ref_df |> inner_join(show, by = "ms_merge_key") |> mutate(transform = "incumbent (v9 suitability)")
+set.seed(1)
+p1 <- ggplot(pd |> filter(dens > 0) |> group_by(common_name, transform) |> slice_sample(n = 4000) |> ungroup(),
+             aes(dens, val, colour = transform)) +
+  geom_point(size = 0.4, alpha = 0.35) +
+  scale_x_log10(labels = label_number()) + facet_wrap(~ common_name, scales = "free_x") +
+  labs(x = expression(annual~density~(km^-2)), y = "val [0,100]", colour = NULL) + theme_minimal()
+p2 <- ggplot(bind_rows(pd |> select(common_name, transform, val), pr |> select(common_name, transform, val)),
+             aes(val, after_stat(density), colour = transform)) +
+  geom_freqpoly(binwidth = 5, linewidth = 0.8) + facet_wrap(~ common_name) +
+  labs(x = "val", y = "share of cells", colour = NULL) + theme_minimal()
+p1 / p2 + plot_layout(guides = "collect") & theme(legend.position = "bottom")
+```
+
+### Mosaic rules and the extinction-risk treatment {#sec-mosaic}
+
+The density-derived surface joins the taxon's other inputs as one more **suitability** dataset
+(`merge_sql(suit_ds = c("am", "ax", "gm"))`) — the merge rules themselves are untouched. What varies:
+
+- **`max`** — the density value simply competes with AquaMaps/AquaX at every cell (`max()` over
+  suitability datasets, then `max(er, ·)` over the range footprint). Density can only *raise* a cell.
+- **`replace`** — inside the taxon's density domain its AquaMaps/AquaX cells are dropped first
+  (`msens::supersede_sql()`, the v9 AquaX-over-AquaMaps precedent), so the survey model's lows are
+  lows; outside the domain the incumbents carry on. This is the regional-inside-global nesting of
+  @pearsonModellingSpeciesDistributions2004, with the seam at the domain boundary.
+- **`range`** vs **`union`** footprint — the merge masks every suitability input to the taxon's expert
+  range, so a density cell outside the BirdLife or IUCN range is dropped like an AquaMaps cell would be.
+  A survey-based density is presence evidence of a different order than an envelope prediction, so M8
+  and M9 admit the density domain to the range footprint (the way `dps_nmfs` designations join the ER
+  footprint), valued at `max(er, density)` inside it.
+- **`fit`** vs **`dist`** — the plain rule values the range footprint at `max(er, suit)` (the "fitting
+  point"), so density is invisible wherever ER ≥ the density value: everywhere for an Endangered
+  species. `dist` is the NMFS-DPS treatment [`msens::dps_sql()`]: the merged value *is* the
+  distribution (`coalesce(suit, er)`) and the ER is applied in the score as the weight, exactly as it
+  already is for every other taxon (`extrisk = er × val / 100`). Sea turtles keep their own
+  multiplicative rule (`msens::turtle_sql()`, ER already baked in) under every method.
+
+```{r}
+#| label: methods-table
+
+methods <- tribble(
+  ~method, ~transform, ~mosaic,   ~er,    ~footprint, ~what,
+  "M0",    NA,         "none",    "fit",  "range", "v9 status quo (density excluded) — reproduced here from the same inputs and asserted equal",
+  "M1",    "cap",      "max",     "fit",  "range", "naive fold-in: cap-scaled density competes with AquaMaps/AquaX by max()",
+  "M2",    "cap",      "replace", "fit",  "range", "cap-scaled density supersedes AquaMaps/AquaX inside its domain",
+  "M3",    "log",      "replace", "fit",  "range", "as M2 with the log transform",
+  "M4",    "ud",       "replace", "fit",  "range", "as M2 with the population-percentile (utilization-distribution) transform",
+  "M5",    "qmap",     "replace", "fit",  "range", "as M2 with density quantile-mapped onto the taxon's own incumbent suitability (cap where none)",
+  "M6",    "cap",      "replace", "dist", "range", "M2 with the distribution treatment: merged value = the distribution, ER weights the score",
+  "M7",    "ud",       "replace", "dist", "range", "M4 with the distribution treatment",
+  "M8",    "ud",       "replace", "fit",  "union", "M4 with the density domain admitted to the taxon's range footprint (a surveyed cell is presence)",
+  "M9",    "ud",       "replace", "dist", "union", "M7 with the density domain admitted to the range footprint")
+kable(methods, caption = "The methods compared. Every method uses the unchanged msens merge rules; they differ only in the transform, in whether the incumbents are superseded inside the density domain, in whether the ER floor is applied to the merged value, and (M8, M9) in whether the density domain counts as part of the taxon's range footprint rather than being masked by it.")
+```
+
+```{r}
+#| label: merge
+
+# one taxon × one method: assemble the merge input `b`, run the rule the taxon merges under, keep the
+# US-trimmed surface. Rules are msens (unit-tested); this only wires them.
+turtle_keys <- dbGetQuery(con, glue("SELECT DISTINCT ms_merge_key FROM inputs WHERE ds_key = '{turtle_ds}'"))$ms_merge_key
+merge_one <- function(key, ds, method, transform, mosaic, er, footprint = "range") {
+  suit_all <- if (is.na(transform)) suit_ds else c(suit_ds, ds)
+  suit_sql <- paste(sprintf("'%s'", suit_all), collapse = ", ")
+  drop_sql <- if (mosaic == "replace") glue("AND NOT (ds_key IN ({suit_in}) AND cell_id IN
+                 (SELECT cell_id FROM tx_dom WHERE ms_merge_key = '{key}'))") else ""
+  dens_sql <- if (!is.na(transform)) glue("UNION ALL SELECT ms_merge_key, ds_key, cell_id, val
+                 FROM dens_suit WHERE ms_merge_key = '{key}' AND transform = '{transform}'") else ""
+  # union footprint: the density domain joins the range datasets (a non-suitability ds_key, so
+  # merge_sql's b_range and the dist branch's er_range both take it; the turtle rule ignores it)
+  fp_sql   <- if (footprint == "union" && !is.na(transform)) glue("UNION ALL SELECT ms_merge_key, '{ds}_dom' AS ds_key, cell_id, 1.0 AS val
+                 FROM tx_dom WHERE ms_merge_key = '{key}'") else ""
+  dbExecute(con, glue("CREATE OR REPLACE TABLE b AS
+    SELECT ms_merge_key, ds_key, cell_id, val FROM inputs WHERE ms_merge_key = '{key}' {drop_sql} {dens_sql} {fp_sql}"))
+  if (key %in% turtle_keys) {
+    # premultiplied rule, whole range, then the US trim; the density enters as a suitability dataset
+    sql <- glue("SELECT t.mdl_key, t.cell_id, t.val, 100.0 AS er FROM ({msens::turtle_sql(turtle_ds, suit_all, ch_ds, src = 'b')}) t
+                 JOIN us_cells u ON t.cell_id = u.cell_id")
+  } else if (er == "dist") {
+    # distribution treatment: the range footprint valued at the taxon's ER is the 'er' dataset of
+    # dps_sql(); val = coalesce(suit, er), er beside it (a constant here: no DPS structure)
+    dbExecute(con, glue("CREATE OR REPLACE TABLE dps_src AS
+      SELECT b.ms_merge_key, 'er_range' AS ds_key, b.cell_id, t.er_score AS val
+      FROM b JOIN taxon t USING (ms_merge_key) WHERE b.ds_key NOT IN ({suit_sql})
+      UNION ALL SELECT ms_merge_key, ds_key, cell_id, val FROM b WHERE ds_key IN ({suit_sql})"))
+    sql <- glue("SELECT d.mdl_key, d.cell_id, d.val, d.er FROM ({msens::dps_sql('er_range', suit_all, src = 'dps_src')}) d
+                 JOIN us_cells u ON d.cell_id = u.cell_id")
+  } else {
+    msq <- msens::merge_sql(suit_all)
+    dbExecute(con, msq$b_range); dbExecute(con, msq$b_am_rng)
+    sql <- glue("SELECT s.mdl_key, s.cell_id, s.val, t.er_score AS er FROM ({msq$us}) s JOIN taxon t ON t.ms_merge_key = s.mdl_key")
+  }
+  dbExecute(con, glue("INSERT INTO merged SELECT '{method}', mdl_key, cell_id, val, er FROM ({sql})"))
+}
+
+have_merged <- "merged" %in% dbListTables(con) &&
+  dbGetQuery(con, "SELECT count(DISTINCT method) n FROM merged")$n == nrow(methods)
+if (!have_merged) {
+  t0 <- Sys.time()
+  dbExecute(con, "CREATE OR REPLACE TABLE merged (method VARCHAR, mdl_key VARCHAR, cell_id INTEGER, val DOUBLE, er DOUBLE)")
+  for (i in seq_len(nrow(tx))) for (j in seq_len(nrow(methods)))
+    merge_one(tx$ms_merge_key[i], tx$ds_key[i], methods$method[j], methods$transform[j], methods$mosaic[j], methods$er[j], methods$footprint[j])
+  log_info("merged {nrow(tx)} taxa × {nrow(methods)} methods in {round(as.numeric(Sys.time() - t0, units = 'mins'), 1)} min")
+}
+n_merged <- dbGetQuery(con, "SELECT method, count(*) AS n_cells, count(DISTINCT mdl_key) AS n_taxa FROM merged GROUP BY 1 ORDER BY 1")
+kable(n_merged, caption = "US scoring-surface rows per method")
+```
+
+### The status quo reproduces v9 exactly
+
+The harness is only trustworthy if M0 — the same inputs through the same rules with no density —
+returns the v9 `model_cell` surface of every one of these taxa, cell for cell. It does:
+
+```{r}
+#| label: check-m0
+
+keys_sql <- paste(sprintf("'%s'", tx$ms_merge_key), collapse = ",")
+chk <- dbGetQuery(con, glue("
+  WITH a AS (SELECT mdl_key, cell_id, val FROM merged WHERE method = 'M0'),
+       b AS (SELECT mdl_key, cell_id, val FROM sdm.model_cell WHERE mdl_key IN ({keys_sql}))
+  SELECT (SELECT count(*) FROM (SELECT * FROM a EXCEPT SELECT * FROM b)) AS only_in_m0,
+         (SELECT count(*) FROM (SELECT * FROM b EXCEPT SELECT * FROM a)) AS only_in_v9,
+         (SELECT count(*) FROM a) AS n_m0, (SELECT count(*) FROM b) AS n_v9"))
+kable(chk, caption = "M0 vs v9 model_cell over the eligible taxa (set difference, both directions)")
+stopifnot("M0 must reproduce v9's model_cell exactly — the harness cannot be trusted otherwise" =
+            chk$only_in_m0 == 0 && chk$only_in_v9 == 0)
+```
+
+## What each method does to a species surface {#sec-species}
+
+```{r}
+#| label: species-stats
+
+# per (method, taxon): inside the density domain — cells, mean value before/after, the share of
+# cells sitting at the ER floor, and the rank agreement between the merged value and the density
+sp_stats <- dbGetQuery(con, "
+  WITH dom AS (SELECT d.ms_merge_key, d.cell_id, d.dens FROM dens d JOIN us_cells u USING (cell_id)),
+       m0  AS (SELECT mdl_key, cell_id, val FROM merged WHERE method = 'M0'),
+       j   AS (SELECT mm.method, dom.ms_merge_key AS mdl_key, dom.cell_id, dom.dens, m.val AS val_after, z.val AS val_before, t.er_score
+               FROM dom CROSS JOIN (SELECT DISTINCT method FROM merged) mm
+               LEFT JOIN merged m ON m.method = mm.method AND m.mdl_key = dom.ms_merge_key AND m.cell_id = dom.cell_id
+               LEFT JOIN m0 z ON z.mdl_key = dom.ms_merge_key AND z.cell_id = dom.cell_id
+               JOIN taxon t ON t.ms_merge_key = dom.ms_merge_key),
+       r   AS (SELECT *, rank() OVER (PARTITION BY method, mdl_key ORDER BY val_after) AS rk_val,
+                         rank() OVER (PARTITION BY method, mdl_key ORDER BY dens) AS rk_dens
+               FROM j WHERE val_after IS NOT NULL),
+       rho AS (SELECT method, mdl_key, corr(rk_val, rk_dens) AS rho FROM r GROUP BY 1, 2)
+  SELECT j.method, j.mdl_key,
+         count(*) AS n_dom, count(val_after) AS n_after, count(val_before) AS n_before,
+         round(100.0 * count(val_after) / count(*), 1) AS pct_in_range,
+         round(avg(val_before), 1) AS mean_before, round(avg(val_after), 1) AS mean_after,
+         round(100.0 * count(*) FILTER (WHERE val_after = er_score) / count(val_after), 1) AS pct_at_floor,
+         round(any_value(rho.rho), 3) AS rho
+  FROM j LEFT JOIN rho USING (method, mdl_key) GROUP BY 1, 2") |>
+  left_join(tx |> select(mdl_key = ms_merge_key, ds_key, sp_label, common_name, er_score, sp_cat), by = "mdl_key")
+```
+
+The Spearman rank correlation `rho` between the merged value and the density, over the domain cells
+the merged surface carries, is the direct measure of whether the survey model shows through: 1 means
+the merged surface *is* the density (re-scaled); 0 means it is invisible. `pct_in_range` is the share
+of the density domain the merged surface can carry at all: the merge masks every suitability input to
+the taxon's expert range, and the density is no exception — a NCCOS surface that runs to the EEZ is
+trimmed to the BirdLife marine range, the SEFSC surface to the IUCN range.
+
+```{r}
+#| label: tbl-species-summary
+#| tbl-cap: "Inside the density domain, by dataset and method (medians across taxa): rank agreement of the merged value with density (rho, over the cells the surface carries), the share of the domain inside the taxon's range mask, the mean merged value before (v9) and after, and the share of carried cells left at the ER floor"
+
+kable(sp_stats |> filter(method != "M0") |> group_by(ds_key, method) |>
+        summarise(taxa = n(), rho_median = round(median(rho, na.rm = TRUE), 2), rho_min = round(min(rho, na.rm = TRUE), 2),
+                  pct_in_range = round(median(pct_in_range), 1),
+                  mean_before = round(median(mean_before, na.rm = TRUE), 1), mean_after = round(median(mean_after, na.rm = TRUE), 1),
+                  pct_at_floor = round(median(pct_at_floor, na.rm = TRUE), 1), .groups = "drop") |>
+        left_join(methods |> select(method, transform, mosaic, er, footprint), by = "method") |>
+        relocate(transform, mosaic, er, footprint, .after = method))
+```
+
+```{r}
+#| label: tbl-species-detail
+#| tbl-cap: "Per taxon: the share of the density domain inside the range mask, the v9 mean inside the domain and, for four methods, the rank agreement with density, the mean after, and the share of carried cells at the floor. Read the Endangered rows (er_score 100): under fit (M2, M4) every carried cell is at the floor and rho is undefined or negative; only the distribution treatment (M7) lets the survey model through; M8 admits the whole domain"
+
+kable(sp_stats |> filter(method %in% c("M2", "M4", "M7", "M8")) |>
+        select(ds_key, sp_label, common_name, er_score, pct_in_range, method, rho, mean_before, mean_after, pct_at_floor) |>
+        pivot_wider(names_from = method, values_from = c(rho, mean_after, pct_at_floor)) |>
+        arrange(ds_key, desc(er_score), sp_label))
+```
+
+## Species maps, before and after {#sec-maps}
+
+```{r}
+#| label: map-helpers
+
+# (cell_id, val) -> SpatRaster on the global grid, cropped to a lon/lat box
+cells_to_rast <- function(d, xlim, ylim) {
+  c0 <- floor((xlim[1] - grid$xmin) / grid$resx) + 1; c1 <- ceiling((xlim[2] - grid$xmin) / grid$resx)
+  r0 <- floor((grid$ymax - ylim[2]) / grid$resy) + 1; r1 <- ceiling((grid$ymax - ylim[1]) / grid$resy)
+  r <- rast(nrows = r1 - r0 + 1, ncols = c1 - c0 + 1,
+            xmin = grid$xmin + (c0 - 1) * grid$resx, xmax = grid$xmin + c1 * grid$resx,
+            ymin = grid$ymax - r1 * grid$resy,       ymax = grid$ymax - (r0 - 1) * grid$resy, crs = "EPSG:4326")
+  row <- (d$cell_id - 1) %/% grid$nc + 1; col <- (d$cell_id - 1) %% grid$nc + 1
+  keep <- row >= r0 & row <= r1 & col >= c0 & col <= c1
+  v <- rep(NA_real_, ncell(r)); v[(row[keep] - r0) * ncol(r) + (col[keep] - c0) + 1] <- d$val[keep]
+  r[] <- v; r
+}
+boxes <- list(gm  = list(xlim = c(-98, -80),  ylim = c(23.5, 31)),
+              atl = list(xlim = c(-82, -64),  ylim = c(24, 46)),
+              pac = list(xlim = c(-128, -116.5), ylim = c(31, 49)))
+zones_sf <- function(box) if (box == "atl") ply_er else ply_pa
+panel <- function(r, title, box, fill_lab = "val", log = FALSE) {
+  b <- boxes[[box]]
+  g <- ggplot() + geom_spatraster(data = r) +
+    geom_sf(data = land, fill = "grey85", colour = NA) +
+    geom_sf(data = zones_sf(box), fill = NA, colour = "grey30", linewidth = 0.25) +
+    coord_sf(xlim = b$xlim, ylim = b$ylim, expand = FALSE) +
+    labs(title = title, fill = fill_lab) +
+    theme_minimal(base_size = 9) + theme(axis.title = element_blank(), panel.grid = element_blank(),
+                                         legend.key.height = unit(0.5, "cm"))
+  if (log) g + scale_fill_viridis_c(option = "magma", transform = "log10", na.value = NA, labels = label_number())
+  else     g + scale_fill_viridis_c(limits = c(0, 100), na.value = NA)
+}
+species_fig <- function(key, box, after = c("M2", "M4", "M5", "M7")) {
+  t  <- tx |> filter(ms_merge_key == key)
+  m0 <- dbGetQuery(con, glue("SELECT cell_id, val FROM merged WHERE method = 'M0' AND mdl_key = '{key}'"))
+  dd <- dbGetQuery(con, glue("SELECT cell_id, dens AS val FROM dens WHERE ms_merge_key = '{key}' AND dens > 0"))
+  ps <- list(panel(cells_to_rast(m0, boxes[[box]]$xlim, boxes[[box]]$ylim), "v9 merged (M0)", box),
+             panel(cells_to_rast(dd, boxes[[box]]$xlim, boxes[[box]]$ylim), "annual density", box,
+                   fill_lab = expression(km^-2), log = TRUE))
+  for (mth in after) {
+    mm <- dbGetQuery(con, glue("SELECT cell_id, val FROM merged WHERE method = '{mth}' AND mdl_key = '{key}'"))
+    lab <- methods |> filter(method == mth)
+    ps[[length(ps) + 1]] <- panel(cells_to_rast(mm, boxes[[box]]$xlim, boxes[[box]]$ylim),
+                                  glue("{mth}: {lab$mosaic} · {lab$transform} · {lab$er}"), box)
+  }
+  wrap_plots(ps, ncol = 3) + plot_annotation(
+    title = glue("{t$common_name} ({t$atlas_name}) — {t$extrisk_code}, er_score {t$er_score}, inputs: {t$datasets}"))
+}
+key_of <- function(label) tx$ms_merge_key[tx$sp_label == label]
+```
+
+### Gulf of America (`gm`)
+
+```{r}
+#| label: fig-gm-bottlenose
+#| fig-cap: "Common bottlenose dolphin: an MMPA-floored species (er 20) with AquaMaps + AquaX + IUCN range. The v9 surface (top left) is AquaX suitability at a mean near 90; the SEFSC density (top middle) resolves the shelf and the Mississippi delta; replacement with cap (M2) or ud (M4) lowers the level to the survey model's — three quarters of the Gulf sits at the floor of 20 — while qmap (M5) keeps AquaX's level and redistributes it, and the distribution treatment (M7) removes the floor so the deep-water lows read as lows."
+#| fig-width: 13
+#| fig-height: 7
+species_fig(key_of("Tursiops truncatus"), "gm")
+```
+
+```{r}
+#| label: fig-gm-sperm
+#| fig-cap: "Sperm whale, NMFS Endangered (er 100): under the fitting point (M2, M4, M5) the merged surface stays a flat 100 whatever the density; only the distribution treatment (M7) shows the slope-water concentration the survey model found."
+#| fig-width: 13
+#| fig-height: 7
+species_fig(key_of("Physeter macrocephalus"), "gm")
+```
+
+```{r}
+#| label: fig-gm-rice
+#| fig-cap: "Rice's whale, NMFS Endangered (er 100), inputs AquaX + NMFS core area + critical habitat + IUCN range: the SEFSC model is the only survey-based surface the atlas holds for it. Same story as the sperm whale: invisible under fit, visible under dist."
+#| fig-width: 13
+#| fig-height: 7
+species_fig(key_of("Balaenoptera ricei"), "gm")
+```
+
+```{r}
+#| label: fig-gm-kemps
+#| fig-cap: "Kemp's ridley (sea-turtle multiplicative rule, ER × suitability with critical habitat overriding): the density enters as the suitability term, so replacement with cap (M2) or ud (M4) lowers the Gulf from AquaX's level (mean 87) to the survey model's (mean 18–20) while keeping the shelf structure; qmap (M5) keeps the level. M7 is M4 for turtles (their rule has no separate dist branch)."
+#| fig-width: 13
+#| fig-height: 7
+species_fig(key_of("Lepidochelys kempii"), "gm")
+```
+
+### Atlantic and Pacific seabirds (`nc`)
+
+For every bird here the v9 surface is the BirdLife range at the MBTA floor (a flat 10), so `qmap` has
+no incumbent and M5 equals M2, and `max` (M1) equals M2 (nothing to supersede). The panels show the
+range-masked methods (M2, M4) beside the union-footprint ones (M8, M9): the difference between M4 and M8
+is the part of the survey model the BirdLife range would discard.
+
+```{r}
+#| label: fig-nc-gannet
+#| fig-cap: "Northern gannet (Atlantic, winter–spring shelf concentration; er 10): from a flat range to a graded surface under every method; cap (M2) leaves four fifths of the carried domain at the floor, ud (M4) three fifths; admitting the domain to the footprint (M8) recovers the offshore part of the NCCOS surface the BirdLife range excludes, and the distribution treatment (M9) lets its lows fall below the floor."
+#| fig-width: 13
+#| fig-height: 7
+species_fig(key_of("NOGA"), "atl", after = c("M2", "M4", "M8", "M9"))
+```
+
+```{r}
+#| label: fig-nc-murre
+#| fig-cap: "Common murre (Pacific; the most heavy-tailed density in the set, cap 17.9 km⁻²): cap and ud both leave a third of the carried domain at the floor — the colonies hold the population; the union footprint (M8) extends the surface to the whole NCCOS domain and the distribution treatment (M9) draws the offshore gradient."
+#| fig-width: 13
+#| fig-height: 7
+species_fig(key_of("COMU"), "pac", after = c("M2", "M4", "M8", "M9"))
+```
+
+```{r}
+#| label: fig-nc-petrel
+#| fig-cap: "Black-capped petrel (Atlantic, FWS Endangered, er 100): the one Endangered bird with an NCCOS surface; under fit (M2, M4, M8) it stays a flat 100 like the sperm whale; only M9 shows the Gulf Stream concentration the survey model found."
+#| fig-width: 13
+#| fig-height: 7
+species_fig(key_of("BCPE"), "atl", after = c("M2", "M4", "M8", "M9"))
+```
+
+```{r}
+#| label: fig-nc-murrelet
+#| fig-cap: "Marbled murrelet (Pacific, FWS Threatened, er 50): the floor binds over half the scale, so under fit (M2, M4) the carried cells sit at 50 and the survey model is invisible; the union footprint (M8) adds the offshore domain — at the floor; only the distribution treatment (M9) shows the nearshore concentration."
+#| fig-width: 13
+#| fig-height: 7
+species_fig(key_of("MAMU"), "pac", after = c("M2", "M4", "M8", "M9"))
+```
+
+### The seam at the domain boundary {#sec-boundary}
+
+Replacement changes values only inside the density domain, so whatever the transform does to the
+*level* of the surface appears as a step at the boundary. The difference maps show it for the
+bottlenose dolphin: `cap` (M2) lowers most of the Gulf against the AquaX values beyond the domain edge
+(a step down at the boundary); `qmap` (M5) keeps the incumbent's marginal so the step is only where the
+two models disagree about *where* the animals are.
+
+```{r}
+#| label: fig-seam
+#| fig-cap: "Bottlenose dolphin, merged value minus the v9 value (blue = lower, red = higher) under cap replacement (M2), qmap replacement (M5) and the ud distribution treatment (M7). The Gulf domain boundary is the eastern edge of the SEFSC hexagon grid at the Florida Straits."
+#| fig-width: 13
+#| fig-height: 4
+
+key <- key_of("Tursiops truncatus")
+seam_panel <- function(mth) {
+  d <- dbGetQuery(con, glue("
+    SELECT coalesce(m.cell_id, z.cell_id) AS cell_id, coalesce(m.val, 0) - coalesce(z.val, 0) AS val
+    FROM (SELECT cell_id, val FROM merged WHERE method = '{mth}' AND mdl_key = '{key}') m
+    FULL JOIN (SELECT cell_id, val FROM merged WHERE method = 'M0' AND mdl_key = '{key}') z USING (cell_id)"))
+  b <- boxes$gm
+  ggplot() + geom_spatraster(data = cells_to_rast(d, b$xlim, b$ylim)) +
+    scale_fill_distiller(palette = "RdBu", limits = c(-100, 100), na.value = NA, direction = 1) +
+    geom_sf(data = land, fill = "grey85", colour = NA) +
+    geom_sf(data = ply_pa, fill = NA, colour = "grey30", linewidth = 0.25) +
+    coord_sf(xlim = b$xlim, ylim = b$ylim, expand = FALSE) +
+    labs(title = glue("{mth} − M0"), fill = "Δ val") + theme_minimal(base_size = 9) +
+    theme(axis.title = element_blank(), panel.grid = element_blank())
+}
+wrap_plots(lapply(c("M2", "M5", "M7"), seam_panel), ncol = 3)
+```
+
+## What each method does to the scores {#sec-scores}
+
+The scoring is re-run for each method the way `score_cell_metrics` and `score_zone_metrics` do it —
+the category sums `extrisk_{cat} = Σ er × val / 100` move only by the affected taxa's deltas, then
+every category is min–max rescaled per ecoregion, the equal-weight composite is the mean of the
+present components, and zones take the coverage-weighted mean with the `pct_area` down-weight. The
+baseline is recomputed from `cell_metric` by the same code and asserted equal to the published
+`zone_metric`, so the method columns are comparable to it.
+
+```{r}
+#| label: rescore
+
+# taxon weights as score_cell_metrics applies them (no 'cell'-mode taxa here, asserted above)
+dbExecute(con, "CREATE OR REPLACE TABLE w AS
+  SELECT t.ms_merge_key, t.sp_cat, CASE WHEN t.er_mode = 'premultiplied' THEN 100.0 ELSE t.er_score END AS w
+  FROM sdm.taxon t WHERE t.ms_merge_key IN (SELECT DISTINCT mdl_key FROM merged)")
+# Δ extrisk per (method, category, cell) = Σ_taxa w × (val_method − val_M0) / 100
+dbExecute(con, "CREATE OR REPLACE TABLE delta AS
+  WITH m AS (SELECT method, mdl_key, cell_id, val FROM merged WHERE method <> 'M0'),
+       z AS (SELECT mdl_key, cell_id, val FROM merged WHERE method = 'M0'),
+       u AS (SELECT method, mdl_key, cell_id FROM m
+             UNION SELECT mm.method, z.mdl_key, z.cell_id FROM z CROSS JOIN (SELECT DISTINCT method FROM m) mm)
+  SELECT u.method, w.sp_cat, u.cell_id, sum(w.w * (coalesce(m.val, 0) - coalesce(z.val, 0))) / 100.0 AS d
+  FROM u LEFT JOIN m USING (method, mdl_key, cell_id) LEFT JOIN z USING (mdl_key, cell_id)
+  JOIN w ON w.ms_merge_key = u.mdl_key GROUP BY 1, 2, 3")
+
+# base metrics of the release, keyed by category; the baseline is method 'M0' with no delta
+base_keys <- paste(sprintf("'extrisk_%s'", sp_cats), collapse = ",")
+dbExecute(con, glue("CREATE OR REPLACE TABLE base AS
+  SELECT cm.cell_id, replace(m.metric_key, 'extrisk_', '') AS sp_cat, cm.val
+  FROM sdm.cell_metric cm JOIN sdm.metric m USING (metric_seq) WHERE m.metric_key IN ({base_keys})"))
+dbExecute(con, "CREATE OR REPLACE TABLE base_new AS
+  WITH mm AS (SELECT DISTINCT method FROM merged),
+       k  AS (SELECT mm.method, b.cell_id, b.sp_cat FROM base b CROSS JOIN mm
+              UNION SELECT method, cell_id, sp_cat FROM delta)
+  SELECT k.method, k.cell_id, k.sp_cat, coalesce(b.val, 0) + coalesce(d.d, 0) AS val
+  FROM k LEFT JOIN base b USING (cell_id, sp_cat) LEFT JOIN delta d USING (method, cell_id, sp_cat)")
+
+# ecoregion min/max → per-cell rescale (coverage-normalized across ecoregions), as score_cell_metrics
+dbExecute(con, "CREATE OR REPLACE TABLE eco AS
+  SELECT zc.cell_id, zc.zone_seq, zc.pct_covered * 100.0 / sum(zc.pct_covered) OVER (PARTITION BY zc.cell_id) AS norm_pct
+  FROM sdm.zone_cell zc JOIN sdm.zone z USING (zone_seq) WHERE z.fld = 'ecoregion_key'")
+dbExecute(con, "CREATE OR REPLACE TABLE rescaled AS
+  WITH mm AS (SELECT bn.method, bn.sp_cat, e.zone_seq, min(bn.val) AS min_v, max(bn.val) AS max_v
+              FROM base_new bn JOIN eco e USING (cell_id) GROUP BY 1, 2, 3)
+  SELECT bn.method, bn.sp_cat AS component, bn.cell_id,
+         sum((bn.val - mm.min_v) / (mm.max_v - mm.min_v) * (e.norm_pct / 100.0)) * 100 AS val
+  FROM base_new bn JOIN eco e USING (cell_id)
+  JOIN mm ON mm.method = bn.method AND mm.sp_cat = bn.sp_cat AND mm.zone_seq = e.zone_seq
+  WHERE mm.min_v < mm.max_v GROUP BY 1, 2, 3
+  UNION ALL
+  SELECT mm.method, 'primprod', cm.cell_id, cm.val
+  FROM sdm.cell_metric cm JOIN sdm.metric m USING (metric_seq) CROSS JOIN (SELECT DISTINCT method FROM merged) mm
+  WHERE m.metric_key = 'primprod_ecoregion_rescaled'")
+dbExecute(con, "CREATE OR REPLACE TABLE composite AS
+  SELECT method, cell_id, round(avg(val)) AS val FROM rescaled GROUP BY 1, 2")
+
+# zones: component → zone (coverage-weighted mean × pct_area), composite = mean of present components
+dbExecute(con, "CREATE OR REPLACE TABLE zone_comp AS
+  WITH zc AS (SELECT zc.zone_seq, zc.cell_id, zc.pct_covered, z.fld, z.val AS zone FROM sdm.zone_cell zc JOIN sdm.zone z USING (zone_seq)),
+       cov AS (SELECT zone_seq, sum(pct_covered) AS cov_all FROM zc GROUP BY 1)
+  SELECT r.method, zc.fld, zc.zone, r.component,
+         sum(r.val * zc.pct_covered) / sum(zc.pct_covered) * (sum(zc.pct_covered) / any_value(cov.cov_all)) AS val
+  FROM zc JOIN rescaled r USING (cell_id) JOIN cov USING (zone_seq)
+  GROUP BY 1, 2, 3, 4")
+zone_scores <- dbGetQuery(con, "
+  SELECT method, fld, zone, avg(val) AS score FROM zone_comp GROUP BY 1, 2, 3 ORDER BY 2, 3, 1")
+
+# the baseline must equal the published zone_metric composite (the same SQL, so the method columns
+# are comparable to what the apps show)
+pub <- dbGetQuery(con, "SELECT z.fld, z.val AS zone, zm.val AS score_pub FROM sdm.zone z JOIN sdm.zone_metric zm USING (zone_seq)
+  JOIN sdm.metric m USING (metric_seq) WHERE m.metric_key = 'score_extriskspcat_primprod_ecoregionrescaled_equalweights'")
+chk_z <- zone_scores |> filter(method == "M0") |> inner_join(pub, by = c("fld", "zone")) |> mutate(d = abs(score - score_pub))
+stopifnot("the recomputed M0 zone composite must equal the published zone_metric" = nrow(chk_z) == nrow(pub), max(chk_z$d) < 1e-3)
+```
+
+```{r}
+#| label: tbl-zones
+
+# the involved areas: zones whose cells intersect a density domain
+involved <- dbGetQuery(con, "
+  SELECT DISTINCT z.fld, z.val AS zone FROM sdm.zone z JOIN sdm.zone_cell zc USING (zone_seq)
+  JOIN (SELECT DISTINCT cell_id FROM dens) d USING (cell_id)")
+zone_names <- bind_rows(
+  ply_pa |> st_drop_geometry() |> transmute(fld = "programarea_key", zone = programarea_key, name = programarea_name),
+  ply_er |> st_drop_geometry() |> transmute(fld = "ecoregion_key", zone = ecoregion_key, name = ecoregion_name),
+  tibble(fld = "subregion_key", zone = c("AK", "AT", "GA", "PA", "USA"),
+         name = c("Alaska", "Atlantic", "Gulf of America", "Pacific", "United States")))
+zt <- zone_scores |> inner_join(involved, by = c("fld", "zone")) |>
+  pivot_wider(names_from = method, values_from = score) |>
+  mutate(across(starts_with("M"), ~ round(.x, 1))) |>
+  left_join(zone_names, by = c("fld", "zone")) |>
+  mutate(fld = str_remove(fld, "_key")) |> relocate(name, .after = zone) |> arrange(fld, zone)
+kable(zt, caption = "Composite score of every zone that intersects a density domain: v9 (M0) and each method. Program Areas: GAA/GAB (Gulf), CEC/NOC/SOC (Pacific); the Atlantic has no 2026 Program Area, so its ecoregions (NECS, SECS) and subregion carry the Atlantic seabird effect.")
+```
+
+```{r}
+#| label: tbl-zone-delta
+#| tbl-cap: "Program-Area composite, each method against v9: mean and maximum absolute change over the 20 areas (the same statistics the release gate msens::pra_score_delta reports; v8→v9 AquaX moved them by mean 4.0 / max 9.0)"
+
+# the version-equivalence gate numbers, per method, over the 20 Program Areas (msens::score_delta)
+pa0 <- zone_scores |> filter(method == "M0", fld == "programarea_key") |> transmute(programarea_key = zone, score)
+gate <- bind_rows(lapply(setdiff(methods$method, "M0"), function(m) {
+  pa <- zone_scores |> filter(method == m, fld == "programarea_key") |> transmute(programarea_key = zone, score)
+  d  <- msens::score_delta(pa0, pa, labels = c("v9", m))
+  s  <- msens::score_delta_summary(d)
+  tibble(method = m, n_pa = s$n, mean_abs = round(s$mean_abs, 2), max_abs = round(s$max_abs, 2),
+         max_at = d$programarea_key[1], rmse = round(s$rmse, 2))
+})) |> left_join(methods |> select(method, transform, mosaic, er), by = "method")
+kable(gate)
+```
+
+```{r}
+#| label: tbl-zone-components
+
+comp <- dbGetQuery(con, "SELECT method, fld, zone, component, val FROM zone_comp WHERE component IN ('mammal','turtle','bird')") |>
+  inner_join(involved, by = c("fld", "zone")) |>
+  mutate(val = round(val, 1)) |>
+  pivot_wider(names_from = method, values_from = val) |>
+  mutate(fld = str_remove(fld, "_key")) |> arrange(component, fld, zone)
+kable(comp, caption = "The three affected components (ecoregion-rescaled, coverage-weighted, pct_area-weighted) per involved zone and method")
+g_m <- function(m, col) gate[[col]][gate$method == m]
+cv <- function(component_, zone_, m) {
+  x <- dbGetQuery(con, glue("SELECT val FROM zone_comp WHERE component = '{component_}' AND zone = '{zone_}' AND method = '{m}'"))$val
+  round(x, 1)
+}
+```
+
+**What the tables say.** No method moves any Program-Area composite by more than
+`r max(gate$max_abs)` points (`r gate$max_at[which.max(gate$max_abs)]`, under
+`r gate$method[which.max(gate$max_abs)]`), against the mean 4.0 / max 9.0 the v8→v9 AquaX change
+produced (`data/manifests/score_zone_metrics.json`) — the density fold-in is a *within-region redistribution*, not a re-levelling of the
+atlas. Three effects carry the table:
+
+- **Replacement lowers the Gulf mammal component** from `r cv("mammal", "GAA", "M0")` (v9) to
+  `r cv("mammal", "GAA", "M2")`–`r cv("mammal", "GAA", "M4")` in GAA under cap, log or ud, because
+  AquaX paints the Gulf dolphins at a mean near 90 and the survey models' relative densities average
+  25–35. `max` (M1: `r cv("mammal", "GAA", "M1")`) leaves it untouched, and qmap (M5:
+  `r cv("mammal", "GAA", "M5")`) keeps the level by construction. Which of these is *right* is the
+  seam question of § @sec-boundary: the survey model says most of the Gulf holds few dolphins per km²
+  relative to the delta and shelf edge; AquaX says most of the Gulf is environmentally fine.
+- **The distribution treatment moves the most** (M6 mean `r g_m("M6", "mean_abs")`, M7
+  `r g_m("M7", "mean_abs")` over the 20 areas) because it also removes the floor of the Endangered
+  species — the sperm whale and Rice's whale stop contributing a flat 100 across the Gulf — and lifts
+  the Atlantic mammal component (SECS `r cv("mammal", "SECS", "M0")` → `r cv("mammal", "SECS", "M7")`)
+  by the same rescaling.
+- **The ecoregional min–max rescale amplifies small input changes.** The turtle component of GAB
+  ranges from `r min(c(cv("turtle","GAB","M2"), cv("turtle","GAB","M3"), cv("turtle","GAB","M4"), cv("turtle","GAB","M5")))`
+  to `r max(c(cv("turtle","GAB","M2"), cv("turtle","GAB","M3"), cv("turtle","GAB","M4"), cv("turtle","GAB","M5")))`
+  across transforms (v9 `r cv("turtle", "GAB", "M0")`) although the four turtle surfaces themselves
+  change similarly under all of them: the transform decides which cell holds the ecoregion's maximum,
+  and every other cell is rescaled against it. This is the fragility the v7.1 patch met and the v10
+  distribution-share method removes; it is not a property of the density data.
+
+- **The expert-range mask discards most of a seabird's survey model.** The merge masks every
+  suitability input to the taxon's range, and for a typical `nc` bird only
+  `r round(sp_stats |> filter(ds_key == "nc", method == "M4") |> pull(pct_in_range) |> median(na.rm = TRUE))` %
+  of the NCCOS domain lies inside its BirdLife marine range (@tbl-species-summary); the `gm` taxa's IUCN
+  ranges cover their whole Gulf domain. Admitting the domain to the footprint (M8 vs M4) is what turns
+  the seabird fold-in from a nearshore retouch into a shelf-wide surface: the Northeast-shelf bird
+  component goes `r cv("bird", "NECS", "M4")` → `r cv("bird", "NECS", "M8")`, the Pacific
+  `r cv("bird", "PA", "M4")` → `r cv("bird", "PA", "M8")`.
+
+The seabird components otherwise move less than the mammals' because the v9 bird surfaces are flat
+MBTA floors and the density adds structure without a level to lose.
+
+## Temporal resolution: what the annual mean hides {#sec-temporal}
+
+Both sources are monthly or seasonal; the scoring surface is annual. The ratio of the peak interval's
+domain-mean density to the annual mean says how much a static surface understates the season that
+matters for a take estimate — NMFS authorizations use the *highest seasonal mean* density, not the
+annual [@nmfsBluepointWindIHA2023], and the choice of temporal resolution should follow the ecology
+[@mannocciTemporalResolutionsSpecies2017].
+
+```{r}
+#| label: tbl-temporal
+
+gm_t <- gm_cells |> group_by(taxa_sci, mm) |> summarise(dens = mean(dens), .groups = "drop") |>
+  group_by(taxa_sci) |> summarise(n_intervals = n(), peak = max(dens), peak_interval = mm[which.max(dens)],
+                                  annual = sum(dens) / 12, .groups = "drop") |>
+  transmute(ds_key = "gm", taxon = taxa_sci, n_intervals, peak_interval, peak_over_annual = round(peak / annual, 1))
+nc_t <- nc_cells |> group_by(sp_code, region, season) |> summarise(dens = mean(dens), .groups = "drop") |>
+  group_by(sp_code, region) |> summarise(n_intervals = n(), peak = max(dens), peak_interval = season[which.max(dens)],
+                                         annual = sum(dens) / 4, .groups = "drop") |>
+  transmute(ds_key = "nc", taxon = glue("{sp_code} ({region})"), n_intervals, peak_interval, peak_over_annual = round(peak / annual, 1))
+tt <- bind_rows(gm_t, nc_t)
+kable(tt |> group_by(ds_key) |> summarise(models = n(), ratio_median = median(peak_over_annual), ratio_max = max(peak_over_annual),
+        modelled_all_intervals = sum(n_intervals == if_else(ds_key[1] == "gm", 12, 4))),
+      caption = "Peak-interval domain-mean density over the annual mean: a ratio of 4 (a species present one season of four) is the factor by which the annual surface understates the season a take estimate would use")
+kable(tt |> arrange(desc(peak_over_annual)) |> head(15), caption = "The 15 most seasonal models")
+```
+
+## Audit of the v8/v9 ingests {#sec-audit}
+
+Re-deriving the density exposed two faults in the ingested `dist/dataset={gm,nc}` surfaces that hold
+whatever method is adopted:
+
+1. **`gm`: raw density rounded to two decimals before rescaling.** `cells_from_raster()` rounds `val`
+   to the atlas' [0,100] precision; the gm ingest passed it *density* (0.001–0.01 km^-2^ for the beaked
+   whales, sperm whale, Rice's whale, *Kogia*), so every cell below 0.005 became 0 and the survivors
+   were quantized to 0.01 — then divided by a p99.5 cap smaller than that. The published beaked-whale
+   and Rice's-whale surfaces are a flat 100 over a fraction of their domain and the sperm whale sits
+   at 90. Fixed by `cells_from_raster(digits = )` (msens 0.45.0, regression test in `test-ingest.R`);
+   the ingest should rescale before calling it, as the nc ingest does.
+2. **Both: the annual mean averaged only the intervals a cell was present in**, which biases every
+   annual cell upward, most for the sparsest species. `msens::density_annual()` counts an absent
+   interval as zero.
+
+```{r}
+#| label: tbl-audit
+
+# the ingested annual surface vs this page's cap transform of the re-derived annual density, per taxon
+ing <- dbGetQuery(con, glue("
+  SELECT split_part(mdl_key, '|', 1) AS ds_key, split_part(mdl_key, '|', 2) AS sp_id, cell_id, val
+  FROM read_parquet(['{dir_dist}/dataset=gm/*.parquet', '{dir_dist}/dataset=nc/*.parquet'])
+  WHERE mdl_key NOT LIKE '%|%|%'"))
+duckdb_register(con, "ing_r", ing)
+duckdb_register(con, "tx_r", tx |> select(ms_merge_key, ds_key, sp_id = ingest_sp_id))
+audit <- dbGetQuery(con, "
+  WITH t AS (SELECT ms_merge_key, ds_key, sp_id FROM tx_r),
+       re AS (SELECT s.ms_merge_key, s.cell_id, s.val FROM dens_suit s WHERE s.transform = 'cap'),
+       n_re AS (SELECT ms_merge_key, count(*) AS n_rederived FROM re GROUP BY 1),
+       j  AS (SELECT t.ds_key, t.sp_id, t.ms_merge_key, i.cell_id, i.val AS val_ing, re.val AS val_re
+              FROM t LEFT JOIN (SELECT i.* FROM ing_r i JOIN us_cells u USING (cell_id)) i
+                ON i.ds_key = t.ds_key AND i.sp_id = t.sp_id
+              LEFT JOIN re ON re.ms_merge_key = t.ms_merge_key AND re.cell_id = i.cell_id),
+       r  AS (SELECT *, rank() OVER (PARTITION BY sp_id ORDER BY val_ing) AS rk_ing,
+                        rank() OVER (PARTITION BY sp_id ORDER BY val_re) AS rk_re FROM j WHERE val_re IS NOT NULL)
+  SELECT j.ds_key, j.sp_id, count(DISTINCT j.cell_id) AS n_ingested, any_value(n_re.n_rederived) AS n_rederived,
+         round(100.0 * count(*) FILTER (WHERE j.val_ing >= 100) / nullif(count(j.val_ing), 0), 1) AS pct_ingested_at_100,
+         (SELECT round(corr(rk_ing, rk_re), 2) FROM r WHERE r.sp_id = j.sp_id) AS rho_shared
+  FROM j LEFT JOIN n_re USING (ms_merge_key)
+  GROUP BY 1, 2 ORDER BY 1, pct_ingested_at_100 DESC")
+duckdb_unregister(con, "ing_r"); duckdb_unregister(con, "tx_r")
+kable(audit |> left_join(tx |> select(sp_id = ingest_sp_id, sp_label, common_name), by = "sp_id") |>
+        relocate(sp_label, common_name, .after = sp_id) |> select(-sp_id),
+      caption = "Ingested annual surface vs the re-derived one, US cells: cells, the share of ingested cells at exactly 100, and the rank agreement on shared cells. A gm row at 100 % is the rounding fault (the sperm whale's constant 90 gives no rank); a large gap between n_ingested and n_rederived is the ≥ 1 threshold on a heavy-tailed cap transform dropping most of the domain (n_rederived keeps every cell with val > 0)")
+```
+
+## Caveats and concerns {#sec-caveats}
+
+**Density and suitability are different quantities, and the literature says the mapping between them
+is weak.** Niche-model suitability predicts at best the *upper limit* of local abundance
+[@vanderwalAbundanceEnvironmentalNiche2009]; across hundreds of species the correlation between the two
+is small and often absent [@dallasHabitatSuitabilityEstimated2018; @weberThereCorrelationAbundance2017;
+@leeyawSpeciesDistributionModels2022]. AquaMaps' own authors describe RES as an index validated only
+against encounter rates — a rank relationship [@kaschnerMappingWorldwideDistributions2006;
+@kaschnerCurrentFuturePatterns2011]. Every transform here is therefore a *rank-preserving
+convention*, not a conversion; what a merged surface can honestly claim after the fold-in is "where the
+species is concentrated", which is exactly what the survey models add and the envelope models lack.
+
+**The NCCOS Atlantic surfaces are explicitly an index, not individuals per km².** The 2018 report
+defines its response as "relative density … proportional to the expected number of birds per unit
+area, but … not the actual number" [@winship2018]; the Pacific report says the same of its nominal
+individuals km^-2^ [@leirness2021]. So for `nc` there is no absolute scale to preserve, the
+`cap` transform's proportionality buys nothing, and a percentile or population-share transform is the
+natural reading. Note also that NCCOS has since superseded the Atlantic surfaces with monthly 10 km
+models on data through 2020 [@winshipModelingDistributionsMarine2023]: the `nc` Atlantic ingest should
+move to them before it is scored.
+
+**Abundance-proportional transforms are dominated by their tails.** With `cap`, the median cell of most
+species sits below 15 (@tbl-species-summary, @fig-transforms): a Program Area's mammal component would
+be driven by a few colony- or delta-adjacent cells while the rest of the domain reads like absence.
+This is the reason the cumulative-impact literature log-transforms or percentile-caps heavy-tailed
+layers before combining them [@halpernSpatialTemporalChanges2015; @halpernRecentPaceChange2019;
+@stockEffectsModelAssumptions2016], and why MDAT's ocean-planning products on these very surfaces are
+cumulative-abundance core areas [@curticeMarinelifeDataAnalysis2019]. The `ud` transform is that
+convention made per cell; note that it is just as bottom-heavy in *cell counts* as `cap` — the
+population lives in few cells — and differs in ranking the top cells by the share they hold rather
+than by a ratio to an arbitrary percentile. Any fixed isopleth is a communication choice, not a
+biological one [@wilsonAccountingIndividualsUncertainty2010]. In the scores the three
+non-calibrated transforms are nearly interchangeable (@tbl-zone-delta); the transform is a decision
+about what the *map* means, not about the composite.
+
+**Max-merging is not an ensemble rule.** Consensus methods take a central tendency or a weighted mean
+[@araujoEnsembleForecastingSpecies2007; @marmionEvaluationConsensusMethods2009]; a per-cell maximum
+can only raise a surface, so the survey model's *absences* — often its most decision-relevant
+content — never enter (M1 in @tbl-species-summary). Replacement inside the domain (the v9 AquaX
+precedent) lets them in, at the price of a seam; the data-integration literature would rather fit
+one model to both sources than stitch two outputs [@fletcherPracticalGuideCombining2019;
+@isaacDataIntegrationLargescale2020; @millerRecentPastPromising2019;
+@pacificiIntegratingMultipleData2017], and hierarchical nesting of a fine regional model inside a
+coarse envelope is the established compromise [@pearsonModellingSpeciesDistributions2004;
+@tallutoCrossscaleIntegrationKnowledge2016].
+
+**Quantile mapping preserves a marginal, not a meaning.** It keeps the incumbent's level so the seam
+nearly vanishes (@fig-seam), but it inherits whatever the incumbent's distribution encodes, cannot fix
+what the density model got wrong, and can manufacture spatial artefacts when the two resolutions differ
+[@maraunBiasCorrectingClimate2016; @maraunBiasCorrectionQuantile2013; @cannonBiasCorrectionGCM2015]. It
+is also undefined for the range-only birds, which is most of `nc`.
+
+**The range mask was designed for envelope models, not surveys.** Masking AquaMaps to an expert
+range is the v6 lesson (the `iucn_range_outside_us_eez` exclusion); applied to a survey-based density
+it discards evidence of presence — seven tenths of a typical NCCOS domain — because BirdLife's marine
+ranges are drawn conservatively along the coast. A surveyed cell with a modelled density should count as
+presence (M8/M9), which is how the NMFS designations already join the DPS footprint; the price is that the
+"range" of these taxa then carries the survey domain's own boundary.
+
+**Regional models stop at their survey boundary.** The SEFSC surfaces extrapolate beyond US waters
+and say so [@litzCetaceanSeaTurtle2022]; density surface models should not be pushed outside surveyed
+covariate space [@millerSpatialModelsDistance2013; @bouchetDsmextraExtrapolationAssessment2020;
+@yatesOutstandingChallengesTransferability2018]. This page limits `gm` to the US study area; the seam
+that leaves at the Florida Straits (@fig-seam) is real and should be shown, not smoothed. The SEFSC
+shelf and oceanic models also meet at the 200 m isobath — a modelling boundary, not a biological one,
+that produced an artificial low-risk band in Gulf wind-siting work [@farmerProtectedSpeciesConsiderations2023].
+
+**The extinction-risk floor is the largest effect in the table, and it is a scoring convention, not a
+density question.** Under the current rule an Endangered species contributes a flat 100 across its
+range; folding density in changes nothing for it (@tbl-species-detail). If the point of scoring these
+surfaces is to show *where* protected species concentrate — the PBR and permitting use — the
+distribution treatment (`dist`) is the only option that does, and it is the treatment v9 already gives
+the 19 NMFS-DPS species. Extending it to every taxon is a v10-scale decision that the distribution-share
+method already moves toward (the share of a species' distribution in a zone is a density-like quantity).
+
+**Species groups, stocks and PBR.** Seven SEFSC and nine NCCOS surfaces are groups; attributing a
+group's density to one member overstates it (the ingest's `Ziphius` for all beaked whales) and
+duplicating it across members overcounts. PBR itself is a stock-level scalar built from a stock-wide
+N~min~ [@wadeCalculatingLimitsAllowable1998; @nmfsGuidelinesPreparingStock2023]; density surfaces enter
+the *other* side of that ledger, exposure and take. A single bottlenose surface spans the 37 Gulf stocks
+NMFS manages [@garrisonBottlenoseDolphinStock2024; @hayesUSAtlanticGulf2024], which is why take notices
+split it at the 20 m isobath — a per-species merged surface cannot be read as a per-stock one.
+
+**Uncertainty is available and unused.** Every SEFSC hexagon carries a CV and every NCCOS COG a CV band;
+neither reaches the merge. High-CV cells are where the models extrapolate [@litzCetaceanSeaTurtle2022],
+and a fold-in that ignores them treats an extrapolated 0.001 and a surveyed 1.0 alike.
+
+**Survey era.** The SEFSC surfaces are 2015–2019 climatology of 2003–2019 surveys; the NCCOS Pacific
+data run 1980–2017 and the Atlantic 1978–2016. Rice's whale, whose entire population is ~50 animals
+[@roselNewSpeciesBaleen2021], is the case where a decade-old survey mean and a current core area can
+disagree.
+
+## Recommendation {#sec-recommendation}
+
+1. **Adopt `replace` as the mosaic rule and `ud` as the transform** (M8 now, M9 with v10): the
+   density's ordering is what the survey model contributes, the population-share scale is the one
+   ocean planners already use on these surfaces (MDAT core areas), it is scale-free (so the `nc`
+   index caveat does not bite), and it needs no incumbent (so birds and mammals get the same
+   treatment). The composites are insensitive to the choice among cap, log and ud
+   (@tbl-zone-delta); the choice is about what a cell value *means*. Keep the density itself as the
+   native representation the species app draws.
+2. **Admit the density domain to the taxon's range footprint** (M8/M9): a surveyed cell with a
+   modelled density is presence, and the BirdLife marine ranges would otherwise discard about 70 % of the
+   NCCOS surfaces.
+3. **Fold density in only under the distribution treatment for the taxa whose ER floor exceeds their
+   typical value** — or, more consistently, treat the density-modelled taxa the way v9 treats the
+   NMFS-DPS taxa (`er_mode = 'cell'` with a constant per-cell ER) so the merged model is the
+   distribution. Without this the fold-in is a no-op for exactly the Endangered species it is meant for.
+4. **Fix the two ingest faults first** (rescale before `cells_from_raster()`, or pass `digits`; annual
+   mean over all intervals via `density_annual()`), re-ingest `gm` and `nc`, and replace the Atlantic
+   `nc` surfaces with the 2023 NCCOS models. Store the density itself as the native representation and
+   the transform's parameters per model in `model_{ds}.csv`.
+5. **Decide the species-group rule with the providers** (exclude; attribute to the single Gulf member
+   where there is one — pilot whales → short-finned pilot whale; share equally otherwise) and commit
+   `data/nc_taxon_crosswalk.csv` as the BirdLife crosswalk for `nc`.
+6. **Gate the release on `pra_score_delta`** as v9 was, expecting the Gulf and Pacific Program Areas
+   and the Atlantic ecoregions to move by the amounts in @tbl-zone-delta and nothing else to move.
+7. Publish the seasonal surfaces beside the annual one and carry the CV bands; the annual merged surface
+   is the score's input, not the take estimate's.
+
+```{r}
+#| label: close
+dbDisconnect(con, shutdown = TRUE)
+```
