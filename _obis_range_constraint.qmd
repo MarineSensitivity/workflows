@@ -1,0 +1,820 @@
+## Why
+
+The six sea turtles and the North Atlantic right whale all have a published OBIS (MPA Europe)
+species distribution model on exactly our `global05` grid
+(`s3://obis-maps/sdm/species/taxonid={AphiaID}/model=mpaeu/`). A model surface is not a range: the
+loggerhead model calls tens of thousands of Alaska cells suitable, and the v9 right whale surface (the
+IUCN range at a flat 100) covers the Gulf. This notebook scores five candidate rules for turning a
+model surface into a range, on **one scorecard**, by **polygon** (Program Areas and US EEZ
+subregions, not latitude / longitude boxes), using only what OBIS published, so nothing here needs a
+refit.
+
+| | candidate | needs a refit |
+|---|---|---|
+| A | OBIS's own recipe: threshold P10, inside the convex hull of fitted records, keeping only patches within 100 km of a record | no |
+| B | Tim White's buffer around occurrences: 150, 250, 400 km | no |
+| C | the v7.1 rule: AquaMaps suitability of 0.5 or more inside the range, critical habitat kept | no |
+| D | threshold plus uncertainty: value minus one bootstrap spread clears the threshold; not an extrapolation | provisional here |
+| E | D plus the regional test with search effort | provisional here |
+
+The notebook takes one parameter, `model`. With `mpaeu` (the default) it scores OBIS's published
+models, and D and E are **provisional**: their threshold is the published P10, which is fitted on
+training data. With one of our own runs (`og`, `ogm`, a control) the threshold of D and E is the
+**held-out** one, from the fold predictions our patched pipeline saves. The rule itself is the same
+either way and lives in `msens` (`R/range.R`, `tests/testthat/test-range.R`), which this notebook
+only calls.
+
+```{mermaid}
+flowchart LR
+  obis["published OBIS models<br/>ensemble, bootstrap sd,<br/>masks, MESS, thresholds, points"] --> cell["og_cell<br/>one row per species x cell"]
+  v9["v9 inputs on global05<br/>AquaMaps, IUCN / SWOT ranges,<br/>critical habitat"] --> cell
+  sg["speciesgrids<br/>OBIS + GBIF records<br/>per species x cell"] --> eff["search effort<br/>target-group records"]
+  zones["zone_cell<br/>Program Areas, EEZ subregions"] --> reg["regions"]
+  cell --> rules["rules A to E<br/>msens::range_*"]
+  eff --> rules
+  reg --> rules
+  rules --> card["scorecard<br/>species x region x rule"]
+```
+
+```{r}
+#| label: setup
+librarian::shelf(
+  arrow, DBI, dplyr, duckdb, FNN, fs, glue, here, jsonlite, knitr, msens, purrr, readr, stringr,
+  terra, tibble, tidyr,
+  quiet = T)
+options(readr.show_col_types = F, knitr.kable.NA = "")
+source(here("libs/paths.R"))
+
+stopifnot("msens >= 0.54.0 has the range rule" = packageVersion("msens") >= "0.54.0")
+
+# inputs ----
+dir_sdm   <- path_expand("~/_big/sdm")
+dir_obis  <- glue("{dir_sdm}/obis")              # scripts/og/fetch_obis_published.sh (S3 layout kept)
+dir_v9in  <- glue("{dir_sdm}/v9_inputs")         # v9 input surfaces, fetched below from the public store
+dir_card  <- glue("{dir_sdm}/scorecard")         # this notebook's working tables
+MODEL     <- params$model
+is_pub    <- MODEL == "mpaeu"
+lbl       <- if (is_pub) "published" else MODEL   # names this run's tables and csv files
+stopifnot(grepl("^[a-z0-9]+$", MODEL))
+dir_mod   <- if (is_pub) glue("{dir_obis}/species") else path_expand(Sys.getenv("OG_OUT", glue("{dir_sdm}/og")))
+db_card   <- glue("{dir_card}/{lbl}.duckdb")
+db_sg     <- path_expand(glue("{dir_big}/speciesgrids_global05.duckdb"))
+atlas_url <- "https://s3.us-east-1.amazonaws.com/oceanmetrics.io-public/marine-atlas"
+dir_create(c(dir_v9in, dir_card, here("data/og")))
+
+redo <- Sys.getenv("REDO_OG_CELLS", "0") == "1"   # rebuild the cached cell table
+
+# species ----
+d_sp <- tribble(
+  ~taxon,  ~common,                       ~sci,                     ~grp,
+  137205L, "Loggerhead",                  "Caretta caretta",        "turtle",
+  137206L, "Green",                       "Chelonia mydas",         "turtle",
+  137207L, "Hawksbill",                   "Eretmochelys imbricata", "turtle",
+  137208L, "Kemp's ridley",               "Lepidochelys kempii",    "turtle",
+  137209L, "Leatherback",                 "Dermochelys coriacea",   "turtle",
+  220293L, "Olive ridley",                "Lepidochelys olivacea",  "turtle",
+  159023L, "North Atlantic right whale",  "Eubalaena glacialis",    "whale")
+ids_turtle <- c(137205L, 137206L, 137207L, 137208L, 137209L, 220293L, 344093L)  # + flatback
+
+# rule parameters (the same for every species) ----
+SENS      <- 0.90                # sensitivity the threshold fixes
+BUF_KM    <- c(150, 250, 400)    # rule B
+PATCH_KM  <- 100                 # rule A: OBIS's max_dispersal
+AM_MIN    <- 50                  # rule C: AquaMaps probability >= 0.5
+UNIT_AGG  <- 10L                 # regional test unit: 10 x 10 cells = 0.5 degree blocks
+ALPHA     <- 0.05
+RATIO     <- 0.25                # regional test: dropped only if the record rate is below this share of the rate elsewhere
+
+# a file of one species' model run, in the OBIS layout: {root}/taxonid={id}/model={MODEL}/{sub}/taxonid={id}_model={MODEL}_{tail}
+f_mod <- function(id, sub, tail, must = T) {
+  d <- glue("{dir_mod}/taxonid={id}/model={MODEL}/{sub}")
+  f <- dir_ls(d, regexp = glue("taxonid={id}_model={MODEL}_{tail}$"), fail = F)
+  if (must) stopifnot("expected exactly one file" = length(f) == 1)
+  if (length(f)) as.character(f[1]) else NA_character_
+}
+f_ens  <- function(id) glue("{dir_mod}/taxonid={id}/model={MODEL}/predictions/taxonid={id}_model={MODEL}_method=ensemble_scen=current_cog.tif")
+f_pub  <- function(id, s) glue("{dir_obis}/species/taxonid={id}/model=mpaeu/", glue(s, id = id))   # always OBIS's own files
+have   <- file_exists(map_chr(d_sp$taxon, f_ens))
+if (is_pub) stopifnot("run scripts/og/fetch_obis_published.sh first" = all(have))
+if (!all(have)) message("no ", MODEL, " run yet for: ", paste(d_sp$common[!have], collapse = ", "))
+d_sp   <- d_sp[have, ]
+stopifnot("no species has a run of this model" = nrow(d_sp) > 0)
+need   <- map_chr(d_sp$taxon, f_ens)
+
+g      <- grid_spec_for("global05")
+r_cid  <- rast(cellid_tif)
+stopifnot(
+  "the OBIS rasters are not on global05" = compareGeom(rast(need[1]), r_cid, stopOnError = F),
+  ncell(r_cid) == 7200 * 3600)
+# cell_id is the pixel index on this grid (asserted on a sample; the cell-id COG is a lookup image)
+local({
+  i <- seq(1, ncell(r_cid), length.out = 2e5) |> round()
+  v <- r_cid[i][, 1]
+  stopifnot(all(v[!is.na(v)] == i[!is.na(v)]))
+})
+unit_of <- function(cell_id, agg = UNIT_AGG) {   # block id of a global05 cell
+  row <- (cell_id - 1L) %/% 7200L; col <- (cell_id - 1L) %% 7200L
+  (row %/% agg) * (7200L %/% agg) + (col %/% agg)
+}
+```
+
+## Inputs
+
+### The models scored here (`r MODEL`)
+
+```{r}
+#| label: obis-meta
+d_meta <- map_dfr(d_sp$taxon, function(id) {
+  j  <- read_json(f_mod(id, ".", "what=log.json"))
+  th <- read_parquet(f_mod(id, "metrics", "what=thresholds.parquet")) |>
+    filter(model == "ensemble")
+  tibble(
+    taxon     = id,
+    hab_depth = unlist(j$hab_depth),
+    n_fit     = unlist(j$model_fit_points),
+    good      = paste(unlist(j$model_good), collapse = ", "),
+    thr_mtp   = th$mtp * 100,
+    thr_p10   = th$p10 * 100,
+    thr_sss   = th$max_spec_sens * 100)
+})
+d_sp <- left_join(d_sp, d_meta, by = "taxon")
+d_sp |>
+  select(common, taxon, hab_depth, n_fit, good, thr_mtp, thr_p10, thr_sss) |>
+  kable(digits = 0, caption = "Models scored. Thresholds are on the ensemble's 0 to 100 scale, all fitted on TRAINING data: minimum training presence, P10 (keeps 90 % of fitted records) and maximum sensitivity + specificity.")
+```
+
+### The threshold of rules D and E
+
+```{r}
+#| label: threshold
+# held-out predictions of each accepted algorithm, saved per fold by the patched pipeline
+# (metrics/..._method={m}_what=cvpred.parquet; cvpredtrain = the fold's model on its training rows).
+# the ensemble is the per-row median of the accepted algorithms, as on the map
+algo_file <- c(maxent = "maxent", rf = "rf_classification_ds", xgboost = "xgboost")
+cv_read <- function(id, what) {
+  good <- str_split_1(d_sp$good[d_sp$taxon == id], ", ")
+  map_dfr(good, ~ read_parquet(f_mod(id, "metrics", glue("method={algo_file[.x]}_what={what}\\.parquet"))) |> mutate(algo = .x))
+}
+cv_ens <- function(d) d |> summarise(pred = median(pred) * 100, .by = c(fold, idx, presence))
+if (is_pub) {
+  d_sp$thr <- d_sp$thr_p10
+  d_thr    <- NULL
+} else {
+  d_thr <- map_dfr(d_sp$taxon, function(id) {
+    te <- cv_read(id, "cvpred"); tr <- cv_read(id, "cvpredtrain")
+    stopifnot(n_distinct(count(te, algo)$n) == 1)   # the algorithms share rows and folds
+    h  <- heldout_threshold(cv_ens(te), cv_ens(tr), sens = SENS)
+    tibble(
+      taxon = id, thr = h$thr, sens = h$pooled$sens, spec = h$pooled$spec,
+      # what the training threshold of each fold delivers on the rows that fold never saw
+      train_thr = mean(h$folds$thr), train_thr_sens = sum(h$folds$tp) / sum(h$folds$tp + h$folds$fn),
+      folds = list(h$folds))
+  })
+  d_sp <- left_join(d_sp, select(d_thr, taxon, thr), by = "taxon")
+  write_csv(
+    d_thr |> select(taxon, folds) |> unnest(folds), here(glue("data/og/{lbl}_heldout_folds.csv")))
+}
+```
+
+```{r}
+#| label: threshold-table
+#| eval: !expr '!is_pub'
+d_thr |>
+  left_join(select(d_sp, taxon, common, thr_p10), by = "taxon") |>
+  transmute(
+    common, `training P10` = thr_p10, `held-out threshold` = thr,
+    `sensitivity` = sens, `specificity vs background` = spec,
+    `mean fold training threshold` = train_thr, `sensitivity it delivers held-out` = train_thr_sens) |>
+  kable(digits = c(0, 0, 1, 2, 2, 1, 2), caption = glue("The held-out threshold (keeps {100 * SENS} % of the presences each fold's model never saw) beside the training P10, ensemble scale 0 to 100. The last two columns fix the threshold on each fold's training rows and count on its test rows: the sensitivity a training threshold really delivers."))
+```
+
+`r if (is_pub) "For the published models no fold predictions exist, so rules D and E use the training P10." else "Rules D and E use the held-out threshold; P10 and rule A keep the training P10, as OBIS applies it."`
+
+### v9 input surfaces
+
+AquaMaps, the range polygons and critical habitat as v9 ingested them, already on `global05`, from the
+public content-addressed store (`tables/native_asset.parquet` names the COG of each input).
+
+```{r}
+#| label: v9-inputs
+f_na <- glue("{dir_card}/v9_native_asset.parquet")
+if (!file_exists(f_na)) download.file(glue("{atlas_url}/v9/tables/native_asset.parquet"), f_na, quiet = T, mode = "wb")
+d_asset <- read_parquet(f_na) |>
+  filter(
+    ms_merge_key %in% glue("ms_merge|WORMS:{d_sp$taxon}"),
+    asset_type == "cog", representation == "model") |>
+  mutate(
+    taxon = as.integer(str_extract(ms_merge_key, "[0-9]+$")),
+    file  = glue("{dir_v9in}/{taxon}/{ds_key}__{content_hash}.tif"))
+walk2(d_asset$asset_url, d_asset$file, function(u, f) {
+  if (file_exists(f)) return()
+  dir_create(path_dir(f)); download.file(u, f, quiet = T, mode = "wb")
+})
+# a v9 input as (cell_id, val) on global05, whatever window the COG was written on
+v9_cells <- function(id, ds) {
+  fs <- unique(d_asset$file[d_asset$taxon == id & d_asset$ds_key %in% ds])
+  if (!length(fs)) return(tibble(cell_id = numeric(), val = numeric()))
+  map_dfr(fs, function(f) {
+    r <- rast(f)[[1]]
+    stopifnot(all(abs(res(r) - 0.05) < 1e-6))   # float noise in the published geotransform
+    i <- which(!is.na(values(r, mat = F)))
+    tibble(cell_id = cellFromXY(r_cid, xyFromCell(r, i)), val = values(r, mat = F)[i])
+  }) |>
+    summarise(val = max(val), .by = cell_id)
+}
+d_asset |>
+  count(taxon, ds_key) |>
+  pivot_wider(names_from = ds_key, values_from = n) |>
+  left_join(select(d_sp, taxon, common), by = "taxon") |>
+  relocate(common) |>
+  kable(caption = "v9 inputs per species (number of surfaces). `ch_*` = critical habitat, `rng_*` = range polygons, `am` / `ax` = AquaMaps 1.0 / 2.0.")
+```
+
+### Regions, by polygon
+
+Program Areas (the 2026 program: 17 in Alaska, 3 off California, 2 in the Gulf, none in the Atlantic)
+grouped by BOEM region, and the four US EEZ subregions. Both come from the committed polygon-to-cell
+extractions (`zones/{zone_set}/global05/zone_cell.parquet`), the same tables scoring uses. The
+regional test runs on the four EEZ subregions, which tile US waters; the Program Area groups are
+reported beside them because that is where scores are published.
+
+```{r}
+#| label: regions
+d_pa <- sf::st_read(glue("{dir_big}/v2/ply_programareas_2026.gpkg"), quiet = T) |>
+  sf::st_drop_geometry() |>
+  select(zone_key = programarea_key, region_key)
+zc_pa <- read_parquet(glue("{dir_big}/zones/programarea_2026-01/global05/zone_cell.parquet")) |>
+  left_join(d_pa, by = "zone_key")
+zc_sr <- read_parquet(glue("{dir_big}/zones/subregion_2025-06/global05/zone_cell.parquet"))
+stopifnot(!anyNA(zc_pa$region_key), setequal(zc_sr$zone_key, c("AK", "AT", "GA", "PA")))
+
+lbl_rgn <- c(AK = "Alaska", AT = "Atlantic", GA = "Gulf", PA = "Pacific")
+d_scregion <- bind_rows(
+  zc_pa |> distinct(region = paste("PA", lbl_rgn[region_key]), cell_id),
+  zc_sr |> distinct(region = paste("EEZ", lbl_rgn[zone_key]),  cell_id))
+d_region <- zc_sr |> distinct(region = paste("EEZ", lbl_rgn[zone_key]), cell_id)   # the rule's regions
+d_scregion |> count(region, name = "cells") |>
+  kable(format.args = list(big.mark = ","), caption = "Regions on the scorecard. `PA` = Program Areas of a BOEM region, `EEZ` = US EEZ subregion (the Pacific one includes Hawaii and the Pacific islands).")
+```
+
+### Records and search effort
+
+*Records* of a species are OBIS's quality-controlled points for it (one per cell, 1950 on; the file
+the published model was fitted from). *Search effort* is where somebody recorded the species'
+**target group**: a cell with any such record was looked at by someone who would have reported the
+species. Two definitions, because the answer depends on it:
+
+- `order`: the species' own order. All sea turtles for a turtle, all cetaceans for the right whale.
+- `mega`: every air-breathing marine vertebrate (birds, mammals, turtles). Seabird and marine mammal
+  surveys record turtles and whales when they see them.
+
+Effort comes from `speciesgrids` (OBIS + GBIF records per species and `global05` cell).
+
+```{r}
+#| label: effort
+con_sg <- dbConnect(duckdb(), db_sg, read_only = T)
+d_spl  <- read_csv(glue("{dir_obis}/source/model=mpaeu/data/all_splist_20240724.csv"))
+ids_cetacean <- d_spl |> filter(class == "Mammalia", order == "Cetartiodactyla") |> pull(taxonID) |> unique()
+
+sg_cells <- function(where) dbGetQuery(con_sg, glue("SELECT DISTINCT cell_id FROM sg_cell WHERE {where}"))$cell_id
+eff <- list(
+  order = list(
+    turtle = sg_cells(glue("aphia IN ({paste(ids_turtle, collapse = ',')})")),
+    whale  = sg_cells(glue("aphia IN ({paste(ids_cetacean, collapse = ',')})"))),
+  mega  = local({
+    x <- sg_cells(glue("class IN ('Aves', 'Mammalia') OR aphia IN ({paste(ids_turtle, collapse = ',')})"))
+    list(turtle = x, whale = x)
+  }))
+dbDisconnect(con_sg, shutdown = T)
+
+d_occ <- map_dfr(d_sp$taxon, function(id) {
+  read_parquet(glue("{dir_obis}/source/model=mpaeu/data/species/key={id}.parquet")) |>
+    transmute(taxon = id, lon = decimalLongitude, lat = decimalLatitude, data_type)
+}) |>
+  mutate(cell_id = as.integer(cellFromXY(r_cid, cbind(lon, lat))))
+d_fit <- map_dfr(d_sp$taxon, function(id) {
+  read_parquet(f_mod(id, ".", "what=fitocc.parquet")) |>
+    transmute(taxon = id, lon = decimalLongitude, lat = decimalLatitude)
+}) |>
+  mutate(cell_id = as.integer(cellFromXY(r_cid, cbind(lon, lat))))
+
+tibble(
+  effort = c("order: sea turtles", "order: cetaceans", "mega: birds + mammals + turtles"),
+  n_species = c(length(ids_turtle), length(ids_cetacean), NA),
+  cells  = c(length(eff$order$turtle), length(eff$order$whale), length(eff$mega$turtle))) |>
+  mutate(us_cells = c(
+    sum(eff$order$turtle %in% zc_sr$cell_id), sum(eff$order$whale %in% zc_sr$cell_id), sum(eff$mega$turtle %in% zc_sr$cell_id))) |>
+  kable(format.args = list(big.mark = ","), caption = "Searched cells by effort definition (global, and inside the US EEZ).")
+```
+
+## Cell table
+
+One row per species and cell that any rule could keep: the model's value, its bootstrap spread, the
+extrapolation flag, OBIS's masks, the distance to the nearest record, and the v9 inputs.
+
+```{r}
+#| label: cells
+to_xyz <- function(lon, lat) {
+  lo <- lon * pi / 180; la <- lat * pi / 180
+  cbind(cos(la) * cos(lo), cos(la) * sin(lo), sin(la))
+}
+# great-circle km from each query cell to the nearest point (kd-tree on the unit sphere)
+near_km <- function(cell_id, lon, lat) {
+  if (!length(lon)) return(rep(NA_real_, length(cell_id)))
+  xy <- xyFromCell(r_cid, cell_id)
+  ch <- get.knnx(to_xyz(lon, lat), to_xyz(xy[, 1], xy[, 2]), k = 1)$nn.dist[, 1]
+  2 * 6371.0088 * asin(pmin(ch / 2, 1))
+}
+
+build_cells <- function(id) {
+  sp  <- d_sp[d_sp$taxon == id, ]
+  e   <- rast(f_ens(id))
+  mk  <- rast(f_mod(id, "predictions", "(what=)?mask_cog\\.tif"))    # our runs write it without `what=`
+  ms  <- rast(f_mod(id, "predictions", "what=mess_cog\\.tif"))[["current"]]
+  # the bootstrap layer comes from a separate step; without it the spread is missing (the rule then
+  # treats it as 0) and the notebook says so in the cell-table summary
+  f_bc <- f_mod(id, "predictions", "method=ensemble_scen=current_what=bootcv_cog\\.tif", must = F)
+  bc   <- if (is.na(f_bc)) NULL else rast(f_bc)
+  stopifnot(compareGeom(e, mk, stopOnError = F), is.null(bc) || (compareGeom(e, bc, stopOnError = F) && names(bc)[1] == "sd"))
+
+  val  <- values(e[[1]], mat = F)
+  # the published MESS layer is the count of predictors outside the fitted range, on a 0.6 degree grid
+  mess <- values(resample(ms, e[[1]], method = "near"), mat = F)
+
+  ch   <- v9_cells(id, c("ch_nmfs", "ch_fws"))
+  am   <- v9_cells(id, "am")
+  rng  <- v9_cells(id, c("rng_iucn", "rng_fws", "rng_turtle_swot_dps"))
+  iucn <- v9_cells(id, "rng_iucn")
+  occ  <- d_occ$cell_id[d_occ$taxon == id]
+  fit  <- d_fit[d_fit$taxon == id, ]
+
+  # rule A, as OBIS codes it (functions/post_proc_functions.R limit_by_closest): mask, threshold P10,
+  # label 8-connected patches, keep the patches within PATCH_KM of a fitted record
+  patch_keep <- function(band) {
+    m  <- values(mk[[band]], mat = F) == 1
+    ok <- !is.na(val) & val >= sp$thr_p10 & !is.na(m) & m
+    r  <- e[[1]]; values(r) <- ifelse(ok, 1L, NA_integer_)
+    p  <- values(patches(r, directions = 8), mat = F)
+    i  <- which(ok)
+    near <- near_km(i, fit$lon, fit$lat) <= PATCH_KM
+    ok & p %in% unique(p[i][near])
+  }
+  a_hull <- patch_keep("convex_hull")
+  a_fitr <- patch_keep("fit_region")
+
+  cells <- sort(unique(c(which(!is.na(val) & val >= 1), ch$cell_id, am$cell_id, rng$cell_id, occ)))
+  cells <- cells[!is.na(cells)]
+  tibble(
+    taxon      = id,
+    cell_id    = as.integer(cells),
+    unit_id    = as.integer(unit_of(cells)),
+    val        = val[cells],
+    spread     = if (is.null(bc)) NA_real_ else values(bc[[1]], mat = F)[cells],
+    sd_algo    = values(e[[2]], mat = F)[cells],
+    extrap     = mess[cells] > 0,
+    is_ch      = cells %in% ch$cell_id,
+    in_hull    = values(mk[["convex_hull"]], mat = F)[cells] == 1,
+    a_hull     = a_hull[cells],
+    a_fitr     = a_fitr[cells],
+    d_occ_km   = near_km(cells, d_occ$lon[d_occ$taxon == id], d_occ$lat[d_occ$taxon == id]),
+    am         = am$val[match(cells, am$cell_id)],
+    in_rng     = cells %in% rng$cell_id,
+    in_iucn    = cells %in% iucn$cell_id)
+}
+
+con <- dbConnect(duckdb(), db_card)
+source(here("libs/duckdb_budget.R")); duckdb_tune(con, glue("{dir_card}/tmp"))
+done <- if (dbExistsTable(con, "og_cell")) dbGetQuery(con, "SELECT DISTINCT taxon FROM og_cell")$taxon else integer()
+if (redo && length(done)) { dbExecute(con, "DROP TABLE og_cell"); done <- integer() }
+for (id in setdiff(d_sp$taxon, done)) {
+  message(glue("cells: {id} {d_sp$common[d_sp$taxon == id]}"))
+  dbWriteTable(con, "og_cell", build_cells(id), append = T)
+}
+
+dbWriteTable(con, "og_thr",      select(d_sp, taxon, thr), overwrite = T)       # rules D and E
+dbWriteTable(con, "og_p10",      transmute(d_sp, taxon, thr = thr_p10), overwrite = T)   # the reference column and rule A
+dbWriteTable(con, "sc_species",  select(d_sp, taxon, common, grp, starts_with("thr_")), overwrite = T)
+dbWriteTable(con, "og_region",   d_region,   overwrite = T)
+dbWriteTable(con, "sc_region",   d_scregion, overwrite = T)
+dbWriteTable(con, "og_fit",      distinct(d_fit, taxon, cell_id), overwrite = T)
+dbWriteTable(con, "og_occ_cell", distinct(d_occ, taxon, cell_id) |> filter(!is.na(cell_id)), overwrite = T)
+for (k in names(eff)) {
+  d <- map_dfr(d_sp$taxon, ~ tibble(taxon = .x, cell_id = eff[[k]][[d_sp$grp[d_sp$taxon == .x]]]))
+  dbWriteTable(con, glue("og_effort_cell_{k}"), d, overwrite = T)
+}
+
+dbGetQuery(con, "
+  SELECT taxon, count(*) AS cells, count(*) FILTER (WHERE val >= 1) AS modeled,
+         count(*) FILTER (WHERE is_ch) AS critical_habitat, count(*) FILTER (WHERE am >= 1) AS aquamaps,
+         count(*) FILTER (WHERE in_rng) AS in_range, count(*) FILTER (WHERE extrap) AS extrapolated,
+         count(*) FILTER (WHERE val >= 1 AND spread IS NULL) AS no_bootstrap_spread
+  FROM og_cell GROUP BY taxon ORDER BY taxon") |>
+  left_join(select(d_sp, taxon, common), by = "taxon") |> relocate(common) |>
+  kable(format.args = list(big.mark = ","), caption = "Cell table, whole globe.")
+```
+
+## The right whale in the Gulf, redone by polygon
+
+The plan's Gulf numbers came from a latitude / longitude box that also took in northeast Florida,
+where the calving ground and four fitted records lie. The same rules, counted inside the polygons:
+
+```{r}
+#| label: whale-gulf
+#| eval: !expr '159023L %in% d_sp$taxon'
+xy <- function(id) { p <- xyFromCell(r_cid, id); tibble(cell_id = id, lon = p[, 1], lat = p[, 2]) }
+w  <- dbGetQuery(con, "SELECT * FROM og_cell WHERE taxon = 159023") |> as_tibble()
+w  <- left_join(w, xy(w$cell_id), by = "cell_id")
+sw <- d_sp[d_sp$taxon == 159023L, ]
+in_rg <- function(rg) w$cell_id %in% d_scregion$cell_id[d_scregion$region == rg]
+w_rules <- list(
+  "Lowest value at any record (MTP {sw$thr_mtp})"         = w$val >= sw$thr_mtp,
+  "Best sensitivity + specificity ({round(sw$thr_sss)})"  = w$val >= sw$thr_sss,
+  "P10 ({sw$thr_p10})"                                    = w$val >= sw$thr_p10,
+  "P10 inside the hull"                                   = w$val >= sw$thr_p10 & w$in_hull,
+  "P10 and spread among algorithms <= 10"                 = w$val >= sw$thr_p10 & w$sd_algo <= 10,
+  "P10 and spread among algorithms <= 5"                  = w$val >= sw$thr_p10 & w$sd_algo <= 5,
+  "Rule D: threshold {round(sw$thr, 1)}, minus one bootstrap spread" = w$val - coalesce(w$spread, 0) >= sw$thr & !coalesce(w$extrap, F))
+d_wg <- imap_dfr(w_rules, function(k, nm) {
+  k <- coalesce(k, F)
+  tibble(
+    rule           = as.character(glue(nm)),
+    `old Gulf box` = sum(k & w$lat >= 18 & w$lat <= 31 & w$lon >= -98 & w$lon <= -81),
+    `PA Gulf`      = sum(k & in_rg("PA Gulf")),
+    `EEZ Gulf`     = sum(k & in_rg("EEZ Gulf")),
+    `EEZ Atlantic` = sum(k & in_rg("EEZ Atlantic")),
+    `EEZ Alaska`   = sum(k & in_rg("EEZ Alaska")),
+    `EEZ Pacific`  = sum(k & in_rg("EEZ Pacific")))
+})
+kable(d_wg, format.args = list(big.mark = ","), caption = glue("North Atlantic right whale, {lbl} ensemble: cells kept by rule. The first column repeats the plan's box; the rest are polygons."))
+
+d_wrec <- bind_rows(
+  fitted = d_fit |> filter(taxon == 159023L),
+  `all quality-controlled` = d_occ |> filter(taxon == 159023L),
+  .id = "records") |>
+  left_join(d_scregion, by = "cell_id", relationship = "many-to-many") |>
+  mutate(
+    region = coalesce(region, "outside the US EEZ"),
+    in_box = lat >= 18 & lat <= 31 & lon >= -98 & lon <= -81)
+bind_rows(
+  d_wrec |> filter(!str_starts(region, "PA ")) |> count(records, region),
+  d_wrec |> distinct(records, lon, lat, in_box) |> filter(in_box) |> count(records) |> mutate(region = "old Gulf box")) |>
+  pivot_wider(names_from = records, values_from = n, values_fill = 0) |>
+  kable(caption = "Right whale records by region. The old box held Atlantic records; the Gulf polygon does not.")
+
+n_v9 <- v9_cells(159023L, "ms_merge")
+tibble(
+  surface = "v9 merged surface (IUCN range at a flat value)",
+  cells   = nrow(n_v9),
+  `EEZ Gulf` = sum(n_v9$cell_id %in% d_scregion$cell_id[d_scregion$region == "EEZ Gulf"]),
+  `PA Gulf`  = sum(n_v9$cell_id %in% d_scregion$cell_id[d_scregion$region == "PA Gulf"]),
+  `EEZ Atlantic` = sum(n_v9$cell_id %in% d_scregion$cell_id[d_scregion$region == "EEZ Atlantic"]),
+  `distinct values` = n_distinct(n_v9$val)) |>
+  kable(format.args = list(big.mark = ","), caption = "What v9 scores today for the right whale.")
+```
+
+## Turtles in Alaska, redone by polygon
+
+```{r}
+#| label: turtle-alaska
+#| eval: !expr 'any(d_sp$grp == "turtle")'
+dbGetQuery(con, "
+  SELECT c.taxon, r.region,
+         count(*) FILTER (WHERE c.val >= 1)                       AS modeled,
+         count(*) FILTER (WHERE c.val >= s.thr_mtp)               AS mtp,
+         count(*) FILTER (WHERE c.val >= p.thr)                   AS p10,
+         count(*) FILTER (WHERE c.val >= p.thr AND c.in_hull)     AS p10_in_hull,
+         count(*) FILTER (WHERE c.val - COALESCE(c.spread, 0) >= t.thr AND NOT COALESCE(c.extrap, FALSE)) AS rule_d
+  FROM og_cell c JOIN og_thr t USING (taxon) JOIN og_p10 p USING (taxon) JOIN sc_region r USING (cell_id)
+  JOIN sc_species s USING (taxon)
+  WHERE r.region IN ('PA Alaska', 'EEZ Alaska') AND c.taxon <> 159023
+  GROUP BY ALL ORDER BY r.region DESC, c.taxon") -> d_ak
+d_ak |>
+  left_join(select(d_sp, taxon, common), by = "taxon") |> select(region, common, modeled:rule_d) |>
+  kable(format.args = list(big.mark = ","), caption = glue("Sea turtles, {lbl} ensembles: Alaska cells kept by threshold, by polygon. `rule_d` uses the threshold of rules D and E, minus one bootstrap spread."))
+```
+
+## The regional test
+
+For each species and EEZ subregion: among the units the model calls present (rule D's cells), how
+many were searched, how many of those hold a record of the species, and how surprising is that count
+given the model's precision everywhere else (`msens::region_effort_test()`). Four variants: two effort
+definitions, at the cell (0.05°) and at 0.5° blocks. A block is the more honest trial, because
+records cluster and neighbouring cells are not independent searches.
+
+```{r}
+#| label: region-test
+# the block id in SQL (// is integer division) must be the one unit_of() wrote into og_cell
+sql_block <- glue("CAST(((cell_id - 1) // 7200 // {UNIT_AGG}) * {7200 %/% UNIT_AGG} + ((cell_id - 1) % 7200) // {UNIT_AGG} AS INTEGER)")
+stopifnot(dbGetQuery(con, glue("SELECT count(*) AS n FROM og_cell WHERE unit_id <> {sql_block}"))$n == 0)
+variants <- expand_grid(effort = names(eff), unit = c("cell", "block"))
+d_count <- pmap_dfr(variants, function(effort, unit) {
+  u <- if (unit == "cell") "cell_id" else sql_block
+  dbExecute(con, glue("CREATE OR REPLACE TEMP VIEW v_cell   AS SELECT * REPLACE ({u} AS unit_id) FROM og_cell"))
+  dbExecute(con, glue("CREATE OR REPLACE TEMP VIEW v_effort AS SELECT taxon, {u} AS unit_id FROM og_effort_cell_{effort}"))
+  dbExecute(con, glue("CREATE OR REPLACE TEMP VIEW v_occ    AS SELECT taxon, {u} AS unit_id FROM og_occ_cell"))
+  n <- dbGetQuery(con, range_region_sql(cell = "v_cell", effort = "v_effort", occ = "v_occ"))
+  bind_cols(tibble(effort = effort, unit = unit), n)
+})
+# verdicts at the rule's ratio and, for the sensitivity table, at three others (1 = significance alone)
+d_verdict_all <- map_dfr(c(1, 0.5, RATIO, 0.1), function(ratio) {
+  bind_cols(
+    d_count, ratio = ratio,
+    region_effort_test(
+      d_count$n_searched, d_count$n_occupied, d_count$n_searched_all, d_count$n_occupied_all,
+      n_records = d_count$n_records, alpha = ALPHA, ratio = ratio))
+})
+d_verdict <- filter(d_verdict_all, ratio == RATIO)
+dbWriteTable(con, "og_verdict_all", d_verdict_all, overwrite = T)
+dir_create(here("data/og"))
+write_csv(d_verdict, here(glue("data/og/{lbl}_region_test.csv")))
+
+show_verdicts <- function(eff_k, unit_k) {
+  d_verdict |>
+    filter(effort == eff_k, unit == unit_k) |>
+    left_join(select(d_sp, taxon, common), by = "taxon") |>
+    mutate(
+      verdict = if_else(!is.na(label), glue("{verdict} ({label})"), verdict),
+      p_value = signif(p_value, 2), p_core = signif(p_core, 2), rate = signif(rate, 2)) |>
+    select(common, region, `present cells` = n_cells, searched = n_searched, `with a record` = n_occupied,
+           records = n_records, rate, `rate elsewhere` = p_core, `needed` = n_min, p = p_value, verdict) |>
+    kable(format.args = list(big.mark = ","), caption = glue("Regional test, effort = {eff_k}, unit = {unit_k}. `needed` is the fewest searched units at which zero records would reject."))
+}
+show_verdicts("order", "block")
+show_verdicts("mega", "block")
+```
+
+```{r}
+#| label: verdict-compare
+d_verdict |>
+  left_join(select(d_sp, taxon, common), by = "taxon") |>
+  mutate(variant = paste(effort, unit)) |>
+  select(common, region, variant, verdict) |>
+  pivot_wider(names_from = variant, values_from = verdict) |>
+  kable(caption = glue("Verdicts under the four variants of the regional test (ratio {RATIO})."))
+```
+
+#### Why the test needs an effect size
+
+As the plan worded it, a region is dropped when the binomial tail alone is below 5 %. With hundreds of
+searched blocks that rejects any region where the species is merely scarcer than in its stronghold.
+The table shows the verdict at four values of `ratio` (the region's record rate must ALSO be below
+`ratio` times the rate elsewhere; `1` is significance alone), for the rows where it matters.
+
+```{r}
+#| label: ratio-sensitivity
+d_verdict_all |>
+  filter(unit == "block") |>
+  left_join(select(d_sp, taxon, common), by = "taxon") |>
+  mutate(`rate / rate elsewhere` = round(rate / p_core, 2)) |>
+  select(effort, common, region, searched = n_searched, `with a record` = n_occupied, `rate / rate elsewhere`, ratio, verdict) |>
+  pivot_wider(names_from = ratio, values_from = verdict, names_prefix = "ratio ") |>
+  filter(n_distinct(c_across(starts_with("ratio "))) > 1, .by = c(effort, common, region)) |>
+  arrange(effort, common, region) |>
+  kable(caption = "Regions whose verdict depends on the ratio (0.5 degree blocks). Everything not listed gets the same verdict at all four.")
+```
+
+## Scorecard
+
+```{r}
+#| label: rules
+# rule E under one variant of the test = msens::range_constrain_sql() with that variant's verdicts;
+# rule D is the same call with no verdict against any region
+rule_e <- function(name, eff_k, unit_k, ratio = RATIO) {
+  v <- if (is.na(eff_k)) "SELECT taxon, region, verdict FROM og_verdict_all WHERE FALSE" else
+    glue("SELECT taxon, region, verdict FROM og_verdict_all WHERE effort = '{eff_k}' AND unit = '{unit_k}' AND ratio = {ratio}")
+  dbExecute(con, glue("CREATE OR REPLACE TEMP VIEW v_verdict AS {v}"))
+  dbExecute(con, glue("
+    CREATE OR REPLACE TEMP TABLE keep_{name} AS
+    SELECT taxon, cell_id, status FROM ({range_constrain_sql(verdict = 'v_verdict')}) WHERE keep"))
+}
+rule_e("d",      NA,      NA)
+rule_e("e",      "order", "block")
+rule_e("e_mega", "mega",  "block")
+rule_e("e_1",    "order", "block", ratio = 1)   # the test as first worded: significance alone
+
+rule_sql <- c(
+  "P10"    = "SELECT c.taxon, c.cell_id FROM og_cell c JOIN og_p10 t USING (taxon) WHERE c.val >= t.thr",
+  "A"      = "SELECT taxon, cell_id FROM og_cell WHERE a_hull",
+  "A fit region" = "SELECT taxon, cell_id FROM og_cell WHERE a_fitr",
+  set_names(glue("SELECT taxon, cell_id FROM og_cell WHERE val >= 1 AND d_occ_km <= {BUF_KM}"), glue("B {BUF_KM} km")),
+  "C"      = glue("SELECT taxon, cell_id FROM og_cell WHERE (am >= {AM_MIN} AND in_rng) OR is_ch"),
+  "D"      = "SELECT taxon, cell_id FROM keep_d",
+  "E"      = "SELECT taxon, cell_id FROM keep_e",
+  "E mega" = "SELECT taxon, cell_id FROM keep_e_mega",
+  "E no guard" = "SELECT taxon, cell_id FROM keep_e_1")
+dbExecute(con, glue(
+  "CREATE OR REPLACE TABLE sc_keep AS ",
+  paste(glue("SELECT '{names(rule_sql)}' AS rule, taxon, cell_id FROM ({rule_sql})"), collapse = " UNION ALL ")))
+rule_lvl <- names(rule_sql)
+
+d_card <- dbGetQuery(con, "
+  WITH rg AS (SELECT region, cell_id FROM sc_region UNION ALL SELECT DISTINCT 'Globe', cell_id FROM og_cell),
+  base AS (
+    SELECT c.taxon, rg.region,
+           count(*) FILTER (WHERE c.val >= t.thr) AS n_p10,
+           count(*) FILTER (WHERE c.is_ch)        AS n_ch,
+           count(f.cell_id)                       AS n_fit
+    FROM og_cell c JOIN og_p10 t USING (taxon) JOIN rg USING (cell_id)
+    LEFT JOIN og_fit f USING (taxon, cell_id)
+    GROUP BY ALL),
+  kept AS (
+    SELECT k.rule, k.taxon, rg.region,
+           count(*)                               AS n_kept,
+           count(*) FILTER (WHERE c.is_ch)        AS n_ch_kept,
+           count(f.cell_id)                       AS n_fit_kept,
+           count(*) FILTER (WHERE c.in_iucn)      AS n_kept_in_iucn
+    FROM sc_keep k JOIN og_cell c USING (taxon, cell_id) JOIN rg USING (cell_id)
+    LEFT JOIN og_fit f USING (taxon, cell_id)
+    GROUP BY ALL)
+  SELECT b.taxon, b.region, r.rule, b.n_p10, b.n_ch, b.n_fit,
+         COALESCE(k.n_kept, 0) AS n_kept, COALESCE(k.n_ch_kept, 0) AS n_ch_kept,
+         COALESCE(k.n_fit_kept, 0) AS n_fit_kept, COALESCE(k.n_kept_in_iucn, 0) AS n_kept_in_iucn
+  FROM base b CROSS JOIN (SELECT DISTINCT rule FROM sc_keep) r
+  LEFT JOIN kept k USING (taxon, region, rule)") |>
+  as_tibble() |>
+  left_join(select(d_sp, taxon, common), by = "taxon") |>
+  mutate(rule = factor(rule, rule_lvl), common = factor(common, d_sp$common))
+write_csv(arrange(d_card, taxon, region, rule), here(glue("data/og/{lbl}_scorecard.csv")))
+```
+
+### One line per candidate
+
+```{r}
+#| label: card-summary
+turtles <- d_sp$common[d_sp$grp == "turtle"]
+d_core0 <- d_card |>
+  filter(str_starts(region, "EEZ"), n_fit >= 20) |>
+  summarise(n_p10 = sum(n_p10), n_kept = sum(n_kept), .by = c(common, rule)) |>
+  summarise(worst_core_cost = max(1 - n_kept / n_p10), .by = rule)
+d_sum <- d_card |>
+  summarise(
+    `Alaska turtle cells`         = sum(n_kept[region == "EEZ Alaska" & common %in% turtles]),
+    `of which loggerhead`         = sum(n_kept[region == "EEZ Alaska" & common == "Loggerhead"]),
+    `right whale Gulf cells`      = sum(n_kept[region == "EEZ Gulf" & common == "North Atlantic right whale"]),
+    `right whale Atlantic cells`  = sum(n_kept[region == "EEZ Atlantic" & common == "North Atlantic right whale"]),
+    `Pacific cells, 6 turtles`    = sum(n_kept[region == "EEZ Pacific" & common %in% turtles]),
+    `fewest records kept`         = sprintf("%.0f%%", 100 * min((n_fit_kept / n_fit)[region == "Globe"])),
+    `critical-habitat cells lost` = sum((n_ch - n_ch_kept)[region == "Globe"]),
+    .by = rule) |>
+  left_join(d_core0, by = "rule") |>
+  mutate(`worst core cost` = sprintf("%.0f%%", 100 * worst_core_cost), worst_core_cost = NULL) |>
+  arrange(rule)
+kable(d_sum, format.args = list(big.mark = ","), caption = "Every candidate on one line. EEZ subregions; `fewest records kept` is the lowest share of fitted records kept for any of the seven species; `worst core cost` the largest share of P10 cells lost in any species' core US regions (negative = more cells than P10).")
+```
+
+```{r}
+#| label: card-read-published
+#| eval: !expr is_pub
+#| results: asis
+#| echo: false
+cat(r"---(
+What this shows, on the published models:
+
+- **A (OBIS's recipe, with the hull)** clears Alaska for every turtle and costs the core range almost
+  nothing, but it does not know about critical habitat and trims it. As OBIS codes it, with the
+  `fit_region` mask instead of the hull, the loggerhead keeps its Alaska footprint.
+- **B (buffer around occurrences)** keeps every record by construction and brings back what the
+  model had removed: the right whale returns to the Gulf at every distance, because four records lie
+  there, and the footprint grows with the distance chosen.
+- **C (AquaMaps at 0.5 or more)** is a different surface; it loses most loggerhead and olive ridley
+  records and keeps the leatherback in Alaska and the right whale in the Gulf.
+- **D (threshold minus one bootstrap spread)** trims margins everywhere but leaves the loggerhead's
+  Alaska footprint: uncertainty is not what separates Alaska.
+- **E (D plus the regional test)** removes the loggerhead from Alaska under either effort
+  definition. The green turtle and olive ridley Alaska cells go only with the wider effort layer
+  (`E mega`): with turtle records as the only evidence of search, Alaska is "unsearched" for them.
+- **E no guard** is the regional test as first worded (significance alone): it also drops the whole
+  Pacific EEZ for the loggerhead and the green turtle. That is why `msens::region_effort_test()`
+  asks for a material shortfall as well (previous section).
+- The right whale has **no cell above P10 in the Gulf EEZ** in the published model. The plan's 487
+  came from a box that took in Atlantic waters. Its Gulf problem in v9 is the flat IUCN range, not the model.
+)---")
+```
+
+```{r}
+#| label: card-vs-published
+#| eval: !expr '!is_pub && file.exists(here::here("data/og/published_scorecard.csv"))'
+# the same line per candidate for OBIS's published models of the same species, beside this run
+d_pub <- read_csv(here("data/og/published_scorecard.csv")) |> filter(taxon %in% d_sp$taxon)
+sum_line <- function(d, model) d |>
+  summarise(
+    `Alaska turtle cells`        = sum(n_kept[region == "EEZ Alaska" & common %in% turtles]),
+    `right whale Gulf cells`     = sum(n_kept[region == "EEZ Gulf" & common == "North Atlantic right whale"]),
+    `Gulf + Atlantic cells`      = sum(n_kept[region %in% c("EEZ Gulf", "EEZ Atlantic")]),
+    `Pacific cells`              = sum(n_kept[region == "EEZ Pacific"]),
+    `fewest records kept`        = sprintf("%.0f%%", 100 * min((n_fit_kept / n_fit)[region == "Globe"])),
+    .by = rule) |>
+  mutate(model = model, .before = 1)
+bind_rows(sum_line(d_card, lbl), sum_line(d_pub, "published")) |>
+  filter(rule %in% c("P10", "A", "B 250 km", "C", "D", "E", "E mega")) |>
+  mutate(rule = factor(rule, rule_lvl)) |> arrange(rule, model) |>
+  kable(format.args = list(big.mark = ","), caption = glue("This run ({lbl}) beside OBIS's published models of the same {nrow(d_sp)} species. Rule C is the v7.1 AquaMaps rule and does not depend on the model."))
+```
+
+### Cells kept
+
+```{r}
+#| label: card-cells
+card_wide <- function(rg) {
+  d_card |> filter(region == rg, rule != "P10") |>
+    select(common, rule, n_kept) |> arrange(rule) |>
+    pivot_wider(names_from = rule, values_from = n_kept) |>
+    left_join(d_card |> filter(region == rg, rule == "P10") |> select(common, P10 = n_kept), by = "common") |>
+    relocate(P10, .after = common) |> arrange(common)
+}
+for (rg in c("PA Alaska", "EEZ Alaska", "PA Gulf", "EEZ Gulf", "EEZ Atlantic", "PA Pacific", "EEZ Pacific"))
+  print(kable(card_wide(rg), format.args = list(big.mark = ","), caption = glue("Cells kept in {rg}. P10 alone is the reference column.")))
+```
+
+### Fitted records kept, and the cost to the core range
+
+A rule that removes Alaska by removing the Gulf has not helped. *Records kept* is the share of the
+fitted records (whole globe) that fall in a kept cell. *Core cost* is the share of P10 cells lost in
+the regions where the species has at least 20 fitted records.
+
+```{r}
+#| label: card-cost
+d_glob <- d_card |> filter(region == "Globe") |>
+  transmute(common, rule, records_kept = n_fit_kept / n_fit)
+d_core <- d_card |>
+  filter(str_starts(region, "EEZ"), n_fit >= 20) |>
+  summarise(core = paste(sort(unique(str_remove(region, "EEZ "))), collapse = " + "), n_p10 = sum(n_p10), n_kept = sum(n_kept), .by = c(common, rule)) |>
+  mutate(core_cost = 1 - n_kept / n_p10)
+d_glob |> filter(rule != "P10") |>
+  mutate(records_kept = sprintf("%.0f%%", 100 * records_kept)) |>
+  pivot_wider(names_from = rule, values_from = records_kept) |>
+  kable(caption = "Share of fitted records (whole globe) inside the kept cells.")
+d_core |> filter(rule != "P10") |>
+  mutate(core_cost = sprintf("%.0f%%", 100 * core_cost)) |>
+  select(common, core, rule, core_cost) |>
+  pivot_wider(names_from = rule, values_from = core_cost) |>
+  kable(caption = "Share of P10 cells lost in the species' core US regions (EEZ subregions with 20 or more fitted records). Negative = the rule keeps cells below P10 there.")
+```
+
+### Critical habitat
+
+Must be zero lost. Rules C, D and E keep critical habitat by construction; A and B do not know about it.
+
+```{r}
+#| label: card-ch
+d_card |> filter(region == "Globe", n_ch > 0, rule != "P10") |>
+  mutate(lost = n_ch - n_ch_kept) |>
+  select(common, `critical-habitat cells` = n_ch, rule, lost) |>
+  pivot_wider(names_from = rule, values_from = lost) |>
+  kable(format.args = list(big.mark = ","), caption = "Critical-habitat cells LOST by each rule (v9's `ch_nmfs` + `ch_fws` cells).")
+```
+
+### Agreement with the IUCN range
+
+```{r}
+#| label: card-iucn
+d_card |> filter(region == "Globe", rule != "P10") |>
+  mutate(x = sprintf("%.0f%%", 100 * n_kept_in_iucn / n_kept)) |>
+  select(common, rule, x) |>
+  pivot_wider(names_from = rule, values_from = x) |>
+  kable(caption = "Share of kept cells (whole globe) that lie inside the IUCN range polygon.")
+```
+
+## Maps
+
+One panel per rule: kept cells in the lower 48 / Gulf / Atlantic window and in the Alaska window.
+Grey = the model's P10 cells the rule dropped; colour = the model value in kept cells.
+
+```{r}
+#| label: maps
+#| fig-width: 12
+#| fig-height: 9
+#| results: asis
+wins <- list(
+  "Gulf and Atlantic" = ext(-100, -60, 17, 48),
+  "Alaska and the Pacific coast" = ext(-180, -115, 30, 75))
+map_rules <- c("A", "B 250 km", "C", "D", "E", "E mega")   # six panels per window
+for (id in d_sp$taxon) {
+  cat(glue("\n\n### {d_sp$common[d_sp$taxon == id]}\n\n"))
+  d  <- dbGetQuery(con, glue("
+    SELECT c.cell_id, c.val, c.val >= t.thr AS p10, k.rule
+    FROM og_cell c JOIN og_p10 t USING (taxon) LEFT JOIN sc_keep k USING (taxon, cell_id)
+    WHERE c.taxon = {id}"))
+  for (wn in names(wins)) {
+    tmpl <- crop(r_cid, wins[[wn]])
+    par(mfrow = c(2, 3))
+    for (rl in map_rules) {
+      bg <- tmpl; values(bg) <- NA
+      fg <- bg
+      i_bg <- cellFromXY(tmpl, xyFromCell(r_cid, unique(d$cell_id[d$p10 %in% TRUE])))
+      bg[i_bg[!is.na(i_bg)]] <- 1
+      k    <- d[d$rule %in% rl, ]
+      i_fg <- cellFromXY(tmpl, xyFromCell(r_cid, k$cell_id))
+      fg[i_fg[!is.na(i_fg)]] <- coalesce(k$val[!is.na(i_fg)], 0)
+      plot(bg, col = "grey80", legend = F, main = glue("{rl}: {wn}"), mar = c(2, 2, 2, 4))
+      if (any(!is.na(i_fg))) plot(fg, add = T, range = c(0, 100), col = hcl.colors(50, "viridis", rev = T), legend = F)
+    }
+  }
+}
+```
+
+```{r}
+#| label: close
+#| include: false
+dbDisconnect(con, shutdown = T)
+```
