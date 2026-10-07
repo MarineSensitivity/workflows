@@ -162,10 +162,16 @@ if (is_pub) {
 } else {
   d_thr <- map_dfr(d_sp$taxon, function(id) {
     te <- cv_read(id, "cvpred"); tr <- cv_read(id, "cvpredtrain")
-    stopifnot(n_distinct(count(te, algo)$n) == 1)   # the algorithms share rows and folds
+    # an accepted algorithm can lack folds (its fit failed there: Kemp's ridley ogm maxent has 3 of 5); within a fold
+    # the algorithms present share the rows, and the held-out ensemble is the median of those present, as on the map
+    n_fa <- count(te, fold, algo)
+    stopifnot(all(summarise(n_fa, ok = n_distinct(n) == 1, .by = fold)$ok))
+    gaps <- n_fa |> summarise(folds = paste(sort(fold), collapse = ","), .by = algo) |>
+      filter(folds != paste(sort(unique(te$fold)), collapse = ","))
     h  <- heldout_threshold(cv_ens(te), cv_ens(tr), sens = SENS)
     tibble(
       taxon = id, thr = h$thr, sens = h$pooled$sens, spec = h$pooled$spec,
+      algo_folds = if (nrow(gaps)) paste(gaps$algo, "folds", gaps$folds, collapse = "; ") else "all",
       # what the training threshold of each fold delivers on the rows that fold never saw
       train_thr = mean(h$folds$thr), train_thr_sens = sum(h$folds$tp) / sum(h$folds$tp + h$folds$fn),
       folds = list(h$folds))
@@ -184,8 +190,9 @@ d_thr |>
   transmute(
     common, `training P10` = thr_p10, `held-out threshold` = thr,
     `sensitivity` = sens, `specificity vs background` = spec,
-    `mean fold training threshold` = train_thr, `sensitivity it delivers held-out` = train_thr_sens) |>
-  kable(digits = c(0, 0, 1, 2, 2, 1, 2), caption = glue("The held-out threshold (keeps {100 * SENS} % of the presences each fold's model never saw) beside the training P10, ensemble scale 0 to 100. The last two columns fix the threshold on each fold's training rows and count on its test rows: the sensitivity a training threshold really delivers."))
+    `mean fold training threshold` = train_thr, `sensitivity it delivers held-out` = train_thr_sens,
+    `algorithm folds` = algo_folds) |>
+  kable(digits = c(0, 0, 1, 2, 2, 1, 2, 0), caption = glue("The held-out threshold (keeps {100 * SENS} % of the presences each fold's model never saw) beside the training P10, ensemble scale 0 to 100. The last two columns fix the threshold on each fold's training rows and count on its test rows: the sensitivity a training threshold really delivers. 'algorithm folds' names an accepted algorithm whose fit failed on some folds; the held-out ensemble there is the median of the algorithms present."))
 ```
 
 `r if (is_pub) "For the published models no fold predictions exist, so rules D and E use the training P10." else "Rules D and E use the held-out threshold; P10 and rule A keep the training P10, as OBIS applies it."`
