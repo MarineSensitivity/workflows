@@ -32,7 +32,9 @@ Publish the **v8 marine-atlas** and stand up its serving, reproducibly:
    Granular flags for the parts: `DEPLOY_APPS=1` (Shiny apps), `DEPLOY_TABLES=1` (local
    Parquet + views), `DEPLOY_API=1` (plumber image), `DEPLOY_CADDY=1` (URL routing alone),
    `DEPLOY_TITILER=1` (restart the tiler so it drops GDAL's cached headers for COGs
-   repainted at their existing URLs — run it after any `publish_native` that rebuilt them).
+   repainted at their existing URLs — run it after any `publish_native` that rebuilt them),
+   `DEPLOY_STAC=1` (the version's STAC subtree alone: rsync the tree the last publishing run
+   built, register it in the deployed root, read every file back through the public host).
    The `deploy` chunk ends by comparing the main site's alias of the root STAC catalog
    (`marinesensitivity.org/stac/catalog.json`) with the root it just deployed (`libs/stac_alias.R`):
    a lagging alias WARNs, `STAC_ALIAS_PUSH=1` commits + pushes it to the site repo and waits for Pages.
@@ -90,7 +92,7 @@ do_check_preview <- nzchar(Sys.getenv("CHECK_PREVIEW"))
 # publishing intent -- RELEASE_DEPLOY, RELEASE_RAW, RELEASE_S3_TABLES,
 # RELEASE_CORS, or an explicit PROMOTE_LATEST -- opts back into the full path.
 .granular_flags <- c("DEPLOY_APPS", "DEPLOY_TABLES", "DEPLOY_API",
-                     "DEPLOY_CADDY", "DEPLOY_TITILER", "DEPLOY_DOCS", "DEPLOY_ACCESS",
+                     "DEPLOY_CADDY", "DEPLOY_TITILER", "DEPLOY_STAC", "DEPLOY_DOCS", "DEPLOY_ACCESS",
                      "CHECK_PREVIEW")
 .publish_flags  <- c("RELEASE_DEPLOY", "RELEASE_RAW", "RELEASE_S3_TABLES",
                      "RELEASE_CORS", "PROMOTE_LATEST")
@@ -416,6 +418,65 @@ if (length(cog_u)) {
 # (marinesensitivity.org/stac) -- WARNs while it lags, STAC_ALIAS_PUSH=1 publishes it
 source(here("libs/stac_alias.R"))
 stac_alias_sync()
+}
+```
+
+## Deploy the STAC subtree alone (`DEPLOY_STAC=1`)
+
+What step 1 of `RELEASE_DEPLOY` does for STAC, without the view DB, `cell_model`, titiler or Caddy:
+the tree the last PUBLISHING run's `stac` chunk built (a granular run builds nothing, so its age is
+logged) is gated, rsynced whole, registered in the deployed root as uid 1000, and every file of it is
+read back through the public host byte-for-byte. Added 2026-10-07 for the asset-store re-pointing,
+when the pointer table had moved but nothing else in the release had.
+
+```{r}
+#| label: deploy-stac
+
+do_deploy_stac <- nzchar(Sys.getenv("DEPLOY_STAC"))
+if (!do_deploy_stac) {
+  log_info("DEPLOY_STAC unset — the server's STAC subtree is left as it is")
+} else if (do_deploy) {
+  log_info("DEPLOY_STAC: already deployed by RELEASE_DEPLOY above")
+} else {
+  stac_dir <- glue("{dir_atlas}/stac"); tree <- glue("{stac_dir}/{ver}")
+  stopifnot("no local STAC tree: run a publishing render (the `stac` chunk) first" =
+              file_exists(glue("{tree}/collection.json")))
+  jf <- dir_ls(tree, glob = "*.json", recurse = TRUE)
+  log_info("STAC tree {tree}: {length(jf)} files, built {format(file_info(glue('{tree}/collection.json'))$modification_time)}")
+  # publish gate (libs/url_gate.R): no bulk file of the tree may be fetched from a VM host
+  source(here("libs/url_gate.R"))
+  tree_urls <- unique(unlist(lapply(jf, function(f) {
+    txt <- paste(readLines(f, warn = FALSE), collapse = "\n")
+    regmatches(txt, gregexpr("https?://[^\"\\\\ ]+", txt))[[1]] })))
+  url_gate(tree_urls, glue("{ver} STAC tree"))
+  # replace the version's subtree whole (--delete: a dropped dataset must not leave a stale node)
+  system2("ssh", c("msens", shQuote(glue("mkdir -p {srv_stac}"))))
+  rc <- system2("rsync", c("-aq", "--delete", glue("{tree}/"), glue("msens:{srv_stac}/")))
+  stopifnot("rsync of the STAC tree failed" = identical(as.integer(rc), 0L))
+  # register in the deployed root (idempotent, children in release order) -- as uid 1000, never root
+  reg <- system2("ssh", c("msens", shQuote(glue(
+    "docker exec -u 1000:1000 rstudio Rscript -e ",
+    shQuote(glue("k <- msens::stac_catalog_register('/share/data/derived/stac/catalog.json', '{ver}'); ",
+                 "cat('STAC_KIDS', basename(dirname(k)), '\\n')"))))), stdout = TRUE, stderr = TRUE)
+  if (!any(grepl("STAC_KIDS", reg))) stop(paste(tail(reg, 15), collapse = "\n"))
+  log_info("root catalog children: {sub('STAC_KIDS ', '', grep('STAC_KIDS', reg, value = TRUE))}")
+  # read back through the PUBLIC host, as a client would: every file byte-equal to what was built,
+  # and the root listing this version -- a 200 on the collection alone passes on a stale tree
+  pub <- "https://file.marinesensitivity.org/stac"
+  md5 <- function(x) digest::digest(x, algo = "md5", serialize = FALSE)
+  stale <- Filter(function(f) {
+    got <- tryCatch(httr2::request(glue("{pub}/{ver}/{path_rel(f, tree)}")) |> httr2::req_perform() |>
+                      httr2::resp_body_raw(), error = function(e) raw(0))
+    !identical(md5(got), md5(readBin(f, "raw", file_size(f))))
+  }, jf)
+  if (length(stale)) stop(glue("{length(stale)} of {length(jf)} STAC files differ on the public host: "),
+                          paste(path_rel(stale, tree), collapse = ", "))
+  root <- jsonlite::fromJSON(glue("{pub}/catalog.json"), simplifyVector = FALSE)
+  stopifnot("the published root catalog does not list this version" =
+              glue("./{ver}/collection.json") %in% unlist(lapply(root$links, function(l) l$href)))
+  log_info("verified {length(jf)} files of {pub}/{ver}/ and the root entry")
+  source(here("libs/stac_alias.R"))
+  stac_alias_sync()
 }
 ```
 

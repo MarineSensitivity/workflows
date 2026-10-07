@@ -207,6 +207,9 @@ one application + reviewer policy per restricted version, `server/cloudflare/acc
 runbook in `server/cloudflare/README.md`), `CHECK_PREVIEW=1` (curl-prove the review gate: public
 host never renders a restricted version, preview host is closed without a Cloudflare Access
 token and open with one, origin-direct is 401, restricted docs are off GitHub Pages),
+`DEPLOY_STAC=1` (the version's static STAC subtree alone: rsync the tree the last publishing run built to
+`/share/data/derived/stac/{ver}`, register it in the deployed root, read every file back through the public
+host byte-for-byte — how a re-pointed release's STAC lands without the full `RELEASE_DEPLOY`),
 `DEPLOY_TITILER=1` (restart `titiler-v8` alone — it was required after every COG repaint while
 `{ver}/native/*` keys were STABLE: new bytes landed under a URL whose header GDAL's `/vsicurl` had
 cached in-process, and a shrunken COG read past EOF so z2–z4 returned HTTP 500 while z5+ looked
