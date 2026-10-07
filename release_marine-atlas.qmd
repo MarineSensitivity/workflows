@@ -423,11 +423,14 @@ stac_alias_sync()
 
 ## Deploy the STAC subtree alone (`DEPLOY_STAC=1`)
 
-What step 1 of `RELEASE_DEPLOY` does for STAC, without the view DB, `cell_model`, titiler or Caddy:
-the tree the last PUBLISHING run's `stac` chunk built (a granular run builds nothing, so its age is
-logged) is gated, rsynced whole, registered in the deployed root as uid 1000, and every file of it is
-read back through the public host byte-for-byte. Added 2026-10-07 for the asset-store re-pointing,
-when the pointer table had moved but nothing else in the release had.
+What step 1 of `RELEASE_DEPLOY` does for STAC, without the view DB, `cell_model`, titiler or Caddy.
+In a publishing run the tree is the one the `stac` chunk just built; in a granular run the chunk
+builds it here from the local `sdm.duckdb` (read-only; whether the release publishes
+`tables/native_asset.parquet` is asked of the bucket, as a client would). The tree is gated, rsynced
+whole, registered in the deployed root as uid 1000, and every file of it is read back through the
+public host byte-for-byte. `MS_VER=v8` (`libs/paths.R`) selects another mdl_key release — the legacy
+mdl_seq releases rebuild through `backfill_versions.qmd`. Added 2026-10-07 for the asset-store
+re-pointing, when the pointer table had moved but nothing else in the release had.
 
 ```{r}
 #| label: deploy-stac
@@ -439,8 +442,21 @@ if (!do_deploy_stac) {
   log_info("DEPLOY_STAC: already deployed by RELEASE_DEPLOY above")
 } else {
   stac_dir <- glue("{dir_atlas}/stac"); tree <- glue("{stac_dir}/{ver}")
-  stopifnot("no local STAC tree: run a publishing render (the `stac` chunk) first" =
-              file_exists(glue("{tree}/collection.json")))
+  if (!do_stage) {
+    suppressWarnings(try(library(msens), silent = TRUE))
+    source(here("../msens/R/stac.R"))                                       # the current generators, not a stale install
+    cfg <- stac_cfg(ver); cfg$titiler_base <- titiler_v8
+    u_na   <- glue("{atlas_base_url()}/{ver}/tables/native_asset.parquet")
+    has_na <- tryCatch(httr2::request(u_na) |> httr2::req_method("HEAD") |>
+                         httr2::req_error(is_error = \(r) FALSE) |> httr2::req_perform() |>
+                         httr2::resp_status() == 200L, error = function(e) FALSE)
+    stopifnot("the release has not published tables/native_asset.parquet -- publish the tables first" = has_na)
+    if (dir_exists(tree)) dir_delete(tree)                                  # a dropped dataset must not survive as a stale node
+    con <- dbConnect(duckdb(sdm_db, read_only = TRUE))
+    stac_build(version = ver, dir_out = stac_dir, cfg = cfg, con = con, has_native_asset = has_na)
+    dbDisconnect(con, shutdown = TRUE)
+  }
+  stopifnot("no local STAC tree" = file_exists(glue("{tree}/collection.json")))
   jf <- dir_ls(tree, glob = "*.json", recurse = TRUE)
   log_info("STAC tree {tree}: {length(jf)} files, built {format(file_info(glue('{tree}/collection.json'))$modification_time)}")
   # publish gate (libs/url_gate.R): no bulk file of the tree may be fetched from a VM host

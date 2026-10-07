@@ -20,7 +20,10 @@ if [ "${1:-}" = "status" ]; then mode=status; shift; fi
 nb="${1:?usage: render_publish.sh [status] <notebook.qmd> [VAR=value ...]}"; shift || true
 [ -f "$nb" ] || { echo "no such notebook: $nb" >&2; exit 2; }
 stem="${nb%.qmd}"
-ver="${VER:-$(sed -n 's/^ver *<- *"\([^"]*\)".*/\1/p' libs/paths.R | head -1)}"
+for kv in "$@"; do                       # VAR=value arguments become the render's environment (MS_VER names the version)
+  case "$kv" in *=*) export "$kv" ;; *) echo "not VAR=value: $kv" >&2; exit 2 ;; esac
+done
+ver="${VER:-${MS_VER:-$(sed -n 's/^ver *<- *Sys.getenv("MS_VER", *"\([^"]*\)").*/\1/p' libs/paths.R | head -1)}}"
 logs=_output/logs; mkdir -p "$logs" .tmp
 latest="$logs/${stem}_${ver}_latest.txt"; done_f="$logs/${stem}_${ver}.done"
 
@@ -32,9 +35,6 @@ if [ "$mode" = status ]; then
   exit 0
 fi
 
-for kv in "$@"; do                       # VAR=value arguments become the render's environment
-  case "$kv" in *=*) export "$kv" ;; *) echo "not VAR=value: $kv" >&2; exit 2 ;; esac
-done
 log="$logs/${stem}_${ver}_$(date +%Y%m%d_%H%M).log"
 echo "$log" > "$latest"; rm -f "$done_f"
 TMPDIR="$PWD/.tmp" nohup sh -c "quarto render '$nb' > '$log' 2>&1; echo \"exit \$?\" > '$done_f'" > /dev/null 2>&1 &
