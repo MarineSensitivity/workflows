@@ -191,8 +191,13 @@ url_gate(hrefs, glue("{ver} STAC API item asset hrefs"))
 ## Deploy (`DEPLOY_STAC_API=1`)
 
 rsync the tree, then bring up the `stac-api` service defined in `server/docker-compose.yml`. The
-image builds from the upstream repo pinned by commit; `PARQUET_URLS_JSON` is passed from the file
-generated above so adding a dataset needs no compose edit.
+image builds from the upstream repo pinned by commit; the version the service mounts
+(`STAC_API_VER`) and `PARQUET_URLS_JSON` (from the file generated above) are written to the server's
+`.env`, where compose reads them on every `up` — passed only on the command line, a later bare
+`docker compose up -d` would recreate the service without them — so adding a dataset or a version
+needs no compose edit. The health check asserts the served collections are THIS version's and that
+an item query answers: on 2026-10-07 a hardcoded v8 mount took v9's `PARQUET_URLS_JSON`, `/collections`
+returned 200 listing v8, and every item query failed.
 
 ```{r}
 #| label: deploy
@@ -208,18 +213,26 @@ if (!do_deploy) {
   log_info("synced stac-api -> msens:{srv_api}")
 
   pu  <- paste(readLines(glue("{stac_api}/parquet_urls.json")), collapse = "")
+  stopifnot("parquet_urls.json must not contain a single quote (it is written single-quoted into .env)" = !grepl("'", pu))
+  n_coll <- length(jsonlite::fromJSON(pu))
   # `docker compose restart caddy`, not `caddy reload`: the Caddyfile is a
   # SINGLE-FILE bind mount, so a git pull replaces the inode and the running
   # container keeps serving the old one.
   cmd <- glue(
     "set -e; cd {srv_repo} && git fetch --quiet origin && git merge --ff-only origin/main; ",
-    "PARQUET_URLS_JSON={shQuote(pu)} docker compose up -d --build --force-recreate stac-api; ",
+    "sed -i '/^STAC_API_VER=/d;/^PARQUET_URLS_JSON=/d' .env; ",
+    "printf \"STAC_API_VER=%s\\nPARQUET_URLS_JSON='%s'\\n\" {ver} {shQuote(pu)} >> .env; ",
+    "docker compose up -d --build --force-recreate stac-api; ",
     "docker compose restart caddy; sleep 12; ",
-    "echo STAC_HTTP $(curl -s -o /dev/null -w '%{{http_code}}' http://localhost:8085/collections)")
+    "echo STAC_HTTP $(curl -s -o /dev/null -w '%{{http_code}}' http://localhost:8085/collections); ",
+    "echo STAC_COLL $(curl -s http://localhost:8085/collections | grep -o 'msens-{ver}-[a-z_]*' | sort -u | wc -l); ",
+    "echo STAC_ITEMS $(curl -s 'http://localhost:8085/collections/msens-{ver}-am/items?limit=1' | grep -c '\"features\"')")
   out <- system2("ssh", c("msens", shQuote(cmd)), stdout = TRUE, stderr = TRUE)
-  if (!any(grepl("STAC_HTTP 200", out)))
-    stop(glue("stac-api did not come up:\n"), paste(utils::tail(out, 25), collapse = "\n"))
-  log_info("stac-api up: {grep('STAC_HTTP', out, value = TRUE)}")
+  got <- function(tag) { x <- grep(paste0("^", tag, " "), out, value = TRUE); if (length(x)) trimws(sub(tag, "", x[1])) else NA }
+  if (!identical(got("STAC_HTTP"), "200") || !identical(got("STAC_COLL"), as.character(n_coll)) || !identical(got("STAC_ITEMS"), "1"))
+    stop(glue("stac-api did not come up serving {ver} (STAC_HTTP {got('STAC_HTTP')}, collections {got('STAC_COLL')} of {n_coll}, items {got('STAC_ITEMS')}):\n"),
+         paste(utils::tail(out, 25), collapse = "\n"))
+  log_info("stac-api up: HTTP {got('STAC_HTTP')}, {got('STAC_COLL')}/{n_coll} {ver} collections listed, item query answers")
 }
 ```
 
