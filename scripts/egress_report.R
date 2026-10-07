@@ -83,7 +83,10 @@ parts <- c(parts, "SELECT * FROM caddy")
 if (!is.na(dir_s3)) {
   if (startsWith(dir_s3, "s3://")) {
     invisible(dbExecute(con, "INSTALL httpfs; LOAD httpfs;"))
-    invisible(dbExecute(con, "CREATE SECRET (TYPE s3, PROVIDER credential_chain)"))
+    # path-style: the log bucket's name has a dot (oceanmetrics.io-logs), and virtual-host addressing puts it
+    # in the TLS hostname, where the wildcard certificate cannot match ("SSL peer certificate ... not OK",
+    # 2026-10-07) -- the same reason the atlas bucket is read path-style everywhere else
+    invisible(dbExecute(con, "CREATE SECRET (TYPE s3, PROVIDER credential_chain, URL_STYLE 'path', REGION 'us-east-1')"))
   }
   glob_s3 <- paste0(sub("/+$", "", dir_s3), "/**")
   # S3 server access log record (AWS docs): owner bucket [time] ip requester reqid operation key
