@@ -36,33 +36,18 @@ fetch <- function(u) { f <- file.path(tmp, gsub("[^A-Za-z0-9._-]", "_", sub(base
   if (!identical(as.integer(r), 0L)) { unlink(f); return(NA_character_) } }; f }
 say <- function(...) cat(sprintf(...), "\n")
 
-# 1. pointer-URL sweep over every registered release ------------------------------------------------------
-reg  <- fromJSON(glue("{base}/versions.json"), simplifyVector = FALSE)
-reg  <- if (is.list(reg) && !is.null(reg$versions)) reg$versions else reg
-all_v <- vapply(reg, function(x) if (!is.null(x$ver)) x$ver else x$id, character(1))
+# 1. pointer-URL sweep over every registered release (libs/store_pointers.R: native_asset, model_asset and
+#    manifest URLs minus the capability probes -- the one definition of "referenced" the GC script shares) ----
+source(here::here("libs/store_pointers.R"))
+pointers <- store_pointers(base, tmp = tmp)
 alt <- paste(vers, collapse = "|")
 legacy_re <- paste0("[/](", alt, ")/native/|pmtiles/(", alt, ")/")
-pointers <- list(); hits <- 0L; swept <- 0L
-for (v in all_v) {
-  na <- fetch(glue("{base}/{v}/tables/native_asset.parquet"))
-  ma <- fetch(glue("{base}/{v}/tables/model_asset.parquet"))
-  mf <- fetch(glue("{base}/{v}/manifest.json"))
-  urls <- c(
-    if (!is.na(na)) as.data.frame(read_parquet(na))$asset_url,
-    if (!is.na(ma)) { m <- as.data.frame(read_parquet(ma)); if ("cog_url" %in% names(m)) m$cog_url },
-    # a manifest's `app.probed` entries are capability PROBES (app_bundle_probe(): HEAD of e.g.
-    # `{ver}/native/pmtiles/index.json`, the pre-store PMTiles index), not pointers: after the prune that probe
-    # answers 404 and the capability flips FALSE at the next manifest build, which is the right answer, so they
-    # are not swept. Everything else in the manifest (score COG hrefs, table URLs) is.
-    if (!is.na(mf)) { m <- fromJSON(mf, simplifyVector = FALSE); m$app$probed <- NULL
-      t <- as.character(toJSON(m, auto_unbox = TRUE)); regmatches(t, gregexpr("https?://[^\"\\\\ ]+", t))[[1]] })
-  urls <- unique(stats::na.omit(urls)); if (!length(urls)) next
-  pointers[[v]] <- urls; swept <- swept + length(urls)
-  h <- sum(grepl(legacy_re, urls)); hits <- hits + h
-  say("sweep %-4s %6d urls, %d legacy", v, length(urls), h)
+hits <- 0L
+for (v in names(pointers)) {
+  h <- sum(grepl(legacy_re, pointers[[v]])); hits <- hits + h
+  say("sweep %-4s %6d urls, %d legacy", v, length(pointers[[v]]), h)
 }
-stopifnot("the pointer-URL sweep found legacy references -- nothing is pruned" = hits == 0L,
-          "no pointers swept" = swept > 0L)
+stopifnot("the pointer-URL sweep found legacy references -- nothing is pruned" = hits == 0L)
 
 # 2. the pruned versions' published pointers pass check_release_pointers.R --------------------------------
 chk <- function(v) { rc <- system2("Rscript", c("scripts/check_release_pointers.R", v, "--n", "100", "--shards", "5"),
