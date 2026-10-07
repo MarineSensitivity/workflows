@@ -115,9 +115,12 @@ if (test_n > 0 && do_s3) { log_warn("NATIVE_TEST_N={test_n}: a subset is never p
 safe_key   <- function(k) gsub("[^A-Za-z0-9._-]", "_", k)                  # mdl_key -> filesystem-safe stem (work dirs only)
 store_path <- function(key) { p <- as.character(glue("{dir_store}/{key}")); dir_create(unique(path_dir(p))); p }
 store_url  <- function(key) as.character(glue("{base}/{key}"))
+# the budget is SET, not passed as config: `dbConnect(duckdb(), config = list(memory_limit = ...))` is silently
+# ignored by the installed driver (the connection reported 19.1 GiB / 8 threads, DuckDB's defaults, 2026-10-07)
 new_con <- function(mem = "10GB", threads = "6") {
-  con <- dbConnect(duckdb(), config = list(threads = threads, memory_limit = mem))
-  dbExecute(con, glue("SET temp_directory='{dir_as}/duckdb_tmp'"))
+  con <- dbConnect(duckdb())
+  dbExecute(con, glue("SET memory_limit='{mem}'; SET threads={threads}; SET temp_directory='{dir_as}/duckdb_tmp'"))
+  stopifnot(dbGetQuery(con, "SELECT current_setting('memory_limit') m")$m != "19.1 GiB" || mem == "19.1 GiB")
   con
 }
 # a content-hash table is cached per (release, class) and recomputed when its source changed (file count,
@@ -137,6 +140,27 @@ cached_keys <- function(name, src_dirs, expr) {
   write_parquet(x, f, compression = "zstd")
   log_info("keys {name}: {nrow(x)} models in {round(as.numeric(Sys.time() - t0, units = 'mins'), 1)} min")
   select(x, -src_sig)
+}
+# a big source is hashed in FILE BATCHES, each its own read_parquet([...]): the GROUP BY (by, cell_id)
+# then never holds more than one batch. The whole-glob form over dist/am (50 GB, 23,699 one-model files)
+# spilled 138 GB of DuckDB temp and filled the laptop disk (2026-10-06), and over dist_merged_global
+# (3.1 G rows) ran out of memory outright (2026-10-07). Valid only where a model's rows never straddle two
+# batches -- a key seen in two batches stops the run rather than hash half a surface. `files` may be globs
+# (one per bucket dir or hive partition); `from(lst)` builds the source from the quoted file list
+pixel_hashes_batched <- function(files, n_batch, by = "mdl_key", from = function(lst) glue("read_parquet([{lst}])"), ...) {
+  b   <- split(files, ceiling(seq_along(files) / n_batch))
+  out <- vector("list", length(b))
+  for (i in seq_along(b)) {
+    con <- new_con()
+    lst <- paste(sprintf("'%s'", b[[i]]), collapse = ",")
+    out[[i]] <- pixel_hashes(con, from(lst), by, ...)
+    dbDisconnect(con, shutdown = TRUE)
+    if (i %% 5 == 0 || i == length(b)) log_info("  hashed file batch {i}/{length(b)}")
+  }
+  h <- bind_rows(out)
+  stopifnot("a model's rows straddle two file batches -- batching by file is invalid for this source" =
+              !anyDuplicated(h[[by]]))
+  h
 }
 take_n <- function(x) if (test_n > 0) head(x, test_n) else x
 log_info("publish_native {ver} | s3 {do_s3} | test_n {test_n} | store mirror {dir_store}")
@@ -333,11 +357,11 @@ am_keys <- if (length(served_by_ds[["am"]])) sort(served_by_ds[["am"]]) else cha
 am_take <- take_n(am_keys)
 am_reg  <- tibble()
 if (!skip_am && length(am_take)) {
+  # one file per model, so batches of files are batches of models (the straddle assertion holds it to that);
+  # every model is hashed, served or not, so the cache is complete for any later served set
   h <- cached_keys("cog_am", glue("{dir_atlas}/dist/dataset=am"), {
-    con <- new_con(); on.exit(dbDisconnect(con, shutdown = TRUE))
-    dbWriteTable(con, "served_k", tibble(mdl_key = am_take), overwrite = TRUE)
-    pixel_hashes(con, glue("(SELECT p.mdl_key, p.cell_id, p.val FROM read_parquet('{dir_atlas}/dist/dataset=am/*.parquet') p ",
-                           "SEMI JOIN served_k USING (mdl_key)) s"), "mdl_key", quant = "trunc", dedup = "max")
+    pixel_hashes_batched(sort(dir_ls(glue("{dir_atlas}/dist/dataset=am"), glob = "*.parquet")), n_batch = 800,
+                         quant = "trunc", dedup = "max")
   })
   h <- h |> filter(mdl_key %in% am_take)
   am_reg <- asset_store_key("cog_model", "global05", h$content_hash) |> mutate(mdl_key = h$mdl_key, ds_key = "am")
@@ -394,7 +418,7 @@ paint_rows <- function(rows, grid, round_first = FALSE, workers = n_workers) {
   if (!nrow(rows)) return(invisible(0L))
   one_batch <- function(b) {
     suppressMessages({library(DBI); library(duckdb); library(terra)})
-    con <- dbConnect(duckdb(), config = list(threads = "2", memory_limit = "3GB"))
+    con <- dbConnect(duckdb()); dbExecute(con, "SET memory_limit='3GB'; SET threads=2")   # SET: the config list is ignored
     on.exit(dbDisconnect(con, shutdown = TRUE))
     for (i in seq_len(nrow(b))) {
       if (file.exists(b$out[i])) next
@@ -453,7 +477,8 @@ am_native_reg <- tibble()
 if (!skip_am && length(am_take) && file_exists(am_db)) {
   native_grid <- grid_spec(rast(nrows = 360, ncols = 720, xmin = -180, xmax = 180, ymin = -90, ymax = 90, crs = "EPSG:4326"))
   h <- cached_keys("native_am", path_dir(am_db), {
-    con <- dbConnect(duckdb(path.expand(am_db), read_only = TRUE), config = list(threads = "6", memory_limit = "10GB"))
+    con <- dbConnect(duckdb(path.expand(am_db), read_only = TRUE))
+    dbExecute(con, glue("SET memory_limit='10GB'; SET threads=6; SET temp_directory='{dir_as}/duckdb_tmp'"))
     on.exit(dbDisconnect(con, shutdown = TRUE))
     duckdb_register(con, "served_k", tibble(sp_key = sub("^am\\|", "", am_take)))   # a VIEW over the df: the db is read-only
     pixel_hashes(con, "(SELECT 'am|' || s.sp_key AS mdl_key, c.loiczid AS cell_id, s.probability * 100 AS val
@@ -649,10 +674,11 @@ if (do_merged_cog && dir_exists(dir_gmerged)) {
     SEMI JOIN (SELECT DISTINCT ms_merge_key AS mdl_key FROM m.taxon
                WHERE is_marine AND ms_merge_key IS NOT NULL AND sp_cat NOT IN ('reptile','amphibian')) s USING (mdl_key)"))$mdl_key
   mkeys <- take_n(sort(mkeys))
+  # the merge writes one taxon to one bucket dir (b1..b406; 0 of 17,131 straddle, 2026-10-07), so batches of
+  # buckets are batches of taxa; every taxon is hashed, served or not, so the cache serves any later set
   h <- cached_keys("cog_merged", dir_gmerged, {
-    dbWriteTable(con, "served_m", tibble(mdl_key = mkeys), overwrite = TRUE)
-    pixel_hashes(con, glue("(SELECT g.mdl_key, g.cell_id, g.val FROM read_parquet('{dir_gmerged}/**/*.parquet') g SEMI JOIN served_m USING (mdl_key)) s"),
-                 "mdl_key", quant = "trunc", dedup = "max")
+    pixel_hashes_batched(glue("{sort(dir_ls(dir_gmerged, type = 'directory'))}/*.parquet"), n_batch = 40,
+                         quant = "trunc", dedup = "max")
   }) |> filter(mdl_key %in% mkeys)
   merged_reg <- asset_store_key("cog_model", "global05", h$content_hash) |> mutate(mdl_key = h$mdl_key, ds_key = "ms_merge")
   merged_reg$file <- store_path(merged_reg$key)
@@ -708,12 +734,15 @@ if (do_merged_cog && dir_exists(dir_parts)) {
   if (test_n > 0) suitonly <- head(suitonly, test_n)
   log_info("suitability-only taxa needing a painted merged COG: {nrow(suitonly)} ({sum(suitonly$n_ax > 0)} with AquaX, {sum(suitonly$n_ax == 0)} multi-AquaMaps)")
   if (nrow(suitonly)) {
+    # one hive partition per taxon, named by the suit-only set (explicit pruning: a JOIN over the 50 GB glob is
+    # not guaranteed to prune); hashed by mkey_id and mapped back to the merged key
     h <- cached_keys("cog_merged_suit", dir_parts, {
-      dbWriteTable(con, "suit_k", suitonly |> select(ms_merge_key, mkey_id), overwrite = TRUE)
-      hh <- pixel_hashes(con, glue("(SELECT k.ms_merge_key AS mdl_key, p.cell_id, p.val
-                                    FROM read_parquet('{dir_parts}/mkey_id=*/*.parquet', hive_partitioning = true) p
-                                    JOIN suit_k k USING (mkey_id)) s"), "mdl_key", quant = "round_trunc", dedup = "max")
-      hh
+      hh <- pixel_hashes_batched(glue("{dir_parts}/mkey_id={sort(suitonly$mkey_id)}/*.parquet"), n_batch = 500, by = "mkey_id",
+                                 from = function(lst) glue("read_parquet([{lst}], hive_partitioning = true)"),
+                                 quant = "round_trunc", dedup = "max")
+      hh |> mutate(mkey_id = as.integer(mkey_id)) |>
+        inner_join(suitonly |> transmute(mkey_id = as.integer(mkey_id), mdl_key = ms_merge_key), by = "mkey_id") |>
+        select(mdl_key, n, content_hash)
     }) |> filter(mdl_key %in% suitonly$ms_merge_key)
     mm_reg <- asset_store_key("cog_model", "global05", h$content_hash) |> mutate(mdl_key = h$mdl_key, ds_key = "ms_merge")
     mm_reg$file <- store_path(mm_reg$key)
@@ -833,17 +862,21 @@ inputs <- rows |> filter(ds_key != "ms_merge") |> inner_join(tm, by = "mdl_key",
 merged <- rows |> filter(ds_key == "ms_merge") |> mutate(ms_merge_key = mdl_key)
 
 # am-only taxa: the merged surface IS the AquaMaps surface (verified byte-identical on a 150-taxon sample) ->
-# alias the model object: same asset_url, same bbox, zero new bytes
+# alias the model object: same asset_url, same bbox, zero new bytes. The aliases are ms_merge rows, so they
+# exist only when that class is built (PUBLISH_MERGED_COG): without it the class must stay ABSENT for
+# registry_merge() to carry the published rows forward -- aliases alone read as a class that shrank to its
+# am-only members, which is where the first v9 run stopped (2026-10-06)
 have_merged <- merged$ms_merge_key
-amonly <- dbGetQuery(con, "
+amonly <- if (do_merged_cog) dbGetQuery(con, "
   SELECT ms_merge_key, max(mdl_key) AS am_key FROM (
     SELECT t.ms_merge_key, tm.mdl_key FROM m.taxon t JOIN m.taxon_model tm USING (ms_merge_key)
     WHERE t.is_marine AND t.ms_merge_key IS NOT NULL AND t.sp_cat NOT IN ('reptile','amphibian'))
-  GROUP BY 1 HAVING count(*) = 1 AND max(split_part(mdl_key,'|',1)) = 'am'")
+  GROUP BY 1 HAVING count(*) = 1 AND max(split_part(mdl_key,'|',1)) = 'am'") else tibble(ms_merge_key = character(), am_key = character())
 alias_rows <- amonly |> filter(!ms_merge_key %in% have_merged) |>
   inner_join(rows |> filter(ds_key == "am", representation == "model") |> rename(am_key = mdl_key), by = "am_key") |>
   mutate(mdl_key = ms_merge_key, ds_key = "ms_merge") |> select(-am_key)
 if (nrow(alias_rows)) log_info("am-only merged aliases: {nrow(alias_rows)} taxa point at their AquaMaps model object (0 new objects)")
+if (!do_merged_cog) log_warn("PUBLISH_MERGED_COG unset: the ms_merge class is carried forward from the published table, not rebuilt")
 dbDisconnect(con, shutdown = TRUE)
 
 native_asset <- bind_rows(inputs, merged, alias_rows) |>
