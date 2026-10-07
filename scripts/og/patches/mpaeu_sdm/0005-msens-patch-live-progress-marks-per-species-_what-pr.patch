@@ -1,0 +1,199 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ben Best <ben@ecoquants.com>
+Date: Wed, 7 Oct 2026 11:30:05 +0200
+Subject: [PATCH 5/5] msens patch: live progress marks per species
+ (_what=progress.tsv): thinning counts, each pipeline step, each algorithm's
+ fit start/done
+
+---
+ functions/components_model_species.R | 23 ++++++++++++++++++++-
+ functions/model_species.R            | 31 ++++++++++++++++------------
+ 2 files changed, 40 insertions(+), 14 deletions(-)
+
+diff --git a/functions/components_model_species.R b/functions/components_model_species.R
+index 8c94233..93f5dbc 100644
+--- a/functions/components_model_species.R
++++ b/functions/components_model_species.R
+@@ -310,7 +310,7 @@
+ 
+ # Fit model -----
+ .cm_model_fit <- function(algorithms, algo_opts, sp_data,
+-                          model_log, verb_1, verb_2) {
++                          model_log, verb_1, verb_2, mark = function(...) NULL) {
+   if (!is.null(algo_opts)) {
+     algo_opts <- algo_opts[algorithms]
+   } else {
+@@ -320,14 +320,17 @@
+   model_fits <- lapply(seq_along(algorithms), \(x) NULL)
+   for (i in seq_len(length(algorithms))) {
+     if (verb_1) cli::cli_alert_info("Fitting {algorithms[i]}")
++    mark(paste("Fit", algorithms[i]), "start")
+     model_fits[[i]] <- try(do.call(paste0("sdm_module_", algorithms[i]),
+                                     list(sp_data, verbose = verb_2,
+                                         options = algo_opts[[i]])))
+     if (inherits(model_fits[[i]], "try-error")) {
+       model_log$model_result[[algorithms[i]]] <- "failed"
++      mark(paste("Fit", algorithms[i]), "failed")
+       model_fits[[i]] <- FALSE
+     } else {
+       model_log$model_result[[algorithms[i]]] <- "succeeded"
++      mark(paste("Fit", algorithms[i]), "done")
+     }
+   }
+ 
+@@ -1565,3 +1568,21 @@ split_ds <- function(sp_occ,
+   if (dir.exists(d_sp) && length(list.files(d_sp, all.files = TRUE, no.. = TRUE)) == 0) fs::dir_delete(d_sp)
+   invisible(NULL)
+ }
++
++# msens patch: progress marks ----
++# returns mark(what, note = ""), which appends one row (time, what, note) to
++# {outfolder}/taxonid={species}/model={outacro}/taxonid={species}_model={outacro}_what=progress.tsv.
++# never stops a fit: every write is wrapped in try().
++.og_marker <- function(outfolder, species, outacro) {
++  dir <- file.path(outfolder, paste0("taxonid=", species), paste0("model=", outacro))
++  f <- file.path(dir, paste0("taxonid=", species, "_model=", outacro, "_what=progress.tsv"))
++  try({
++    dir.create(dir, recursive = TRUE, showWarnings = FALSE)
++    cat("time\twhat\tnote\n", file = f)
++  }, silent = TRUE)
++  function(what, note = "") {
++    try(cat(sprintf("%s\t%s\t%s\n", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), what, note), file = f, append = TRUE),
++        silent = TRUE)
++    invisible(NULL)
++  }
++}
+diff --git a/functions/model_species.R b/functions/model_species.R
+index b45be5a..1a6a846 100644
+--- a/functions/model_species.R
++++ b/functions/model_species.R
+@@ -111,6 +111,10 @@ model_species <- function(species,
+   
+   # Record timing
+   treg <- obissdm::.get_time()
++  # msens patch: live progress marks (time, step, note) appended to the species folder as _what=progress.tsv, so a long fit can
++  # be followed from outside (the pipeline otherwise writes nothing between the bias metrics and the end of the fit)
++  mark <- .og_marker(outfolder, species, outacro)
++  get_time <- function(treg, what = NULL) { treg <- obissdm::.get_time(treg, what); if (!is.null(what)) mark(what); treg }
+   
+   # Define global objects and fill log
+   coord_names <- c("decimalLongitude", "decimalLatitude")
+@@ -134,7 +138,7 @@ model_species <- function(species,
+   if (verb_1) cli::cli_alert_info("Reading data")
+   species_data <- .cm_load_species(species, species_dataset)
+   
+-  treg <- obissdm::.get_time(treg, "Species data loading")
++  treg <- get_time(treg, "Species data loading")
+   
+   # If data is available, proceeds
+   minptslim <- 30
+@@ -168,7 +172,7 @@ model_species <- function(species,
+     eval_pts <- split_ds(species_data, "eval")
+     model_log$n_init_points <- nrow(fit_pts)
+     
+-    treg <- obissdm::.get_time(treg, "Data loading")
++    treg <- get_time(treg, "Data loading")
+     
+     
+     
+@@ -213,6 +217,7 @@ model_species <- function(species,
+     if (inherits(fit_pts_sac, "try-error")) {
+       fit_pts_sac <- fit_pts
+     } 
++    mark("Thinning", paste0(nrow(fit_pts), " -> ", nrow(fit_pts_sac), " points"))
+ 
+     # msens patch (control runs, optional): use OBIS's published fit presences instead of re-drawing the
+     # (random, seed-dependent) spatial thinning. OG_FITOCC_FROM = root of the published species folders.
+@@ -300,7 +305,7 @@ model_species <- function(species,
+     model_log$model_fit_points <- sum(sp_data$training$presence)
+     model_log$model_eval_points <- sum(sp_data$eval_data$presence)
+ 
+-    treg <- obissdm::.get_time(treg, "Data preparing")
++    treg <- get_time(treg, "Data preparing")
+     
+     # PART 3: ASSESS SPATIAL BIAS ----
+     if (assess_bias) {
+@@ -308,7 +313,7 @@ model_species <- function(species,
+ 
+       .cm_spat_bias(metric_out, species, outacro, env, sp_data)
+ 
+-      treg <- obissdm::.get_time(treg, "Sample bias assessment")
++      treg <- get_time(treg, "Sample bias assessment")
+     }
+     
+     # PART 4: MODEL SELECTION ----
+@@ -333,17 +338,17 @@ model_species <- function(species,
+     sp_data$training <- sp_data$training[, c("presence", multi_mod$best_variables)]
+     sp_data$eval_data <- sp_data$eval_data[, c("presence", multi_mod$best_variables)]
+     
+-    treg <- obissdm::.get_time(treg, "Model selection")
++    treg <- get_time(treg, "Model selection")
+     
+     
+     # PART 5: FIT MODELS ----
+     if (verb_1) cli::cli_alert_info("Starting model fitting")
+     fit_obj <- .cm_model_fit(algorithms, algo_opts, sp_data,
+-                             model_log, verb_1, verb_2)
++                             model_log, verb_1, verb_2, mark)
+     model_fits <- fit_obj$fits
+     model_log <- fit_obj$logs
+     rm(fit_obj)
+-    treg <- obissdm::.get_time(treg, "Model fit")    
++    treg <- get_time(treg, "Model fit")    
+     
+     if (any(unlist(model_log$model_result) == "succeeded")) {
+       if (verb_1) cli::cli_alert_info("Model fitting concluded. Checking if models are good")
+@@ -360,7 +365,7 @@ model_species <- function(species,
+                                                 outacro, species, env,
+                                                 verb_1, verb_2)
+         
+-        treg <- obissdm::.get_time(treg, "Model prediction")
++        treg <- get_time(treg, "Model prediction")
+         
+         model_log$model_good <- algorithms[good_models]
+         model_log$model_good_metric <- tg_metric
+@@ -377,7 +382,7 @@ model_species <- function(species,
+           species, outacro
+         )
+         
+-        treg <- obissdm::.get_time(treg, "Response curves")
++        treg <- get_time(treg, "Response curves")
+         
+         
+         # Variables importance
+@@ -387,7 +392,7 @@ model_species <- function(species,
+           species, outacro
+         )
+         
+-        treg <- obissdm::.get_time(treg, "Variable importance")
++        treg <- get_time(treg, "Variable importance")
+         
+         # PART 8: ENSEMBLE ----
+         if (length(good_models) > 1) {
+@@ -399,7 +404,7 @@ model_species <- function(species,
+           model_predictions <- ens_obj$preds
+           model_log <- ens_obj$logs
+           rm(ens_obj)
+-          treg <- obissdm::.get_time(treg, "Ensemble")
++          treg <- get_time(treg, "Ensemble")
+         }
+ 
+         # PART 9: SAVE BINARIZATION INFO ----
+@@ -416,7 +421,7 @@ model_species <- function(species,
+           env, model_predictions, sp_data,
+           pred_out, species, outacro, coord_names, max_depth
+         )
+-        treg <- obissdm::.get_time(treg, "Masks")
++        treg <- get_time(treg, "Masks")
+ 
+ 
+ 
+@@ -435,7 +440,7 @@ model_species <- function(species,
+           species, outacro,
+           model_varimport, env, verb_1
+         )
+-        treg <- obissdm::.get_time(treg, "Post-evaluation")
++        treg <- get_time(treg, "Post-evaluation")
+ 
+ 
+         # PART 12: SAVE MODELS OBJECTS ----
