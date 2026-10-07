@@ -460,8 +460,9 @@ Every distribution file of every release lives ONCE in a content-addressed store
 `first_ver`). A release owns only POINTERS: `{ver}/tables/native_asset.parquet` (`asset_url`,
 `content_hash`, `source_key`) and the app shards built from it. v9, v8, v7b and v7 were re-pointed on
 2026-10-02 (runbook in the notes vault, `plans_todo/atlas-refs/round4-session/m2-m4-runbook.md`);
-their pre-store copies under `{ver}/native/` and the file host's `pmtiles/{v8,v9}/` stay until the
-M6 prune (earliest 2026-10-16, Ben's explicit go). **The key is known before the file is built**:
+their pre-store copies under `{ver}/native/` and the file host's `pmtiles/{v8,v9}/` were PRUNED on
+2026-10-07 (M6, `scripts/prune_legacy_native.R`: pointer sweep of every release + `check_release_pointers.R`
+before and after; `v8/native/gm/` kept, it holds the gm density COGs, not pre-store copies). **The key is known before the file is built**:
 `msens::asset_store_key(family, scope, content_hash)` folds the payload hash — `pixel_hashes()` (the
 rows quantised as the writer quantises them, `trunc` into INT1U, `round_trunc` for AquaX and the
 suitability-only merged paint, repeated cells collapsed by `max` as the merge consumes them) or
