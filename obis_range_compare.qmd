@@ -1,0 +1,153 @@
+---
+title: "OBIS-method runs compared: published `mpaeu`, our `og` / `ogm` and the controls"
+author: "Ben Best"
+date: "2026-10-08"
+editor_options:
+  chunk_output_type: console
+---
+
+## Why
+
+`obis_range_constraint.qmd` scores the range rules A–E on one model run at a time (OBIS's published
+models and, through `obis_range_constraint_{og,ogm}.qmd`, each of ours). This page puts the runs side by
+side: how good each model is, how many cells each rule keeps per US EEZ subregion under each run, where the
+regional effort test agrees, and what each run cost. It reads only the committed csvs under `data/og/`
+(`scripts/og/cv_metrics.R`, `scripts/og/timings.R` and the scorecard notebooks write them), so it renders on
+any machine.
+
+| run | fit points | background | layers | species |
+|---|---|---|---|---|
+| `mpaeu` | OBIS's published models (their thinning, their tuning) | random cells of the masked stack | OBIS's depth choice | all seven |
+| `ogp` | pinned to OBIS's fit points and hyperparameters (control) | random | surface | leatherback, right whale |
+| `ogc` | our thinning, our tuning | random | surface | leatherback, right whale |
+| `og` | our thinning, our tuning | target group = the species' ORDER (turtle records for turtles) | surface | six (loggerhead apart) |
+| `ogm` | our thinning, our tuning | target group = air-breathing megafauna | surface | six (loggerhead running) |
+
+```{r}
+#| label: setup
+#| message: false
+librarian::shelf(dplyr, ggplot2, glue, here, knitr, purrr, readr, stringr, tidyr, quiet = TRUE)
+acros  <- c(mpaeu = "published", ogp = "ogp", ogc = "ogc", og = "og", ogm = "ogm")
+read_set <- function(what) imap_dfr(acros, \(f, a) {
+  p <- here(glue("data/og/{f}_{what}.csv"))
+  if (!file.exists(p)) return(NULL)
+  read_csv(p, show_col_types = FALSE) |> mutate(acro = a, taxon = as.character(taxon)) })
+card <- read_set("scorecard") |> mutate(acro = factor(acro, names(acros)))
+rtest <- read_set("region_test")
+cvm  <- read_csv(here("data/og/cv_metrics.csv"), show_col_types = FALSE) |> mutate(taxon = as.character(taxon))
+tim  <- read_csv(here("data/og/timings.csv"),    show_col_types = FALSE) |> mutate(taxon = as.character(taxon))
+common <- card |> distinct(taxon, common)
+sp_order <- c("Loggerhead", "Green", "Hawksbill", "Kemp's ridley", "Leatherback", "Olive ridley", "North Atlantic right whale")
+```
+
+## Model quality
+
+The pipeline reports two sets of metrics per algorithm: the spatial-block cross-validation (`cv`, what its
+acceptance gate reads, CBI ≥ 0.3) and the independent evaluation records (`eval`, records held back before
+the fit; for these species only `r min(cvm$n_eval)`–`r max(cvm$n_eval)` presences, so a single eval AUC is
+noisy — read the pattern across runs, not one cell). The ensemble row is the mean over the accepted
+algorithms.
+
+```{r}
+#| label: quality
+#| tbl-cap: "Ensemble metrics per run: AUC / CBI / TSS at P10, on the independent evaluation records (eval) and on the spatial-block CV folds (cv)."
+q <- cvm |> filter(method == "ensemble") |>
+  mutate(v = sprintf("%.2f / %.2f / %.2f", auc, cbi, tss_p10), common = factor(common, levels = c("loggerhead", "green", "hawksbill", "kemps_ridley", "leatherback", "olive_ridley", "right_whale"))) |>
+  select(common, origin, acro, v) |> pivot_wider(names_from = acro, values_from = v) |> arrange(common, desc(origin))
+kable(q |> select(common, origin, any_of(names(acros))))
+```
+
+```{r}
+#| label: accepted
+#| tbl-cap: "Fit points, evaluation presences, background and the algorithms the gate accepted, per run."
+kable(cvm |> filter(method != "ensemble", origin == "cv") |>
+  summarise(n_fit = first(n_fit), n_eval = first(n_eval), background = first(background),
+            algos_accepted = paste(method[accepted], collapse = "+"), algos_rejected = paste(method[!accepted], collapse = "+"),
+            .by = c(common, acro)) |> arrange(common, acro))
+```
+
+The order-level target group fails as a background: for a turtle it is the turtle records, which for the
+loggerhead are mostly its own 80,012 occurrences, so presences and background are the same places. Every
+`og` run scores below its `ogm` twin on the evaluation records (leatherback 0.63 vs 0.90, hawksbill 0.75
+vs 0.93), and the loggerhead `og` ensemble is below chance (0.42) while its CV CBI is 0.93–0.96 — the gate
+accepted all three algorithms. The megafauna background (`ogm`) and the random background (`ogc`, `ogp`)
+are in the same band as OBIS's published models.
+
+## Cells kept per EEZ subregion
+
+```{r}
+#| label: kept
+#| tbl-cap: "Cells kept per US EEZ subregion, rule P10 (the published threshold inside the fitted-record hull) and rule E (held-out threshold, uncertainty, regional effort test), by run."
+kept <- card |> filter(rule %in% c("P10", "E"), str_starts(region, "EEZ")) |>
+  mutate(region = str_remove(region, "EEZ "), common = factor(common, sp_order)) |>
+  select(common, region, rule, acro, n_kept) |>
+  pivot_wider(names_from = c(acro, rule), values_from = n_kept, names_sep = " ") |> arrange(common, region)
+kable(kept, format.args = list(big.mark = ","))
+```
+
+```{r}
+#| label: fig-kept
+#| fig-cap: "Rule E cells kept per EEZ subregion and run (log scale; a missing bar is zero)."
+#| fig-width: 10
+#| fig-height: 6
+card |> filter(rule == "E", str_starts(region, "EEZ"), n_kept > 0) |>
+  mutate(region = str_remove(region, "EEZ "), common = factor(common, sp_order)) |>
+  ggplot(aes(region, n_kept, fill = acro)) + geom_col(position = position_dodge(preserve = "single")) +
+  scale_y_log10(labels = scales::comma) + facet_wrap(~ common, ncol = 4) +
+  labs(x = NULL, y = "cells kept (rule E)", fill = "run") + theme_minimal() + theme(legend.position = "bottom")
+```
+
+```{r}
+#| label: variants
+#| tbl-cap: "Rule E and its two variants for the runs that have a held-out threshold: `E mega` runs the effort test on megafauna records, `E no guard` drops the ratio guard."
+kable(card |> filter(rule %in% c("E", "E mega", "E no guard"), str_starts(region, "EEZ"), acro %in% c("og", "ogm")) |>
+  mutate(region = str_remove(region, "EEZ "), common = factor(common, sp_order)) |>
+  select(common, region, acro, rule, n_kept) |>
+  pivot_wider(names_from = c(acro, rule), values_from = n_kept, names_sep = " ") |> arrange(common, region),
+  format.args = list(big.mark = ","))
+```
+
+## Regional effort test
+
+```{r}
+#| label: verdicts
+#| tbl-cap: "Verdict of the regional effort test (order-level effort, cell unit, ratio 0.25) per species x EEZ subregion and run."
+v <- rtest |> filter(effort == "order", unit == "cell", str_starts(region, "EEZ")) |>
+  left_join(common, by = "taxon") |>
+  mutate(region = str_remove(region, "EEZ "), common = factor(common, sp_order),
+         verdict = if_else(!is.na(label) & verdict == "dropped", paste0(verdict, " (", label, ")"), verdict)) |>
+  select(common, region, acro, verdict) |> pivot_wider(names_from = acro, values_from = verdict) |> arrange(common, region)
+kable(v |> select(common, region, any_of(names(acros))))
+agree <- v |> filter(!is.na(og), !is.na(ogm)) |> summarise(n = n(), same = sum(og == ogm))
+```
+
+`og` and `ogm` reach the same verdict in `r agree$same` of `r agree$n` species × subregion cells; the test
+reads records and effort, not the model, so a background change moves it only through the P10 footprint it
+is applied to.
+
+## Cost
+
+```{r}
+#| label: timings
+#| tbl-cap: "Minutes per run (fit only, bootstrap excluded) and the share of the slowest step."
+t <- tim |> summarise(total = first(total_mins), n_fit = first(n_fit),
+                      slowest = step[which.max(mins)], pct = max(pct), .by = c(common, acro)) |>
+  mutate(acro = factor(acro, names(acros)))
+kable(t |> mutate(v = sprintf("%s (%s %s %%)", round(total), slowest, pct)) |> select(common, acro, v) |>
+  pivot_wider(names_from = acro, values_from = v) |> arrange(common))
+```
+
+Maxent is ~91–95 % of a fit and roughly linear in fit points (5.5 k → 3 h 51, 8.5 k → 6 h 20, 24 k →
+13 h 20); rf and xgboost take ≤ 10 min each. The loggerhead's 23,666 fit points (OBIS: 1,160) come from the
+Mantel distance being drawn from a 1,000-record random sample, which sends the >15,000-point branch to a
+grid prune at a different resolution.
+
+## What this settles, and what it does not
+
+- The ORDER-level target-group background is not usable for these species; carry the megafauna (`ogm`) or
+  random (`ogc`) background forward. The `og` scorecard stays as the record of why.
+- The acceptance gate (CV CBI ≥ 0.3) passed a model that is below chance on independent records; a floor on
+  CV AUC or on the evaluation metrics would have caught it. That is a method change in the pipeline, not made.
+- Open (Ben): the loggerhead thinning (cap the fit points, pin OBIS's `fitocc`, or a fixed thinning
+  distance); which background to carry; the `ratio = 0.25` guard and the 0.5° unit of the effort test;
+  whether the leatherback's P10 count of 51 vs 57 is acceptable.
