@@ -1,0 +1,160 @@
+---
+title: "The OBIS-method trial, explained: what we ran on seven species, what it showed, and what it means for modeling 19,000"
+author: "Ben Best"
+date: "2026-10-09"
+---
+
+> Written for Ben Best and Tim White as the plain-English companion to `obis_range_compare.html` and the
+> per-run scorecards. Every number is from `data/og/cv_metrics.csv`, `data/og/timings.csv` and the
+> `data/og/*_scorecard.csv` tables at workflows commit `0318fb00`, the proposal
+> `proposal_MST-supplemental-modeling_round-1.docx` (2026-09) and `data/obis_sdm_gapfill_species.csv`.
+
+## The one-paragraph version
+
+We took OBIS's open species-distribution-modeling pipeline (the one the proposal says we will use for 19,000 species), ran it ourselves on the Mac mini for six sea turtles and the North Atlantic right whale, and compared what came out against the models OBIS has already published for those species. Three things came out of it. (1) We can reproduce OBIS's models: when we feed the pipeline the same points and settings, we get the same answer. (2) One setting matters a lot: where the "background" points come from. Taking them from the species' own order (turtle records for a turtle) ruins the model; taking them from all air-breathing marine megafauna, or at random, gives models as good as OBIS's. (3) The loggerhead is a special case: it has 360,000 records, and how many of them you keep to fit the model decides how much of the Pacific it paints. None of this changes the proposal's compute budget, because the seven species we picked are among the most data-rich marine species on Earth; the typical species in the proposal has 80 occupied cells, not 91,000, and fits in about 15 minutes.
+
+## Why we did this
+
+The MST scores every species from a habitat-suitability surface. Today those surfaces come from AquaMaps, whose grids FishBase will not release, so a BOEM product built on them is not fully open. OBIS's framework (`obissdm` + `mpaeu_sdm`, built for MPA Europe) is open, uses the same public inputs (OBIS + GBIF records, Bio-ORACLE environmental layers), and fits on the MST's own 0.05 degree grid. The proposal's Task 1 is to run it for the 19,034 species the MST scores or could score that OBIS has not modeled yet.
+
+Before promising that, we needed to know three things: can we run the pipeline at all (it was written for OBIS's cluster), do we get OBIS's answers back when we do, and which of its settings change the result. We tested on species that matter to BOEM and where we already had something to compare against: OBIS's published models, IUCN range maps, and the sea-turtle Alaska problem from the v7.1 patch (AquaMaps painted loggerheads into Alaskan waters where there are no records).
+
+## How the method works, in plain words
+
+Every run of the pipeline does the same eight things for one species.
+
+1. **Get the records.** Every occurrence of the species in OBIS and GBIF, with OBIS's quality control (land points, impossible dates, duplicates removed). The loggerhead has 80,012 clean records after this step; the right whale 2,923.
+2. **Thin them.** Records cluster where people look (harbors, research cruises, satellite tags). Thinning keeps one record per patch of ocean so the model learns habitat, not effort. What survives are the **fit points**. OBIS's own thinning turned the loggerhead's 80,012 records into 1,160 fit points; ours turned them into 23,666 (the two differ in how they choose the thinning distance; more on that below).
+3. **Hold some back.** A small set of records (11 to 24 for these species) is set aside before anything is fit. These **evaluation records** are the only truly independent test of the finished model.
+4. **Choose background points.** A presence-only model needs to know what "available ocean" looks like, so it draws a sample of places with no record of the species. These are the **background** (about 143,000 cells here). The pipeline's default is random cells. A common refinement is a **target group**: use places where *similar* species were recorded, so the background has the same sampling bias as the presences. We tried both and two kinds of target group.
+5. **Fit three algorithms.** Maxent (through the `maxnet` R package, not the Java program), random forest, and XGBoost. Each is tuned by **spatial-block cross-validation**: the ocean is cut into blocks, the model is fit on four fifths of the blocks and tested on the fifth, five times, and the settings that test best are kept.
+6. **Accept or reject each algorithm.** An algorithm is kept if its cross-validation Boyce index (CBI) is at least 0.3. The accepted ones are averaged into the **ensemble**.
+7. **Predict and threshold.** The ensemble is predicted onto every grid cell, giving a suitability from 0 to 100. The pipeline's threshold is **P10**: the value that keeps 90 % of the fit points. Cells at or above it are the model's footprint.
+8. **Bootstrap.** The fit is repeated on resamples of the data to produce an uncertainty surface.
+
+The scores we report:
+
+- **AUC** (0.5 is a coin flip, 1 is perfect) asks whether the model ranks the held-back records above random background.
+- **CBI** (Boyce index, from -1 to 1) asks whether higher suitability actually means more records; 0 means suitability tells you nothing.
+- **TSS** (true skill statistic, from -1 to 1) scores the footprint after thresholding.
+
+We report each twice: on the cross-validation folds (**cv**, what the pipeline's own gate reads) and on the held-back evaluation records (**eval**, the independent test). The eval sets are tiny, so one eval number is noisy; the pattern across runs is what counts.
+
+## The six runs
+
+Each run is a complete pass of the pipeline over the species listed, differing in one or two settings. The acronyms are the folder names in the outputs.
+
+| run | fit points come from | background | species | what it tells us |
+|---|---|---|---|---|
+| `mpaeu` | OBIS's published models as downloaded | random | all 7 | the reference |
+| `ogp` | OBIS's exact fit points and tuned settings, re-run by us | random | leatherback, right whale | do we get their answer back |
+| `ogc` | our thinning, our tuning | random | leatherback, right whale | does our thinning or tuning change anything |
+| `og` | our thinning, our tuning | target group: the species' order (turtle records for turtles, whale records for the whale) | all 7 | the "obvious" target group |
+| `ogm` | our thinning, our tuning | target group: all air-breathing megafauna (turtles, whales, seals, seabirds) | all 7 | a broader target group |
+| `ogmp` | OBIS's 1,160 fit points, our tuning | megafauna target group | loggerhead | fit points alone, with the background held fixed |
+
+One difference applies to all of ours: we used Bio-ORACLE's surface layers for every species, while OBIS picks surface, water-column or bottom layers by habitat. We did this to keep one environmental stack across the species; it is a setting to revisit.
+
+## What we found
+
+### We can reproduce OBIS's models
+
+`ogp` gives back OBIS's published model within the noise of the tiny evaluation sets: leatherback eval AUC 0.93 against the published 0.94, right whale 0.99 against 0.99. The pipeline runs on our machine, with our patches, and gives their answer. That was not a given; the pipeline assumes OBIS's storage layout and cluster, and we carry eight small patches to run it here (committed under `scripts/og/patches/`).
+
+### Our own thinning and tuning do not hurt
+
+`ogc` (our thinning, our tuning, random background) scores as well as `ogp` on both species (leatherback 0.97 vs 0.93; right whale 0.99 vs 0.99). So the parts of the pipeline we re-implemented for our grid are not the problem.
+
+### The background choice can make or break a model
+
+This was the biggest finding. Using the species' own order as the target group (`og`) is wrong for these species. For a turtle, "turtle records" are mostly the loggerhead's own 80,000 records, so presences and background are the same places and the model cannot tell them apart. Every `og` model scored below its `ogm` twin on the evaluation records, and the loggerhead `og` model was **below chance** (eval AUC 0.42). Yet the pipeline accepted it, because its cross-validation CBI was 0.94; the gate reads only CV, and CV shares the same bias. A floor on eval metrics would have caught it. That is a method change to propose to OBIS, not something we changed.
+
+The megafauna target group (`ogm`) and the random background (`ogc`, `ogp`) are both in the same band as OBIS's published models.
+
+| species | published | `og` (order) | `ogm` (megafauna) | `ogc` (random) | `ogp` (pinned) | `ogmp` |
+|---|---|---|---|---|---|---|
+| loggerhead | 0.83 / 0.56 / 0.60 | **0.42** / -0.21 / 0.03 | 0.91 / 0.46 / 0.73 | | | 0.85 / -0.02 / 0.62 |
+| green | 0.88 / 0.38 / 0.49 | 0.89 / 0.72 / 0.68 | 0.99 / 0.82 / 0.89 | | | |
+| hawksbill | 0.61 / -0.12 / 0.24 | 0.75 / -0.15 / 0.48 | 0.93 / 0.56 / 0.77 | | | |
+| Kemp's ridley | 0.98 / 0.70 / 0.81 | 0.86 / 0.51 / 0.50 | 0.91 / 0.54 / 0.67 | | | |
+| leatherback | 0.94 / 0.78 / 0.68 | 0.63 / -0.10 / 0.30 | 0.90 / 0.49 / 0.70 | 0.97 / 0.74 / 0.80 | 0.93 / 0.78 / 0.65 | |
+| olive ridley | 1.00 / 0.59 / 0.85 | 0.98 / 0.69 / 0.80 | 0.98 / 0.66 / 0.81 | | | |
+| right whale | 0.99 / 0.66 / 0.88 | 0.84 / 0.47 / 0.65 | 0.91 / 0.86 / 0.73 | 0.99 / 0.65 / 0.88 | 0.99 / 0.69 / 0.86 | |
+
+Ensemble AUC / CBI / TSS on the held-back evaluation records. Read across a row: `ogm` beats `og` for every species; `ogm`, `ogc` and `ogp` sit with the published column. The green turtle's `og` maxent fit failed outright, so that ensemble is two algorithms.
+
+### The loggerhead: the fit points decide the footprint
+
+The loggerhead is the one species where our runs and OBIS's disagree on the map, and we now know why. Same megafauna background, same tuning, two sets of fit points:
+
+| | `ogm` (our 23,666 points) | `ogmp` (OBIS's 1,160 points) | published |
+|---|---|---|---|
+| eval AUC / CBI / TSS | 0.91 / 0.46 / 0.73 | 0.85 / -0.02 / 0.62 | 0.83 / 0.56 / 0.60 |
+| fit time | 19 h 21 (maxent 18 h 19) | 1 h 30 | 6 h 41 on OBIS's machine |
+| P10 cells, Alaska | 0 | 0 | 55,807 |
+| P10 cells, Atlantic | 32,626 | 32,532 | 51,436 |
+| P10 cells, Gulf of Mexico | 11,450 | 17,439 | 23,874 |
+| P10 cells, Pacific | 55,943 | 198,141 | 61,327 |
+
+Cells are 0.05 degree cells inside each US EEZ subregion above the P10 threshold. With our 23,666 points the Pacific footprint is close to the published one; with OBIS's 1,160 points it is three times larger. Fewer points, same background, means a looser model. And neither of ours paints a single Alaska cell at P10, where the published model paints 55,807; the published model used OBIS's depth-layer choice, ours the surface layers, and Alaska is where that difference shows.
+
+The thinning difference is a quirk, not a design choice. The pipeline picks a thinning distance from a spatial-autocorrelation test on a random sample of 1,000 records, and for species with more than 15,000 records it switches to a grid-based prune. OBIS's sample sent the loggerhead down one branch, ours down the other. The cost of the 23,666-point branch is 18 hours of maxent; the 1,160-point branch costs 1.5 hours and gives a model that is no worse by the gate but paints far more ocean. A fixed cap on fit points, or pinning the published thinning, is the decision to make here.
+
+### The range rules A to E
+
+The scorecards also apply the five range rules we drafted for the v7.1 turtle patch (A: P10 inside the convex hull of the fit points; B to D: add held-out thresholds and uncertainty; E: all of that plus a **regional effort test**, which asks, per EEZ subregion, whether the region has been searched enough for an absence of records to mean anything). The effort test gives the same verdict for every run: Atlantic, Gulf and Pacific "kept", Alaska "unsearched". Between our two backgrounds the test agrees in 24 of 24 species-by-subregion cells. It reads records and effort, not the model, so a background change moves it only through which cells are in the P10 footprint to begin with.
+
+Rule E also reaches beyond the convex hull that bounds P10, so for the loggerhead `ogm` it grows the Pacific from 55,943 to 138,957 cells with thresholds (72 to 81 across folds) at the P10 value (73). Whether that reach is wanted is one of the open choices.
+
+## What the week of computing actually bought, and what it means for 19,034 species
+
+### Where the time went
+
+The seven species took about three days of machine time, not a week of pure compute; the rest of the week was fetching the pipeline's inputs (Bio-ORACLE layers, OBIS's published models, the target-group backgrounds), patching the pipeline to run outside OBIS's cluster, building the scorecards, and sharing the mini with a CalCOFI release, which held most runs to 2 to 6 cores.
+
+The machine time itself was almost entirely the loggerhead:
+
+| run | species | wall time | of which maxent |
+|---|---|---|---|
+| `og` six | 6 (no loggerhead) | fits of 12 to 329 min per species, six in parallel (about 5.5 h), + about 2 h bootstrap | most |
+| `ogm` six | 6 | 7 h 14 fit + 1 h 50 bootstrap, 6 cores | most |
+| `og` loggerhead | 1 | 14 h 35 fit + 5 h bootstrap, 4 cores | 13 h 20 |
+| `ogm` loggerhead | 1 | 19 h 21 fit + 5 h bootstrap, 2 cores | 18 h 19 |
+| `ogmp` loggerhead | 1 | 1 h 30 fit + 22 min bootstrap, 2 cores | about 1 h |
+
+Per species, fit time is a flat 10 minutes plus about 3 minutes per 100 fit points, and maxent is 91 to 95 % of it. The other two algorithms are cheap: for the loggerhead's 23,666 points, random forest took 7 minutes and XGBoost 12, against maxent's 1,099.
+
+### Why these seven are the worst case
+
+The seven species we chose are freakishly well recorded. Among the 19,034 gap-fill species in the proposal, the median species has **80** occupied 0.05 degree cells worldwide; 90 % have fewer than 500; 99 % fewer than 2,200; only 24 have more than 10,000. The loggerhead has 91,557, the green turtle 23,859, the leatherback 20,181. Our cheapest runs are the right representatives of the proposal's species: Kemp's ridley and the right whale, each with 155 fit points, fit in 11 to 15 minutes and bootstrapped in a few more.
+
+Scaling the measured cost (10 min + 0.05 min per fit point, plus 25 % for the bootstrap, as measured on the six) over the real record counts of the 19,034 species gives about **8,000 worker-hours**, or **11 days on a 64-core machine** running 32 two-core workers. Capping fit points at 2,000 (which only touches 231 species) trims that to 7,400. The proposal's figure, 40 minutes per species, 12,689 core-hours and 8 days on 64 cores, is the right order of magnitude. The expensive tail is a few hundred species, and it is the tail where a cap on fit points, or OBIS's own thinning, costs nothing in model quality.
+
+### Is there something faster than maxent?
+
+The pipeline already uses `maxnet`, the R re-implementation of Maxent on top of `glmnet`; there is no Java Maxent in the loop. What makes it slow here is not the algorithm but how it is driven:
+
+- **The tuning grid.** OBIS's settings try two feature sets (linear + quadratic, and hinge) and four regularization values, each by five-fold cross-validation: 41 maxnet fits per species. The hinge features are the expensive half; they expand every predictor into dozens of columns, and glmnet's cost grows with columns times rows. `obissdm`'s own default is linear + quadratic only with four regularization values, 21 fits and no hinge.
+- **The rows.** 143,000 background cells plus the fit points, times five folds, times 41 fits.
+- **The fit points.** Linear in cost, and for the loggerhead 20 times OBIS's count through the thinning quirk above.
+
+So the fastest way to the same answer is to keep OBIS's thinning as published, drop or shrink the hinge grid, and cap the background for the data-rich species; each is a one-line setting. Beyond that, the evidence from these runs says maxent is not the algorithm carrying the ensemble: in cross-validation, random forest matched or beat maxent for all seven species on the megafauna background (for example loggerhead AUC 0.93 vs 0.92, right whale 0.80 vs 0.74), and the same holds in OBIS's own published fits (random forest 0.79 to 0.94 against maxent 0.71 to 0.94). Random forest and XGBoost take 3 to 12 minutes each regardless of record count. For the few hundred data-rich species, an ensemble without maxent, or maxent on a light grid, is a defensible way to keep the batch inside the budget; for the 18,000 ordinary species it does not matter, because 10 minutes of fixed cost dominates.
+
+We have not tested a lighter maxent grid or a two-algorithm ensemble on these species yet. Both are cheap to test now that the data and scorecards exist (the whole loop on the right whale is 15 minutes).
+
+## Decisions this leaves open
+
+1. **Background.** Carry the megafauna target group (`ogm`) or random (`ogc`) into the batch; never the order-level group. For the 19,034 species, "megafauna" does not generalize; a target group per broad taxon (fish records for fish, and so on) or the random default are the choices. Random is OBIS's own setting and needs no extra table.
+2. **Loggerhead thinning, and the general rule.** Cap fit points (OBIS's branch gives 1,160; a fixed cap of 2,000 to 5,000 would be explicit), or accept 19-hour fits for the handful of species above 10,000 cells.
+3. **Acceptance gate.** Propose to OBIS a floor on the independent evaluation metrics beside the CV Boyce index, so a below-chance model is rejected. Until then we can apply it ourselves when ingesting.
+4. **Range rule.** Whether rule E's reach beyond the fit-point hull is wanted, the 0.25 ratio guard and the 0.5 degree unit of the effort test, and whether a P10 footprint of 51 vs 57 cells for the leatherback is acceptable.
+5. **Depth layers.** Re-run with OBIS's per-habitat layer choice before deciding anything about Alaska.
+6. **Compute for the proposal.** The budget line holds. Pin OBIS's thinning and a light maxent grid in the batch settings; test both on the seven species first (an afternoon).
+
+## Where everything is
+
+- **Reports** (rendered pages, workflows repo `_output/`, published at marinesensitivity.org/workflows/): `obis_range_compare.html` (every run side by side), `obis_range_constraint.html` (the published models under rules A to E), and one scorecard per run: `obis_range_constraint_og.html`, `_ogm.html`, `_ogmp.html`, `_ogp.html`. `ogc` has no card; it is compared in `scripts/og/compare_control.R`.
+- **Tables** (`workflows/data/og/`): `cv_metrics.csv` (every metric above), `timings.csv` (every step time), and per run `{run}_scorecard.csv`, `{run}_region_test.csv`, `{run}_heldout_folds.csv`.
+- **Code** (`workflows/scripts/og/`): the run scripts (`run_one.sh`, `run_seven.sh`, `run_logger_ogm.sh`, `run_og.R`), the scorecard renderer, the metric and timing collectors, the target-group builder, and `patches/` with the eight patches we apply to OBIS's pipeline (kept on a local branch of our clone until we decide to fork publicly).
+- **Model outputs** (`~/_big/sdm/` on the Mac mini and the laptop): `og/taxonid=<id>/model=<run>/` holds each run's predictions as COGs, metrics, log and manifest; `scorecard/<run>.duckdb` the scorecard databases; `obis/species/` OBIS's published models; `og_inputs/` the environmental stack and target-group backgrounds.
+- **The rules in code**: `msens::heldout_threshold()` and `msens::region_effort_test()` (msens 0.54.0), with unit tests.
