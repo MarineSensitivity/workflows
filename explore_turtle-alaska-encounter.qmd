@@ -1,0 +1,717 @@
+---
+title: "Downweighting Alaska sea turtles by encounter rate"
+subtitle: "A mock-up on real records: NOAA Alaska sightings and strandings, OBIS surveys, OBIS + GBIF, iNaturalist"
+author: "Ben Best"
+date: "2026-10-12"
+format:
+  html:
+    code-fold: true
+    code-tools: true
+    toc: true
+editor_options:
+  chunk_output_type: console
+---
+
+## Why
+
+Every range rule tried so far (v7.1's AquaMaps P ≥ 0.5, the OBIS P10, hulls, buffers, the regional
+effort test in `obis_range_constraint.qmd`) is a **mask**: a cell keeps its turtle or loses it. This
+notebook tries the other idea from the 2026-10-06 thread with Tim White, "comparable data based on
+effort with strandings and/or survey for the other coasts … so that we can proportionally downweight
+Alaska". The suitability stays, scaled by how often turtles are actually encountered per unit of
+looking, compared with the US West Coast, where the same North Pacific populations are recorded.
+
+$$
+w_{s,r} = \min\left(1,\; \frac{\lambda_{s,r}}{\lambda_{s,\text{ref}}}\right), \qquad
+\lambda_{s,r} = \frac{\text{units in region } r \text{ where species } s \text{ was recorded}}{\text{units in region } r \text{ where someone who would have reported it looked}}
+$$
+
+- $s$ is a species, $r$ an ecoregion and ref the US West Coast (California Current + Washington/Oregon).
+- Each $\lambda$ gets a Jeffreys Beta(½, ½) posterior, so a region with zero records gets an upper
+  bound set by its effort rather than a hard zero.
+- $w$ is reported two ways. *Central* is the posterior median of the ratio. *Precautionary* is its
+  95th percentile, which is generous to Alaska.
+- The weight multiplies suitability, so a cell keeps its turtle at a fraction of its value.
+
+The ratio is only fair when the numerator and the denominator come from the **same reporting
+channel**, so the notebook builds three lines of evidence from real data. A fourth, strandings, is
+mocked up with the Alaska half filled in:
+
+| line | records (numerator) | looking (denominator) | unit |
+|---|---|---|---|
+| A. surveys | OBIS turtle records | OBIS records from datasets that have recorded a sea turtle anywhere; telemetry and photo-ID excluded | 0.5° block × year |
+| B. all records | OBIS + GBIF turtle records (`speciesgrids`) | cells with any marine mammal or sea turtle record | 0.05° cell |
+| C. public reports | iNaturalist turtle observations (GBIF API) | iNaturalist marine mammal + sea turtle observations | observation |
+| D. strandings | NOAA Alaska Region turtle carcasses and bycatch, 1963–2020 | marine mammal strandings, same region and years | stranding |
+
+```{r}
+#| label: setup
+librarian::shelf(
+  arrow, DBI, dplyr, duckdb, forcats, fs, ggplot2, glue, here, httr2, jsonlite, knitr, purrr, readr,
+  readxl, scales, sf, stringr, tibble, tidyr,
+  quiet = T)
+options(readr.show_col_types = F, knitr.kable.NA = "", dplyr.summarise.inform = F)
+source(here("libs/paths.R"))   # dir_raw, dir_big
+sf_use_s2(F)
+set.seed(42)
+dbx <- function(...) invisible(DBI::dbExecute(...))   # quiet in the rendered page
+
+# inputs ----
+f_ak      <- glue("{dir_raw}/fisheries.noaa.gov/turtles-alaska/Sea Turtle Sightings & Strandings for MMA Project, 2026_09_23.xlsx")
+dir_obis  <- path_expand("~/_big/obis_20250318_parquet/occurrence")   # OBIS full export, 2025-03-18
+db_sg     <- path_expand(glue("{dir_big}/speciesgrids_global05.duckdb"))
+db_card   <- path_expand("~/_big/sdm/scorecard/published.duckdb")   # obis_range_constraint.qmd: OBIS published ensembles per cell
+f_eco_ply <- path_expand(glue("{dir_big}/v8/ply_ecoregions_2025.gpkg"))
+f_zc_eco  <- path_expand(glue("{dir_big}/zones/ecoregion_2025-06/global05/zone_cell.parquet"))
+f_zc_pa   <- path_expand(glue("{dir_big}/zones/programarea_2026-01/global05/zone_cell.parquet"))
+dir_te    <- path_expand(glue("{dir_big}/turtle_encounter"))   # cached extracts
+dir_out   <- here("data/turtle_encounter")                      # small tables, committed
+dir_create(c(dir_te, dir_out))
+stopifnot(all(file_exists(c(f_ak, db_sg, db_card, f_eco_ply, f_zc_eco, f_zc_pa))), dir_exists(dir_obis))
+
+# species ----
+d_sp <- tribble(
+  ~aphia,  ~sp_key, ~common,         ~sci,
+  137205L, "cc",    "Loggerhead",    "Caretta caretta",
+  137206L, "cm",    "Green",         "Chelonia mydas",
+  137207L, "ei",    "Hawksbill",     "Eretmochelys imbricata",
+  137208L, "lk",    "Kemp's ridley", "Lepidochelys kempii",
+  137209L, "dc",    "Leatherback",   "Dermochelys coriacea",
+  220293L, "lo",    "Olive ridley",  "Lepidochelys olivacea")
+FAM_TURTLE <- c("Cheloniidae", "Dermochelyidae")
+
+# weight parameters ----
+ECO_REF   <- c("CAC", "WAOR")   # reference: the US West Coast
+ECO_AK    <- c("GOA", "EBS", "CBS", "HAR")
+SQL_AK    <- paste0("'", ECO_AK, "'", collapse = ", ")
+MIN_REF   <- 20L                # fewer reference detections than this -> use the all-turtle rate
+PRIOR     <- 0.5                # Jeffreys Beta(1/2, 1/2)
+N_DRAW    <- 2e4
+UNIT_AGG  <- 10L                # 10 x 10 global05 cells = 0.5 degree blocks
+
+# global05 cell id (1-based, row-major from the north-west corner), as terra::cellFromXY on the cell-id COG
+cell_of <- function(lon, lat) {
+  col <- pmin(floor((lon + 180) / 0.05), 7199); row <- pmin(floor((90 - lat) / 0.05), 3599)
+  as.integer(row * 7200 + col + 1)
+}
+stopifnot(cell_of(-180, 90) == 1L, cell_of(179.99, -89.99) == 7200L * 3600L)
+
+# ecoregions ----
+ply_eco <- st_read(f_eco_ply, quiet = T) |>
+  select(region_key, region_name, eco = ecoregion_key, eco_name = ecoregion_name)
+d_eco <- st_drop_geometry(ply_eco) |>
+  mutate(eco_lbl = glue("{eco_name} ({eco})"))
+# a boundary cell belongs to the ecoregion covering most of it (951 cells straddle two)
+zc_eco <- read_parquet(f_zc_eco) |>
+  arrange(cell_id, desc(pct_covered), zone_key) |>
+  distinct(cell_id, .keep_all = T) |>
+  transmute(cell_id = as.integer(cell_id), zone_key)
+stopifnot(setequal(unique(zc_eco$zone_key), d_eco$eco), !anyDuplicated(zc_eco$cell_id))
+f_zc_eco <- glue("{dir_te}/zone_cell_ecoregion_1.parquet")   # one ecoregion per cell, for the SQL below
+write_parquet(zc_eco, f_zc_eco)
+zc_eco <- rename(zc_eco, eco = zone_key)
+```
+
+## The Alaska record: NOAA sightings and strandings, 1963–2020
+
+Jenna Malek (NOAA Alaska Regional Office, stranding co-coordinator) sent these 49 rows to Tim White
+on 2026-10-05: the Alaska Region's file for the MMA project. The file is the long-running
+Wing/Hodge compilation. NOAA's feature story
+[*Sea turtles in Alaska? Yes, we have them far north*](https://www.fisheries.noaa.gov/feature-story/sea-turtles-alaska-yes-we-have-them-far-north)
+counts 48 sightings over the same years (19 green, 19 leatherback, 2 loggerhead, 4 olive ridley).
+Records from 2020 to the present were requested but have not arrived.
+
+Fixes and flags applied here:
+
+- **Fripo Island (2020):** the longitude is entered as +131.23, so it is negated.
+- **Dundas Island, B.C. (1981):** Canadian waters.
+- **Cannon Beach (1986):** the coordinates (50.5, −139.75) are far offshore and fall outside US waters.
+- **Noyes Island vicinity (1983):** the coordinates (59.0, −134.0) are near Haines, but Noyes
+  Island is at about 55.5° N. The record is kept, since either place is in the Gulf of Alaska
+  ecoregion.
+- **2013 and 2020:** two records have no coordinates.
+
+The ecoregion polygons stop at the outer coast and leave out the Inside Passage, where most of these
+records are. So each record goes to the nearest ecoregion within 150 km, and anything south of Dixon
+Entrance (54.6° N) counts as Canadian.
+
+```{r}
+#| label: ak-records
+d_ak <- read_excel(f_ak) |>
+  transmute(
+    year     = as.integer(Year),
+    location = Location,
+    species  = species,
+    lat      = Lat_dd,
+    lon      = if_else(Location == "Fripo Island" & Long_dd > 0, -Long_dd, Long_dd),
+    how      = Comments,
+    source   = AUTHORITY) |>
+  mutate(
+    type = case_when(
+      str_detect(str_to_lower(how), "carcass|hypoplastron|killed") ~ "carcass / dead",
+      str_detect(str_to_lower(how), "netted|live|alive")           ~ "live, in hand",
+      .default = "sighting"),
+    aphia = d_sp$aphia[match(species, d_sp$sci)])
+stopifnot(nrow(d_ak) == 49)
+
+# nearest ecoregion within 150 km: the polygons leave out the Inside Passage and beaches
+d_ak <- mutate(d_ak, i = row_number())
+pts  <- d_ak |> filter(!is.na(lon)) |> st_as_sf(coords = c("lon", "lat"), crs = 4326, remove = F)
+i_near <- st_nearest_feature(pts, ply_eco)
+d_ak <- d_ak |>
+  left_join(
+    tibble(
+      i        = pts$i,
+      eco_near = ply_eco$eco[i_near],
+      km_near  = as.numeric(st_distance(pts, ply_eco[i_near, ], by_element = T)) / 1000),
+    by = "i") |>
+  mutate(
+    eco    = if_else(km_near <= 150 & lat >= 54.6, eco_near, NA_character_),
+    status = case_when(
+      is.na(lat)  ~ "no coordinates",
+      is.na(eco)  ~ "outside US waters",
+      .default    = "in Alaska waters"))
+write_csv(d_ak, glue("{dir_out}/noaa_ak_turtles_1963-2020.csv"))
+
+d_ak |>
+  count(status, eco, species) |>
+  pivot_wider(names_from = species, values_from = n, values_fill = 0) |>
+  kable(caption = "NOAA Alaska Region turtle records by status, ecoregion and species.")
+```
+
+Every located Alaska record falls in the Gulf of Alaska ecoregion. The Bering, Chukchi and
+Beaufort seas have none in 58 years.
+
+```{r}
+#| label: ak-time
+#| fig-height: 3.5
+d_ak |>
+  mutate(decade = 10 * year %/% 10, species = str_replace(species, "^(\\w)\\w+ ", "\\1. ")) |>
+  ggplot(aes(decade, fill = type)) +
+  geom_bar() +
+  facet_wrap(~species, nrow = 1) +
+  labs(x = NULL, y = "records", fill = NULL, title = "Alaska turtle records per decade") +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+Reporting effort is not constant. Most records come from 1976–2002, while the compilation was
+actively maintained. The 2003–2020 gap more likely reflects nobody compiling than a lack of turtles,
+so the 2020–present request matters.
+
+```{r}
+#| label: ak-map
+#| fig-height: 5
+bb <- st_bbox(c(xmin = -170, xmax = -128, ymin = 50, ymax = 66), crs = 4326)
+ggplot() +
+  geom_sf(data = st_crop(ply_eco, bb), aes(fill = eco), alpha = 0.25, color = NA) +
+  geom_sf(data = filter(pts, !is.na(lon)), aes(shape = type, color = species), size = 2) +
+  coord_sf(xlim = bb[c(1, 3)], ylim = bb[c(2, 4)]) +
+  labs(fill = "ecoregion", shape = NULL, color = NULL) +
+  theme_minimal()
+```
+
+Neither OBIS nor GBIF holds any of these records. The OBIS export has no sea turtle north of
+48.5° N in the Pacific, and `speciesgrids` (OBIS + GBIF) has none in any Alaska ecoregion (line B).
+So the Alaska numerator rests on this file. The comparison is only fair against a lower-48 file
+collected the same way, which is line D.
+
+## Line A: surveys (OBIS)
+
+The unit is a 0.5° block in one year. A unit counts as **searched** if it holds any non-telemetry
+record from a dataset that has recorded a sea turtle somewhere in the world, meaning the observers
+would have written a turtle down. This drops seabird-only programmes, which never record turtles.
+The USGS North Pacific Pelagic Seabird Database is one: it has no turtle code and no turtle in its
+comments, so its 50 years of Alaska transects cannot count as turtle effort. A unit counts as
+**occupied** if it holds a turtle record.
+
+Telemetry is left out, because tags go where the tagged animals go. That means `MachineObservation`,
+which also carries placeholder fixes at Seattle (47.5, −122.5), plus any dataset whose name says
+telemetry, tracking or photo-ID. The TOPP state-space track summary, filed as `HumanObservation`,
+was otherwise most of the "Alaska effort".
+
+```{r}
+#| label: obis-extract
+f_mega <- glue("{dir_te}/mega_cell_year.parquet")    # birds, mammals, turtles per cell x year x dataset
+f_tds  <- glue("{dir_te}/turtle_datasets.parquet")   # datasets with a sea turtle record anywhere
+f_dsn  <- glue("{dir_te}/datasets.parquet")          # dataset names
+if (!all(file_exists(c(f_mega, f_tds, f_dsn)))) {
+  con <- dbConnect(duckdb())
+  dbx(con, "SET threads = 10")
+  fams <- paste0("'", FAM_TURTLE, "'", collapse = ", ")
+  dbx(con, glue("
+    CREATE VIEW occ AS SELECT * FROM read_parquet('{dir_obis}/*.parquet', union_by_name = true)
+    WHERE NOT COALESCE(absence, false)"))
+  dbx(con, glue("
+    COPY (SELECT dataset_id, count(*) AS n_turtle FROM occ WHERE family IN ({fams}) GROUP BY 1)
+    TO '{f_tds}'"))
+  dbx(con, glue("
+    COPY (
+      SELECT CAST(floor((90 - decimalLatitude) / 0.05) * 7200 + floor((decimalLongitude + 180) / 0.05) + 1 AS BIGINT) AS cell_id,
+             date_year, class, family, aphiaid, dataset_id, basisOfRecord, count(*) AS n
+      FROM occ
+      WHERE decimalLatitude BETWEEN 0 AND 75
+        AND (decimalLongitude BETWEEN -180 AND -50 OR decimalLongitude >= 165)
+        AND (class IN ('Aves', 'Mammalia') OR family IN ({fams}))
+      GROUP BY ALL)
+    TO '{f_mega}'"))
+  dbx(con, glue("
+    COPY (SELECT DISTINCT dataset_id, datasetName, institutionCode FROM occ
+          WHERE decimalLatitude BETWEEN 0 AND 75 AND (class IN ('Aves', 'Mammalia') OR family IN ({fams})))
+    TO '{f_dsn}'"))
+  dbDisconnect(con, shutdown = T)
+}
+
+RX_TELEMETRY <- "telemetr|track|satellite|argos|happywhale"   # tags and photo-ID go where the animals are
+
+con <- dbConnect(duckdb())
+dbx(con, glue("CREATE TABLE zc_eco AS SELECT * FROM '{f_zc_eco}'"))
+dbx(con, glue("
+  CREATE TABLE ds AS
+  SELECT dataset_id, any_value(datasetName) AS datasetName,
+         regexp_matches(lower(COALESCE(any_value(datasetName), '')), '{RX_TELEMETRY}') AS is_tel
+  FROM '{f_dsn}' GROUP BY 1"))
+dbx(con, glue("
+  CREATE TABLE a_rec AS
+  SELECT m.*, z.zone_key AS eco, ds.datasetName,
+         m.dataset_id IN (SELECT dataset_id FROM '{f_tds}') AS turtle_ds,
+         COALESCE(m.family IN ('Cheloniidae', 'Dermochelyidae'), false) AS is_turtle,
+         ((cell_id - 1) // 7200 // {UNIT_AGG}) * {7200 %/% UNIT_AGG} + ((cell_id - 1) % 7200) // {UNIT_AGG} AS blk
+  FROM '{f_mega}' m JOIN zc_eco z USING (cell_id) LEFT JOIN ds USING (dataset_id)
+  WHERE m.basisOfRecord <> 'MachineObservation' AND NOT COALESCE(ds.is_tel, false)"))
+n_tel <- dbGetQuery(con, glue("
+  SELECT count(*) AS n FROM ds WHERE is_tel AND dataset_id IN (SELECT dataset_id FROM '{f_tds}')"))$n
+
+# searched units per ecoregion, and occupied units per ecoregion x species (+ any turtle)
+a_eff <- dbGetQuery(con, "
+  SELECT eco, count(DISTINCT (blk, date_year)) AS n, count(DISTINCT dataset_id) AS datasets
+  FROM a_rec WHERE turtle_ds GROUP BY eco")
+a_det <- dbGetQuery(con, "
+  SELECT eco, aphiaid AS aphia, count(DISTINCT (blk, date_year)) AS x
+  FROM a_rec WHERE is_turtle AND turtle_ds GROUP BY ALL
+  UNION ALL
+  SELECT eco, 0 AS aphia, count(DISTINCT (blk, date_year)) AS x
+  FROM a_rec WHERE is_turtle AND turtle_ds GROUP BY ALL")
+# which surveys make up the Alaska effort
+a_ak_ds <- dbGetQuery(con, glue("
+  SELECT eco, datasetName, count(DISTINCT (blk, date_year)) AS units, min(date_year) AS y0, max(date_year) AS y1
+  FROM a_rec
+  WHERE turtle_ds AND eco IN ({SQL_AK})
+  GROUP BY ALL ORDER BY eco, units DESC"))
+dbDisconnect(con, shutdown = T)
+
+a_ak_ds |>
+  kable(caption = glue("Line A: the turtle-reporting surveys behind the Alaska effort (0.5° block-years), after dropping {n_tel} telemetry and photo-ID datasets."))
+```
+
+## Line B: all records (OBIS + GBIF)
+
+`speciesgrids` merges OBIS and GBIF records, without dates, onto the same 0.05° grid. Marine mammals
+are the effort. Stranding networks, whale watchers and survey crews report mammals and turtles
+alike, so a cell with a mammal record is a cell someone was watching. Birds are left out because
+eBird dominates them and does not report turtles.
+
+```{r}
+#| label: line-b
+con_sg <- dbConnect(duckdb())
+dbx(con_sg, glue("ATTACH '{db_sg}' AS sg (READ_ONLY)"))
+ids <- paste(d_sp$aphia, collapse = ", ")
+b_cell <- dbGetQuery(con_sg, glue("
+  SELECT s.cell_id, z.zone_key AS eco, s.aphia, s.aphia IN ({ids}) AS is_turtle
+  FROM sg.sg_cell s JOIN '{f_zc_eco}' z USING (cell_id)
+  WHERE s.class = 'Mammalia' OR s.aphia IN ({ids})"))
+dbDisconnect(con_sg, shutdown = T)
+
+# searched units (n) per ecoregion and occupied units (x) per ecoregion x species; aphia 0 = any turtle
+count_units <- function(d) {   # d: eco, cell_id, aphia, is_turtle (aphia NA = unidentified turtle)
+  list(
+    eff = d |> group_by(eco) |> summarize(n = n_distinct(cell_id)),
+    det = bind_rows(
+      d |> filter(is_turtle, !is.na(aphia)) |> group_by(eco, aphia) |> summarize(x = n_distinct(cell_id)),
+      d |> filter(is_turtle) |> group_by(eco) |> summarize(x = n_distinct(cell_id)) |> mutate(aphia = 0L)))
+}
+b  <- count_units(b_cell)
+
+# variant B+: the NOAA Alaska records added as if they were in GBIF (generous to Alaska)
+ak_cells <- d_ak |>
+  filter(status == "in Alaska waters") |>
+  transmute(cell_id = cell_of(lon, lat), eco, aphia, is_turtle = T)
+bp <- count_units(bind_rows(b_cell, ak_cells))
+
+tibble(
+  ecoregion = c("any Alaska", ECO_AK),
+  `cells, B`  = c(sum(b$eff$n[b$eff$eco %in% ECO_AK]), b$eff$n[match(ECO_AK, b$eff$eco)]),
+  `turtle cells, B`  = c(sum(b$det$x[b$det$eco %in% ECO_AK & b$det$aphia == 0]), b$det$x[match(paste(ECO_AK, 0), paste(b$det$eco, b$det$aphia))]),
+  `turtle cells, B+` = c(sum(bp$det$x[bp$det$eco %in% ECO_AK & bp$det$aphia == 0]), bp$det$x[match(paste(ECO_AK, 0), paste(bp$det$eco, bp$det$aphia))])) |>
+  mutate(across(-ecoregion, ~ coalesce(.x, 0L))) |>
+  kable(format.args = list(big.mark = ","), caption = "Line B in Alaska: cells with a marine mammal or turtle record (OBIS + GBIF), and cells with a turtle, without and with the NOAA file.")
+```
+
+## Line C: public reports (iNaturalist via GBIF)
+
+The Alaska file is mostly public reports: fishers, beachcombers, newspapers. iNaturalist is the
+nearest lower-48 equivalent, so line C counts iNaturalist observations for each Pacific ecoregion.
+The ecoregion polygons stop at the outer coast, so each one is buffered by 1° to take in sounds,
+passages and beaches, then cut to its stretch of US coast. The query polygon cannot cross the
+antimeridian, so this line covers the Gulf of Alaska and the West Coast only.
+
+```{r}
+#| label: line-c
+f_c <- glue("{dir_out}/inat_counts.csv")
+INAT    <- "50c9509d-22c7-4a22-a47d-8c48425ef4a7"
+gbif_q  <- function(...) {
+  request("https://api.gbif.org/v1/occurrence/search") |>
+    req_url_query(..., limit = 0, .multi = "explode") |>
+    req_retry(max_tries = 4) |> req_perform() |> resp_body_json()
+}
+# each ecoregion buffered 1 degree (sounds, passages, beaches), cut to its own stretch of US coast
+BOX_C <- list(
+  GOA  = c(xmin = -166, xmax = -129.9, ymin = 54.6,  ymax = 62),
+  WAOR = c(xmin = -128, xmax = -121,   ymin = 42,    ymax = 48.4),
+  CAC  = c(xmin = -126, xmax = -116.5, ymin = 32.53, ymax = 42))
+ccw_wkt <- function(e) {   # gbif wants counter-clockwise outer rings
+  g <- st_geometry(filter(ply_eco, eco == e)) |> st_union() |> st_buffer(1) |>
+    st_intersection(st_as_sfc(st_bbox(BOX_C[[e]], crs = 4326))) |>
+    st_simplify(dTolerance = 0.05) |> st_make_valid() |> st_cast("POLYGON")
+  g <- g[order(-as.numeric(st_area(g)))][seq_len(min(3, length(g)))]   # the 3 largest parts
+  rings <- map(g, function(p) {
+    m <- p[[1]]; a <- sum(m[-1, 1] * m[-nrow(m), 2] - m[-nrow(m), 1] * m[-1, 2])   # shoelace (sign = orientation)
+    if (a < 0) m <- m[nrow(m):1, ]
+    list(m)
+  })
+  st_as_text(st_multipolygon(rings), digits = 7)
+}
+if (!file_exists(f_c)) {
+  key_sp <- map_int(d_sp$sci, function(x) {
+    request("https://api.gbif.org/v1/species/match") |>
+      req_url_query(name = x, rank = "SPECIES") |> req_perform() |> resp_body_json() |> pluck("usageKey")
+  })
+  taxa <- c(
+    set_names(as.list(key_sp), d_sp$aphia),
+    list(`0` = c(9413L, 5464L)),                          # Cheloniidae + Dermochelyidae
+    list(mm = c(733L, 5310L, 5309L, 5308L)))               # Cetacea, Phocidae, Otariidae, Odobenidae
+  d_c <- expand_grid(eco = c("CAC", "WAOR", "GOA"), what = names(taxa)) |>
+    mutate(x = map2_int(eco, what, function(e, w) {
+      wkt <- ccw_wkt(e)
+      gbif_q(geometry = wkt, taxonKey = taxa[[w]], datasetKey = INAT, occurrenceStatus = "PRESENT")$count
+    }))
+  write_csv(d_c, f_c)
+}
+d_c <- read_csv(f_c)
+c_eff <- d_c |> filter(what %in% c("mm", "0")) |> group_by(eco) |> summarize(n = sum(x))
+c_det <- d_c |> filter(!what %in% "mm") |> transmute(eco, aphia = as.integer(what), x)
+d_c |> pivot_wider(names_from = eco, values_from = x) |>
+  mutate(what = recode(what, mm = "marine mammals", `0` = "any sea turtle", !!!set_names(d_sp$common, d_sp$aphia))) |>
+  kable(format.args = list(big.mark = ","), caption = "Line C: iNaturalist observations per Pacific ecoregion (1° coastal buffer, US side).")
+```
+
+## Encounter rates
+
+```{r}
+#| label: rates
+# posterior draws of a binomial rate, Jeffreys prior
+draw_rate <- function(x, n) rbeta(N_DRAW, PRIOR + x, PRIOR + n - x)
+
+d_rate <- bind_rows(
+  list(
+    "A. surveys"              = list(a_eff, a_det),
+    "B. all records"          = list(b$eff, b$det),
+    "B+. all records + NOAA AK" = list(bp$eff, bp$det),
+    "C. public reports"       = list(c_eff, c_det)) |>
+    imap(function(l, line) {
+      d <- expand_grid(eco = l[[1]]$eco, aphia = c(0L, d_sp$aphia)) |>
+        left_join(select(l[[1]], eco, n), by = "eco") |>
+        left_join(select(l[[2]], eco, aphia, x), by = c("eco", "aphia")) |>
+        mutate(x = coalesce(as.integer(x), 0L), n = as.integer(n), line = line)
+      # "AK" = all Alaska ecoregions pooled, the fallback for an ecoregion a line never searched
+      # (a sum of per-ecoregion units: units never straddle ecoregions on lines A and B)
+      bind_rows(d, d |> filter(eco %in% ECO_AK) |> group_by(line, aphia) |>
+        summarize(eco = "AK", x = sum(x), n = sum(n), .groups = "drop"))
+    })) |>
+  left_join(
+    bind_rows(select(d_eco, eco, region_key, eco_name), tibble(eco = "AK", region_key = "AK", eco_name = "Alaska, pooled")),
+    by = "eco") |>
+  mutate(
+    sp   = if_else(aphia == 0L, "any sea turtle", d_sp$common[match(aphia, d_sp$aphia)]),
+    rate = (x + PRIOR) / (n + 2 * PRIOR),
+    lo   = qbeta(0.025, PRIOR + x, PRIOR + n - x),
+    hi   = qbeta(0.975, PRIOR + x, PRIOR + n - x))
+stopifnot(all(d_rate$x <= d_rate$n))
+write_csv(d_rate, glue("{dir_out}/encounter_rates.csv"))
+```
+
+```{r}
+#| label: rates-plot
+#| fig-height: 6
+d_rate |>
+  filter(aphia == 0L, n > 0, !eco %in% c("PUR", "AK")) |>
+  mutate(
+    eco_lbl = glue("{eco_name} ({region_key})"),
+    group   = case_when(eco %in% ECO_AK ~ "Alaska", eco %in% ECO_REF ~ "reference: West Coast", .default = "other US"),
+    eco_lbl = fct_reorder(eco_lbl, as.integer(factor(region_key, c("AK", "PA", "GA", "AT"))), .desc = T)) |>
+  ggplot(aes(rate, eco_lbl, color = group)) +
+  geom_pointrange(aes(xmin = lo, xmax = hi)) +
+  geom_text(aes(x = 2, label = glue("{comma(x)} / {comma(n)}")), hjust = 0, size = 2.6, show.legend = F) +
+  scale_x_log10(
+    breaks = 10^c(-6, -4, -2, 0), labels = c("0.0001%", "0.01%", "1%", "100%"),
+    limits = c(1e-6, 1e3), expand = c(0, 0)) +
+  scale_color_manual(values = c("Alaska" = "#c0392b", "reference: West Coast" = "#2471a3", "other US" = "grey50")) +
+  facet_wrap(~line, ncol = 2) +
+  labs(x = "encounter rate, any sea turtle (log scale, 95 % interval)", y = NULL, color = NULL) +
+  theme_minimal() + theme(legend.position = "bottom", panel.grid.minor = element_blank())
+```
+
+The numbers on the right are occupied over searched units. Zero records against a small number of searched units
+leaves a wide interval. The interval narrows only as effort grows, which is the "empty of turtles or
+empty of observers" distinction stated as a number.
+
+## The Alaska weights
+
+$w$ compares each Alaska ecoregion with the West Coast, species by species. A species with fewer than
+`r MIN_REF` reference detections on a line uses the any-turtle rate instead. Kemp's ridley, the
+hawksbill and, on most lines, the loggerhead and olive ridley are recorded too rarely off the West
+Coast to pin down a reference rate. That rarity says nothing about Alaska; it only means their
+reference is unknown. The any-turtle reference is dominated by green turtles, mostly the resident
+San Diego Bay and Long Beach greens on line C.
+
+```{r}
+#| label: weights
+ref <- d_rate |>
+  filter(eco %in% ECO_REF) |>
+  group_by(line, aphia, sp) |> summarize(x_ref = sum(x), n_ref = sum(n))
+
+d_w <- d_rate |>
+  filter(eco %in% c(ECO_AK, "AK")) |>
+  left_join(ref, by = c("line", "aphia", "sp")) |>
+  left_join(ref |> filter(aphia == 0L) |> ungroup() |> select(line, x_any = x_ref, n_any = n_ref), by = "line") |>
+  left_join(d_rate |> filter(aphia == 0L) |> select(line, eco, x_eco_any = x, n_eco_any = n), by = c("line", "eco")) |>
+  mutate(
+    pooled = x_ref < MIN_REF,
+    x_use  = if_else(pooled, x_eco_any, x),   n_use  = if_else(pooled, n_eco_any, n),
+    xr_use = if_else(pooled, x_any, x_ref),   nr_use = if_else(pooled, n_any, n_ref)) |>
+  rowwise() |>
+  mutate(
+    ratio   = list(draw_rate(x_use, n_use) / draw_rate(xr_use, nr_use)),
+    w_mid   = min(1, median(ratio)),
+    w_prec  = min(1, quantile(ratio, 0.95)[[1]]),
+    p_below = mean(ratio < 1)) |>
+  ungroup() |>
+  select(line, eco, eco_name, aphia, sp, x, n, x_ref, n_ref, pooled, w_mid, w_prec, p_below)
+write_csv(d_w, glue("{dir_out}/alaska_weights.csv"))
+fmt_w <- function(x) format(signif(x, 2), scientific = F, drop0trailing = T)
+
+d_w |>
+  filter(n > 0) |>
+  mutate(
+    w  = glue("{fmt_w(w_mid)} ({fmt_w(w_prec)}){if_else(pooled, '*', '')}"),
+    sp = factor(sp, c("any sea turtle", d_sp$common))) |>
+  select(line, eco, sp, w) |>
+  arrange(sp) |>
+  pivot_wider(names_from = sp, values_from = w) |>
+  arrange(line, factor(eco, c(ECO_AK, "AK"))) |>
+  kable(caption = "Alaska weights relative to the West Coast: central (precautionary 95th percentile). * = too few West Coast records of the species, so the any-turtle rate is used. AK = the four Alaska ecoregions pooled. Ecoregions with no effort on a line are left out.")
+```
+
+```{r}
+#| label: weights-numbers
+#| include: false
+nr  <- function(ln, e, what = "n") d_rate |> filter(line == ln, eco == e, aphia == 0L) |> pull(what)
+wv  <- function(ln, e, what = "w_mid") d_w |> filter(line == ln, eco == e, aphia == 0L) |> pull(what) |> fmt_w()
+```
+
+Read across the lines (any-turtle weights in brackets: central, precautionary):
+
+- **A (surveys)** is effort-matched by design, but OBIS holds almost no turtle-aware survey effort
+  in Alaska. All of it is the Lamont-Doherty/LGL seismic cruises of 2004–2008 with
+  protected-species observers, `r nr("A. surveys", "AK")` block-years in all against
+  `r format(nr("A. surveys", "CAC") + nr("A. surveys", "WAOR"), big.mark = ",")` off the West Coast. So Alaska's zero barely
+  constrains anything (pooled Alaska `r wv("A. surveys", "AK")`, `r wv("A. surveys", "AK", "w_prec")`).
+  The NOAA AFSC and Marine Mammal Lab cetacean surveys, Platforms of Opportunity and fishery
+  observers would make this line count, and they are the survey ask.
+- **B (all records)** has `r format(nr("B. all records", "AK"), big.mark = ",")` Alaska cells with a
+  marine mammal or turtle record, and not one turtle. Its weights are the smallest
+  (`r wv("B. all records", "AK")`, `r wv("B. all records", "AK", "w_prec")`).
+- **B+** puts the NOAA records into GBIF as though they had always been there. The Gulf of Alaska
+  climbs back toward the West Coast rate (`r wv("B+. all records + NOAA AK", "GOA")`,
+  `r wv("B+. all records + NOAA AK", "GOA", "w_prec")`). So line B's Alaska weight measures the
+  records' absence from GBIF as much as turtles' absence from Alaska. The NOAA numerator is 58 years
+  of every reporting channel, while the mammal denominator is whatever reached GBIF. Because of that
+  mismatch, B+ is a generous bound rather than an estimate, and the honest comparison for the NOAA
+  file is line D.
+- **C (public reports)** is like-for-like on reporting: `r format(nr("C. public reports", "GOA"), big.mark = ",")`
+  iNaturalist mammal and turtle observations in the Gulf of Alaska, none of them a turtle, against
+  `r format(nr("C. public reports", "CAC") + nr("C. public reports", "WAOR"), big.mark = ",")` on the
+  West Coast, of which `r percent(d_rate |> filter(line == "C. public reports", eco %in% ECO_REF, aphia == 0L) |> with(sum(x) / sum(n)), 0.01)`
+  are turtles
+  (`r wv("C. public reports", "GOA")`, `r wv("C. public reports", "GOA", "w_prec")`). It covers
+  roughly the last 15 years, the iNaturalist era, and it misses everything before.
+
+## Line D: strandings, the comparison still missing
+
+The Alaska numerator below is real; the denominators are the data request. For each region and the
+same years, the request is turtle carcasses and live strandings, and marine mammal strandings as the
+effort proxy: the same beaches, walked by the same networks.
+
+```{r}
+#| label: line-d
+ak_d <- d_ak |> filter(status == "in Alaska waters", type != "sighting", year >= 1963, year <= 2020)
+tibble(
+  region                    = c("Alaska (Gulf of Alaska)", "Washington / Oregon", "California", "Gulf of America", "US Atlantic"),
+  `turtle strandings`       = c(nrow(ak_d), NA, NA, NA, NA),
+  `marine mammal strandings`= NA_integer_,
+  source                    = c(
+    "NOAA AK Region file (this notebook); MM: AK Region stranding network (Jenna Malek / Mandy Keogh)",
+    "NOAA West Coast Region stranding network (turtles + MM)",
+    "NOAA West Coast Region stranding network (turtles + MM)",
+    "STSSN (sea turtle stranding and salvage network); MM: Southeast Region",
+    "STSSN; MM: Greater Atlantic + Southeast Regions")) |>
+  kable(caption = glue("Line D, 1963–2020. Alaska: {nrow(ak_d)} turtle carcasses or in-hand animals in 58 years ({round(nrow(ak_d) / 58, 2)} per year)."))
+```
+
+Once the table is filled, line D's weight is the same function:
+$w = \frac{\text{AK turtle} / \text{AK MM}}{\text{WC turtle} / \text{WC MM}}$, with the Jeffreys
+posterior on each rate. The STSSN 10-year summary is public through its
+[data application](https://connect.fisheries.noaa.gov/content/cb3f4647-9e4f-4f3d-9edf-e7a87a1feef6/)
+(preliminary, Atlantic and Gulf only). The West Coast and Alaska counts have to be requested.
+
+## Applied to the suitability
+
+The weights are applied to the published OBIS ensembles (0–100, the surfaces scored in
+`obis_range_constraint.qmd`) on US waters, unthresholded, so that only the downweight shows. The
+lines disagree, so each one is applied in turn. An Alaska ecoregion that a line never searched takes
+that line's pooled-Alaska weight: the High Arctic on every line, and every ecoregion except the Gulf
+of Alaska on line C. The lower 48 keep a weight of 1.
+
+```{r}
+#| label: apply
+lines_apply <- c("A. surveys", "B. all records", "B+. all records + NOAA AK", "C. public reports")
+w_apply <- map_dfr(lines_apply, function(ln) {
+  d_l <- filter(d_w, line == ln)
+  expand_grid(eco = ECO_AK, aphia = d_sp$aphia) |>
+    left_join(d_l |> select(eco, aphia, n, w_mid, w_prec), by = c("eco", "aphia")) |>
+    left_join(d_l |> filter(eco == "AK") |> select(aphia, ak_mid = w_mid, ak_prec = w_prec), by = "aphia") |>
+    transmute(
+      line = ln, eco, aphia, borrowed = coalesce(n, 0L) == 0,
+      w_mid  = if_else(borrowed, ak_mid,  w_mid),
+      w_prec = if_else(borrowed, ak_prec, w_prec))
+})
+stopifnot(!anyNA(w_apply$w_mid), !anyNA(w_apply$w_prec))
+write_csv(w_apply, glue("{dir_out}/alaska_weights_applied.csv"))
+
+# summed suitability per species x ecoregion x Program Area (the weight is constant within each)
+con <- dbConnect(duckdb())
+dbx(con, glue("ATTACH '{db_card}' AS card (READ_ONLY)"))
+d_suit <- dbGetQuery(con, glue("
+  SELECT c.taxon AS aphia, z.zone_key AS eco, p.zone_key AS pa, count(*) AS cells, sum(c.val) AS suit
+  FROM card.og_cell c
+  JOIN '{f_zc_eco}' z USING (cell_id)
+  LEFT JOIN '{f_zc_pa}' p USING (cell_id)
+  WHERE c.taxon IN ({ids}) AND c.val >= 1
+  GROUP BY ALL"))
+n_pa <- dbGetQuery(con, glue("SELECT zone_key AS pa, count(*) AS n_cell FROM '{f_zc_pa}' GROUP BY 1"))
+dbDisconnect(con, shutdown = T)
+
+# every (line, weight) applied to the same table; "unweighted" = w of 1 everywhere
+d_suit_w <- bind_rows(
+  d_suit |> mutate(line = "unweighted", weight = "none", w = 1),
+  expand_grid(line = lines_apply, weight = c("central", "precautionary")) |>
+    pmap_dfr(function(line, weight) {
+      wk <- if (weight == "central") "w_mid" else "w_prec"
+      d_suit |>
+        left_join(w_apply |> filter(line == !!line) |> select(eco, aphia, w = all_of(wk)), by = c("eco", "aphia")) |>
+        mutate(line = line, weight = weight, w = coalesce(w, 1))
+    })) |>
+  mutate(suit_w = suit * w)
+
+d_share <- d_suit_w |>
+  group_by(line, weight, aphia) |>
+  summarize(ak_share = sum(suit_w[eco %in% ECO_AK]) / sum(suit_w)) |>
+  ungroup() |>
+  left_join(select(d_sp, aphia, common), by = "aphia")
+write_csv(d_share, glue("{dir_out}/alaska_share.csv"))
+d_share |>
+  mutate(
+    col = if_else(line == "unweighted", "unweighted", glue("{str_sub(line, 1, 2)} {str_sub(weight, 1, 4)}.")),
+    col = str_replace(col, "\\. ", " "),
+    val = percent(ak_share, 0.01)) |>
+  select(species = common, col, val) |>
+  pivot_wider(names_from = col, values_from = val) |>
+  kable(caption = "Alaska's share of each species' summed suitability in US waters (OBIS published ensembles), unweighted and under each line's weight (cent. = central, prec. = precautionary).")
+```
+
+```{r}
+#| label: apply-pa
+#| fig-height: 8
+d_pa <- d_suit_w |>
+  filter(!is.na(pa)) |>
+  group_by(line, weight, pa) |>
+  summarize(suit_w = sum(suit_w)) |>
+  ungroup() |>
+  left_join(n_pa, by = "pa") |>
+  mutate(per_cell = suit_w / n_cell)
+write_csv(d_pa, glue("{dir_out}/programarea_suitability.csv"))
+
+pa_order <- d_pa |> filter(line == "unweighted") |> arrange(per_cell) |> pull(pa)
+d_pa |>
+  filter(line != "unweighted") |>
+  left_join(d_pa |> filter(line == "unweighted") |> select(pa, unweighted = per_cell), by = "pa") |>
+  mutate(pa = factor(pa, pa_order), weight = factor(weight, c("precautionary", "central"))) |>
+  ggplot(aes(y = pa)) +
+  geom_col(data = \(d) distinct(d, line, pa, unweighted), aes(x = unweighted), fill = "grey85") +
+  geom_point(aes(x = per_cell, color = weight), size = 2) +
+  scale_color_manual(values = c(precautionary = "#f5b041", central = "#c0392b")) +
+  facet_wrap(~line, nrow = 1) +
+  labs(
+    x = "summed suitability of the six turtles per cell (bars: unweighted)", y = "Program Area", color = NULL,
+    title = "Program Areas, turtle suitability before and after the Alaska weight") +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+## What this does and does not show
+
+So far, any-turtle weights for Alaska pooled (central, precautionary):
+
+- **Lines with real Alaska effort agree that turtles are rarer there per unit of looking.**
+  All records (B) gives `r wv("B. all records", "AK")`, `r wv("B. all records", "AK", "w_prec")`,
+  and iNaturalist (C) gives `r wv("C. public reports", "AK")`, `r wv("C. public reports", "AK", "w_prec")`.
+  The Gulf of Alaska's share of US turtle suitability falls by one to two orders of magnitude.
+- **Folding in the NOAA records (B+) is the generous bound.** It gives `r wv("B+. all records + NOAA AK", "AK")`,
+  `r wv("B+. all records + NOAA AK", "AK", "w_prec")`, and the Gulf of Alaska alone sits near half the
+  West Coast rate. The truth for the NOAA file is somewhere between B and B+, and line D is the test
+  that would place it.
+- **OBIS surveys (A) cannot tell yet.** OBIS has `r nr("A. surveys", "AK")` turtle-aware Alaska
+  block-years, so the zero there is not yet evidence.
+
+- **The rule.** One multiplicative weight per species × ecoregion, from occupied over searched units,
+  relative to the West Coast. Nothing is masked. Critical habitat and the lower 48 are untouched, and
+  a single Alaska record cannot flip a cell on or off. The weight shrinks only as fast as the Alaska
+  effort justifies.
+- **The answer depends on the reporting channel.** Surveys (A) and public reports (C) are
+  like-for-like. All records (B) is not, unless the NOAA file is held against an equivalent lower-48
+  file, and B+ shows how far that moves things. Line D, strandings normalized by marine mammal
+  strandings, is the like-for-like test for the NOAA file and needs the requested counts.
+- **The effort definition carries the result, as it did in the regional test.** Seabird-only surveys
+  (NPPSD and much of OBIS's Alaska avifauna) are excluded because they never record turtles.
+  Counting them would shrink the Alaska weights a great deal without justification.
+- **Season is ignored.** Alaska greens are reported mostly October–December and leatherbacks
+  July–August (NOAA). An annual weight is the right scale for an annual score, but a seasonal
+  product would need the same table by month.
+- **Time is ignored on lines B and C**, and line A pools 1950s–2020s. Restricting to 1990 on could be
+  checked.
+- **Generalising.** The same function gives a weight for every species × ecoregion against that
+  species' best-recorded US region, which would make this a candidate rule for the national score.
+  If adopted it belongs in msens (`encounter_weight()`) with fixtures: zero detections, the pooled
+  fallback, the cap at 1.
+
+### Asks
+
+1. Jenna Malek: Alaska marine mammal strandings per year, 1963–2020 (line D denominator), and the
+   2020–present turtle records.
+2. NOAA West Coast Region: turtle and marine mammal strandings per year by state.
+3. STSSN: annual turtle strandings by state (the data application covers the latest 10 years), plus
+   Southeast and Greater Atlantic marine mammal strandings.
+4. Survey effort that records turtles in Alaska. Candidates: NOAA AFSC / Marine Mammal Laboratory
+   cetacean surveys, Platforms of Opportunity, and the North Pacific Groundfish Observer Program,
+   whose turtle bycatch per observed haul sets against the West Coast observer programs. Any of them
+   would turn line A from "not searched" into evidence.
+5. Lance Garrison (SEFSC on-effort database, already requested by Tim): on-effort turtle sightings
+   per km surveyed, for the same weight in the Gulf and Atlantic if the rule goes national.
