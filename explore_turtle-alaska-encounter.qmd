@@ -3,7 +3,7 @@ title: "Downweighting Alaska sea turtles by encounter rate"
 subtitle: "Alaska against the Pacific (CA/OR/WA) and Gulf of America Program Areas: strandings, surveys, OBIS + GBIF and iNaturalist"
 author: "Ben Best"
 date: "2026-10-12"
-date-modified: "2026-10-12"
+date-modified: "2026-10-13"
 format:
   html:
     code-fold: true
@@ -64,8 +64,8 @@ since 2002 would settle which one holds today.
    20% → 9%, hawksbill 42% → 6%, Kemp's ridley 32% → 7%, olive ridley 20% → 8%. The leatherback
    stays at 1.7%. The Bering and Arctic Program Areas keep 4–17% of their turtle suitability; the
    Gulf of Alaska, Kodiak, Cook Inlet and Shumagin Program Areas keep about 97%. If the Gulf of
-   Alaska took line C instead, they would keep about 30%, and Alaska's loggerhead share would be
-   3.4%.
+   Alaska took line C instead, they would keep 17–30%, and Alaska's loggerhead share would be
+   3.4%. [Maps](#maps-before-and-after) show each species before and after.
 
 **The decision this needs:** whether the Gulf of Alaska's weight comes from strandings (D, no
 downweight) or iNaturalist (C, a strong one), until the Alaska Region's 2003-to-present records
@@ -121,8 +121,8 @@ reporting channel, so each line pairs a turtle count with an effort count from t
 ```{r}
 #| label: setup
 librarian::shelf(
-  arrow, DBI, dplyr, duckdb, forcats, fs, ggplot2, glue, here, httr2, jsonlite, knitr, purrr, readr,
-  readxl, scales, sf, stringr, tibble, tidyr,
+  arrow, DBI, dplyr, duckdb, forcats, fs, ggplot2, glue, here, httr2, jsonlite, knitr, mapgl, purrr,
+  readr, readxl, scales, sf, stringr, tibble, tidyr,
   quiet = T)
 options(readr.show_col_types = F, knitr.kable.NA = "", dplyr.summarise.inform = F)
 source(here("libs/paths.R"))   # dir_raw, dir_big
@@ -195,6 +195,13 @@ stopifnot(setequal(unique(zc_eco$zone_key), d_eco$eco), !anyDuplicated(zc_eco$ce
 f_zc_eco <- glue("{dir_te}/zone_cell_ecoregion_1.parquet")   # one ecoregion per cell, for the SQL below
 write_parquet(zc_eco, f_zc_eco)
 zc_eco <- rename(zc_eco, eco = zone_key)
+# the same for Program Areas (2,298 cells straddle two), so a join never counts a cell twice
+read_parquet(f_zc_pa) |>
+  arrange(cell_id, desc(pct_covered), zone_key) |>
+  distinct(cell_id, .keep_all = T) |>
+  transmute(cell_id = as.integer(cell_id), zone_key) |>
+  write_parquet(glue("{dir_te}/zone_cell_programarea_1.parquet"))
+f_zc_pa <- glue("{dir_te}/zone_cell_programarea_1.parquet")
 stopifnot(all(c(ECO_AK, ECO_REF, ECO_GULF) %in% d_eco$eco))
 ```
 
@@ -997,8 +1004,98 @@ Under the proposal:
 - **Gulf of Alaska Program Areas** (Gulf of Alaska, Kodiak, Cook Inlet, Shumagin) keep about 97%.
 - **Pacific and Gulf of America Program Areas** are untouched.
 
-Taking the Gulf of Alaska from line C instead drops those four to about 30%, and Alaska's share of
-loggerhead suitability from 19% to 3.4%.
+Taking the Gulf of Alaska from line C instead drops those four to 17–30% (Gulf of Alaska 30%,
+Kodiak, Cook Inlet and Shumagin 17–18%), and Alaska's share of loggerhead suitability from 19% to
+3.4%.
+
+### Maps: before and after {#maps-before-and-after}
+
+Each species' published OBIS ensemble suitability in US waters, before and after the proposed
+(precautionary) weights. Both tabs share one colour scale, 0–100, so a downweighted cell changes
+colour but never drops out: nothing is masked. Grey lines outline the ecoregions the weights are
+set by. Use the button at the top left for full screen.
+
+```{r}
+#| label: maps-prep
+# cells and weights: the same cells as the suitability tables above, weighted per ecoregion
+con <- dbConnect(duckdb())
+dbx(con, glue("ATTACH '{db_card}' AS card (READ_ONLY)"))
+d_cell <- dbGetQuery(con, glue("
+  SELECT c.taxon AS aphia, c.cell_id, z.zone_key AS eco, c.val
+  FROM card.og_cell c JOIN '{f_zc_eco}' z USING (cell_id)
+  WHERE c.taxon IN ({ids}) AND c.val >= 1")) |>
+  left_join(w_rule |> select(eco, aphia, w = w_prec), by = c("eco", "aphia")) |>
+  mutate(w = coalesce(w, 1), val_w = val * w)
+dbDisconnect(con, shutdown = T)
+stopifnot(all.equal(   # the maps sum to the precautionary table above
+  d_cell |> group_by(aphia) |> summarize(s = sum(val_w)) |> arrange(aphia) |> pull(s),
+  d_suit_w |> filter(weight == "precautionary") |> group_by(aphia) |> summarize(s = sum(suit_w)) |>
+    arrange(aphia) |> pull(s)))
+
+# one fixed scale for every map: value v (0-100) is stored as v + 1 with its colour in the
+# raster's colour table, since mapgl draws value 0 as transparent
+SUIT_COLS <- colorRampPalette(rev(RColorBrewer::brewer.pal(11, "Spectral")))(101)   # as apps/mapsp
+suit_coltab <- data.frame(value = 1:101, t(col2rgb(SUIT_COLS, alpha = T)))
+
+# global05 grid shifted to 0-360 longitude, so Alaska is not split at the antimeridian
+r_0360 <- terra::rast(nrows = 3600, ncols = 7200, xmin = 0, xmax = 360, ymin = -90, ymax = 90, crs = "EPSG:4326")
+cell_0360 <- function(cell_id) {
+  i <- cell_id - 1
+  as.integer(i %/% 7200 * 7200 + (i %% 7200 + 3600) %% 7200 + 1)
+}
+stopifnot(cell_0360(cell_of(-170, 60)) == terra::cellFromXY(r_0360, cbind(190.025, 59.975)))
+
+# ecoregion outlines for the compared regions, also in 0-360
+ln_eco <- ply_eco |>
+  filter(eco %in% c(ECO_AK, ECO_REF, ECO_GULF)) |>
+  st_cast("MULTILINESTRING") |>
+  st_shift_longitude() |>
+  st_simplify(dTolerance = 0.05) |>
+  select(eco, eco_name)
+
+map_suit <- function(d, col, title) {
+  r <- terra::rast(r_0360)
+  r[cell_0360(d$cell_id)] <- round(pmin(d[[col]], 100)) + 1
+  r <- terra::trim(r)
+  terra::coltab(r) <- suit_coltab
+  maplibre(
+    style = maptiler_style("bright", variant = "dark"), projection = "globe",   # globe, not mercator: no polar stretch over the arctic
+    center = c(-128, 50), zoom = 2.2,   # not fit_bounds: a map in a hidden tab fits at zero size
+    cooperativeGestures = T, height = "520px") |>   # page scroll passes through; ctrl/cmd + scroll zooms
+    add_image_source(id = "suit_src", data = r) |>
+    add_raster_layer(id = "suit", source = "suit_src", raster_resampling = "nearest", raster_opacity = 0.85) |>
+    add_line_layer(id = "eco", source = ln_eco, line_color = "grey", line_width = 1.5, tooltip = "eco_name") |>
+    mapgl::add_legend(title, values = c(0, 100), colors = SUIT_COLS, position = "bottom-right") |>
+    add_fullscreen_control(position = "top-left") |>
+    add_navigation_control() |>
+    add_scale_control()
+}
+
+maps <- set_names(d_sp$aphia) |>
+  map(\(a) {
+    d <- filter(d_cell, aphia == a)
+    list(
+      before = map_suit(d, "val",   "suitability, unweighted"),
+      after  = map_suit(d, "val_w", "suitability, weighted"))
+  })
+```
+
+```{r}
+#| label: maps
+#| results: asis
+share_of <- function(a, wt) percent(d_share$ak_share[d_share$aphia == a & d_share$weight == wt], 0.1)
+tabs <- map_chr(seq_len(nrow(d_sp)), function(i) {
+  a <- d_sp$aphia[i]
+  knitr::knit_child(quiet = T, envir = environment(), text = c(
+    glue("#### {d_sp$common[i]}"), "",
+    glue("*{d_sp$sci[i]}*. Alaska's share of US suitability: {share_of(a, 'unweighted')} before, {share_of(a, 'precautionary')} after."), "",
+    "::: {.panel-tabset}", "",
+    "##### Before", "", "```{r}", "#| echo: false", "maps[[as.character(a)]]$before", "```", "",
+    "##### After (precautionary weights)", "", "```{r}", "#| echo: false", "maps[[as.character(a)]]$after", "```", "",
+    ":::", ""))
+})
+cat("::: {.panel-tabset}\n\n", tabs, "\n:::\n", sep = "\n")
+```
 
 ## Caveats
 
