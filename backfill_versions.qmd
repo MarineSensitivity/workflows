@@ -301,6 +301,12 @@ native_asset <- msens::native_asset_backfill(
   taxon_key = dbGetQuery(con, "SELECT mdl_seq FROM taxon WHERE mdl_seq IS NOT NULL")$mdl_seq)
 arrow::write_parquet(native_asset, file.path(dir_tbl, "native_asset.parquet"), compression = "zstd")
 log_info("native_asset: {nrow(native_asset)} rows ({sum(native_asset$representation == 'native')} native) from {ref_ver}")
+# manifest_build() introspects the CONNECTION, never dir_tbl (see the taxon_model note above): a table
+# written only as a file is published but never advertised, and `native_representation` stays FALSE.
+# A TEMP view makes the manifest see exactly what is published (the first v7c run shipped the table
+# and a manifest that omitted it).
+dbExecute(con, glue(
+  "CREATE OR REPLACE TEMP VIEW native_asset AS SELECT * FROM read_parquet('{file.path(dir_tbl, 'native_asset.parquet')}')"))
 have <- c(have, "native_asset")
 ```
 
@@ -333,6 +339,12 @@ native_asset <- msens::native_asset_carry_forward(as.data.frame(from_tbl("native
 n_moved <- sum(native_asset$asset_url != from_tbl("native_asset")$asset_url)
 arrow::write_parquet(native_asset, file.path(dir_tbl, "native_asset.parquet"), compression = "zstd")
 log_info("native_asset: {nrow(native_asset)} rows from {from_ver} ({n_moved} model row(s) re-pointed at {bver}'s own COGs)")
+# manifest_build() introspects the CONNECTION, never dir_tbl (see the taxon_model note above): a table
+# written only as a file is published but never advertised, and `native_representation` stays FALSE.
+# A TEMP view makes the manifest see exactly what is published (the first v7c run shipped the table
+# and a manifest that omitted it).
+dbExecute(con, glue(
+  "CREATE OR REPLACE TEMP VIEW native_asset AS SELECT * FROM read_parquet('{file.path(dir_tbl, 'native_asset.parquet')}')"))
 have <- c(have, "native_asset")
 ```
 
@@ -499,6 +511,12 @@ mfst <- msens::manifest_build(
 f_mfst <- file.path(dir_v, "manifest.json")
 writeLines(as.character(jsonlite::toJSON(mfst, auto_unbox = TRUE, pretty = TRUE, na = "null")), f_mfst)
 msens::validate_manifest(jsonlite::fromJSON(f_mfst), ver = bver)
+# a native_asset.parquet that was written must be advertised: `native_representation` and
+# `tables.native_asset` are derived from the connection, so a table that exists only as a file leaves both
+# silently absent (v7c, 2026-10-14)
+if (file.exists(file.path(dir_tbl, "native_asset.parquet")))
+  stopifnot("native_asset.parquet was written but the manifest does not advertise it" =
+              isTRUE(mfst$capabilities$native_representation) && !is.null(mfst$tables$native_asset))
 
 cat(glue("{bver}: id_field={mfst$id_field} grid={mfst$grid_id} tables={length(mfst$tables)} ",
          "metrics={nrow(mfst$metrics)} zones={nrow(mfst$zones)}\n"))
