@@ -304,6 +304,38 @@ log_info("native_asset: {nrow(native_asset)} rows ({sum(native_asset$representat
 have <- c(have, "native_asset")
 ```
 
+## `native_asset` for a PATCH release (carried forward from its parent)
+
+A patch of a v1-v7 release (v7b, v7c) keeps its parent's models and source datasets and repaints only a few
+merged surfaces, so its pointer table is the parent's PUBLISHED `native_asset` with the `model` rows re-pointed at
+this release's own `model_asset` (`msens::native_asset_carry_forward()`; the `native` originals are the parent's,
+untouched). This is how v7b's table differs from v7's (6 model rows) and how v7c's does (5). Gated by
+`BACKFILL_NATIVE_FROM=<parent ver>` (e.g. `v7`), exclusive with `BACKFILL_NATIVE`; it refuses a differing model
+set or a differing dataset vintage, and writes `native_asset.parquet` beside the other tables, from where the
+manifest sync below publishes it and records `tables.native_asset` / `native_representation`.
+Check afterwards with `Rscript scripts/check_release_pointers.R <ver>`.
+
+```{r}
+#| label: native-asset-carry
+#| eval: !expr Sys.getenv("BACKFILL_NATIVE_FROM") != "" && Sys.getenv("BACKFILL_NATIVE") == ""
+
+from_ver <- Sys.getenv("BACKFILL_NATIVE_FROM")
+stopifnot("BACKFILL_NATIVE_FROM must be a version label" = grepl("^v[0-9]+[a-z]?$", from_ver),
+          "BACKFILL_NATIVE_FROM must name another release" = from_ver != bver,
+          "needs msens >= 0.58.0 (native_asset_carry_forward)" = packageVersion("msens") >= "0.58.0",
+          "native_asset carry-forward is for mdl_seq releases (v1-v7c)" = "mdl_seq" %in% names(model_asset))
+from_tbl <- \(t) arrow::read_parquet(sprintf("%s/%s/tables/%s.parquet", msens::atlas_base_url(), from_ver, t))
+vint <- msens::native_vintage_check(dbGetQuery(con, "SELECT * FROM dataset"), from_tbl("dataset"))
+print(vint)
+stopifnot("a dataset's source vintage differs from the parent's: its originals cannot be carried forward" =
+            all(vint$same %in% TRUE))
+native_asset <- msens::native_asset_carry_forward(as.data.frame(from_tbl("native_asset")), as.data.frame(model_asset))
+n_moved <- sum(native_asset$asset_url != from_tbl("native_asset")$asset_url)
+arrow::write_parquet(native_asset, file.path(dir_tbl, "native_asset.parquet"), compression = "zstd")
+log_info("native_asset: {nrow(native_asset)} rows from {from_ver} ({n_moved} model row(s) re-pointed at {bver}'s own COGs)")
+have <- c(have, "native_asset")
+```
+
 ## The per-version view DB
 
 The app resolves its database as `{dir_big}/serve.duckdb`, falling back to the multi-GB
