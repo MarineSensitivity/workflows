@@ -1,0 +1,1306 @@
+---
+title: "Build v7.2 (`v7c`) — sea turtles and the North Atlantic right whale where the record places them"
+params:
+  ver: v7c
+  ver_prev: v7
+msens:
+  target_name: build_v7c
+  workflow_type: release
+  dependency: [build_v7c_exclusions]
+  output: data/manifests/build_v7c.json
+editor_options:
+  chunk_output_type: console
+---
+
+v7.2 is a **second surgical patch of the public v7 release** — same `usa05` grid, same
+`mdl_seq`/`value` schema, same 20 Program Areas — built exactly as v7.1 (`build_v7b.qmd`) was: clone
+v7's DuckDB copy-on-write, change only the merged models the rules touch under their EXISTING
+`mdl_seq`, then re-execute v7's own scoring chunks verbatim. It supersedes v7.1 for review. Three
+rules, nothing else:
+
+1. **Turtle record rule.** A sea-turtle species is dropped from an ecoregion where it has **never
+   been recorded** in any observational channel (NOAA Alaska sightings, strandings and bycatch
+   1963–2020, OBIS, GBIF incl. iNaturalist, WDFW, STSSN). On v7 that is the East Bering Sea for
+   loggerhead, green, leatherback and olive ridley; the Gulf of Alaska, where all four are recorded,
+   keeps them at their v7 values. **v7.1's suitability threshold (P ≥ 0.5, floor-of-1 fill dropped)
+   is NOT carried**: v7's turtle models are kept exactly as they are everywhere the record rule does
+   not reach, because the threshold removed loggerhead, green and olive ridley from the Gulf of
+   Alaska where all three have been recorded.
+2. **Right whale Gulf rule.** The North Atlantic right whale (`mdl_seq` 54252) is dropped from the
+   two Gulf of America ecoregions (EGOA, WCGOA), outside its range.
+3. **Coverage floor κ = 5 %**, carried from v7.1 unchanged (`msens::coverage_sql()` /
+   `coverage_floor()`): a Program-Area component whose scored cells cover < 5 % of the area is not
+   reportable — no row, never a zero.
+
+Rules 1 and 2 are one mechanism: a **taxon × ecoregion exclusion** read from the evidence table
+`data/v7c/zone_exclusions.csv`, written and justified by `build_v7c_exclusions.qmd`, and applied by
+`msens::zone_exclude_sql()`. A cell belongs to the ecoregion covering most of it
+(`msens::cell_zone_major_sql()`), and **critical habitat is never excluded**: a cell the taxon holds
+under a designated `ch_*` / `ca_*` dataset survives inside an excluded ecoregion. The notebook asserts
+that the cells it removes per (model, ecoregion) are exactly the evidence table's `n_cells_v7`.
+
+Each rule is a flag whose **control value is off**, so the same code path reproduces v7 exactly.
+That is the first gate below, and it is what makes every other number here attributable.
+
+Not in v7.2: productivity, the distribution-share / national score, anything of v10. **Every
+`primprod*` row of v7c must equal v7's**, and a gate asserts it in every run.
+
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "v7 sdm.duckdb → copy-on-write clone → taxon × ecoregion exclusions under the SAME mdl_seq → v7's own scoring chunks → κ → v7c"
+flowchart LR
+  v7[("v7 sdm.duckdb<br/>read-only")] -->|cp -c| cl[("{ver} sdm.duckdb")]
+  ev[["data/v7c/zone_exclusions.csv<br/>(build_v7c_exclusions)"]] --> ex
+  cz["msens::cell_zone_major_sql<br/>majority ecoregion per cell"] --> ex
+  ch["ch_src<br/>ch_* / ca_* cells per taxon"] --> ex
+  ex["msens::zone_exclude_sql<br/>(mdl_seq, cell_id) to DELETE"] -->|"DELETE<br/>mdl_seq 54238-54243, 54252"| cl
+  cl --> cz
+  cl --> ch
+  cl --> sc["v7 scoring chunks, verbatim<br/>(old/calc_scores_v7.qmd)"]
+  sc --> k["msens::coverage_sql + coverage_floor<br/>kappa = 5%"]
+  k --> sc2["composite score<br/>SUM(value)/COUNT(value)"]
+  sc2 --> out[("v7c: model_cell, cell_metric,<br/>zone_metric, zone_taxon,<br/>release_method")]
+```
+
+## Setup
+
+```{r}
+#| label: setup
+
+librarian::shelf(
+  DBI, dbplyr, dplyr, duckdb, fs, glue, here, jsonlite, logger, purrr, readr,
+  sf, stringr, tibble, tidyr,
+  quiet = T)
+options(readr.show_col_types = F)
+
+ver      <- params$ver
+ver_prev <- params$ver_prev
+
+# paths come from msens::sdm_db_path(), never libs/paths.R (that file pins v9). The
+# small per-release artifacts live under derived/{ver} (which IS big/{ver} on the
+# laptop but NOT on the server), because backfill_versions.qmd reads layers_{ver}.csv
+# from there.
+is_server     <- Sys.info()[["sysname"]] == "Linux"
+dir_derived   <- if (is_server) "/share/data/derived" else "~/_big/msens/derived"
+sdm_db        <- path.expand(msens::sdm_db_path(ver))
+sdm_db_prev   <- path.expand(msens::sdm_db_path(ver_prev))
+dir_big_v     <- path_dir(sdm_db)
+dir_v         <- path.expand(glue("{dir_derived}/{ver}"))
+dir_v_prev    <- path.expand(glue("{dir_derived}/{ver_prev}"))
+dir_scratch   <- path.expand(glue("{dir_big_v}/_controls"))
+dir_create(c(dir_big_v, dir_v))
+
+stopifnot(
+  "previous release database not found"          = file_exists(sdm_db_prev),
+  "previous release Program Area gpkg not found" =
+    file_exists(glue("{dir_v_prev}/ply_programareas_2026_{ver_prev}.gpkg")),
+  "msens 0.57.0 or newer is required (cell_zone_major_sql + zone_exclude_sql)" =
+    packageVersion("msens") >= "0.57.0",
+  "grid registry does not know this version"     = msens::grid_for_ver(ver) == "usa05")
+
+# method flags -- CONTROL VALUE IS OFF for each, so all-off == v7 exactly ----
+# EXCLUDE_TURTLES     : apply the turtle rows of the evidence table (0 = off)
+# EXCLUDE_RIGHT_WHALE : apply the right-whale rows of the evidence table (0 = off)
+# COVERAGE_FLOOR      : kappa, the reportability floor as a fraction (0 = off)
+env_num <- function(key, default) {
+  v <- trimws(Sys.getenv(key))
+  if (!nzchar(v)) return(default)
+  if (tolower(v) %in% c("na", "none", "")) return(NA_real_)
+  as.numeric(v)
+}
+env_flag <- function(key, default) {
+  v <- env_num(key, default)
+  stopifnot("an on/off flag must be 0 or 1" = !is.na(v) && v %in% c(0, 1))
+  v == 1
+}
+EXCLUDE_TURTLES     <- env_flag("EXCLUDE_TURTLES",     1)
+EXCLUDE_RIGHT_WHALE <- env_flag("EXCLUDE_RIGHT_WHALE", 1)
+COVERAGE_FLOOR      <- env_num ("COVERAGE_FLOOR",      0.05)
+do_build            <- !file_exists(sdm_db) || nzchar(Sys.getenv("REDO_BUILD"))
+
+# the merged models v7.2 may touch: v7's six sea turtles and the North Atlantic right whale
+MDL_TURTLE_V7 <- 54238:54243
+MDL_WHALE     <- 54252L
+N_TURTLE_V7   <- 2022909      # v7's six merged turtle models, cells
+N_WHALE_V7    <- 60690        # v7's merged right whale model, cells
+
+# the evidence table: one row per excluded (model x ecoregion), written by build_v7c_exclusions ----
+f_excl <- here("data/v7c/zone_exclusions.csv")
+stopifnot("data/v7c/zone_exclusions.csv not found -- render build_v7c_exclusions.qmd first" =
+  file_exists(f_excl))
+d_excl <- read_csv(f_excl) |>
+  mutate(mdl_seq = as.integer(mdl_seq), n_cells_v7 = as.integer(n_cells_v7))
+stopifnot(
+  "zone_exclusions.csv lacks a required column" =
+    all(c("mdl_seq", "taxon_id", "common_name", "zone_fld", "zone_key", "n_cells_v7", "reason") %in%
+          names(d_excl)),
+  "zone_exclusions.csv is empty" = nrow(d_excl) > 0,
+  "every exclusion is by ecoregion (decision 2: the ecoregion is the unit of exclusion)" =
+    all(d_excl$zone_fld == "ecoregion_key"),
+  "a (mdl_seq, zone_key) repeats in zone_exclusions.csv" =
+    !anyDuplicated(d_excl[c("mdl_seq", "zone_key")]),
+  "zone_exclusions.csv may only name v7's six merged turtles and the right whale" =
+    all(d_excl$mdl_seq %in% c(MDL_TURTLE_V7, MDL_WHALE)),
+  "every exclusion must remove at least one v7 cell" =
+    all(!is.na(d_excl$n_cells_v7) & d_excl$n_cells_v7 > 0))
+# decision 7: a turtle exclusion is exactly a zero-record row of the evidence
+if ("n_records" %in% names(d_excl))
+  stopifnot("a turtle exclusion has records in the evidence table -- the record rule drops only never-recorded pairs" =
+    all(d_excl$n_records[d_excl$mdl_seq %in% MDL_TURTLE_V7] == 0))
+
+N_TURTLE_EXCL <- sum(d_excl$n_cells_v7[d_excl$mdl_seq %in% MDL_TURTLE_V7])
+N_WHALE_EXCL  <- sum(d_excl$n_cells_v7[d_excl$mdl_seq == MDL_WHALE])
+
+# the exclusions as data, fingerprinted: release_method + the manifest carry it, so a release
+# says which evidence table it applied
+EXCL_HASH <- local({
+  cc0 <- dbConnect(duckdb())
+  on.exit(dbDisconnect(cc0, shutdown = TRUE))
+  dbWriteTable(cc0, "excl", d_excl |> select(mdl_seq, zone_fld, zone_key, n_cells_v7))
+  msens::hash_query(cc0, "SELECT mdl_seq, zone_fld, zone_key, n_cells_v7 FROM excl")
+})
+
+# size DuckDB to the machine, not to the laptop this was written on: duckdb_budget() /
+# duckdb_tune() (40 % of available memory, <= 12 GB, threads <= cores; the why is in the file)
+source(here("libs/duckdb_budget.R"))
+
+f_gates <- file.path(dir_v, glue("tbl_gates_{ver}.csv"))
+f_attr  <- file.path(dir_v, glue("tbl_attribution_programarea_{ver}.csv"))
+
+msens::report_table(
+  d_excl |> select(any_of(c("mdl_seq", "common_name", "zone_key", "n_cells_v7", "n_records", "reason"))),
+  caption = glue("The evidence table applied (data/v7c/zone_exclusions.csv, hash {EXCL_HASH})"))
+
+log_info(
+  "{ver} <- {ver_prev}: turtles={EXCLUDE_TURTLES}, right_whale={EXCLUDE_RIGHT_WHALE}, ",
+  "kappa={COVERAGE_FLOOR}; exclusions={nrow(d_excl)} rows / {EXCL_HASH}; build={do_build}; db={sdm_db}")
+```
+
+## The build
+
+The whole patch is one function of `(flags, target dir)`, so the four control runs of
+@sec-controls execute **the same code** on copy-on-write clones in a scratch directory. Nothing
+here reads `libs/paths.R` and nothing writes to `{ver_prev}`: the previous release is opened
+`read_only = TRUE` and never otherwise.
+
+### v7's scoring chunks, read out of the archived notebook
+
+v7 was never rendered from these notebooks — it is v6's database patched by `dev/build_v7.R`, which
+**evals labelled chunks of the scoring notebook verbatim**. That technique is kept (it is the only
+way to be bit-faithful to v7's arithmetic) but moved inside a committed, rendered notebook.
+
+```{r}
+#| label: chunk_reader
+
+qmd_v7    <- here("old/calc_scores_v7.qmd")
+qmd_lines <- readLines(qmd_v7)
+
+get_chunk <- function(label) {
+  lab <- grep(glue("^#\\|\\s*label:\\s*{label}\\s*$"), qmd_lines)
+  stopifnot("chunk label not found exactly once in old/calc_scores_v7.qmd" = length(lab) == 1)
+  open  <- max(grep("^```\\{", qmd_lines[seq_len(lab)]))
+  close <- lab + grep("^```\\s*$", qmd_lines[(lab + 1):length(qmd_lines)])[1]
+  code  <- qmd_lines[(open + 1):(close - 1)]
+  paste(code[!grepl("^#\\|", code)], collapse = "\n")
+}
+
+# the two halves of v7's scoring, with kappa between them: the composite is
+# SUM(value)/COUNT(value) over the component rows, so a not-reportable component must be
+# gone BEFORE calc_programarea_score_from_programarea_metrics runs.
+CHUNKS_PRE <- c(
+  "calc_cell_metric_redlist", "calc_ecoregion_minmax",
+  "extrisk_spcat_ecoregion_rescaled_cell", "cell_metrics_to_zone_metrics",
+  "apply_pctarea_to_programarea_components")
+CHUNKS_POST <- c(
+  "cell_metrics_to_ecoregion_metrics", "cell_metric_score",
+  "calc_programarea_score_from_programarea_metrics", "metric_labels",
+  "add_full_studyarea_zone", "zone_taxon")
+
+# `IUCN:TN` is a v1-v7 data artifact: an ESA "Threatened" code stamped with the IUCN
+# authority, on 11 taxa (1 mammal -- the Arctic ringed seal -- and 10 birds). The msens that
+# built v7 did not validate the code, so it fell through `score_iucn`'s `.default = 1L` and
+# scored **1**; that is what `taxon.er_score` still stores for all 11. msens >= 0.19 ERRORS
+# on it, which stops `calc_cell_metric_redlist` dead. Reproducing v7 means reproducing that
+# 1 -- recoding those taxa is a data question, and it belongs to v10, not to a patch that
+# must reproduce its predecessor exactly. The IUCN branch also ignores `is_mmpa` (the same
+# documented quirk that made `IUCN:LC + MMPA` score 1); that too is v7's behavior and stays.
+ER_LEGACY <- c("IUCN:TN" = 1L)
+er_score_v7 <- function(extrisk_code, is_mmpa = FALSE, is_mbta = FALSE) {
+  n   <- length(extrisk_code)
+  out <- rep(NA_integer_, n)
+  leg <- !is.na(extrisk_code) & extrisk_code %in% names(ER_LEGACY)
+  if (any(leg))  out[leg]  <- unname(ER_LEGACY[extrisk_code[leg]])
+  if (any(!leg)) out[!leg] <- msens::compute_er_score(
+    extrisk_code[!leg],
+    is_mmpa = rep_len(is_mmpa, n)[!leg],
+    is_mbta = rep_len(is_mbta, n)[!leg])
+  out
+}
+
+# dev/build_v7.R:87-88 widened zone_taxon from (subregions, program areas) to include
+# ecoregions. The archived notebook already carries that edit, so the substitution is a
+# no-op -- asserted rather than assumed, because a silent no-op would drop 45k rows.
+chunk_fix <- function(code)
+  gsub("msens::compute_er_score(", "er_score_v7(",
+    gsub("c(tbl_sr, tbl_pra)", "c(tbl_sr, tbl_pra, tbl_er)", code, fixed = TRUE), fixed = TRUE)
+zt_fix <- chunk_fix
+stopifnot("zone_taxon chunk does not cover ecoregions" =
+  grepl("c(tbl_sr, tbl_pra, tbl_er)", chunk_fix(get_chunk("zone_taxon")), fixed = TRUE),
+  "the extinction-risk chunk no longer calls compute_er_score" =
+  grepl("er_score_v7(", chunk_fix(get_chunk("calc_cell_metric_redlist")), fixed = TRUE))
+
+# no primprod_* chunk is evaluated (the year-integrated productivity stays with v10), so
+# those cell metrics remain v7's own rows.
+stopifnot("a primprod chunk leaked into the run list" =
+  !any(grepl("primprod", c(CHUNKS_PRE, CHUNKS_POST))))
+
+# er_score_v7 may differ from msens ONLY on the legacy code, and only by not erroring
+.codes <- c("NMFS:EN", "NMFS:TN", "NMFS:LC", "FWS:EN", "FWS:TN", "FWS:LC",
+            "IUCN:CR", "IUCN:EN", "IUCN:VU", "IUCN:NT", "IUCN:LC", "IUCN:DD", NA)
+stopifnot(
+  "er_score_v7 diverges from msens::compute_er_score on a valid code" =
+    identical(er_score_v7(.codes, is_mmpa = TRUE, is_mbta = TRUE),
+              msens::compute_er_score(.codes, is_mmpa = TRUE, is_mbta = TRUE)),
+  "the legacy IUCN:TN code must score 1, as it did for v1-v7" =
+    identical(er_score_v7(c("IUCN:TN", "IUCN:LC"), is_mmpa = TRUE), c(1L, 1L)))
+```
+
+### Clone, exclusions, κ, `release_method`
+
+```{r}
+#| label: build_fns
+
+# copy-on-write clone: APFS `cp -c` on the laptop, `cp --reflink=auto` on Linux. A 3.6 GB
+# release database clones in milliseconds and only the pages the patch rewrites cost space.
+clone_db <- function(src, dst) {
+  if (file_exists(dst))               file_delete(dst)
+  if (file_exists(glue("{dst}.wal"))) file_delete(glue("{dst}.wal"))
+  dir_create(path_dir(dst))
+  flag <- if (is_server) "--reflink=auto" else "-c"
+  rc   <- system2("cp", c(flag, shQuote(src), shQuote(dst)))
+  stopifnot("copy-on-write clone failed" = identical(as.integer(rc), 0L))
+  log_info("cloned {src} -> {dst}")
+}
+
+# the record rule: DELETE the evidence table's (model x ecoregion) cells under the EXISTING
+# merged ids. Re-merging would RENUMBER mdl_seq and break every published ?mdl_seq= deep link;
+# a delete leaves every surviving cell at its v7 value, which is the point -- outside the
+# excluded ecoregions the species is exactly v7's.
+apply_exclusions <- function(con, excl, label) {
+  if (!nrow(excl)) {
+    log_info("[{label}] no exclusion applied -- the merged models stay v7's")
+    return(invisible(tibble(mdl_seq = integer(), zone_key = character(),
+                            n_cells_v7 = integer(), n_deleted = integer())))
+  }
+  seqs    <- sort(unique(excl$mdl_seq))
+  seq_sql <- paste(seqs, collapse = ", ")
+  stopifnot("an exclusion names a model outside v7's six turtles and the right whale" =
+    all(seqs %in% c(MDL_TURTLE_V7, MDL_WHALE)))
+
+  # each cell's ONE ecoregion: the one covering most of it (1,125 cells straddle two)
+  dbExecute(con, glue(
+    "CREATE OR REPLACE TEMP TABLE cell_zone AS {msens::cell_zone_major_sql('ecoregion_key')}"))
+
+  # critical habitat is never excluded: the cells each excluded taxon carries under any
+  # designation dataset (ch_* / ca_*), keyed by the taxon's MERGED mdl_seq. A table, not a
+  # view: it reads model_cell, which the delete below changes.
+  dbExecute(con, glue(
+    "CREATE OR REPLACE TEMP TABLE ch_src AS
+     SELECT DISTINCT t.mdl_seq, mc.cell_id
+     FROM taxon t
+     JOIN taxon_model tm ON tm.taxon_id = t.taxon_id
+     JOIN model_cell  mc ON mc.mdl_seq  = tm.mdl_seq
+     WHERE t.mdl_seq IN ({seq_sql})
+       AND (tm.ds_key LIKE 'ch\\_%' ESCAPE '\\' OR tm.ds_key LIKE 'ca\\_%' ESCAPE '\\')"))
+
+  # materialize the rows to delete, so the count per (model, ecoregion) is asserted against
+  # the evidence table BEFORE anything is removed
+  sql <- msens::zone_exclude_sql(
+    excl |> select(mdl_seq, zone_key),
+    src = "model_cell", cell_zone = "cell_zone", ch_src = "ch_src")
+  dbExecute(con, glue("CREATE OR REPLACE TEMP TABLE excl_del AS {sql}"))
+
+  d_n <- dbGetQuery(con,
+    "SELECT d.mdl_seq, cz.zone_key, count(*) AS n_deleted
+     FROM excl_del d JOIN cell_zone cz USING (cell_id) GROUP BY ALL")
+  d_chk <- excl |>
+    select(mdl_seq, zone_key, n_cells_v7) |>
+    left_join(d_n |> mutate(mdl_seq = as.integer(mdl_seq)), by = c("mdl_seq", "zone_key")) |>
+    mutate(n_deleted = coalesce(as.integer(n_deleted), 0L))
+  stopifnot(
+    "cells selected per (mdl_seq, ecoregion) must equal the evidence table's n_cells_v7 exactly" =
+      all(d_chk$n_deleted == d_chk$n_cells_v7),
+    "the exclusion selected cells outside the evidence table's (mdl_seq, ecoregion) pairs" =
+      sum(d_n$n_deleted) == sum(d_chk$n_deleted))
+
+  n <- dbExecute(con,
+    "DELETE FROM model_cell WHERE (mdl_seq, cell_id) IN (SELECT mdl_seq, cell_id FROM excl_del)")
+  stopifnot("DELETE removed a different number of rows than the exclusion selected" =
+    n == sum(d_chk$n_cells_v7))
+
+  # the rule, stated on the model it changed; idempotent (any previous v7.2 clause is stripped)
+  d_z <- excl |> group_by(mdl_seq) |>
+    summarize(zones = paste(sort(zone_key), collapse = ", "), .groups = "drop")
+  for (i in seq_len(nrow(d_z)))
+    dbExecute(con, glue(
+      "UPDATE model SET description =
+         regexp_replace(coalesce(description, ''), ' \\| v7\\.2 record rule.*$', '') ||
+         ' | v7.2 record rule: excluded from {d_z$zones[i]}'
+       WHERE mdl_seq = {d_z$mdl_seq[i]}"))
+
+  log_info("[{label}] excluded {format(n, big.mark = ',')} cells: ",
+           "{paste(glue('{d_chk$mdl_seq} x {d_chk$zone_key} = {d_chk$n_deleted}'), collapse = '; ')}")
+  invisible(d_chk)
+}
+
+# kappa: a ZONE reporting rule. Cell-level rasters are untouched; only the Program-Area
+# component row of a pair below the floor is deleted (its raw and _prepctareaweighting rows
+# stay, so the diagnostic remains readable), and the composite then averages one fewer
+# component -- exactly as it already does for an area with no turtles at all.
+apply_kappa <- function(con, tbl_pra, component_keys, kappa, f_csv) {
+  if (is.na(kappa) || kappa <= 0) {
+    log_info("COVERAGE_FLOOR off -- no _coverage metrics written, no component dropped")
+    return(invisible(NULL))
+  }
+  d <- dbGetQuery(con, msens::coverage_sql(
+        tbl_pra, component_keys, weight = "pct_covered",
+        val_col = msens::sdm_val_col(con, "cell_metric"))) |>
+    msens::coverage_floor(kappa = kappa)
+
+  z_seqs <- dbGetQuery(con, glue(
+    "SELECT zone_seq FROM zone WHERE tbl = '{tbl_pra}'"))$zone_seq
+  z_sql  <- paste(z_seqs, collapse = ", ")
+
+  for (k in component_keys) {
+    k_cov <- glue("{k}_coverage")
+    if (!nrow(dbGetQuery(con, glue("SELECT 1 FROM metric WHERE metric_key = '{k_cov}'"))))
+      dbExecute(con, glue(
+        "INSERT INTO metric (metric_key, description) VALUES
+         ('{k_cov}', 'Percent of the zone covered by cells carrying {k} (coverage floor input)')"))
+    s_cov <- dbGetQuery(con, glue(
+      "SELECT metric_seq FROM metric WHERE metric_key = '{k_cov}'"))$metric_seq
+    dbExecute(con, glue(
+      "DELETE FROM zone_metric WHERE metric_seq = {s_cov} AND zone_seq IN ({z_sql})"))
+    dd <- d |> filter(metric_key == k)
+    if (nrow(dd))
+      dbExecute(con, glue(
+        "INSERT INTO zone_metric (zone_seq, metric_seq, value) VALUES {vals}",
+        vals = paste(glue("({dd$zone_seq}, {s_cov}, {dd$coverage * 100})"), collapse = ", ")))
+  }
+
+  d_drop <- d |> filter(!reportable)
+  for (i in seq_len(nrow(d_drop)))
+    dbExecute(con, glue(
+      "DELETE FROM zone_metric
+       WHERE zone_seq = {d_drop$zone_seq[i]}
+         AND metric_seq = (SELECT metric_seq FROM metric WHERE metric_key = '{d_drop$metric_key[i]}')"))
+
+  d_out <- d |>
+    left_join(dbGetQuery(con, glue(
+      "SELECT zone_seq, value AS programarea_key FROM zone WHERE tbl = '{tbl_pra}'")),
+      by = "zone_seq") |>
+    arrange(coverage) |>
+    select(programarea_key, metric_key, coverage, reportable)
+  write_csv(d_out |> filter(!reportable), f_csv)
+  log_info("kappa={kappa}: {nrow(d_drop)} of {nrow(d)} (zone x component) pairs not reportable")
+  invisible(d_out)
+}
+
+# the methods a release actually used, as data -- backfill_versions.qmd stages this table and
+# manifest_build() carries it as `methods`, so the docs state the rules from the release itself
+write_release_method <- function(con, ex_turtles, ex_whale, kappa) {
+  onoff <- function(x) if (isTRUE(x)) "on" else "off"
+  d <- tibble(
+    method_key  = c("turtle_record_rule", "right_whale_gulf_rule", "coverage_floor_pct",
+                    "zone_exclusions_hash", "prev"),
+    value       = c(
+      onoff(ex_turtles),
+      onoff(ex_whale),
+      as.character(if (is.na(kappa)) 0 else kappa * 100),
+      EXCL_HASH,
+      ver_prev),
+    description = c(
+      "A sea-turtle species is dropped from an ecoregion where it has never been recorded in any observational channel; critical habitat is never dropped (v7: off)",
+      "The North Atlantic right whale is dropped from the Gulf of America ecoregions (EGOA, WCGOA), outside its range; critical habitat is never dropped (v7: off)",
+      "A Program-Area component is reportable only if its scored cells cover at least this percent of the area (v7: 0)",
+      "msens::hash_query digest of data/v7c/zone_exclusions.csv (mdl_seq, zone_fld, zone_key, n_cells_v7), the evidence table the record rules apply",
+      "The release this one patches"))
+  dbWriteTable(con, "release_method", d, overwrite = TRUE)
+  d
+}
+```
+
+### One function, five runs
+
+```{r}
+#| label: build_release
+
+build_release <- function(db_path, out_dir, ex_turtles, ex_whale, kappa, label) {
+  t0 <- Sys.time()
+  dir_create(out_dir)
+  clone_db(sdm_db_prev, db_path)
+
+  con <- dbConnect(duckdb(dbdir = db_path, read_only = FALSE))
+  # v7's zone / metric / model / dataset tables carry `DEFAULT CURRENT_DATE`, which DuckDB binds
+  # to the icu extension -- so EVERY write to them needs it, the zone-table rename included.
+  # A laptop autoloads icu from ~/.duckdb; the server's rstudio container has no copy for
+  # uid 1000 and halted here on its first UPDATE. Declared, as the other notebooks declare httpfs.
+  dbExecute(con, "INSTALL icu; LOAD icu;")
+  on.exit(dbDisconnect(con, shutdown = TRUE), add = TRUE)
+  duckdb_tune(con, glue("{out_dir}/duckdb_tmp"))
+
+  # the server's clone inherits a cell_model VIEW whose read_parquet path is absolute and
+  # points at {ver_prev}: left in place it would serve the PREVIOUS release's cells under
+  # this release's name. Dropped, then asserted gone.
+  dbExecute(con, "DROP VIEW IF EXISTS cell_model")
+  v_bad <- dbGetQuery(con, glue(
+    "SELECT view_name FROM duckdb_views() WHERE sql LIKE '%/{ver_prev}/%'"))
+  stopifnot("a view still references the previous release's path" = nrow(v_bad) == 0)
+
+  # zone tbl suffix _v7 -> _v7c (dev/build_v7.R:55-61)
+  for (old_tbl in dbGetQuery(con, glue(
+      "SELECT DISTINCT tbl FROM zone WHERE tbl LIKE '%\\_{ver_prev}' ESCAPE '\\'"))$tbl) {
+    new_tbl <- str_replace(old_tbl, glue("_{ver_prev}$"), glue("_{ver}"))
+    dbExecute(con, glue("UPDATE zone       SET tbl = '{new_tbl}'      WHERE tbl = '{old_tbl}'"))
+    dbExecute(con, glue("UPDATE zone_taxon SET zone_tbl = '{new_tbl}' WHERE zone_tbl = '{old_tbl}'"))
+    log_info("renamed zone tbl: {old_tbl} -> {new_tbl}")
+  }
+
+  # the ids the rules may touch, asserted on the clone: the merged ids never move
+  seq_turtle <- dbGetQuery(con,
+    "SELECT mdl_seq FROM taxon WHERE sp_cat = 'turtle' ORDER BY mdl_seq")$mdl_seq
+  d_whale <- dbGetQuery(con, glue(
+    "SELECT sp_cat, common_name FROM taxon WHERE mdl_seq = {MDL_WHALE}"))
+  stopifnot(
+    "expected v7's six merged turtle models at 54238-54243" =
+      identical(as.integer(seq_turtle), MDL_TURTLE_V7),
+    "expected v7's merged North Atlantic right whale at mdl_seq 54252" =
+      nrow(d_whale) == 1 && d_whale$sp_cat == "mammal" &&
+        d_whale$common_name == "North Atlantic Right Whale")
+
+  # split the evidence table by flag: turtle rows = the turtle taxa's merged ids, whale rows = 54252
+  excl <- bind_rows(
+    d_excl |> filter(ex_turtles, mdl_seq %in% seq_turtle),
+    d_excl |> filter(ex_whale,   mdl_seq == MDL_WHALE))
+  d_ex <- apply_exclusions(con, excl, label)
+
+  # v7's scoring chunks need these names; a child of globalenv() keeps the chunk code's own
+  # assignments out of the session while still resolving library functions
+  env <- new.env(parent = globalenv())
+  env$con_sdm <- con
+  env$tbl_pra <- glue("ply_programareas_2026_{ver}")
+  env$tbl_sr  <- glue("ply_subregions_2026_{ver}")
+  env$tbl_er  <- "ply_ecoregions_2025"
+  env$component_pct_pra_csv <- file.path(out_dir, glue("tbl_component_pct_programarea_{ver}.csv"))
+  env$zone_taxon_csv        <- file.path(out_dir, glue("zone_taxon_{ver}.csv"))
+  # NEVER narrow sp_cats: the pct-area and composite chunks enumerate every component from it
+  env$sp_cats <- dbGetQuery(con,
+    "SELECT DISTINCT sp_cat FROM taxon WHERE is_ok ORDER BY sp_cat")$sp_cat
+  stopifnot("sp_cats lost a category" = length(env$sp_cats) == 7)
+
+  run <- function(labels)
+    for (lbl in labels) {
+      log_info("[{label}] chunk: {lbl}")
+      eval(parse(text = chunk_fix(get_chunk(lbl))), envir = env)
+    }
+
+  run(CHUNKS_PRE)
+  d_cov <- apply_kappa(
+    con, env$tbl_pra,
+    c(glue("extrisk_{env$sp_cats}_ecoregion_rescaled"), "primprod_ecoregion_rescaled"),
+    kappa, file.path(out_dir, glue("tbl_component_not_reportable_programarea_{ver}.csv")))
+  run(CHUNKS_POST)
+
+  write_release_method(con, ex_turtles, ex_whale, kappa)
+
+  log_info("[{label}] built in {round(as.numeric(difftime(Sys.time(), t0, units = 'mins')), 1)} min")
+  invisible(list(excl = d_ex, coverage = d_cov))
+}
+```
+
+## Build `v7c`
+
+```{r}
+#| label: build
+
+if (!do_build) {
+  log_info("{sdm_db} exists -- rendering report + gates read-only (REDO_BUILD=1 to rebuild)")
+} else {
+  build_release(sdm_db, dir_v, EXCLUDE_TURTLES, EXCLUDE_RIGHT_WHALE, COVERAGE_FLOOR, ver)
+}
+stopifnot("release database missing after build" = file_exists(sdm_db))
+
+con <- dbConnect(duckdb(dbdir = sdm_db, read_only = TRUE))
+duckdb_tune(con, glue("{dir_big_v}/duckdb_tmp"))
+dbExecute(con, glue("ATTACH '{sdm_db_prev}' AS prev (READ_ONLY)"))
+
+tbl_pra <- glue("ply_programareas_2026_{ver}")
+tbl_sr  <- glue("ply_subregions_2026_{ver}")
+tbl_er  <- "ply_ecoregions_2025"
+sp_cats <- dbGetQuery(con, "SELECT DISTINCT sp_cat FROM taxon WHERE is_ok ORDER BY sp_cat")$sp_cat
+MDL_TURTLE <- dbGetQuery(con, "SELECT mdl_seq FROM taxon WHERE sp_cat = 'turtle' ORDER BY mdl_seq")$mdl_seq
+mdl_sql     <- paste(MDL_TURTLE, collapse = ", ")
+mdl_all_sql <- paste(c(MDL_TURTLE, MDL_WHALE), collapse = ", ")
+K_SCORE <- "score_extriskspcat_primprod_ecoregionrescaled_equalweights"
+
+# the evidence table's own v7 numbers, checked against v7 itself
+n_prev <- dbGetQuery(con, glue(
+  "SELECT count(*) FILTER (WHERE mdl_seq IN ({mdl_sql})) AS n_turtle,
+          count(*) FILTER (WHERE mdl_seq = {MDL_WHALE})  AS n_whale
+   FROM prev.model_cell WHERE mdl_seq IN ({mdl_all_sql})"))
+stopifnot(
+  "v7's six turtle models are not 2,022,909 cells" = n_prev$n_turtle == N_TURTLE_V7,
+  "v7's right whale model is not 60,690 cells"     = n_prev$n_whale  == N_WHALE_V7)
+
+# each cell's majority ecoregion, for the gates and the report (the zone geometry is v7's)
+dbExecute(con, glue(
+  "CREATE OR REPLACE TEMP TABLE cell_zone AS {msens::cell_zone_major_sql('ecoregion_key')}"))
+```
+
+## Artifacts {#sec-artifacts}
+
+`layers_{ver}.csv`, the pct-area diagnostic and `zone_taxon_{ver}.csv` are written by the build
+itself; the Program-Area geopackage is **regenerated** (v7's own gpkg is md5-identical to v6's — it
+was copied, so its metric columns are stale) from the previous release's geometry columns plus this
+release's `zone_metric` pivoted wide, per `old/calc_scores_v7.qmd:2893-2940`.
+
+```{r}
+#| label: artifacts
+
+f_lyrs <- file.path(dir_v, glue("layers_{ver}.csv"))
+f_gpkg <- file.path(dir_v, glue("ply_programareas_2026_{ver}.gpkg"))
+f_srpa <- file.path(dir_v, "subregion_programareas.csv")
+
+if (do_build || !file_exists(f_lyrs))
+  bind_rows(
+    tibble(order = 1, category = "Overall",
+           layer = "score", lyr = K_SCORE),
+    tibble(order = 2, category = "Species, rescaled by Ecoregion",
+           layer = glue("{sp_cats}: ext. risk, ecorgn"),
+           lyr   = glue("extrisk_{sp_cats}_ecoregion_rescaled")),
+    tibble(order = 3, category = "Primary Productivity, rescaled by Ecoregion",
+           layer = "prim prod, ecorgn", lyr = "primprod_ecoregion_rescaled"),
+    tibble(order = 4, category = "Species, raw Extinction Risk",
+           layer = glue("{sp_cats}: ext. risk"), lyr = glue("extrisk_{sp_cats}")),
+    tibble(order = 5, category = "Primary Productivity, raw Phytoplankton",
+           lyr = "primprod", layer = "prim prod, 2014-2023 avg (mg C/m^2/day)")) |>
+    write_csv(f_lyrs)
+
+# version-independent lookup: carried forward, not recomputed
+if (!file_exists(f_srpa))
+  file_copy(file.path(dir_v_prev, "subregion_programareas.csv"), f_srpa)
+
+if (do_build || !file_exists(f_gpkg)) {
+  d_pra_metrics <- dbGetQuery(con, glue(
+    "SELECT z.value AS programarea_key, m.metric_key, round(zm.value, 1) AS value
+     FROM zone z JOIN zone_metric zm USING (zone_seq) JOIN metric m USING (metric_seq)
+     WHERE z.tbl = '{tbl_pra}' AND zm.value IS NOT NULL")) |>
+    pivot_wider(names_from = metric_key, values_from = value)
+  base_cols <- c("programarea_id", "region_key", "region_name", "planarea_key", "planarea_name",
+                 "programarea_key", "programarea_name", "ctr_lon", "ctr_lat", "area_km2")
+  read_sf(file.path(dir_v_prev, glue("ply_programareas_2026_{ver_prev}.gpkg"))) |>
+    select(any_of(base_cols)) |>
+    left_join(d_pra_metrics, by = "programarea_key") |>
+    st_write(f_gpkg, delete_dsn = TRUE, quiet = TRUE)
+}
+
+f_art <- c(f_lyrs, f_gpkg, f_srpa,
+           file.path(dir_v, glue("tbl_component_pct_programarea_{ver}.csv")),
+           file.path(dir_v, glue("zone_taxon_{ver}.csv")))
+msens::report_table(
+  tibble(file = basename(f_art), exists = file_exists(f_art),
+         kb = round(as.numeric(file_size(f_art)) / 1024)),
+  caption = glue("Artifacts in {dir_v}"))
+```
+
+## Comparing a build against v7 {#sec-compare}
+
+One function, used for `v7c` and for each control. It compares the touched merged models and the
+three surfaces that carry the release — `cell_metric` (~22.0 M rows), `zone_metric` and
+`zone_taxon` — **by key, exactly**, and reports the largest value movement per metric.
+
+A note on "exactly". `model_cell.value` is INTEGER, so the six turtle models and the right whale are
+compared bit-for-bit and the only admissible answers are 0 diffs (flag off) or exactly the evidence
+table's cells (flag on). The scored surfaces are DOUBLE and every zone value is a `SUM()` over up to
+662,075 cells: IEEE addition is not associative, and DuckDB's parallel aggregate does not fix the
+reduction order, so re-running v7's own SQL on v7's own data reproduces `zone_metric` to about 5 ULP
+(measured: max 8.9e-15 on values near 10) rather than bit-identically. The gate is therefore
+**exact on keys** (no row gained, none lost, none renamed) and **bounded on values at 1e-9
+relative** — four orders of magnitude tighter than the smallest change either method makes, and six
+orders looser than reassociation noise. `n_moved` below counts values outside that bound; it is the
+number the gates assert.
+
+```{r}
+#| label: compare_fn
+
+# rel difference guard: |a-b| / max(|b|, 1) -- absolute for small values, relative for large
+REL_TOL <- 1e-9
+
+# an INTEGER model surface vs v7's: exact multiset difference, both directions
+surface_cmp <- function(cc, ms) dbGetQuery(cc, glue(
+  "SELECT
+     (SELECT count(*) FROM (SELECT mdl_seq, cell_id, value FROM model_cell WHERE mdl_seq IN ({ms})
+        EXCEPT ALL SELECT mdl_seq, cell_id, value FROM prev.model_cell WHERE mdl_seq IN ({ms}))) AS new_not_prev,
+     (SELECT count(*) FROM (SELECT mdl_seq, cell_id, value FROM prev.model_cell WHERE mdl_seq IN ({ms})
+        EXCEPT ALL SELECT mdl_seq, cell_id, value FROM model_cell WHERE mdl_seq IN ({ms}))) AS prev_not_new,
+     (SELECT count(*) FROM model_cell      WHERE mdl_seq IN ({ms})) AS n_new,
+     (SELECT count(*) FROM prev.model_cell WHERE mdl_seq IN ({ms})) AS n_prev,
+     (SELECT count(*) FROM (SELECT mdl_seq, cell_id FROM model_cell WHERE mdl_seq IN ({ms})
+        EXCEPT SELECT mdl_seq, cell_id FROM prev.model_cell WHERE mdl_seq IN ({ms}))) AS n_gained"))
+
+compare_build <- function(db_path) {
+  cc <- dbConnect(duckdb(dbdir = db_path, read_only = TRUE))
+  on.exit(dbDisconnect(cc, shutdown = TRUE), add = TRUE)
+  duckdb_tune(cc, glue("{path_dir(db_path)}/duckdb_tmp"))
+  # ATTACH is per DATABASE INSTANCE, not per connection: comparing the release this notebook
+  # already holds open would otherwise fail with `database with name "prev" already exists`.
+  if (!nrow(dbGetQuery(cc, "SELECT 1 FROM duckdb_databases() WHERE database_name = 'prev'")))
+    dbExecute(cc, glue("ATTACH '{sdm_db_prev}' AS prev (READ_ONLY)"))
+
+  turtle <- surface_cmp(cc, paste(MDL_TURTLE, collapse = ", "))
+  whale  <- surface_cmp(cc, MDL_WHALE)
+
+  cell <- dbGetQuery(cc, glue(
+    "WITH a AS (SELECT m.metric_key AS k, cm.cell_id AS cid, cm.value AS v
+                FROM cell_metric cm JOIN metric m USING (metric_seq)),
+          b AS (SELECT m.metric_key AS k, cm.cell_id AS cid, cm.value AS v
+                FROM prev.cell_metric cm JOIN prev.metric m USING (metric_seq)),
+          j AS (SELECT coalesce(a.k, b.k) AS metric_key, a.v AS va, b.v AS vb
+                FROM a FULL JOIN b ON a.k = b.k AND a.cid = b.cid)
+     SELECT metric_key,
+            count(*) FILTER (WHERE vb IS NULL) AS n_only_new,
+            count(*) FILTER (WHERE va IS NULL) AS n_only_prev,
+            coalesce(max(abs(va - vb) / greatest(abs(vb), 1.0)), 0) AS max_rel,
+            count(*) FILTER (WHERE abs(va - vb) / greatest(abs(vb), 1.0) > {REL_TOL}) AS n_moved
+     FROM j GROUP BY 1 ORDER BY 1"))
+
+  zone <- dbGetQuery(cc, glue(
+    "WITH a AS (SELECT z.fld AS f, z.value AS zv, m.metric_key AS k, zm.value AS v
+                FROM zone_metric zm JOIN zone z USING (zone_seq) JOIN metric m USING (metric_seq)),
+          b AS (SELECT z.fld AS f, z.value AS zv, m.metric_key AS k, zm.value AS v
+                FROM prev.zone_metric zm JOIN prev.zone z USING (zone_seq)
+                JOIN prev.metric m USING (metric_seq)),
+          j AS (SELECT coalesce(a.k, b.k) AS metric_key, a.v AS va, b.v AS vb
+                FROM a FULL JOIN b ON a.f = b.f AND a.zv = b.zv AND a.k = b.k)
+     SELECT metric_key,
+            count(*) FILTER (WHERE vb IS NULL) AS n_only_new,
+            count(*) FILTER (WHERE va IS NULL) AS n_only_prev,
+            coalesce(max(abs(va - vb) / greatest(abs(vb), 1.0)), 0) AS max_rel,
+            count(*) FILTER (WHERE abs(va - vb) / greatest(abs(vb), 1.0) > {REL_TOL}) AS n_moved
+     FROM j GROUP BY 1 ORDER BY 1"))
+
+  # zone_taxon: key = (zone_fld, zone_value, mdl_seq); zone_tbl differs by the _v7c rename
+  ztx <- dbGetQuery(cc, glue(
+    "WITH a AS (SELECT zone_fld f, zone_value zv, mdl_seq, sp_cat, area_km2, avg_suit,
+                       suit_rl, suit_rl_area, cat_suit_rl_area, pct_cat FROM zone_taxon),
+          b AS (SELECT zone_fld f, zone_value zv, mdl_seq, sp_cat, area_km2, avg_suit,
+                       suit_rl, suit_rl_area, cat_suit_rl_area, pct_cat FROM prev.zone_taxon),
+          j AS (SELECT coalesce(a.sp_cat, b.sp_cat) AS sp_cat,
+                       a.area_km2 aa, b.area_km2 ba, a.avg_suit sa, b.avg_suit sb,
+                       a.suit_rl ra, b.suit_rl rb, a.pct_cat pa, b.pct_cat pb,
+                       a.f AS af, b.f AS bf
+                FROM a FULL JOIN b ON a.f = b.f AND a.zv = b.zv AND a.mdl_seq = b.mdl_seq)
+     -- named `metric_key` so moved_keys() reads the real column: it looked for metric_key,
+     -- found nothing on a frame keyed by sp_cat, and the zone_taxon gate passed vacuously
+     SELECT sp_cat AS metric_key,
+            count(*) FILTER (WHERE bf IS NULL) AS n_only_new,
+            count(*) FILTER (WHERE af IS NULL) AS n_only_prev,
+            coalesce(greatest(
+              max(abs(aa - ba) / greatest(abs(ba), 1.0)),
+              max(abs(sa - sb) / greatest(abs(sb), 1.0)),
+              max(abs(ra - rb) / greatest(abs(rb), 1.0)),
+              max(abs(pa - pb) / greatest(abs(pb), 1.0))), 0) AS max_rel,
+            count(*) FILTER (WHERE
+              greatest(abs(aa - ba) / greatest(abs(ba), 1.0),
+                       abs(sa - sb) / greatest(abs(sb), 1.0),
+                       abs(ra - rb) / greatest(abs(rb), 1.0),
+                       abs(pa - pb) / greatest(abs(pb), 1.0)) > {REL_TOL}) AS n_moved
+     FROM j GROUP BY 1 ORDER BY 1"))
+
+  pra <- dbGetQuery(cc, glue(
+    "SELECT z.value AS programarea_key, m.metric_key, zm.value
+     FROM zone_metric zm JOIN zone z USING (zone_seq) JOIN metric m USING (metric_seq)
+     WHERE z.fld = 'programarea_key'"))
+
+  list(turtle = turtle, whale = whale, cell = cell, zone = zone, ztx = ztx, pra = pra)
+}
+
+# the invariant that must hold in EVERY run, whatever the flags: the productivity fix is
+# v10's. `{key}_coverage` is a NEW zone-only key, not a primprod row -- it says how much of
+# the zone the component covers and never touches primprod's values.
+moved_keys <- function(d) {
+  # a check that reads a column that is not there returns character(0) and passes forever
+  stopifnot("comparison frame has no metric_key column" = "metric_key" %in% names(d))
+  sort(d$metric_key[d$n_moved > 0 | d$n_only_new > 0 | d$n_only_prev > 0])
+}
+primprod_ok <- function(cmp) {
+  k <- c(moved_keys(cmp$cell), moved_keys(cmp$zone))
+  !any(grepl("^primprod", k) & !grepl("_coverage$", k))
+}
+```
+
+## Control runs {#sec-controls}
+
+Four clones in a scratch directory, each through `build_release()` with a different flag set, then
+deleted. The point of the all-off run is that it is the *same code path* as `v7c`: if it reproduces
+v7, every difference `v7c` shows is attributable to a flag and nothing else.
+
+```{r}
+#| label: controls
+
+CONTROLS <- tribble(
+  ~run,           ~turtles, ~whale, ~kappa,
+  "all_off",         FALSE,  FALSE, 0,
+  "turtles_only",     TRUE,  FALSE, 0,
+  "whale_only",      FALSE,   TRUE, 0,
+  "kappa_only",      FALSE,  FALSE, COVERAGE_FLOOR)
+
+do_controls <- do_build || !file_exists(f_gates)
+
+if (!do_controls) {
+  log_info("control gate results cached at {f_gates} -- not rebuilding the clones")
+  # an EMPTY moved-key set is the passing answer, and read_csv() reads "" back as NA:
+  # nchar(NA) == 0 is NA, so every gate below would halt on a cached re-render of a good build
+  d_gates <- read_csv(f_gates) |>
+    mutate(across(ends_with("_moved"), \(x) coalesce(as.character(x), "")))
+  d_attr  <- read_csv(f_attr)
+} else {
+  cmps <- list()
+  pras <- list()
+  for (i in seq_len(nrow(CONTROLS))) {
+    r  <- CONTROLS[i, ]
+    od <- file.path(dir_scratch, r$run)
+    build_release(file.path(od, "sdm.duckdb"), od, r$turtles, r$whale, r$kappa, r$run)
+    cmps[[r$run]] <- compare_build(file.path(od, "sdm.duckdb"))
+    pras[[r$run]] <- cmps[[r$run]]$pra
+  }
+  cmps[[ver]] <- compare_build(sdm_db)
+  pras[[ver]] <- cmps[[ver]]$pra
+
+  # one tidy row per (run, check) so the gates and a cached re-render assert the same numbers
+  d_gates <- imap_dfr(cmps, function(cmp, run) tibble(
+    run           = run,
+    turtle_n      = cmp$turtle$n_new,
+    turtle_gained = cmp$turtle$n_gained,
+    turtle_diff   = cmp$turtle$new_not_prev + cmp$turtle$prev_not_new,
+    whale_n       = cmp$whale$n_new,
+    whale_gained  = cmp$whale$n_gained,
+    whale_diff    = cmp$whale$new_not_prev + cmp$whale$prev_not_new,
+    cell_moved    = paste(moved_keys(cmp$cell),  collapse = " "),
+    zone_moved    = paste(moved_keys(cmp$zone),  collapse = " "),
+    ztx_moved     = paste(moved_keys(cmp$ztx),   collapse = " "),
+    cell_max_rel  = max(cmp$cell$max_rel), zone_max_rel = max(cmp$zone$max_rel),
+    ztx_max_rel   = max(cmp$ztx$max_rel),
+    primprod_ok   = primprod_ok(cmp)))
+  write_csv(d_gates, f_gates)
+
+  K_ATTR <- c(turtle    = "extrisk_turtle_ecoregion_rescaled",
+              mammal    = "extrisk_mammal_ecoregion_rescaled",
+              composite = K_SCORE)
+  what_of <- function(k) names(K_ATTR)[match(k, K_ATTR)]
+  d_attr <- imap_dfr(pras, \(d, run) d |> mutate(run = run)) |>
+    filter(metric_key %in% K_ATTR) |>
+    mutate(what = what_of(metric_key)) |>
+    select(programarea_key, what, run, value) |>
+    bind_rows(
+      dbGetQuery(con, glue(
+        "SELECT z.value AS programarea_key, m.metric_key, zm.value
+         FROM prev.zone_metric zm JOIN prev.zone z USING (zone_seq)
+         JOIN prev.metric m USING (metric_seq)
+         WHERE z.fld = 'programarea_key'")) |>
+        filter(metric_key %in% K_ATTR) |>
+        mutate(what = what_of(metric_key), run = ver_prev) |>
+        select(programarea_key, what, run, value))
+  write_csv(d_attr, f_attr)
+
+  dir_delete(dir_scratch)
+  log_info("control clones removed from {dir_scratch}")
+}
+
+msens::report_table(
+  d_gates |> select(run, turtle_n, turtle_gained, turtle_diff, whale_n, whale_gained, whale_diff,
+                    primprod_ok, cell_max_rel, zone_max_rel, ztx_max_rel),
+  caption = "Control runs vs v7 (turtle_diff / whale_diff are exact INTEGER multiset differences)")
+```
+
+## Gates that stop the line
+
+```{r}
+#| label: gate_all_off
+
+g <- d_gates |> filter(run == "all_off")
+stopifnot(
+  "all flags off: the six turtle models must be v7's 2,022,909 cells, bit-identical" =
+    g$turtle_n == N_TURTLE_V7 && g$turtle_diff == 0,
+  "all flags off: the right whale model must be v7's 60,690 cells, bit-identical" =
+    g$whale_n == N_WHALE_V7 && g$whale_diff == 0,
+  "all flags off: cell_metric must not gain, lose or move a (metric_key, cell_id) value" =
+    nchar(g$cell_moved) == 0,
+  "all flags off: zone_metric must not gain, lose or move a (zone, metric_key) value" =
+    nchar(g$zone_moved) == 0,
+  "all flags off: zone_taxon must not gain, lose or move a row" =
+    nchar(g$ztx_moved) == 0)
+log_info("GATE all-off == v7: turtles {g$turtle_n} cells / {g$turtle_diff} diffs; right whale ",
+         "{g$whale_n} cells / {g$whale_diff} diffs; max rel dev cell {signif(g$cell_max_rel, 3)}, ",
+         "zone {signif(g$zone_max_rel, 3)}, zone_taxon {signif(g$ztx_max_rel, 3)} (tol {REL_TOL})")
+```
+
+```{r}
+#| label: gate_single_flags
+
+# each flag may move only its own component, the composite that averages it, and its own
+# zone_taxon rows -- and must remove EXACTLY the evidence table's cells, no more, no fewer.
+# kappa may move only the ONE pair it drops on v7 (St. George Basin turtles, 1.5 % coverage),
+# the composite that no longer averages it, and the new _coverage keys -- and no cell metric
+# at all, because it is a zone reporting rule. Naming the admissible keys rather than allowing
+# any component is the point: if a second pair falls below the floor, that is news, not noise.
+keys_of   <- function(x) setdiff(strsplit(coalesce(x, ""), " ")[[1]], "")
+ok_turtle <- function(keys) all(grepl("^extrisk_turtle|^score_", keys))
+ok_mammal <- function(keys) all(grepl("^extrisk_mammal|^score_", keys))
+ok_kappa  <- function(keys) all(
+  keys %in% c("extrisk_turtle_ecoregion_rescaled", K_SCORE) | grepl("_coverage$", keys))
+
+gt <- d_gates |> filter(run == "turtles_only")
+gw <- d_gates |> filter(run == "whale_only")
+gk <- d_gates |> filter(run == "kappa_only")
+
+stopifnot(
+  "turtles-only: only extrisk_turtle* and the score may move in cell_metric" =
+    ok_turtle(keys_of(gt$cell_moved)),
+  "turtles-only: only extrisk_turtle* and the score may move in zone_metric" =
+    ok_turtle(keys_of(gt$zone_moved)),
+  "turtles-only: only turtle rows may move in zone_taxon" =
+    all(keys_of(gt$ztx_moved) %in% "turtle"),
+  "turtles-only: the turtle models must lose exactly the evidence table's cells and gain none" =
+    gt$turtle_n == N_TURTLE_V7 - N_TURTLE_EXCL && gt$turtle_diff == N_TURTLE_EXCL &&
+      gt$turtle_gained == 0,
+  "turtles-only: the right whale must stay v7's" =
+    gt$whale_n == N_WHALE_V7 && gt$whale_diff == 0,
+
+  "whale-only: only extrisk_mammal* and the score may move in cell_metric" =
+    ok_mammal(keys_of(gw$cell_moved)),
+  "whale-only: only extrisk_mammal* and the score may move in zone_metric" =
+    ok_mammal(keys_of(gw$zone_moved)),
+  "whale-only: only mammal rows may move in zone_taxon" =
+    all(keys_of(gw$ztx_moved) %in% "mammal"),
+  "whale-only: the right whale must lose exactly the evidence table's cells and gain none" =
+    gw$whale_n == N_WHALE_V7 - N_WHALE_EXCL && gw$whale_diff == N_WHALE_EXCL &&
+      gw$whale_gained == 0,
+  "whale-only: the turtle models must stay v7's" =
+    gw$turtle_n == N_TURTLE_V7 && gw$turtle_diff == 0,
+
+  "kappa-only: no cell metric may move -- kappa is a zone reporting rule" =
+    nchar(gk$cell_moved) == 0,
+  "kappa-only: zone_taxon must not move" =
+    nchar(gk$ztx_moved) == 0,
+  "kappa-only: only the dropped component, the score and the new _coverage keys may move" =
+    ok_kappa(keys_of(gk$zone_moved)),
+  "kappa-only: the turtle and right whale models must stay v7's" =
+    gk$turtle_diff == 0 && gk$turtle_n == N_TURTLE_V7 &&
+      gk$whale_diff == 0 && gk$whale_n == N_WHALE_V7)
+log_info("GATE single flags: turtles-only moved cell[{gt$cell_moved}] zone[{gt$zone_moved}] ",
+         "ztx[{gt$ztx_moved}], -{gt$turtle_diff} turtle cells; whale-only moved ",
+         "cell[{gw$cell_moved}] zone[{gw$zone_moved}] ztx[{gw$ztx_moved}], -{gw$whale_diff} ",
+         "right whale cells; kappa-only moved zone[{gk$zone_moved}]")
+```
+
+```{r}
+#| label: gate_primprod
+
+# the productivity fix is NOT in v7.2. Every primprod row, cell and zone, must equal v7's in
+# EVERY run -- the control runs included.
+stopifnot("a primprod row moved in some run -- the productivity fix is v10's, not v7.2's" =
+  all(d_gates$primprod_ok))
+log_info("GATE primprod unchanged in all {nrow(d_gates)} runs")
+```
+
+```{r}
+#| label: gate_surface
+
+# the release itself: exactly the flagged exclusions, nothing gained, only admissible keys
+gv  <- d_gates |> filter(run == ver)
+n_t <- if (EXCLUDE_TURTLES)     N_TURTLE_EXCL else 0
+n_w <- if (EXCLUDE_RIGHT_WHALE) N_WHALE_EXCL  else 0
+ok_release <- function(keys) all(grepl("^extrisk_turtle|^extrisk_mammal|^score_|_coverage$", keys))
+
+# critical habitat: every v7 cell a ch_* / ca_* dataset gives these taxa survives at its v7 value
+n_ch <- dbGetQuery(con, glue(
+  "WITH ch AS (
+     SELECT DISTINCT t.mdl_seq, mc.cell_id
+     FROM prev.taxon t
+     JOIN prev.taxon_model tm ON tm.taxon_id = t.taxon_id
+     JOIN prev.model_cell  mc ON mc.mdl_seq  = tm.mdl_seq
+     WHERE t.mdl_seq IN ({mdl_all_sql})
+       AND (tm.ds_key LIKE 'ch\\_%' ESCAPE '\\' OR tm.ds_key LIKE 'ca\\_%' ESCAPE '\\'))
+   SELECT CASE WHEN ch.mdl_seq = {MDL_WHALE} THEN 'right_whale' ELSE 'turtle' END AS grp,
+          count(*) AS n_ch,
+          count(*) FILTER (WHERE n.value IS NULL)                    AS n_lost,
+          count(*) FILTER (WHERE n.value IS DISTINCT FROM o.value)   AS n_changed
+   FROM ch
+   LEFT JOIN model_cell      n ON n.mdl_seq = ch.mdl_seq AND n.cell_id = ch.cell_id
+   LEFT JOIN prev.model_cell o ON o.mdl_seq = ch.mdl_seq AND o.cell_id = ch.cell_id
+   GROUP BY 1 ORDER BY 1"))
+
+d_typ <- dbGetQuery(con,
+  "SELECT (SELECT column_type FROM (DESCRIBE SELECT * FROM model_cell)  WHERE column_name = 'value') AS mc_type,
+          (SELECT column_type FROM (DESCRIBE SELECT * FROM cell_metric) WHERE column_name = 'value') AS cm_type")
+
+# cells per (model, MAJORITY ecoregion), v7 vs v7c -- the unit the rule is stated in
+d_eco <- dbGetQuery(con, glue(
+  "WITH n AS (SELECT mdl_seq, zone_key, count(*) AS n FROM model_cell
+              JOIN cell_zone USING (cell_id) WHERE mdl_seq IN ({mdl_all_sql}) GROUP BY ALL),
+        o AS (SELECT mdl_seq, zone_key, count(*) AS n FROM prev.model_cell
+              JOIN cell_zone USING (cell_id) WHERE mdl_seq IN ({mdl_all_sql}) GROUP BY ALL)
+   SELECT coalesce(n.mdl_seq, o.mdl_seq) AS mdl_seq, coalesce(n.zone_key, o.zone_key) AS ecoregion,
+          coalesce(o.n, 0) AS n_prev, coalesce(n.n, 0) AS n_new
+   FROM n FULL JOIN o ON n.mdl_seq = o.mdl_seq AND n.zone_key = o.zone_key
+   ORDER BY 2, 1")) |>
+  mutate(mdl_seq = as.integer(mdl_seq))
+
+ex_applied <- bind_rows(
+  d_excl |> filter(EXCLUDE_TURTLES,     mdl_seq %in% MDL_TURTLE),
+  d_excl |> filter(EXCLUDE_RIGHT_WHALE, mdl_seq == MDL_WHALE)) |>
+  select(mdl_seq, ecoregion = zone_key, n_cells_v7)
+d_eco_chk <- d_eco |>
+  left_join(ex_applied, by = c("mdl_seq", "ecoregion")) |>
+  mutate(expected = n_prev - coalesce(n_cells_v7, 0L))
+d_goa   <- d_eco |> filter(mdl_seq %in% MDL_TURTLE, ecoregion == "GOA", n_prev > 0 | n_new > 0)
+d_rw    <- d_eco |> filter(mdl_seq == MDL_WHALE)
+rw_n    <- \(e, col) sum(d_rw[[col]][d_rw$ecoregion %in% e])
+
+stopifnot(
+  "mdl_seq 54238-54243 must be the six merged turtles, unchanged" =
+    identical(as.integer(MDL_TURTLE), MDL_TURTLE_V7),
+  "the right whale must keep mdl_seq 54252" =
+    nrow(dbGetQuery(con, glue("SELECT 1 FROM taxon WHERE mdl_seq = {MDL_WHALE}
+                               AND common_name = 'North Atlantic Right Whale'"))) == 1,
+  "model_cell.value must stay INTEGER and cell_metric.value DOUBLE (DuckDB hash() is type-sensitive)" =
+    d_typ$mc_type == "INTEGER" && d_typ$cm_type == "DOUBLE",
+  "critical habitat was trimmed -- every v7 CH cell of the turtles and the right whale must survive with its v7 value" =
+    nrow(n_ch) == 2 && all(n_ch$n_ch > 0) && all(n_ch$n_lost == 0) && all(n_ch$n_changed == 0),
+  "v7c: the turtle models must lose exactly the applied exclusions and gain none" =
+    gv$turtle_n == N_TURTLE_V7 - n_t && gv$turtle_diff == n_t && gv$turtle_gained == 0,
+  "v7c: the right whale must lose exactly the applied exclusions and gain none" =
+    gv$whale_n == N_WHALE_V7 - n_w && gv$whale_diff == n_w && gv$whale_gained == 0,
+  "v7c: only turtle, mammal, score and _coverage keys may move" =
+    ok_release(keys_of(gv$cell_moved)) && ok_release(keys_of(gv$zone_moved)) &&
+      all(keys_of(gv$ztx_moved) %in% c("turtle", "mammal")),
+  "every (model, majority ecoregion) must hold v7's cells minus exactly the applied exclusion" =
+    all(d_eco_chk$n_new == d_eco_chk$expected),
+  "no turtle cell may remain in the East Bering Sea, Chukchi/Beaufort Sea or High Arctic ecoregions" =
+    !EXCLUDE_TURTLES ||
+      !any(d_eco$mdl_seq %in% MDL_TURTLE & d_eco$ecoregion %in% c("EBS", "CBS", "HAR") & d_eco$n_new > 0),
+  "the Gulf of Alaska ecoregion must hold exactly v7's four turtles at v7's cell counts" =
+    setequal(d_goa$mdl_seq, c(54238L, 54239L, 54241L, 54243L)) && all(d_goa$n_new == d_goa$n_prev),
+  "the right whale must hold no cell in the Gulf of America ecoregions (EGOA, WCGOA)" =
+    !EXCLUDE_RIGHT_WHALE || rw_n(c("EGOA", "WCGOA"), "n_new") == 0,
+  "the right whale must keep v7's Northeast and Southeast Continental Shelf cells" =
+    rw_n("NECS", "n_new") == rw_n("NECS", "n_prev") && rw_n("SECS", "n_new") == rw_n("SECS", "n_prev"))
+log_info("GATE surface: CH turtle {n_ch$n_ch[n_ch$grp == 'turtle']} / right whale ",
+         "{n_ch$n_ch[n_ch$grp == 'right_whale']} cells, 0 lost / 0 changed; types {d_typ$mc_type}/",
+         "{d_typ$cm_type}; v7c turtles {gv$turtle_n} (-{gv$turtle_diff}), right whale {gv$whale_n} ",
+         "(-{gv$whale_diff}), gained 0; GOA {paste(glue('{d_goa$mdl_seq}={d_goa$n_new}'), collapse = ' ')}; ",
+         "right whale EGOA+WCGOA {rw_n(c('EGOA', 'WCGOA'), 'n_new')}, NECS {rw_n('NECS', 'n_new')}, ",
+         "SECS {rw_n('SECS', 'n_new')}")
+
+msens::report_table(
+  d_eco |>
+    left_join(dbGetQuery(con, glue(
+      "SELECT mdl_seq, common_name FROM taxon WHERE mdl_seq IN ({mdl_all_sql})")) |>
+        mutate(mdl_seq = as.integer(mdl_seq)), by = "mdl_seq") |>
+    select(ecoregion, species = common_name, mdl_seq, n_prev, n_new) |>
+    rename(!!glue("cells_{ver_prev}") := n_prev, !!glue("cells_{ver}") := n_new),
+  caption = "Turtle and right whale cells by majority ecoregion (EBS for the turtles, EGOA / WCGOA for the right whale must be gone)")
+```
+
+## Report
+
+### Attribution: what each flag moves, per Program Area
+
+The composite per Program Area under each run, v7.1 (`v7b`, read-only from its own release
+database when present) beside it. There is no emulated expectation for v7.2 — the deltas are
+printed, and a Program Area whose composite moves by more than 5 points is flagged.
+
+```{r}
+#| label: tbl_attribution
+
+lvl <- c(ver_prev, "all_off", "turtles_only", "whale_only", "kappa_only", ver)
+d_w <- d_attr |>
+  filter(run %in% lvl) |>
+  mutate(run = factor(run, levels = lvl)) |>
+  pivot_wider(names_from = run, values_from = value) |>
+  arrange(what, programarea_key)
+
+# v7.1 beside it: its own release database, read-only, if this machine has it
+sdm_db_v7b <- path.expand(msens::sdm_db_path("v7b"))
+if (file_exists(sdm_db_v7b)) {
+  if (!nrow(dbGetQuery(con, "SELECT 1 FROM duckdb_databases() WHERE database_name = 'v7b'")))
+    dbExecute(con, glue("ATTACH '{sdm_db_v7b}' AS v7b (READ_ONLY)"))
+  d_v7b <- dbGetQuery(con, glue(
+    "SELECT z.value AS programarea_key, m.metric_key, zm.value AS v7b
+     FROM v7b.zone_metric zm JOIN v7b.zone z USING (zone_seq) JOIN v7b.metric m USING (metric_seq)
+     WHERE z.fld = 'programarea_key'
+       AND m.metric_key IN ('extrisk_turtle_ecoregion_rescaled', 'extrisk_mammal_ecoregion_rescaled', '{K_SCORE}')")) |>
+    mutate(what = case_when(
+      metric_key == K_SCORE ~ "composite",
+      str_detect(metric_key, "turtle") ~ "turtle",
+      TRUE ~ "mammal")) |>
+    select(programarea_key, what, v7b)
+  d_w <- d_w |> left_join(d_v7b, by = c("programarea_key", "what"))
+} else {
+  log_info("v7b release database not on this machine ({sdm_db_v7b}) -- v7.1 column omitted")
+}
+
+rank_of <- function(x) rank(-x, na.last = "keep", ties.method = "min")
+d_comp <- d_w |> filter(what == "composite") |>
+  mutate(across(where(is.numeric), \(x) round(x, 1)))
+d_turt <- d_w |> filter(what == "turtle") |>
+  mutate(across(where(is.numeric), \(x) round(x, 1)))
+d_mamm <- d_w |> filter(what == "mammal") |>
+  mutate(across(where(is.numeric), \(x) round(x, 1)))
+
+d_rank <- d_comp |>
+  select(-what) |>
+  mutate(
+    d_v7c    = round(.data[[ver]] - .data[[ver_prev]], 1),
+    rank_v7  = rank_of(.data[[ver_prev]]),
+    rank_v7c = rank_of(.data[[ver]]),
+    flag     = if_else(abs(coalesce(d_v7c, 0)) > 5, "MOVED > 5", ""))
+if ("v7b" %in% names(d_rank)) d_rank <- d_rank |> mutate(rank_v7b = rank_of(v7b))
+msens::report_table(d_rank,
+  caption = "Composite score per Program Area: v7 | controls | v7.2, v7.1 beside it, with ranks")
+msens::report_table(d_turt |> select(-what),
+  caption = "Turtle component per Program Area (blank = not reportable / no cells)")
+msens::report_table(d_mamm |> select(-what),
+  caption = "Mammal component per Program Area")
+
+sp <- suppressWarnings(cor(d_comp[[ver_prev]], d_comp[[ver]], method = "spearman", use = "complete.obs"))
+log_info("Spearman rank correlation of the composite, {ver_prev} vs {ver}: {round(sp, 4)}")
+if ("v7b" %in% names(d_comp)) {
+  sp_b <- suppressWarnings(cor(d_comp$v7b, d_comp[[ver]], method = "spearman", use = "complete.obs"))
+  log_info("Spearman rank correlation of the composite, v7b vs {ver}: {round(sp_b, 4)}")
+}
+d_rk <- d_rank |> filter(rank_v7 != rank_v7c)
+log_info("ranks changed {ver_prev} -> {ver}: ",
+         "{if (nrow(d_rk)) paste(glue('{d_rk$programarea_key} {d_rk$rank_v7}->{d_rk$rank_v7c}'), collapse = ', ') else 'none'}")
+if (any(d_rank$flag != ""))
+  log_warn("Program Areas whose composite moved > 5: ",
+           "{paste(d_rank$programarea_key[d_rank$flag != ''], collapse = ', ')}")
+```
+
+### Critical-habitat retention
+
+```{r}
+#| label: tbl_ch
+
+msens::report_table(dbGetQuery(con, glue(
+  "WITH ch AS (
+     SELECT DISTINCT t.mdl_seq, t.common_name, mc.cell_id
+     FROM prev.taxon t
+     JOIN prev.taxon_model tm ON tm.taxon_id = t.taxon_id
+     JOIN prev.model_cell  mc ON mc.mdl_seq  = tm.mdl_seq
+     WHERE t.mdl_seq IN ({mdl_all_sql})
+       AND (tm.ds_key LIKE 'ch\\_%' ESCAPE '\\' OR tm.ds_key LIKE 'ca\\_%' ESCAPE '\\'))
+   SELECT ch.common_name AS species, count(*) AS ch_cells,
+          count(*) FILTER (WHERE cz.zone_key IN ('EBS', 'CBS', 'HAR', 'EGOA', 'WCGOA')) AS in_excluded_ecoregions,
+          count(*) FILTER (WHERE n.value IS NULL) AS lost_in_{ver}
+   FROM ch LEFT JOIN cell_zone cz USING (cell_id)
+           LEFT JOIN model_cell n ON n.mdl_seq = ch.mdl_seq AND n.cell_id = ch.cell_id
+   GROUP BY 1 ORDER BY ch_cells DESC")),
+  caption = "Critical habitat per species: none lies in an excluded ecoregion on v7, so the guard is asserted, not exercised")
+```
+
+### Species presence per Program Area, before and after
+
+```{r}
+#| label: tbl_presence
+
+d_pres <- dbGetQuery(con, glue(
+  "WITH z AS (SELECT zone_seq, value AS pa FROM zone WHERE fld = 'programarea_key'),
+        n AS (SELECT z.pa, mc.mdl_seq, count(*) AS n
+              FROM model_cell mc JOIN zone_cell zc ON zc.cell_id = mc.cell_id
+              JOIN z ON z.zone_seq = zc.zone_seq WHERE mc.mdl_seq IN ({mdl_all_sql}) GROUP BY 1, 2),
+        o AS (SELECT z.pa, mc.mdl_seq, count(*) AS n
+              FROM prev.model_cell mc JOIN zone_cell zc ON zc.cell_id = mc.cell_id
+              JOIN z ON z.zone_seq = zc.zone_seq WHERE mc.mdl_seq IN ({mdl_all_sql}) GROUP BY 1, 2)
+   SELECT coalesce(n.pa, o.pa) AS programarea_key, t.common_name AS species,
+          coalesce(n.mdl_seq, o.mdl_seq) AS mdl_seq,
+          coalesce(o.n, 0) AS cells_{ver_prev}, coalesce(n.n, 0) AS cells_{ver}
+   FROM o FULL JOIN n ON n.pa = o.pa AND n.mdl_seq = o.mdl_seq
+   JOIN taxon t ON t.mdl_seq = coalesce(n.mdl_seq, o.mdl_seq)
+   ORDER BY 1, 2"))
+
+msens::report_table(d_pres |> filter(mdl_seq != MDL_WHALE) |> select(-mdl_seq),
+  caption = glue("Turtle cells per Program Area, {ver_prev} -> {ver}"))
+msens::report_table(d_pres |> filter(mdl_seq == MDL_WHALE) |> select(-mdl_seq),
+  caption = glue("North Atlantic right whale cells per Program Area, {ver_prev} -> {ver}"))
+```
+
+### The ten lowest coverages, and what κ removed
+
+```{r}
+#| label: tbl_coverage
+
+component_keys <- c(glue("extrisk_{sp_cats}_ecoregion_rescaled"), "primprod_ecoregion_rescaled")
+d_cov <- dbGetQuery(con, msens::coverage_sql(
+    tbl_pra, component_keys, weight = "pct_covered",
+    val_col = msens::sdm_val_col(con, "cell_metric"))) |>
+  msens::coverage_floor(kappa = if (is.na(COVERAGE_FLOOR)) 0 else COVERAGE_FLOOR) |>
+  left_join(dbGetQuery(con, glue(
+    "SELECT zone_seq, value AS programarea_key FROM zone WHERE tbl = '{tbl_pra}'")),
+    by = "zone_seq") |>
+  arrange(coverage) |>
+  select(programarea_key, metric_key, coverage, reportable)
+
+msens::report_table(head(d_cov, 10) |> mutate(coverage = round(coverage * 100, 2)),
+  caption = glue("Ten lowest (Program Area x component) coverages in {ver}, percent"))
+
+f_nr <- file.path(dir_v, glue("tbl_component_not_reportable_programarea_{ver}.csv"))
+msens::report_table(
+  if (file_exists(f_nr)) read_csv(f_nr) else tibble(note = "kappa off -- nothing dropped"),
+  caption = "Pairs below the floor (removed from the composite, never published as a zero)")
+```
+
+### US-EEZ location quotient — diagnostic only
+
+Tim's national reading: turtle weight per km², with **100 = the study-area average**. It is printed
+here as a diagnostic, not published — the released metric is v10's distribution share.
+
+```{r}
+#| label: tbl_lq
+
+lq_sql <- function(src) glue(
+  "WITH t AS (SELECT cell_id, sum(value) AS v FROM {src} WHERE mdl_seq IN ({mdl_sql}) GROUP BY 1),
+        nat AS (SELECT sum(t.v * c.area_km2) / sum(c.area_km2) AS m
+                FROM cell c LEFT JOIN t USING (cell_id))
+   SELECT z.value AS programarea_key,
+          sum(coalesce(t.v, 0) * c.area_km2 * zc.pct_covered / 100.0) /
+          sum(c.area_km2 * zc.pct_covered / 100.0) / (SELECT m FROM nat) * 100 AS lq,
+          sum(coalesce(t.v, 0) * c.area_km2 * zc.pct_covered / 100.0) /
+          (SELECT sum(coalesce(t.v, 0) * c.area_km2) FROM cell c LEFT JOIN t USING (cell_id)) * 100 AS pct_us
+   FROM zone z JOIN zone_cell zc USING (zone_seq) JOIN cell c ON c.cell_id = zc.cell_id
+   LEFT JOIN t ON t.cell_id = zc.cell_id
+   WHERE z.fld = 'programarea_key' GROUP BY 1 ORDER BY lq DESC")
+
+d_lq <- dbGetQuery(con, lq_sql("prev.model_cell")) |>
+  rename(lq_v7 = lq, pct_us_v7 = pct_us) |>
+  full_join(dbGetQuery(con, lq_sql("model_cell")) |>
+              rename(lq_v7c = lq, pct_us_v7c = pct_us), by = "programarea_key") |>
+  mutate(across(where(is.numeric), \(x) round(x, 1))) |>
+  arrange(desc(lq_v7))
+msens::report_table(d_lq, caption = "Turtle location quotient (100 = study-area average per km2) and share of US turtle weight")
+
+ak <- c("ALA", "BOW", "CHU", "COK", "GEO", "GOA", "HOP", "KOD", "NAV", "NOR", "SHU", "MAT")
+log_info("Alaska Program Areas hold {round(sum(d_lq$pct_us_v7[d_lq$programarea_key %in% ak], na.rm = TRUE), 2)}% ",
+         "of US turtle weight in {ver_prev}, {round(sum(d_lq$pct_us_v7c[d_lq$programarea_key %in% ak], na.rm = TRUE), 2)}% in {ver}")
+```
+
+## Manifest
+
+Digests of the surfaces P4 must reproduce on the server: the six turtle models, the right whale,
+`cell_metric`, `zone_metric` and `zone_taxon`. `msens::hash_query()` is an order-independent
+reduction (`count + bit_xor + sum`), so it does not care how DuckDB partitioned the scan.
+
+It DOES care about the last bit of a DOUBLE, and @sec-compare measured that the zone sums are
+not bit-reproducible (parallel `SUM()` reassociates; ~5 ULP). A digest of the raw doubles would
+therefore differ between two correct builds, and the server-equals-laptop gate would be red for
+no reason. So the INTEGER model surfaces are digested as they are (exact), and every DOUBLE is
+digested as `CAST(... AS FLOAT)`: ~7 significant digits at every magnitude (`area_km2` runs to
+1e6, a score to 100), nine orders coarser than the noise and far finer than anything either
+rule moves.
+
+**The committed manifest is the reference.** A build with the same flags on any machine must
+reproduce its digests, and this chunk stops if it does not -- that is P4's "server build equals
+the laptop's" gate, run by the render itself rather than by eye. A changed evidence table
+(`zone_exclusions_hash`) under the same flags moves the digests too, so it also stops here.
+`BUILD_REFERENCE=1` is the only way to move the reference, and says so in the log.
+
+```{r}
+#| label: manifest
+
+h <- list(
+  turtle_models = msens::hash_query(con, glue(
+    "SELECT mdl_seq, cell_id, value FROM model_cell WHERE mdl_seq IN ({mdl_sql})")),
+  right_whale_model = msens::hash_query(con, glue(
+    "SELECT mdl_seq, cell_id, value FROM model_cell WHERE mdl_seq = {MDL_WHALE}")),
+  cell_metric = msens::hash_query(con,
+    "SELECT m.metric_key, cm.cell_id, CAST(cm.value AS FLOAT) AS value
+     FROM cell_metric cm JOIN metric m USING (metric_seq)"),
+  zone_metric = msens::hash_query(con,
+    "SELECT z.fld, z.value AS zone_value, m.metric_key, CAST(zm.value AS FLOAT) AS value
+     FROM zone_metric zm JOIN zone z USING (zone_seq) JOIN metric m USING (metric_seq)"),
+  zone_taxon = msens::hash_query(con,
+    "SELECT zone_fld, zone_value, mdl_seq, CAST(area_km2 AS FLOAT) AS area_km2,
+            CAST(avg_suit AS FLOAT) AS avg_suit, CAST(suit_rl AS FLOAT) AS suit_rl,
+            CAST(pct_cat AS FLOAT) AS pct_cat
+     FROM zone_taxon"))
+
+# the reference gate: same flags => same digests as the committed manifest ----
+f_mfst   <- here(glue("data/manifests/build_{ver}.json"))
+ref      <- if (file_exists(f_mfst)) read_json(f_mfst) else NULL
+kappa    <- if (is.na(COVERAGE_FLOOR)) 0 else COVERAGE_FLOOR
+is_ref   <- nzchar(Sys.getenv("BUILD_REFERENCE"))
+same_flags <- !is.null(ref) &&
+  isTRUE(ref$exclude_turtles     == EXCLUDE_TURTLES) &&
+  isTRUE(ref$exclude_right_whale == EXCLUDE_RIGHT_WHALE) &&
+  isTRUE(ref$coverage_floor      == kappa)
+
+d_dig <- tibble(
+  surface   = names(h),
+  digest    = unlist(h),
+  reference = vapply(names(h), \(k) ref[[glue("digest_{k}")]] %||% NA_character_, ""))
+if (is_ref || is.null(ref)) {
+  log_info("BUILD_REFERENCE / no manifest yet: these digests BECOME the reference")
+} else if (!same_flags) {
+  log_info("flags differ from the committed manifest's -- a control render, reference not compared")
+} else {
+  stopifnot("this build's digests differ from the committed reference (data/manifests); a correct build with the same flags reproduces them on any machine" =
+    all(d_dig$digest == d_dig$reference))
+  log_info("GATE reference digests reproduced: {paste(d_dig$surface, collapse = ', ')}")
+}
+
+gv <- d_gates |> filter(run == ver)
+ga <- d_gates |> filter(run == "all_off")
+
+# a control render (flags differ) never overwrites the reference it was not compared against
+if (is_ref || is.null(ref) || same_flags) msens::write_manifest(
+  f_mfst,
+  target       = glue("build_{ver}"),
+  content_hash = msens::hash_query(con, glue(
+    "SELECT '{h$turtle_models}' AS a, '{h$right_whale_model}' AS b, '{h$cell_metric}' AS c,
+            '{h$zone_metric}' AS d, '{h$zone_taxon}' AS e")),
+  stats = list(
+    ver                       = ver,
+    ver_prev                  = ver_prev,
+    exclude_turtles           = EXCLUDE_TURTLES,
+    exclude_right_whale       = EXCLUDE_RIGHT_WHALE,
+    coverage_floor            = kappa,
+    zone_exclusions_hash      = EXCL_HASH,
+    n_zone_exclusions         = nrow(d_excl),
+    digest_turtle_models      = h$turtle_models,
+    digest_right_whale_model  = h$right_whale_model,
+    digest_cell_metric        = h$cell_metric,
+    digest_zone_metric        = h$zone_metric,
+    digest_zone_taxon         = h$zone_taxon,
+    n_turtle_cells            = gv$turtle_n,
+    n_turtle_cells_prev       = ga$turtle_n,
+    n_turtle_gained           = gv$turtle_gained,
+    n_right_whale_cells       = gv$whale_n,
+    n_right_whale_cells_prev  = ga$whale_n,
+    n_right_whale_gained      = gv$whale_gained,
+    allflagsoff_diffs         = ga$turtle_diff + ga$whale_diff,
+    n_ch_cells_turtle         = n_ch$n_ch[n_ch$grp == "turtle"],
+    n_ch_cells_right_whale    = n_ch$n_ch[n_ch$grp == "right_whale"],
+    n_ch_lost                 = sum(n_ch$n_lost),
+    goa_ecoregion_cells       = sum(d_goa$n_new),
+    n_not_reportable          = sum(!d_cov$reportable),
+    spearman_composite        = round(sp, 4)),
+  force = msens::force_target(glue("build_{ver}")))
+
+msens::report_table(d_dig,
+  caption = "Content digests (DOUBLEs as FLOAT) vs the committed reference any same-flag build must reproduce")
+
+dbDisconnect(con, shutdown = TRUE)
+```
