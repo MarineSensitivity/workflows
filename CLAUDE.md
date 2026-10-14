@@ -68,6 +68,25 @@ spatial-ER taxa's merge-input partitions + surfaces; the batched surfaces of the
 maps (`mkey_id`, `mmid`) have not moved before touching a partition. There is no "v9.1": the DPS work is
 part of v9.
 
+**v7.2 (release id `v7c`, 2026-10-14, `prerelease`/`restricted`, `prev = v7`) = a SECOND surgical patch of public
+v7 that supersedes v7b for review** — same `build_v7b.qmd` machinery in `build_v7c.qmd`, three flags whose control value
+is OFF (all-off reproduces v7 exactly; reference digests in `data/manifests/build_v7c.json`, reproduced on the laptop,
+msens1 and the Mac mini): **`EXCLUDE_TURTLES`** — a sea-turtle species is dropped from an Alaska ecoregion where it has
+NEVER been recorded in any channel (NOAA Alaska sightings/strandings/bycatch 1963–2020, fishery observers, OBIS, GBIF,
+iNaturalist, stranding networks: `build_v7c_exclusions.qmd` → `data/v7c/zone_exclusions.csv`, the evidence table the
+build asserts against); on v7 that is loggerhead, green, leatherback and olive ridley × East Bering Sea (141,479 cells)
+while the Gulf of Alaska keeps all four at v7's values (v7b's P ≥ 0.5 threshold, which removed three of them, is NOT
+carried); **`EXCLUDE_RIGHT_WHALE`** — `ms_merge` 54252 dropped from the Gulf of America ecoregions EGOA + WCGOA
+(12,917 cells; 11 OBIS records there vs 4,133 in the Atlantic, no critical habitat, Roberts et al. 2016 model it in the
+Atlantic only); **`COVERAGE_FLOOR`** (κ = 5 %, kept from v7b — and NOT moot: a sliver of ALA/GEO turtle cells belongs
+by majority to the GOA ecoregion, so κ is what finally empties the Aleutian Arc and St. George Basin). Both exclusions
+are ONE mechanism, `msens::zone_exclude_sql()` over `cell_zone_major_sql()` (a straddling cell belongs to the ecoregion
+covering most of it, ties to the first key; critical habitat is never excluded; `test-exclude.R`). A patch release's
+`native_asset` is its parent's table with the repainted `model` rows re-pointed (`BACKFILL_NATIVE_FROM=v7`,
+`msens::native_asset_carry_forward()`), and the backfill now CATALOGS the store objects it uploads (the `catalog` chunk;
+v7b's 21 were only swept up by the 2026-10-02 migration). Record-rule scope is Alaska-only by design (the olive ridley
+also has zero records in Puerto Rico — a later call).
+
 **v7.1 (release id `v7b`, 2026-09, `prerelease`/`restricted`) = a surgical PATCH of public v7**, not a
 new build: `build_v7b.qmd` clones v7's `sdm.duckdb` copy-on-write, rewrites the six merged sea-turtle
 models under their EXISTING `mdl_seq` 54238–54243, and re-evaluates v7's own scoring chunks by label from
