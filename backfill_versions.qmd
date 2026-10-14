@@ -556,6 +556,38 @@ if (do_s3) {
 }
 ```
 
+## Catalog what the release points at
+
+A release that lands must catalog what it published. The model and score COGs go to the content-addressed
+store (`cog/{grid_id}/`), and the store's catalog (`assets.parquet`) is what `store_publish_gate()`,
+`scripts/check_release_pointers.R`, `scripts/verify_asset_store.R` and the garbage collector trust: a pointer at an
+object the catalog lacks fails the gate (v7c's 5 repainted merged COGs and 11 score COGs were the case that
+exposed it). This sweep (`libs/asset_catalog.R`, `msens::asset_catalog_register()`) takes every store object this
+release's `model_asset` and `score_cog` table point at, finds those missing from the PUBLISHED catalog, builds
+their rows (bytes and md5 from the file, `first_ver` = this release; each key's hash is verified against its
+payload hash and encoding tag) and pushes `assets.parquet`, then re-reads it and asserts every pointer is
+catalogued. The file is taken from this render's `backfill_cogs/` / `score_cogs/` directory when present (that is
+where the COG was built and uploaded from) and otherwise downloaded from the store to a temp dir; either way
+the object must already answer on the store. It runs in the `models` and `manifest` stages (a sweep: the scores
+stage has its own copy in `publish_score_cogs.qmd`), is idempotent (a second run finds 0 missing), and under
+`BACKFILL_NO_S3=1` (or no authenticated `aws`) writes nothing and logs `would catalog N`.
+
+```{r}
+#| label: catalog
+
+source(here::here("libs/asset_catalog.R"))
+ptr <- dplyr::bind_rows(
+  h |> dplyr::distinct(content_hash, .keep_all = TRUE) |>
+    dplyr::transmute(url = cog_url, payload_hash, enc = ENC),
+  if (!is.null(scog_all))
+    scog_all |> dplyr::transmute(
+      url = cog_url,
+      payload_hash = if ("payload_hash" %in% names(scog_all)) payload_hash else NA_character_,
+      enc = if ("payload_hash" %in% names(scog_all)) msens::asset_enc("cog_score") else NA_character_))
+swept <- catalog_sweep(bver, ptr$url, ptr$payload_hash, ptr$enc,
+                       local_dirs = c(dir_cog, file.path(dir_v, "score_cogs")), do_s3 = do_s3)
+```
+
 ## STAC + app reload: what "a release landed" means
 
 Publishing the tables and the manifest is not the end of a release. Two things used to be left to
