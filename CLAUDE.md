@@ -190,7 +190,7 @@ requirements, both mandatory:
 
 **Atlas cutover B2 (2026-10-16): the Shiny apps are no longer reachable.** Caddy 301s every `/scores/` and
 `/species/` shape into the static Atlas, query verbatim (the Atlas rewrites legacy `mdl_key` / `mdl_seq` → `sp`
-itself): on the public app host `/{v}/scores/…?Q` → `marinesensitivity.org/atlas/?ver={v}&Q`, `/{v}/species/…?Q`
+itself): on the public app host (and `shiny.marinesensitivity.org` / `shiny.oceanmetrics.io`, which proxy the same Shiny Server) `/{v}/scores/…?Q` → `marinesensitivity.org/atlas/?ver={v}&Q`, `/{v}/species/…?Q`
 → `…/atlas/?ver={v}&lens=species&Q`, the unversioned spellings (with or without `?ver=`) and the retired
 `/mapgl` `/mapsp` `/mapgl_v{n}` `/mapsp_v{n}` `/scores_v{n}` `/species_v{n}` aliases the same way in ONE hop; a
 RESTRICTED version (`PREVIEW_RESTRICTED_VERSIONS`, still asserted against `versions.json` by `DEPLOY_CADDY`) goes
