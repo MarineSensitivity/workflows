@@ -662,11 +662,17 @@ if (!nzchar(Sys.getenv("DEPLOY_API"))) {
 
 ## Deploy the Caddy routing (`DEPLOY_CADDY=1`)
 
-The **URL surface** is part of the release, not server trivia: since the cutover, every
-retired per-version app URL is a 301 into `/scores` or `/species`, so a routing change decides
-whether a link published in a report still resolves. It had its own bug — the redirect targets
-carry their own `?ver=`, which REPLACES the incoming query, so `/mapsp/?mdl_seq=1434` arrived
-as `/species/?ver=v7` and the app opened on its default taxon (MarineSensitivity/apps#6).
+The **URL surface** is part of the release, not server trivia: since the Atlas cutover (B2,
+2026-10-16) every Shiny URL — `/{ver}/scores|species/`, the unversioned `/scores/` and `/species/`
+(with or without `?ver=`), the retired `/mapgl` `/mapsp` `/mapgl_v{n}` `/mapsp_v{n}` `/scores_v{n}`
+`/species_v{n}` aliases, on the public app host AND the preview host — is a 301 into the static
+Atlas (`https://marinesensitivity.org/atlas/?ver={v}[&lens=species]&…`, a restricted version
+straight to `preview.marinesensitivity.org/{v}/atlas/`), so a routing change decides whether a
+link published in a report still resolves. It had its own bug — a redirect target that carries its
+own query REPLACES the incoming one, so `/mapsp/?mdl_seq=1434` arrived as `/species/?ver=v7` and
+the app opened on its default taxon (MarineSensitivity/apps#6); every rule in
+`atlas_cutover_public.caddy` therefore appends `{query}`, and `caddy/test/atlas_cutover_local.sh`
+(106-case matrix, laptop, no Docker) fails if one stops.
 
 Caddyfile-only changes had no reproducible home: the routing rode along with `RELEASE_DEPLOY`,
 which also rebuilds and force-recreates titiler. This flag is the narrow path — pull the server
@@ -705,10 +711,11 @@ if (!do_caddy) {
 
   # PROVE THE PREVIEW ROUTES. caddy/test/run.sh starts a throwaway caddy from the
   # same image importing the same routes file behind a test jwtauth, on the compose
-  # network, and asserts the URL scheme end to end (401 without a token, /v8/scores/
-  # renders v8 with ms-preview=1, ?ver= on that path is overridden, sockjs proxies,
-  # the pre-path spelling redirects and is never proxied). A routing regression is
-  # a failed deploy here, not a reviewer's bug report.
+  # network, and asserts the URL scheme end to end (401 without a token -- redirects
+  # included --, /{ver}/scores|species/ and the pre-path ?ver= spelling 301 into the
+  # Atlas of the same version with the query intact and are never proxied, a crafted
+  # ver= is never a redirect target, docs/landing/atlas serve). A routing regression
+  # is a failed deploy here, not a reviewer's bug report.
   out_routes <- system2("ssh", c("msens", shQuote(glue("cd {srv_repo} && caddy/test/run.sh 2>&1"))),
                         stdout = TRUE, stderr = TRUE)
   cat(paste(out_routes, collapse = "\n"), "\n")
@@ -717,7 +724,7 @@ if (!do_caddy) {
 
   # PROVE THE REDIRECT KEEPS THE QUERY. `curl -sf` on a 301 is not a check — it follows
   # nothing and reports success on exactly the failure being fixed. Read the Location back
-  # and assert the model id survived it.
+  # and assert it EXACTLY: the version, the lens and the model id must all survive it.
   # the restricted-version redirect: Caddy's PREVIEW_RESTRICTED_VERSIONS (server .env) must be
   # the registry's restricted set, or a version that flips public/restricted keeps (or stops)
   # sending the public host's visitors to the review host. Assert BEFORE trusting the routes.
@@ -726,33 +733,46 @@ if (!do_caddy) {
     stdout = TRUE, stderr = TRUE), collapse = ""))
   vers_now  <- msens::atlas_versions(refresh = TRUE)
   restr_now <- sort(vers_now$ver[!is.na(vers_now$access) & vers_now$access == "restricted"])
+  pub_now   <- vers_now$ver[!is.na(vers_now$access) & vers_now$access == "public"]
   env_set   <- sort(setdiff(trimws(strsplit(env_re, "|", fixed = TRUE)[[1]]), ""))
   if (!identical(env_set, restr_now))
     stop(glue("server .env PREVIEW_RESTRICTED_VERSIONS='{env_re}' != versions.json restricted ",
               "'{paste(restr_now, collapse = '|')}' — edit .env on msens, then DEPLOY_CADDY again"))
   log_info("PREVIEW_RESTRICTED_VERSIONS='{env_re}' matches versions.json")
-  for (v in restr_now) {
-    # shQuote the -w format too: system2() goes through a shell, and the space split it into
-    # `-w %{http_code}` plus a bogus URL `%{redirect_url}` (reported as "000302")
-    r302 <- system2("curl", c("-s", "-o", "/dev/null", "-w", shQuote("%{http_code} %{redirect_url}"),
-                              shQuote(glue("https://app.marinesensitivity.org/{v}/scores/?mdl_key=abc"))), stdout = TRUE)
-    if (!identical(paste(r302, collapse = ""), as.character(glue("302 https://preview.marinesensitivity.org/{v}/scores/?mdl_key=abc"))))
-      stop(glue("public /{v}/scores/ should 302 to the review host with its query: got '{r302}'"))
-    log_info("public /{v}/scores/ -> {r302}")
+  # one request, no following: "<status> <Location>" exactly as Caddy answered
+  # (shQuote is NOT optional: system2() runs through a shell, so a bare `&` in the URL ends the
+  # command there -- the unquoted form once asked for `?ver=v8` alone and the check then
+  # blamed Caddy for dropping the parameter it had never been sent. The -w format needs it too:
+  # the space split it into `-w %{http_code}` plus a bogus URL, reported as "000302".)
+  head_of <- function(url) paste(system2("curl", c("-s", "-o", "/dev/null", "-w",
+                                  shQuote("%{http_code} %{redirect_url}"), shQuote(url)), stdout = TRUE), collapse = "")
+  app    <- "https://app.marinesensitivity.org"
+  pages  <- "https://marinesensitivity.org/atlas/"
+  prev   <- "https://preview.marinesensitivity.org"
+  expect <- list()   # url -> expected "<status> <Location>"
+  for (v in restr_now) {   # a restricted version goes STRAIGHT to the review host's Atlas (one hop)
+    expect[[glue("{app}/{v}/scores/?mdl_key=abc")]]  <- glue("302 {prev}/{v}/atlas/?mdl_key=abc")
+    expect[[glue("{app}/{v}/species/?mdl_key=abc")]] <- glue("302 {prev}/{v}/atlas/?lens=species&mdl_key=abc")
+    expect[[glue("{app}/{v}/species/")]]             <- glue("302 {prev}/{v}/atlas/?lens=species")
   }
-  for (u in c("mapsp/?mdl_seq=1434", "species_v8/?ver=v8&mdl_key=abc")) {
-    # shQuote is NOT optional: system2() runs through a shell, so a bare `&` in the URL
-    # ends the command there. The unquoted form asked for `?ver=v8` alone and this check
-    # then blamed Caddy for dropping the parameter it had never been sent.
-    loc <- system2("curl", c("-s", "-o", "/dev/null", "-w", "%{redirect_url}",
-                             shQuote(glue("https://app.marinesensitivity.org/{u}"))),
-                   stdout = TRUE)
-    log_info("redirect {u} -> {loc}")
-    id <- if (grepl("mdl_seq", u)) "mdl_seq=1434" else "mdl_key=abc"
-    if (!grepl(id, loc, fixed = TRUE))
-      stop(glue("Caddy dropped the model id: /{u} -> {loc}"))
+  for (v in head(pub_now, 2)) {   # a public one to the public Atlas, query intact, no dangling ? or &
+    expect[[glue("{app}/{v}/scores/")]]                  <- glue("301 {pages}?ver={v}")
+    expect[[glue("{app}/{v}/species/?mdl_key=abc")]]     <- glue("301 {pages}?ver={v}&lens=species&mdl_key=abc")
   }
-  log_info("redirects preserve the model id")
+  # the retired aliases and the unversioned spellings (the published deep links of the final report)
+  expect[[glue("{app}/mapsp/?mdl_seq=1434")]]            <- glue("301 {pages}?ver=v7&lens=species&mdl_seq=1434")
+  expect[[glue("{app}/mapgl/")]]                         <- glue("301 {pages}?ver=v7")
+  expect[[glue("{app}/species/?ver=v7&mdl_key=abc")]]    <- glue("301 {pages}?lens=species&ver=v7&mdl_key=abc")
+  expect[[glue("{app}/scores/")]]                        <- glue("301 {pages}")
+  if ("v8" %in% restr_now)
+    expect[[glue("{app}/species_v8/?ver=v8&mdl_key=abc")]] <- glue("302 {prev}/v8/atlas/?lens=species&ver=v8&mdl_key=abc")
+  for (u in names(expect)) {
+    got <- head_of(u)
+    log_info("redirect {u} -> {got}")
+    if (!identical(got, as.character(expect[[u]])))
+      stop(glue("Caddy answered '{got}' for {u}, expected '{expect[[u]]}' (version, lens or query lost?)"))
+  }
+  log_info("redirects land on the Atlas with version, lens and model id intact ({length(expect)} shapes)")
 }
 ```
 
@@ -848,6 +868,12 @@ Gated by `RELEASE_DEPLOY` (full release) or the granular `DEPLOY_APPS=1`.
 > it restarts what everyone sees. The touches target the CHECKOUT
 > (`apps_v8/{scores,species}/restart.txt`), not the symlink, so retiring the aliases did not
 > affect them.
+>
+> **Since the Atlas cutover B2 (2026-10-16) nobody reaches these apps:** Caddy 301s every
+> `/scores/` and `/species/` URL (public and preview host, every spelling) into the static Atlas
+> (`DEPLOY_CADDY`, `atlas_cutover_public.caddy`), so a `DEPLOY_APPS` reload restarts workers no
+> request can hit. It stays until B3 (60 quiet days, then the shiny-server blocks go) so the
+> rollback is reverting the Caddy commit.
 
 ```{r}
 #| label: deploy-apps
@@ -957,8 +983,11 @@ Checks that **cannot pass on broken input** — every one reads a sentinel or a 
 asserts on it, so a misrouted host or a leaked release fails the render. The apps put
 `<meta name="ms-ver">` / `<meta name="ms-preview">` in `<head>` for exactly this.
 
-- **public host, restricted version → NOT that version** (`ms-ver` = the promoted release,
-  `ms-preview` = 0); public versions render as themselves.
+- **public host, restricted version → the PREVIEW Atlas, one hop, never the public one**
+  (`/{ver}/scores|species/` and the pre-path `?ver=` spelling 302 to
+  `preview…/{ver}/atlas/[?lens=species&]…`, query kept); a public version 301s to the public Atlas
+  (`marinesensitivity.org/atlas/?ver={ver}`). Since the Atlas cutover (B2, 2026-10-16) nothing on the
+  app hosts renders a Shiny page, so these are exact `Location` assertions.
 - **the preview host is actually PROXIED through Cloudflare** — asserted first, because every
   other check below passes trivially when it is not: a grey-cloud DNS record sends visitors
   straight to the origin, which 401s everything, so the gate reads as "closed" while Access is
@@ -967,16 +996,16 @@ asserts on it, so a misrouted host or a leaked release fails the render. The app
 - **preview host without a token → never 200** (Cloudflare Access 302s to its login; the
   origin's `jwtauth` 401s). With a Cloudflare Access **service token**
   (`CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` in the environment) → 200,
-  `ms-preview` = 1, `ms-ver` = the requested (restricted) version. **The version is the PATH
-  there** (`/v9/scores/`, `msens::preview_app_url()`); the pre-path spelling `/scores/?ver=`
-  must redirect, never 200.
+  the requested (restricted) version's Atlas at `/{ver}/atlas/` (see the atlas bullet). **The
+  version is the PATH there**; `/{ver}/scores/` and the pre-path spelling `/scores/?ver=` 301 to
+  `/{ver}/atlas/…`, never 200.
 - **origin-direct** (`--resolve` the preview hostname to this server's IP, bypassing
   Cloudflare) → 401, never 200. This is what proves proxying only that hostname is safe.
 - **the atlas app** (`/{ver}/atlas/`, a static build served straight off disk — restricted
   releases only, `server/caddy/atlas_preview_routes.caddy`) gets the same shape of probe as
   scores/species: a version's own token → 200 for both `/{ver}/atlas/` and its synthesized
   `/{ver}/atlas/session.json`, whose `ver` field must equal that version; no token → 401/302;
-  origin-direct → 401; and since `@restricted_app` covers atlas too (2026-09-24), the public
+  origin-direct → 401; and since the public cutover rules cover atlas too (2026-09-24), the public
   host 302s a restricted version's `/{ver}/atlas/` to the review host with the query intact.
 - **docs**: restricted versions 404 on GitHub Pages and (with a token) 200 on the preview host.
 
@@ -1031,33 +1060,37 @@ if (!do_check_preview) {
              "Proxied, or Access can never see -- or admit -- a request"))
   else log_info("{prev_host} is proxied through Cloudflare (cf-ray present)")
 
-  # 1. the PUBLIC host never renders a restricted version: since 2026-08-28 it 302s the path
-  #    form to the review host (Caddy @restricted_app, PREVIEW_RESTRICTED_VERSIONS in .env),
-  #    carrying the query; public ones render as themselves
+  # 1. the PUBLIC host never renders a restricted version -- and, since the Atlas cutover (B2,
+  #    2026-10-16), renders no Shiny page at all: a restricted version's path form AND its
+  #    `?ver=` spelling 302 STRAIGHT to the review host's Atlas (atlas_cutover_public.caddy,
+  #    PREVIEW_RESTRICTED_VERSIONS in .env), query kept; a public one 301s to the public Atlas
   for (a in c("scores", "species")) {
+    lens <- if (a == "species") "lens=species&" else ""
     for (v in restricted) {
       r <- probe(glue("https://app.marinesensitivity.org/{v}/{a}/?probe=1"))
       if (!r$ok) { bad(glue("public {a} ?ver={v}: unreachable ({r$err})")); next }
-      want <- glue("{prev_url}/{v}/{a}/?probe=1")
-      if (identical(r$code, 200L) && identical(r$ms_ver, v))
-        bad(glue("LEAK: public /{v}/{a}/ -> code={r$code} ms-ver={r$ms_ver} ms-preview={r$ms_preview}"))
+      want <- glue("{prev_url}/{v}/atlas/?{lens}probe=1")
+      if (identical(r$code, 200L))
+        bad(glue("LEAK: public /{v}/{a}/ answered 200 (ms-ver={r$ms_ver %||% NA}) -- a restricted version must redirect to the review host"))
       else if (!identical(r$code, 302L) || !identical(r$location, as.character(want)))
-        bad(glue("public /{v}/{a}/ does not send a restricted version to the review host: code={r$code} -> {r$location} (want 302 {want}; is PREVIEW_RESTRICTED_VERSIONS in the server .env current?)"))
-      else log_info("public /{v}/{a}/ -> 302 {r$location} (review host, query kept; ok)")
-      # ...and the old spellings still get there, two hops, with their query intact
+        bad(glue("public /{v}/{a}/ does not send a restricted version to the review host's Atlas: code={r$code} -> {r$location} (want 302 {want}; is PREVIEW_RESTRICTED_VERSIONS in the server .env current?)"))
+      else log_info("public /{v}/{a}/ -> 302 {r$location} (review host Atlas, query kept; ok)")
+      # ...and the old spelling gets there too, ONE hop, with `ver` and the query intact
       rq <- probe(glue("https://app.marinesensitivity.org/{a}/?ver={v}&probe=1"))
-      if (!rq$ok || !identical(rq$code, 301L) || !grepl(glue("/{v}/{a}/"), rq$location))
-        bad(glue("public {a} ?ver={v} no longer 301s to the path: code={rq$code %||% NA} -> {rq$location %||% NA}"))
+      wq <- glue("{prev_url}/{v}/atlas/?{lens}ver={v}&probe=1")
+      if (!rq$ok || !identical(rq$code, 302L) || !identical(rq$location, as.character(wq)))
+        bad(glue("public {a} ?ver={v} does not land on the review host's Atlas: code={rq$code %||% NA} -> {rq$location %||% NA} (want 302 {wq})"))
     }
     for (v in public) {
-      # canonical since 2026-08-27: the version is the PATH on this host too
-      r <- probe(glue("https://app.marinesensitivity.org/{v}/{a}/"))
-      if (!r$ok || !identical(r$code, 200L) || !identical(r$ms_ver, v))
-        bad(glue("public /{v}/{a}/ does not render {v}: ok={r$ok} code={r$code %||% NA} ms-ver={r$ms_ver %||% NA}"))
-      # ...and every published deep link in the old spelling still lands there
-      rq <- probe(glue("https://app.marinesensitivity.org/{a}/?ver={v}"))
-      if (!rq$ok || !identical(rq$code, 301L) || !grepl(glue("/{v}/{a}/"), rq$location))
-        bad(glue("public {a} ?ver={v} no longer 301s to the path: code={rq$code %||% NA} -> {rq$location %||% NA}"))
+      r <- probe(glue("https://app.marinesensitivity.org/{v}/{a}/?probe=1"))
+      want <- glue("https://marinesensitivity.org/atlas/?ver={v}&{lens}probe=1")
+      if (!r$ok || !identical(r$code, 301L) || !identical(r$location, as.character(want)))
+        bad(glue("public /{v}/{a}/ does not 301 to the Atlas: ok={r$ok} code={r$code %||% NA} -> {r$location %||% NA} (want 301 {want})"))
+      # ...and every published deep link in the old spelling lands there as well
+      rq <- probe(glue("https://app.marinesensitivity.org/{a}/?ver={v}&probe=1"))
+      wq <- glue("https://marinesensitivity.org/atlas/?{lens}ver={v}&probe=1")
+      if (!rq$ok || !identical(rq$code, 301L) || !identical(rq$location, as.character(wq)))
+        bad(glue("public {a} ?ver={v} does not 301 to the Atlas: code={rq$code %||% NA} -> {rq$location %||% NA} (want 301 {wq})"))
     }
   }
 
@@ -1065,7 +1098,7 @@ if (!do_check_preview) {
   origin_ip <- trimws(system2("dig", c("+short", "app.marinesensitivity.org"), stdout = TRUE))[1]
   for (v in c(restricted, head(public, 1))) {
     u <- msens::preview_app_url("scores", v)          # the version is the PATH on the preview host
-    r <- probe(u)
+    r <- probe(u)   # (a redirect to /{v}/atlas/ behind the same gate, since B2)
     if (!r$ok) log_warn("preview {u}: unreachable without token ({r$err}) — DNS/cert not in place yet?")
     else if (identical(r$code, 200L)) bad(glue("OPEN: preview {u} answered 200 with no token"))
     else log_info("preview {u} without token -> {r$code} {r$location} (closed)")
@@ -1076,15 +1109,22 @@ if (!do_check_preview) {
       else log_info("origin-direct {u} -> {r0$code} (closed)")
     }
     if (has_tok) {
+      # with a token the old app URL 301s into the SAME version's Atlas (the Atlas itself is
+      # proven in 2c below); an unversioned path must never be served: it would sit outside
+      # every per-version Access policy
       rt <- probe(u, tok_hdr)
-      if (!rt$ok || !identical(rt$code, 200L) || !identical(rt$ms_preview, "1") || !identical(rt$ms_ver, v))
-        bad(glue("preview {u} with token: ok={rt$ok} code={rt$code %||% NA} ms-ver={rt$ms_ver %||% NA} ms-preview={rt$ms_preview %||% NA}"))
-      else log_info("preview {u} with token -> {v}, preview=1 (ok)")
-      # the pre-path spelling must never be served: it would sit outside every
-      # per-version Access policy
-      rq <- probe(glue("{prev_url}/scores/?ver={v}"), tok_hdr)
-      if (rq$ok && identical(rq$code, 200L)) bad(glue("OPEN: {prev_url}/scores/?ver={v} answered 200 (unversioned path served)"))
-      else if (rq$ok) log_info("preview /scores/?ver={v} -> {rq$code} {rq$location} (redirected, ok)")
+      wt <- glue("{prev_url}/{v}/atlas/")
+      if (!rt$ok || !identical(rt$code, 301L) || !identical(rt$location, as.character(wt)))
+        bad(glue("preview {u} with token: ok={rt$ok} code={rt$code %||% NA} -> {rt$location %||% NA} (want 301 {wt})"))
+      else log_info("preview {u} with token -> 301 {wt} (ok)")
+      rq <- probe(glue("{prev_url}/species/?ver={v}&mdl_key=abc"), tok_hdr)
+      wq <- glue("{prev_url}/{v}/atlas/?lens=species&ver={v}&mdl_key=abc")
+      # (an unversioned path sits outside the per-version Access applications, so a refusal
+      # there is fine; what it may NOT do is answer 200, or redirect anywhere but the Atlas)
+      if (rq$ok && identical(rq$code, 200L)) bad(glue("OPEN: {prev_url}/species/?ver={v} answered 200 (unversioned path served)"))
+      else if (rq$ok && identical(rq$code, 301L) && !identical(rq$location, as.character(wq)))
+        bad(glue("preview /species/?ver={v}&mdl_key=abc 301s to the wrong place: {rq$location} (want {wq})"))
+      else if (rq$ok) log_info("preview /species/?ver={v} -> {rq$code} {rq$location} (not served; ok)")
     }
   }
 
@@ -1104,13 +1144,14 @@ if (!do_check_preview) {
     }
     ph <- c("-H", shQuote(glue("CF-Access-Client-Id: {pid}")),
             "-H", shQuote(glue("CF-Access-Client-Secret: {psc}")))
-    own <- probe(msens::preview_app_url("scores", v), ph)
-    if (!own$ok || !identical(own$code, 200L) || !identical(own$ms_ver, v))
-      bad(glue("probe token for {v} cannot open its OWN version: code={own$code %||% NA} ms-ver={own$ms_ver %||% NA}"))
-    else log_info("probe {v} opens /{v}/scores/ (ok)")
+    # (the Atlas's session.json, since B2: /{v}/scores/ is only a redirect now)
+    own <- probe(glue("{prev_url}/{v}/atlas/session.json"), ph)
+    if (!own$ok || !identical(own$code, 200L) || !identical(own$json_ver, v))
+      bad(glue("probe token for {v} cannot open its OWN version: code={own$code %||% NA} json_ver={own$json_ver %||% NA}"))
+    else log_info("probe {v} opens /{v}/atlas/ (ok)")
     # ...and must NOT open another version, nor the landing page
     for (other in c(setdiff(c(restricted, public), v)[1], NA)) {
-      u <- if (is.na(other)) prev_url else msens::preview_app_url("scores", other)
+      u <- if (is.na(other)) prev_url else glue("{prev_url}/{other}/atlas/session.json")
       r <- probe(u, ph)
       if (r$ok && identical(r$code, 200L))
         bad(glue("ISOLATION BROKEN: the {v} probe token opened {u}"))
@@ -1161,7 +1202,7 @@ if (!do_check_preview) {
       else log_info("origin-direct atlas {idx_u} -> {r0$code} (closed)")
     }
 
-    # (c) the PUBLIC host: @restricted_app also covers atlas (2026-09-24), so a restricted
+    # (c) the PUBLIC host: the cutover rules also cover atlas (2026-09-24), so a restricted
     # version's /{ver}/atlas/ 302s to the review host with the query intact -- the same
     # LEAK/redirect shape as the scores/species probe in section 1 above.
     rp   <- probe(glue("https://app.marinesensitivity.org/{v}/atlas/?x=1"))

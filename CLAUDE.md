@@ -188,6 +188,21 @@ requirements, both mandatory:
    running container and its image is a **bug to fix now** (bake it in), not a reason to avoid
    recreating. A brief outage is cheaper than state nobody can reproduce.
 
+**Atlas cutover B2 (2026-10-16): the Shiny apps are no longer reachable.** Caddy 301s every `/scores/` and
+`/species/` shape into the static Atlas, query verbatim (the Atlas rewrites legacy `mdl_key` / `mdl_seq` → `sp`
+itself): on the public app host `/{v}/scores/…?Q` → `marinesensitivity.org/atlas/?ver={v}&Q`, `/{v}/species/…?Q`
+→ `…/atlas/?ver={v}&lens=species&Q`, the unversioned spellings (with or without `?ver=`) and the retired
+`/mapgl` `/mapsp` `/mapgl_v{n}` `/mapsp_v{n}` `/scores_v{n}` `/species_v{n}` aliases the same way in ONE hop; a
+RESTRICTED version (`PREVIEW_RESTRICTED_VERSIONS`, still asserted against `versions.json` by `DEPLOY_CADDY`) goes
+straight to `preview.marinesensitivity.org/{v}/atlas/` (302). On the preview host `/{v}/scores/` → `/{v}/atlas/`,
+`/{v}/species/` → `/{v}/atlas/?lens=species`, all inside `handle` (a bare `redir` sorts ahead of jwtauth). The rules
+live in `server/caddy/atlas_cutover_public.caddy` and the top of `preview_routes.caddy` and are proven by
+`server/caddy/test/atlas_cutover_local.sh` (laptop, no Docker; 106-case matrix + seeded faults) and, on the
+server, `caddy/test/run.sh`; `DEPLOY_CADDY` and `CHECK_PREVIEW` assert exact `Location`s instead of a rendered
+app. The shiny-server blocks and `apps_v8` stay until B3 (60 quiet days), so rollback = revert the Caddy commit +
+`DEPLOY_CADDY=1`; `DEPLOY_APPS` now reloads workers nobody can reach. The paragraphs below describe the
+pre-cutover app and stay accurate for B3's removal list.
+
 **ONE app, every version (cutover 2026-08-12).** There is no longer a per-generation fork to
 keep in sync. `apps` branch `main` → `apps_v8/{scores,species}` is served as **`/scores` and
 `/species`**, and renders any published release from `?ver=` (default = `latest.txt`, currently
@@ -287,9 +302,10 @@ links "oddly ended up on v7". `DEPLOY_CADDY` refuses to restart Caddy if the lis
 `versions.json`, and `CHECK_PREVIEW` asserts the 302; a version flipping to `public` must be removed.
 
 **Deploy order for a coordinated routes+apps change: `DEPLOY_APPS=1` FIRST, then `DEPLOY_CADDY=1`.**
-`DEPLOY_CADDY` runs `server/caddy/test/run.sh`, which asserts end-to-end that `/v8/scores/` renders
-v8 — so if the routing half lands while the apps still expect the old contract, the test fails and
-the notebook stops before it reaches the app deploy. **On the preview host
+`DEPLOY_CADDY` runs `server/caddy/test/run.sh`, which (before B2) asserted end-to-end that `/v8/scores/`
+renders v8 and since B2 asserts that it 301s to `/v8/atlas/` with the query intact — so if the routing half
+lands while the other half expects the old contract, the test fails and the notebook stops before it reaches
+the app deploy. **On the preview host
 the version is the URL PATH** (`/v9/scores/`, `/v9/species/`, `/docs/v9/` —
 `msens::preview_app_url()`), never `?ver=`, because Cloudflare Access holds one reviewer policy per
 version and scopes it by path; `server/caddy/preview_routes.caddy` strips the prefix and hands the
