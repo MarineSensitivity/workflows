@@ -1,0 +1,739 @@
+---
+title: "Ingest SWFSC California Current cetacean densities (preview)"
+subtitle: "Becker et al. 2020: 13 species, summer–fall habitat-based density on 0.1° cells, area-weighted onto the global 0.05° grid for a per-dataset preview. Not part of any version."
+# NOT a pipeline notebook, on purpose: there is NO `msens:` block. Three readers decide what a notebook
+# is, and each one skips a file without `msens:`:
+#   - msens::build_targets_list() -> parse_qmd_frontmatter() keeps only files whose front-matter has
+#     `msens:`, so tar_make() never renders this, and no `dependency: [auto]` (release) or merge picks it
+#     up as an upstream ingest of v8/v9.
+#   - build_registry.qmd globs ingest_*.qmd but reads `m$msens$dataset$ds_key`; with no `msens:` the
+#     dataset table never gets `cce`. (Its other gate, "every dist/dataset=* has a block", only looks in
+#     the VERSION's dist dir; this notebook writes under derived/preview/, never under derived/{ver}/.)
+#   - scripts/build_workflows_index.R draws a landing-page card only for an `msens:` workflow_type.
+# The dataset metadata a future ingest would need is kept below under `dataset_preview:`, a key that
+# must NOT start with "msens": R's `$` partial-matches list names, so `meta$msens` would return an
+# `msens_preview:` block and turn this into a (broken) pipeline target. The `frontmatter` chunk asserts
+# all of this. To promote the dataset later, move the block under `msens: dataset:` (and add
+# target_name / workflow_type / dependency / output) in a separate, reviewed change.
+dataset_preview:
+  ds_key: cce
+  response_type: density
+  source_authority: NOAA SWFSC
+  temporal_interval: seasonal
+  native_format: vector
+  name_short: "SWFSC CCE cetacean densities"
+  name_display: "SWFSC California Current cetacean densities (Becker et al. 2020)"
+  value_info: "density, animals per km² (area-weighted mean onto 0.05° cells); band 2 = CV"
+  regions: "California Current Ecosystem: US West Coast to ~300 nmi offshore, 30.05-48.5 N"
+  citation: "Becker EA, Forney KA, Miller DL, Fiedler PC, Barlow J, Moore JE (2020) Habitat-based density estimates for cetaceans in the California Current Ecosystem based on 1991-2018 survey data. NOAA Technical Memorandum NMFS-SWFSC-638. https://doi.org/10.25923/3znq-yx13"
+  link_info: "https://www.fisheries.noaa.gov/inport/item/64349"
+  link_download: "https://noaa.maps.arcgis.com/home/item.html?id=566b4ad31f1d40eeb65b8cf3a4f087ca"
+editor_options:
+  chunk_output_type: console
+---
+
+NOAA Southwest Fisheries Science Center (SWFSC) habitat-based **density** models for 13 cetacean
+species in the California Current Ecosystem (CCE), summer–fall [@becker2020cce], put on the
+MarineSensitivity **global 0.05° cell grid** (`global05`) so each species can be previewed on its own.
+
+This is a **preview ingest** and stays out of every scoring version. Nothing here is merged, scored,
+registered or released. The outputs live outside the version directories, in
+`{dir_derived}/preview/swfsc_cce/`. How a density surface should enter the [0,100] merge is the open
+question in [`compare_density_methods`](compare_density_methods.html), and it is not answered here.
+The values stay in **animals km⁻²**.
+
+## Source
+
+The models come from line-transect ship surveys by SWFSC in the CCE, nine summer–fall surveys
+between 1991 and 2018. Habitat-based density models were fitted to those surveys using dynamic ocean
+covariates from a model calibrated to the CCE. The authors averaged the predictions over the survey
+seasons and assigned them to a 0.1° grid, clipped at the coast and the study-area edge. The delivery is
+an Esri file geodatabase with one layer per species, holding 12,257 cells each. Every cell carries
+`DENSITY` (animals km⁻²), `UNCERTAINTY`, `AREA_SQKM` and `ABUNDANCE` (`DENSITY × AREA_SQKM`).
+
+Two points from the InPort metadata ([item 64349](https://www.fisheries.noaa.gov/inport/item/64349)
+and its attribute entity [64350](https://www.fisheries.noaa.gov/inport/item/64350)) matter here:
+
+- **`UNCERTAINTY` is a coefficient of variation.** The attribute definition (quoted in
+  [Credits and use constraints](#credits-and-use-constraints)) calls it "Numerical uncertainty value
+  (CV)", with `-99999` where no estimate exists. No layer here uses that sentinel. The values run from
+  0.12 to 6.4, and a CV above 1 is legitimate for a sparse species.
+- **`AREA_SQKM` is the true ellipsoidal area of each clipped cell.** The `source` chunk shows that it
+  matches `sf::st_area()` on WGS84 to within 0.1 %. Because the 0.05° cell areas below are also
+  ellipsoidal, the abundance check can be held to 1 %.
+
+The record's abstract also lists sperm whale and a small-beaked-whale guild (*Mesoplodon* spp. and
+Cuvier's beaked whale). Those surfaces are **not** in this geodatabase, which holds 13 layers.
+
+## What this notebook does
+
+1. Reads the 13 layers and asserts what it relies on: 12,257 cells per layer, identical geometry
+   across layers, one species and one season per layer, and `ABUNDANCE = DENSITY × AREA_SQKM`.
+2. Resolves each `SPECIES_2` to a WoRMS AphiaID from the pipeline's own WoRMS snapshot
+   (`spp.duckdb` `worms`), with a live `worrms` cross-check when the network is available.
+3. **Area-weighted regrid.** For each 0.05° cell *c*:
+   $\hat d_c = \sum_p d_p\,A(p \cap c) \,/\, \sum_p A(p \cap c)$. Here $A$ is the exact overlap area in
+   km², computed as the `exactextractr` coverage fraction times the cell's WGS84 ellipsoidal area,
+   which depends on latitude. The same weighting gives the CV and the covered fraction of each cell.
+   The rule lives in msens (`poly_cell_overlap()`, `cells_area_mean()`, msens ≥ 0.59.0), and
+   `test-ingest.R` checks it against a synthetic fixture. The polygon-cell weights are computed
+   **once**, because all 13 layers share the same geometry.
+4. Checks every species: the regridded abundance $\sum_c \hat d_c \cdot \text{covered km}^2$ is
+   within 1 % of $\sum$ `ABUNDANCE`, no output cell lies outside the source extent, and every density
+   is ≥ 0.
+5. Writes one 2-band Float32 COG per species (density, CV), aligned to the grid, plus the long
+   Parquet and the `models.csv` model table. It writes `DONE` last.
+
+::: {.callout-note}
+## The CV band is an approximation
+
+An area-weighted mean is right for a density, which is intensive: the regridded abundance equals the
+source abundance. It is **not** right for a CV, because the CVs of the parts of a cell do not average
+linearly. The CV of a mixed cell's density would need the covariance between its parts, which the
+delivery does not carry. Band 2 is therefore an area-weighted average of the source CVs. It is exact
+only where an output cell lies inside a single source cell, and the
+[regrid section](#regrid) counts how many cells do.
+:::
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "SWFSC CCE geodatabase → exact overlap weights (once) → per-species area-weighted density + CV → checks → COG, Parquet and the model table, all under derived/preview/ (no version, no merge, no registry)"
+flowchart LR
+  gdb["swfsc_cce_becker_et_al_2020b.gdb<br/>13 layers x 12,257 cells (0.1 deg)<br/>DENSITY, UNCERTAINTY (CV)"] --> w["msens::poly_cell_overlap()<br/>overlap km2 per (polygon, cell)<br/>computed once: shared geometry"]
+  grid["r_cellid_global.tif<br/>global05, 0.05 deg"] --> w
+  w --> m["msens::cells_area_mean()<br/>per species: density, cv, frac"]
+  worms[("spp.duckdb worms<br/>+ worrms cross-check")] --> key["mdl_key = cce, WORMS id, summer-fall"]
+  m --> chk{"checks<br/>abundance within 1 pct<br/>extent, counts, density >= 0"}
+  key --> chk
+  chk --> cog["cog/cce_ID_summer-fall.tif<br/>2-band Float32 COG"]
+  chk --> pq[("dist/dataset=cce/*.parquet<br/>mdl_key, cell_id, val, cv, frac")]
+  chk --> csv["models.csv<br/>+ data/swfsc_cce_models.csv"]
+```
+
+## Setup
+
+```{r}
+#| label: setup
+
+librarian::shelf(
+  DBI, digest, dplyr, duckdb, fs, ggplot2, glue, here, jsonlite, knitr, logger, patchwork, purrr,
+  readr, rnaturalearth, sf, stringr, terra, tibble, tidyr, worrms, xml2,
+  MarineSensitivity/msens, quiet = T)
+source(here("libs/paths.R"))
+source(here("libs/vars.R"))
+options(readr.show_col_types = FALSE)
+stopifnot(
+  "msens >= 0.59.0 needed (poly_cell_overlap, cells_area_mean); reinstall ../msens" =
+    packageVersion("msens") >= "0.59.0")
+
+ds_key <- "cce"
+season <- "summer-fall"     # the SEASON field ("Summer-Fall"), slugged for keys and file names
+
+# source geodatabase (read-only). CCE_GDB overrides it, e.g. on a machine without Google Drive
+gdb <- Sys.getenv("CCE_GDB", unset = path_expand(paste0(
+  "~/Library/CloudStorage/GoogleDrive-ben@ecoquants.com/My Drive/projects/msens/data/raw/",
+  "swfsc.noaa.gov/Predictive Models of Cetacean Densities in the California Current Ecosystem, 2020b/",
+  "swfsc_cce_becker_et_al_2020b.gdb")))
+stopifnot("source gdb not found; set CCE_GDB" = dir_exists(gdb))
+
+# outputs: a PREVIEW dir, deliberately outside every version dir (derived/{ver}/)
+dir_out    <- path_expand(glue("{dir_derived}/preview/swfsc_cce"))
+dir_cog    <- path(dir_out, "cog")
+dir_dist   <- path(dir_out, "dist", glue("dataset={ds_key}"))
+dir_inport <- path(dir_out, "inport")
+models_csv <- path(dir_out, "models.csv")
+repo_csv   <- here("data/swfsc_cce_models.csv")
+done_file  <- path(dir_out, "DONE")
+stopifnot(!str_detect(dir_out, "/v[0-9]+[a-z]?(/|$)"))
+
+cellid_tif <- path_expand(cellid_tif)          # GDAL does not expand "~"
+stopifnot(file_exists(cellid_tif))
+grid <- msens::grid_spec_for("global05", cellid_tif)
+
+cce_fetch <- .flag("CCE_FETCH")                # re-download the InPort metadata records
+
+# this notebook owns everything under dir_out: start clean so no stale COG/Parquet survives a rerun,
+# and DONE only reappears when the whole render has succeeded
+if (file_exists(done_file)) file_delete(done_file)
+for (d in c(dir_cog, dir_dist)) { if (dir_exists(d)) dir_delete(d); dir_create(d) }
+dir_create(dir_inport)
+log_info("source: {gdb}")
+log_info("outputs: {dir_out}")
+```
+
+## Stays out of the pipeline {#frontmatter}
+
+The three readers that decide what a notebook is are described in the front-matter comment. This
+chunk asserts that each of them skips this file.
+
+```{r}
+#| label: frontmatter
+
+me   <- "ingest_swfsc_cce.qmd"
+txt  <- readLines(here(me), warn = FALSE)
+dl   <- which(trimws(txt) == "---")
+meta <- yaml::yaml.load(paste(txt[(dl[1] + 1):(dl[2] - 1)], collapse = "\n"))
+
+# 1. targets: parse_qmd_frontmatter() is what build_targets_list() turns into the DAG
+wf <- msens::parse_qmd_frontmatter(here())
+# 2. build_registry.qmd's fm_dataset() reads m$msens$dataset$ds_key (with R's partial `$`)
+# 3. build_workflows_index.R reads fm$msens$workflow_type
+checks_fm <- tibble(
+  check = c("no `msens:` key (partial `$` match included)",
+            "not a target in parse_qmd_frontmatter() / build_targets_list()",
+            "no dataset for build_registry (`m$msens$dataset$ds_key`)",
+            "no landing-page card (`fm$msens$workflow_type`)",
+            "outputs outside every version dir"),
+  ok    = c(is.null(meta$msens),
+            !me %in% wf$qmd_file,
+            is.null(meta$msens$dataset$ds_key),
+            is.null(meta$msens$workflow_type),
+            !str_detect(dir_out, "/v[0-9]+[a-z]?(/|$)")))
+kable(checks_fm, caption = "This notebook stays out of the targets DAG, the dataset registry and the versions")
+stopifnot(all(checks_fm$ok))
+```
+
+## Read the source {#read-source}
+
+```{r}
+#| label: source
+
+lyrs <- st_layers(gdb)
+src  <- set_names(lyrs$name) |> map(\(l) read_sf(gdb, l))
+
+# the delivery we rely on: 13 layers x 12,257 cells, one species + season + study per layer
+need <- c("SPECIES", "SPECIES_2", "SEASON", "STUDY", "STRATUM", "MODEL_TYPE",
+          "DENSITY", "UNCERTAINTY", "AREA_SQKM", "ABUNDANCE")
+stopifnot(
+  "expected 13 layers"                 = length(src) == 13,
+  "expected 12,257 cells per layer"    = all(map_int(src, nrow) == 12257L),
+  "missing fields"                     = all(map_lgl(src, \(x) all(need %in% names(x)))),
+  "one species per layer"              = all(map_int(src, \(x) n_distinct(x$SPECIES_2)) == 1L),
+  "season is Summer-Fall"              = all(map_lgl(src, \(x) all(x$SEASON == "Summer-Fall"))),
+  "stratum is CCE"                     = all(map_lgl(src, \(x) all(x$STRATUM == "CCE"))),
+  "no NA density"                      = all(map_lgl(src, \(x) !anyNA(x$DENSITY))),
+  "ABUNDANCE = DENSITY x AREA_SQKM"    = all(map_lgl(src, \(x)
+    max(abs(x$ABUNDANCE - x$DENSITY * x$AREA_SQKM) / pmax(x$ABUNDANCE, 1e-12)) < 1e-4)))
+
+# every layer carries the SAME cells in the SAME order, so the polygon->cell weights are computed once
+geom_hash <- map_chr(src, \(x) digest::digest(st_as_binary(st_geometry(x))))
+stopifnot("layers do not share one geometry" = n_distinct(geom_hash) == 1L)
+
+# AREA_SQKM is the true (ellipsoidal) area: what lets the abundance check below be held to 1 %
+geom   <- st_sf(geometry = st_geometry(src[[1]]))
+op     <- sf_use_s2(FALSE)                     # planar GEOS predicate engine -> st_area on the ellipsoid
+a_ell  <- as.numeric(st_area(geom)) / 1e6
+sf_use_s2(op)
+r_area <- a_ell / src[[1]]$AREA_SQKM
+bb_src <- st_bbox(geom)
+
+# the source lattice: full (unclipped) cells are 0.1 x 0.1 deg; how far are their edges from the
+# 0.05-degree grid lines? (an offset makes output cells straddle two source cells)
+full    <- abs(src[[1]]$Shape_Area - 0.01) < 1e-9
+bb_full <- do.call(rbind, lapply(st_geometry(geom)[full], st_bbox))
+off_05  <- \(v) v - round(v / 0.05) * 0.05
+lat_off <- unique(round(off_05(bb_full[, "ymin"]), 6))
+lon_off <- unique(round(off_05(bb_full[, "xmin"]), 6))
+stopifnot("source cells are not one regular 0.1-degree lattice" =
+            length(lon_off) == 1, length(lat_off) == 1,
+            all(abs(bb_full[, "xmax"] - bb_full[, "xmin"] - 0.1) < 1e-6),
+            all(abs(bb_full[, "ymax"] - bb_full[, "ymin"] - 0.1) < 1e-6))
+log_info("source lattice: {sum(full)} full 0.1-degree cells, edges offset {lon_off} deg (lon), {lat_off} deg (lat) from the 0.05 grid lines")
+log_info("AREA_SQKM vs ellipsoidal area: ratio {round(min(r_area[src[[1]]$AREA_SQKM > 1]), 4)}-{round(max(r_area[src[[1]]$AREA_SQKM > 1]), 4)} (cells > 1 km2); totals {round(sum(src[[1]]$AREA_SQKM))} vs {round(sum(a_ell))} km2")
+stopifnot(abs(sum(a_ell) / sum(src[[1]]$AREA_SQKM) - 1) < 1e-3)
+
+d_src <- imap_dfr(src, \(x, l) tibble(
+  layer           = l,
+  species         = x$SPECIES[1],
+  scientific_name = x$SPECIES_2[1],
+  n_src           = nrow(x),
+  model_type      = x$MODEL_TYPE[1],
+  density_min     = min(x$DENSITY),
+  density_max     = max(x$DENSITY),
+  cv_min          = min(x$UNCERTAINTY),
+  cv_max          = max(x$UNCERTAINTY),
+  n_cv_sentinel   = sum(x$UNCERTAINTY <= -99999),
+  abundance_src   = sum(x$ABUNDANCE)))
+kable(d_src |> mutate(across(c(density_min, density_max), \(v) formatC(v, format = "g", digits = 3))),
+      digits = 4, format.args = list(big.mark = ","),
+      caption = glue("Source layers ({unique(src[[1]]$STUDY)}): extent ",
+                     "{paste(round(bb_src, 4), collapse = ', ')} (xmin, ymin, xmax, ymax)"))
+```
+
+## Taxa → WoRMS {#taxa}
+
+Each delivered name (`SPECIES_2`) is matched exactly against the pipeline's WoRMS snapshot. Where a
+name has several WoRMS records (homonyms and synonym records), the rule picks one in this order:
+
+1. the record that is itself **accepted**;
+2. otherwise, a synonym whose accepted taxon is accepted **and in the same genus**;
+3. otherwise, a synonym whose accepted taxon is accepted.
+
+The render stops if more than one record ties at the top, or if any accepted target is not itself
+accepted.
+
+```{r}
+#| label: taxa
+
+con_spp   <- dbConnect(duckdb(), path_expand(spp_db), read_only = TRUE)
+worms_ver <- dbGetQuery(con_spp, "SELECT worms_ver, source FROM worms_meta")
+nm        <- unique(d_src$scientific_name)
+
+w_rec <- tbl(con_spp, "worms") |>
+  filter(scientificName %in% !!nm) |>
+  select(taxonID, scientificName, scientificNameAuthorship, taxonRank, taxonomicStatus,
+         acceptedNameUsageID) |>
+  collect()
+w_acc <- tbl(con_spp, "worms") |>
+  filter(taxonID %in% !!unique(na.omit(w_rec$acceptedNameUsageID))) |>
+  select(acc_id = taxonID, acc_name = scientificName, acc_status = taxonomicStatus, acc_genus = genus) |>
+  collect()
+dbDisconnect(con_spp, shutdown = TRUE)
+
+w_pick <- w_rec |>
+  left_join(w_acc, by = c(acceptedNameUsageID = "acc_id")) |>
+  mutate(
+    src_genus = word(scientificName, 1),
+    tier      = case_when(
+      taxonomicStatus == "accepted"                             ~ 1L,
+      acc_status %in% "accepted" & acc_genus %in% src_genus     ~ 2L,
+      acc_status %in% "accepted"                                ~ 3L,
+      .default = NA_integer_)) |>
+  filter(!is.na(tier)) |>
+  group_by(scientificName) |>
+  filter(tier == min(tier)) |>
+  ungroup()
+
+stopifnot(
+  "a name did not resolve to WoRMS"         = setequal(w_pick$scientificName, nm),
+  "a name resolved to more than one record" = !any(duplicated(w_pick$scientificName)),
+  "an accepted target is not accepted"      = all(w_pick$acc_status == "accepted"),
+  "the record's own id must be unique (mdl_key)" = !any(duplicated(w_pick$taxonID)))
+
+taxa <- d_src |>
+  select(layer, species, scientific_name) |>
+  left_join(
+    w_pick |> transmute(
+      scientific_name          = scientificName,
+      worms_id                 = as.integer(taxonID),
+      worms_status             = taxonomicStatus,
+      worms_id_accepted        = as.integer(acceptedNameUsageID),
+      scientific_name_accepted = acc_name),
+    by = "scientific_name") |>
+  mutate(
+    mdl_key = glue("{ds_key}|WORMS:{worms_id}|{season}") |> as.character(),
+    cog     = glue("{ds_key}_{worms_id}_{season}.tif") |> as.character(),
+    parquet = glue("{ds_key}_{worms_id}_{season}.parquet") |> as.character())
+stopifnot(nrow(taxa) == 13, !anyNA(taxa$worms_id), !any(duplicated(taxa$mdl_key)))
+
+# live cross-check against the WoRMS web service: informative only (an offline render still passes)
+live <- tryCatch(
+  worrms::wm_record(taxa$worms_id) |>
+    transmute(worms_id = as.integer(AphiaID), live_status = status,
+              live_valid_id = as.integer(valid_AphiaID)),
+  error = \(e) { log_warn("worrms live cross-check skipped: {conditionMessage(e)}"); NULL })
+if (!is.null(live)) {
+  taxa <- taxa |> left_join(live, by = "worms_id")
+  n_disagree <- sum(taxa$live_status != taxa$worms_status |
+                    taxa$live_valid_id != taxa$worms_id_accepted, na.rm = TRUE)
+  if (n_disagree > 0)
+    log_warn("{n_disagree} taxa differ between the {worms_ver$worms_ver} snapshot and live WoRMS")
+}
+
+kable(taxa |> select(any_of(c("species", "scientific_name", "worms_id", "worms_status",
+                              "worms_id_accepted", "scientific_name_accepted", "live_status",
+                              "mdl_key"))),
+      caption = glue("WoRMS: snapshot {worms_ver$worms_ver} ({worms_ver$source}); ",
+                     "live = worrms::wm_record() at render time"))
+
+n_syn <- sum(taxa$worms_status != "accepted")
+acc_dup <- taxa |> filter(worms_id_accepted %in% worms_id_accepted[duplicated(worms_id_accepted)])
+```
+
+`r 13 - n_syn` of the 13 delivered names are accepted in WoRMS, and `r n_syn` are synonyms:
+
+- ***Delphinus capensis***, the long-beaked common dolphin, is unaccepted in WoRMS and placed under
+  *Delphinus delphis*. The InPort abstract itself calls this population *Delphinus delphis bairdii*,
+  but WoRMS lists that subspecies as *nomen dubium*, so no accepted WoRMS taxon is specific to the CCE
+  long-beaked form.
+- ***Lagenorhynchus obliquidens***, the Pacific white-sided dolphin, is a junior objective synonym of
+  *Sagmatias obliquidens*.
+
+**Key choice.** `mdl_key` and the file names use the AphiaID of the name **as delivered**
+(`worms_id`), not the accepted one. A raw model key identifies the source's own species, in the same
+way that AquaMaps keys use its species code. Using the accepted id would collide for the two
+*Delphinus* layers: `r paste(acc_dup$species, collapse = " and ")` share accepted AphiaID
+`r unique(acc_dup$worms_id_accepted)`. The accepted id is kept in `worms_id_accepted`. A per-taxon
+merge would fold both layers into one *D. delphis* surface, and that is a decision for whoever
+promotes this dataset.
+
+## Regrid onto the 0.05° grid {#regrid}
+
+```{r}
+#| label: regrid
+
+# exact overlap (km2) of every source cell with every 0.05-degree grid cell, once for all 13 layers
+t0 <- Sys.time()
+w  <- msens::poly_cell_overlap(geom, cellid_tif)
+log_info("poly_cell_overlap: {nrow(w)} (polygon, cell) rows over {n_distinct(w$cell_id)} cells in {round(difftime(Sys.time(), t0, units = 'secs'), 1)} s")
+
+# how much each output cell mixes source cells: share of its covered area from its largest polygon
+mixing <- w |>
+  group_by(cell_id) |>
+  summarise(n_poly = n(), dom = max(area_km2) / sum(area_km2), .groups = "drop")
+
+# per species: area-weighted density and CV (a -99999 CV would be NA, i.e. drop out of the CV only)
+cells <- imap(src, \(x, l) msens::cells_area_mean(
+  w, tibble(density = x$DENSITY,
+            cv      = if_else(x$UNCERTAINTY <= -99999, NA_real_, x$UNCERTAINTY))))
+stopifnot("layers must regrid to the same cell set" =
+            all(map_lgl(cells, \(d) identical(d$cell_id, cells[[1]]$cell_id))))
+
+n_out    <- nrow(cells[[1]])
+n_single <- sum(mixing$dom >= 0.999)
+pct      <- \(n) round(100 * n / n_out, 1)
+med_dom  <- round(100 * median(mixing$dom[mixing$dom < 0.999]), 1)
+kable(tibble(
+  output_cells        = n_out,
+  partial_cells       = sum(cells[[1]]$frac < 1 - 1e-6),
+  frac_min            = signif(min(cells[[1]]$frac), 3),
+  in_one_source_cell  = n_single,
+  mixed_cells         = n_out - n_single,
+  dom_median_mixed    = round(median(mixing$dom[mixing$dom < 0.999]), 4),
+  dom_min             = round(min(mixing$dom), 4)),
+  format.args = list(big.mark = ","),
+  caption = paste(
+    "Output cells. partial = covered fraction < 1 (coast, Canada/Mexico and offshore edges);",
+    "in_one_source_cell = the largest source cell supplies >= 99.9 % of the covered area;",
+    "dom = that share in the mixed cells (median, minimum)"))
+```
+
+The source's 0.1° lattice is regular, but its edges sit `r lon_off`° (longitude) and `r lat_off`°
+(latitude) off the 0.05° grid lines. That is `r round(100 * abs(lon_off) / 0.05, 1)` % and
+`r round(100 * abs(lat_off) / 0.05, 1)` % of a grid cell. So every other output column and every other
+output row straddles a source edge. `r pct(n_single)` % of output cells lie inside a single source cell
+and carry its values unchanged. In the other `r pct(n_out - n_single)` %, the largest source cell
+supplies a median `r med_dom` % of the covered area, and the result is an area-weighted blend across
+a sliver of the neighbour. That is harmless for the density, since the abundance is conserved (next
+section). It is the approximation for the CV described in the callout above.
+
+## Checks {#checks}
+
+```{r}
+#| label: checks
+
+ctr <- msens::cell_lonlat(cells[[1]]$cell_id, grid)     # cell centres
+h   <- grid$resx / 2                                      # a cell intersects the bbox iff its centre is within h
+
+chk <- imap_dfr(cells, \(d, l) {
+  x <- src[[l]]
+  tibble(
+    layer               = l,
+    n_src               = nrow(x),
+    n_cells             = nrow(d),
+    abundance_source    = sum(x$ABUNDANCE),
+    abundance_regridded = sum(d$density * d$area_km2),
+    covered_km2         = sum(d$area_km2),
+    area_sqkm_src       = sum(x$AREA_SQKM),
+    density_min         = min(d$density),
+    n_outside_extent    = sum(ctr$lon < bb_src[["xmin"]] - h | ctr$lon > bb_src[["xmax"]] + h |
+                              ctr$lat < bb_src[["ymin"]] - h | ctr$lat > bb_src[["ymax"]] + h),
+    frac_max            = max(d$frac),
+    n_na_density        = sum(is.na(d$density)))
+}) |>
+  mutate(abundance_rel_diff = abundance_regridded / abundance_source - 1,
+         ok = n_src == 12257 & abs(abundance_rel_diff) < 0.01 & n_outside_extent == 0 &
+              density_min >= 0 & frac_max <= 1 + 1e-6 & n_na_density == 0)
+
+kable(chk |>
+        select(layer, n_src, n_cells, abundance_source, abundance_regridded, abundance_rel_diff,
+               covered_km2, area_sqkm_src, density_min, n_outside_extent, frac_max, ok) |>
+        mutate(density_min = formatC(density_min, format = "g", digits = 3),
+               abundance_rel_diff = formatC(abundance_rel_diff, format = "e", digits = 1)),
+      digits = c(0, 0, 0, 2, 2, 0, 0, 0, 0, 0, 6, 0), format.args = list(big.mark = ","),
+      caption = "Per species: regridded abundance (sum of density x covered km2) vs the source's sum of ABUNDANCE (must be within 1 %), cells outside the source extent (must be 0), density >= 0")
+
+stopifnot(
+  "13 species x 12,257 source cells"           = nrow(chk) == 13 && all(chk$n_src == 12257L),
+  "regridded abundance not within 1 % of source" = all(abs(chk$abundance_rel_diff) < 0.01),
+  "an output cell lies outside the source extent" = all(chk$n_outside_extent == 0),
+  "negative density"                             = all(chk$density_min >= 0),
+  "covered fraction > 1 (overlapping sources?)"  = all(chk$frac_max <= 1 + 1e-6),
+  "NA density in an output cell"                 = all(chk$n_na_density == 0),
+  "every output cell is covered"                 = all(cells[[1]]$frac > 0))
+```
+
+## Write COGs {#cog}
+
+Each species gets one COG, `cog/cce_<worms_id>_summer-fall.tif`. Band 1 is `density`
+(animals km⁻²) and band 2 is `cv`. Both are Float32 with nodata −9999 outside the modelled cells,
+DEFLATE-compressed with the floating-point predictor, and in 256 × 256 blocks. There are no internal
+overviews, because titiler decimates from full resolution. The window is cut from the cell-id raster
+by row and column, so its origin and pixel size are the grid's own, including the ~5 × 10⁻⁶° float
+drift. Each output pixel *is* a `global05` cell.
+
+```{r}
+#| label: cog
+
+# the data window in grid rows/cols (arithmetic, row-major, 1-based, top-left origin)
+ids <- as.double(cells[[1]]$cell_id)
+row <- ((ids - 1) %/% grid$nc) + 1; col <- ((ids - 1) %% grid$nc) + 1
+r0 <- min(row); r1 <- max(row); c0 <- min(col); c1 <- max(col)
+
+# cut that window from the cell-id raster itself: exact grid geometry, and a lookup check for free
+r_id   <- rast(cellid_tif)[r0:r1, c0:c1, drop = FALSE]
+win_id <- values(r_id, mat = FALSE)
+win_rc <- expand_grid(rr = r0:r1, cc = c0:c1)               # row-major, same order as values()
+stopifnot("cell-id window != row-major arithmetic" =
+            all(win_id == (win_rc$rr - 1) * grid$nc + win_rc$cc))
+win_idx <- match(win_id, cells[[1]]$cell_id)                  # pixel -> row of cells[[l]] (NA = no data)
+log_info("COG window: rows {r0}-{r1}, cols {c0}-{c1} ({nrow(r_id)} x {ncol(r_id)} px), {sum(!is.na(win_idx))} data px")
+
+write_cog <- function(d, tx) {
+  r <- rast(r_id, nlyrs = 2)
+  values(r) <- cbind(d$density[win_idx], d$cv[win_idx])
+  names(r)  <- c("density", "cv")
+  tmp <- file_temp(ext = "tif"); on.exit(file_delete(tmp))
+  writeRaster(r, tmp, datatype = "FLT4S", NAflag = -9999, overwrite = TRUE)
+  # COG via gdal_translate: -stats writes real band statistics (terra's own COG path writes
+  # STATISTICS_MEAN = -9999), -mo carries what a viewer needs to read the file on its own
+  sf::gdal_utils("translate", tmp, path(dir_cog, tx$cog), options = c(
+    "-of", "COG", "-co", "COMPRESS=DEFLATE", "-co", "PREDICTOR=YES", "-co", "BLOCKSIZE=256",
+    "-co", "OVERVIEWS=NONE", "-stats",
+    "-mo", glue("MDL_KEY={tx$mdl_key}"),
+    "-mo", glue("SPECIES={tx$species}"),
+    "-mo", glue("SCIENTIFIC_NAME={tx$scientific_name}"),
+    "-mo", glue("WORMS_ID={tx$worms_id}"),
+    "-mo", glue("WORMS_ID_ACCEPTED={tx$worms_id_accepted}"),
+    "-mo", "SEASON=summer-fall",
+    "-mo", "GRID=global05 (0.05 deg, -180..180; pixel = cell_id of r_cellid_global.tif)",
+    "-mo", "BAND_1=density: animals per km2, area-weighted mean of the source 0.1 deg cells",
+    "-mo", "BAND_2=cv: coefficient of variation of density, same weighting (an approximation for a CV)",
+    "-mo", "SOURCE=Becker et al. 2020, NOAA-TM-NMFS-SWFSC-638, https://doi.org/10.25923/3znq-yx13",
+    "-mo", "INPORT=https://www.fisheries.noaa.gov/inport/item/64349"))
+  invisible(path(dir_cog, tx$cog))
+}
+walk(seq_len(nrow(taxa)), \(i) write_cog(cells[[taxa$layer[i]]], taxa[i, ]))
+
+# validate: gdalinfo says COG, 2 Float32 bands named density/cv with nodata, on the grid; then reopen
+# and compare EVERY pixel with what was written (float32 rounding only), plus a few cells by location
+set.seed(42)
+cog_chk <- map_dfr(seq_len(nrow(taxa)), \(i) {
+  tx <- taxa[i, ]; f <- path(dir_cog, tx$cog); d <- cells[[tx$layer]]
+  info <- fromJSON(sf::gdal_utils("info", f, options = "-json", quiet = TRUE), simplifyVector = FALSE)
+  b    <- info$bands
+  gt   <- unlist(info$geoTransform)
+  off_x <- (gt[1] - grid$xmin) / grid$resx; off_y <- (grid$ymax - gt[4]) / grid$resy
+  r <- rast(f)
+  v <- values(r, mat = TRUE)
+  exp_d <- d$density[win_idx]; exp_cv <- d$cv[win_idx]
+  rel <- function(a, e) max(abs(a - e) / pmax(abs(e), 1e-30), na.rm = TRUE)
+  # a few cells looked up by LOCATION (cell centre -> pixel), incl. the densest one
+  k  <- c(which.max(d$density), sample(nrow(d), 5))
+  ll <- msens::cell_lonlat(d$cell_id[k], grid)
+  ex <- terra::extract(r, as.matrix(ll[, c("lon", "lat")]))
+  tibble(
+    cog          = tx$cog,
+    layout       = info$metadata$IMAGE_STRUCTURE$LAYOUT %||% NA,
+    compression  = info$metadata$IMAGE_STRUCTURE$COMPRESSION %||% NA,
+    bands        = length(b),
+    type         = paste(unique(map_chr(b, "type")), collapse = ","),
+    descriptions = paste(map_chr(b, \(x) x$description %||% ""), collapse = ","),
+    nodata       = paste(unique(map_dbl(b, \(x) x$noDataValue %||% NA_real_)), collapse = ","),
+    overviews    = sum(map_int(b, \(x) length(x$overviews))),
+    on_grid      = abs(off_x - round(off_x)) < 1e-6 && abs(off_y - round(off_y)) < 1e-6 &&
+                   abs(gt[2] - grid$resx) < 1e-12 && abs(-gt[6] - grid$resy) < 1e-12,
+    n_data_px    = sum(!is.na(v[, 1])),
+    max_rel_density = rel(v[, 1], exp_d),
+    max_rel_cv      = rel(v[, 2], exp_cv),
+    same_na      = identical(is.na(v[, 1]), is.na(exp_d)),
+    pts_rel_max  = max(abs(ex$density - d$density[k]) / pmax(d$density[k], 1e-30)))
+})
+kable(cog_chk, digits = 9, format.args = list(big.mark = ","),
+      caption = "COG validation: gdalinfo layout/bands, alignment to the grid, and every pixel read back vs what was written (float32: relative error < 1e-6)")
+stopifnot(
+  all(cog_chk$layout == "COG"), all(cog_chk$compression == "DEFLATE"), all(cog_chk$bands == 2),
+  all(cog_chk$type == "Float32"), all(cog_chk$descriptions == "density,cv"),
+  all(cog_chk$nodata == "-9999"), all(cog_chk$overviews == 0), all(cog_chk$on_grid),
+  all(cog_chk$n_data_px == nrow(cells[[1]])), all(cog_chk$same_na),
+  all(cog_chk$max_rel_density < 1e-6), all(cog_chk$max_rel_cv < 1e-6), all(cog_chk$pts_rel_max < 1e-6))
+```
+
+## Write Parquet {#parquet}
+
+The long table has one row per (model, cell): `mdl_key`, `cell_id`, `val` (density in animals
+km⁻², full double precision, no rounding), `cv` and `frac` (the covered fraction of the cell). It
+lives in `dist/dataset=cce/`, using the same layout as a version's `dist/`, so a later scoring
+decision can read it directly.
+
+```{r}
+#| label: parquet
+
+walk(seq_len(nrow(taxa)), \(i) {
+  tx <- taxa[i, ]; d <- cells[[tx$layer]]
+  msens::write_atlas_parquet(
+    tibble(mdl_key = tx$mdl_key, cell_id = d$cell_id, val = d$density, cv = d$cv, frac = d$frac),
+    path(dir_dist, tx$parquet))
+})
+
+# read back through DuckDB: one mdl_key per file, the expected rows, the same abundance
+con <- dbConnect(duckdb())
+pq  <- dbGetQuery(con, glue(
+  "SELECT mdl_key, count(*) AS n_cells, count(DISTINCT cell_id) AS n_distinct, min(val) AS val_min,
+          max(frac) AS frac_max
+   FROM read_parquet('{dir_dist}/*.parquet') GROUP BY mdl_key ORDER BY mdl_key"))
+dbDisconnect(con, shutdown = TRUE)
+pq_hash <- msens::hash_parquet(glue("{dir_dist}/*.parquet"))
+stopifnot(setequal(pq$mdl_key, taxa$mdl_key), all(pq$n_cells == nrow(cells[[1]])),
+          all(pq$n_distinct == pq$n_cells), all(pq$val_min >= 0))
+kable(pq, digits = 6, format.args = list(big.mark = ","),
+      caption = glue("dist/dataset={ds_key}/ read back (content hash {pq_hash})"))
+```
+
+## Model table {#models}
+
+```{r}
+#| label: models
+
+models <- taxa |>
+  left_join(chk |> select(layer, n_cells, abundance_source, abundance_regridded), by = "layer") |>
+  mutate(
+    season      = season,
+    density_min = map_dbl(layer, \(l) min(cells[[l]]$density)),
+    density_p98 = map_dbl(layer, \(l) quantile(cells[[l]]$density, 0.98, names = FALSE)),
+    density_max = map_dbl(layer, \(l) max(cells[[l]]$density)),
+    cv_median   = map_dbl(layer, \(l) median(cells[[l]]$cv, na.rm = TRUE))) |>
+  transmute(
+    layer, species, scientific_name, worms_id, season, mdl_key, cog, n_cells,
+    abundance_source    = round(abundance_source, 3),
+    abundance_regridded = round(abundance_regridded, 3),
+    density_min = signif(density_min, 6), density_p98 = signif(density_p98, 6),
+    density_max = signif(density_max, 6), cv_median = signif(cv_median, 6),
+    worms_status, worms_id_accepted, scientific_name_accepted, parquet)
+
+write_csv(models, models_csv)
+file_copy(models_csv, repo_csv, overwrite = TRUE)
+
+# a small manifest beside the outputs: what produced them and their content fingerprint
+write_json(list(
+  dataset       = ds_key, season = season, n_models = nrow(models), n_cells = nrow(cells[[1]]),
+  source_gdb    = path_file(gdb), source_geometry_md5 = unname(geom_hash[1]),
+  worms_snapshot = worms_ver$worms_ver, msens = as.character(packageVersion("msens")),
+  dist_content_hash = pq_hash, built = format(Sys.time(), "%Y-%m-%dT%H:%M:%S%z")),
+  path(dir_out, "manifest.json"), auto_unbox = TRUE, pretty = TRUE)
+
+kable(models |> select(species, worms_id, mdl_key, n_cells, abundance_source, abundance_regridded,
+                       density_min, density_p98, density_max, cv_median),
+      format.args = list(big.mark = ","),
+      caption = glue("models.csv ({models_csv}; committed copy data/swfsc_cce_models.csv)"))
+```
+
+## Humpback whale: source vs regridded {#map}
+
+```{r}
+#| label: fig-humpback
+#| fig-cap: "Humpback whale summer–fall density (animals km⁻², log scale over four orders of magnitude below the maximum; lower densities, down to 10⁻¹⁴ offshore, take the bottom colour): the source 0.1° cells (left) and the 0.05° COG band 1 as written (right). The bottom row zooms to Monterey Bay. Each source cell maps onto about 2 × 2 grid cells; its edges sit ~0.003° off the grid lines, so alternate rows and columns blend a sliver of the neighbouring cell. Cells clipped by the coast keep the source density over the part of the grid cell they cover."
+#| fig-width: 10
+#| fig-height: 11
+
+hb_l <- "Humpback_whale_summer_fall"
+hb   <- src[[hb_l]]
+hb_r <- rast(path(dir_cog, taxa$cog[taxa$layer == hb_l]), lyrs = 1) |>
+  as.data.frame(xy = TRUE, na.rm = TRUE)
+lims <- max(hb$DENSITY) * c(1e-4, 1)          # four orders of magnitude; lower values take the bottom colour
+land <- ne_countries(scale = "medium", returnclass = "sf",
+                     country = c("United States of America", "Mexico", "Canada"))
+fill <- scale_fill_viridis_c(
+  "animals / km²", trans = "log10", limits = lims, oob = scales::squish,
+  breaks = scales::breaks_log(n = 6), labels = \(v) formatC(v, format = "g", digits = 2))
+bb   <- st_bbox(geom)
+zoom <- c(xmin = -123.1, xmax = -121.7, ymin = 36.3, ymax = 37.3)
+
+panel <- function(p, title, b) p + fill +
+  geom_sf(data = land, fill = "grey85", color = "grey40", linewidth = 0.2, inherit.aes = FALSE) +
+  coord_sf(xlim = b[c("xmin", "xmax")], ylim = b[c("ymin", "ymax")], expand = FALSE) +
+  labs(title = title, x = NULL, y = NULL) + theme_minimal(base_size = 10)
+
+p_src  <- panel(ggplot() + geom_sf(data = hb, aes(fill = DENSITY), color = NA),
+                "source: 0.1° cells (DENSITY)", bb)
+p_rg   <- panel(ggplot() + geom_raster(data = hb_r, aes(x, y, fill = density)),
+                "regridded: 0.05° COG band 1", bb)
+hb_z   <- st_crop(hb, zoom)
+p_src_z <- panel(ggplot() + geom_sf(data = hb_z, aes(fill = DENSITY), color = "white", linewidth = 0.15),
+                 "source, Monterey Bay (cell outlines)", zoom)
+p_rg_z  <- panel(ggplot() + geom_tile(data = hb_r |> filter(between(x, zoom[["xmin"]], zoom[["xmax"]]),
+                                                            between(y, zoom[["ymin"]], zoom[["ymax"]])),
+                                      aes(x, y, fill = density), color = "white", linewidth = 0.1),
+                 "regridded, Monterey Bay (0.05° cells)", zoom)
+
+(p_src | p_rg) / (p_src_z | p_rg_z) + plot_layout(guides = "collect", heights = c(1.6, 1))
+```
+
+## Credits and use constraints {#credits-and-use-constraints}
+
+The quotes below are read from the InPort metadata records at render time. The XML is cached under
+`preview/swfsc_cce/inport/`, and `CCE_FETCH=1` refreshes it.
+
+```{r}
+#| label: inport
+
+inport_xml <- function(id) {
+  f <- path(dir_inport, glue("{id}.xml"))
+  if (cce_fetch || !file_exists(f))
+    download.file(glue("https://www.fisheries.noaa.gov/inport/item/{id}/inport-xml"), f,
+                  quiet = TRUE, mode = "wb")
+  read_xml(f)
+}
+x_ds  <- inport_xml(64349)
+x_att <- inport_xml(64350)
+txt1  <- \(x, xp) xml_text(xml_find_first(x, xp)) |> str_squish()
+md    <- \(s) str_replace_all(s, "([*_\"'])", "\\\\\\1")   # quote verbatim: escape emphasis + smart quotes
+
+ip <- list(
+  title       = txt1(x_ds, "//item-identification/title"),
+  published   = txt1(x_ds, "//item-identification/publication-date"),
+  credit      = txt1(x_ds, "//data-set-information/data-set-credit"),
+  constraints = txt1(x_ds, "//access-information/data-use-constraints"),
+  security    = txt1(x_ds, "//access-information/security-class"),
+  download    = txt1(x_ds, "//distribution-information/distribution/download-url"),
+  modified    = txt1(x_ds, "//catalog-details/metadata-record-last-modified"),
+  cv_def      = txt1(x_att, "//data-attribute[name='UNCERTAINTY']/description"),
+  area_def    = txt1(x_att, "//data-attribute[name='AREA_SQKM']/description"))
+stopifnot(map_lgl(ip, \(s) !is.na(s) && nzchar(s)))
+```
+
+**Citation.** Becker EA, Forney KA, Miller DL, Fiedler PC, Barlow J, Moore JE (2020).
+*Habitat-based density estimates for cetaceans in the California Current Ecosystem based on
+1991–2018 survey data.* U.S. Department of Commerce, NOAA Technical Memorandum NMFS-SWFSC-638.
+<https://doi.org/10.25923/3znq-yx13> [@becker2020cce]. The InPort record, *`r ip$title`*
+(published `r ip$published`; metadata last modified `r ip$modified`), gives this credit:
+
+> `r md(ip$credit)`
+
+**Data use constraints** (InPort, verbatim; security class `r ip$security`):
+
+> `r md(ip$constraints)`
+
+**Attribute definitions relied on above** (InPort entity 64350):
+
+> **UNCERTAINTY**: `r md(ip$cv_def)`
+>
+> **AREA_SQKM**: `r md(ip$area_def)`
+
+The data were downloaded from the ArcGIS item <`r ip$download`> (NOAA Fisheries Office of Science
+and Technology). Point of contact: Karin A. Forney (SWFSC). Credit SWFSC and Becker et al. (2020)
+wherever these surfaces are shown. The constraint above also asks users to read the metadata before
+use. The models describe summer–fall (July–November survey) conditions averaged over 1991–2018, and
+carry no information about winter–spring distribution.
+
+## Done
+
+```{r}
+#| label: done
+
+# last step: a marker a later session can trust (it is deleted at the top of every render)
+writeLines(format(Sys.time(), "%Y-%m-%dT%H:%M:%S%z"), done_file)
+kable(tibble(output = c(dir_cog, dir_dist, models_csv, path(dir_out, "manifest.json"), repo_csv, done_file),
+             n_files = map_int(output, \(p) if (dir_exists(p)) length(dir_ls(p)) else as.integer(file_exists(p)))),
+      caption = "Outputs")
+```
