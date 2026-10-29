@@ -1,0 +1,217 @@
+---
+title: "Build taxon global totals — each species' denominator for the distribution share (v10)"
+msens:
+  target_name: build_taxon_global_total
+  workflow_type: score
+  dependency: [score_zones]
+  output: data/manifests/build_taxon_global_total.json
+editor_options:
+  chunk_output_type: console
+---
+
+The v10 distribution share scores a place by the fraction of each species' suitable habitat it holds, so every
+scored species needs a denominator: its total `sum(val / 100 * area_km2)` over its whole modelled range. This
+notebook builds that table, `taxon_denom`, by calling `msens::denom_sql()`, which resolves the total from three
+sources in precedence order: (1) a curated **fallback fraction** (`data/us_share_fallback.csv`; the US total divided
+by the share of the range inside the US), (2) the **merged global surface** (`dist_merged_global`), (3) **AquaMaps
+outside the US plus the merged surface inside**, for taxa that only have a US merge. Each total comes in a plain
+and a `_strip` variant (floored cells of the premultiplied sea turtles omitted) for the floor-strip sensitivity.
+
+The base is v8's distributions (cloned into v10) because they are global: AquaX (`ax`) rasters are clipped to US
+waters and cannot form a global share, so the notebook stops if an `ax` model is present (Ben, 2026-10-29).
+
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "taxon_denom: fallback fraction > merged global surface > AquaMaps outside the US + merged inside"
+flowchart LR
+  mc["model_cell (US surface)"] --> ds["msens::denom_sql()"]
+  mg["dist_merged_global/ms_merge"] --> ds
+  am["dist/dataset=am"] --> ds
+  fb["data/us_share_fallback.csv"] --> ds
+  tx["taxon (+ er_mode)"] --> ds
+  ds --> td["taxon_denom"]
+  td --> chk["P2 gate: coverage, total_usa <= total_global"]
+  chk --> mf["hash_query(taxon_denom) → manifest"]
+```
+
+## Setup
+
+The setup opens `sdm.duckdb` read-write with a memory budget sized to the machine (`duckdb_tune`, never a
+hardcoded limit), and stops early if a required input is missing or if AquaX is present.
+
+```{r}
+#| label: setup
+
+librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, readr, tibble, tidyr,
+                 MarineSensitivity/msens, quiet = T)
+source(here("libs/paths.R"))
+source(here("libs/vars.R"))
+source(here("libs/duckdb_budget.R"))
+stopifnot(packageVersion("msens") >= "0.60.0")
+
+dir_atlas <- glue("{dir_big_v}/marine-atlas")
+manifest  <- here("data/manifests/build_taxon_global_total.json")
+tmp_dir   <- path.expand(glue("{dir_big_v}/_tmp"))
+dir_create(c(path_dir(manifest), tmp_dir))
+stopifnot(
+  file_exists(sdm_db),
+  dir_exists(glue("{dir_atlas}/dist_merged_global/dataset=ms_merge")),
+  dir_exists(glue("{dir_atlas}/dist/dataset=am")))
+
+con <- dbConnect(duckdb(sdm_db))
+duckdb_tune(con, tmp_dir)
+stopifnot(all(c("model_cell", "taxon", "taxon_model", "cell") %in% dbListTables(con)))
+# AquaX is clipped to US waters: it cannot form a global share
+stopifnot(!"ax" %in% dbGetQuery(con, "SELECT DISTINCT ds_key FROM taxon_model")$ds_key)
+log_info("{ver}: sdm.duckdb open, tuned; no ax models")
+```
+
+## Extinction-risk mode
+
+`denom_sql()` reads `taxon.er_mode` (how the extinction-risk weight reaches the score), a column v9 added. This
+v10 database is a clone of the v8 base, whose `taxon` has none; there `is_er_spatial` marks exactly the
+premultiplied sea turtles. v8's `taxon` table is NOT altered (it is part of the control the clone verified):
+a **temporary** `taxon` shadowing it carries `er_mode` for this session, and `score_share_metrics.qmd` does
+the same. The `cell` mode (NMFS DPS species with a per-cell ER in `model_cell_er`) arrives with v11, so an
+empty temporary `model_cell_er` stands in when the table is absent.
+
+```{r}
+#| label: er_mode
+
+if (!"er_mode" %in% dbListFields(con, "taxon")) {
+  dbExecute(con, "CREATE TEMP TABLE taxon AS
+    SELECT *, CASE WHEN is_er_spatial THEN 'premultiplied' ELSE 'taxon' END AS er_mode FROM main.taxon")
+  log_info("taxon.er_mode derived from is_er_spatial in a temporary shadow of taxon (main.taxon untouched)")
+}
+if (!"model_cell_er" %in% dbListTables(con)) {
+  dbExecute(con, "CREATE TEMP TABLE model_cell_er (mdl_key VARCHAR, cell_id INTEGER, er DOUBLE)")
+  log_info("model_cell_er stands in empty (cell mode arrives with v11)")
+}
+msens::report_table(
+  dbGetQuery(con, "SELECT er_mode, count(*) AS n_taxa FROM taxon GROUP BY 1 ORDER BY 1"),
+  caption = "taxa by er_mode")
+```
+
+## Fallback fractions
+
+For species whose merged range is only the national (US) part, a curated fraction of the range inside the US
+turns the US total into a global one. The CSV is keyed by `taxon_id`; it is joined to this version's `taxon`
+to get `ms_merge_key`. Rows for taxa absent here (v9's CSV holds AquaX-only taxa) simply do not map. The
+relation `denom_sql()` expects is named `fallback`, kept as a small real table beside `taxon_fallback`.
+
+```{r}
+#| label: fallback
+
+fb <- read_csv(here("data/us_share_fallback.csv"), col_types = cols(taxon_id = col_character(), .default = col_guess()))
+duckdb_register(con, "fb_csv", fb)
+stopifnot("data/us_share_fallback.csv must have one row per taxon_id" = !anyDuplicated(fb$taxon_id),
+          "fallback fractions must lie in (0, 1]" = all(fb$fraction > 0 & fb$fraction <= 1))
+dbExecute(con, "CREATE OR REPLACE TABLE taxon_fallback AS
+  SELECT t.ms_merge_key, f.taxon_id, f.fraction, f.method, f.basis
+  FROM fb_csv f JOIN taxon t ON t.taxon_id = f.taxon_id")
+dbExecute(con, "CREATE OR REPLACE TEMP VIEW fallback AS SELECT ms_merge_key, fraction, method FROM taxon_fallback")
+n_fallback_csv <- nrow(fb)
+n_fallback     <- dbGetQuery(con, "SELECT count(*) n FROM taxon_fallback")$n
+stopifnot("a fallback taxon_id maps to more than one merged taxon" =
+            dbGetQuery(con, "SELECT count(*) - count(DISTINCT ms_merge_key) n FROM taxon_fallback")$n == 0)
+log_info("fallback: {n_fallback} of {n_fallback_csv} CSV rows map to a taxon in {ver}")
+```
+
+## Denominators
+
+The expensive step reads the merged global and AquaMaps Parquet through views and aggregates over the cell table.
+It resumes: an existing `taxon_denom` is kept unless `REDO_DENOM=1`.
+
+```{r}
+#| label: denom
+
+if ("taxon_denom" %in% dbListTables(con) && !redo_denom) {
+  log_info("taxon_denom exists ({dbGetQuery(con, 'SELECT count(*) n FROM taxon_denom')$n} rows) - skipping (REDO_DENOM=1 to rebuild)")
+} else {
+  t0 <- Sys.time()
+  dbExecute(con, glue("CREATE OR REPLACE TEMP VIEW mc_global AS SELECT mdl_key, cell_id, val
+    FROM read_parquet('{dir_atlas}/dist_merged_global/dataset=ms_merge/**/*.parquet')"))
+  dbExecute(con, glue("CREATE OR REPLACE TEMP VIEW mc_am AS SELECT mdl_key, cell_id, val
+    FROM read_parquet('{dir_atlas}/dist/dataset=am/*.parquet')"))
+  # the whole range includes land: a cell absent from the ocean-only `cell` table takes its latitude
+  # row's area, which needs the grid's column count (see ?msens::denom_sql)
+  nc <- msens::grid_spec_for(msens::grid_for_ver(ver))$nc
+  dbExecute(con, paste("CREATE OR REPLACE TABLE taxon_denom AS",
+                       msens::denom_sql(val_col = msens::sdm_val_col(con, "model_cell"), nc = nc)))
+  n_den <- dbGetQuery(con, "SELECT count(*) n FROM taxon_denom")$n
+  log_info("taxon_denom: {n_den} rows in {round(as.numeric(difftime(Sys.time(), t0, units = 'mins')), 1)} min")
+}
+```
+
+## Check — the P2 gate
+
+The gate asserts that every scored taxon (valid in the US, marine, in a scored category) has a positive,
+finite global total no smaller than its US total, and that none was left unresolved by a missing or unsupported
+source. Taxa that are national-only and have no fallback fraction are reported, not stopped on: they need
+curation in `data/us_share_fallback.csv`.
+
+```{r}
+#| label: check
+
+scored <- "t.is_valid_usa AND t.is_marine AND t.sp_cat IN ('bird','coral','fish','invertebrate','mammal','primary_producer','turtle')"
+den <- dbGetQuery(con, glue("
+  SELECT t.ms_merge_key, t.scientific_name, t.common_name, t.sp_cat, d.source, d.total_usa, d.total_global,
+         d.total_usa / d.total_global AS f_us, d.n_cells_global, d.n_cells_no_area,
+         (SELECT string_agg(DISTINCT ds_key, '+') FROM taxon_model tm WHERE tm.ms_merge_key = t.ms_merge_key) AS datasets
+  FROM taxon t LEFT JOIN taxon_denom d USING (ms_merge_key) WHERE {scored}"))
+
+msens::report_table(
+  den |> mutate(source = coalesce(source, "(missing)"), src = sub(":.*", "", source)) |> count(src, sp_cat) |>
+    pivot_wider(names_from = sp_cat, values_from = n, values_fill = 0),
+  caption = "scored taxa by denominator source x sp_cat")
+
+bad <- den |> filter(!is.na(source), total_usa > total_global * (1 + 1e-9))
+if (nrow(bad) > 0) print(as.data.frame(bad |> select(ms_merge_key, sp_cat, source, total_usa, total_global)))
+stopifnot(
+  "every scored taxon has a taxon_denom row" = !any(is.na(den$source)),
+  "total_global is finite and > 0"           = all(is.finite(den$total_global) & den$total_global > 0),
+  "total_usa <= total_global"                = nrow(bad) == 0,
+  "no source none / cell_er_unsupported"     = !any(den$source %in% c("none", "cell_er_unsupported")))
+
+unres <- den |> filter(source == "national_only_unresolved")
+if (nrow(unres) > 0) {
+  log_warn("{nrow(unres)} scored taxa are national_only_unresolved: curate data/us_share_fallback.csv")
+  msens::report_table(unres |> select(scientific_name, common_name, sp_cat, datasets),
+                      caption = "national-only taxa without a fallback fraction")
+}
+
+# land cells in a row with no ocean cell at all get no area (the polar rows): report, do not stop
+no_area <- den |> filter(coalesce(n_cells_no_area, 0) > 0)
+log_info("{nrow(no_area)} scored taxa have global cells with no row area ({sum(no_area$n_cells_no_area)} cells)")
+msens::report_table(
+  den |> group_by(sp_cat) |>
+    summarise(n = n(), median = median(f_us), p10 = quantile(f_us, 0.1), p90 = quantile(f_us, 0.9)),
+  caption = "f_us = total_usa / total_global by category")
+msens::report_table(
+  den |> filter(sp_cat == "turtle") |> select(common_name, total_usa, total_global, f_us),
+  caption = "sea turtles")
+
+n_taxa  <- dbGetQuery(con, "SELECT count(*) n FROM taxon_denom")$n
+n_by    <- \(p) sum(grepl(p, den$source))
+```
+
+## Manifest
+
+The manifest records a content hash of `taxon_denom`, so downstream share scoring can tell whether its
+denominators changed.
+
+```{r}
+#| label: manifest
+
+h <- msens::hash_query(con, "taxon_denom")
+msens::write_manifest(
+  manifest, target = "build_taxon_global_total", content_hash = h,
+  stats = list(
+    ver = ver, n_taxa = n_taxa, n_scored = nrow(den), n_cells_no_area = sum(no_area$n_cells_no_area),
+    n_merged_global = n_by("^merged_global$"), n_aquamaps = n_by("^aquamaps$"),
+    n_fallback = n_by("^fallback:"), n_unresolved = nrow(unres)),
+  force = msens::force_target("build_taxon_global_total"))
+dbDisconnect(con, shutdown = TRUE)
+```
