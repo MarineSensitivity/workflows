@@ -235,6 +235,27 @@ taxon <- taxon_model |>
     n_datasets      = n_distinct(str_extract(mdl_key, "^[^|]+")), .groups = "drop") |>
   left_join(resolved |> select(scientific_name, worms_is_marine, worms_is_extinct),
             by = "scientific_name")
+# `resolved` only covers the taxa resolved afresh this run; a taxon that kept ver_prev's crosswalk by mdl_key got
+# NO WoRMS flags here (v11's first control run: 15,003 reused taxa with worms_is_marine NULL, 48 of them newly
+# "valid" through coalesce(NULL, TRUE), and the scoring digests moved). Carry ver_prev's flags for the same taxon
+# first (the reuse path reproduces ver_prev by construction), then WoRMS itself by AphiaID for anything still NA.
+prev_tax <- if (file_exists(prev_tm_db)) {
+  con_p <- dbConnect(duckdb(prev_tm_db, read_only = TRUE))
+  on.exit(dbDisconnect(con_p, shutdown = TRUE), add = TRUE)
+  dbGetQuery(con_p, "SELECT ms_merge_key, worms_is_marine AS prev_marine, worms_is_extinct AS prev_extinct FROM taxon") |> as_tibble()
+} else tibble(ms_merge_key = character(), prev_marine = logical(), prev_extinct = logical())
+con_spp <- dbConnect(duckdb(spp_db, read_only = TRUE))
+worms_flags <- dbGetQuery(con_spp, "SELECT CAST(scientificNameID AS VARCHAR) AS taxon_id, isMarine AS spp_marine, isExtinct AS spp_extinct FROM worms") |>
+  as_tibble() |> mutate(across(c(spp_marine, spp_extinct), as.logical)) |> distinct(taxon_id, .keep_all = TRUE)
+dbDisconnect(con_spp, shutdown = TRUE)
+n_na0 <- sum(is.na(taxon$worms_is_marine) & taxon$taxon_authority == "worms")
+taxon <- taxon |>
+  left_join(prev_tax, by = "ms_merge_key") |>
+  left_join(worms_flags |> mutate(taxon_authority = "worms"), by = c("taxon_authority", "taxon_id")) |>
+  mutate(worms_is_marine  = coalesce(worms_is_marine,  prev_marine,  spp_marine),
+         worms_is_extinct = coalesce(worms_is_extinct, prev_extinct, spp_extinct)) |>
+  select(-prev_marine, -prev_extinct, -spp_marine, -spp_extinct)
+log_info("WoRMS flags: {n_na0} reused WoRMS taxa had none from this run's resolution; {sum(is.na(taxon$worms_is_marine) & taxon$taxon_authority == 'worms')} remain NA after ver_prev + WoRMS by AphiaID")
 
 con <- dbConnect(duckdb(glue("{dir_atlas}/merge.duckdb")))
 dbWriteTable(con, "taxon_model", taxon_model, overwrite = TRUE)
