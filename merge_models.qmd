@@ -204,23 +204,38 @@ keep_sql <- paste(keep_parts, collapse = " AND ")
 log_info("merge-input filter: {length(keep_parts)} supersession predicate(s)")
 # the survey domain joins the range footprint as its own pseudo-dataset at the governing er_score (nothing off:
 # the control's partition query is byte-identical to v10's)
-dens_rows_sql <- if (fold_density) "UNION ALL SELECT mm.mkey_id, d.ms_merge_key, 'dens_dom' AS ds_key, d.cell_id, t.er_score::DOUBLE AS val
-       FROM dens_dom d JOIN mkey_map mm USING (ms_merge_key) JOIN taxon t USING (ms_merge_key)" else ""
+dens_rows_fn <- function(chunk_sql = "") if (fold_density) glue(
+  "UNION ALL SELECT mm.mkey_id, d.ms_merge_key, 'dens_dom' AS ds_key, d.cell_id, t.er_score::DOUBLE AS val
+       FROM dens_dom d JOIN mkey_map mm USING (ms_merge_key) JOIN taxon t USING (ms_merge_key) {chunk_sql}") else ""
 dir_parts <- glue("{dir_atlas}/mc_parts")
 # the partition write is the ~40-min step; skip it if the input already exists (REDO_MC_PARTS=1 forces)
 if (!dir_exists(dir_parts) || nzchar(Sys.getenv("REDO_MC_PARTS"))) {
   if (dir_exists(dir_parts)) dir_delete(dir_parts)
   dbExecute(con, "SET partitioned_write_max_open_files=512")
   # the supersession filter is applied HERE, on the partitioned merge input, so every consumer
-  # downstream (both surfaces, turtles, the masking check) sees the same input
-  msens::copy_atlas_parquet(con, glue(
-    "SELECT mkey_id, ms_merge_key, ds_key, cell_id, val FROM (
-       SELECT mm.mkey_id, tm.ms_merge_key, split_part(mc.mdl_key,'|',1) AS ds_key, mc.cell_id, mc.val
-       FROM read_parquet('{dir_dist}/*/*.parquet') mc JOIN taxon_model tm USING (mdl_key)
-       JOIN mkey_map mm USING (ms_merge_key)
-       {dens_rows_sql}) mc
-     WHERE {keep_sql}"),
-    dir_parts, partition_by = "mkey_id")
+  # downstream (both surfaces, turtles, the masking check) sees the same input.
+  # MERGE_PARTS_CHUNKS=n (default 1) writes the partitions in n passes over disjoint mkey_id ranges: the
+  # one-pass write of ~13 B rows spilled past 700 GB on the Mac mini (every partition's buffer in flight at
+  # once); chunks bound the spill at the cost of n scans of dist/. The output is identical -- a partition
+  # is written by exactly one chunk (OVERWRITE_OR_IGNORE never touches another chunk's directories).
+  n_chunks <- max(1L, as.integer(Sys.getenv("MERGE_PARTS_CHUNKS", "1")))
+  id_max   <- dbGetQuery(con, "SELECT max(mkey_id) m FROM mkey_map")$m
+  bounds   <- unique(as.integer(round(seq(0, id_max, length.out = n_chunks + 1L))))
+  for (k in seq_len(length(bounds) - 1L)) {
+    lo <- bounds[k] + 1L; hi <- bounds[k + 1L]
+    chunk_sql <- if (n_chunks > 1L) glue("WHERE mm.mkey_id BETWEEN {lo} AND {hi}") else ""
+    dens_rows_sql <- dens_rows_fn(chunk_sql)
+    if (n_chunks > 1L) log_info("mc_parts chunk {k}/{length(bounds) - 1L}: mkey_id {lo}-{hi} ({format(Sys.time(), '%H:%M')})")
+    msens::copy_atlas_parquet(con, glue(
+      "SELECT mkey_id, ms_merge_key, ds_key, cell_id, val FROM (
+         SELECT mm.mkey_id, tm.ms_merge_key, split_part(mc.mdl_key,'|',1) AS ds_key, mc.cell_id, mc.val
+         FROM read_parquet('{dir_dist}/*/*.parquet') mc JOIN taxon_model tm USING (mdl_key)
+         JOIN mkey_map mm USING (ms_merge_key)
+         {chunk_sql}
+         {dens_rows_sql}) mc
+       WHERE {keep_sql}"),
+      dir_parts, partition_by = "mkey_id")
+  }
 } else if (nzchar(Sys.getenv("REDO_MC_PARTS_SPATIAL"))) {
   # refresh ONLY the spatial-ER taxa's partitions (a re-ingested dps_nmfs / turtle surface): mkey_id
   # is dense_rank over the taxon set, so refreshing in place is valid only while the set -- and
@@ -233,6 +248,7 @@ if (!dir_exists(dir_parts) || nzchar(Sys.getenv("REDO_MC_PARTS"))) {
        OR (split_part(tm.mdl_key, '|', 1) IN ({if (length(dens_ds)) dens_sql else \"''\"}))")$mkey_id
   for (id in sp_ids) { pd <- glue("{dir_parts}/mkey_id={id}"); if (dir_exists(pd)) dir_delete(pd) }
   dbExecute(con, "SET partitioned_write_max_open_files=512")
+  dens_rows_sql <- dens_rows_fn()
   msens::copy_atlas_parquet(con, glue(
     "SELECT mkey_id, ms_merge_key, ds_key, cell_id, val FROM (
        SELECT mm.mkey_id, tm.ms_merge_key, split_part(mc.mdl_key,'|',1) AS ds_key, mc.cell_id, mc.val
