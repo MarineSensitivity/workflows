@@ -43,6 +43,12 @@ bio_oracle_tif <- glue::glue("{dir_raw}/bio-oracle.org/bio-oracle_v3.tif")
 # cell_id by position. Shared across versions.
 cellid_tif <- glue::glue("{dir_derived}/r_cellid_global.tif")
 
+# NOAA SEFSC Gulf of Mexico cetacean + sea-turtle monthly density shapefiles (NCEI 0256800 v2.2; 19 shapefiles
+# plus ../spp_gmx.xlsx) read by ingest_sdm-gm.qmd. Local under dir_raw (hydrated by scripts/pull_from_laptop.sh,
+# `--drive`), not Google Drive; GM_SHP_DIR overrides.
+gm_shp_dir <- Sys.getenv("GM_SHP_DIR", unset = glue::glue(
+  "{dir_raw}/sdm/gm/0256800/2.2/data/0-data/NOAA_SEFSC_Cetacean_SeaTurtle_SDM_shapefiles"))
+
 # SWFSC Becker et al. (2020b) California Current cetacean densities: one Esri file geodatabase, 13 layers
 # (ingest_swfsc_cce.qmd). Local under dir_raw (hydrated by scripts/pull_from_laptop.sh), not Google Drive;
 # CCE_GDB overrides it.
