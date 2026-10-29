@@ -1,0 +1,374 @@
+---
+title: "Score share metrics — the v10 distribution share: each species' share of its global range, per km² against the national average"
+msens:
+  target_name: score_share_metrics
+  workflow_type: score
+  dependency: [build_taxon_global_total, score_zone_metrics]
+  output: data/manifests/score_share_metrics.json
+editor_options:
+  chunk_output_type: console
+---
+
+v10 adds **one scoring stage** to the v8 build and changes nothing upstream of it. The published
+("within ecoregion") metrics of v8 — `extrisk_{cat}` → ecoregional min–max → equal-weight composite —
+are kept in `cell_metric` / `zone_metric` unchanged and are the **control**: with `SHARE_METRICS=0`
+this notebook writes nothing and only proves that the five scoring tables still digest to v8's
+checkpoints. With `SHARE_METRICS=1` it adds the **"across the nation"** family of the method page
+(*Sensitivity Across Regions*, 2026-09-11, rev 14; plan 2026-10-29 §2), computed by
+`msens::share_run()` — the rule lives in `msens::share_sql()` and is asserted by `test-share.R`:
+
+- `share_s,c = v_s,c · A_c / Σ_range(s) v · A` — each species' share of its WHOLE modelled range
+  per cell (`taxon_denom`, built by `build_taxon_global_total`);
+- `share_c,g = Σ_s w_s · share_s,c / 100` and `share_z,g = Σ_c share_c,g · p_zc` — risk-weighted,
+  summed per category and zone;
+- `v10_z,g = 100 · (share_z,g / share_USA,g) / (A_z / A_USA)` — a location quotient: **100 = the
+  national average concentration**, the same reference for every area and component;
+- `pct_world` (the percent of the world's risk-weighted importance at stake) and `pct_nation` beside
+  it; a component is **reportable** only where its cells cover ≥ κ of the zone, else no score, never
+  zero; `primprod_v10 = 100 · mean_z(npp) / mean_USA(npp)`; the composite is the equal-weight mean
+  of the reportable components.
+
+Three denominators are computed as columns (plan D2; `SHARE_DENOM` names the headline): `global`
+(the species' whole range — the headline), `usa` (its US cells: Tim White's 2026-09-11 brief, the same
+score with species weight `w` instead of `w · f_us`), `pooled` (no per-species normalization, the
+RESA-style sum). The floored turtle cells are kept by default and stripped as a sensitivity column
+(D4). Nothing here touches the v8 rows: the gate below digests them before and after.
+
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "v8's scoring tables (the control, untouched) + taxon_denom → msens::share_run() per denominator → share metrics beside them; reference digests gate every run"
+flowchart LR
+  v8[("sdm.duckdb (clone of v8)<br/>model_cell · taxon · cell · zone · zone_cell<br/>cell_metric · zone_metric (within ecoregion)")] --> sr
+  td[("taxon_denom<br/>(build_taxon_global_total)")] --> sr
+  sr["msens::share_run()<br/>denom = global | usa | pooled<br/>kappa, floor_strip"] --> zm[("zone_metric<br/>extrisk_{cat}_v10_{denom} · _share_ · _pct_world ·<br/>_pct_nation · _coverage · _n_species · primprod_v10 ·<br/>score_v10_equalweights_{denom}")]
+  sr --> cm[("cell_metric<br/>extrisk_{cat}_share_global · extrisk_{cat}_v10_global")]
+  sr --> zt[("zone_taxon + share_global · share_usa · share_v10_contrib")]
+  sr --> rm[("release_method")]
+  v8 --> gate["digests of v8's rows == checkpoints_v8<br/>share rows == data/manifests/score_share_metrics.json"]
+  zm --> gate
+```
+
+## Setup + flags
+
+```{r}
+#| label: setup
+
+librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, purrr, readr, tibble, tidyr,
+                 MarineSensitivity/msens, quiet = T)
+source(here("libs/paths.R")); source(here("libs/vars.R")); source(here("libs/duckdb_budget.R"))
+options(readr.show_col_types = FALSE)
+manifest <- here("data/manifests/score_share_metrics.json"); dir_create(path_dir(manifest))
+stopifnot(
+  "run build_cell_grid / bootstrap first (sdm.duckdb missing)" = file_exists(sdm_db),
+  "msens 0.60.0 or newer is required (share_sql / share_run / denom_sql)" = packageVersion("msens") >= "0.60.0")
+
+# method flags -- CONTROL VALUE IS OFF: SHARE_METRICS=0 writes nothing and proves the v8 rows ----
+# SHARE_METRICS     : compute the share family (0 = control)
+# SHARE_DENOM       : the headline denominator (global | usa | pooled); the other two are written beside it
+# SHARE_KAPPA       : the reportability floor as a fraction of the zone's area (0.05)
+# SHARE_FLOOR_STRIP : 1 = the headline strips the floored (val = 1) cells of premultiplied taxa; the
+#                     other treatment is always written as the `_strip` / `_keep` sensitivity column
+# SHARE_CELL_DENOMS : which denominators also get per-cell rasters (default the headline only)
+share_metrics  <- .flag("SHARE_METRICS")
+share_denom    <- match.arg(Sys.getenv("SHARE_DENOM", "global"), c("global", "usa", "pooled"))
+share_kappa    <- as.numeric(Sys.getenv("SHARE_KAPPA", "0.05"))
+share_strip    <- .flag("SHARE_FLOOR_STRIP")
+cell_denoms    <- strsplit(Sys.getenv("SHARE_CELL_DENOMS", share_denom), ",")[[1]]
+denoms         <- c("global", "usa", "pooled")
+sp_cats        <- c("bird", "coral", "fish", "invertebrate", "mammal", "primary_producer", "turtle")
+stopifnot(!is.na(share_kappa), share_kappa >= 0, share_kappa <= 1, all(cell_denoms %in% denoms))
+log_info("SHARE_METRICS={share_metrics} denom={share_denom} kappa={share_kappa} floor_strip={share_strip} cell_denoms={paste(cell_denoms, collapse=',')}")
+
+con <- dbConnect(duckdb(sdm_db))
+duckdb_tune(con, path.expand(glue("{dir_big_v}/_tmp")))
+val_col <- msens::sdm_val_col(con, "cell_metric")
+stopifnot("cell_metric must use `val` (v8+ schema)" = val_col == "val")
+
+# the five tables the control digests, DOUBLEs as FLOAT (build_v7c: parallel SUM() reassociates,
+# so raw-double digests legitimately differ between two correct builds)
+digest_tables <- function(con) list(
+  cell_metric = msens::hash_query(con, "SELECT m.metric_key, cm.cell_id, CAST(cm.val AS FLOAT) AS val
+                                        FROM cell_metric cm JOIN metric m USING (metric_seq)"),
+  zone_metric = msens::hash_query(con, "SELECT z.fld, z.val AS zone_val, m.metric_key, CAST(zm.val AS FLOAT) AS val
+                                        FROM zone_metric zm JOIN zone z USING (zone_seq) JOIN metric m USING (metric_seq)"),
+  metric      = msens::hash_query(con, "SELECT metric_key FROM metric"),
+  taxon       = msens::hash_query(con, "SELECT taxon_id, ms_merge_key, sp_cat, er_score, is_valid_usa, is_marine, is_er_spatial FROM taxon"),
+  zone_taxon  = msens::hash_query(con, "SELECT zone_fld, zone_value, mdl_key, CAST(area_km2 AS FLOAT) AS area_km2,
+                                        CAST(avg_suit AS FLOAT) AS avg_suit, CAST(suit_er_area AS FLOAT) AS suit_er_area FROM zone_taxon"))
+```
+
+## The control: v8's rows are v8's, before anything is written
+
+The clone verified at bootstrap hashes the whole tables (`checkpoints_v8.json`). This stage adds
+rows to three of them, so its own gate is on the **v8 subset** — the metric keys and `zone_taxon`
+columns v8 wrote — digested the same way before and after the share rows land. The reference values
+are recorded on the first run and asserted on every later one; `BUILD_REFERENCE=1` is the only way
+to move them.
+
+```{r}
+#| label: control_before
+
+v8_keys <- dbGetQuery(con, "SELECT metric_key FROM metric WHERE metric_key NOT LIKE '%\\_v10%' ESCAPE '\\'
+  AND metric_key NOT LIKE 'extrisk\\_%\\_share\\_%' ESCAPE '\\' AND metric_key NOT LIKE '%\\_pct\\_world' ESCAPE '\\'
+  AND metric_key NOT LIKE '%\\_pct\\_nation%' ESCAPE '\\' AND metric_key NOT LIKE '%\\_coverage' ESCAPE '\\'
+  AND metric_key NOT LIKE '%\\_n\\_species' ESCAPE '\\' AND metric_key NOT LIKE '%\\_mean\\_share%' ESCAPE '\\'
+  AND metric_key NOT LIKE 'primprod\\_v10%' ESCAPE '\\' AND metric_key NOT LIKE 'score\\_v10%' ESCAPE '\\'")$metric_key
+keys_sql <- paste(sprintf("'%s'", v8_keys), collapse = ", ")
+digest_v8 <- function(con) list(
+  cell_metric = msens::hash_query(con, glue("SELECT m.metric_key, cm.cell_id, CAST(cm.val AS FLOAT) AS val
+    FROM cell_metric cm JOIN metric m USING (metric_seq) WHERE m.metric_key IN ({keys_sql})")),
+  zone_metric = msens::hash_query(con, glue("SELECT z.fld, z.val AS zone_val, m.metric_key, CAST(zm.val AS FLOAT) AS val
+    FROM zone_metric zm JOIN zone z USING (zone_seq) JOIN metric m USING (metric_seq) WHERE m.metric_key IN ({keys_sql})")),
+  metric      = msens::hash_query(con, glue("SELECT metric_key FROM metric WHERE metric_key IN ({keys_sql})")),
+  taxon       = digest_tables(con)$taxon,
+  zone_taxon  = digest_tables(con)$zone_taxon)
+before <- digest_v8(con)
+ck_prev <- fromJSON(here(glue("data/manifests/checkpoints_{ver_prev}.json")))$targets
+# the whole-table checkpoints of ver_prev hold as long as nothing has been added: the FIRST run of
+# this stage (no share rows yet) must reproduce them exactly, which ties this gate to the clone's
+n_share_keys <- dbGetQuery(con, "SELECT count(*) n FROM metric")$n - length(v8_keys)
+if (n_share_keys == 0) {
+  whole <- list(cell_metric = msens::hash_query(con, "cell_metric"), zone_metric = msens::hash_query(con, "zone_metric"))
+  stopifnot(
+    "cell_metric does not hash to ver_prev's score_cell_metrics checkpoint" = identical(whole$cell_metric, ck_prev$score_cell_metrics$content_hash),
+    "zone_metric does not hash to ver_prev's score_zone_metrics checkpoint" = identical(whole$zone_metric, ck_prev$score_zone_metrics$content_hash))
+  log_info("GATE ver_prev checkpoints reproduced on the untouched tables: cell_metric {whole$cell_metric}, zone_metric {whole$zone_metric}")
+}
+knitr::kable(tibble(table = names(before), digest_v8_rows = unlist(before)), caption = glue("digests of {ver_prev}'s rows before this run ({length(v8_keys)} metric keys)"))
+```
+
+## The share family (`SHARE_METRICS=1`)
+
+`msens::share_run()` is called once per denominator (and once more for the floor-strip sensitivity
+under the global denominator); each call returns the zone table, the per-cell table, the per-zone
+per-species table and the composite, and asserts the rule's own invariants (a positive denominator
+for every species, cell shares summing to 1 / `f_us`, the national pseudo-zone present). Inputs:
+`taxon_denom` (from `build_taxon_global_total`), a temporary `taxon` shadow carrying `er_mode` for the v8
+schema, an empty temporary `model_cell_er`, and `primprod_cell` from v8's own `primprod` metric. The
+national reference is the study area (`cell.in_usa`), not the `USA` pseudo-zone (see `?msens::share_sql`).
+
+```{r}
+#| label: share
+
+mseq <- function(key, desc = "") {   # idempotent metric_seq: fetch or insert, wiping prior rows of this key
+  ex <- dbGetQuery(con, glue("SELECT metric_seq FROM metric WHERE metric_key = '{key}'"))
+  s  <- if (nrow(ex)) ex$metric_seq[1] else {
+    s0 <- dbGetQuery(con, "SELECT coalesce(max(metric_seq),0)+1 s FROM metric")$s
+    dbExecute(con, glue("INSERT INTO metric VALUES ({s0}, '{key}', '{gsub(\"'\",\"\",desc)}')")); s0 }
+  dbExecute(con, glue("DELETE FROM cell_metric WHERE metric_seq = {s}"))
+  dbExecute(con, glue("DELETE FROM zone_metric WHERE metric_seq = {s}"))
+  s
+}
+write_zone <- function(d, key, desc, col = "val") {
+  s <- mseq(key, desc)
+  d <- d |> filter(!is.na(.data[[col]])) |> transmute(zone_seq, metric_seq = s, val = .data[[col]])
+  if (nrow(d)) { duckdb_register(con, "tmp_zm", d); dbExecute(con, glue("INSERT INTO zone_metric SELECT * FROM tmp_zm")); duckdb_unregister(con, "tmp_zm") }
+  nrow(d)
+}
+write_cell <- function(d, key, desc, col = "val") {
+  s <- mseq(key, desc)
+  d <- d |> filter(!is.na(.data[[col]])) |> transmute(cell_id, metric_seq = s, val = .data[[col]])
+  duckdb_register(con, "tmp_cm", d); dbExecute(con, glue("INSERT INTO cell_metric SELECT * FROM tmp_cm")); duckdb_unregister(con, "tmp_cm")
+  nrow(d)
+}
+LAB <- c(global = "share of the species' global range", usa = "share of the species' US distribution (Tim White 2026-09-11)",
+         pooled = "pooled value-area, no per-species normalization (RESA-style)")
+
+results <- list(); n_written <- 0L
+if (share_metrics) {
+  stopifnot("run build_taxon_global_total first (taxon_denom missing)" = "taxon_denom" %in% dbListTables(con))
+  # v8's taxon has no er_mode and no model_cell_er: a temporary shadow carries them (main.taxon untouched,
+  # as in build_taxon_global_total); is_er_spatial marks exactly the premultiplied sea turtles
+  if (!"er_mode" %in% dbListFields(con, "taxon"))
+    dbExecute(con, "CREATE TEMP TABLE taxon AS SELECT *, CASE WHEN is_er_spatial THEN 'premultiplied' ELSE 'taxon' END AS er_mode FROM main.taxon")
+  if (!"model_cell_er" %in% dbListTables(con))
+    dbExecute(con, "CREATE TEMP TABLE model_cell_er (mdl_key VARCHAR, cell_id INTEGER, er DOUBLE)")
+  dbExecute(con, "CREATE OR REPLACE TEMP TABLE primprod_cell AS
+    SELECT cm.cell_id, cm.val AS npp FROM cell_metric cm JOIN metric m USING (metric_seq) WHERE m.metric_key = 'primprod'")
+  zones <- dbGetQuery(con, "SELECT zone_seq, fld, val AS zone_key FROM zone")
+
+  runs <- c(setNames(as.list(denoms), denoms), list(global_alt = "global"))
+  for (nm in names(runs)) {
+    d <- runs[[nm]]; strip <- if (nm == "global_alt") !share_strip else share_strip
+    t0 <- Sys.time()
+    r <- share_run(con, cats = sp_cats, denom = d, kappa = share_kappa, floor_strip = strip)
+    results[[nm]] <- r
+    log_info("share_run {nm} (denom {d}, floor_strip {strip}): {nrow(r$zone)} zone x category rows, {nrow(r$cell)} cell rows, {round(as.numeric(difftime(Sys.time(), t0, units = 'mins')), 1)} min")
+    sfx <- if (nm == "global_alt") glue("global_{if (strip) 'strip' else 'keep'}") else d
+    # zone metrics (every zone set) ----
+    for (cat in sp_cats) {
+      z <- r$zone |> filter(sp_cat == cat)
+      n_written <- n_written +
+        write_zone(z, glue("extrisk_{cat}_v10_{sfx}"), glue("v10 across the nation, {cat}: 100 = the national average concentration of risk-weighted {LAB[[d]]}; absent where coverage < kappa"), "v10") +
+        write_zone(z, glue("extrisk_{cat}_share_{sfx}"), glue("zone total of risk-weighted {LAB[[d]]}, {cat}"), "share") +
+        write_zone(z, glue("extrisk_{cat}_pct_nation_{sfx}"), glue("percent of the nation's risk-weighted {cat} importance in the zone ({d} denominator)"), "pct_nation") +
+        write_zone(z, glue("extrisk_{cat}_mean_share_{sfx}"), glue("zone total divided by the number of {cat} species present ({d} denominator)"), "mean_share")
+      if (nm == "global") n_written <- n_written +
+        write_zone(z, glue("extrisk_{cat}_pct_world"), glue("percent of the world's risk-weighted {cat} importance in the zone"), "pct_world") +
+        write_zone(z, glue("extrisk_{cat}_coverage"), glue("area-weighted fraction of the zone's cells carrying a scored {cat} species (reportable iff >= kappa)"), "coverage") +
+        write_zone(z, glue("extrisk_{cat}_n_species"), glue("number of scored {cat} species with cells in the zone"), "n_species")
+    }
+    if (nm == "global") n_written <- n_written +
+      write_zone(r$primprod, "primprod_v10", "v10 across the nation, primary productivity: 100 x the zone's area-weighted mean npp over the national mean; absent where coverage < kappa", "v10") +
+      write_zone(r$primprod, "primprod_coverage", "area-weighted fraction of the zone's cells with a productivity value", "coverage")
+    n_written <- n_written +
+      write_zone(r$composite, glue("score_v10_equalweights_{sfx}"), glue("v10 composite: equal-weight mean of the reportable components ({LAB[[d]]})"), "score") +
+      write_zone(r$composite, glue("score_v10_n_components_{sfx}"), "number of reportable components in the composite", "n_components")
+    # cell rasters (headline denominators only) ----
+    if (nm %in% cell_denoms) {
+      for (cat in sp_cats) {
+        cc <- r$cell |> filter(sp_cat == cat)
+        n_written <- n_written +
+          write_cell(cc, glue("extrisk_{cat}_share_{sfx}"), glue("per-cell sum of risk-weighted {LAB[[d]]}, {cat}"), "share") +
+          write_cell(cc, glue("extrisk_{cat}_v10_{sfx}"), glue("v10 per cell, {cat}: 100 = the national average cell ({d} denominator)"), "v10")
+      }
+      # per-cell composite: the equal-weight mean of the components present in the cell, with the
+      # productivity quotient as one more component (no coverage floor at cell level)
+      comp_cell <- dbGetQuery(con, "SELECT cell_id, npp FROM primprod_cell") |>
+        transmute(cell_id, v10 = 100 * npp / r$primprod$mean_usa[1]) |>
+        bind_rows(r$cell |> select(cell_id, v10)) |>
+        group_by(cell_id) |> summarise(val = mean(v10), .groups = "drop")
+      n_written <- n_written + write_cell(comp_cell, glue("score_v10_equalweights_{sfx}"), glue("v10 composite per cell: equal-weight mean of the components present ({LAB[[d]]})"), "val")
+    }
+  }
+  # zone_taxon: the per-species shares that explain a zone's score (treemap leaf = w x share) ----
+  for (col in c("share_global", "share_usa", "share_v10_contrib"))
+    if (!col %in% dbListFields(con, "zone_taxon")) dbExecute(con, glue("ALTER TABLE zone_taxon ADD COLUMN {col} DOUBLE"))
+  zt <- results[[share_denom]]$zone_taxon |> inner_join(zones, by = "zone_seq") |>
+    transmute(zone_fld = fld, zone_value = zone_key, mdl_key = ms_merge_key, share_global, share_usa, share_v10_contrib = contrib)
+  duckdb_register(con, "tmp_zt", zt)
+  dbExecute(con, "UPDATE zone_taxon SET share_global = NULL, share_usa = NULL, share_v10_contrib = NULL")
+  n_zt <- dbExecute(con, "UPDATE zone_taxon z SET share_global = t.share_global, share_usa = t.share_usa, share_v10_contrib = t.share_v10_contrib
+    FROM tmp_zt t WHERE t.zone_fld = z.zone_fld AND t.zone_value = z.zone_value AND t.mdl_key = z.mdl_key")
+  duckdb_unregister(con, "tmp_zt")
+  log_info("zone_taxon: share columns set on {n_zt} rows ({share_denom} headline)")
+  log_info("share family: {n_written} metric rows written")
+} else log_info("SHARE_METRICS unset — control run: nothing written")
+```
+
+## The methods as data (`release_method`)
+
+```{r}
+#| label: release_method
+
+onoff <- function(x) if (isTRUE(x)) "on" else "off"
+rm_rows <- tibble(
+  method_key = c("share_metrics", "share_denom", "share_kappa_pct", "share_floor_strip", "share_components", "prev"),
+  value = c(onoff(share_metrics), share_denom, as.character(share_kappa * 100), onoff(share_strip), paste(sp_cats, collapse = ","), ver_prev),
+  description = c(
+    "The across-the-nation score family (each species' risk-weighted share of its range per km2 against the national average = 100) computed beside the within-ecoregion metrics (v8: off)",
+    "The headline denominator of each species' share: global (its whole modelled range), usa (its US distribution), pooled (no per-species normalization); the other two are written beside it",
+    "A zone component is reportable only if its scored cells cover at least this percent of the zone's area (area-weighted); below it there is no score, never a zero",
+    "Whether the floored (val = 1) cells of the premultiplied sea turtles are zeroed on both sides of the share (off = kept, the surface stays continuous)",
+    "The scored components; v8's taxonomy-based categories (no 'other'); primary productivity joins as primprod_v10",
+    "The release whose merge and within-ecoregion scoring this version keeps unchanged"))
+if (share_metrics) dbWriteTable(con, "release_method", rm_rows, overwrite = TRUE)
+knitr::kable(rm_rows)
+```
+
+## Gates: the v8 rows are untouched, the share rows reproduce the reference
+
+```{r}
+#| label: gate
+
+after <- digest_v8(con)
+d_ctl <- tibble(table = names(before), before = unlist(before), after = unlist(after)) |> mutate(same = before == after)
+knitr::kable(d_ctl, caption = glue("{ver_prev}'s rows before vs after this run"))
+stopifnot("this stage changed a v8 row: the control is broken" = all(d_ctl$same))
+
+# the share rows' digests: recorded by BUILD_REFERENCE=1 (or the first run), asserted on every
+# same-flag run after; a run with different flags is a control render and is not compared
+h_share <- if (share_metrics) list(
+  zone_share = msens::hash_query(con, glue("SELECT z.fld, z.val AS zone_val, m.metric_key, CAST(zm.val AS FLOAT) AS val
+    FROM zone_metric zm JOIN zone z USING (zone_seq) JOIN metric m USING (metric_seq) WHERE m.metric_key NOT IN ({keys_sql})")),
+  cell_share = msens::hash_query(con, glue("SELECT m.metric_key, cm.cell_id, CAST(cm.val AS FLOAT) AS val
+    FROM cell_metric cm JOIN metric m USING (metric_seq) WHERE m.metric_key NOT IN ({keys_sql})")),
+  zone_taxon_share = msens::hash_query(con, "SELECT zone_fld, zone_value, mdl_key, CAST(share_global AS FLOAT) AS a,
+    CAST(share_usa AS FLOAT) AS b, CAST(share_v10_contrib AS FLOAT) AS c FROM zone_taxon WHERE share_global IS NOT NULL")) else list()
+ref <- if (file_exists(manifest)) fromJSON(manifest) else NULL
+is_ref <- nzchar(Sys.getenv("BUILD_REFERENCE"))
+flags <- list(share_metrics = share_metrics, share_denom = share_denom, share_kappa = share_kappa, share_floor_strip = share_strip,
+              cell_denoms = paste(cell_denoms, collapse = ","))
+same_flags <- !is.null(ref) && all(vapply(names(flags), \(k) isTRUE(all.equal(ref[[k]], flags[[k]])), TRUE))
+if (share_metrics) {
+  d_ref <- tibble(surface = names(h_share), digest = unlist(h_share),
+                  reference = vapply(names(h_share), \(k) ref[[glue("digest_{k}")]] %||% NA_character_, ""))
+  knitr::kable(d_ref, caption = "share-row digests vs the committed reference")
+  if (is_ref || is.null(ref) || !isTRUE(ref$share_metrics)) log_info("BUILD_REFERENCE / no reference yet: these digests BECOME the reference")
+  else if (!same_flags) log_info("flags differ from the committed reference's — a sensitivity render, reference not compared")
+  else stopifnot("the share rows differ from the committed reference (same flags): a correct build reproduces them on any machine" = all(d_ref$digest == d_ref$reference))
+}
+```
+
+## Plausibility: the method's own validation targets (plan 2026-10-29 §2)
+
+The page's v9 numbers are the reference *shape*, not the target: on v8's models the Gulf of America
+Program Areas must hold the nation's turtle concentration, the Aleutian Arc almost none, St. George
+Basin's turtles must not be reportable, Kemp's ridley must carry the Gulf's turtle column, the Arctic
+must keep its mammal column through the bowhead, walrus and ice seals, and Alaska as a whole must hold
+under 1 % of the nation's turtle importance under the global weighting.
+
+```{r}
+#| label: plausibility
+
+if (share_metrics) {
+  r  <- results[[share_denom]]
+  pa <- r$zone |> inner_join(zones, by = "zone_seq") |> filter(fld == "programarea_key")
+  v10_of <- function(key, cat) { x <- pa |> filter(zone_key == key, sp_cat == cat); if (nrow(x)) x$v10 else NA_real_ }
+  rep_of <- function(key, cat) { x <- pa |> filter(zone_key == key, sp_cat == cat); nrow(x) > 0 && isTRUE(x$reportable) }
+  turt <- pa |> filter(sp_cat == "turtle") |> select(zone_key, share, n_species, coverage, reportable, pct_world, pct_nation, v10) |> arrange(desc(v10))
+  msens::report_table(turt, caption = glue("sea turtles by Program Area ({share_denom} denominator)"))
+  ak_keys <- dbGetQuery(con, "SELECT DISTINCT pa.val AS pa FROM zone pa JOIN zone_cell zc USING (zone_seq)
+    JOIN zone_cell zs ON zs.cell_id = zc.cell_id JOIN zone s ON s.zone_seq = zs.zone_seq
+    WHERE pa.fld = 'programarea_key' AND s.fld = 'subregion_key' AND s.val = 'AK'")$pa
+  ak_turtle_pct <- sum(turt$pct_nation[turt$zone_key %in% ak_keys], na.rm = TRUE)
+  # top contributors per Program Area and category (what the treemap shows)
+  top <- r$zone_taxon |> inner_join(zones, by = "zone_seq") |> filter(fld == "programarea_key") |>
+    inner_join(dbGetQuery(con, "SELECT ms_merge_key, common_name, scientific_name FROM taxon"), by = "ms_merge_key") |>
+    group_by(zone_key, sp_cat) |> slice_max(contrib, n = 1, with_ties = FALSE) |> ungroup() |>
+    transmute(zone_key, sp_cat, top_species = coalesce(common_name, scientific_name), contrib = signif(contrib, 3))
+  gulf_turtle_top <- top |> filter(zone_key %in% c("GAA", "GAB"), sp_cat == "turtle")
+  arctic_mammal <- top |> filter(zone_key %in% c("BFT", "CHU", "HOP", "NOR"), sp_cat == "mammal")
+  msens::report_table(bind_rows(gulf_turtle_top, arctic_mammal), caption = "top contributor: Gulf turtles, Arctic mammals")
+  checks <- tibble(
+    check  = c("GAA turtles >> 100", "GAB turtles >> 100", "ALA turtles << 100", "GEO turtles not reportable",
+               "Kemp's ridley is the top turtle of GAA (GAB: green turtle on v8)", "Arctic Program Areas keep a mammal column",
+               "Alaska holds < 2 % of the nation's turtle importance (global weighting; v8 preview 1.05 %)"),
+    value  = c(v10_of("GAA", "turtle"), v10_of("GAB", "turtle"), v10_of("ALA", "turtle"), as.numeric(rep_of("GEO", "turtle")),
+               NA, nrow(arctic_mammal), ak_turtle_pct),
+    pass   = c(isTRUE(v10_of("GAA", "turtle") > 200), isTRUE(v10_of("GAB", "turtle") > 200), isTRUE(v10_of("ALA", "turtle") < 50) || is.na(v10_of("ALA", "turtle")),
+               !rep_of("GEO", "turtle"), any(grepl("Kemp", gulf_turtle_top$top_species[gulf_turtle_top$zone_key == "GAA"])), nrow(arctic_mammal) >= 2,
+               share_denom != "global" || ak_turtle_pct < 2))   # the page measured 0.7 % on v9 (AquaX surfaces); v8 gives ~1.05 %
+  knitr::kable(checks)
+  # Spearman between the within-ecoregion (v8) and across-the-nation (v10) composite rankings
+  v8c <- dbGetQuery(con, "SELECT z.val AS zone_key, zm.val AS score_v8 FROM zone_metric zm JOIN zone z USING (zone_seq) JOIN metric m USING (metric_seq)
+    WHERE z.fld = 'programarea_key' AND m.metric_key = 'score_extriskspcat_primprod_ecoregionrescaled_equalweights'")
+  cmp <- r$composite |> inner_join(zones, by = "zone_seq") |> filter(fld == "programarea_key") |> inner_join(v8c, by = "zone_key")
+  rho <- cor(cmp$score, cmp$score_v8, method = "spearman")
+  msens::report_table(cmp |> transmute(zone_key, score_v8 = round(score_v8, 1), score_v10 = round(score, 1), n_components) |> arrange(desc(score_v10)),
+                      caption = glue("Program-Area composite: within ecoregion (v8) vs across the nation (v10, {share_denom}); Spearman rho = {round(rho, 3)}"))
+  stopifnot("a plausibility target failed — inspect the tables above before trusting the family" = all(checks$pass))
+} else log_info("control run: plausibility checks skipped")
+```
+
+## Manifest
+
+```{r}
+#| label: manifest
+
+n_metric <- dbGetQuery(con, "SELECT count(*) n FROM metric")$n
+dbDisconnect(con, shutdown = TRUE)
+# the reference is the share run's: a control render writes the manifest only when none exists yet,
+# never over a share reference; a share run writes it under BUILD_REFERENCE, when no share reference
+# exists, or when its flags equal the reference's (a sensitivity render never moves it)
+write_mf <- if (share_metrics) (is_ref || is.null(ref) || !isTRUE(ref$share_metrics) || same_flags) else is.null(ref)
+if (write_mf) msens::write_manifest(
+  manifest, target = "score_share_metrics",
+  content_hash = if (share_metrics) msens::hash_query(dbConnect(duckdb()), glue("SELECT '{paste(unlist(h_share), collapse = '')}' AS a")) else paste(unlist(after), collapse = ""),
+  stats = c(flags, list(ver = ver, ver_prev = ver_prev, n_metric_keys = n_metric, n_v8_keys = length(v8_keys), n_rows_written = n_written),
+            setNames(as.list(unlist(after)), paste0("digest_v8_", names(after))),
+            if (share_metrics) setNames(as.list(unlist(h_share)), paste0("digest_", names(h_share))) else list()),
+  force = msens::force_target("score_share_metrics"))
+```
