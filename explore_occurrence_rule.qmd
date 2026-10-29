@@ -14,7 +14,9 @@ editor_options:
 <!--
 HOW merge_models.qmd CONSUMES THIS (OCC_RULE=1, the orchestrator wires it; nothing here couples through a flag):
 
-  data/v11/zone_exclusions_occ.csv  = msens::occurrence_exclusions() at the D10 defaults, one row per DROPPED
+  data/v11/zone_weights_occ.csv     = msens::encounter_weight() at the defaults, one row per (mdl_key, zone_key) with w < 1
+  (REGION_WEIGHT=1: multiply the merged value by w inside the zone via cell_zone_major_sql; w = 0 rows are the gate).
+  data/v11/zone_exclusions_occ.csv  = msens::occurrence_exclusions(gate = OCC_GATE) at the D10 defaults, one row per GATED
   (mdl_key, zone_key), the shape msens::zone_exclude_sql(id_col = "mdl_key") takes, with the counts and the
   verdict that justify the row. data/manifests/explore_occurrence_rule.json records the CSV's xxhash64.
 
@@ -88,8 +90,8 @@ source(here("libs/duckdb_budget.R"))  # duckdb_tune()
 source(here("libs/obis_h3.R"))        # obis_h3_src(), obis_h3_info()
 
 stopifnot(
-  "msens >= 0.63.0 (occurrence_rule(baseline), cells_within_sql) is required; reinstall msens" =
-    packageVersion("msens") >= "0.63.0" && all(c("occurrence_rule", "cells_within_sql") %in% getNamespaceExports("msens")))
+  "msens >= 0.64.1 (occurrence_rule(baseline), occurrence_exclusions(gate), encounter_weight, cells_within_sql) is required; reinstall msens" =
+    packageVersion("msens") >= "0.64.1" && all(c("occurrence_rule", "occurrence_exclusions", "encounter_weight", "cells_within_sql") %in% getNamespaceExports("msens")))
 
 # parameters ---- (env-overridable; the defaults are D10's)
 redo_occ     <- .flag("REDO_OCC")                                  # rebuild every cache below
@@ -100,6 +102,7 @@ occ_block    <- as.integer(Sys.getenv("OCC_BLOCK", "10"))          # cells per b
 occ_min_cells<- as.integer(Sys.getenv("OCC_MIN_CELLS", "20"))      # narrow-range override below this many cells worldwide
 occ_year_min <- as.integer(Sys.getenv("OCC_YEAR_MIN", "1950"))     # OBIS records dated earlier are ignored (NULL year kept)
 occ_baseline <- match.arg(Sys.getenv("OCC_BASELINE", "zones"), c("zones", "range"))   # what a zone is judged against (msens 0.63.0)
+occ_gate     <- match.arg(Sys.getenv("OCC_GATE", "zero"), c("zero", "all"))            # D11: gate = zero records (default) | every dropped pair
 occ_nc       <- 7200L                                              # global05 columns
 d_default    <- occ_buffer_km                                      # libs/vars.R OCC_BUFFER_KM, default 100
 d_all        <- sort(unique(c(0, 100, 250, d_default)))            # sensitivity buffers (km)
@@ -120,7 +123,8 @@ dir_tmp      <- glue("{dir_occ}/duckdb_tmp")
 f_zone_cell  <- path_expand(glue("{dir_big}/zones/ecoregion_2025-06/global05/zone_cell.parquet"))
 f_obis       <- path_expand(obis_h3_src("obis_cell.parquet")$path)
 f_worms      <- path_expand(obis_h3_src("worms_taxon.parquet")$path)
-f_csv        <- here("data/v11/zone_exclusions_occ.csv")
+f_csv        <- here("data/v11/zone_exclusions_occ.csv")   # the GATE (OCC_RULE=1 in merge_models)
+f_wcsv       <- here("data/v11/zone_weights_occ.csv")      # the WEIGHTS (REGION_WEIGHT=1 in merge_models)
 manifest     <- here("data/manifests/explore_occurrence_rule.json")
 dir_create(c(dir_occ, dir_tmp, path_dir(f_csv), path_dir(manifest)))
 stopifnot(
@@ -709,17 +713,24 @@ us |> filter((sp_cat == "turtle" & zone_key %in% c("EBS", "GOA")) | (scientific_
   kable(format.args = list(big.mark = ","), caption = glue("The anchors under both baselines (default = {def_name})."))
 ```
 
-## Output: the exclusions the merge consumes
+## Output: the gate and the weights the merge consumes
 
-`msens::occurrence_exclusions()` of the default run: the dropped (mdl_key, zone_key) pairs, with the counts and the
-verdict that justify each (the shape and the extra columns follow `data/v7c/zone_exclusions.csv`: `zone_fld`, the
-evidence). The full verdict table (kept / unsearched / dropped, every pair) is cached beside the counts as
-`rule_default.parquet` for review.
+D11, "gate + weight": `msens::occurrence_exclusions(gate = "zero")` of the default run — a species leaves an ecoregion
+only where it has NO record under adequate effort (`OCC_GATE=all` = every dropped pair, the rule as first written).
+A species that IS recorded but at a rate well below its other ecoregions is not excluded: the first full run dropped
+1,904 such pairs, among them the bowhead whale from the Bering Sea (23 of 458 searched blocks against 44 % elsewhere —
+its wintering ground, surveyed mostly in summer when the whales are north), the beluga (51 of 604; coastal stocks),
+the sperm whale and the common eider — seasonal or coastal presence the block rate cannot tell from absence. Those
+pairs, and every kept pair below its reference rate, get `msens::encounter_weight()` instead: `w = min(1, rate /
+p_core)`, a multiplier on the merged value inside the ecoregion under `REGION_WEIGHT=1` (default off; it inherits the
+same survey-season bias, so it is a flag for the 2026-11-12 review, not a default). The shape and the extra columns
+follow `data/v7c/zone_exclusions.csv` (`zone_fld`, the evidence). The full verdict table (kept / unsearched /
+dropped, every pair) is cached beside the counts as `rule_default.parquet` for review.
 
 ```{r}
 #| label: write-csv
 
-ex  <- occurrence_exclusions(res_def)
+ex  <- occurrence_exclusions(res_def, gate = occ_gate)
 out <- ex |>
   left_join(res_def, by = c("mdl_key", "zone_key")) |>
   transmute(
@@ -731,7 +742,24 @@ out <- ex |>
     reason = as.character(glue("occurrence rule E: {n_occupied} of {n_searched} searched 0.5-degree blocks hold a record (rate {signif(rate, 3)}), against {signif(p_core, 3)} in the species' {if (occ_baseline == 'zones') 'other ecoregions' else 'whole range'} (p = {signif(p_value, 2)})")),
     source = as.character(glue("OBIS {obis_h3_release}"))) |>
   arrange(mdl_key, zone_key)
-stopifnot("every exclusion row must be a dropped pair" = all(out$verdict == "dropped"), !anyDuplicated(out[c("mdl_key", "zone_key")]))
+stopifnot("every exclusion row must be a dropped pair" = all(out$verdict == "dropped"), !anyDuplicated(out[c("mdl_key", "zone_key")]),
+          "under the zero gate every exclusion has no record" = occ_gate == "all" || all(out$n_occupied == 0))
+
+# the weights: a pair the rule dropped on the RATE (records exist) is kept with its ratio; dropped-with-zero stays 0
+# (redundant with the gate, by design); unsearched / overridden = 1 (unsampled is unknown, critical habitat untouched)
+wt <- res_def |>
+  mutate(verdict = ifelse(verdict == "dropped" & n_occupied > 0 & occ_gate == "zero", "kept", verdict)) |>
+  encounter_weight() |>
+  filter(w < 1) |>
+  transmute(mdl_key, zone_fld = "ecoregion_key", zone_key, taxon_id, scientific_name, common_name, sp_cat,
+            effort = eff_default, d_km = d_default, block_cells = occ_block, n_cells, n_searched, n_occupied, n_records,
+            rate = signif(rate, 8), p_core = signif(p_core, 8), w = signif(w, 6), w_reason,
+            reason = as.character(glue("encounter weight: rate {signif(rate, 3)} here vs {signif(p_core, 3)} in the species' {if (occ_baseline == 'zones') 'other ecoregions' else 'whole range'} -> w = {signif(w, 3)}")),
+            source = as.character(glue("OBIS {obis_h3_release}"))) |>
+  arrange(mdl_key, zone_key)
+stopifnot("a gated pair must weigh 0 and a weighted pair must have records" =
+            all((wt$w == 0) == (paste(wt$mdl_key, wt$zone_key) %in% paste(out$mdl_key, out$zone_key))) || occ_gate == "all",
+          !anyDuplicated(wt[c("mdl_key", "zone_key")]))
 
 # the full verdict table, for review (cache, not a deliverable)
 dbWriteTable(con, "tmp_df", res_def |> select(-any_of(c("run", "eff"))), overwrite = TRUE)
@@ -741,9 +769,17 @@ if (occ_test_n > 0) {
   message("OCC_TEST_N smoke test: data/v11/zone_exclusions_occ.csv and the manifest are NOT written")
 } else {
   write_csv(out, f_csv, na = "")
+  write_csv(wt, f_wcsv, na = "")
 }
 kable(head(out |> select(mdl_key, scientific_name, zone_key, n_cells, n_searched, n_occupied, n_records, p_core, p_value, label), 15),
-      format.args = list(big.mark = ","), caption = glue("First rows of data/v11/zone_exclusions_occ.csv ({nrow(out)} rows)."))
+      format.args = list(big.mark = ","), caption = glue("First rows of data/v11/zone_exclusions_occ.csv ({nrow(out)} rows, gate = {occ_gate})."))
+wt |> filter(w > 0) |> group_by(sp_cat) |>
+  summarise(pairs_weighted = n(), species = n_distinct(mdl_key), `w median` = round(median(w), 3), `w < 0.25` = sum(w < 0.25), `w < 0.5` = sum(w < 0.5), .groups = "drop") |>
+  kable(format.args = list(big.mark = ","), caption = glue("data/v11/zone_weights_occ.csv: pairs weighted below 1 by component ({sum(wt$w > 0)} rows; {sum(wt$w == 0)} more are the gated pairs at 0)."))
+wt |> filter(w > 0, sp_cat %in% c("mammal", "turtle")) |> arrange(w) |>
+  select(common_name, zone_key, n_occupied, n_searched, rate, p_core, w) |> head(25) |>
+  mutate(across(c(rate, p_core, w), \(v) signif(v, 3))) |>
+  kable(caption = "The 25 most downweighted mammal / turtle pairs (recorded, but far below the species' rate elsewhere).")
 ```
 
 ## Manifest
@@ -770,9 +806,14 @@ if (occ_test_n == 0) {
       n_taxa           = nrow(tx),
       n_taxa_no_surface= n_nosurface,
       n_rule_rows      = nrow(res_def),
+      gate             = occ_gate,
       n_pairs_dropped  = nrow(out),
       n_species_dropped= n_distinct(out$mdl_key),
       cells_dropped    = sum(out$n_cells),
+      n_pairs_rule_dropped = sum(res_def$verdict == "dropped"),
+      n_pairs_weighted = sum(wt$w > 0),
+      n_species_weighted = n_distinct(wt$mdl_key[wt$w > 0]),
+      weights_csv      = list(path = "data/v11/zone_weights_occ.csv", rows = nrow(wt), xxhash64 = digest::digest(file = as.character(f_wcsv), algo = "xxhash64")),
       n_pairs_unsearched = sum(res_def$verdict == "unsearched"),
       by_component     = by_comp |> split(by_comp$sp_cat) |> map(\(x) as.list(select(x, -sp_cat))),
       anchors          = list(turtles_ebs_dropped = nrow(filter(anchor_ok$turtles_ebs, verdict == "dropped")),
@@ -807,7 +848,15 @@ if (run_anchors) {
     "the v7c turtles (loggerhead, green, leatherback, olive ridley) must each have an EBS row" =
       setequal(anchor_ok$turtles_ebs$scientific_name, v7c_turtles),
     "right whale needs a row in both EGOA and WCGOA" = setequal(anchor_ok$rw_gulf$zone_key, c("EGOA", "WCGOA")))
-  bad <- bind_rows(anchor_ok$turtles_ebs, anchor_ok$rw_gulf) |> filter(verdict != "dropped")
+  gated <- paste(out$mdl_key, out$zone_key)
+  rw_w  <- wt |> semi_join(anchor_ok$rw_gulf, by = c("mdl_key", "zone_key"))
+  # the turtles must be GATED (zero records); the right whale is gated or, with its handful of Gulf records, weighted
+  # at or below the ratio (3 of 79 blocks vs 26 % on its other ecoregions -> w 0.14): Tim's "downweight, not drop"
+  bad <- bind_rows(
+    anchor_ok$turtles_ebs |> filter(!paste(mdl_key, zone_key) %in% gated),
+    anchor_ok$rw_gulf |> filter(!paste(mdl_key, zone_key) %in% gated,
+                                !paste(mdl_key, zone_key) %in% paste(rw_w$mdl_key, rw_w$zone_key)[rw_w$w <= occ_ratio]))
+  if (nrow(rw_w)) message(glue("right whale Gulf weights: {paste(rw_w$zone_key, signif(rw_w$w, 3), sep = ' = ', collapse = ', ')}"))
   if (nrow(bad) > 0) {
     v_alt <- us$verdict_alt[match(paste(bad$mdl_key, bad$zone_key), paste(us$mdl_key, us$zone_key))]
     stop("ANCHOR NOT DROPPED at the defaults (effort = megafauna, d = ", d_default, " km, ratio ", occ_ratio, ", baseline ", occ_baseline, ", OBIS only):\n",
@@ -817,6 +866,7 @@ if (run_anchors) {
          "\nOutside OCC_TEST_N the exclusions CSV and the manifest above were written regardless. Read the anchor and baseline tables: a failure means the baseline, ",
          "the effort definition or the channels (OBIS only) are wrong for this species, not necessarily the anchor.", call. = FALSE)
   }
-  message("anchors: the four v7c turtles are dropped from EBS and the right whale from EGOA + WCGOA")
+  message(glue("anchors: the four v7c turtles are gated out of EBS; the right whale x EGOA + WCGOA is ",
+               "{if (all(paste(anchor_ok$rw_gulf$mdl_key, anchor_ok$rw_gulf$zone_key) %in% gated)) 'gated' else 'weighted at or below the ratio'}"))
 }
 ```
