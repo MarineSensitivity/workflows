@@ -23,9 +23,24 @@ PATHS=(
   raw/marinespecies.org
   raw/BOTW_2024_2.gpkg
 )
-[ $# -gt 0 ] && PATHS=("$@")
+# Sources that live OUTSIDE ~/_big/msens on the laptop (Google Drive mirrors): "<laptop path>|<path under ~/_big/msens>".
+# The gm ingest's GM_SHP_DIR and the cce preview's CCE_GDB point at these on the mini (libs/paths.R).
+DRIVE_PATHS=(
+  "My Drive/projects/msens/data/raw/ncei.noaa.gov - GoMex cetacean & sea turtle SDMs|raw/sdm/gm"            # v11 Q6: SEFSC Gulf cetacean shapefiles + spp_gmx.xlsx (718 MB)
+  "Library/CloudStorage/GoogleDrive-ben@ecoquants.com/My Drive/projects/msens/data/raw/swfsc.noaa.gov|raw/sdm/swfsc"   # v11 Q6: Becker 2020b CCE gdb
+)
+if [ $# -gt 0 ]; then
+  if [ "$1" = "--drive" ]; then PATHS=(); else PATHS=("$@"); DRIVE_PATHS=(); fi
+fi
 rc=0
-for p in "${PATHS[@]}"; do
+for m in "${DRIVE_PATHS[@]}"; do
+  m="${m%%#*}"; m="$(echo "$m" | xargs)"; [ -z "$m" ] && continue
+  rp="${m%%|*}"; lp="${m##*|}"
+  mkdir -p "$BIG/$lp"
+  echo "==> drive: $rp -> $lp  ($(date +%H:%M))"
+  rsync -a --partial "laptop:\"$HOME/$rp/\"" "$BIG/$lp/" || { echo "!! $lp failed (rsync exit $?)"; rc=1; }
+done
+for p in ${PATHS[@]+"${PATHS[@]}"}; do   # set -u safe when --drive emptied PATHS
   p="${p%%#*}"; p="$(echo "$p" | xargs)"; [ -z "$p" ] && continue
   mkdir -p "$BIG/$(dirname "$p")"
   if ssh -o BatchMode=yes laptop "test -d ~/_big/msens/$p"; then src="laptop:~/_big/msens/$p/"; dst="$BIG/$p/"
