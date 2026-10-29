@@ -41,3 +41,6 @@ bootstrap_clone_merge <- .flag("BOOTSTRAP_CLONE_MERGE")  # a SCORING-ONLY versio
 
 # ingest_nmfs-dps.qmd (v9.1 `dps_nmfs`)
 dps_fetch <- .flag("DPS_FETCH")   # re-download the NMFS critical-habitat service layers into raw/
+
+# build_taxon_global_total.qmd (v10 P2)
+redo_denom <- .flag("REDO_DENOM")  # build_taxon_global_total.qmd: rebuild taxon_denom
