@@ -1,0 +1,457 @@
+---
+title: "Ingest OBIS occurrences → `obs_obis` counts + `rng_occ` buffered-record range"
+subtitle: "v11 Q1: one OBIS snapshot (marinebon/obisindicators export, global 0.05° cells) for every record count, and the occurrence-buffer range dataset"
+msens:
+  target_name: ingest_obis_occurrence
+  workflow_type: ingest
+  dependency: [build_cell_grid]
+  output: data/manifests/ingest_obis_occurrence.json
+  # `rng_occ` is a RANGE dataset (the cells within d km of a record) that is NOT merged as one: merge_models_prep
+  # excludes it (it would max-merge as a plain range and move every turtle score); the occurrence rule
+  # (v11 Q2, msens::occurrence_rule()) reads it as the evidence footprint. native_format is `parquet`
+  # (like ms_merge), not raster/vector: there is no native asset for stac/publish_native to expect.
+  dataset: {ds_key: rng_occ, response_type: range, source_authority: OBIS, temporal_interval: static,
+            native_format: parquet, name_short: "OBIS record buffer (range)", name_display: "OBIS record buffer",
+            description: "Cells within d km (OCC_BUFFER_KM, default 100) of any 0.05 degree cell holding at least one OBIS occurrence record of the species, from the obisindicators export of one OBIS snapshot. A range dataset valued at the species' extinction-risk score. Evidence footprint for the v11 occurrence rule; not merged as a range.",
+            value_info: "extinction-risk score of the species (compute_er_score) on every cell within d km of a record",
+            regions: "global (the species' recorded surroundings)", is_mask: false,
+            citation: "OBIS (Ocean Biodiversity Information System). Intergovernmental Oceanographic Commission of UNESCO. https://obis.org. Occurrence counts per 0.05 degree cell from the marinebon/obisindicators export (OBIS snapshot and WoRMS version recorded in the manifest).",
+            link_info: "https://obis.org"}
+format: html
+editor_options:
+  chunk_output_type: console
+---
+
+v11 counts every record from **one OBIS snapshot**: the monthly H3 store that
+[marinebon/obisindicators](https://github.com/marinebon/obisindicators) refreshes on the Mac mini and
+publishes beside its indicator layers as `obis-h3/vYYYYMMDD/`. The MST-facing export in that folder is
+
+- `obis_cell.parquet` — `aphiaid, cell_id, date_year, records`: every OBIS species-level record count per
+  MST `global05` cell (the cell holding the centroid of its H3 res-7 hexagon, ~5 km² against the cell's
+  ~25 km²), `date_year` NULL where the record has no year;
+- `worms_taxon.parquet` — the WoRMS taxonomy of the same release (read by `ingest_worms.qmd` under
+  `WORMS_SOURCE=obisindicators`);
+- `release.json` — whose `mst` block records `obis_snapshot` and `worms_version`.
+
+The release is `OBIS_H3_RELEASE` (default `v20261012`), read from `{obis_h3_dir}/{release}` (`~/_big/obis/obis-h3`
+on the laptop and the Mac mini) and, when that folder is absent, over HTTPS from `obis_h3_url`.
+
+This notebook writes two things:
+
+1. **`obs_obis`** — the occurrence-count table, kept whole (all 170,174 AphiaIDs, ~99 MB) as Parquet at
+   `marine-atlas/obs/dataset=obs_obis/obis_cell.parquet` beside a copy of `worms_taxon.parquet` and the
+   release's provenance. It is not in `dist/`, which is for `(mdl_key, cell_id, val)` model surfaces. Every
+   v11 count (the occurrence rule, the R2 fallbacks, effort proxies) reads this one file.
+2. **`rng_occ`** — for a configured species list (`data/v11/occ_species.csv`: the six sea turtles and the
+   North Atlantic right whale; `OCC_SPECIES=137205,159023` selects a subset) the **cells within `d` km of any
+   cell with ≥ 1 record**, as `dist/dataset=rng_occ/{aphiaid}_d{d}km.parquet` — `(mdl_key, cell_id, val)`,
+   `mdl_key = "rng_occ|{aphiaid}"`, `val` = the species' extinction-risk score. One `d` per run
+   (`OCC_BUFFER_KM`, default 100, `libs/vars.R`), recorded in the file name, in `model_rng_occ.csv` and in the
+   manifest; a run at another `d`, another release or another species set clears the files it supersedes
+   (the merge input globs `dist/*/*.parquet`, so a stale `d` must never survive beside a new one).
+
+The **gate** at the end is the Q1 acceptance: for the six turtles and the right whale, the OBIS records per BOEM
+ecoregion counted from `obis_cell.parquet` × the ecoregion zone cells must reproduce the v7c evidence table
+(`data/v7c/records_species_ecoregion.csv`, channel `obis_all`, taken from the 2025-03-18 OBIS export) within the
+snapshot difference.
+
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "obisindicators export → obs_obis table + rng_occ buffered-record range; gate against the v7c evidence counts"
+flowchart LR
+  rel["obis-h3/vYYYYMMDD/<br/>obis_cell + worms_taxon + release.json"] --> obs[("marine-atlas/obs/<br/>dataset=obs_obis/")]
+  rel --> sp["species list<br/>data/v11/occ_species.csv"]
+  sp --> rc["cells with >= 1 record"]
+  rc --> buf["cells within d km<br/>(haversine on cell centres)"]
+  buf --> rng[("dist/dataset=rng_occ/<br/>(mdl_key, cell_id, val)")]
+  obs --> gate{"gate: records per ecoregion<br/>vs v7c obis_all"}
+  zc["zones/ecoregion_2025-06/<br/>global05/zone_cell"] --> gate
+  gate --> mf["hash → manifest"]
+  rng --> mf
+```
+
+## Setup
+
+```{r}
+#| label: setup
+
+librarian::shelf(
+  arrow, DBI, digest, dplyr, duckdb, fs, glue, here, jsonlite, logger, purrr, readr, stringr,
+  tibble, MarineSensitivity/msens, quiet = T)
+source(here("libs/paths.R"))          # ver, dir_big_v, dir_derived, obis_h3_*
+source(here("libs/vars.R"))           # redo_ingest, occ_buffer_km
+source(here("libs/obis_h3.R"))        # obis_h3_src(), obis_h3_info()
+stopifnot("msens 0.62.1 or newer is required (cells_within_sql / cell_id_of)" = packageVersion("msens") >= "0.62.1")
+source(here("libs/duckdb_budget.R"))  # duckdb_tune()
+options(readr.show_col_types = F)
+
+ds_key    <- "rng_occ"
+dir_atlas <- path.expand(glue("{dir_big_v}/marine-atlas"))
+dir_dist  <- glue("{dir_atlas}/dist/dataset={ds_key}")
+dir_obs   <- glue("{dir_atlas}/obs/dataset=obs_obis")
+f_model   <- glue("{dir_atlas}/dist/model_{ds_key}.csv")
+manifest  <- here("data/manifests/ingest_obis_occurrence.json")
+dir_create(c(dir_dist, dir_obs, path_dir(manifest)))
+stopifnot("OCC_BUFFER_KM must be a positive number" = is.finite(occ_buffer_km) && occ_buffer_km > 0,
+          "run build_cell_grid.qmd first" = file_exists(cellid_tif))
+d_tag <- format(occ_buffer_km, trim = TRUE, scientific = FALSE)   # 100 -> "100": the file-name tag
+
+info <- obis_h3_info()
+log_info("OBIS release {info$release}: OBIS {info$obis_snapshot}, WoRMS {info$worms_version}, ",
+         "{format(info$n_rows, big.mark = ',')} rows / {format(info$records, big.mark = ',')} records ",
+         "({if (info$remote) 'over HTTPS' else 'local folder'}); buffer d = {d_tag} km")
+
+con <- dbConnect(duckdb())
+duckdb_tune(con, path.expand(glue("{dir_big_v}/_tmp")))
+dbExecute(con, "SET preserve_insertion_order = true")   # the sorted COPYs below need it (duckdb_tune turns it off)
+if (info$remote) obis_h3_httpfs(con)
+```
+
+## `obs_obis` — the occurrence counts, all AphiaIDs
+
+The file is copied (re-encoded V2/zstd, sorted by `aphiaid, cell_id` so a per-species read prunes row groups),
+not filtered: the pipeline's taxon table does not exist yet at this stage of a version, and the whole table is
+99 MB. The copy is skipped when the folder already holds this release.
+
+```{r}
+#| label: obs
+
+f_cell  <- glue("{dir_obs}/obis_cell.parquet")
+f_worms <- glue("{dir_obs}/worms_taxon.parquet")
+f_rel   <- glue("{dir_obs}/release.json")
+prev    <- if (file_exists(f_rel)) read_json(f_rel) else list()
+fresh   <- !redo_ingest && file_exists(f_cell) && file_exists(f_worms) &&
+  identical(prev$release, info$release) && identical(prev$obis_snapshot, info$obis_snapshot)
+
+if (fresh) {
+  log_info("obs_obis already holds {info$release}; skipping the copy (REDO_INGEST=1 to force)")
+} else {
+  msens::copy_atlas_parquet(con, glue(
+    "SELECT aphiaid, cell_id, date_year, records FROM read_parquet('{obis_h3_src('obis_cell.parquet')$path}')"),
+    f_cell, order_by = "aphiaid, cell_id, date_year")
+  msens::copy_atlas_parquet(con, glue(
+    "SELECT * FROM read_parquet('{obis_h3_src('worms_taxon.parquet')$path}')"),
+    f_worms, order_by = "taxonID")
+  write_json(info[c("release", "obis_snapshot", "worms_version", "h3_res", "grid_id", "n_rows", "records", "n_aphiaid")],
+             f_rel, auto_unbox = TRUE, pretty = TRUE)
+}
+
+obs <- dbGetQuery(con, glue("
+  SELECT count(*) AS n_rows, sum(records)::BIGINT AS records, count(DISTINCT aphiaid) AS n_aphiaid,
+         min(cell_id) AS cell_min, max(cell_id) AS cell_max, count(*) FILTER (WHERE date_year IS NULL) AS n_no_year
+  FROM read_parquet('{f_cell}')"))
+n_worms <- dbGetQuery(con, glue("SELECT count(*) n FROM read_parquet('{f_worms}')"))$n
+# the copy must be the release, row for row and record for record
+stopifnot("obs_obis rows != release.json" = obs$n_rows == info$n_rows,
+          "obs_obis records != release.json" = obs$records == info$records,
+          "obs_obis AphiaIDs != release.json" = obs$n_aphiaid == info$n_aphiaid,
+          "worms_taxon rows != release.json" = n_worms == info$files$worms_taxon$rows,
+          "cell_id outside the global05 grid" = obs$cell_min >= 1, obs$cell_max <= 7200L * 3600L)
+msens::report_table(
+  tibble(release = info$release, obis_snapshot = info$obis_snapshot, worms_version = info$worms_version,
+         rows = obs$n_rows, records = obs$records, aphiaids = obs$n_aphiaid, no_year_rows = obs$n_no_year,
+         worms_taxa = n_worms),
+  caption = "obs_obis: the copied OBIS occurrence counts")
+```
+
+## The species and their AphiaIDs
+
+Each configured AphiaID is checked against the release's own WoRMS table (name, rank, status): a wrong id would
+buffer another species' records without any error. Records filed under a synonym's AphiaID count toward the
+accepted species (none do in v20261012 — OBIS files them under the accepted id — but the join is by
+`acceptedNameUsageID`, so a later release that did would not drop them).
+
+```{r}
+#| label: species
+
+sp <- read_csv(here("data/v11/occ_species.csv"))
+sel <- Sys.getenv("OCC_SPECIES")
+if (nzchar(sel)) {
+  ids <- as.integer(strsplit(sel, ",")[[1]])
+  stopifnot("OCC_SPECIES names an AphiaID not in data/v11/occ_species.csv" = all(ids %in% sp$aphiaid))
+  sp <- filter(sp, aphiaid %in% ids)
+}
+stopifnot(nrow(sp) > 0, !anyDuplicated(sp$aphiaid))
+
+w <- dbGetQuery(con, glue("
+  SELECT taxonID AS aphiaid, scientificName, taxonRank, taxonomicStatus
+  FROM read_parquet('{f_worms}') WHERE taxonID IN ({paste(sp$aphiaid, collapse = ',')})"))
+chk <- sp |> left_join(w, by = "aphiaid")
+stopifnot("an AphiaID is not in worms_taxon.parquet" = !anyNA(chk$scientificName),
+          "an AphiaID's WoRMS name differs from data/v11/occ_species.csv" = all(chk$scientificName == chk$scientific_name),
+          "an AphiaID is not an accepted species" = all(chk$taxonRank == "Species" & chk$taxonomicStatus == "accepted"))
+
+sp <- sp |>
+  mutate(mdl_key  = mdl_key_raw(ds_key, aphiaid),
+         er_score = map_dbl(er_code, compute_er_score),   # the range value: NEVER hard-coded
+         file     = as.character(glue("{dir_dist}/{aphiaid}_d{d_tag}km.parquet")))
+msens::report_table(select(chk, aphiaid, scientific_name, common_name, taxonRank, taxonomicStatus),
+                    caption = "Species checked against worms_taxon.parquet")
+```
+
+## Cells with at least one record
+
+```{r}
+#| label: record-cells
+
+dbExecute(con, glue("
+  CREATE OR REPLACE TEMP TABLE sp_ids AS
+  SELECT w.taxonID AS aphiaid, coalesce(w.acceptedNameUsageID, w.taxonID) AS sp_aphia
+  FROM read_parquet('{f_worms}') w
+  WHERE coalesce(w.acceptedNameUsageID, w.taxonID) IN ({paste(sp$aphiaid, collapse = ',')})"))
+dbExecute(con, glue("
+  CREATE OR REPLACE TEMP TABLE rc AS
+  SELECT s.sp_aphia AS aphiaid, o.cell_id, sum(o.records)::BIGINT AS n
+  FROM read_parquet('{f_cell}') o JOIN sp_ids s ON o.aphiaid = s.aphiaid
+  WHERE o.records >= 1
+  GROUP BY 1, 2"))   # basis of record is not in the export: every record counts, as in the v7c obis_all channel
+rc_n <- dbGetQuery(con, "SELECT aphiaid, count(*) AS n_record_cells, sum(n) AS n_records FROM rc GROUP BY 1")
+sp <- sp |> left_join(rc_n, by = "aphiaid")
+stopifnot("a configured species has no OBIS record at all" = !anyNA(sp$n_record_cells))
+```
+
+## `rng_occ` — the cells within d km of a record
+
+A cell is within `d` km when the great-circle distance between its **centre** and the centre of a record cell is
+≤ `d` (`msens::cells_within_sql()`, unit-tested against a brute-force scan: haversine, R = 6371.0088 km, in DuckDB on the `cell_id`
+arithmetic — no spatial extension, no raster). The column index wraps modulo 7200, so the **antimeridian
+needs no special case** (the Aleutians and Fiji are one contiguous neighbourhood), and the longitude reach of
+the cap widens with latitude (`asin(sin(d/R)/cos(lat))`, every longitude when the cap holds a pole). The
+whole grid is buffered, land cells included: this is a range dataset, and "how marine" is derived at the merge.
+The self-test below checks the SQL against a brute-force scan of all 25.9 M cells.
+
+```{r}
+#| label: buffer
+
+# clear what this run supersedes: another release, another d, or a species no longer configured
+prev_model <- if (file_exists(f_model)) read_csv(f_model) else NULL
+same_run <- !redo_ingest && !is.null(prev_model) && "release" %in% names(prev_model) &&
+  all(prev_model$release == info$release) && all(prev_model$obis_snapshot == info$obis_snapshot) &&
+  all(prev_model$buffer_km == occ_buffer_km)
+have <- as.character(dir_ls(dir_dist, glob = "*.parquet"))
+drop <- if (same_run) setdiff(have, sp$file) else have
+if (length(drop)) {
+  log_info("clearing {length(drop)} rng_occ file(s) from another release / d / species set")
+  file_delete(drop)
+}
+# the crosswalk first (counts are filled at the end), so a killed run resumes only its own release + d
+sp_model <- function(sp) {
+  if (!"n_cells" %in% names(sp)) sp$n_cells <- NA_integer_
+  transmute(sp, mdl_key, sp_id = aphiaid, worms_id = aphiaid, scientific_name, common_name, er_code, er_score,
+            buffer_km = occ_buffer_km, n_record_cells, n_records, n_cells,
+            release = info$release, obis_snapshot = info$obis_snapshot)
+}
+write_csv(sp_model(sp), f_model)
+
+for (i in seq_len(nrow(sp))) {
+  s <- sp[i, ]
+  if (file_exists(s$file)) { log_info("{s$aphiaid} {s$common_name}: skip (exists)"); next }
+  dbExecute(con, glue("CREATE OR REPLACE TEMP TABLE src AS SELECT cell_id FROM rc WHERE aphiaid = {s$aphiaid}"))
+  t0 <- Sys.time()
+  msens::copy_atlas_parquet(con, glue(
+    "SELECT '{s$mdl_key}' AS mdl_key, cell_id, {s$er_score}::DOUBLE AS val FROM ({msens::cells_within_sql('src', occ_buffer_km)})"),
+    s$file, order_by = "cell_id")
+  log_info("{s$aphiaid} {s$common_name}: {s$n_record_cells} record cells -> buffered in ",
+           "{round(as.numeric(difftime(Sys.time(), t0, units = 'secs')), 1)} s")
+}
+```
+
+## Verify
+
+```{r}
+#| label: verify
+
+# (1) the SQL buffer equals a brute-force scan, at the antimeridian (both sides), mid-latitude, the equator and both poles
+tests <- tribble(
+  ~name,             ~lon,     ~lat,
+  "antimeridian E",   179.975,    0.025,
+  "antimeridian W",  -179.975,   60.025,
+  "equator",           10.025,    0.025,
+  "Bering 70N",      -179.975,   70.025,
+  "north pole cap",     0.025,   89.975,
+  "south pole cap",  -120.025,  -89.975,
+  "Oregon coast",    -124.775,   48.625)
+# brute force over ALL 25.9 M cells (test-only; the rule itself is msens::cells_within_sql)
+occ_buffer_brute_sql <- function(cell_id, d_km, ncol = 7200L, nrow = 3600L, deg = 0.05) {
+  R_km <- 6371.0088
+  glue::glue("
+    WITH a AS (
+      SELECT 90 - (({cell_id} - 1) // {ncol} + 0.5) * {deg} AS lat0,
+             -180 + (({cell_id} - 1) % {ncol} + 0.5) * {deg} AS lon0),
+    g AS (
+      SELECT (i + 1)::INTEGER AS cell_id, 90 - (i // {ncol} + 0.5) * {deg} AS lat1, -180 + (i % {ncol} + 0.5) * {deg} AS lon1
+      FROM range(0, {ncol * nrow}) t(i))
+    SELECT g.cell_id FROM g, a
+    WHERE 2 * {R_km} * asin(sqrt(least(1,
+            pow(sin(radians(lat1 - lat0) / 2), 2) +
+            cos(radians(lat0)) * cos(radians(lat1)) * pow(sin(radians(lon1 - lon0) / 2), 2)))) <= {d_km}
+    ORDER BY g.cell_id", .trim = TRUE)
+}
+selftest <- pmap_dfr(tests, \(name, lon, lat) {
+  cid <- msens::cell_id_of(lon, lat)
+  dbWriteTable(con, "t1", tibble(cell_id = cid), overwrite = TRUE)
+  a <- dbGetQuery(con, paste(msens::cells_within_sql("t1", occ_buffer_km), "ORDER BY 1"))$cell_id
+  b <- dbGetQuery(con, occ_buffer_brute_sql(cid, occ_buffer_km))$cell_id
+  tibble(name, cell_id = cid, n_sql = length(a), n_brute = length(b), identical = identical(a, b)) })
+stopifnot("msens::cells_within_sql() differs from the brute-force haversine scan" = all(selftest$identical))
+msens::report_table(selftest, caption = glue("Self-test: msens::cells_within_sql() vs brute force over every cell, d = {d_tag} km"))
+
+# (2) the written surfaces
+sm <- dbGetQuery(con, glue("
+  SELECT mdl_key, count(*) AS n_cells, min(cell_id) AS cell_min, max(cell_id) AS cell_max,
+         min(val) AS val_min, max(val) AS val_max, count(DISTINCT cell_id) AS n_distinct
+  FROM read_parquet('{dir_dist}/*.parquet', hive_partitioning = false) GROUP BY 1 ORDER BY 1"))
+chk <- sp |> select(mdl_key, er_score, n_record_cells) |> inner_join(sm, by = "mdl_key")
+stopifnot("a species has no rng_occ surface" = nrow(chk) == nrow(sp),
+          "rng_occ rows are not distinct cells" = all(chk$n_cells == chk$n_distinct),
+          "cell_id outside [1, 25,920,000]" = all(chk$cell_min >= 1, chk$cell_max <= 7200L * 3600L),
+          "val != the species' compute_er_score()" = all(chk$val_min == chk$er_score & chk$val_max == chk$er_score),
+          "the buffer lost record cells" = all(chk$n_cells >= chk$n_record_cells))
+# (3) every record cell is inside its own buffer
+miss <- sum(map_dbl(seq_len(nrow(sp)), \(i) dbGetQuery(con, glue("
+  SELECT count(*) n FROM rc WHERE aphiaid = {sp$aphiaid[i]}
+    AND cell_id NOT IN (SELECT cell_id FROM read_parquet('{sp$file[i]}'))"))$n))
+stopifnot("a record cell is missing from its own buffer" = miss == 0)
+
+sp <- sp |> left_join(select(sm, mdl_key, n_cells), by = "mdl_key")
+write_csv(sp_model(sp), f_model)
+msens::report_table(
+  sp |> transmute(aphiaid, species = common_name, er_score, record_cells = n_record_cells, records = n_records,
+                  buffer_km = occ_buffer_km, rng_occ_cells = n_cells),
+  caption = "rng_occ: cells within d km of a record, per species")
+```
+
+## Gate — records per ecoregion against the v7c evidence
+
+For the six turtles and the right whale: the OBIS records per BOEM ecoregion counted here (`obis_cell.parquet`
+× the shared ecoregion zone cells of the `global05` grid) against `data/v7c/records_species_ecoregion.csv`,
+channel `obis_all` (the OBIS export of 2025-03-18, `build_v7c_exclusions.qmd`).
+
+**Assignment follows the v7c count so the two are comparable:** a cell goes to the ecoregion covering most of it
+(`pct_covered`, ties to the first key — `msens::cell_zone_major_sql()`'s rule), and a cell in no ecoregion (a
+beach or harbour record) goes to the nearest ecoregion cell within 5 cells (0.25°, ≈ 25 km), searched on the
+grid. Records without a year count.
+
+**Resolution caveat.** v7c located each record by its coordinates, to its 0.05° cell; here the record is the
+centroid cell of its H3 res-7 hexagon (≤ ~2.5 km from the point), so a record within a hex of an ecoregion edge
+or of the 25-km search radius can fall on the other side. And v7c intersected cells with the v7 ecoregion
+vintage on the `usa05` grid; the zone cells here are the `global05` extract of the same polygons. Counts near an
+edge therefore move by a few records either way.
+
+**Rules** (per species × ecoregion; `old` = the v7c count, `new` = this snapshot):
+
+- *zero*: `old = 0` ⇒ `new = 0` — a place v7c found never recorded must still be so, else the v7c exclusions
+  (turtles out of the East Bering Sea, the right whale out of the Gulf of America) lose their evidence;
+- *lower*: `new ≥ old − max(5, 2 % of old)` — OBIS only grows between snapshots; the slack is the edge effect above;
+- *upper*: `new ≤ 1.5 × old + 5` — the growth the snapshot difference can account for.
+
+A deviation passes only when `data/v11/obis_gate_reviewed.csv` lists the pair and rule with `status = accepted`
+and a reason; anything else stops the render (`OBIS_GATE=warn` logs it instead, for a look at the table).
+
+```{r}
+#| label: gate
+
+gate_mode <- match.arg(Sys.getenv("OBIS_GATE", "stop"), c("stop", "warn"))
+f_zc  <- path.expand(glue("{dir_derived}/zones/ecoregion_2025-06/global05/zone_cell.parquet"))
+f_v7c <- here("data/v7c/records_species_ecoregion.csv")
+stopifnot("ecoregion zone_cell (global05) missing: build_zone_sets.qmd" = file_exists(f_zc), file_exists(f_v7c))
+
+old <- read_csv(f_v7c) |> filter(channel == "obis_all") |>
+  transmute(common, aphia = as.integer(aphia), eco, old = as.integer(n))
+g_ids <- unique(old$aphia)
+
+dbExecute(con, glue("
+  CREATE OR REPLACE TEMP TABLE cz AS
+  SELECT cell_id, zone_key FROM (
+    SELECT cell_id, zone_key, row_number() OVER (PARTITION BY cell_id ORDER BY pct_covered DESC, zone_key) AS r
+    FROM read_parquet('{f_zc}')) WHERE r = 1"))
+dbExecute(con, glue("
+  CREATE OR REPLACE TEMP TABLE g_ids AS
+  SELECT w.taxonID AS aphiaid, coalesce(w.acceptedNameUsageID, w.taxonID) AS sp_aphia
+  FROM read_parquet('{f_worms}') w WHERE coalesce(w.acceptedNameUsageID, w.taxonID) IN ({paste(g_ids, collapse = ',')})"))
+dbExecute(con, glue("
+  CREATE OR REPLACE TEMP TABLE g_oc AS
+  SELECT g.sp_aphia AS aphia, o.cell_id, sum(o.records)::BIGINT AS n
+  FROM read_parquet('{f_cell}') o JOIN g_ids g ON o.aphiaid = g.aphiaid WHERE o.records >= 1 GROUP BY 1, 2"))
+# cells in no ecoregion -> the nearest ecoregion cell within 5 cells (distance in cells, circular offsets), column wrap at 7200
+dbExecute(con, "
+  CREATE OR REPLACE TEMP TABLE g_un AS SELECT DISTINCT cell_id FROM g_oc WHERE cell_id NOT IN (SELECT cell_id FROM cz)")
+dbExecute(con, "
+  CREATE OR REPLACE TEMP TABLE g_off AS
+  SELECT dr, dc, dr * dr + dc * dc AS d2 FROM range(-5, 6) a(dr), range(-5, 6) b(dc) WHERE dr * dr + dc * dc <= 25")
+dbExecute(con, "
+  CREATE OR REPLACE TEMP TABLE g_near AS
+  SELECT cell_id, zone_key AS eco_near FROM (
+    SELECT u.cell_id, cz.zone_key,
+           row_number() OVER (PARTITION BY u.cell_id ORDER BY o.d2, cz.zone_key) AS r
+    FROM g_un u CROSS JOIN g_off o
+    JOIN cz ON cz.cell_id = (((u.cell_id - 1) // 7200 + o.dr) * 7200 + ((u.cell_id - 1) % 7200 + o.dc + 7200) % 7200 + 1)
+    WHERE (u.cell_id - 1) // 7200 + o.dr BETWEEN 0 AND 3599) WHERE r = 1")
+new <- dbGetQuery(con, "
+  SELECT o.aphia, coalesce(cz.zone_key, n.eco_near) AS eco,
+         sum(o.n)::BIGINT AS new, (sum(o.n) FILTER (WHERE cz.zone_key IS NOT NULL))::BIGINT AS new_in_cells
+  FROM g_oc o LEFT JOIN cz USING (cell_id) LEFT JOIN g_near n USING (cell_id)
+  WHERE coalesce(cz.zone_key, n.eco_near) IS NOT NULL GROUP BY 1, 2") |> as_tibble() |>
+  mutate(aphia = as.integer(aphia))
+
+cmp <- old |>
+  left_join(new, by = c("aphia", "eco")) |>
+  mutate(across(c(new, new_in_cells), \(x) coalesce(as.integer(x), 0L)),
+         lower_ok = new >= old - pmax(5, 0.02 * old),
+         upper_ok = new <= 1.5 * old + 5,
+         rule     = case_when(old == 0L & new > 0L ~ "zero",
+                              !lower_ok            ~ "lower",
+                              !upper_ok            ~ "upper",
+                              TRUE                 ~ NA_character_),
+         verdict  = if_else(is.na(rule), "ok", paste("DEVIATES:", rule)),
+         ratio    = round(if_else(old > 0L, new / old, NA_real_), 2)) |>
+  arrange(factor(aphia, g_ids), eco)
+msens::report_table(
+  cmp |> select(species = common, aphia, eco, `v7c obis_all (2025-03-18)` = old, `this snapshot` = new,
+                `of which in-ecoregion cells` = new_in_cells, ratio, verdict),
+  caption = glue("OBIS records per ecoregion: v7c evidence vs {info$obis_snapshot} snapshot ",
+                 "({nrow(cmp)} species x ecoregion pairs)"))
+
+f_rev <- here("data/v11/obis_gate_reviewed.csv")
+reviewed <- if (file_exists(f_rev)) read_csv(f_rev) else tibble(aphia = integer(), eco = character(), rule = character(), status = character(), reason = character())
+dev   <- cmp |> filter(!is.na(rule)) |>
+  left_join(mutate(reviewed, aphia = as.integer(aphia)), by = c("aphia", "eco", "rule"))
+unreviewed <- dev |> filter(is.na(status) | status != "accepted")
+n_zero_kept <- cmp |> filter(old == 0L, new == 0L) |> nrow()
+log_info("gate: {nrow(cmp)} pairs; {sum(cmp$old == 0L)} zero in v7c ({n_zero_kept} still zero); ",
+         "{nrow(dev)} deviate ({nrow(unreviewed)} not accepted in obis_gate_reviewed.csv)")
+if (nrow(unreviewed)) {
+  print(msens::report_table(unreviewed |> select(common, aphia, eco, old, new, rule, status),
+                            caption = "Gate deviations that no accepted row in data/v11/obis_gate_reviewed.csv covers"))
+  msg <- glue("OBIS gate: {nrow(unreviewed)} species x ecoregion pair(s) deviate from the v7c evidence beyond the ",
+              "snapshot tolerance and are not accepted in data/v11/obis_gate_reviewed.csv (OBIS_GATE=warn to log instead)")
+  if (gate_mode == "stop") stop(msg) else log_warn(msg)
+}
+```
+
+## Manifest
+
+```{r}
+#| label: manifest
+
+h_rng <- msens::hash_parquet(glue("{dir_dist}/*.parquet"), con)
+h_obs <- msens::hash_parquet(f_cell, con)
+h     <- digest(c(h_rng, h_obs), algo = "xxhash64", serialize = TRUE)
+dbDisconnect(con, shutdown = TRUE)
+
+# content-addressed manifest: deterministic (no wall-clock, no machine paths), so downstream targets re-run only
+# when the surfaces or the snapshot change. The snapshot and WoRMS version are recorded: every v11 record count
+# comes from this one release.
+msens::write_manifest(
+  manifest, target = "ingest_obis_occurrence", content_hash = h,
+  stats = list(
+    ds_key = ds_key, ver = ver, release = info$release, obis_snapshot = info$obis_snapshot,
+    worms_version = info$worms_version, h3_res = info$h3_res, buffer_km = occ_buffer_km,
+    n_species = nrow(sp), n_rng_occ_cells = sum(sp$n_cells), hash_rng_occ = h_rng, hash_obs_obis = h_obs,
+    obs_rows = obs$n_rows, obs_records = obs$records, obs_aphiaid = obs$n_aphiaid,
+    gate_pairs = nrow(cmp), gate_zero_pairs = sum(cmp$old == 0L), gate_zero_kept = n_zero_kept,
+    gate_deviations = nrow(dev), gate_unreviewed = nrow(unreviewed)),
+  force = msens::force_target("ingest_obis_occurrence"))
+```

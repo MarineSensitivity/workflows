@@ -48,6 +48,9 @@ redo_denom <- .flag("REDO_DENOM")  # build_taxon_global_total.qmd: rebuild taxon
 # ingest_productivity.qmd (v11 Q4)
 redo_vgpm_download <- .flag("REDO_VGPM_DOWNLOAD")  # ingest_productivity.qmd: re-download + re-untar the OSU monthly VGPM tarballs
 
+# ingest_obis-occurrence.qmd (v11 Q1)
+occ_buffer_km <- as.numeric(Sys.getenv("OCC_BUFFER_KM", "100"))  # rng_occ: cells within d km of a cell with >= 1 OBIS record
+
 # v11 method flags (plan 2026-10-29 §4, §4.10 Q0): every flag OFF reproduces v10 — the control run
 # `scripts/run_version.sh --control` is every flag off and its digests must equal v10's. Each flag is
 # read HERE and consumed by the stage it enters (named in the comment); a stage that does not yet

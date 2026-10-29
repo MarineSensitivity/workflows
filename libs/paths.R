@@ -43,6 +43,15 @@ bio_oracle_tif <- glue::glue("{dir_raw}/bio-oracle.org/bio-oracle_v3.tif")
 # cell_id by position. Shared across versions.
 cellid_tif <- glue::glue("{dir_derived}/r_cellid_global.tif")
 
+# OBIS + WoRMS export of marinebon/obisindicators (v11 Q1): one folder per monthly release
+# (`obis-h3/vYYYYMMDD/`: obis_cell.parquet, worms_taxon.parquet, release.json beside the indicators).
+# `~/_big` is the external disk on the Mac mini (a symlink to /Volumes/msens_big/_big), so one spelling
+# serves the laptop and the mini. libs/obis_h3.R reads from here and falls back to obis_h3_url (HTTPS)
+# when the folder is absent -- the published location after the monthly job (first run 2026-11-01).
+obis_h3_dir     <- ifelse(is_server, "/share/data/obis/obis-h3", "~/_big/obis/obis-h3")
+obis_h3_release <- Sys.getenv("OBIS_H3_RELEASE", "v20261012")   # the release every v11 record count comes from
+obis_h3_url     <- "https://s3.us-east-1.amazonaws.com/oceanmetrics.io-public/obis-h3"
+
 # AquaMaps source db + precomputed bilinear weight table (HCAF 0.5 deg -> 0.05 deg
 # cells; built once by ingest_aquamaps.qmd, shared across versions on this grid).
 # The 3.7GB am.duckdb + weights live under dir_big (~/_big, fast local disk) on the
