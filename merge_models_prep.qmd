@@ -95,10 +95,20 @@ models <- lookup |> filter(mdl_key %in% ingested)
 # so a name can now land on a synonym id), moved one taxon's ER and broke the plumbing check by 3
 # taxa. Name / native-id resolution below is for models ver_prev never had (ax, new ranges).
 prev_tm_pq <- path.expand(glue("{dir_big}/{ver_prev}/marine-atlas/tables/taxon_model.parquet"))
+prev_tm_db <- path.expand(glue("{dir_big}/{ver_prev}/marine-atlas/merge.duckdb"))
 prev_tm <- if (file_exists(prev_tm_pq)) {
   arrow::read_parquet(prev_tm_pq) |>
     transmute(mdl_key, prev_authority = taxon_authority, prev_taxon_id = as.character(taxon_id))
-} else { log_warn("no ver_prev taxon_model at {prev_tm_pq} — every model resolves afresh"); tibble(mdl_key = character(), prev_authority = character(), prev_taxon_id = character()) }
+} else if (file_exists(prev_tm_db)) {
+  # the released tables/ live on the publish machine; the render machine has ver_prev's merge.duckdb
+  # (v10 on the mini: the verified clone of v8's), whose taxon_model is the same crosswalk
+  log_info("ver_prev taxon_model read from {prev_tm_db} (no released tables/ on this machine)")
+  con_p <- dbConnect(duckdb(prev_tm_db, read_only = TRUE))
+  on.exit(dbDisconnect(con_p, shutdown = TRUE), add = TRUE)
+  dbGetQuery(con_p, "SELECT mdl_key, taxon_authority AS prev_authority, CAST(taxon_id AS VARCHAR) AS prev_taxon_id FROM taxon_model") |>
+    as_tibble()
+} else { log_warn("no ver_prev taxon_model at {prev_tm_pq} nor {prev_tm_db} — every model resolves afresh"); tibble(mdl_key = character(), prev_authority = character(), prev_taxon_id = character()) }
+stopifnot("ver_prev's crosswalk must not repeat a mdl_key" = !anyDuplicated(prev_tm$mdl_key))
 models <- models |> left_join(prev_tm, by = "mdl_key")
 log_info("crosswalk reuse: {sum(!is.na(models$prev_taxon_id))} models keep {ver_prev}'s taxon by mdl_key; {sum(is.na(models$prev_taxon_id))} resolve afresh")
 # the CONTROL run (AX_SUPERSEDE=0) merges EXACTLY ver_prev's model set, so its hash is binary
