@@ -1,0 +1,822 @@
+---
+title: "The occurrence rule over every scored taxon x 12 ecoregions (v11 Q2)"
+subtitle: "msens::occurrence_rule() at the D10 defaults on OBIS records: anchors, tabulation by component, sensitivity to buffer, effort proxy and ratio"
+msens:
+  target_name: explore_occurrence_rule
+  workflow_type: score
+  dependency: [ingest_obis_occurrence]
+  output: data/manifests/explore_occurrence_rule.json
+format: html
+editor_options:
+  chunk_output_type: console
+---
+
+<!--
+HOW merge_models.qmd CONSUMES THIS (OCC_RULE=1, the orchestrator wires it; nothing here couples through a flag):
+
+  data/v11/zone_exclusions_occ.csv  = msens::occurrence_exclusions() at the D10 defaults, one row per DROPPED
+  (mdl_key, zone_key), the shape msens::zone_exclude_sql(id_col = "mdl_key") takes, with the counts and the
+  verdict that justify the row. data/manifests/explore_occurrence_rule.json records the CSV's xxhash64.
+
+RESUMABILITY (every expensive step is a cache under {dir_big_v}/marine-atlas/occ/, rebuilt only if missing
+or REDO_OCC=1): obis_sp, worms_lineage, effort_blocks, region_rec_{d}km, taxa, ch, and one counts/{sig}/{batch}.parquet
+per batch of taxa. A killed render resumes at the first batch without a file.
+
+SMOKE TEST: OCC_TEST_N=<n> runs the anchors plus the first n other taxa, writes nothing to data/ and skips the
+final assertion unless the anchors were run. OCC_SRC_VER points the rule at another version's merged outputs.
+-->
+
+## Goal
+
+v7c removed two things by hand-evidenced rows: the sea turtles from the East Bering Sea (zero records in nine channels)
+and the North Atlantic right whale from the Gulf of America ecoregions (an "outside range" judgment). Tim White
+(2026-10-21) asked for one written rule that treats both the same way, with tiers: protected places override,
+"unsampled is unknown, not absent", wide-ranging taxa. The rule is `msens::occurrence_rule()` (msens 0.63.0, a wrapper
+of `region_effort_test()`, rule E of `obis_range_constraint.qmd`): per ecoregion, the species' modelled 0.5-degree blocks
+that were **searched** (a record of its effort group exists) against those that hold a record of the species, judged
+against the species' record rate in its OTHER ecoregions (`OCC_BASELINE=zones`, the default since msens 0.63.0; `range` =
+the whole modelled range, the rule as first written, kept below as a sensitivity: the right whale's modelled range spans
+the North Atlantic, most of it unsurveyed in OBIS, and against that diluted baseline its Gulf pairs could not be
+significantly fewer); an ecoregion is dropped only when records are significantly (binomial p < alpha) AND materially
+(rate < ratio x the baseline rate) fewer, kept when nobody looked.
+
+This notebook runs that rule at the D10 defaults over **every scored taxon x the 12 BOEM ecoregions** and tabulates it
+by component. It writes `data/v11/zone_exclusions_occ.csv`, which `merge_models.qmd` consumes under `OCC_RULE=1`.
+
+**Scope of this version of the notebook.** Records come from **OBIS only** (the obisindicators `obis_cell` export,
+`libs/obis_h3.R`). GBIF through `speciesgrids`, iNaturalist and the Alaska stranding / observer channels are later
+additions (plan 2026-10-29 section 4.3, D10): more channels can only add searched blocks and records, so a drop here
+that disappears with GBIF is a channel gap, and the anchors are read with that in mind (the Gulf of Alaska turtles
+are reported, not asserted).
+
+Defaults (D10): effort = megafauna records for air-breathers (mammals, turtles, birds) and the taxon's own order for
+the rest; buffer d = `OCC_BUFFER_KM` (100 km: a record just outside an ecoregion counts, for RECORDS and EFFORT
+only; presence stays inside the ecoregion); ratio 0.25, alpha 0.05, 0.5-degree blocks, no recency weight, critical
+habitat and narrow-range (< 20 cells) overrides, all taxa. One data-quality choice is not in D10: OBIS records dated
+before 1950 are ignored (`OCC_YEAR_MIN`, as `obis_range_constraint.qmd` did); records without a year are kept.
+
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "OBIS records + the v10 modelled range, per species x ecoregion, through occurrence_rule()"
+flowchart LR
+  obis[("obis_cell + worms_taxon<br/>(obisindicators release)")] --> sp["records per species x cell<br/>+ order / megafauna effort blocks"]
+  rng[("v10 merged GLOBAL surfaces<br/>(AquaMaps for am-only taxa)")] --> pr["present blocks<br/>(val >= 1)"]
+  zc[("ecoregion zone_cell")] --> rg["majority region<br/>+ region_rec (d km)"]
+  ch[("ch_fws / ch_nmfs / ca_nmfs")] --> rule
+  sp --> rule["occurrence_rule()<br/>per batch of taxa"]
+  pr --> rule
+  rg --> rule
+  rule --> ver["verdict: kept / dropped / unsearched<br/>+ overrides"]
+  ver --> csv["data/v11/zone_exclusions_occ.csv<br/>(merge_models, OCC_RULE=1)"]
+  ver --> tab["tables: anchors, components,<br/>sensitivity (d x effort x ratio)"]
+```
+
+## Setup
+
+```{r}
+#| label: setup
+#| message: false
+
+librarian::shelf(
+  DBI, digest, dplyr, duckdb, fs, glue, here, jsonlite, knitr, purrr, readr, stringr,
+  tibble, tidyr, MarineSensitivity/msens, quiet = T)
+source(here("libs/paths.R"))          # ver, ver_prev, dir_big, dir_big_v, obis_h3_*
+source(here("libs/vars.R"))           # .flag(), occ_buffer_km
+source(here("libs/duckdb_budget.R"))  # duckdb_tune()
+source(here("libs/obis_h3.R"))        # obis_h3_src(), obis_h3_info()
+
+stopifnot(
+  "msens >= 0.63.0 (occurrence_rule(baseline), cells_within_sql) is required; reinstall msens" =
+    packageVersion("msens") >= "0.63.0" && all(c("occurrence_rule", "cells_within_sql") %in% getNamespaceExports("msens")))
+
+# parameters ---- (env-overridable; the defaults are D10's)
+redo_occ     <- .flag("REDO_OCC")                                  # rebuild every cache below
+occ_test_n   <- as.integer(Sys.getenv("OCC_TEST_N", "0"))          # smoke test: anchors + first n taxa, writes nothing to data/
+occ_alpha    <- as.numeric(Sys.getenv("OCC_ALPHA", "0.05"))
+occ_ratio    <- as.numeric(Sys.getenv("OCC_RATIO", "0.25"))
+occ_block    <- as.integer(Sys.getenv("OCC_BLOCK", "10"))          # cells per block side: 10 = 0.5 degrees on global05
+occ_min_cells<- as.integer(Sys.getenv("OCC_MIN_CELLS", "20"))      # narrow-range override below this many cells worldwide
+occ_year_min <- as.integer(Sys.getenv("OCC_YEAR_MIN", "1950"))     # OBIS records dated earlier are ignored (NULL year kept)
+occ_baseline <- match.arg(Sys.getenv("OCC_BASELINE", "zones"), c("zones", "range"))   # what a zone is judged against (msens 0.63.0)
+occ_nc       <- 7200L                                              # global05 columns
+d_default    <- occ_buffer_km                                      # libs/vars.R OCC_BUFFER_KM, default 100
+d_all        <- sort(unique(c(0, 100, 250, d_default)))            # sensitivity buffers (km)
+ratio_all    <- sort(unique(c(0.25, 0.5, 1, occ_ratio)))
+cap_rows     <- as.numeric(Sys.getenv("OCC_BATCH_ROWS", "2e8"))    # merged-surface rows per batch
+am_per_batch <- as.integer(Sys.getenv("OCC_AM_PER_BATCH", "300"))  # AquaMaps models per batch
+sp_cats      <- c("bird", "mammal", "turtle", "fish", "coral", "invertebrate", "primary_producer")
+air_cats     <- c("bird", "mammal", "turtle")                      # effort = megafauna by default
+stopifnot(occ_block >= 1, nc_div = occ_nc %% occ_block == 0, all(d_all >= 0), occ_ratio > 0, occ_ratio <= 1)
+
+# paths ---- inputs are the SOURCE version's (default v10) merged outputs; caches live in this version's dir
+ver_src      <- Sys.getenv("OCC_SRC_VER", ver_prev)
+dir_src_v    <- ifelse(is_server, glue("{dir_derived}/{ver_src}"), glue("{dir_big}/{ver_src}"))
+dir_src      <- path_expand(glue("{dir_src_v}/marine-atlas"))
+sdm_src      <- path_expand(glue("{dir_src_v}/sdm.duckdb"))
+dir_occ      <- path_expand(Sys.getenv("OCC_DIR", glue("{dir_big_v}/marine-atlas/occ")))
+dir_tmp      <- glue("{dir_occ}/duckdb_tmp")
+f_zone_cell  <- path_expand(glue("{dir_big}/zones/ecoregion_2025-06/global05/zone_cell.parquet"))
+f_obis       <- path_expand(obis_h3_src("obis_cell.parquet")$path)
+f_worms      <- path_expand(obis_h3_src("worms_taxon.parquet")$path)
+f_csv        <- here("data/v11/zone_exclusions_occ.csv")
+manifest     <- here("data/manifests/explore_occurrence_rule.json")
+dir_create(c(dir_occ, dir_tmp, path_dir(f_csv), path_dir(manifest)))
+stopifnot(
+  "OBIS release is not on local disk (libs/obis_h3.R would read HTTPS; stage ~/_big/obis first)" =
+    file_exists(f_obis) && file_exists(f_worms),
+  "source version's sdm.duckdb not found" = file_exists(sdm_src),
+  "ecoregion zone_cell extract not found" = file_exists(f_zone_cell))
+obis_info <- tryCatch(obis_h3_info(), error = \(e) list(release = obis_h3_release, obis_snapshot = NA, worms_version = NA))
+
+con <- dbConnect(duckdb())
+duckdb_tune(con, dir_tmp)
+q <- \(x) paste0("'", x, "'", collapse = ", ")   # SQL list of string literals
+
+# the block (unit) of a cell: IDENTICAL to occurrence_counts_sql()'s arithmetic (checked below)
+unit_sql <- \(id) glue(
+  "CAST((((CAST({id} AS BIGINT) - 1) // {occ_nc}) // {occ_block}) * {occ_nc %/% occ_block} + ((CAST({id} AS BIGINT) - 1) % {occ_nc}) // {occ_block} AS INTEGER)")
+
+message(glue("explore_occurrence_rule: source {ver_src}, OBIS {obis_h3_release}, d {d_default} km, ratio {occ_ratio}, test_n {occ_test_n}"))
+```
+
+The block arithmetic is repeated here (effort is looked up by block), so a toy run of the msens rule proves the two
+agree: cells of one block share a verdict count, a neighbouring block does not.
+
+```{r}
+#| label: unit-check
+
+cells <- c(a = 5 * occ_nc + 10 + 1, b = 5 * occ_nc + 19 + 1,              # same 10 x 10 block (row 5, cols 10-19)
+           c = 5 * occ_nc + 20 + 1, d = 10 * occ_nc + 10 + 1)              # next block east / next block south
+u <- dbGetQuery(con, glue("SELECT {unit_sql('c')} AS u FROM (SELECT unnest([{paste(cells, collapse = ',')}]) AS c) ORDER BY c"))$u
+stopifnot("unit_sql: cells of one block must share a unit" = u[1] == u[2], "unit_sql: neighbouring blocks must differ" = length(unique(u)) == 3)
+dbWriteTable(con, "chk_present", data.frame(mdl_key = "x", cell_id = unname(cells)), overwrite = TRUE)
+dbWriteTable(con, "chk_occ",     data.frame(mdl_key = "x", cell_id = cells[["a"]], records = 1L), overwrite = TRUE)
+dbWriteTable(con, "chk_effort",  data.frame(mdl_key = "x", cell_id = cells[["b"]]), overwrite = TRUE)   # b, not a: same block
+dbWriteTable(con, "chk_region",  data.frame(zone_key = "Z", cell_id = unname(cells)), overwrite = TRUE)
+chk <- dbGetQuery(con, occurrence_counts_sql("chk_present", "chk_occ", "chk_effort", "chk_region", nc = occ_nc, block = occ_block))
+stopifnot("msens block unit disagrees with unit_sql" = chk$n_searched == 1, chk$n_occupied == 1, chk$n_cells == 4)
+for (t in c("chk_present", "chk_occ", "chk_effort", "chk_region")) dbExecute(con, glue("DROP TABLE {t}"))
+```
+
+## WoRMS: records of a species, its order, the megafauna
+
+OBIS records carry an AphiaID, which may be a synonym or an infraspecific name. Every record is credited to the
+**accepted species**: the accepted name (`acceptedNameUsageID`), then, for a subspecies / variety / form, its parent
+species. The accepted-species ids are then walked up `parentNameUsageID` to their **Order** and **Class**
+(`worms_lineage`). The two effort groups follow: `order:{id}` = blocks with a record of any species of the order, and
+`mega` = blocks with a record of any bird (Aves), mammal (Mammalia) or turtle (order Testudines).
+
+```{r}
+#| label: obis-sp
+
+dbExecute(con, glue("CREATE OR REPLACE VIEW worms AS SELECT * FROM read_parquet('{f_worms}')"))
+dbExecute(con, "
+  CREATE OR REPLACE TABLE w_alias AS
+  SELECT w.taxonID AS aphiaid,
+         CASE WHEN a.taxonID IS NULL THEN w.taxonID
+              WHEN a.taxonRank IN ('Subspecies', 'Variety', 'Subvariety', 'Forma', 'Subforma') THEN COALESCE(a.parentNameUsageID, a.taxonID)
+              ELSE a.taxonID END AS sp_id
+  FROM worms w
+  LEFT JOIN worms a ON a.taxonID = COALESCE(w.acceptedNameUsageID, w.taxonID)")
+
+f_obis_sp <- glue("{dir_occ}/obis_sp_{obis_h3_release}_y{occ_year_min}.parquet")
+if (redo_occ || !file_exists(f_obis_sp)) {
+  tmp <- glue("{f_obis_sp}.tmp")
+  dbExecute(con, glue("
+    COPY (
+      SELECT a.sp_id, o.cell_id, sum(o.records)::BIGINT AS records
+      FROM read_parquet('{f_obis}') o
+      JOIN w_alias a ON a.aphiaid = o.aphiaid
+      WHERE a.sp_id IS NOT NULL AND (o.date_year IS NULL OR o.date_year >= {occ_year_min})
+      GROUP BY a.sp_id, o.cell_id
+    ) TO '{tmp}' (FORMAT parquet, COMPRESSION zstd)"))
+  file_move(tmp, f_obis_sp)
+}
+dbExecute(con, glue("CREATE OR REPLACE TABLE obis_sp AS SELECT * FROM read_parquet('{f_obis_sp}')"))
+obis_n <- dbGetQuery(con, "SELECT count(*) AS rows, count(DISTINCT sp_id) AS species, count(DISTINCT cell_id) AS cells, sum(records) AS records FROM obis_sp")
+kable(obis_n, format.args = list(big.mark = ","), caption = glue("OBIS records credited to accepted species ({obis_h3_release}; dated >= {occ_year_min} or undated)."))
+```
+
+## The scored taxa and where their modelled range lives
+
+A scored taxon is `taxon.is_valid_usa AND taxon.is_marine` with `sp_cat` in the seven components (reptiles and
+amphibians are not scored). Its **present** cells are `val >= 1` on the v10 merged GLOBAL surface
+(`dist_merged_global`, built for the 2,105 range-constrained taxa); a taxon without one is AquaMaps-only, and its
+present cells are the union of its `am` models (`taxon_model`), the surface the merge itself would have used. The
+global surface is the right one (not the US trim): a zone is judged against the species' record rate across its whole
+range. Which bucket directory (`b1` ... `b402`, and `turtle`) of the merged surface holds each key is read once (a taxon lives in exactly one).
+BirdLife taxa carry a BOTW id, not an AphiaID, so they are matched to WoRMS accepted species by name; an unmatched taxon
+has no records and every ecoregion comes out "unsearched" (kept), which is the safe direction.
+
+```{r}
+#| label: taxa-base
+
+f_taxa_base <- glue("{dir_occ}/taxa_base_{ver_src}.parquet")
+f_buckets   <- glue("{dir_occ}/merged_buckets_{ver_src}.parquet")
+f_am        <- glue("{dir_occ}/am_models_{ver_src}.parquet")
+glob_mg     <- glue("{dir_src}/dist_merged_global/dataset=ms_merge/**/*.parquet")
+
+if (redo_occ || !all(file_exists(c(f_taxa_base, f_buckets, f_am)))) {
+  con_s <- dbConnect(duckdb(), dbdir = sdm_src, read_only = TRUE)
+  tx <- dbGetQuery(con_s, glue("
+    SELECT ms_merge_key AS mdl_key, taxon_authority, taxon_id, scientific_name, common_name, sp_cat
+    FROM taxon
+    WHERE is_valid_usa AND is_marine AND sp_cat IN ({q(sp_cats)})"))
+  tm_am <- dbGetQuery(con_s, "
+    SELECT ms_merge_key AS mdl_key, mdl_key AS am_key FROM taxon_model WHERE ds_key = 'am'") |>
+    semi_join(tx, by = "mdl_key")
+  # which merged bucket holds each key (one scan of the key column)
+  bk <- dbGetQuery(con, glue("
+    SELECT DISTINCT mdl_key, regexp_extract(filename, 'dataset=ms_merge/([^/]+)/', 1) AS bucket
+    FROM read_parquet('{glob_mg}', filename = true, hive_partitioning = false)"))
+  stopifnot("a merged key lives in two buckets" = !anyDuplicated(bk$mdl_key), "bucket not parsed" = all(nzchar(bk$bucket)))
+  dbDisconnect(con_s, shutdown = TRUE)
+  write_parquet_df <- \(df, f) { dbWriteTable(con, "tmp_df", df, overwrite = TRUE); dbExecute(con, glue("COPY tmp_df TO '{f}' (FORMAT parquet)")); dbExecute(con, "DROP TABLE tmp_df") }
+  write_parquet_df(tx,    f_taxa_base)
+  write_parquet_df(bk,    f_buckets)
+  write_parquet_df(tm_am, f_am)
+}
+rd <- \(f) dbGetQuery(con, glue("SELECT * FROM read_parquet('{f}')")) |> as_tibble()
+tx <- rd(f_taxa_base); bk <- rd(f_buckets); tm_am <- rd(f_am)
+
+# AphiaID of each taxon: WoRMS taxa carry it; BOTW taxa are matched to a WoRMS accepted species by name
+nm <- dbGetQuery(con, "
+  SELECT scientificName AS scientific_name, min(taxonID) AS nm_id
+  FROM worms WHERE taxonRank = 'Species' AND taxonomicStatus = 'accepted' GROUP BY 1") |> as_tibble()
+alias <- dbGetQuery(con, "SELECT aphiaid, sp_id FROM w_alias") |> as_tibble()
+tx <- tx |>
+  left_join(nm, by = "scientific_name") |>
+  mutate(aphia = case_when(taxon_authority == "worms" ~ suppressWarnings(as.numeric(taxon_id)), TRUE ~ as.numeric(nm_id))) |>
+  left_join(alias |> mutate(aphia = as.numeric(aphiaid)) |> select(aphia, sp_id), by = "aphia") |>
+  select(-nm_id) |>
+  mutate(
+    sp_id       = as.numeric(sp_id),
+    src         = case_when(mdl_key %in% bk$mdl_key ~ "merged", mdl_key %in% tm_am$mdl_key ~ "am", TRUE ~ NA_character_),
+    eff_default = ifelse(sp_cat %in% air_cats, "megafauna", "order"),
+    anchor      = scientific_name %in% c("Eubalaena glacialis") | sp_cat == "turtle") |>
+  left_join(bk, by = "mdl_key")
+n_nosurface <- sum(is.na(tx$src))
+tx <- tx |> filter(!is.na(src))
+if (occ_test_n > 0) {                                                            # smoke test: the anchors + an even spread of taxa
+  keep <- sort(unique(c(which(tx$anchor), round(seq(1, nrow(tx), length.out = occ_test_n)))))
+  tx <- tx[keep, ]
+}
+tx |> count(sp_cat, src) |> pivot_wider(names_from = src, values_from = n, values_fill = 0) |>
+  kable(format.args = list(big.mark = ","), caption = glue("Scored taxa by component and where their modelled range comes from (no surface at all: {n_nosurface}; no AphiaID: {sum(is.na(tx$sp_id))})."))
+```
+
+```{r}
+#| label: lineage
+
+f_lin <- glue("{dir_occ}/worms_lineage_{obis_h3_release}.parquet")
+ids_needed <- dbGetQuery(con, "SELECT DISTINCT sp_id FROM obis_sp")$sp_id |> union(tx$sp_id) |> na.omit()
+lin <- if (!redo_occ && file_exists(f_lin)) rd(f_lin) else NULL
+if (is.null(lin) || !all(ids_needed %in% lin$sp_id)) {
+  dbWriteTable(con, "lin_ids", tibble(sp_id = as.numeric(ids_needed)), overwrite = TRUE)
+  # walk each accepted species up the parent chain (<= 40 steps) and keep the Order and the Class on the way
+  lin <- dbGetQuery(con, "
+    WITH RECURSIVE up(start_id, cur, depth) AS (
+      SELECT sp_id::BIGINT, sp_id::BIGINT, 0 FROM lin_ids
+      UNION ALL
+      SELECT up.start_id, w.parentNameUsageID, up.depth + 1
+      FROM up JOIN worms w ON w.taxonID = up.cur
+      WHERE w.parentNameUsageID IS NOT NULL AND up.depth < 40)
+    SELECT up.start_id AS sp_id,
+           max(CASE WHEN w.taxonRank = 'Order' THEN w.taxonID END)        AS order_id,
+           max(CASE WHEN w.taxonRank = 'Order' THEN w.scientificName END) AS order_name,
+           max(CASE WHEN w.taxonRank = 'Class' THEN w.scientificName END) AS class_name
+    FROM up JOIN worms w ON w.taxonID = up.cur
+    GROUP BY up.start_id") |> as_tibble()
+  dbWriteTable(con, "tmp_df", lin, overwrite = TRUE)
+  dbExecute(con, glue("COPY tmp_df TO '{f_lin}' (FORMAT parquet)")); dbExecute(con, "DROP TABLE tmp_df")
+}
+dbWriteTable(con, "worms_lineage", lin |> mutate(sp_id = as.numeric(sp_id), order_id = as.numeric(order_id)), overwrite = TRUE)
+tx <- tx |>
+  left_join(lin |> transmute(sp_id = as.numeric(sp_id), order_id = as.numeric(order_id), order_name, class_name), by = "sp_id") |>
+  mutate(grp_order = ifelse(is.na(order_id), NA_character_, paste0("order:", sprintf("%.0f", order_id))))
+tx |> count(sp_cat, has_order = !is.na(order_id), has_aphia = !is.na(sp_id)) |>
+  kable(format.args = list(big.mark = ","), caption = "Scored taxa with a resolved AphiaID and Order (an unresolved taxon has no records / no order effort: every ecoregion is 'unsearched').")
+```
+
+```{r}
+#| label: effort-blocks
+
+f_eff <- glue("{dir_occ}/effort_blocks_{obis_h3_release}_y{occ_year_min}_b{occ_block}.parquet")
+if (redo_occ || !file_exists(f_eff)) {
+  tmp <- glue("{f_eff}.tmp")
+  dbExecute(con, glue("
+    COPY (
+      SELECT DISTINCT 'order:' || CAST(l.order_id::BIGINT AS VARCHAR) AS grp, {unit_sql('o.cell_id')} AS unit_id
+      FROM obis_sp o JOIN worms_lineage l ON l.sp_id = o.sp_id
+      WHERE l.order_id IS NOT NULL
+      UNION
+      SELECT DISTINCT 'mega' AS grp, {unit_sql('o.cell_id')} AS unit_id
+      FROM obis_sp o JOIN worms_lineage l ON l.sp_id = o.sp_id
+      WHERE l.class_name IN ('Aves', 'Mammalia') OR l.order_name = 'Testudines'
+    ) TO '{tmp}' (FORMAT parquet, COMPRESSION zstd)"))
+  file_move(tmp, f_eff)
+}
+dbExecute(con, glue("CREATE OR REPLACE TABLE effort_blocks AS SELECT * FROM read_parquet('{f_eff}')"))
+dbGetQuery(con, "SELECT (grp = 'mega') AS is_mega, count(DISTINCT grp) AS groups, count(*) AS group_blocks, max(CASE WHEN grp = 'mega' THEN 1 END) AS x FROM effort_blocks GROUP BY 1") |>
+  select(-x) |> kable(format.args = list(big.mark = ","), caption = "Effort blocks (0.5 degree) by group: order groups, and the megafauna group (birds + mammals + turtles).")
+```
+
+## Ecoregions: the majority region and the buffered region
+
+`occ_region` gives each cell to the ecoregion covering most of it (`msens::cell_zone_major_sql()`, ties to the first
+key, the rule `zone_exclude_sql()` will delete under): PRESENCE is counted there. `occ_rec_{d}` is the same region
+dilated by `d` km: every cell whose centre is within `d` km of a cell of the ecoregion (`msens::cells_within_sql()`, haversine
+on cell centres, the column index wraps at the antimeridian); RECORDS and EFFORT are counted there. Each dilation is
+cached as `region_rec_{d}km.parquet`.
+
+```{r}
+#| label: zones
+
+dbExecute(con, glue("CREATE OR REPLACE TEMP VIEW zc_raw AS SELECT * FROM read_parquet('{f_zone_cell}')"))
+# present the extract in the v1-v7 `zone` / `zone_cell` schema cell_zone_major_sql() reads
+dbExecute(con, "CREATE OR REPLACE TEMP TABLE zone AS SELECT row_number() OVER (ORDER BY zone_key) AS zone_seq, 'ecoregion_key' AS fld, zone_key AS value FROM (SELECT DISTINCT zone_key FROM zc_raw)")
+dbExecute(con, "CREATE OR REPLACE TEMP TABLE zone_cell AS SELECT z.zone_seq, p.cell_id, p.pct_covered FROM zc_raw p JOIN zone z ON z.value = p.zone_key")
+dbExecute(con, glue("CREATE OR REPLACE TABLE occ_region AS SELECT cell_id, zone_key FROM ({cell_zone_major_sql()})"))
+zones <- dbGetQuery(con, "SELECT zone_key, count(*) AS cells FROM occ_region GROUP BY 1 ORDER BY 1") |> as_tibble()
+stopifnot("expected the 12 BOEM ecoregions" = nrow(zones) == 12,
+          "anchor ecoregions missing from the extract" = all(c("EBS", "GOA", "EGOA", "WCGOA") %in% zones$zone_key))
+
+dbExecute(con, "CREATE OR REPLACE VIEW occ_rec_0 AS SELECT zone_key, cell_id FROM occ_region")
+for (d in setdiff(d_all, 0)) {
+  f <- glue("{dir_occ}/region_rec_{d}km.parquet")
+  if (redo_occ || !file_exists(f)) {
+    t0 <- Sys.time(); tmp <- glue("{f}.tmp")
+    dbExecute(con, glue("COPY (SELECT zone_key, cell_id FROM ({cells_within_sql('occ_region', d, by = 'zone_key')})) TO '{tmp}' (FORMAT parquet, COMPRESSION zstd)"))
+    file_move(tmp, f)
+    message(glue("region_rec {d} km built in {round(as.numeric(difftime(Sys.time(), t0, units = 'secs')))} s"))
+  }
+  dbExecute(con, glue("CREATE OR REPLACE TABLE occ_rec_{d} AS SELECT * FROM read_parquet('{f}')"))
+}
+rec_n <- map_dfr(d_all, \(d) dbGetQuery(con, glue("SELECT zone_key, {d} AS d, count(*) AS cells FROM occ_rec_{d} GROUP BY 1"))) |>
+  pivot_wider(names_from = d, values_from = cells, names_prefix = "d")
+zones |> left_join(rec_n, by = "zone_key") |>
+  kable(format.args = list(big.mark = ","), caption = "Ecoregion cells (majority region) and the cells of the region dilated by d km (columns d0, d100, ...).")
+```
+
+## Protected cells and batches
+
+The protected override is about places, not ESA status: a zone holding designated cells of the species
+(critical habitat from `ch_fws`, `ch_nmfs`, the NMFS core areas `ca_nmfs`) is never dropped, which is why both v7c
+exclusions survive without carrying a status test. The three datasets' `mdl_key` are mapped to the merged key
+through `taxon_model`.
+
+```{r}
+#| label: ch
+
+f_ch <- glue("{dir_occ}/ch_{ver_src}.parquet")
+if (redo_occ || !file_exists(f_ch)) {
+  con_s <- dbConnect(duckdb(), dbdir = sdm_src, read_only = TRUE)
+  tm_ch <- dbGetQuery(con_s, "SELECT mdl_key AS ch_key, ms_merge_key AS mdl_key FROM taxon_model WHERE ds_key IN ('ch_fws', 'ch_nmfs', 'ca_nmfs')")
+  dbDisconnect(con_s, shutdown = TRUE)
+  dbWriteTable(con, "tm_ch", tm_ch, overwrite = TRUE)
+  globs <- glue("{dir_src}/dist/dataset={c('ch_fws', 'ch_nmfs', 'ca_nmfs')}/**/*.parquet")
+  dbExecute(con, glue("
+    COPY (SELECT DISTINCT t.mdl_key, c.cell_id
+          FROM read_parquet([{q(globs)}], hive_partitioning = false) c
+          JOIN tm_ch t ON t.ch_key = c.mdl_key)
+    TO '{f_ch}' (FORMAT parquet)"))
+}
+dbExecute(con, glue("CREATE OR REPLACE TABLE occ_ch AS SELECT * FROM read_parquet('{f_ch}')"))
+dbGetQuery(con, "SELECT count(DISTINCT mdl_key) AS taxa_with_ch, count(*) AS ch_cells FROM occ_ch") |>
+  kable(format.args = list(big.mark = ","), caption = "Protected cells (critical habitat + core areas), by merged taxon.")
+```
+
+Taxa are processed in **batches** so the multi-billion-row surfaces stream: merged-surface taxa by bucket directory
+(about `OCC_BATCH_ROWS` rows each), AquaMaps-only taxa by `OCC_AM_PER_BATCH` models. The batch of a taxon is stored with
+it; `counts/{sig}/{batch}.parquet` is the resume marker, and `sig` hashes everything the counts depend on.
+
+```{r}
+#| label: batches
+
+if (nrow(tx) > 0) {
+  bk_n <- dbGetQuery(con, glue("
+    SELECT regexp_extract(file_name, 'dataset=ms_merge/([^/]+)/', 1) AS bucket, sum(num_rows) AS n
+    FROM parquet_file_metadata('{glob_mg}') GROUP BY 1")) |> as_tibble()
+  m_b <- tx |> filter(src == "merged") |> distinct(bucket) |>
+    left_join(bk_n, by = "bucket") |> arrange(suppressWarnings(as.integer(sub("^b", "", bucket))), bucket) |>
+    mutate(batch = sprintf("m%03d", dense_rank(cumsum(n) %/% cap_rows)))
+  n_am <- tm_am |> count(mdl_key, name = "n_mod")
+  a_b <- tx |> filter(src == "am") |> arrange(mdl_key) |> left_join(n_am, by = "mdl_key") |>
+    mutate(batch = sprintf("a%03d", dense_rank(cumsum(n_mod) %/% am_per_batch))) |> select(mdl_key, batch)
+  tx <- tx |> select(-any_of(c("batch", "n_mod", "multi"))) |>
+    left_join(n_am, by = "mdl_key") |>
+    mutate(batch = coalesce(m_b$batch[match(bucket, m_b$bucket)], a_b$batch[match(mdl_key, a_b$mdl_key)]),
+           multi = coalesce(n_mod, 0L) > 1L)
+  stopifnot("every taxon needs a batch" = !anyNA(tx$batch))
+}
+sig <- substr(digest::digest(list(
+  ver_src, obis_h3_release, occ_year_min, occ_block, occ_min_cells, occ_alpha, d_all, ratio_all, occ_ratio, d_default,
+  occ_baseline, "msens 0.63.0 counts", occ_test_n, sort(tx$mdl_key), tx$batch[order(tx$mdl_key)]), algo = "xxhash64"), 1, 10)
+dir_cnt <- glue("{dir_occ}/counts/{sig}")
+dir_create(dir_cnt)
+tx |> count(batch, src, name = "taxa") |>
+  summarise(batches = n(), merged_batches = sum(src == "merged"), am_batches = sum(src == "am"), taxa = sum(taxa)) |>
+  kable(format.args = list(big.mark = ","), caption = glue("Batches (cache signature {sig}; {length(list.files(dir_cnt, '[.]parquet$'))} already done)."))
+```
+
+## Run the rule, batch by batch
+
+For one batch: stream the batch's surfaces into `(taxon, cell)` pairs with `val >= 1`, then **reduce** them without
+changing any count the rule takes: it uses present cells (a) inside an ecoregion (`n_cells`, and the protected test),
+(b) as distinct 0.5-degree blocks (searched / occupied / totals), and (c) as a worldwide cell count for the
+narrow-range override. So a species of at least `block^2 x min_cells` cells keeps every present cell inside an
+ecoregion plus one representative cell per block (which preserves the block set, and still has at least `min_cells`
+cells), and a smaller species keeps all its cells; a check below proves the narrow-range classification is unchanged.
+The effort relation is the species' effort group restricted to the species' own present blocks (the rule reads effort
+only there). Then `occurrence_rule()` runs: once at the D10 defaults (effort by taxon, d = `OCC_BUFFER_KM`, ratio
+`OCC_RATIO`) and, for the sensitivity table, at every buffer x effort proxy with `ratio = 1` (the verdict at a smaller
+ratio is the ratio-1 verdict with `rate < ratio x p_core` applied on top, which the tabulation re-derives with
+`region_effort_test()` and checks against the default run).
+
+```{r}
+#| label: run-batches
+#| message: false
+
+thr_small <- occ_block^2 * occ_min_cells     # a species with fewer cells than this keeps ALL of them
+
+rule <- function(eff, d, ratio) occurrence_rule(
+  con, present = "occ_present", occ = "occ_records", effort = glue("occ_effort_{eff}"),
+  region = "occ_region", region_rec = glue("occ_rec_{d}"), ch = "occ_ch",
+  nc = occ_nc, block = occ_block, alpha = occ_alpha, ratio = ratio, min_cells = occ_min_cells, baseline = occ_baseline)
+
+run_batch <- function(b) {
+  f_out <- glue("{dir_cnt}/{b}.parquet")
+  if (file_exists(f_out)) return(invisible(NULL))
+  t0 <- Sys.time()
+  tb <- tx |> filter(batch == b) |> mutate(k = row_number())
+  stopifnot(length(unique(tb$src)) == 1)
+  dbWriteTable(con, "occ_tx", tb |> transmute(mdl_key, k = as.integer(k), sp_id, grp_order, eff_default, multi), overwrite = TRUE)
+
+  # 1. stream the surfaces into (k, cell_id), val >= 1
+  if (tb$src[1] == "merged") {
+    globs <- glue("{dir_src}/dist_merged_global/dataset=ms_merge/{unique(tb$bucket)}/*.parquet")
+    dbExecute(con, glue("
+      CREATE OR REPLACE TABLE occ_scan AS
+      SELECT t.k, s.cell_id
+      FROM read_parquet([{q(globs)}], hive_partitioning = false) s
+      JOIN occ_tx t ON t.mdl_key = s.mdl_key
+      WHERE s.val >= 1"))
+  } else {
+    am <- tm_am |> inner_join(tb |> select(mdl_key, k), by = "mdl_key")
+    files <- glue("{dir_src}/dist/dataset=am/{sub('^am[|]', '', am$am_key)}.parquet")
+    stopifnot("an AquaMaps surface file is missing" = all(file_exists(files)))
+    dbWriteTable(con, "occ_am", am |> transmute(am_key, k = as.integer(k)), overwrite = TRUE)
+    dbExecute(con, glue("
+      CREATE OR REPLACE TABLE occ_scan AS
+      SELECT a.k, s.cell_id
+      FROM read_parquet([{q(files)}], hive_partitioning = false) s
+      JOIN occ_am a ON a.am_key = s.mdl_key
+      WHERE s.val >= 1"))
+  }
+  # worldwide present cells per taxon (distinct: a multi-model AquaMaps taxon repeats cells)
+  dbExecute(con, "
+    CREATE OR REPLACE TABLE occ_n AS
+    SELECT k, count(*) AS n FROM occ_scan WHERE k NOT IN (SELECT k FROM occ_tx WHERE multi) GROUP BY k
+    UNION ALL
+    SELECT k, count(DISTINCT cell_id) AS n FROM occ_scan WHERE k IN (SELECT k FROM occ_tx WHERE multi) GROUP BY k")
+  # 2. reduce (see the prose above)
+  dbExecute(con, glue("
+    CREATE OR REPLACE TABLE occ_present AS
+    SELECT t.mdl_key, x.cell_id FROM (
+      SELECT DISTINCT k, cell_id FROM occ_scan WHERE k IN (SELECT k FROM occ_n WHERE n < {thr_small})
+      UNION
+      SELECT k, min(cell_id) FROM occ_scan WHERE k IN (SELECT k FROM occ_n WHERE n >= {thr_small}) GROUP BY k, {unit_sql('cell_id')}
+      UNION
+      SELECT k, cell_id FROM occ_scan WHERE k IN (SELECT k FROM occ_n WHERE n >= {thr_small}) AND cell_id IN (SELECT cell_id FROM occ_region)
+    ) x JOIN occ_tx t USING (k)"))
+  bad <- dbGetQuery(con, glue("
+    SELECT count(*) AS n FROM (
+      SELECT t.k, count(DISTINCT p.cell_id) AS r FROM occ_present p JOIN occ_tx t USING (mdl_key) GROUP BY t.k) a
+    JOIN occ_n USING (k) WHERE (a.r < {occ_min_cells}) <> (occ_n.n < {occ_min_cells})"))$n
+  stopifnot("the reduction changed a narrow-range classification" = bad == 0)
+  n_in  <- dbGetQuery(con, "SELECT count(*) AS n FROM occ_scan")$n
+  n_red <- dbGetQuery(con, "SELECT count(*) AS n FROM occ_present")$n
+  dbExecute(con, "DROP TABLE occ_scan")
+
+  # 3. records of each taxon (its accepted species, all synonyms / infraspecifics) and the effort relations
+  dbExecute(con, "
+    CREATE OR REPLACE TABLE occ_records AS
+    SELECT t.mdl_key, o.cell_id, sum(o.records)::BIGINT AS records
+    FROM occ_tx t JOIN obis_sp o ON o.sp_id = t.sp_id GROUP BY t.mdl_key, o.cell_id")
+  mk_eff <- \(name, grp_expr) dbExecute(con, glue("
+    CREATE OR REPLACE TABLE {name} AS
+    SELECT DISTINCT p.mdl_key, p.cell_id
+    FROM occ_present p JOIN occ_tx t USING (mdl_key)
+    JOIN effort_blocks e ON e.grp = {grp_expr} AND e.unit_id = {unit_sql('p.cell_id')}"))
+  mk_eff("occ_effort_order", "t.grp_order")
+  mk_eff("occ_effort_mega",  "'mega'")
+  dbExecute(con, "
+    CREATE OR REPLACE TABLE occ_effort_default AS
+    SELECT * FROM occ_effort_order WHERE mdl_key IN (SELECT mdl_key FROM occ_tx WHERE eff_default = 'order')
+    UNION ALL
+    SELECT * FROM occ_effort_mega  WHERE mdl_key IN (SELECT mdl_key FROM occ_tx WHERE eff_default = 'megafauna')")
+
+  # 4. the rule: the D10 defaults, then the sensitivity grid at ratio = 1
+  out <- list(
+    rule("default", d_default, occ_ratio) |> mutate(run = "default", eff = "default", d = d_default, ratio = occ_ratio))
+  for (eff in c("order", "mega")) for (d in d_all)
+    out[[length(out) + 1]] <- rule(eff, d, 1) |> mutate(run = "sens", eff = ifelse(eff == "mega", "megafauna", eff), d = d, ratio = 1)
+  res_b <- bind_rows(out) |> mutate(batch = b, n_scan = n_in, n_reduced = n_red)
+  dbWriteTable(con, "occ_out", res_b, overwrite = TRUE)
+  tmp <- glue("{f_out}.tmp")
+  dbExecute(con, glue("COPY occ_out TO '{tmp}' (FORMAT parquet, COMPRESSION zstd)"))
+  file_move(tmp, f_out)
+  for (t in c("occ_out", "occ_present", "occ_records", "occ_n", "occ_effort_order", "occ_effort_mega", "occ_effort_default")) dbExecute(con, glue("DROP TABLE IF EXISTS {t}"))
+  message(glue("batch {b}: {nrow(tb)} taxa, {format(n_in, big.mark = ',')} cells -> {format(n_red, big.mark = ',')} kept, ",
+               "{nrow(res_b)} rule rows, {round(as.numeric(difftime(Sys.time(), t0, units = 'secs')))} s"))
+  invisible(NULL)
+}
+
+batch_ids <- sort(unique(tx$batch))
+walk(batch_ids, run_batch)
+f_counts <- list.files(dir_cnt, "[.]parquet$", full.names = TRUE)
+stopifnot("not every batch produced a counts file" = length(f_counts) == length(batch_ids))
+res_all <- dbGetQuery(con, glue("SELECT * FROM read_parquet([{q(f_counts)}])")) |> as_tibble()
+meta <- tx |> select(mdl_key, taxon_id, scientific_name, common_name, sp_cat, eff_default, src, order_name, class_name)
+message(glue("{nrow(res_all)} rule rows over {n_distinct(res_all$mdl_key)} taxa"))
+```
+
+## Re-derive the ratio grid, and check the derivation
+
+The sensitivity runs used ratio 1. The verdict at any smaller ratio is `region_effort_test()` on the stored counts
+(the "unsearched" test does not depend on the ratio) with the stored override flag applied on top. Two checks make
+the derivation trustworthy: at ratio 1 it must reproduce the stored verdicts, and at the default
+(buffer, ratio, effort by taxon) it must reproduce the dropped set of the direct `occurrence_rule()` run.
+
+```{r}
+#| label: derive
+
+base_cols <- if (occ_baseline == "zones") c("n_searched_zones", "n_occupied_zones") else c("n_searched_all", "n_occupied_all")
+verdict_at <- function(x, ratio, cols = base_cols) {
+  v <- region_effort_test(x$n_searched, x$n_occupied, x[[cols[1]]], x[[cols[2]]],
+                          n_records = x$n_records, alpha = occ_alpha, ratio = ratio)$verdict
+  ifelse(v == "dropped" & !is.na(x$override), "kept", v)
+}
+res_def  <- res_all |> filter(run == "default") |> left_join(meta, by = "mdl_key")
+res_sens <- res_all |> filter(run == "sens")    |> left_join(meta, by = "mdl_key")
+
+stopifnot("derivation at ratio 1 must reproduce the stored verdicts" = identical(verdict_at(res_sens, 1), res_sens$verdict))
+# effort by taxon at (d_default, occ_ratio) from the order / megafauna sens rows == the direct default run
+mix <- res_sens |> filter(d == d_default, eff == eff_default) |> mutate(verdict = verdict_at(pick(everything()), occ_ratio))
+key <- \(x) sort(paste(x$mdl_key, x$zone_key))
+stopifnot("derived default must reproduce the direct occurrence_rule() default" =
+            identical(key(filter(mix, verdict == "dropped")), key(filter(res_def, verdict == "dropped"))),
+          "derived default has other rows than the direct run" = nrow(mix) == nrow(res_def))
+message(glue("derivation verified: {sum(res_def$verdict == 'dropped')} dropped pairs at the defaults"))
+```
+
+## The anchors, first
+
+Two cases the rule must reproduce without any hand-written row: the sea turtles in the **East Bering Sea** (EBS)
+and the North Atlantic right whale in the **Gulf of America** ecoregions EGOA + WCGOA. The Gulf of Alaska (GOA) is
+shown beside EBS because v7c kept the turtles there; with OBIS alone it is reported, not asserted. Full rule rows
+(`n_cells` = modelled cells in the ecoregion; `n_searched` / `n_occupied` = 0.5-degree blocks searched / with a record;
+`n_searched_zones` / `n_occupied_zones` = the same over every ecoregion of the set, `n_searched_all` / `n_occupied_all` over the species' whole range; `p_core` = the baseline record rate (the other ecoregions under `OCC_BASELINE=zones`);
+`rate` = the rate here; `n_min` = searched blocks needed for zero records to reject).
+
+```{r}
+#| label: anchors
+
+v7c_turtles <- c("Caretta caretta", "Chelonia mydas", "Dermochelys coriacea", "Lepidochelys olivacea")   # dropped from EBS in v7c
+anchor_cols <- c("common_name", "zone_key", "n_cells", "n_searched", "n_occupied", "n_records", "n_searched_all", "n_occupied_all",
+                 "p_core", "rate", "n_min", "p_value", "verdict_raw", "override", "verdict", "label")
+fmt <- \(x) x |> mutate(across(c(p_core, rate, p_value), \(v) signif(v, 3)), n_min = ifelse(is.finite(n_min), n_min, NA))
+turtle_rows <- res_def |> filter(sp_cat == "turtle", zone_key %in% c("EBS", "GOA")) |> arrange(scientific_name, zone_key)
+rw_rows     <- res_def |> filter(scientific_name == "Eubalaena glacialis") |> arrange(zone_key)
+kable(fmt(turtle_rows)[, anchor_cols], format.args = list(big.mark = ","), caption = glue(
+  "Anchor 1: the six sea turtles x East Bering Sea and Gulf of Alaska at the defaults (effort = megafauna, d = {d_default} km, ratio {occ_ratio}, OBIS only). A turtle with no row has no modelled cell in that ecoregion."))
+kable(fmt(rw_rows |> filter(zone_key %in% c("EGOA", "WCGOA")))[, anchor_cols], format.args = list(big.mark = ","), caption = glue(
+  "Anchor 2: North Atlantic right whale x the Gulf of America ecoregions (EGOA, WCGOA)."))
+kable(fmt(rw_rows |> filter(!zone_key %in% c("EGOA", "WCGOA")))[, anchor_cols], format.args = list(big.mark = ","), caption =
+  "For context: the right whale in its other ecoregions (the stronghold the Gulf is judged against).")
+
+anchor_ok <- list(
+  turtles_ebs = turtle_rows |> filter(scientific_name %in% v7c_turtles, zone_key == "EBS"),
+  rw_gulf     = rw_rows |> filter(zone_key %in% c("EGOA", "WCGOA")))
+```
+
+## Tabulation by component
+
+"Kept" is the test's own verdict with no override; the two overrides are counted apart (a pair the test would drop but
+critical habitat / a narrow range keeps), and "unsearched" pairs are kept and flagged (nobody looked). `cells` is the sum of
+modelled cells in the dropped species x ecoregion pairs (`n_cells`).
+
+```{r}
+#| label: by-component
+
+n_scored <- count(tx, sp_cat, name = "taxa")
+tab_comp <- res_def |>
+  group_by(sp_cat) |>
+  summarise(
+    species_with_rows   = n_distinct(mdl_key),
+    species_dropped     = n_distinct(mdl_key[verdict == "dropped"]),
+    pairs               = n(),
+    kept                = sum(verdict == "kept" & is.na(override)),
+    dropped             = sum(verdict == "dropped"),
+    unsearched          = sum(verdict == "unsearched"),
+    override_protected  = sum(override %in% "protected"),
+    override_narrow     = sum(override %in% "narrow range"),
+    documented_only     = sum(label %in% "documented occurrence only"),
+    cells_dropped       = sum(n_cells[verdict == "dropped"]),
+    .groups = "drop") |>
+  left_join(n_scored, by = "sp_cat") |> relocate(sp_cat, taxa)
+tab_total <- tab_comp |> summarise(across(where(is.numeric), sum)) |> mutate(sp_cat = "all", .before = 1)
+bind_rows(tab_comp, tab_total) |>
+  kable(format.args = list(big.mark = ","), caption = glue("The rule at the defaults, by component. `taxa` = scored taxa run; `species_with_rows` = those with a modelled cell in at least one ecoregion."))
+
+res_def |> filter(verdict == "dropped") |>
+  count(zone_key, sp_cat) |> pivot_wider(names_from = sp_cat, values_from = n, values_fill = 0) |>
+  right_join(zones |> select(zone_key), by = "zone_key") |> mutate(across(where(is.numeric), \(x) coalesce(x, 0L))) |> arrange(zone_key) |>
+  kable(format.args = list(big.mark = ","), caption = "Dropped species x ecoregion pairs by ecoregion and component.")
+
+res_def |> filter(verdict == "dropped") |>
+  group_by(sp_cat, scientific_name, common_name) |>
+  summarise(zones = paste(sort(zone_key), collapse = ", "), pairs = n(), cells = sum(n_cells), .groups = "drop") |>
+  arrange(desc(cells)) |> head(25) |>
+  kable(format.args = list(big.mark = ","), caption = "The 25 taxa losing the most cells to the rule (for eyeballing, not a ranking of importance).")
+```
+
+## Sensitivity: buffer x effort proxy x ratio
+
+Each row is the whole scored set under one parameter choice; `effort` is the proxy applied to ALL taxa (`order`,
+`megafauna`) or `default` (megafauna for air-breathers, order for the rest). The anchor columns say whether the
+four v7c turtles fall out of EBS and whether the right whale falls out of EGOA and WCGOA. The D10 default row is marked.
+
+```{r}
+#| label: sensitivity
+
+sens_one <- function(d_k, eff_k, ratio_k) {
+  x <- res_sens |> filter(d == d_k)
+  x <- if (eff_k == "default") filter(x, eff == eff_default) else filter(x, eff == eff_k)
+  x <- x |> mutate(verdict = verdict_at(pick(everything()), ratio_k))
+  dr <- filter(x, verdict == "dropped")
+  tibble(d_km = d_k, effort = eff_k, ratio = ratio_k,
+         pairs_dropped = nrow(dr), species_dropped = n_distinct(dr$mdl_key), cells_dropped = sum(dr$n_cells),
+         unsearched = sum(x$verdict == "unsearched"),
+         turtles_ebs = sum(dr$scientific_name %in% v7c_turtles & dr$zone_key == "EBS"),
+         rw_gulf = sum(dr$scientific_name == "Eubalaena glacialis" & dr$zone_key %in% c("EGOA", "WCGOA")),
+         goa_turtles = sum(dr$sp_cat == "turtle" & dr$zone_key == "GOA"))
+}
+sens <- expand_grid(d_k = d_all, eff_k = c("order", "megafauna", "default"), ratio_k = ratio_all) |>
+  pmap_dfr(sens_one) |>
+  mutate(anchors_out = turtles_ebs == length(v7c_turtles) & rw_gulf == 2L,
+         is_default  = d_km == d_default & effort == "default" & ratio == occ_ratio)
+sens |> transmute(`d (km)` = d_km, effort, ratio, `pairs dropped` = pairs_dropped, `species dropped` = species_dropped,
+                  `cells dropped` = cells_dropped, unsearched,
+                  `v7c turtles out of EBS (of 4)` = turtles_ebs, `right whale out of Gulf (of 2)` = rw_gulf,
+                  `turtles out of GOA` = goa_turtles, `both anchors` = anchors_out, default = ifelse(is_default, "<- D10", "")) |>
+  kable(format.args = list(big.mark = ","), caption = "Sensitivity of the rule to the record buffer d, the effort proxy and the ratio (OBIS only).")
+```
+
+## Sensitivity: the baseline the record rate is judged against
+
+Not written to the CSV: the same counts judged against the OTHER baseline. The default (`OCC_BASELINE=zones`, msens
+0.63.0) compares an ecoregion with the species' record rate across its other ecoregions of the set (the 12 BOEM
+ecoregions, Tim's "US denominator"); the rule as first written (`range`) used the species' WHOLE modelled range. For a
+species whose modelled range is far wider than where it is recorded (the right whale: IUCN range x AquaMaps suitability
+covers the whole North Atlantic, records are on the shelf) the whole-range baseline is diluted (7,099 blocks, 352
+with a record) and an ecoregion cannot be significantly below it, while the other-ecoregions baseline (41 % of blocks
+recorded on the Northeast shelf) is what the anchor needs. Both are computed from the stored counts (no extra run;
+the CH / narrow-range overrides are NOT re-derived, so the columns are "before overrides").
+
+```{r}
+#| label: baseline-other
+
+alt_cols <- if (occ_baseline == "zones") c("n_searched_all", "n_occupied_all") else c("n_searched_zones", "n_occupied_zones")
+alt_name <- if (occ_baseline == "zones") "whole range" else "other ecoregions"
+def_name <- if (occ_baseline == "zones") "other ecoregions" else "whole range"
+t_alt <- region_effort_test(res_def$n_searched, res_def$n_occupied, res_def[[alt_cols[1]]], res_def[[alt_cols[2]]],
+                            n_records = res_def$n_records, alpha = occ_alpha, ratio = occ_ratio)
+us <- res_def |> mutate(p_core_alt = t_alt$p_core, p_value_alt = t_alt$p_value, verdict_alt = t_alt$verdict)
+
+us |> group_by(sp_cat) |>
+  summarise(pairs = n(), !!glue("dropped, {def_name} baseline (default, before overrides)") := sum(verdict_raw == "dropped"),
+            !!glue("dropped, {alt_name} baseline (before overrides)") := sum(verdict_alt == "dropped"),
+            !!glue("unsearched, {alt_name} baseline") := sum(verdict_alt == "unsearched"), .groups = "drop") |>
+  kable(format.args = list(big.mark = ","), caption = "Pairs dropped by the rule under the two baselines (default buffer, effort and ratio).")
+us |> filter((sp_cat == "turtle" & zone_key %in% c("EBS", "GOA")) | (scientific_name == "Eubalaena glacialis" & zone_key %in% c("EGOA", "WCGOA", "NECS", "SECS"))) |>
+  arrange(scientific_name, zone_key) |>
+  transmute(common_name, zone_key, n_searched, n_occupied, `rate here` = signif(rate, 3),
+            !!glue("p_core, {def_name}") := signif(p_core, 3), !!glue("verdict, {def_name}") := verdict_raw,
+            !!glue("p_core, {alt_name}") := signif(p_core_alt, 3), !!glue("p, {alt_name}") := signif(p_value_alt, 3), !!glue("verdict, {alt_name}") := verdict_alt) |>
+  kable(format.args = list(big.mark = ","), caption = glue("The anchors under both baselines (default = {def_name})."))
+```
+
+## Output: the exclusions the merge consumes
+
+`msens::occurrence_exclusions()` of the default run: the dropped (mdl_key, zone_key) pairs, with the counts and the
+verdict that justify each (the shape and the extra columns follow `data/v7c/zone_exclusions.csv`: `zone_fld`, the
+evidence). The full verdict table (kept / unsearched / dropped, every pair) is cached beside the counts as
+`rule_default.parquet` for review.
+
+```{r}
+#| label: write-csv
+
+ex  <- occurrence_exclusions(res_def)
+out <- ex |>
+  left_join(res_def, by = c("mdl_key", "zone_key")) |>
+  transmute(
+    mdl_key, zone_fld = "ecoregion_key", zone_key, taxon_id, scientific_name, common_name, sp_cat,
+    effort = eff_default, d_km = d_default, ratio = occ_ratio, alpha = occ_alpha, block_cells = occ_block,
+    n_cells, n_searched, n_occupied, n_records, n_searched_all, n_occupied_all,
+    p_core = signif(p_core, 8), rate = signif(rate, 8), n_min, p_value = signif(p_value, 8),
+    verdict, label,
+    reason = as.character(glue("occurrence rule E: {n_occupied} of {n_searched} searched 0.5-degree blocks hold a record (rate {signif(rate, 3)}), against {signif(p_core, 3)} in the species' {if (occ_baseline == 'zones') 'other ecoregions' else 'whole range'} (p = {signif(p_value, 2)})")),
+    source = as.character(glue("OBIS {obis_h3_release}"))) |>
+  arrange(mdl_key, zone_key)
+stopifnot("every exclusion row must be a dropped pair" = all(out$verdict == "dropped"), !anyDuplicated(out[c("mdl_key", "zone_key")]))
+
+# the full verdict table, for review (cache, not a deliverable)
+dbWriteTable(con, "tmp_df", res_def |> select(-any_of(c("run", "eff"))), overwrite = TRUE)
+dbExecute(con, glue("COPY tmp_df TO '{dir_occ}/rule_default_{sig}.parquet' (FORMAT parquet, COMPRESSION zstd)")); dbExecute(con, "DROP TABLE tmp_df")
+
+if (occ_test_n > 0) {
+  message("OCC_TEST_N smoke test: data/v11/zone_exclusions_occ.csv and the manifest are NOT written")
+} else {
+  write_csv(out, f_csv, na = "")
+}
+kable(head(out |> select(mdl_key, scientific_name, zone_key, n_cells, n_searched, n_occupied, n_records, p_core, p_value, label), 15),
+      format.args = list(big.mark = ","), caption = glue("First rows of data/v11/zone_exclusions_occ.csv ({nrow(out)} rows)."))
+```
+
+## Manifest
+
+```{r}
+#| label: manifest
+
+if (occ_test_n == 0) {
+  h <- digest::digest(file = as.character(f_csv), algo = "xxhash64")
+  by_comp <- tab_comp |> select(sp_cat, taxa, species_dropped, dropped, unsearched, override_protected, override_narrow, cells_dropped)
+  write_manifest(
+    manifest, target = "explore_occurrence_rule", content_hash = h,
+    stats = list(
+      version          = ver,
+      source_version   = ver_src,
+      msens_version    = as.character(packageVersion("msens")),
+      obis_release     = obis_h3_release,
+      obis_snapshot    = obis_info$obis_snapshot,
+      worms_version    = obis_info$worms_version,
+      channels         = list("obis"),                      # GBIF (speciesgrids), iNat, strandings: later additions
+      parameters       = list(effort = "megafauna for air-breathers (mammal, turtle, bird), order otherwise", d_km = d_default,
+                              ratio = occ_ratio, alpha = occ_alpha, block_cells = occ_block, min_cells = occ_min_cells,
+                              year_min = occ_year_min, d_sensitivity = as.list(d_all), ratio_sensitivity = as.list(ratio_all)),
+      n_taxa           = nrow(tx),
+      n_taxa_no_surface= n_nosurface,
+      n_rule_rows      = nrow(res_def),
+      n_pairs_dropped  = nrow(out),
+      n_species_dropped= n_distinct(out$mdl_key),
+      cells_dropped    = sum(out$n_cells),
+      n_pairs_unsearched = sum(res_def$verdict == "unsearched"),
+      by_component     = by_comp |> split(by_comp$sp_cat) |> map(\(x) as.list(select(x, -sp_cat))),
+      anchors          = list(turtles_ebs_dropped = nrow(filter(anchor_ok$turtles_ebs, verdict == "dropped")),
+                              turtles_ebs_rows    = nrow(anchor_ok$turtles_ebs),
+                              right_whale_gulf_dropped = nrow(filter(anchor_ok$rw_gulf, verdict == "dropped"))),
+      baseline         = occ_baseline,
+      sensitivity_other_baseline = list(
+        baseline = alt_name,
+        pairs_dropped_before_overrides = sum(us$verdict_alt == "dropped"),
+        turtles_ebs_dropped = sum(us$verdict_alt == "dropped" & us$scientific_name %in% v7c_turtles & us$zone_key == "EBS"),
+        right_whale_gulf_dropped = sum(us$verdict_alt == "dropped" & us$scientific_name == "Eubalaena glacialis" & us$zone_key %in% c("EGOA", "WCGOA"))),
+      exclusions_csv   = list(path = "data/v11/zone_exclusions_occ.csv", rows = nrow(out), xxhash64 = h),
+      cache_signature  = sig),
+    force = force_target("explore_occurrence_rule"))
+  message(glue("explore_occurrence_rule: {nrow(out)} exclusion rows -> {basename(f_csv)} ({h})"))
+}
+dbDisconnect(con, shutdown = TRUE)
+```
+
+## Assertion: both anchors fall out at the defaults
+
+The rule is only adopted if it reproduces, with no hand-written row, what v7c did by hand. A failure means the
+parameters, the effort definition or (most likely at this stage) the channels are wrong, not that the anchor is wrong:
+the printed rows above say which of the three.
+
+```{r}
+#| label: assert-anchors
+
+run_anchors <- occ_test_n == 0 || nrow(anchor_ok$rw_gulf) > 0
+if (run_anchors) {
+  stopifnot(
+    "the v7c turtles (loggerhead, green, leatherback, olive ridley) must each have an EBS row" =
+      setequal(anchor_ok$turtles_ebs$scientific_name, v7c_turtles),
+    "right whale needs a row in both EGOA and WCGOA" = setequal(anchor_ok$rw_gulf$zone_key, c("EGOA", "WCGOA")))
+  bad <- bind_rows(anchor_ok$turtles_ebs, anchor_ok$rw_gulf) |> filter(verdict != "dropped")
+  if (nrow(bad) > 0) {
+    v_alt <- us$verdict_alt[match(paste(bad$mdl_key, bad$zone_key), paste(us$mdl_key, us$zone_key))]
+    stop("ANCHOR NOT DROPPED at the defaults (effort = megafauna, d = ", d_default, " km, ratio ", occ_ratio, ", baseline ", occ_baseline, ", OBIS only):\n",
+         paste0("  ", bad$scientific_name, " x ", bad$zone_key, ": ", bad$verdict, " (", bad$n_occupied, " of ", bad$n_searched,
+                " blocks have a record against ", signif(bad$p_core, 3), " in the ", def_name, ", p = ", signif(bad$p_value, 2),
+                "; need ", bad$n_min, " searched; ", alt_name, " baseline: ", v_alt, ")", collapse = "\n"),
+         "\nOutside OCC_TEST_N the exclusions CSV and the manifest above were written regardless. Read the anchor and baseline tables: a failure means the baseline, ",
+         "the effort definition or the channels (OBIS only) are wrong for this species, not necessarily the anchor.", call. = FALSE)
+  }
+  message("anchors: the four v7c turtles are dropped from EBS and the right whale from EGOA + WCGOA")
+}
+```
