@@ -50,8 +50,8 @@ source(here("libs/vars.R"))
 # every other flag must be at its control value here -- a flag that could be set and silently
 # ignored would fake an attribution row
 stopifnot("a v11 flag this stage does not implement is on (libs/vars.R v11_flags)" =
-            identical(v11_flags[setdiff(names(v11_flags), c("TURTLE_SUIT", "TURTLE_RULE", "OCC_RULE", "REGION_WEIGHT", "VGPM_INTEGRATED", "COMPONENTS_V11"))],
-                      list(FOLD_DENSITY = FALSE, WORMS_SOURCE = "download")))
+            identical(v11_flags[setdiff(names(v11_flags), c("TURTLE_SUIT", "TURTLE_RULE", "OCC_RULE", "REGION_WEIGHT", "VGPM_INTEGRATED", "COMPONENTS_V11", "FOLD_DENSITY"))],
+                      list(WORMS_SOURCE = "download")))
 options(readr.show_col_types = F)
 
 dir_atlas <- glue("{dir_big_v}/marine-atlas")
@@ -81,7 +81,9 @@ lookup <- dir_ls(dir_dist, glob = "*model_*.csv") |>
       iucn_code       = if (is.na(iucn)) NA_character_ else as.character(m[[iucn]]),
       sisid           = if ("sisid" %in% names(m)) as.character(m$sisid) else NA_character_,
       # a dataset keyed by WoRMS AphiaID natively (AquaX `ax`) resolves by id, never by name
-      worms_id        = if ("worms_id" %in% names(m)) as.character(m$worms_id) else NA_character_) }) |>
+      worms_id        = if ("worms_id" %in% names(m)) as.character(m$worms_id) else NA_character_,
+      # a multi-species guild (nc `GUILD:{code}`, model_nc.csv) has no taxon of its own
+      is_guild        = if ("is_guild" %in% names(m)) as.logical(m$is_guild) %in% TRUE else FALSE) }) |>
   bind_rows() |> distinct(mdl_key, .keep_all = TRUE)
 
 # read ingested mdl_keys per dataset so a mid-transfer / corrupt dataset (e.g. am
@@ -113,11 +115,17 @@ if (!ax_supersede) {
   log_info("control run: {n0 - nrow(models)} model(s) {ver_prev} never crosswalked are EXCLUDED so the surface can reproduce its checkpoint")
 }
 
-# density datasets (gm, nc) are ingested + published natively, but are NOT yet folded into the merge:
-# merge treats every non-`am` dataset as a binary range (max-merge), which would misrepresent graded
-# density and silently change scoring (a composite change to validate with `pra_score_delta`). So
-# exclude them here even when their `dist/dataset=` Parquet is present on disk, until MERGE_FOLD_DENSITY=1.
-merge_exclude_ds <- if (nzchar(Sys.getenv("MERGE_FOLD_DENSITY"))) character(0) else c("gm", "nc")
+# v11 Q6 (D12, FOLD_DENSITY): the density datasets (gm = SEFSC Gulf cetaceans, nc = NCCOS birds) enter the merge
+# as a suitability source (0-100 population percentiles, density_to_suit "ud") that REPLACES AquaMaps / AquaX
+# inside each species' own survey domain (merge_models: supersede_sql(by_taxon = TRUE)); only the ANNUAL model
+# of each species (the two-part key `{ds}|{sp_id}`, msens::density_annual over the intervals) is merged -- the
+# monthly / seasonal surfaces are published for the species app, never max()ed into a year. Control: excluded.
+merge_exclude_ds <- if (fold_density) character(0) else c("gm", "nc")
+if (fold_density) {
+  is_interval <- models$ds_key %in% c("gm", "nc") & lengths(strsplit(models$mdl_key, "|", fixed = TRUE)) > 2
+  log_info("FOLD_DENSITY: {sum(is_interval)} interval density model(s) left to the species app; {sum(models$ds_key %in% c('gm','nc') & !is_interval)} annual density model(s) enter the merge")
+  models <- models |> filter(!is_interval)
+}
 # v11 Q1 `rng_occ` (ingest_obis-occurrence.qmd): the cells within d km of an OBIS record are the EVIDENCE footprint of the
 # occurrence rule (Q2, msens::occurrence_rule(), read straight from dist/), never a plain range -- merged as one it would
 # max() into every turtle and right-whale surface and move their scores. Excluded here unconditionally.
@@ -130,6 +138,10 @@ if (!ax_supersede) merge_exclude_ds <- c(merge_exclude_ds, "ax")
 # TURTLE_SUIT=ogm; the control (`am`) excludes them outright -- left in but unsuperseded they would
 # still max() with AquaMaps, which is a third design, not a control (the AX_SUPERSEDE=0 lesson)
 if (turtle_suit != "ogm") merge_exclude_ds <- c(merge_exclude_ds, "og")
+# v11 Q6 (D12): the NCCOS multi-species guilds (`nc|GUILD:{code}`, `is_guild` in model_nc.csv) are ingested for review but are
+# not a taxon -- they never enter the merge, whatever FOLD_DENSITY says
+n_guild <- sum(models$is_guild %in% TRUE)
+if (n_guild) { models <- models |> filter(!is_guild); log_info("excluded {n_guild} guild model(s) (is_guild) from merge") }
 if (length(merge_exclude_ds)) {
   n0 <- nrow(models); models <- models |> filter(!ds_key %in% merge_exclude_ds)
   if (nrow(models) < n0) log_info(
