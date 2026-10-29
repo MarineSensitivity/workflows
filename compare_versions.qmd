@@ -5,6 +5,7 @@ params:
   version_a: v8
   version_b: v9
   metric_key: score_extriskspcat_primprod_ecoregionrescaled_equalweights
+  metric_key_v10: score_v10_equalweights_global
   mean_tol: 5
   max_tol: 15
 format:
@@ -541,6 +542,277 @@ long <- bind_rows(lapply(shared_m, function(m) metric_delta(m) |> mutate(metric_
 DT::datatable(long, rownames = FALSE, filter = "top",
               options = list(pageLength = 20, order = list(list(5, "desc"))),
               caption = glue("{nrow(long)} (zone × metric) pairs shared by {va} and {vb}"))
+```
+
+## Across the nation: the v10 distribution share
+
+Everything above is **within ecoregion**: a species' importance in a Program Area is rescaled against
+the other cells of the *ecoregion* that Program Area sits in, so a quiet ecoregion's best Program Area
+can outscore a busy ecoregion's. The v10 score is **across the nation**: for each category the score
+is the Program Area's risk-weighted share of each species' distribution, divided by the area's share
+of the nation, so **100 = the national-average concentration** and 250 holds two and a half times its
+area's fair share. It is computed under three denominators (`global` = the species' whole range, the
+headline; `usa` = its US slice; `pooled`), with the companion **percent of the world** beside it, and
+a category with too little coverage in a Program Area is **not reportable** (no row, never zero — the
+floor). This section runs only when version B carries `{r} params$metric_key_v10`.
+
+```{r}
+#| label: v10-setup
+
+mk_v10 <- params$metric_key_v10
+mk_eco <- "score_extriskspcat_primprod_ecoregionrescaled_equalweights"
+has_v10 <- unit_b == "programarea" &&
+  "programarea_key" %in% msens::zone_scored_flds(con_b, mk_v10)
+if (!has_v10) cat(glue("`{vb}` carries no Program-Area `{mk_v10}`: the v10 section is skipped."))
+
+# vector helpers over the 20 Program Areas of B (A is already keyed onto B's zones)
+pa <- st_drop_geometry(ply_b) |> select(zone_key, zone_name, region)
+col_of <- function(df, m) {
+  if (is.na(m)) return(rep(NA_real_, nrow(pa)))
+  x <- df[df$metric_key == m, ]
+  x$score[match(pa$zone_key, x$zone_key)]
+}
+rk <- function(x) rank(-x, ties.method = "min", na.last = "keep")             # 1 = highest
+rho <- function(x, y) suppressWarnings(cor(x, y, method = "spearman", use = "pairwise.complete.obs"))
+```
+
+### Re-issued Program-Area table
+
+One row per Program Area: the published composite of **A**, B's own **ecoregional** composite (B keeps
+v8's within-ecoregion metrics unchanged, so this is the data rebuild alone), and the v10
+across-the-nation composite under each denominator plus the floor-strip sensitivity (`global_strip`:
+the floor removed, so the areas it hides appear). Ranks run 1 = highest; Δrank = rank in A − rank in
+v10 global, so a positive value is a Program Area that moves **up** under v10.
+
+```{r}
+#| label: v10-pa-table
+
+if (has_v10) {
+  tab <- pa |> mutate(
+    a      = col_of(scores_a_m, mk),
+    eco    = col_of(scores_b, mk_eco),
+    global = col_of(scores_b, mk_v10),
+    usa    = col_of(scores_b, "score_v10_equalweights_usa"),
+    pooled = col_of(scores_b, "score_v10_equalweights_pooled"),
+    strip  = col_of(scores_b, "score_v10_equalweights_global_strip"),
+    n_comp = col_of(scores_b, "score_v10_n_components_global")) |>
+    mutate(across(c(a, eco, global, usa, pooled, strip), rk, .names = "rk_{.col}"),
+           d_rank = rk_a - rk_global) |>
+    arrange(desc(global))
+  cols_v10 <- c("global", "usa", "pooled", "strip")
+  rho_tab <- tibble(ranking = cols_v10,
+                    `ρ vs A` = sapply(cols_v10, \(k) rho(tab[[k]], tab$a)),
+                    `ρ vs B ecoregional` = sapply(cols_v10, \(k) rho(tab[[k]], tab$eco)))
+  cap <- glue("Composite per Program Area, sorted by v10 global. Spearman ρ of the v10 ranking against ",
+              "{va}'s / B's ecoregional: ",
+              paste(glue("{rho_tab$ranking} {round(rho_tab[[2]], 2)} / {round(rho_tab[[3]], 2)}"), collapse = "; "))
+  tab |>
+    transmute(`Program Area` = zone_key, Name = zone_name,
+              !!glue("{va} published") := round(a, 1), `B ecoregional` = round(eco, 1),
+              `v10 global` = round(global, 1), `v10 usa` = round(usa, 1), `v10 pooled` = round(pooled, 1),
+              `v10 global_strip` = round(strip, 1), `n components` = n_comp,
+              !!glue("rank {va}") := rk_a, `rank B eco` = rk_eco, `rank global` = rk_global,
+              `rank usa` = rk_usa, `rank pooled` = rk_pooled, `rank strip` = rk_strip,
+              `Δrank` = d_rank) |>
+    DT::datatable(rownames = FALSE, caption = cap,
+                  options = list(pageLength = 25, dom = "t", scrollX = TRUE))
+}
+```
+
+### Per component
+
+The same comparison one category at a time. The two ecoregional columns are the within-ecoregion
+component (A, B); `v10 global` is the across-the-nation score (100 = national average) with
+`% of world` — the share of the world's risk-weighted distribution that sits in the Program Area —
+its number of species and the area's `coverage`. **n/r** = not reportable: the category has coverage
+in the area but too little to publish a score (the floor), so no row exists.
+
+```{r}
+#| label: v10-components
+
+if (has_v10) {
+  cats <- scores_b$metric_key |> unique()
+  cats <- sort(unique(sub("^extrisk_(.*)_(v10_global|coverage)$", "\\1",
+                          cats[grepl("^extrisk_(.*)_(v10_global|coverage)$", cats)])))
+  spec <- bind_rows(
+    tibble(component = cats,
+           eco = glue("extrisk_{cats}_ecoregion_rescaled"), v10 = glue("extrisk_{cats}_v10_global"),
+           cov = glue("extrisk_{cats}_coverage"), world = glue("extrisk_{cats}_pct_world"),
+           nsp = glue("extrisk_{cats}_n_species"), usa = glue("extrisk_{cats}_v10_usa"),
+           pooled = glue("extrisk_{cats}_v10_pooled")),
+    tibble(component = "primprod", eco = "primprod_ecoregion_rescaled", v10 = "primprod_v10",
+           cov = "primprod_coverage", world = NA_character_, nsp = NA_character_,
+           usa = NA_character_, pooled = NA_character_))
+  comp_tab <- purrr::pmap_dfr(spec, function(component, eco, v10, cov, world, nsp, usa, pooled) {
+    cv <- col_of(scores_b, cov)
+    # absent v10 row + coverage present = "n/r"; no coverage either = blank
+    fmt <- function(v) ifelse(!is.na(v), sprintf("%.1f", v), ifelse(!is.na(cv), "n/r", ""))
+    tibble(`Program Area` = pa$zone_key, Component = component,
+           !!va := round(col_of(scores_a_m, eco), 1), `B ecoregional` = round(col_of(scores_b, eco), 1),
+           `v10 global` = fmt(col_of(scores_b, v10)), `% of world` = round(col_of(scores_b, world), 2),
+           coverage = round(cv, 3), `n species` = col_of(scores_b, nsp),
+           `v10 usa` = fmt(col_of(scores_b, usa)), `v10 pooled` = fmt(col_of(scores_b, pooled)))
+  }) |>
+    filter(!is.na(.data[[va]]) | !is.na(`B ecoregional`) | `v10 global` != "" | !is.na(coverage))
+  DT::datatable(comp_tab, rownames = FALSE, filter = "top",
+                options = list(pageLength = 25, scrollX = TRUE, order = list(list(1, "asc"))),
+                caption = glue("Program Area × component: {va} and B ecoregional (within ecoregion) vs v10 (across the nation)"))
+}
+```
+
+### Attribution: v7 → v8 → v10
+
+Two things changed between the published release and v10, and they are kept apart here. **A → B
+ecoregional** is the *data rebuild* (new models, same within-ecoregion scoring): both scores are on
+one scale, so it gets the usual deltas and gate statistics. **B ecoregional → v10 global** is the
+*scoring change*: the scale itself changes (a rescaled 0–100 index becomes a concentration index
+around 100), so a score delta is meaningless and it is reported as rank movement and Spearman ρ only.
+
+```{r}
+#| label: v10-attribution
+
+if (has_v10) {
+  d_eco <- msens::score_delta(scores_a_m |> filter(metric_key == mk),
+                              scores_b   |> filter(metric_key == mk_eco),
+                              key = "zone_key", value = "score", labels = c(va, vb))
+  s_eco <- msens::score_delta_summary(d_eco)
+  step_tab <- tibble(
+    step = c(glue("{va} → B ecoregional (data rebuild)"),
+             "B ecoregional → v10 global (scoring change)", glue("{va} → v10 global (both)")),
+    `same scale` = c("yes", "no", "no"), zones = c(s_eco$n, sum(!is.na(tab$eco + tab$global)), sum(!is.na(tab$a + tab$global))),
+    `mean |Δ|` = c(round(s_eco$mean_abs, 2), NA, NA), `max |Δ|` = c(round(s_eco$max_abs, 2), NA, NA),
+    `r` = c(round(cor(d_eco[[va_col]], d_eco[[vb_col]]), 3), NA, NA),
+    `Spearman ρ` = round(c(rho(tab$a, tab$eco), rho(tab$eco, tab$global), rho(tab$a, tab$global)), 3))
+}
+```
+
+```{r}
+#| label: v10-attribution-steps
+
+if (has_v10) knitr::kable(step_tab, caption = "Gate statistics per step (score deltas only where the scales match)")
+```
+
+```{r}
+#| label: v10-attribution-table
+
+if (has_v10) {
+  tab |>
+    transmute(`Program Area` = zone_key, !!va := round(a, 1), `B ecoregional` = round(eco, 1),
+              `v10 global` = round(global, 1), `Δ data (B eco − A)` = round(eco - a, 1),
+              `rank A` = rk_a, `rank B eco` = rk_eco, `rank v10` = rk_global,
+              `Δrank data` = rk_a - rk_eco, `Δrank scoring` = rk_eco - rk_global) |>
+    arrange(desc(`v10 global`)) |>
+    DT::datatable(rownames = FALSE, options = list(pageLength = 25, dom = "t", scrollX = TRUE),
+                  caption = "Per Program Area: the data-rebuild delta and the scoring-change rank move (positive = moves up)")
+}
+```
+
+### Sea turtles by species
+
+Turtles are the category the across-the-nation view changes most: a few Program Areas hold nearly all
+of a species' world distribution weight while most hold none. For each Program Area and species,
+`share_global` is the share of the **world** distribution (risk-weighted) inside the area,
+`share_usa` the share of the species' **US slice**, and `share_v10_contrib` its contribution to the
+area's turtle total under the headline global denominator. Areas are ordered by region (Alaska,
+Pacific, Gulf, Atlantic).
+
+```{r}
+#| label: v10-turtles
+
+if (has_v10) {
+  zc <- msens::sdm_val_col(con_b, "zone")
+  # region of a Program Area = the subregion covering most of its cells
+  reg <- tryCatch(dbGetQuery(con_b, glue("
+      SELECT pa.{zc} AS zone_key, s.{zc} AS subregion, count(*) AS n
+      FROM zone pa JOIN zone_cell zp ON zp.zone_seq = pa.zone_seq
+      JOIN zone_cell zs ON zs.cell_id = zp.cell_id JOIN zone s ON s.zone_seq = zs.zone_seq
+      WHERE pa.fld = 'programarea_key' AND s.fld = 'subregion_key'
+      GROUP BY 1, 2")) |> as_tibble() |> group_by(zone_key) |> slice_max(n, n = 1, with_ties = FALSE) |>
+      ungroup() |> select(zone_key, subregion),
+    error = function(e) tibble(zone_key = character(), subregion = character()))
+  reg_ord <- c("AK", "PA", "GA", "AT")                       # Alaska, Pacific, Gulf, Atlantic
+  zt <- dbGetQuery(con_b, "SELECT zone_value AS zone_key, mdl_key, sp_common, sp_scientific,
+                             share_usa, share_global, share_v10_contrib
+                           FROM zone_taxon WHERE sp_cat = 'turtle' AND zone_fld = 'programarea_key'") |>
+    as_tibble() |> mutate(species = coalesce(sp_common, sp_scientific))
+  turt <- pa |> select(zone_key, zone_name) |>
+    left_join(reg, by = "zone_key") |>
+    left_join(zt |> mutate(share_global = round(100 * share_global, 2)) |>
+                select(zone_key, species, share_global) |>
+                pivot_wider(names_from = species, values_from = share_global), by = "zone_key") |>
+    mutate(`turtle v10 global` = round(col_of(scores_b, "extrisk_turtle_v10_global"), 1)[match(zone_key, pa$zone_key)],
+           `% of world` = round(col_of(scores_b, "extrisk_turtle_pct_world"), 2)[match(zone_key, pa$zone_key)],
+           ord = match(subregion, reg_ord, nomatch = 99L)) |>
+    arrange(ord, zone_key) |> select(-ord) |> rename(`Program Area` = zone_key, Name = zone_name, Region = subregion)
+}
+```
+
+```{r}
+#| label: v10-turtles-wide
+
+# one row per Program Area, a column per species: % of the world's distribution inside the area
+if (has_v10) {
+  DT::datatable(turt, rownames = FALSE, options = list(pageLength = 25, dom = "t", scrollX = TRUE),
+                caption = "Sea turtles: world share (%) per species and the Program Area's turtle v10 score") |>
+    DT::formatRound(setdiff(names(turt)[sapply(turt, is.numeric)], "turtle v10 global"), 2)
+}
+```
+
+```{r}
+#| label: v10-turtles-long
+
+if (has_v10) {
+  zt |> transmute(`Program Area` = zone_key, Species = species, `share usa` = signif(share_usa, 3),
+                  `share global` = signif(share_global, 3), `contribution to v10` = signif(share_v10_contrib, 3)) |>
+    DT::datatable(rownames = FALSE, filter = "top", options = list(pageLength = 15),
+                  caption = "Long form: every (Program Area, turtle species) row of zone_taxon")
+}
+```
+
+### The three denominators
+
+The same composite under the three denominators, one row per Program Area sorted by the global
+headline. Where the three dots coincide the denominator does not matter; where they spread, the
+answer depends on whether the species' range is read as the world, the US slice, or pooled. The
+dashed line is 100, the national average.
+
+```{r}
+#| label: v10-denominators
+#| fig-height: 6.5
+#| fig-width: 8
+
+if (has_v10) {
+  den <- tab |> select(zone_key, global, usa, pooled) |>
+    pivot_longer(-zone_key, names_to = "denominator", values_to = "score") |>
+    mutate(zone_key = factor(zone_key, levels = tab$zone_key[order(tab$global, na.last = FALSE)]),
+           denominator = factor(denominator, c("global", "usa", "pooled")))
+  # Okabe-Ito: colour-blind safe
+  pal <- c(global = "#0072B2", usa = "#E69F00", pooled = "#009E73")
+  g <- ggplot(den, aes(score, zone_key, colour = denominator)) +
+    geom_line(aes(group = zone_key), colour = "grey70", linewidth = 0.5, na.rm = TRUE) +
+    geom_vline(xintercept = 100, linetype = "dashed", linewidth = 0.4) +
+    geom_point(size = 2.6, na.rm = TRUE) +
+    scale_colour_manual(values = pal) +
+    labs(x = "v10 composite  (100 = national average)", y = NULL, colour = "denominator",
+         title = glue("Across-the-nation composite under three denominators ({vb})")) +
+    theme_minimal(base_size = 12) + theme(legend.position = "top")
+  # log axis when every score is positive (a concentration index spans orders of magnitude)
+  if (all(den$score > 0, na.rm = TRUE)) g <- g + scale_x_log10()
+  g
+}
+```
+
+### Method flags
+
+What the release states about how v10 was built (`release_method`).
+
+```{r}
+#| label: v10-methods
+
+if (has_v10 && DBI::dbExistsTable(con_b, "release_method")) {
+  dbGetQuery(con_b, "SELECT method_key, value, description FROM release_method ORDER BY method_key") |>
+    knitr::kable(caption = glue("release_method of {vb}"))
+} else if (has_v10) cat(glue("`{vb}` has no `release_method` table.\n"))
 ```
 
 ```{r}
