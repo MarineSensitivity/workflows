@@ -116,7 +116,9 @@ dbExecute(con, glue("PRAGMA memory_limit='{mem_gb}GB'"))
 # streaming COPY/aggregates need no insertion order; keeping it pins buffers the OOM guard then hits
 dbExecute(con, "SET preserve_insertion_order = false")
 dbExecute(con, glue("PRAGMA temp_directory='{dir_atlas}/duckdb_tmp'"))
-dbExecute(con, glue("PRAGMA max_temp_directory_size='400GB'"))
+# the mc_parts repartition of ~13 B rows spills far beyond RAM (v8: ~500 GB); MERGE_TEMP_GB raises the cap where
+# the disk allows (the mini's 2 TB volume), MERGE_MEM_GB the buffer pool (48 GB machine, nothing else running)
+dbExecute(con, glue("PRAGMA max_temp_directory_size='{as.integer(Sys.getenv('MERGE_TEMP_GB', '400'))}GB'"))
 dbExecute(con, glue("PRAGMA threads={min(4L, max(1L, parallel::detectCores() - 1L))}"))
 
 # ONE GLOBAL merge, two outputs from the same data: the whole-range merged surface
@@ -188,14 +190,22 @@ if (fold_density) {
 }
 # the merge-input filter: AquaX's supersession (v9) AND, for the turtles under ogm, am and ax inside og AND, for
 # the density taxa under FOLD_DENSITY, am and ax inside each taxon's own survey domain
-keep_sql <- paste(msens::supersede_sql(src = "mc"),
-                  "AND", msens::supersede_sql("am", taxa = "turtle_og", mask = "og_mask", src = "mc"),
-                  "AND", msens::supersede_sql("ax", taxa = "turtle_og", mask = "og_mask", src = "mc"),
-                  "AND", msens::supersede_sql("am", taxa = "dens_taxa", mask = "dens_dom", src = "mc", by_taxon = TRUE),
-                  "AND", msens::supersede_sql("ax", taxa = "dens_taxa", mask = "dens_dom", src = "mc", by_taxon = TRUE))
-# the survey domain joins the range footprint as its own pseudo-dataset at the governing er_score (empty off)
-dens_rows_sql <- "UNION ALL SELECT mm.mkey_id, d.ms_merge_key, 'dens_dom' AS ds_key, d.cell_id, t.er_score::DOUBLE AS val
-       FROM dens_dom d JOIN mkey_map mm USING (ms_merge_key) JOIN taxon t USING (ms_merge_key)"
+# Only the predicates whose taxa table is non-empty are applied: an anti-join of 13 B rows against an EMPTY table
+# is not free (each IN (subquery) is a hash join the planner materializes), and the control run must send the
+# SAME query the v9 / v10 merge sent -- the AquaX predicate alone -- so its spill and its hash are reproducible
+n_tab <- function(t) dbGetQuery(con, glue("SELECT count(*) n FROM {t}"))$n
+keep_parts <- c(
+  msens::supersede_sql(src = "mc"),
+  if (n_tab("turtle_og")) c(msens::supersede_sql("am", taxa = "turtle_og", mask = "og_mask", src = "mc"),
+                            msens::supersede_sql("ax", taxa = "turtle_og", mask = "og_mask", src = "mc")),
+  if (n_tab("dens_taxa")) c(msens::supersede_sql("am", taxa = "dens_taxa", mask = "dens_dom", src = "mc", by_taxon = TRUE),
+                            msens::supersede_sql("ax", taxa = "dens_taxa", mask = "dens_dom", src = "mc", by_taxon = TRUE)))
+keep_sql <- paste(keep_parts, collapse = " AND ")
+log_info("merge-input filter: {length(keep_parts)} supersession predicate(s)")
+# the survey domain joins the range footprint as its own pseudo-dataset at the governing er_score (nothing off:
+# the control's partition query is byte-identical to v10's)
+dens_rows_sql <- if (fold_density) "UNION ALL SELECT mm.mkey_id, d.ms_merge_key, 'dens_dom' AS ds_key, d.cell_id, t.er_score::DOUBLE AS val
+       FROM dens_dom d JOIN mkey_map mm USING (ms_merge_key) JOIN taxon t USING (ms_merge_key)" else ""
 dir_parts <- glue("{dir_atlas}/mc_parts")
 # the partition write is the ~40-min step; skip it if the input already exists (REDO_MC_PARTS=1 forces)
 if (!dir_exists(dir_parts) || nzchar(Sys.getenv("REDO_MC_PARTS"))) {
