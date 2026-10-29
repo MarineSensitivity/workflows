@@ -22,6 +22,9 @@ against the clone — every Parquet already present — so their manifests do no
 downstream re-runs for the wrong reason. Datasets this version re-ingests (v9: nothing; a future
 AquaMaps refresh would be `BOOTSTRAP_SKIP_DS=am`) are simply not cloned.
 
+A **scoring-only** version (v10) additionally clones the merge outputs and the scoring database
+(`BOOTSTRAP_CLONE_MERGE=1`, section below), so nothing upstream of the new scoring stage is rebuilt.
+
 Verification: by default file count + byte total per dataset must equal `ver_prev`'s;
 `BOOTSTRAP_VERIFY=1` re-hashes each cloned surface with `msens::hash_parquet()` and asserts
 equality with that ingest's `data/manifests/ingest_*.json` `content_hash` — proof that what was
@@ -35,6 +38,8 @@ cloned is the checkpointed surface and not a stale directory.
 flowchart LR
   prev[("{ver_prev}/marine-atlas/dist/<br/>dataset=* + model_*.csv")] -->|"cp -c (APFS clonefile)<br/>cp -al (Linux)"| cur[("{ver}/marine-atlas/dist/")]
   cur --> chk["count + bytes == ver_prev<br/>BOOTSTRAP_VERIFY=1: hash_parquet == ingest manifest"]
+  prev2[("{ver_prev}/marine-atlas/dist_merged*<br/>merge.duckdb · sdm.duckdb")] -->|"BOOTSTRAP_CLONE_MERGE=1<br/>cp -c / cp -al"| cur2[("{ver}/ (scoring-only version)")]
+  cur2 --> chk2["BOOTSTRAP_VERIFY=1: hashes ==<br/>checkpoints_{ver_prev}.json (from git)"]
   chk --> mf["manifest: what was cloned,<br/>from where, how"]
 ```
 
@@ -45,7 +50,7 @@ flowchart LR
 
 librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, purrr, readr, tibble, yaml, quiet = TRUE)
 source(here("libs/paths.R"))   # ver, ver_prev, dir_big, dir_big_v
-source(here("libs/vars.R"))    # bootstrap_verify
+source(here("libs/vars.R"))    # bootstrap_verify, bootstrap_clone_merge
 options(readr.show_col_types = FALSE)
 
 dist_prev <- path.expand(glue("{dir_big}/{ver_prev}/marine-atlas/dist"))
@@ -162,6 +167,91 @@ if (.flag("BOOTSTRAP_PUBLISH")) {
 } else log_info("BOOTSTRAP_PUBLISH unset — published native copies (S3, file host) not made")
 ```
 
+## Clone the merge + scoring outputs too (`BOOTSTRAP_CLONE_MERGE=1`)
+
+A version that changes **only the scoring** (v10: the distribution-share score on v8's merged models,
+no dataset added, no merge rule changed) must not re-run the 3 h merge and its COG repaint only to
+reproduce `ver_prev`'s surfaces byte for byte. With `BOOTSTRAP_CLONE_MERGE=1` the merge outputs
+(`dist_merged`, `dist_merged_global`, `dist_merged_er` when present, `merge.duckdb`) and the
+scoring database (`sdm.duckdb`: `cell`, `model_cell`, `taxon`, `zone*`, `cell_metric`, `zone_metric`,
+`zone_taxon`) are cloned copy-on-write from `ver_prev` as well, so the new scoring stage reads
+exactly what `ver_prev` scored and the control run (every new flag off) is `ver_prev` by
+construction.
+
+Under `BOOTSTRAP_VERIFY=1` each clone is re-hashed against **`ver_prev`'s own checkpoints**:
+`data/manifests/<target>.json` holds only the current version's, so `ver_prev`'s are recovered from
+git by `scripts/checkpoints_from_git.py <ver_prev>` into the committed
+`data/manifests/checkpoints_<ver_prev>.json` (the last commit whose manifest carried that `ver`).
+`dist_merged_global` has never been checkpointed (the merge manifest fingerprints the US surface
+only); its hash is recorded here as its first.
+
+```{r}
+#| label: clone_merge
+
+merge_items <- tibble(
+  item   = c("marine-atlas/dist_merged", "marine-atlas/dist_merged_global", "marine-atlas/dist_merged_er",
+             "marine-atlas/merge.duckdb", "sdm.duckdb"),
+  needed = c(TRUE, TRUE, FALSE, TRUE, TRUE))   # dist_merged_er exists only from v9 (dps taxa)
+merge_rows <- tibble(); merge_verified <- tibble()
+if (bootstrap_clone_merge) {
+  merge_rows <- pmap_dfr(merge_items, function(item, needed) {
+    from <- path.expand(glue("{dir_big}/{ver_prev}/{item}")); to <- path.expand(glue("{dir_big_v}/{item}"))
+    if (!file_exists(from)) {
+      if (needed) stop(glue("ver_prev has no {item} to clone")) else
+        return(tibble(item = item, method = "absent in ver_prev", n_files = 0L, gb = 0))
+    }
+    # a database must be at rest: a write-ahead log beside it means uncheckpointed changes the
+    # file alone would not carry
+    if (grepl("\\.duckdb$", from)) stopifnot("ver_prev database has a .wal (not at rest)" = !file_exists(paste0(from, ".wal")))
+    dir_create(path_dir(to))
+    method <- if (file_exists(to)) "exists" else {
+      st <- clone(from, to); if (!identical(st, 0L)) stop(glue("clone of {item} failed (exit {st})"))
+      if (Sys.info()[["sysname"]] == "Darwin") "clonefile" else "hardlink" }
+    tf <- if (is_dir(from)) tally(from) else tibble(n_files = 1L, bytes = file_size(from))
+    tc <- if (is_dir(to))   tally(to)   else tibble(n_files = 1L, bytes = file_size(to))
+    stopifnot("clone of a merge/scoring output differs from ver_prev in count or bytes" =
+                tf$n_files == tc$n_files && tf$bytes == tc$bytes)
+    tibble(item = item, method = method, n_files = tc$n_files, gb = round(tc$bytes / 1e9, 2))
+  })
+  knitr::kable(merge_rows, caption = "merge + scoring outputs carried forward from ver_prev (copy-on-write)")
+
+  if (bootstrap_verify) {
+    ck_file <- here(glue("data/manifests/checkpoints_{ver_prev}.json"))
+    stopifnot("no checkpoint file for ver_prev — run scripts/checkpoints_from_git.py <ver_prev>" = file_exists(ck_file))
+    ck <- fromJSON(ck_file)$targets
+    con <- dbConnect(duckdb()); source(here("libs/duckdb_budget.R")); duckdb_tune(con, path.expand(glue("{dir_big_v}/_tmp")))
+    hq <- function(db, tbl) {   # hash one table of a cloned database through a read-only attach
+      dbExecute(con, glue("ATTACH '{db}' AS x (READ_ONLY)")); on.exit(dbExecute(con, "DETACH x"))
+      msens::hash_query(con, glue("x.{tbl}")) }
+    pq <- function(dir) msens::hash_parquet(glue("{dir_big_v}/{dir}/**/*.parquet"), con)
+    sdm_v <- path.expand(glue("{dir_big_v}/sdm.duckdb")); mrg_v <- path.expand(glue("{dir_big_v}/marine-atlas/merge.duckdb"))
+    # score_zones' checkpoint is a concatenation: model_cell + taxon + zone + zone_cell (v8),
+    # with model_cell_er second from v9 on — the length says which
+    sz_tbls <- if (nchar(ck$score_zones$content_hash) == 80) c("model_cell", "model_cell_er", "taxon", "zone", "zone_cell") else
+                                                              c("model_cell", "taxon", "zone", "zone_cell")
+    got <- list(
+      merge_models         = pq("marine-atlas/dist_merged"),
+      merge_models_global  = pq("marine-atlas/dist_merged_global"),
+      merge_taxon          = hq(mrg_v, "taxon"),
+      score_zones          = paste(vapply(sz_tbls, \(t) hq(sdm_v, t), ""), collapse = ""),
+      score_cell_metrics   = hq(sdm_v, "cell_metric"),
+      score_zone_metrics   = hq(sdm_v, "zone_metric"))
+    if (file_exists(path.expand(glue("{dir_big_v}/marine-atlas/dist_merged_er"))) && !is.null(ck$merge_models$er_hash))
+      got$merge_models_er <- pq("marine-atlas/dist_merged_er")
+    dbDisconnect(con, shutdown = TRUE)
+    expect <- c(merge_models = ck$merge_models$content_hash, merge_models_global = NA_character_,
+                merge_models_er = ck$merge_models$er_hash %||% NA_character_,
+                merge_taxon = ck$merge_taxon$content_hash, score_zones = ck$score_zones$content_hash,
+                score_cell_metrics = ck$score_cell_metrics$content_hash, score_zone_metrics = ck$score_zone_metrics$content_hash)
+    merge_verified <- tibble(target = names(got), got = unlist(got)) |>
+      mutate(expected = unname(expect[target]),
+             ok = ifelse(is.na(expected), NA, expected == got))
+    knitr::kable(merge_verified, caption = glue("cloned merge + scoring outputs vs {ver_prev}'s checkpoints (NA = first checkpoint, recorded)"))
+    stopifnot("a cloned merge/scoring output does not hash to ver_prev's checkpoint" = all(merge_verified$ok, na.rm = TRUE))
+  } else log_info("BOOTSTRAP_VERIFY unset — merge + scoring clones checked by count + bytes only")
+} else log_info("BOOTSTRAP_CLONE_MERGE unset — merge + scoring outputs not cloned (this version re-merges)")
+```
+
 ## Verify against the ingest checkpoints (`BOOTSTRAP_VERIFY=1`)
 
 The count/bytes check above says the clone is complete; it cannot say the *source* was the
@@ -205,12 +295,18 @@ if (bootstrap_verify) {
 #| label: manifest
 
 # content-addressed on WHAT was cloned (dataset set + sizes + method), not when
-h <- digest::digest(rows |> select(ds_key, n_files, gb, method), algo = "xxhash64")
+h <- digest::digest(list(rows |> select(ds_key, n_files, gb, method),
+                         merge_rows |> select(any_of(c("item", "n_files", "gb", "method")))), algo = "xxhash64")
+mv <- if (nrow(merge_verified)) setNames(as.list(merge_verified$got), paste0("hash_", merge_verified$target)) else list()
 msens::write_manifest(
   manifest, target = "bootstrap_version", content_hash = h,
-  stats = list(ver = ver, ver_prev = ver_prev, n_datasets = nrow(rows), n_native = sum(nat_rows$n_files),
-               datasets = paste(rows$ds_key, collapse = ","), skipped = paste(skip_ds, collapse = ","),
-               gb_total = sum(rows$gb), method = paste(unique(rows$method), collapse = ","),
-               verified = if (nrow(verified)) all(verified$ok) else NA),
+  stats = c(list(ver = ver, ver_prev = ver_prev, n_datasets = nrow(rows), n_native = sum(nat_rows$n_files),
+                 datasets = paste(rows$ds_key, collapse = ","), skipped = paste(skip_ds, collapse = ","),
+                 gb_total = sum(rows$gb), method = paste(unique(rows$method), collapse = ","),
+                 verified = if (nrow(verified)) all(verified$ok) else NA,
+                 clone_merge = bootstrap_clone_merge,
+                 merge_items = paste(merge_rows$item, collapse = ","),
+                 merge_verified = if (nrow(merge_verified)) all(merge_verified$ok, na.rm = TRUE) else NA),
+            mv),
   force = msens::force_target("bootstrap_version"))
 ```

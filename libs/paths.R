@@ -1,9 +1,9 @@
 # shared version and path configuration ----
 # sourced by all workflow notebooks and apps
 
-ver <- Sys.getenv("MS_VER", "v9") # version string; change on branches (e.g., "v3b"). MS_VER overrides it for a
+ver <- Sys.getenv("MS_VER", "v10") # version string; change on branches (e.g., "v3b"). MS_VER overrides it for a
                                   # version-agnostic run of ONE notebook (e.g. DEPLOY_STAC=1 MS_VER=v8); a pipeline
-                                  # run never sets it (ver_prev below still names v9's predecessor)
+                                  # run never sets it (ver_prev below still names v10's predecessor)
 ver_prev <- "v8" # previous version (bootstrap_version.qmd clones its unchanged ingests; the
                  # score gate compares against it)
 
