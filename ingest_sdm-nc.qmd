@@ -1,53 +1,86 @@
 ---
 title: "Ingest SDMs: NCCOS Atlantic & Pacific Seabird Densities"
-subtitle: "Seasonal seabird density (#/km²) → suitability [0,100] on the global 0.05° grid"
+subtitle: "Seasonal seabird density (#/km²) → population-percentile suitability [1,100] on the global 0.05° grid"
 msens:
   target_name: ingest_sdm_nc
   workflow_type: ingest
   dependency: [build_cell_grid]
   output: data/manifests/ingest_sdm_nc.json
-  dataset: {ds_key: nc, response_type: density, source_authority: NOAA NCCOS, temporal_interval: seasonal, native_format: raster}
+  dataset: {ds_key: nc, response_type: density, source_authority: NOAA NCCOS, temporal_interval: seasonal, native_format: raster,
+            description: "NOAA NCCOS at-sea seabird models, seasonal: Pacific (Leirness et al. 2021) are densities (n per km2); Atlantic (Winship et al. 2018) are a RELATIVE density index, not an absolute abundance. Mapped onto [1,100] by the population-percentile transform (ud), which is scale-free, so both are treated alike. Multi-species guilds are ingested for review (is_guild) and excluded from the merge.",
+            value_info: "population percentile of the cell's density within its model (100 = densest cell; val >= 100 - p is the p % core); per-model response_type is density (Pacific) or relative_index (Atlantic 2018)"}
 editor_options:
   chunk_output_type: console
 ---
 
 NCCOS at-sea seabird **density** models, Atlantic [@winship2018] + Pacific [@leirness2021], as
-seasonal COGs (`n_per_km2`, 2-km, oblique-mercator). v8 rasterizes each (species × season) onto
-the global 0.05° cell grid and rescales the heavy-tailed density to a graded **suitability [0,100]**
-per species (so seasons/regions share a scale), plus an **annual** mean surface for scoring.
+seasonal COGs (`n_per_km2`, 2-km, oblique-mercator). v11 rasterizes each (species × season × region)
+onto the global 0.05° cell grid and maps the heavy-tailed density onto the merge's **[1,100]** scale
+by the **population-percentile** transform (`msens::density_to_suit(method = "ud")`), plus an
+**annual** surface for scoring.
 
 - **Source COGs** (in-repo): `data/sdm/raw/nc_atl_birds_dens/*.tif` (140) + `nc_pac_birds_dens/*.tif`
   (135); band 1 = `n_per_km2` (bands 2/3 = CV/CI). Also public at
   `file.marinesensitivity.org/cog/sdm/raw/{ds}/{sp_code}_{season}.tif` (served natively via titiler).
-- **`mdl_key`**: seasonal `nc|{sp_id}|{season}` + annual `nc|{sp_id}` (`sp_id` = `GBIF:…`, or
-  `GUILD:{sp_code}` for the multi-species guilds that lack a single taxon id). Regions (atl/pac) are
-  spatially disjoint and **unioned** per `sp_id`.
+- **`mdl_key`**: seasonal `nc|{sp_id}|{season}` + annual `nc|{sp_id}`. `sp_id` is `GBIF:…` for a
+  species and `GUILD:{sp_code}` for the 13 multi-species guilds (these used to land under the
+  genus/family GBIF id with `is_guild = FALSE`, and three of them shared an id with a real species).
+  Regions (atl/pac) are spatially disjoint and **unioned** per `sp_id`.
+- **Value transform (v11 Q6, D12).** Per model (species × season × region), AFTER regridding:
+  `val = density_to_suit(d, "ud", area = cell area_km2)` — 100 minus the percent of the modelled
+  population in cells strictly denser than this one, so the densest cell is 100 and the cells with
+  `val >= 100 - p` are exactly the p % core. Cells with `val < 1` are dropped (the merge's floor). It is
+  scale-free, which is why the Atlantic 2018 index and the Pacific densities are treated alike.
+  The old recipe (`NC_TRANSFORM=cap`: linear to the species' pooled p99.5 of positive density, which left
+  most cells near 0) stays available and is compared with it below.
+- **Annual** = `msens::density_annual(n_intervals = 4)` on the DENSITIES — a season NCCOS did not
+  model counts as zero — and THEN the same transform. The v8 ingest averaged the transformed values
+  over the seasons a cell was *present* in, biasing the annual upward for the sparsest species.
+- **Crosswalk** (`data/nc_taxon_crosswalk.csv`, written HERE): common name first, then scientific
+  name, then explicit overrides, resolved to the BirdLife `sisid` (the `bl` model table) and the WoRMS
+  AphiaID (`spp.duckdb`). `model_nc.csv` carries `sisid`, `worms_id`, `is_guild`, `response_type`;
+  `merge_models_prep.qmd` excludes `is_guild` rows.
 
-> **Density → [0,100] is a modeling choice**, not a v7-faithful recipe (v7 never scored nc). Here:
-> per-`sp_id` linear rescale to the pooled **p99.5** of non-zero density (caps outliers), stored as
-> `val_cap` in `model_nc.csv` for reversibility. **NOT yet folded into merge/scoring** — see the note
-> at the end (merge treats non-`am` datasets as binary ranges; folding density in is a scoring change
-> to validate with `pra_score_delta`).
+> **Not yet folded into merge/scoring** (a flagged scoring change, `FOLD_DENSITY`).
+>
+> **Atlantic source.** The Winship et al. (2018) product is a *relative density index* ("relative
+> density … not the actual number"), which the `ud` transform is indifferent to. NCCOS 2023-060
+> (monthly, 10 km, 49 species) would replace the Atlantic set when acquired; `NC_ATL_SOURCE` is the
+> placeholder for that switch and accepts only `2018` today.
 
 ## Setup
 
 ```{r}
 #| label: setup
 
-librarian::shelf(arrow, dplyr, fs, glue, here, jsonlite, logger, purrr, readr, sf, terra, tibble,
-                 tidyr, MarineSensitivity/msens, quiet = T)
+librarian::shelf(arrow, DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, purrr, readr, sf, stringr,
+                 terra, tibble, tidyr, quiet = T)
+library(msens)                      # the installed msens (density_to_suit / density_annual); never via shelf(), which can reinstall a stale main
 source(here("libs/paths.R"))
 source(here("libs/vars.R"))
+source(here("libs/duckdb_budget.R"))
 options(readr.show_col_types = FALSE)
 `%||%` <- function(a, b) if (is.null(a) || length(a) == 0 || all(is.na(a))) b else a
 
 ds_key   <- "nc"
-dir_dist <- glue("{dir_big_v}/marine-atlas/dist/dataset={ds_key}"); dir_create(dir_dist)
-mdl_csv  <- glue("{dir_big_v}/marine-atlas/dist/model_{ds_key}.csv")
+dir_atlas <- glue("{dir_big_v}/marine-atlas")
+dir_dist <- glue("{dir_atlas}/dist/dataset={ds_key}"); dir_create(dir_dist)
+mdl_csv  <- glue("{dir_atlas}/dist/model_{ds_key}.csv")
 manifest <- here("data/manifests/ingest_sdm_nc.json"); dir_create(path_dir(manifest))
+xw_csv   <- here("data/nc_taxon_crosswalk.csv")
+cmp_csv  <- here("data/nc_transform_compare.csv")
 cog_base <- "https://file.marinesensitivity.org/cog/sdm/raw"
-p_cap    <- 0.995                                        # density percentile used as the 100 point
+p_cap    <- 0.995                      # the density percentile the OLD recipe used as the 100 point
 stopifnot(file_exists(cellid_tif))
+
+# flags (this notebook's own; default = the v11 recipe) ----
+nc_transform  <- tolower(Sys.getenv("NC_TRANSFORM", "ud"))        # ud (v11) | cap (the v8 recipe, for comparison)
+nc_atl_source <- Sys.getenv("NC_ATL_SOURCE", "2018")              # Atlantic source: only Winship 2018 today
+stopifnot("NC_TRANSFORM must be 'ud' or 'cap'" = nc_transform %in% c("ud", "cap"))
+if (nc_atl_source != "2018")
+  stop("NC_ATL_SOURCE='", nc_atl_source, "' is not available: only the Winship et al. (2018) set ('2018') is ",
+       "acquired; NCCOS 2023-060 (monthly, 10 km, 49 spp) must be ingested before it can replace it", call. = FALSE)
+log_info("nc: transform = {nc_transform}; Atlantic source = {nc_atl_source}; redo = {redo_ingest}")
 
 if (redo_ingest && dir_exists(dir_dist)) { dir_delete(dir_dist); dir_create(dir_dist) }
 
@@ -62,6 +95,41 @@ write_parquet_row <- function(d, sid, ssn, safe) {
 }
 ```
 
+## Cell areas
+
+The `ud` transform weights each cell by its area (the population in a cell is density × area). The
+`cell` table is a property of the grid, not of the release: this version's `sdm.duckdb` is used when
+`build_cell_grid` has written it, else `ver_prev`'s (which `build_cell_grid` copies unchanged).
+
+```{r}
+#| label: cell-area
+
+sdm_cell_db <- c(sdm_db, glue("{dir_big}/{ver_prev}/sdm.duckdb")) |> path_expand() |> keep(file_exists) |> first()
+stopifnot("no sdm.duckdb with a cell table (this version's or ver_prev's)" = !is.null(sdm_cell_db))
+log_info("cell areas from {sdm_cell_db}")
+con_sdm <- dbConnect(duckdb(sdm_cell_db, read_only = TRUE))
+duckdb_tune(con_sdm, glue("{dir_big_v}/_tmp/nc"))
+ca <- dbGetQuery(con_sdm, "SELECT cell_id, area_km2 FROM cell")
+dbDisconnect(con_sdm, shutdown = TRUE)
+area_by_id <- rep(NA_real_, 7200 * 3600); area_by_id[ca$cell_id] <- ca$area_km2
+# the cell table holds the OCEAN cells only (17.07 M of 25.92 M), while the regridded surfaces fade into
+# land cells along the coast (whole range, no land mask): those take the area of their latitude row
+# (a cell's area depends on its row alone; the table's rows are constant to 1e-9 relative)
+row_of <- \(id) (id - 1L) %/% 7200L + 1L
+a_row  <- ca |> mutate(row = row_of(cell_id)) |> group_by(row) |>
+  summarise(a = first(area_km2), spread = max(area_km2) / min(area_km2) - 1, .groups = "drop")
+stopifnot("cell area is not constant within a row" = max(a_row$spread) < 1e-6)
+area_by_row <- rep(NA_real_, 3600); area_by_row[a_row$row] <- a_row$a
+cell_area <- function(id) {
+  a <- area_by_id[id]; miss <- is.na(a)
+  if (any(miss)) a[miss] <- area_by_row[row_of(id[miss])]
+  stopifnot("a cell id has no area (no ocean cell in its row)" = !anyNA(a), all(a > 0))
+  a }
+log_info("cell table: {nrow(ca)} ocean cells, area {round(min(ca$area_km2), 3)}-{round(max(ca$area_km2), 1)} km2; ",
+         "land cells take their row's area")
+rm(ca)
+```
+
 ## Models + species crosswalk
 
 ```{r}
@@ -70,46 +138,208 @@ write_parquet_row <- function(d, sid, ssn, safe) {
 # one row per (region, sp_code, season) at band 1 (density)
 m <- read_csv(here("data/nc_models.csv")) |>
   filter(var == "n_per_km2") |>
-  transmute(region_ds = ds_key, region, sp_code, season, cog_url, bidx)
+  transmute(region_ds = ds_key, region, sp_code, season, cog_url,
+            response_type = if_else(region == "Atlantic", "relative_index", "density"))
+stopifnot("unexpected region" = all(m$region %in% c("Atlantic", "Pacific")))
 
-# sp_code -> sp_id / names, unioned across the two regions' crosswalks; guilds get GUILD:{sp_code}
-read_xw <- function(f) {
-  if (!file_exists(f)) return(tibble())
-  read_csv(f) |> transmute(sp_code, sp_id = as.character(sp_id), sp_common, sp_scientific)
-}
-xw <- bind_rows(
+# sp_code -> GBIF id / names, unioned across the two regions' crosswalks
+read_xw <- function(f) read_csv(f) |>
+  transmute(sp_code, gbif_id = as.character(sp_id), sp_common, sp_scientific)
+nc_xw <- bind_rows(
   read_xw(here("data/sdm/derived/nc_atl_birds_dens/mw_spp.csv")),
   read_xw(here("data/sdm/derived/nc_pac_birds_dens/m_spp.csv")),
-  read_xw(here("data/sdm/derived/nc_pac_birds_dens/m_spp-multiple.csv")),
-  read_xw(here("data/sdm/derived/nc_atl_birds_dens/mw_spp-multiple.csv"))) |>
+  read_xw(here("data/sdm/derived/nc_pac_birds_dens/m_spp-multiple.csv"))) |>
   distinct(sp_code, .keep_all = TRUE)
+nc_multi <- read_csv(here("data/sdm/derived/nc_pac_birds_dens/m_spp-multiple.csv"))$sp_code
+stopifnot("a model's sp_code has no species row" = all(m$sp_code %in% nc_xw$sp_code))
+nc_xw <- nc_xw |> filter(sp_code %in% m$sp_code) |>
+  mutate(is_guild = sp_code %in% nc_multi | str_detect(sp_code, "-") | !str_detect(sp_scientific, " ") |
+                    str_detect(sp_common, "spp\\.|/"))
+stopifnot("expected 82 NCCOS codes, 13 of them guilds" = nrow(nc_xw) == 82, sum(nc_xw$is_guild) == 13)
+```
 
-m <- m |> left_join(xw, by = "sp_code") |>
-  mutate(
-    is_guild = is.na(sp_id) | grepl("/", sp_scientific %||% ""),
-    sp_id    = ifelse(is.na(sp_id), glue("GUILD:{sp_code}"), sp_id),
-    scientific_name = sp_scientific %||% sp_code)
-log_info("nc models: {nrow(m)} (species×season×region); {n_distinct(m$sp_id)} sp_id; guilds: {sum(m$is_guild & !duplicated(m$sp_id))}")
+### Crosswalk: common name → scientific name → override, to BirdLife `sisid` and WoRMS AphiaID
+
+The AOU codes are defined by common name, so a common name is the strongest key; the NCCOS scientific
+names follow an older taxonomy (`Puffinus gravis` vs *Ardenna gravis*), which is why a name-only match
+missed 20 of 79 species and matched three to the WRONG one.
+
+```{r}
+#| label: crosswalk
+
+# BirdLife species table (the `bl` model table merge_models_prep.qmd reads its birds from)
+bl <- read_csv(glue("{dir_atlas}/dist/model_bl.csv")) |>
+  transmute(sisid = as.character(sisid), bl_sci = sci_name, bl_common = common)
+norm <- function(x) str_to_lower(str_replace_all(x, "[^A-Za-z]", ""))
+bl <- bl |> mutate(k_common = norm(bl_common), k_sci = norm(bl_sci))
+
+# curated overrides (a match the names cannot make)
+nc_override <- tribble(
+  ~sp_code, ~sisid,     ~note,
+  "HERG",   "62030590", "American herring gull = BirdLife Larus smithsonianus (the GBIF name L. argentatus is the European species)")
+
+# common name first; an ambiguous common name is narrowed by scientific name, never guessed
+pick_bl <- function(k_common, k_sci) {
+  by_common <- bl |> filter(k_common == !!k_common)
+  if (nrow(by_common) == 1) return(tibble(sisid = by_common$sisid, match_by = "common name", note = NA_character_))
+  if (nrow(by_common) > 1) {
+    narrowed <- by_common |> filter(k_sci == !!k_sci)
+    if (nrow(narrowed) == 1) return(tibble(sisid = narrowed$sisid, match_by = "common name", note = "common name ambiguous; narrowed by scientific name"))
+  }
+  by_sci <- bl |> filter(k_sci == !!k_sci)
+  if (nrow(by_sci) == 1) return(tibble(sisid = by_sci$sisid, match_by = "scientific name", note = NA_character_))
+  tibble(sisid = NA_character_, match_by = NA_character_, note = NA_character_)
+}
+
+cw <- nc_xw |> mutate(k_common = norm(sp_common), k_sci = norm(sp_scientific)) |>
+  bind_cols(pmap_dfr(list(norm(nc_xw$sp_common), norm(nc_xw$sp_scientific)), pick_bl) |>
+              rename(sisid_name = sisid, match_by_name = match_by, note_name = note)) |>
+  left_join(nc_override, by = "sp_code") |>
+  mutate(sisid    = if_else(is_guild, NA_character_, coalesce(sisid, sisid_name)),
+         match_by = case_when(is_guild ~ NA_character_, !is.na(note) & !is.na(sisid) ~ "override",
+                              TRUE ~ match_by_name),
+         note     = case_when(is_guild ~ sp_common, TRUE ~ coalesce(note, note_name))) |>
+  select(-sisid_name, -match_by_name, -note_name, -k_common, -k_sci) |>
+  left_join(bl |> select(sisid, bl_sci, bl_common), by = "sisid")
+
+# WoRMS AphiaID by name (BirdLife's accepted name first, then NCCOS's), accepted species of class Aves;
+# an unaccepted hit resolves to its accepted AphiaID. WoRMS covers birds poorly, so a miss is a note,
+# not a stop: the bird authority is BirdLife (BOTW:{sisid}).
+con_spp <- dbConnect(duckdb(path_expand(spp_db), read_only = TRUE))
+nm <- unique(na.omit(c(cw$bl_sci, cw$sp_scientific[!cw$is_guild])))
+wm <- dbGetQuery(con_spp, glue("
+  SELECT scientificName AS nm, CAST(COALESCE(acceptedNameUsageID, taxonID) AS VARCHAR) AS worms_id,
+         taxonomicStatus = 'accepted' AS is_acc
+  FROM worms WHERE \"class\" = 'Aves' AND taxonRank = 'Species'
+    AND scientificName IN ({paste(dbQuoteString(con_spp, nm), collapse = ',')})")) |>
+  arrange(desc(is_acc)) |> distinct(nm, .keep_all = TRUE)
+dbDisconnect(con_spp, shutdown = TRUE)
+cw <- cw |>
+  left_join(wm |> transmute(bl_sci = nm, w_bl = worms_id), by = "bl_sci") |>
+  left_join(wm |> transmute(sp_scientific = nm, w_nc = worms_id), by = "sp_scientific") |>
+  mutate(worms_id = if_else(is_guild, NA_character_, coalesce(w_bl, w_nc))) |> select(-w_bl, -w_nc)
+
+# --- hard stops ----
+nong <- cw |> filter(!is_guild)
+stopifnot("a non-guild code resolves to nothing" = !anyNA(nong$sisid),
+          "two codes resolve to the same BirdLife species" = !anyDuplicated(nong$sisid),
+          "two codes share a GBIF id" = !anyDuplicated(nong$gbif_id))
+# the three formerly WRONG matches (name-only on GBIF scientific names) must stay impossible:
+#  Cory's shearwater -> Calonectris diomedea (Scopoli's, Mediterranean) instead of C. borealis;
+#  herring gull -> Larus argentatus (the European species) instead of L. smithsonianus;
+#  white-winged scoter -> the European velvet scoter instead of Melanitta deglandi
+want <- c(COSH = "Calonectris borealis", HERG = "Larus smithsonianus", WWSC = "Melanitta deglandi")
+got  <- setNames(cw$bl_sci[match(names(want), cw$sp_code)], names(want))
+stopifnot("the Cory's / herring gull / white-winged scoter crosswalk regressed" = identical(got, want))
+# a common-name match must agree with the crosswalk's common name; a name or override match may
+# differ only for a curated, known BirdLife rename
+common_renamed_ok <- c("DOVE", "PAJA", "HERG")          # Dovekie = Little Auk; Parasitic = Arctic Jaeger; American = Arctic Herring Gull
+bad <- nong |> filter(norm(sp_common) != norm(bl_common), !sp_code %in% common_renamed_ok)
+stopifnot("a matched species' common name disagrees with the crosswalk" = nrow(bad) == 0)
+stopifnot("an override/name match outside the curated list" =
+            all(nong$sp_code[nong$match_by != "common name"] %in% common_renamed_ok))
+
+cw_out <- cw |>
+  transmute(sp_code, common_name = sp_common, scientific_name = sp_scientific, match_by, worms_id, sisid, is_guild,
+            note, gbif_id, sp_id = if_else(is_guild, glue("GUILD:{sp_code}"), gbif_id),
+            bl_scientific = bl_sci, bl_common) |>
+  arrange(is_guild, sp_code)
+write_csv(cw_out, xw_csv, na = "")
+log_info("crosswalk: {nrow(cw_out)} codes; {sum(cw_out$is_guild)} guilds; WoRMS id for {sum(!is.na(cw_out$worms_id))} of {sum(!cw_out$is_guild)} species")
+knitr::kable(cw_out |> mutate(match_by = coalesce(match_by, "guild")) |> count(match_by, name = "n_codes"),
+             caption = "crosswalk: codes by match_by")
+knitr::kable(cw_out |> filter(!is_guild, match_by != "common name" | scientific_name != bl_scientific) |>
+               select(sp_code, common_name, scientific_name, bl_scientific, bl_common, match_by, sisid, worms_id),
+             caption = "species whose NCCOS scientific name differs from BirdLife's, or that matched off the common name")
+knitr::kable(cw_out |> filter(is_guild) |> select(sp_code, common_name, scientific_name, sp_id),
+             caption = "guilds: ingested as nc|GUILD:{code}, excluded from the merge")
+
+# model table with the ingest's sp_id / names
+m <- m |> left_join(cw_out |> select(sp_code, sp_id, common_name, nc_scientific = scientific_name, scientific_name = bl_scientific,
+                                     is_guild, sisid, worms_id, match_by), by = "sp_code") |>
+  mutate(scientific_name = coalesce(scientific_name, nc_scientific))
+log_info("nc models: {nrow(m)} (species×season×region); {n_distinct(m$sp_id)} sp_id; guilds: {n_distinct(m$sp_id[m$is_guild])}")
 knitr::kable(m |> count(region, season, name = "n") |> pivot_wider(names_from = season, values_from = n))
 ```
 
-## Rasterize + rescale per species
+## Regrid + transform
+
+```{r}
+#| label: functions
+
+# a source model's density on the 0.05° cells: bilinear reprojection of the omerc COG to EPSG:4326, then
+# cells_from_raster() (bilinear onto the cell grid, zero-filled so the surface fades to 0 at its edge).
+# digits = NULL: the raster holds NATIVE density, which rounds to 0 at 2 decimals; min_value is a
+# positive epsilon, i.e. "any positive density" (the default 1 would drop every cell of a density < 1)
+dens_cells <- function(region_ds, sp_code, season) {
+  f <- here(glue("data/sdm/raw/{region_ds}/{sp_code}_{season}.tif"))
+  if (!file_exists(f)) return(NULL)
+  r <- terra::project(terra::rast(f, lyrs = 1), "EPSG:4326", method = "bilinear")
+  msens::cells_from_raster(r, cellid_tif, min_value = 1e-12, digits = NULL) |> rename(dens = val)
+}
+
+# density -> [0,100]: the v11 population percentile (ud, area-weighted by the cell table), or the v8
+# recipe (cap: linear to the species' pooled p99.5 of positive density, clamped)
+to_val <- function(dens, cell_id, how, cap = NA_real_) {
+  if (how == "ud") msens::density_to_suit(dens, "ud", area = cell_area(cell_id), digits = 2)
+  else             round(100 * pmin(dens / cap, 1), 2)
+}
+
+# a species' models in one region as (cell_id, interval, dens)
+region_dens <- function(sp_code, region) {
+  mi <- m |> filter(sp_code == !!sp_code, region == !!region)
+  map2_dfr(mi$region_ds, mi$season, \(rd, s) dens_cells(rd, sp_code, s) |> mutate(interval = s))
+}
+```
+
+### The annual surface is the mean over ALL four seasons
+
+An unmodelled season counts as zero (NCCOS fits a season only where the species was sighted enough to
+model). Checked on the densities, before any transform, on hand-picked species: with four seasons the
+annual equals the plain mean of the seasons; a species missing a season has a LOWER annual than the
+present-only mean (by exactly n_present / 4).
+
+```{r}
+#| label: annual-check
+
+chk <- function(code, region) {
+  d   <- region_dens(code, region)
+  ann <- msens::density_annual(d, n_intervals = 4)
+  wide <- d |> pivot_wider(names_from = interval, values_from = dens, values_fill = 0)
+  list(d = d, ann = ann, wide = wide, n = n_distinct(d$interval))
+}
+chk4 <- list(ATPU = "Atlantic", AUSH = "Atlantic", BFAL = "Pacific", CAAU = "Pacific")   # all four seasons
+for (code in names(chk4)) {
+  x <- chk(code, chk4[[code]]); stopifnot(x$n == 4)
+  plain <- x$wide |> transmute(cell_id, mean4 = rowMeans(across(-cell_id)))
+  j <- inner_join(x$ann, plain, by = "cell_id")
+  stopifnot("annual != plain 4-season mean" = nrow(j) == nrow(x$ann), nrow(j) == nrow(plain),
+            max(abs(j$dens - j$mean4)) < 1e-12 * max(j$mean4))
+}
+chk3 <- list(ASSP = "Pacific", BLSP = "Pacific", BVSH = "Pacific", BLKI = "Atlantic")   # three seasons
+chk_rows <- list()
+for (code in names(chk3)) {
+  x <- chk(code, chk3[[code]]); stopifnot(x$n == 3)
+  present <- x$d |> group_by(cell_id) |> summarise(present_mean = mean(dens), n_ssn = n(), .groups = "drop")
+  j <- inner_join(x$ann, present, by = "cell_id")
+  stopifnot("annual is not below the present-only mean" = all(j$dens < j$present_mean),
+            "annual != present-only mean x n_present/4" = all(abs(j$dens - j$present_mean * j$n_ssn / 4) < 1e-12 * max(j$present_mean)))
+  chk_rows[[code]] <- tibble(sp_code = code, seasons = x$n, cells = nrow(j),
+                             mean_annual = mean(j$dens), mean_present_only = mean(j$present_mean))
+}
+log_info("annual checks passed: {length(chk4)} four-season species (annual == plain mean), {length(chk3)} three-season species (annual < present-only mean)")
+knitr::kable(bind_rows(chk_rows) |> mutate(across(starts_with("mean"), \(v) signif(v, 3))),
+             caption = "three-season species: annual vs the present-only mean the v8 ingest used (cell means)")
+```
 
 ```{r}
 #| label: rasterize
 
-# local source cog for a model row (reproject omerc -> 4326, band 1)
-read_cog <- function(region_ds, sp_code, season) {
-  f <- here(glue("data/sdm/raw/{region_ds}/{sp_code}_{season}.tif"))
-  if (!file_exists(f)) return(NULL)
-  r <- rast(f, lyrs = 1)
-  terra::project(r, "EPSG:4326", method = "bilinear")
-}
-
-# process per sp_id: pool all its (season×region) densities for a shared p99.5 cap, then write one
-# seasonal surface per season (regions unioned) + an annual mean. resumable (skip existing parquet).
+# per sp_id: regrid every (region × season) model, add the per-region annual (density_annual on the
+# DENSITIES), transform each model on its own cells (both recipes, for the comparison), write the
+# selected one with the regions unioned per season. resumable (skip existing parquet) unless REDO_INGEST.
 sp_ids   <- sort(unique(m$sp_id))
-reg_rows <- list()
+cmp_rows <- list(); cap_rows <- list()
 for (sid in sp_ids) {
   mi   <- m |> filter(sp_id == sid)
   safe <- gsub("[^A-Za-z0-9._-]", "_", sid)
@@ -117,68 +347,113 @@ for (sid in sp_ids) {
           file_exists(glue("{dir_dist}/{ds_key}_{safe}.parquet"))
   if (done && !redo_ingest) next
 
-  # read every source raster for this sp_id, pool non-zero densities -> cap
-  rs   <- pmap(list(mi$region_ds, mi$sp_code, mi$season), read_cog)
-  keep <- !vapply(rs, is.null, logical(1)); mi <- mi[keep, ]; rs <- rs[keep]
-  if (!length(rs)) { log_warn("no source rasters for {sid}"); next }
-  vals <- unlist(lapply(rs, function(r) { v <- values(r, mat = FALSE); v[!is.na(v) & v > 0] }))
-  cap  <- as.numeric(quantile(vals, p_cap, names = FALSE))
-  if (!is.finite(cap) || cap <= 0) cap <- max(vals, na.rm = TRUE)
+  dl   <- pmap(list(mi$region_ds, mi$sp_code, mi$season), dens_cells)
+  keep <- !vapply(dl, is.null, logical(1)); mi <- mi[keep, ]; dl <- dl[keep]
+  if (!length(dl)) { log_warn("no source rasters for {sid}"); next }
+  dd <- map_dfr(seq_along(dl), \(j) dl[[j]] |> mutate(region = mi$region[j], interval = mi$season[j]))
+  # the v8 recipe's 100 point: pooled p99.5 of the species' positive densities (all seasons, both regions)
+  cap <- as.numeric(quantile(dd$dens, p_cap, names = FALSE))
+  if (!is.finite(cap) || cap <= 0) cap <- max(dd$dens)
+  # annual per region: mean over 4 seasons, an unmodelled season = 0
+  ann <- dd |> group_by(region) |>
+    group_modify(\(x, k) msens::density_annual(x, n_intervals = 4)) |> ungroup() |> mutate(interval = "annual")
+  res <- bind_rows(dd, ann) |> group_by(region, interval) |>
+    group_modify(\(x, k) tibble(cell_id = x$cell_id, dens = x$dens,
+                                v_ud = to_val(x$dens, x$cell_id, "ud"), v_cap = to_val(x$dens, x$cell_id, "cap", cap))) |>
+    ungroup() |> mutate(val = if (nc_transform == "ud") v_ud else v_cap)
 
-  # per season: union regions' cells, rescale density->[0,100] by the shared cap
-  cells_season <- list()
-  for (ssn in unique(mi$season)) {
-    idx <- which(mi$season == ssn)
-    d <- map_dfr(idx, function(j) {
-      r <- rs[[j]]; r <- terra::clamp(r / cap * 100, upper = 100, values = TRUE)
-      msens::cells_from_raster(r, cellid_tif, min_value = 1)
-    })
+  # per-model comparison of the two recipes (cells written = val >= 1)
+  q <- \(v) quantile(v, c(.1, .5, .9), names = FALSE)
+  cmp_rows[[sid]] <- res |> group_by(region, interval) |>
+    summarise(n_cells = n(), n_ud = sum(v_ud >= 1), n_cap = sum(v_cap >= 1),
+              ud_q10 = q(v_ud[v_ud >= 1])[1], ud_q50 = q(v_ud[v_ud >= 1])[2], ud_q90 = q(v_ud[v_ud >= 1])[3],
+              cap_q10 = q(v_cap[v_cap >= 1])[1], cap_q50 = q(v_cap[v_cap >= 1])[2], cap_q90 = q(v_cap[v_cap >= 1])[3],
+              .groups = "drop") |>
+    mutate(sp_id = sid, sp_code = mi$sp_code[1], .before = 1)
+  cap_rows[[sid]] <- tibble(sp_id = sid, dens_cap = cap)
+
+  # one surface per interval, regions unioned (disjoint; max where they touch)
+  for (iv in unique(res$interval)) {
+    d <- res |> filter(interval == iv, val >= 1) |> group_by(cell_id) |> summarise(val = max(val), .groups = "drop")
     if (!nrow(d)) next
-    d <- d |> group_by(cell_id) |> summarise(val = max(val), .groups = "drop")   # union regions (disjoint)
-    write_parquet_row(d, sid, ssn, safe)
-    cells_season[[ssn]] <- d
+    write_parquet_row(d, sid, if (iv == "annual") NA_character_ else iv, safe)
   }
-  # annual = mean across the available seasons (per cell)
-  if (length(cells_season)) {
-    da <- bind_rows(cells_season, .id = "season") |>
-      group_by(cell_id) |> summarise(val = round(mean(val), 2), .groups = "drop")
-    write_parquet_row(da, sid, NA, safe)
-  }
-  reg_rows[[sid]] <- mi |> distinct(sp_id, sp_code, scientific_name, is_guild) |>
-    slice(1) |> mutate(val_cap = round(cap, 4),
-                       seasons = paste(sort(unique(mi$season)), collapse = "|"),
-                       regions = paste(sort(unique(mi$region)), collapse = "|"))
 }
+log_info("rasterized {length(cmp_rows)} sp_id ({nc_transform})")
 ```
 
-## Model registry (`model_nc.csv`)
+## Model registry (`model_nc.csv`) + transform comparison
 
 ```{r}
 #| label: model-csv
 
-# resumable: a re-render with every surface already on disk leaves reg_rows empty (the rasterize
-# loop `next`s), so keep the existing registry rather than rebuilding it from nothing.
-if (length(reg_rows) == 0 && file_exists(mdl_csv)) {
-  model_nc <- read_csv(mdl_csv)
-} else {
-  reg <- bind_rows(reg_rows)
-  # expand to one mdl_key per (seasonal + annual) surface actually written
-  model_nc <- reg |> rowwise() |> do({
-    r <- .; ssns <- strsplit(r$seasons, "\\|")[[1]]
-    tibble(
-      mdl_key = c(glue("{ds_key}|{r$sp_id}|{ssns}"), glue("{ds_key}|{r$sp_id}")),
-      interval = c(ssns, "annual"),
-      sp_id = r$sp_id, sp_code = r$sp_code, scientific_name = r$scientific_name,
-      is_guild = r$is_guild, val_cap = r$val_cap, regions = r$regions,
-      cog_url = c(glue("{cog_base}/nc_{ifelse(r$regions=='Atlantic','atl','pac')}_birds_dens/{r$sp_code}_{ssns}.tif"), NA))
-  }) |> ungroup() |>
-    rowwise() |>
-    filter(file_exists(glue("{dir_dist}/{ds_key}_{gsub('[^A-Za-z0-9._-]','_',sp_id)}{ifelse(interval=='annual','', paste0('_',interval))}.parquet"))) |>
-    ungroup()
-  write_csv(model_nc, mdl_csv)
-}
-log_info("model_nc.csv: {nrow(model_nc)} mdl_keys ({sum(model_nc$interval=='annual')} annual)")
+# stats of every written surface, read back from the parquet (so a resumed run is complete too)
+con <- dbConnect(duckdb())
+duckdb_tune(con, glue("{dir_big_v}/_tmp/nc"))
+surf <- dbGetQuery(con, glue("
+  SELECT mdl_key, count(*) AS n_cells, round(min(val), 2) AS val_min, round(max(val), 2) AS val_max
+  FROM read_parquet('{dir_dist}/*.parquet') GROUP BY mdl_key"))
+dbDisconnect(con, shutdown = TRUE)
+
+# dens_cap per sp_id: this run's, else the previous registry's (resume)
+caps <- bind_rows(cap_rows)
+prev_nc <- if (file_exists(mdl_csv)) read_csv(mdl_csv) else tibble()
+if ("dens_cap" %in% names(prev_nc))
+  caps <- bind_rows(caps, prev_nc |> distinct(sp_id, dens_cap) |> filter(!sp_id %in% caps$sp_id))
+meta <- m |> group_by(sp_id) |>
+  summarise(sp_code = first(sp_code), common_name = first(common_name), scientific_name = first(scientific_name),
+            nc_scientific_name = first(nc_scientific), is_guild = first(is_guild), sisid = first(sisid),
+            worms_id = first(worms_id), match_by = first(match_by),
+            regions = paste(sort(unique(region)), collapse = "|"),
+            response_type = if (n_distinct(response_type) == 1) first(response_type) else "mixed",
+            seasons = list(sort(unique(season))), .groups = "drop")
+# a model row per surface written: the seasonal ones + the annual
+model_nc <- meta |> rowwise() |>
+  reframe(sp_id, interval = c(seasons, "annual")) |>
+  left_join(meta |> select(-seasons), by = "sp_id") |>
+  mutate(mdl_key = if_else(interval == "annual", glue("{ds_key}|{sp_id}"), glue("{ds_key}|{sp_id}|{interval}")),
+         transform = nc_transform) |>
+  left_join(caps, by = "sp_id") |>
+  inner_join(surf, by = "mdl_key") |>
+  left_join(m |> group_by(sp_id, interval = season) |>
+              summarise(cog_url = paste(cog_url, collapse = "|"), .groups = "drop"), by = c("sp_id", "interval")) |>
+  select(mdl_key, interval, sp_id, sp_code, common_name, scientific_name, nc_scientific_name, is_guild, sisid, worms_id,
+         match_by, regions, response_type, transform, dens_cap, val_min, val_max, n_cells, cog_url) |>
+  arrange(sp_id, interval)
+stopifnot("val outside [1,100]" = all(model_nc$val_min >= 1 & model_nc$val_max <= 100),
+          "a model has no dens_cap" = !anyNA(model_nc$dens_cap),
+          "every guild code must be ingested" = setequal(model_nc$sp_code[model_nc$is_guild], cw_out$sp_code[cw_out$is_guild]),
+          "nc|GUILD key missing" = all(grepl("^nc\\|GUILD:", model_nc$mdl_key[model_nc$is_guild])),
+          "every species has an annual surface" = all(table(model_nc$sp_id, model_nc$interval == "annual")[, "TRUE"] == 1))
+write_csv(model_nc, mdl_csv)
+log_info("model_nc.csv: {nrow(model_nc)} mdl_keys ({sum(model_nc$interval=='annual')} annual, {n_distinct(model_nc$sp_id)} sp_id, {n_distinct(model_nc$sp_id[model_nc$is_guild])} guilds)")
 knitr::kable(model_nc |> count(interval, name = "n"))
+knitr::kable(model_nc |> distinct(sp_id, .keep_all = TRUE) |> count(response_type, regions, is_guild, name = "n_sp_id"),
+             caption = "sp_id by response type (Atlantic Winship 2018 = relative_index), regions and guild")
+
+# the two recipes side by side, per model (species × region × season|annual); persisted so a resumed
+# run keeps the rows of the species it skipped
+cmp <- bind_rows(cmp_rows)
+if (file_exists(cmp_csv)) cmp <- bind_rows(cmp, read_csv(cmp_csv) |> filter(!sp_id %in% cmp$sp_id))
+cmp <- cmp |> arrange(sp_id, region, interval)
+write_csv(cmp |> mutate(across(where(is.double), \(v) signif(v, 5))), cmp_csv)
+```
+
+```{r}
+#| label: compare-transforms
+#| results: asis
+
+cat(glue("**{nrow(cmp)} models** (species × region × season, plus annual per region). `n_cells` = cells with a positive ",
+         "density; `n_ud` / `n_cap` = cells kept (`val >= 1`) under each recipe; the quantiles are over the kept cells. ",
+         "The written surface is `{nc_transform}`.\n\n"))
+print(knitr::kable(
+  cmp |> mutate(kind = if_else(interval == "annual", "annual", "seasonal")) |> group_by(kind) |>
+    summarise(models = n(), across(c(n_cells, n_ud, n_cap, ud_q10, ud_q50, ud_q90, cap_q10, cap_q50, cap_q90), \(v) round(median(v), 1)),
+              .groups = "drop"),
+  caption = "median over models, by kind"))
+cat("\n\n<details><summary>every model, both recipes</summary>\n\n")
+print(knitr::kable(cmp |> mutate(across(where(is.double), \(v) round(v, 1)))))
+cat("\n\n</details>\n\n")
 ```
 
 ## Manifest
@@ -192,12 +467,14 @@ h    <- msens::hash_parquet(glue("{dir_dist}/*.parquet"))
 smry <- arrow::open_dataset(dir_dist) |>
   summarise(n_rows = n(), n_mdl = n_distinct(mdl_key),
             val_min = round(min(val), 2), val_max = round(max(val), 2)) |> collect()
-msens::report_table(smry, caption = "nc density model_cell surface (density → suitability [0,100])")
+msens::report_table(smry, caption = glue("nc density model_cell surface (density → population percentile [1,100], {nc_transform})"))
 
 msens::write_manifest(
   manifest, target = "ingest_sdm_nc", content_hash = h,
   stats = list(
-    ds_key = ds_key, n_sp_id = n_distinct(model_nc$sp_id), n_mdl = nrow(model_nc), p_cap = p_cap,
-    note = "seasonal + annual density->[0,100]; NOT yet folded into merge/scoring"),
+    ds_key = ds_key, n_sp_id = n_distinct(model_nc$sp_id), n_mdl = nrow(model_nc),
+    n_guild = n_distinct(model_nc$sp_id[model_nc$is_guild]), transform = nc_transform, p_cap = p_cap,
+    atl_source = nc_atl_source,
+    note = "seasonal + annual density -> population percentile [1,100]; annual = mean over 4 seasons (unmodelled = 0) then transformed; guilds ingested, excluded from the merge; NOT yet folded into merge/scoring"),
   force = msens::force_target("ingest_sdm_nc"))
 ```
