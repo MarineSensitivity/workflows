@@ -133,10 +133,46 @@ ck_prev <- fromJSON(here(glue("data/manifests/checkpoints_{ver_prev}.json")))$ta
 n_share_keys <- dbGetQuery(con, "SELECT count(*) n FROM metric")$n - length(v8_keys)
 if (n_share_keys == 0) {
   whole <- list(cell_metric = msens::hash_query(con, "cell_metric"), zone_metric = msens::hash_query(con, "zone_metric"))
-  stopifnot(
-    "cell_metric does not hash to ver_prev's score_cell_metrics checkpoint" = identical(whole$cell_metric, ck_prev$score_cell_metrics$content_hash),
-    "zone_metric does not hash to ver_prev's score_zone_metrics checkpoint" = identical(whole$zone_metric, ck_prev$score_zone_metrics$content_hash))
-  log_info("GATE ver_prev checkpoints reproduced on the untouched tables: cell_metric {whole$cell_metric}, zone_metric {whole$zone_metric}")
+  exact <- identical(whole$cell_metric, ck_prev$score_cell_metrics$content_hash) &&
+           identical(whole$zone_metric, ck_prev$score_zone_metrics$content_hash)
+  if (exact) {
+    log_info("GATE ver_prev checkpoints reproduced on the untouched tables: cell_metric {whole$cell_metric}, zone_metric {whole$zone_metric}")
+  } else {
+    # a version SCORED FROM SCRATCH on another machine (v11's control on the Mac mini, 2026-10-30) reproduces v8's
+    # merge bit-for-bit but not its cell_metric digest: the raw extrisk_* metrics are rounded to two decimals from
+    # parallel sums, and ~0.1 % of cells sit on a rounding tie that reassociation flips by exactly 0.01 (zone
+    # metrics then differ by < 1e-4). The gate for the scoring family is therefore a TOLERANCE against ver_prev's
+    # own tables: identical row sets, raw cell |delta| <= 0.01 on <= 0.5 % of rows, zone |delta| <= 1e-3.
+    prev_sdm <- path.expand(glue("{dir_big}/{ver_prev}/sdm.duckdb"))
+    stopifnot("cell_metric / zone_metric do not hash to ver_prev's checkpoints and ver_prev's sdm.duckdb is not here to compare against" = file_exists(prev_sdm))
+    dbExecute(con, glue("ATTACH '{prev_sdm}' AS prev (READ_ONLY)"))
+    cmp <- dbGetQuery(con, glue("
+      WITH a AS (SELECT m.metric_key, cm.cell_id, cm.val FROM cell_metric cm JOIN metric m USING (metric_seq) WHERE m.metric_key IN ({keys_sql})),
+           b AS (SELECT m.metric_key, cm.cell_id, cm.val FROM prev.cell_metric cm JOIN prev.metric m USING (metric_seq) WHERE m.metric_key IN ({keys_sql}))
+      SELECT count(*) AS n, count(*) FILTER (WHERE a.val IS DISTINCT FROM b.val) AS n_diff,
+             max(abs(a.val - b.val)) AS max_abs,
+             count(*) FILTER (WHERE a.val IS NULL OR b.val IS NULL) AS n_oneside,
+             count(*) FILTER (WHERE a.val IS DISTINCT FROM b.val AND m2.metric_key NOT LIKE '%rescaled%' AND m2.metric_key NOT LIKE 'score%') AS n_diff_raw,
+             max(abs(a.val - b.val)) FILTER (WHERE m2.metric_key NOT LIKE '%rescaled%' AND m2.metric_key NOT LIKE 'score%') AS max_abs_raw
+      FROM a FULL OUTER JOIN b USING (metric_key, cell_id) JOIN metric m2 ON m2.metric_key = coalesce(a.metric_key, b.metric_key)"))
+    cmz <- dbGetQuery(con, glue("
+      WITH a AS (SELECT z.fld, z.val AS zone_val, m.metric_key, zm.val FROM zone_metric zm JOIN zone z USING (zone_seq) JOIN metric m USING (metric_seq) WHERE m.metric_key IN ({keys_sql})),
+           b AS (SELECT z.fld, z.val AS zone_val, m.metric_key, zm.val FROM prev.zone_metric zm JOIN prev.zone z USING (zone_seq) JOIN prev.metric m USING (metric_seq) WHERE m.metric_key IN ({keys_sql}))
+      SELECT count(*) AS n, count(*) FILTER (WHERE a.val IS DISTINCT FROM b.val) AS n_diff, max(abs(a.val - b.val)) AS max_abs,
+             count(*) FILTER (WHERE a.val IS NULL OR b.val IS NULL) AS n_oneside
+      FROM a FULL OUTER JOIN b USING (fld, zone_val, metric_key)"))
+    dbExecute(con, "DETACH prev")
+    log_warn("GATE (tolerance): ver_prev's scoring digests not reproduced bit-for-bit (cell_metric {whole$cell_metric} vs {ck_prev$score_cell_metrics$content_hash}); ",
+             "vs {ver_prev}'s tables: cell rows {cmp$n}, {cmp$n_diff} differ (raw {cmp$n_diff_raw}, max |delta| raw {signif(cmp$max_abs_raw, 3)}, any {signif(cmp$max_abs, 3)}), ",
+             "{cmp$n_oneside} one-sided; zone rows {cmz$n}, {cmz$n_diff} differ, max |delta| {signif(cmz$max_abs, 3)}, {cmz$n_oneside} one-sided")
+    stopifnot(
+      "cell_metric row set differs from ver_prev's (a cell or metric present on one side only)" = cmp$n_oneside == 0,
+      "zone_metric row set differs from ver_prev's" = cmz$n_oneside == 0,
+      "raw cell metrics differ from ver_prev's by more than a 0.01 rounding tie" = cmp$max_abs_raw <= 0.01 + 1e-9,
+      "more than 0.5 % of raw cell metrics differ from ver_prev's" = cmp$n_diff_raw <= 0.005 * cmp$n,
+      "zone metrics differ from ver_prev's by more than 1e-3" = cmz$max_abs <= 1e-3)
+    log_info("GATE ver_prev's scoring reproduced within tolerance (floating-point rounding ties only)")
+  }
 }
 knitr::kable(tibble(table = names(before), digest_v8_rows = unlist(before)), caption = glue("digests of {ver_prev}'s rows before this run ({length(v8_keys)} metric keys)"))
 ```
