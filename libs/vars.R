@@ -45,6 +45,9 @@ dps_fetch <- .flag("DPS_FETCH")   # re-download the NMFS critical-habitat servic
 # build_taxon_global_total.qmd (v10 P2)
 redo_denom <- .flag("REDO_DENOM")  # build_taxon_global_total.qmd: rebuild taxon_denom
 
+# ingest_productivity.qmd (v11 Q4)
+redo_vgpm_download <- .flag("REDO_VGPM_DOWNLOAD")  # ingest_productivity.qmd: re-download + re-untar the OSU monthly VGPM tarballs
+
 # v11 method flags (plan 2026-10-29 §4, §4.10 Q0): every flag OFF reproduces v10 — the control run
 # `scripts/run_version.sh --control` is every flag off and its digests must equal v10's. Each flag is
 # read HERE and consumed by the stage it enters (named in the comment); a stage that does not yet

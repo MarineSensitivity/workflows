@@ -1,43 +1,48 @@
 ---
-title: "Ingest Primary Productivity"
-editor: visual
-editor_options: 
+title: "Ingest Primary Productivity (VGPM, annual integral)"
+subtitle: "OSU VGPM R2022 (VIIRS chl + sst) monthly HDFs 2014-2023 -> annual NPP that integrates the year (polar night / ice = 0), beside the legacy mean of observed months"
+msens:
+  target_name: ingest_productivity
+  # `ingest` is accepted without a `dataset:` block (ingest_worms / ingest_taxon do the same): productivity
+  # is an environmental layer scored by score_cell_metrics.qmd, not a species dataset, so build_registry.qmd
+  # (reads `msens$dataset$ds_key`) and bootstrap_version.qmd (verifies only ingests that declare a ds_key)
+  # both skip it. `ingest` rather than `grid` keeps it in the `dependency: [auto]` set the release uses.
+  workflow_type: ingest
+  dependency: [build_cell_grid]
+  output: data/manifests/ingest_productivity.json
+format: html
+editor_options:
   chunk_output_type: console
 ---
 
-```{r}
-#| label: setup
+<!--
+HOW score_cell_metrics.qmd CONSUMES THIS (the orchestrator wires it; nothing here couples through a file):
 
-librarian::shelf(
-  cmocean, dplyr, DT, fs, ggplot2, glue, here, htmltools, janitor, jsonlite, leaflet, 
-  leaflet.extras, lubridate, mapview, R.utils, readr, sf, stringr, stars, terra, tibble, 
-  tidyr, units,
-  quiet = T)
+  - VGPM_INTEGRATED=0 (default, the control; v10 and earlier) -> score_cell_metrics reads the OLD
+    `vgpm.r2022.v.chl.v.sst.2160x4320_2014-2023.avg.sd.tif` (layer `npp_avg`): mean of the OBSERVED months.
+  - VGPM_INTEGRATED=1 (v11, Q4)                               -> it reads the NEW
+    `vgpm.r2022.v.chl.v.sst.2160x4320_2014-2023.avg.sd_integrated.tif` (layer `npp_avg`): the year integrated
+    with polar-night / ice months = 0 (`msens::vgpm_annual_integrate()`), divided by days in the year.
 
-yrs         <- 2014:2023  # vgpm-viirs most recent complete 10 years
-dir_data    <- "~/My Drive/projects/msens/data"
-dir_vgpm    <- glue("{dir_data}/raw/oregonstate.edu/vgpm.r2022.v.chl.v.sst.2160x4320")
-vgpm_tif    <- glue("{dir_vgpm}_{min(yrs)}-{max(yrs)}.avg.sd.tif")
-vgpm_pa_tif <- glue("{dir_vgpm}_{min(yrs)}-{max(yrs)}.avg.sd_planareas.tif")
-vgpm_csv    <- glue("{dir_vgpm}_{min(yrs)}-{max(yrs)}_planareas.avg.sd.csv")
+The OLD file is never written or modified here (v10's checkpoint reads it). The manifest records which outputs
+exist and their xxhash64 digests, so a downstream change is attributable.
+-->
 
+## Goal
 
-dir_raw     <- glue("{dir_data}/raw/boem.gov")
-dir_out     <- glue("{dir_data}/derived")
-oa_new_geo  <- glue("{dir_raw}/OCS_Area_Polygons.geojson")
-pa_new_geo  <- glue("{dir_raw}/OCS_Proposed_Planning_Area_Polygons.geojson")
-pa_oa_geo   <- glue("{dir_out}/pa_oa_2025.geojson")
+Rasser's v1 review (comment C76) found the Arctic Planning Areas (Hope, Norton) implausibly productive. Cause:
+the legacy annual value is `mean(na.rm = TRUE)` over the 12 monthly VGPM composites, but monthly VGPM has **no
+retrieval** under polar night or ice, so north of ~65 N a "year" was the mean of the 4-6 observed bloom months
+while a Gulf year was the mean of all twelve. Both were then treated as a full-year daily rate.
 
-pa_gpkg     <- glue("{dir_data}/derived/ply_planareas_2025.gpkg")
-dir_figs    <- here("figs/ingest_productivity")
-pp_csv      <- glue("{dir_figs}/planarea_primprod.csv")
-pp_png      <- glue("{dir_figs}/planarea_primprod.png")
-pp_pdf      <- glue("{dir_figs}/planarea_primprod.pdf")
-
-verbose    <- F
-```
-
-## Vertically Generalized Production Model (VGPM), CAFE VIIRS `r paste(range(yrs), collapse = " to ")` \| OregonState
+This notebook keeps the monthly inputs (the legacy notebook deleted the tarballs and HDFs after each annual mean),
+and produces the **integrated** annual rate: per year `msens::vgpm_annual_integrate()` =
+sum over months of `rate_m * days_in_month / days_in_year`, a month with no retrieval contributing 0 and a cell
+with no retrieval in any month staying `NA` (land is not painted as zero). Units stay mg C / m^2^ / day (an
+annual-mean daily rate), so nothing downstream changes except the file `score_cell_metrics.qmd` reads. The
+legacy method is **reproduced from the same monthly inputs** (`_meanobs.tif`) so the two can be compared on
+identical data, and the reproduction is asserted against the legacy per-year and ten-year files when those are
+present (a check that fails if the HDF orientation or no-data handling is wrong).
 
 Source:
 
@@ -45,398 +50,420 @@ Source:
 
 -   [VIIRS R2022 - 2160 by 4320 Monthly HDF files](https://orca.science.oregonstate.edu/2160.by.4320.monthly.hdf.vgpm.v.chl.v.sst.php)
 
--   old: [CAFE model description](https://orca.science.oregonstate.edu/cafe.model.php)
+-   Behrenfeld and Falkowski (1997a) [VGPM](http://science.oregonstate.edu/ocean.productivity/references.php#Behrenfeld.1997a): a "chlorophyll-based" model that estimates net primary production from chlorophyll using a temperature-dependent description of chlorophyll-specific photosynthetic efficiency, with available light and a euphotic-zone depth from Morel and Berthon (1989).
 
--   old: [Online updated CAFE data](https://orca.science.oregonstate.edu/2160.by.4320.monthly.hdf.cafe.v.php)
+-   old (CAFE was tried and abandoned; do not switch products here): [CAFE model description](https://orca.science.oregonstate.edu/cafe.model.php); Silsbe et al (2016) [The CAFE model](https://agupubs.onlinelibrary.wiley.com/doi/10.1002/2016GB005521)
 
--   Silsbe et al (2025) [Global declines in net primary production in the ocean color era \| Nature Communications](https://www.nature.com/articles/s41467-025-60906-y). *Nature Communications*
+Units: mg C / m^2^ / day.
 
-    -   Silsbe et al (2016) [The CAFE model: A net production model for global ocean phytoplankton](https://agupubs.onlinelibrary.wiley.com/doi/10.1002/2016GB005521). *Global Biogeochemical Cycles*
+## Design
 
-        > The Carbon, Absorption, and Fluorescence Euphotic-resolving (CAFE) net primary production model is an adaptable framework for advancing global ocean productivity assessments by exploiting state-of-the-art satellite ocean color analyses and addressing key physiological and ecological attributes of phytoplankton.
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "OSU monthly VGPM tarballs (kept) -> HDFs (kept) -> per-year integrated + mean-of-observed rasters -> ten-year avg/sd, beside the untouched legacy file"
+flowchart LR
+  osu["OSU orca<br/>vgpm.v.{yyyy}.tar"] --> hdf["monthly/{yyyy}/unzipped<br/>12 HDFs per year (kept)"]
+  hdf --> int["vgpm_annual_integrate()<br/>vgpm_{yyyy}_integrated.tif"]
+  hdf --> obs["mean of observed months<br/>vgpm_{yyyy}_meanobs.tif"]
+  int --> avg["..._avg.sd_integrated.tif<br/>npp_avg, npp_sd, n_valid"]
+  obs --> avgo["..._avg.sd_meanobs.tif"]
+  old["legacy ..._avg.sd.tif<br/>(v10 control, untouched)"] -.-> chk{{"compare"}}
+  avgo --> chk
+  avg --> mf["manifest: hashes + latitude-band ratios"]
+```
 
-        -   older: [Standara VGPM: 1080 by 2160 Monthly HDF files from VIIRS R2022](http://orca.science.oregonstate.edu/1080.by.2160.monthly.hdf.vgpm.v.chl.v.sst.php)
-        -   [Frequently Asked Questions](http://orca.science.oregonstate.edu/faq01.php)
+## Setup
 
-Calculated sum of `r paste(range(yrs), collapse = " to ")` monthly net primary production (NPP) from VIIRS data.
-
-> Community guidance for developing this website was to provide a single productivity product as a Standard product. For this, we initially chose the original Vertically Generalized Production Model (VGPM) (Behrenfeld and Falkowski, 1997a) as the standard algorithm. The VGPM is a "chlorophyll-based" model that estimate net primary production from chlorophyll using a temperature-dependent description of chlorophyll-specific photosynthetic efficiency. For the VGPM, net primary production is a function of chlorophyll, available light, and the photosynthetic efficiency.
->
-> Standard products are based on chlorophyll, temperature and PAR data from SeaWiFS, MODIS and VIIRS satellites, along with estimates of euphotic zone depth from a model developed by Morel and Berthon (1989) and based on chlorophyll concentration.
-
-Units: mg C / m^2^ / day
-
-Citation: [Behrenfeld and Falkowski, 1997a](http://science.oregonstate.edu/ocean.productivity/references.php#Behrenfeld.1997a)
-
--   [Ocean Productivity: Online updated CAFE data](https://orca.science.oregonstate.edu/2160.by.4320.monthly.hdf.cafe.v.php)
+Paths come from `libs/paths.R` (`dir_raw`); the legacy per-year means and ten-year file stay where
+`score_cell_metrics.qmd` reads them, and the kept monthly inputs go in `monthly/` beside them. The flags are
+read from `libs/vars.R`: `REDO_VGPM_DOWNLOAD=1` re-downloads and re-untars the tarballs, `REDO_INGEST=1` rebuilds
+the derived rasters, and `VGPM_INTEGRATED=1` (or either redo flag) is what makes this target build the
+integrated products at all, so the v10 control run never needs the network or the ~2 GB of HDFs.
 
 ```{r}
-#| label: get_vgpm
+#| label: setup
 
-if (!file.exists(vgpm_tif)) {
-  
-  for (yr in yrs){ # yr = 2015
-    
-    # vgpm_yr_tif  <- glue("{dir_vgpm}/cafe.v.{yr}.tif")
-    vgpm_yr_tif  <- glue("{dir_vgpm}/vgpm.{yr}.tif")
-    
-    if (!file.exists(vgpm_yr_tif)) {
-      tar      <- glue("vgpm.v.{yr}.tar")
-      url_tar  <- glue("https://orca.science.oregonstate.edu/data/2x4/monthly/vgpm.r2022.v.chl.v.sst/hdf/{tar}")
-      path_tar <- file.path(dir_vgpm, tar)
-      
-      dir_create(dirname(path_tar))
-      if(!file_exists(path_tar))
-        download.file(url_tar, path_tar, method = "curl", extra = "-k -L")
-      
-      dir_untar <- path_ext_remove(path_tar)
-      dir_create(dir_untar)
-      untar(path_tar, exdir = dir_untar)
-      
-      # Get list of compressed files
-      files_gz <- dir_ls(dir_untar, glob = "*.gz")
-      
-      dir_unzip <- path(dir_untar, "unzipped")
-      dir_create(dir_unzip)
-      
-      # Unzip all files
-      for (file_gz in files_gz) { # file_gz = files_gz[1]
-        file_hdf <- path(dir_unzip, sub("\\.gz$", "", basename(file_gz)))
-        
-        if (!file.exists(file_hdf))
-          gunzip(file_gz, destname = file_hdf)
-      }
-      
-      # Get list of unzipped HDF files
-      files_hdf <- dir_ls(dir_unzip, glob = "*.hdf") # length(files_hdf) = 12
-      
-      # Function to read VGPM data from HDF file
-      read_vgpm_hdf <- function(file_hdf) { # file_hdf <- files_hdf[7]
-        # First, query the HDF file to see the subdatasets
-        # file_exists(file_hdf)
-        
-        r <- read_stars(file_hdf) |> # read all subdatasets
-          rast()
-        ext(r) <- c(-180, 180, -90, 90) # set extent to global
-        crs(r) <- "epsg:4326"
-        NAflag(r) <- -9999
-        names(r) <- "npp" # set name for all layers
-        
-        time(r, tstep = "yearmonths") <- basename(file_hdf) |> 
-          str_replace("vgpm.([0-9]+).hdf", "\\1") |>
-          as_date(format = "%Y%j")
-        
-        r
-      }
-      
-      # Initialize a list to store all monthly rasters
-      monthly_rasters <- list()
-      
-      # Read all monthly files
-      for (i in seq_along(files_hdf)) {
-        if (verbose)
-          message("Processing file", i, "of", length(files_hdf), ":", files_hdf[i], "\n")
-        r <- read_vgpm_hdf(files_hdf[i])
-        
-        if (!is.null(r)) {
-          monthly_rasters[[i]] <- r
-        }
-      }
-      
-      # Create a SpatRaster collection from all the monthly rasters
-      r_yr <- rast(monthly_rasters) |> 
-        mean(na.rm = T)
-      names(r_yr) <- "npp"
-      time(r_yr, tstep = "years") <- yr
+librarian::shelf(
+  dplyr, digest, fs, glue, here, jsonlite, R.utils, readr, stringr, terra, tibble, tidyr,
+  MarineSensitivity/msens, quiet = T)
+source(here("libs/paths.R"))   # dir_raw, ver
+source(here("libs/vars.R"))    # vgpm_integrated, redo_vgpm_download, redo_ingest
 
-      writeRaster(r_yr, vgpm_yr_tif, overwrite = TRUE)
-      
-      dir_delete(dir_untar)
-      file_delete(path_tar)
-      
-      message(glue(
-        "Created annual for {yr}: {basename(vgpm_yr_tif)}"))
+# the integrator lands in msens 0.61.0 (R/productivity.R)
+stopifnot(
+  "msens >= 0.61.0 (vgpm_annual_integrate) is required; reinstall ../msens" =
+    packageVersion("msens") >= "0.61.0",
+  "msens::vgpm_annual_integrate not exported" =
+    "vgpm_annual_integrate" %in% getNamespaceExports("msens"))
+
+yrs <- 2014:2023   # VIIRS: the most recent complete 10 years
+y0  <- min(yrs); y1 <- max(yrs)
+
+dir_osu     <- path_expand(glue("{dir_raw}/oregonstate.edu"))
+dir_vgpm    <- glue("{dir_osu}/vgpm.r2022.v.chl.v.sst.2160x4320")   # legacy per-year means lived inside this dir
+dir_monthly <- path(dir_osu, "monthly")                              # KEPT monthly inputs (v11 Q4)
+dir_figs    <- here("figs/ingest_productivity")
+dir_create(c(dir_osu, dir_monthly, dir_figs, here("data/manifests")))
+
+# legacy outputs (READ ONLY here: the v10 control and score_cell_metrics read them)
+tif_old     <- glue("{dir_vgpm}_{y0}-{y1}.avg.sd.tif")              # npp_avg, npp_sd
+# new outputs, beside the legacy file
+tif_int     <- glue("{dir_vgpm}_{y0}-{y1}.avg.sd_integrated.tif")   # npp_avg, npp_sd, n_valid
+tif_obs     <- glue("{dir_vgpm}_{y0}-{y1}.avg.sd_meanobs.tif")      # npp_avg, npp_sd (legacy method, same inputs)
+
+manifest    <- here("data/manifests/ingest_productivity.json")
+
+# the integrated products are built when asked for; the control run (all flags off) skips straight
+# to the manifest and stays offline
+do_integrate <- vgpm_integrated || redo_vgpm_download || redo_ingest
+
+url_tar <- \(yr) glue("https://orca.science.oregonstate.edu/data/2x4/monthly/vgpm.r2022.v.chl.v.sst/hdf/vgpm.v.{yr}.tar")
+dir_yr  <- \(yr) path(dir_monthly, yr)                                # untarred tarball contents + unzipped/
+tar_yr  <- \(yr) path(dir_monthly, glue("vgpm.v.{yr}.tar"))
+tif_yr  <- \(yr, kind) path(dir_monthly, glue("vgpm_{yr}_{kind}.tif"))   # kind: integrated | meanobs
+csv_yr  <- \(yr) path(dir_monthly, glue("vgpm_{yr}_month_share_ge66N.csv"))
+
+# the legacy per-year mean: either beside the legacy ten-year file's dir or inside it
+tif_old_yr <- \(yr) {
+  cand <- c(path(dir_vgpm, glue("vgpm.{yr}.tif")), path(dir_osu, glue("vgpm.{yr}.tif")))
+  cand[file_exists(cand)][1]   # NA when neither exists
+}
+
+message(glue("ingest_productivity: do_integrate={do_integrate} (VGPM_INTEGRATED={vgpm_integrated}, ",
+             "REDO_VGPM_DOWNLOAD={redo_vgpm_download}, REDO_INGEST={redo_ingest}); msens {packageVersion('msens')}"))
+```
+
+## Functions
+
+`read_vgpm_hdf()` keeps the legacy notebook's reading rules: the HDF carries no usable georeferencing, so the extent
+is set to the globe, and `-9999` is the no-retrieval value. It goes through terra (R's GDAL carries the HDF4 driver;
+Homebrew's `gdalinfo` does not). `hdf_files()` lists a year's 12 HDFs in month order from the day-of-year in the
+file name (`vgpm.{yyyyDDD}.hdf`, the DOY is the first day of the month).
+
+```{r}
+#| label: functions
+
+# 12 HDFs of a year, in month order (asserts exactly one per month)
+hdf_files <- function(yr) {
+  if (!dir_exists(dir_yr(yr))) return(character())
+  f <- dir_ls(dir_yr(yr), recurse = T, type = "file", regexp = "vgpm\\.[0-9]{7}\\.hdf$")
+  if (length(f) == 0) return(character())
+  d <- as.Date(str_match(path_file(f), "vgpm\\.([0-9]{7})\\.hdf$")[, 2], format = "%Y%j")
+  f <- f[order(d)]; d <- sort(d)
+  stopifnot(
+    "an HDF is not in the requested year"  = all(as.integer(format(d, "%Y")) == yr),
+    "HDF months are not unique"            = !anyDuplicated(format(d, "%m")))
+  setNames(as.character(f), format(d, "%m"))
+}
+
+read_vgpm_hdf <- function(f) {
+  r <- terra::rast(f)                                   # HDF4 via GDAL
+  if (nlyr(r) < 1) r <- terra::sds(f)[[1]]               # multi-subdataset file: first dataset
+  stopifnot("HDF is not 2160 x 4320" = nrow(r) == 2160 && ncol(r) == 4320)
+  r <- r[[1]]
+  ext(r) <- c(-180, 180, -90, 90)                        # no georeferencing in the HDF: global
+  crs(r) <- "epsg:4326"
+  NAflag(r) <- -9999
+  r <- terra::subst(r, -9999, NA)                        # belt and braces: -9999 = no retrieval = NA
+  names(r) <- "npp"
+  r
+}
+
+# write atomically (a killed render never leaves a half-written TIF that a resume would trust)
+write_tif <- function(r, f) {
+  tmp <- paste0(f, ".part.tif")
+  writeRaster(r, tmp, overwrite = T, datatype = "FLT4S", gdal = c("COMPRESS=DEFLATE"))
+  if (file_exists(f)) file_delete(f)
+  file_move(tmp, f)
+  invisible(f)
+}
+
+xxh <- \(f) digest::digest(file = as.character(f), algo = "xxhash64")
+```
+
+## Download (resumable, gated)
+
+For each year the OSU tarball `vgpm.v.{yyyy}.tar` (~200 MB) is fetched, untarred into `monthly/{yyyy}/` and each
+gzipped HDF is expanded into `monthly/{yyyy}/unzipped/`. **Both the tarball and the HDFs are kept** (the legacy
+notebook deleted them, which is why a ~2 GB re-download is needed once). A year whose 12 HDFs are already present is
+skipped unless `REDO_VGPM_DOWNLOAD=1`; a present tarball is not fetched again, only re-untarred.
+
+```{r}
+#| label: download
+
+if (do_integrate) {
+  options(timeout = max(3600, getOption("timeout")))
+  for (yr in yrs) {  # yr = 2019
+    have <- hdf_files(yr)
+    if (length(have) == 12 && !redo_vgpm_download) {
+      message(glue("{yr}: 12 HDFs present, skipping download"))
+      next
+    }
+
+    dir_create(dir_yr(yr))
+    if (!file_exists(tar_yr(yr)) || redo_vgpm_download) {
+      part <- paste0(tar_yr(yr), ".part")
+      message(glue("{yr}: downloading {url_tar(yr)}"))
+      download.file(url_tar(yr), part, method = "curl", extra = "-k -L -f")
+      file_move(part, tar_yr(yr))
+    }
+    stopifnot("tarball has no members" = length(untar(tar_yr(yr), list = T)) >= 12)
+    untar(tar_yr(yr), exdir = dir_yr(yr))
+
+    # expand the gzipped HDFs, keeping the .gz
+    dir_unz <- path(dir_yr(yr), "unzipped"); dir_create(dir_unz)
+    for (f_gz in dir_ls(dir_yr(yr), recurse = T, glob = "*.hdf.gz")) {
+      f_hdf <- path(dir_unz, sub("\\.gz$", "", path_file(f_gz)))
+      if (!file_exists(f_hdf) || redo_vgpm_download)
+        gunzip(f_gz, destname = f_hdf, remove = F, overwrite = T)
+    }
+
+    have <- hdf_files(yr)
+    if (length(have) != 12)
+      stop(glue("{yr}: expected 12 monthly HDFs, found {length(have)}"))
+  }
+}
+
+# per-year file counts, from what is on disk (also in the control run, where nothing is downloaded)
+n_hdf <- setNames(vapply(yrs, \(yr) length(hdf_files(yr)), integer(1)), yrs)
+tibble(year = yrs, n_hdf = unname(n_hdf)) |> print()
+```
+
+## Integrate each year
+
+Per year the 12 monthly rasters are stacked in month order and passed to `msens::vgpm_annual_integrate()`; the
+result (`npp`, `n_valid`) is written as `monthly/vgpm_{yyyy}_integrated.tif`. The legacy method (mean of the
+observed months) is computed from the same stack as `monthly/vgpm_{yyyy}_meanobs.tif`. Each reproduction is
+asserted against the legacy `vgpm.{yyyy}.tif` when it exists (same no-data pattern, values equal to float
+precision), which is the check that the HDFs were read the way the legacy notebook read them. Per month, the
+share of cells north of 66 N with a retrieval is kept (denominator: cells with a retrieval in at least one month
+of that year) for the table further down. A year whose three outputs exist is skipped unless `REDO_INGEST=1`.
+
+```{r}
+#| label: integrate_years
+
+legacy_chk <- list()
+
+if (do_integrate) {
+  for (yr in yrs) {  # yr = 2019
+    outs <- c(tif_yr(yr, "integrated"), tif_yr(yr, "meanobs"), csv_yr(yr))
+    if (all(file_exists(outs)) && !redo_ingest) {
+      message(glue("{yr}: derived rasters present, skipping"))
+    } else {
+      f_hdf   <- hdf_files(yr)
+      if (length(f_hdf) != 12)
+        stop(glue("{yr}: need 12 HDFs, found {length(f_hdf)} (run with REDO_VGPM_DOWNLOAD=1)"))
+      monthly <- rast(lapply(f_hdf, read_vgpm_hdf))     # 12 layers, month order
+      names(monthly) <- glue("npp_{names(f_hdf)}")
+
+      r_int <- msens::vgpm_annual_integrate(monthly, year = yr)    # npp, n_valid
+      stopifnot(
+        "integrator must return layers npp + n_valid" = identical(names(r_int), c("npp", "n_valid")),
+        "integrator must keep the 2160 x 4320 grid"   = nrow(r_int) == 2160 && ncol(r_int) == 4320)
+      r_obs <- mean(monthly, na.rm = T)                  # the legacy method, verbatim
+      names(r_obs) <- "npp"
+
+      # per-month share of >= 66 N cells with a retrieval
+      m66  <- crop(monthly, ext(-180, 180, 66, 90))
+      den  <- global(sum(!is.na(m66)) > 0, "sum")[[1]]
+      tibble(
+        year      = yr,
+        month     = as.integer(names(f_hdf)),
+        n_ret     = global(!is.na(m66), "sum")[[1]],
+        n_den     = den) |>
+        write_csv(csv_yr(yr))
+
+      write_tif(r_int, tif_yr(yr, "integrated"))
+      write_tif(r_obs, tif_yr(yr, "meanobs"))
+    }
+
+    # reproduction of the legacy per-year mean from the same monthly inputs
+    f_old <- tif_old_yr(yr)
+    if (!is.na(f_old)) {
+      a <- rast(tif_yr(yr, "meanobs"), lyrs = "npp"); b <- rast(f_old)[[1]]
+      d <- global(abs(a - b), "max", na.rm = T)[[1]]
+      n_na_mismatch <- global(is.na(a) != is.na(b), "sum", na.rm = T)[[1]]
+      legacy_chk[[as.character(yr)]] <- tibble(year = yr, max_abs_diff = d, n_na_mismatch = n_na_mismatch)
+      if (!is.finite(d) || d >= 0.01)
+        stop(glue("{yr}: meanobs differs from the legacy vgpm.{yr}.tif by {d} (HDF read orientation / no-data?)"))
+      if (n_na_mismatch != 0)
+        stop(glue("{yr}: {n_na_mismatch} cells differ in NA pattern from the legacy vgpm.{yr}.tif"))
     }
   }
-  
-  # aggregate across years ----
-  r_yrs <- dir_ls(dir_vgpm, glob = "*.tif") |> 
-    rast()
-  
-  r_avg <- r_yrs |> 
-    mean(na.rm = T)
-
-  r_sd <- r_yrs |> 
-    stdev(na.rm = T)
-    
-  r <- c(r_avg, r_sd) |> 
-    setNames(glue("npp_{c('avg','sd')}"))
-  
-  r |> 
-    writeRaster(vgpm_tif, overwrite = T)
-}
-
-r <- rast(vgpm_tif,  lyrs = "npp_avg")
-#   # rotate(left=F) # -180 to 180 -> 0 to 360
-#   # shift(dx = 0.0001) # problem with -180 extent
-
-if (!file.exists(vgpm_pa_tif)) {
-  
-  cell_tif <- glue("{dir_data}/derived/r_bio-oracle_planarea.tif")
-  
-  r_cell <- rast(cell_tif, lyrs = "cell_id")
-  
-  # downsample and mask
-  r_r <- rotate(r)  # [-180, 180] -> [0, 360]
-  
-  r_ds <- terra::resample(
-    r_r,
-    r_cell,
-    method = "bilinear") |>
-    mask(r_cell) |> 
-    crop(r_cell)
-  # plot(r_ds, main = "Downsampled Productivity"
-  
-  writeRaster(r_ds, vgpm_pa_tif, overwrite = T)
-}
-r_pa <- rast(vgpm_pa_tif)  
-
-vgpm_png <- here("figs/ingest_productivity/map_vgpm_avg.png")
-if (!file.exists(vgpm_png)){
-  m <- mapView(
-    r_pa, maxpixels = ncell(r), col.regions = cmocean("algae"),
-    layer.name = glue("NPP avg")) |> 
-    slot("map") |>
-    # addFullscreenControl() |>
-    addControl(tags$div(HTML("units: mg C / m<sup>2</sup> / day")), position = "topright") |> 
-    removeMapJunk(c("homeButton", "layersControl"))
-  
-  mapshot2(m, file = vgpm_png)
+  legacy_chk <- bind_rows(legacy_chk)
+  if (nrow(legacy_chk)) print(legacy_chk) else message("no legacy per-year means found to compare against")
 }
 ```
 
-![Static map (to limit file size) of Standard VGPM from VIIRS satellite, averaged across all months and years 2014 to 2023.](figs/ingest_productivity/map_vgpm_avg.png){#fig-vgpm .lightbox}
+## Ten-year average and standard deviation
 
-## NEW Proposed Planning Areas
-
-BOEM internal:
-
--   [Marine Ecoregions](https://boem.maps.arcgis.com/home/item.html?id=b00a15d7e4224ef98e496542d9a9d25f)
--   [OCS Areas](https://boem.maps.arcgis.com/home/item.html?id=8dbc5e97fc3346f58466c2de7b2fc870)
--   [Proposed Planning Areas](https://boem.maps.arcgis.com/home/item.html?id=b833761e456f4cbfb227a4b5a9632b89)
+Across the ten years: the mean of the integrated annual `npp` layers (`NA` only where all ten are `NA`), their
+standard deviation, and the mean `n_valid` (months with a retrieval) as a climatology. The legacy method is
+aggregated identically from the per-year mean-of-observed layers. Both are written beside the legacy file, which
+is not touched; the reproduction is asserted against it when present.
 
 ```{r}
-#| label: get_pa
+#| label: aggregate_years
 
-set_geom_ctr_area <- function(x){
-  x |>
-    st_set_geometry("geom") |>
-    mutate(
-      ctr      = st_centroid(geom),
-      ctr_lon  = ctr |> st_coordinates() %>% .[,"X"],
-      ctr_lat  = ctr |> st_coordinates() %>% .[,"Y"],
-      area_km2 = st_area(geom) |>
-        set_units(km^2) |>
-        as.numeric() ) |>
-    select(-ctr)
+if (do_integrate) {
+  if (all(file_exists(c(tif_int, tif_obs))) && !redo_ingest) {
+    message("ten-year integrated + meanobs files present, skipping")
+  } else {
+    r_i <- rast(lapply(yrs, \(yr) rast(tif_yr(yr, "integrated"))))     # 20 layers: npp, n_valid per year
+    stopifnot(nlyr(r_i) == 2 * length(yrs))
+    i_npp <- r_i[[seq(1, nlyr(r_i), by = 2)]]
+    i_nv  <- r_i[[seq(2, nlyr(r_i), by = 2)]]
+    stopifnot(all(names(r_i)[seq(1, nlyr(r_i), by = 2)] == "npp"),
+              all(names(r_i)[seq(2, nlyr(r_i), by = 2)] == "n_valid"))
+
+    r_int <- c(mean(i_npp, na.rm = T), stdev(i_npp, na.rm = T), mean(i_nv, na.rm = T))
+    names(r_int) <- c("npp_avg", "npp_sd", "n_valid")
+    write_tif(r_int, tif_int)
+
+    o_npp <- rast(lapply(yrs, \(yr) rast(tif_yr(yr, "meanobs"))))
+    r_obs <- c(mean(o_npp, na.rm = T), stdev(o_npp, na.rm = T))
+    names(r_obs) <- c("npp_avg", "npp_sd")
+    write_tif(r_obs, tif_obs)
+  }
+
+  # the legacy ten-year file, reproduced from the monthly inputs
+  if (file_exists(tif_old)) {
+    a <- rast(tif_obs); b <- rast(tif_old)
+    stopifnot("legacy file must have npp_avg, npp_sd" = all(c("npp_avg", "npp_sd") %in% names(b)))
+    d_avg <- global(abs(a[["npp_avg"]] - b[["npp_avg"]]), "max", na.rm = T)[[1]]
+    d_sd  <- global(abs(a[["npp_sd"]]  - b[["npp_sd"]]),  "max", na.rm = T)[[1]]
+    message(glue("meanobs vs legacy ten-year file: max |d npp_avg| = {signif(d_avg, 3)}, max |d npp_sd| = {signif(d_sd, 3)}"))
+    stopifnot(
+      "meanobs npp_avg differs from the legacy ten-year file" = is.finite(d_avg) && d_avg < 0.01,
+      "meanobs npp_sd differs from the legacy ten-year file"  = is.finite(d_sd)  && d_sd  < 0.05)
+  } else {
+    message("legacy ten-year file not found: skipping the reproduction check")
+  }
 }
-
-drop_ctr_area <- function(x){
-  x |>
-    select(-ctr_lon, -ctr_lat, -area_km2)
-}
-
-if (!file.exists(pa_oa_geo)){
-  source(here("libs/db.R")) # define: database connection (con)
-  
-  pa0 <- st_read(con, "ply_planareas_s05") |> 
-    st_drop_geometry() |> 
-    select(planarea_key, planarea_name) |> 
-    mutate(
-      planarea_name = str_replace(planarea_name, "Gulf of Mexico", "Gulf of America"),
-      planarea_key = str_replace(planarea_key, "pa", ""),
-      planarea_key = case_match(
-        planarea_key, 
-        "CGM" ~ "CGA",
-        "EGM" ~ "EGA",
-        "WGM" ~ "WGA",
-        .default = planarea_key))
-  
-  pa <- read_sf(pa_new_geo) |> 
-    clean_names() |> 
-    rename(
-      region_name  = region,
-      planarea_key = planning_area) |>
-    mutate(
-      region_name = str_replace(region_name, "Gulf of Mexico", "Gulf of America"),
-      region_key = case_match(
-        region_name,
-        "Alaska"          ~ "AK",
-        "Atlantic"        ~ "AT",
-        "Gulf of America" ~ "GA",
-        "Pacific"         ~ "PA"),
-      planarea_key = case_match(
-        planarea_key, 
-        "CG" ~ "CGA",
-        "EG" ~ "EGA",
-        "WG" ~ "WGA",
-        .default = planarea_key)) |> 
-    left_join(
-      pa0, by = "planarea_key") |> 
-    mutate(
-      planarea_name = case_match(
-        planarea_key,
-        "HAR" ~ "High Arctic",
-        .default = planarea_name)) # TODO: planarea_name for HAR is ...?
-  
-  oa <- read_sf(oa_new_geo) |> 
-    clean_names() |> 
-    rename(
-      region_name   = region,
-      planarea_name = area_name) |> 
-    filter(!planarea_name %in% c("Alaska", "Pacific Coast", "Atlantic Coast", "Gulf of Mexico")) |> 
-    mutate(
-      region_key = case_match(
-        region_name,
-        "Atlantic" ~ "AT",
-        "Pacific"  ~ "PA"),
-      planarea_key = case_match(
-        planarea_name,
-        "American Samoa"                                        ~ "AMS",
-        "Guam and Commonwealth of the Northern Mariana Islands" ~ "GUA",
-        "Hawaiian Islands and Midway Atoll"                     ~ "HAW",
-        "Howland and Baker Islands"                             ~ "HOW",
-        "Jarvis Island"                                         ~ "JAR",
-        "Johnston Atoll"                                        ~ "JOH",
-        "Palmyra Atoll and Kingman Reef"                        ~ "PAL",
-        "Puerto Rico and U.S. Virgin Islands"                   ~ "PUR",
-        "Wake Island"                                           ~ "WAK"))
-  
-  pa_oa <- bind_rows(
-    pa,
-    oa) |>
-    select(region_key, region_name, planarea_key, planarea_name) |>
-    st_make_valid() |> 
-    set_geom_ctr_area() |> 
-    st_shift_longitude() |> 
-    arrange(region_key, planarea_key)
-  
-  write_sf(pa_oa, pa_oa_geo)
-}
-
-pa_oa <- read_sf(pa_oa_geo)
-
-# Rendered to a static PNG rather than a live widget (as the VGPM map above
-# already does): this embedded ~25 MB of GeoJSON. See msens::widget_png().
-knitr::include_graphics(msens::widget_png(
-  mapView(pa_oa) |> slot("map"), "figures/ingest_productivity_pa_oa.png"))
-
-pa_oa |> 
-  st_drop_geometry() |> 
-  datatable()
 ```
 
-## VGPM in Proposed Planning Areas
+## Integrated vs mean of observed, by latitude
 
-Extract daily average net primary production (NPP) values across all cells within the proposed planning areas.
+The ratio of the integrated climatology to the mean of the observed months, area-weighted (cosine of latitude) over
+cells that have a retrieval, in 5 degree bands north of 50 N. The spec's measured expectation (one-year 2019
+prototype) is 1.00 below 50 N, then 0.88, 0.74, 0.61, 0.43, 0.32, 0.21; a deviation is reported, and only the
+shape is asserted (about 1 at low latitude, never rising with latitude), because the ten-year climatology is not
+the 2019 prototype. The band containing the equator (50 S to 50 N) is the "< 50" band; the southern high-latitude
+band is listed separately because the Southern Ocean has the same polar-night gap.
 
 ```{r}
-#| label: pa_zonal_plot
+#| label: lat_bands
 
-pa <- read_sf(pa_gpkg) |>
-  # planning areas: Alaska and lower 48 states 
-  filter(
-    region_key == "AK" |
-      planarea_key %in% c(
-        'CEC','SOA','NOC','CGA','EGA','WGA','SOC','FLS','MDA','NOA','WAO')) 
+lat_expect <- c("50S-50N" = 1.00, "50-55N" = 0.88, "55-60N" = 0.74, "60-65N" = 0.61,
+                "65-70N" = 0.43, "70-75N" = 0.32, "75-85N" = 0.21)
+lat_ratio  <- NULL
 
-r_yrs <- dir_ls(dir_vgpm, glob = "*.tif") |> 
-    rast()
-names(r_yrs) <- glue("npp_{time(r_yrs)}")
+if (file_exists(tif_int) && file_exists(tif_obs)) {
+  ia <- as.matrix(rast(tif_int, lyrs = "npp_avg"), wide = T)
+  mo <- as.matrix(rast(tif_obs, lyrs = "npp_avg"), wide = T)
+  ok <- !is.na(ia) & !is.na(mo)
+  stopifnot("integrated has a retrieval where mean-of-observed has none (or the reverse)" =
+              identical(is.na(ia), is.na(mo)))
+  ia[!ok] <- 0; mo[!ok] <- 0
 
-d_pa_npp <- r_yrs |> 
-  zonal(
-    pa |> 
-      select(planarea_key, planarea_name) |>
-      vect(),
-    fun         = "mean",
-    na.rm       = T,
-    as.polygons = T) |> 
-  st_as_sf() |> 
-  st_drop_geometry() |> 
-  tibble() |>
-  pivot_longer(
-    cols      = starts_with("npp_"),
-    names_to  = "year",
-    values_to = "npp") |> 
-  filter(!is.na(npp)) |> 
-  mutate(
-    year = str_replace(year, "npp_", "") |> as.integer(),
-    npp = set_units(npp, mg/m^2/day) |> 
-      set_units(t/km^2/yr) ) |>
-  group_by(planarea_key, planarea_name) |>
-  summarize(
-    npp_avg = mean(npp, na.rm = T),
-    npp_sd  = sd(npp, na.rm = T),
-    .groups = "drop") |> 
-    arrange(desc(npp_avg)) |>
-  mutate(
-    npp_avg = npp_avg |> drop_units()) |> 
-  mutate(planarea_name = factor(planarea_name, levels = planarea_name))
+  y   <- yFromRow(rast(tif_int), seq_len(nrow(ia)))
+  brk <- c(-50, 50, 55, 60, 65, 70, 75, 85)
+  lab <- c("S of 50S", "50S-50N", "50-55N", "55-60N", "60-65N", "65-70N", "70-75N", "75-85N", "N of 85N")
+  lat_ratio <- tibble(
+    band = factor(lab[findInterval(y, brk) + 1], levels = lab),
+    w    = cos(y * pi / 180),
+    s_i  = rowSums(ia), s_o = rowSums(mo), n = rowSums(ok)) |>
+    group_by(band) |>
+    summarize(
+      n_cell         = sum(n),
+      mean_observed  = sum(w * s_o) / sum(w * n),
+      mean_integrated= sum(w * s_i) / sum(w * n),
+      ratio          = sum(w * s_i) / sum(w * s_o),
+      .groups = "drop") |>
+    mutate(expected = unname(lat_expect[as.character(band)]), delta = ratio - expected)
+  print(lat_ratio, n = Inf)
 
-write_csv(d_pa_npp, pp_csv)
-
-g <- d_pa_npp |> 
-  ggplot(aes(x = planarea_name, y = npp_avg)) +
-  geom_bar(
-    position=position_dodge(), stat="identity", fill='darkgreen') +
-  geom_errorbar(aes(ymin = npp_avg-npp_sd, ymax = npp_avg+npp_sd), width=.4) + 
-  labs(
-    title = NULL,
-    x     = NULL,
-    y     = expression("Areal NPP (metric tons C km"^-2~"yr"^-1*")")) +
-  scale_y_continuous(expand = c(0, 20)) +
-  theme(
-    axis.text.x = element_text(
-      angle = 45, vjust = 1, hjust = 1 ) )
-
-png(pp_png, width = 1200, height = 800, res = 150)
-print(g)
-dev.off()
-# browseURL(pp_png)
-pdf(pp_pdf, width = 7, height = 5)
-print(g)
-dev.off()
-# browseURL(pp_pdf)
+  r_main <- lat_ratio |> filter(band %in% names(lat_expect))
+  stopifnot(
+    "low-latitude (50S-50N) integrated/observed ratio should be ~1" =
+      abs(r_main$ratio[r_main$band == "50S-50N"] - 1) < 0.02,
+    "integrated/observed ratio must not rise with latitude (50N and north)" =
+      all(diff(r_main$ratio[r_main$band != "50S-50N"]) <= 1e-6))
+  if (any(abs(r_main$delta) > 0.10, na.rm = T))
+    warning("a latitude-band ratio is more than 0.10 from the spec's measured value: ",
+            paste(r_main$band[abs(r_main$delta) > 0.10], collapse = ", "))
+}
 ```
 
-![Primary productivity of Planning Areas with average (green bar) and standard deviation (black error bars) for annual average Net Primary Production (NPP) from 2014 to 2023.](./figs/ingest_productivity/planarea_primprod.png)
+## Cells with a retrieval, by month (>= 66 N)
+
+Share of cells north of 66 N with a retrieval in each month, pooled over the years (the denominator is the cells
+with a retrieval in at least one month of the same year). Expectation from the spec: Jan-Apr and Nov-Dec 0 %,
+May 14 %, Jun 30 %, Jul 77 %, Aug-Sep about 100 %, Oct 3 %.
 
 ```{r}
-#| label: plot_bars
-pa_npp <- pa |>
-  select(planarea_key, planarea_name) |> 
-  left_join(
-    d_pa_npp |> 
-      select(planarea_key, npp_avg, npp_sd),
-    by = "planarea_key")
+#| label: month_share
 
-mapviewOptions(
-  basemaps = "Esri.OceanBasemap",
-  raster.palette = \(n) hcl.colors(n, palette = "viridis"),
-  vector.palette = \(n) hcl.colors(n, palette = "viridis"))
+month_share <- NULL
+if (all(file_exists(csv_yr(yrs)))) {
+  month_share <- bind_rows(lapply(yrs, \(yr) read_csv(csv_yr(yr), show_col_types = F))) |>
+    group_by(month) |>
+    summarize(pct_with_retrieval = round(100 * sum(n_ret) / sum(n_den), 1), .groups = "drop")
+  print(month_share, n = 12)
+}
+```
 
-# Static PNG: this planning-areas choropleth embedded ~22 MB. See msens::widget_png().
-m_pa_npp <- (mapView(
-    pa_npp, zcol = "npp_avg", 
-    layer.name = "planning areas")) |> 
-  slot("map") |> 
-  addFullscreenControl() |> 
-  addControl(tags$div(HTML("units: mg C / m<sup>2</sup> / day")), position = "topright")
+## Map: mean of observed months vs integrated
 
-knitr::include_graphics(msens::widget_png(
-  m_pa_npp, "figures/ingest_productivity_pa_npp.png"))
+```{r}
+#| label: fig_compare
 
-d_pa_npp |> 
-  datatable()
+png_cmp <- path(dir_figs, "map_vgpm_meanobs_vs_integrated.png")
+if (file_exists(tif_int) && file_exists(tif_obs) && (!file_exists(png_cmp) || redo_ingest)) {
+  e   <- ext(-180, 180, 45, 90)
+  a   <- aggregate(crop(rast(tif_obs, lyrs = "npp_avg"), e), fact = 2, na.rm = T)
+  b   <- aggregate(crop(rast(tif_int, lyrs = "npp_avg"), e), fact = 2, na.rm = T)
+  rng <- c(0, as.numeric(global(a, quantile, probs = 0.99, na.rm = T)[[1]]))
+  png(png_cmp, width = 1800, height = 560, res = 150)
+  par(mfrow = c(1, 2), mar = c(2, 2, 3, 3))
+  plot(a, range = rng, main = "mean of observed months (legacy)")
+  plot(b, range = rng, main = "integrated year, polar night / ice = 0")
+  dev.off()
+}
+if (file_exists(png_cmp)) knitr::include_graphics(as.character(png_cmp))
+```
+
+## Manifest
+
+The content hash is the xxhash64 of the integrated ten-year TIF when it exists (otherwise of the legacy file, the
+control run). `stats` records which outputs exist and their digests, the per-year HDF counts, and the
+latitude-band ratios. Paths are relative to `dir_raw`, so the manifest is host-independent. The legacy file's own
+digest is recorded as the proof it is untouched.
+
+```{r}
+#| label: manifest
+
+rel <- \(f) as.character(path_rel(f, dir_raw |> path_expand()))
+outs <- c(integrated = tif_int, meanobs = tif_obs, legacy = tif_old)
+outs <- outs[file_exists(outs)]
+stopifnot("neither the integrated nor the legacy VGPM file exists" = length(outs) > 0)
+
+h_out <- vapply(outs, xxh, character(1))
+h     <- unname(if ("integrated" %in% names(outs)) h_out["integrated"] else h_out["legacy"])
+
+msens::write_manifest(
+  manifest, target = "ingest_productivity", content_hash = h,
+  stats = list(
+    version         = ver,
+    years           = as.list(yrs),
+    n_hdf           = as.list(n_hdf),
+    integrated_built= "integrated" %in% names(outs),
+    outputs         = as.list(setNames(vapply(outs, rel, character(1)), names(outs))),
+    xxhash64        = as.list(h_out),
+    lat_band_ratio  = if (is.null(lat_ratio)) NULL else
+      as.list(setNames(round(lat_ratio$ratio, 3), as.character(lat_ratio$band))),
+    pct_ge66N_with_retrieval = if (is.null(month_share)) NULL else
+      as.list(setNames(month_share$pct_with_retrieval, sprintf("m%02d", month_share$month)))),
+  force = msens::force_target("ingest_productivity"))
+message(glue("ingest_productivity: {paste(names(outs), collapse = ', ')} -> {basename(manifest)} ({h})"))
 ```
