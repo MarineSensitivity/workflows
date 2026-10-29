@@ -108,6 +108,11 @@ if (redo_mc || n_mc != n_pq || is.na(mrg_hash) || !length(have_hash) || !identic
 #                   from model_cell_er x val
 # is_er_spatial (= er_mode <> 'taxon') stays for the docs/app. v7 taxon_id is DOUBLE, v8 VARCHAR
 # -> cast via BIGINT (R as.character gives scientific notation for large ids, won't match).
+# v11 Q3 (TURTLE_RULE=dps, libs/vars.R): the turtles merged through dps_sql carry their ER beside
+# the value like the NMFS DPS species, so scoring reads them in 'cell' mode; the control keeps
+# 'premultiplied' (msens::turtle_sql). The merge wrote whichever applies (merge_models.qmd).
+turtle_er_mode <- if (turtle_rule == "dps") "cell" else "premultiplied"
+log_info("turtle er_mode: {turtle_er_mode} (TURTLE_RULE={turtle_rule})")
 dbExecute(con, glue("ATTACH '{dir_big}/{ver_prev}/sdm.duckdb' AS v7 (READ_ONLY)"))
 # ver_prev's "scored set" column: v1-v7 `is_ok` (bakes in the marine + category cull);
 # v8+ `is_valid_usa AND is_marine` (the definition changed at v8). Resolved by introspecting
@@ -122,16 +127,16 @@ dbExecute(con, glue("CREATE OR REPLACE TABLE v7_cat AS
   SELECT taxon_authority, CAST(TRY_CAST(taxon_id AS BIGINT) AS VARCHAR) AS taxon_id,
          bool_or({prev_ok}) AS is_ok
   FROM v7.taxon WHERE TRY_CAST(taxon_id AS BIGINT) IS NOT NULL GROUP BY 1, 2"))
-dbExecute(con, "CREATE OR REPLACE TABLE taxon AS
+dbExecute(con, glue("CREATE OR REPLACE TABLE taxon AS
   SELECT *, (er_mode <> 'taxon') AS is_er_spatial FROM (
     SELECT t.*,
       coalesce(c.is_ok, FALSE)                                 AS in_v7,   -- in v7's scored set (same-species compare)
       CASE
         WHEN t.ms_merge_key IN (SELECT DISTINCT ms_merge_key FROM m.taxon_model WHERE mdl_key LIKE 'dps_nmfs|%')            THEN 'cell'
-        WHEN t.ms_merge_key IN (SELECT DISTINCT ms_merge_key FROM m.taxon_model WHERE mdl_key LIKE 'rng_turtle_swot_dps|%') THEN 'premultiplied'
+        WHEN t.ms_merge_key IN (SELECT DISTINCT ms_merge_key FROM m.taxon_model WHERE mdl_key LIKE 'rng_turtle_swot_dps|%') THEN '{turtle_er_mode}'
         ELSE 'taxon' END                                       AS er_mode
     FROM m.taxon t
-    LEFT JOIN v7_cat c ON t.taxon_authority = c.taxon_authority AND t.taxon_id = c.taxon_id)")
+    LEFT JOIN v7_cat c ON t.taxon_authority = c.taxon_authority AND t.taxon_id = c.taxon_id)"))
 # every 'cell' taxon must have its ER beside every scored cell, or scoring would silently weight it NULL
 n_gap <- dbGetQuery(con, "SELECT count(*) n FROM model_cell mc JOIN taxon t ON mc.mdl_key = t.ms_merge_key
   LEFT JOIN model_cell_er e ON e.mdl_key = mc.mdl_key AND e.cell_id = mc.cell_id

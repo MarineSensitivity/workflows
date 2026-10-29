@@ -60,9 +60,11 @@ flowchart LR
 librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, quiet = T)
 source(here("libs/paths.R"))
 source(here("libs/vars.R"))
-# v11 method flags (libs/vars.R): until this stage implements its flag(s), every one must be at its
-# control value -- a flag that could be set and silently ignored would fake an attribution row
-stopifnot("a v11 flag is on but this stage does not implement it yet (libs/vars.R v11_flags)" = v11_flags_off)
+# v11 method flags (libs/vars.R): this stage implements TURTLE_SUIT (og supersedes am/ax for the
+# turtles inside the og footprint) and TURTLE_RULE (turtles merged by dps_sql); OCC_RULE and
+# REGION_WEIGHT arrive with Q2/Q3b; every other flag must be at its control value here
+stopifnot("a v11 flag this stage does not implement is on (libs/vars.R v11_flags)" =
+            !occ_rule && !region_weight && !fold_density && worms_source == "download")
 
 dir_atlas   <- glue("{dir_big_v}/marine-atlas")
 dir_dist    <- glue("{dir_atlas}/dist")
@@ -76,6 +78,10 @@ stopifnot("run merge_models_prep first" = file_exists(merge_db),
           "run build_cell_grid first"   = file_exists(sdm_db))
 
 suit_ds   <- c("am", "ax")      # v9: AquaX joins AquaMaps as a suitability dataset (msens::merge_sql)
+# v11 Q3 (D9): under TURTLE_SUIT=ogm our own OBIS-method models (`og`) are a third suitability
+# dataset -- present only for the six turtles (merge_models_prep admits og only then), superseding
+# am and ax inside the og footprint (og_mask) exactly as AquaX supersedes AquaMaps inside its mask
+if (turtle_suit == "ogm") suit_ds <- c(suit_ds, "og")
 turtle_ds <- "rng_turtle_swot_dps"
 # SPATIAL extinction risk, two rules (both msens, both unit-tested in test-merge.R):
 #  * sea turtles (v4b, msens::turtle_sql): val = greatest(1, round(er x suit / 100)), critical
@@ -146,6 +152,22 @@ if (has_ax) {
   dbExecute(con, "CREATE OR REPLACE TABLE supersede (ms_merge_key VARCHAR)")
   log_info("no ax ingest found — no supersession (v8-style merge)")
 }
+# v11 Q3: the og footprint + the turtle keys whose am/ax rows it supersedes (TURTLE_SUIT=ogm);
+# an empty table under the control so the predicate below keeps every row
+og_dir <- glue("{dir_dist}/dataset=og")
+if (turtle_suit == "ogm") {
+  stopifnot("TURTLE_SUIT=ogm but dist/dataset=og is missing (run ingest_og first)" = dir_exists(og_dir))
+  dbExecute(con, glue("CREATE OR REPLACE TABLE og_mask AS SELECT DISTINCT cell_id FROM read_parquet('{og_dir}/*.parquet')"))
+  dbExecute(con, "CREATE OR REPLACE TABLE turtle_og AS SELECT DISTINCT ms_merge_key FROM taxon_model WHERE mdl_key LIKE 'og|%'")
+  log_info("TURTLE_SUIT=ogm: {dbGetQuery(con, 'SELECT count(*) n FROM turtle_og')$n} taxa lose am + ax inside the og footprint ({dbGetQuery(con, 'SELECT count(*) n FROM og_mask')$n} cells)")
+} else {
+  dbExecute(con, "CREATE OR REPLACE TABLE og_mask (cell_id INTEGER)")
+  dbExecute(con, "CREATE OR REPLACE TABLE turtle_og (ms_merge_key VARCHAR)")
+}
+# the merge-input filter: AquaX's supersession (v9) AND, for the turtles under ogm, am and ax inside og
+keep_sql <- paste(msens::supersede_sql(src = "mc"),
+                  "AND", msens::supersede_sql("am", taxa = "turtle_og", mask = "og_mask", src = "mc"),
+                  "AND", msens::supersede_sql("ax", taxa = "turtle_og", mask = "og_mask", src = "mc"))
 dir_parts <- glue("{dir_atlas}/mc_parts")
 # the partition write is the ~40-min step; skip it if the input already exists (REDO_MC_PARTS=1 forces)
 if (!dir_exists(dir_parts) || nzchar(Sys.getenv("REDO_MC_PARTS"))) {
@@ -158,7 +180,7 @@ if (!dir_exists(dir_parts) || nzchar(Sys.getenv("REDO_MC_PARTS"))) {
        SELECT mm.mkey_id, tm.ms_merge_key, split_part(mc.mdl_key,'|',1) AS ds_key, mc.cell_id, mc.val
        FROM read_parquet('{dir_dist}/*/*.parquet') mc JOIN taxon_model tm USING (mdl_key)
        JOIN mkey_map mm USING (ms_merge_key)) mc
-     WHERE {msens::supersede_sql(src = 'mc')}"),
+     WHERE {keep_sql}"),
     dir_parts, partition_by = "mkey_id")
 } else if (nzchar(Sys.getenv("REDO_MC_PARTS_SPATIAL"))) {
   # refresh ONLY the spatial-ER taxa's partitions (a re-ingested dps_nmfs / turtle surface): mkey_id
@@ -177,7 +199,7 @@ if (!dir_exists(dir_parts) || nzchar(Sys.getenv("REDO_MC_PARTS"))) {
        FROM read_parquet('{dir_dist}/*/*.parquet') mc JOIN taxon_model tm USING (mdl_key)
        JOIN mkey_map mm USING (ms_merge_key)
        WHERE mm.mkey_id IN ({paste(sp_ids, collapse = ',')})) mc
-     WHERE {msens::supersede_sql(src = 'mc')}"),
+     WHERE {keep_sql}"),
     dir_parts, partition_by = "mkey_id")
   log_info("REDO_MC_PARTS_SPATIAL: re-partitioned {length(sp_ids)} spatial-ER taxa; the other partitions are kept")
 } else log_info("mc_parts exists — skipping repartition (REDO_MC_PARTS=1 to force, REDO_MC_PARTS_SPATIAL=1 for the spatial-ER taxa only)")
@@ -210,9 +232,19 @@ log_info("spatial-ER taxa: {length(turtle_keys)} turtles (multiplicative) + {len
 # (mkey_id IN (...) → partition-pruned, tiny). Rule = msens::turtle_sql() (unit-tested).
 dbExecute(con, glue("CREATE OR REPLACE TABLE turtle_src AS
   SELECT ms_merge_key, ds_key, cell_id, val FROM {parts_sql(turtle_ids)}"))
-dbExecute(con, paste("CREATE OR REPLACE TABLE mc_turtle AS",
-  msens::turtle_sql(turtle_ds, suit_ds, ch_ds, src = "turtle_src")))
-log_info("mc_turtle (whole-range): {dbGetQuery(con, 'SELECT count(*) n FROM mc_turtle')$n} cells")
+if (turtle_rule == "turtle") {
+  dbExecute(con, paste("CREATE OR REPLACE TABLE mc_turtle AS",
+    msens::turtle_sql(turtle_ds, suit_ds, ch_ds, src = "turtle_src")))
+  log_info("mc_turtle (whole-range, multiplicative rule): {dbGetQuery(con, 'SELECT count(*) n FROM mc_turtle')$n} cells")
+} else {
+  # v11 Q3 (D8, TURTLE_RULE=dps): the turtles merge like every DPS-listed species -- the value is the
+  # suitability masked to the ER footprint, the per-cell SWOT-DPS ER rides beside it, and the
+  # critical-habitat datasets EXTEND the footprint at their own (species-level) ER; fill = ER where
+  # nothing models the cell. They join mc_dps below, so scoring reads them in er_mode = 'cell';
+  # mc_turtle stays empty. test-merge.R pins the rule.
+  dbExecute(con, "CREATE OR REPLACE TABLE mc_turtle (mdl_key VARCHAR, cell_id INTEGER, val DOUBLE)")
+  log_info("TURTLE_RULE=dps: the {length(turtle_keys)} turtles merge through dps_sql (mc_dps), CH extending the footprint")
+}
 
 # NMFS DPS species: msens::dps_sql() -- (mdl_key, cell_id, val = suitability, er = per-cell ER).
 # The critical-habitat datasets are NOT an input: dps_nmfs was built from the same designations
@@ -227,7 +259,14 @@ for (id in dps_ids) {
     SELECT ms_merge_key, ds_key, cell_id, val FROM {parts_sql(id)} WHERE ds_key NOT IN ({ch_sql})"))
   dbExecute(con, paste("INSERT INTO mc_dps", msens::dps_sql(dps_ds, suit_ds, src = "dps_src")))
 }
-if (length(dps_ids)) dbExecute(con, "DROP VIEW IF EXISTS dps_src")
+if (turtle_rule == "dps") for (id in turtle_ids) {
+  # the turtles: the SWOT-DPS surface is the ER layer and the ch_* datasets are kept IN as ER
+  # (dps_sql takes max(val) over the ER datasets, so a critical-habitat cell carries its own ER)
+  dbExecute(con, glue("CREATE OR REPLACE VIEW dps_src AS
+    SELECT ms_merge_key, ds_key, cell_id, val FROM {parts_sql(id)}"))
+  dbExecute(con, paste("INSERT INTO mc_dps", msens::dps_sql(c(turtle_ds, ch_ds), suit_ds, src = "dps_src")))
+}
+if (length(dps_ids) || turtle_rule == "dps") dbExecute(con, "DROP VIEW IF EXISTS dps_src")
 log_info("mc_dps (whole-range): {dbGetQuery(con, 'SELECT count(*) n FROM mc_dps')$n} cells over {length(dps_ids)} taxa")
 ```
 
