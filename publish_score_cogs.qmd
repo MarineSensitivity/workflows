@@ -33,7 +33,9 @@ One COG per **(metric_key × subregion_key)**, mirroring what `cell_sql()` build
 - each subregion — cells masked to it, so the app's "Study area" filter is a raster, not a query
 
 `rescale` is computed here (plain `min`/`max`, matching the app's `c(stats$min, stats$max)`), which
-is what removes the runtime `/statistics` round-trip on every layer switch.
+is what removes the runtime `/statistics` round-trip on every layer switch. The v10 across-the-nation
+rasters are the exception: a location quotient with a heavy tail (two-cell endemics) is stretched to
+`[0, p99]` (`SCORE_COG_Q`), or a min/max stretch would paint everything but two cells in one colour.
 
 ## Design
 
@@ -169,12 +171,22 @@ log_info("{length(store)} object(s) already in cog/{grid_id}/")
 todo <- h |> distinct(content_hash, .keep_all = TRUE) |> filter(redo | !content_hash %in% store)
 log_info("{nrow(todo)} raster(s) to write ({n_distinct(h$content_hash) - nrow(todo)} reused)")
 
+# the v10 across-the-nation rasters (`_v10_`, `_share_`, `score_v10_*`) are location quotients with
+# a heavy tail by construction -- an endemic confined to two cells puts its whole world there, and
+# v10's invertebrate raster peaks at 2.67 million against a p99 of ~1,100 -- so a min/max stretch
+# would paint everything but two cells in the lowest colour. Their rescale is [0, p-quantile]
+# (SCORE_COG_Q, default 0.99); the within-ecoregion rasters keep the plain min/max the app has
+# always drawn (a published release's stretch must not move).
+score_cog_q <- as.numeric(Sys.getenv("SCORE_COG_Q", "0.99"))
+stopifnot(!is.na(score_cog_q), score_cog_q > 0, score_cog_q <= 1)
+is_v10_key <- function(k) grepl("_v10_|_share_|^score_v10_|^primprod_v10", k)
 rescale <- list()
 for (i in seq_len(nrow(h))) {
   r   <- h[i, ]
   out <- file.path(dir_cog, basename(r$cog_key))
   d   <- dbGetQuery(con, glue("SELECT cell_id, val FROM cog_payload WHERE k = '{r$k}'"))
-  rescale[[r$k]] <- c(min(d$val, na.rm = TRUE), max(d$val, na.rm = TRUE))
+  rescale[[r$k]] <- if (is_v10_key(r$metric_key)) c(0, unname(quantile(d$val, score_cog_q, na.rm = TRUE)))
+                    else c(min(d$val, na.rm = TRUE), max(d$val, na.rm = TRUE))
 
   # `redo` must force a rewrite even when the file is there: the content hash is
   # of the PAYLOAD, so a change to how the raster is written (datatype, overviews)

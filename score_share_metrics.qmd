@@ -105,7 +105,9 @@ The clone verified at bootstrap hashes the whole tables (`checkpoints_v8.json`).
 rows to three of them, so its own gate is on the **v8 subset** — the metric keys and `zone_taxon`
 columns v8 wrote — digested the same way before and after the share rows land. The reference values
 are recorded on the first run and asserted on every later one; `BUILD_REFERENCE=1` is the only way
-to move them.
+to move them. Zone-level surfaces are digested as `FLOAT` (as `build_v7c` does); the per-cell shares
+at four significant digits, because their parallel sums differ in the last double bits between two
+correct runs.
 
 ```{r}
 #| label: control_before
@@ -152,25 +154,33 @@ national reference is the study area (`cell.in_usa`), not the `USA` pseudo-zone 
 ```{r}
 #| label: share
 
-mseq <- function(key, desc = "") {   # idempotent metric_seq: fetch or insert, wiping prior rows of this key
+# idempotent metric_seq: fetch or insert the key, then wipe the prior rows of this key at the ONE level
+# being written. A metric key is shared by cell_metric and zone_metric by design (v8's
+# extrisk_{cat}_ecoregion_rescaled lives at both levels), so a writer must never clear the other
+# level: the first render of this stage deleted the zone-level headline rows while writing the
+# per-cell rasters of the same keys.
+mseq <- function(key, desc = "", level = c("zone", "cell")) {
+  level <- match.arg(level)
   ex <- dbGetQuery(con, glue("SELECT metric_seq FROM metric WHERE metric_key = '{key}'"))
   s  <- if (nrow(ex)) ex$metric_seq[1] else {
     s0 <- dbGetQuery(con, "SELECT coalesce(max(metric_seq),0)+1 s FROM metric")$s
     dbExecute(con, glue("INSERT INTO metric VALUES ({s0}, '{key}', '{gsub(\"'\",\"\",desc)}')")); s0 }
-  dbExecute(con, glue("DELETE FROM cell_metric WHERE metric_seq = {s}"))
-  dbExecute(con, glue("DELETE FROM zone_metric WHERE metric_seq = {s}"))
+  dbExecute(con, glue("DELETE FROM {level}_metric WHERE metric_seq = {s}"))
   s
 }
+written <- list()   # key -> rows written per level, re-read from the database at the end
 write_zone <- function(d, key, desc, col = "val") {
-  s <- mseq(key, desc)
+  s <- mseq(key, desc, "zone")
   d <- d |> filter(!is.na(.data[[col]])) |> transmute(zone_seq, metric_seq = s, val = .data[[col]])
   if (nrow(d)) { duckdb_register(con, "tmp_zm", d); dbExecute(con, glue("INSERT INTO zone_metric SELECT * FROM tmp_zm")); duckdb_unregister(con, "tmp_zm") }
+  written[[paste0("zone:", key)]] <<- nrow(d)
   nrow(d)
 }
 write_cell <- function(d, key, desc, col = "val") {
-  s <- mseq(key, desc)
+  s <- mseq(key, desc, "cell")
   d <- d |> filter(!is.na(.data[[col]])) |> transmute(cell_id, metric_seq = s, val = .data[[col]])
   duckdb_register(con, "tmp_cm", d); dbExecute(con, glue("INSERT INTO cell_metric SELECT * FROM tmp_cm")); duckdb_unregister(con, "tmp_cm")
+  written[[paste0("cell:", key)]] <<- nrow(d)
   nrow(d)
 }
 LAB <- c(global = "share of the species' global range", usa = "share of the species' US distribution (Tim White 2026-09-11)",
@@ -245,6 +255,13 @@ if (share_metrics) {
   duckdb_unregister(con, "tmp_zt")
   log_info("zone_taxon: share columns set on {n_zt} rows ({share_denom} headline)")
   log_info("share family: {n_written} metric rows written")
+  # what was written is what the database holds: every key re-read at its level
+  held <- dbGetQuery(con, "SELECT 'zone:' || m.metric_key AS k, count(*) n FROM zone_metric zm JOIN metric m USING (metric_seq) GROUP BY 1
+    UNION ALL SELECT 'cell:' || m.metric_key, count(*) FROM cell_metric cm JOIN metric m USING (metric_seq) GROUP BY 1")
+  chk <- tibble(k = names(written), n_written = unlist(written)) |> left_join(held, by = "k") |> mutate(n = coalesce(n, 0L), ok = n == n_written)
+  stopifnot("a written metric does not hold the rows written (a writer cleared another level's rows)" = all(chk$ok))
+  stopifnot("the headline composite has no Program-Area rows" = held$n[held$k == glue("zone:score_v10_equalweights_{share_denom}")] >= 20)
+  log_info("re-read check: {nrow(chk)} key x level pairs hold exactly the rows written")
 } else log_info("SHARE_METRICS unset — control run: nothing written")
 ```
 
@@ -283,7 +300,12 @@ stopifnot("this stage changed a v8 row: the control is broken" = all(d_ctl$same)
 h_share <- if (share_metrics) list(
   zone_share = msens::hash_query(con, glue("SELECT z.fld, z.val AS zone_val, m.metric_key, CAST(zm.val AS FLOAT) AS val
     FROM zone_metric zm JOIN zone z USING (zone_seq) JOIN metric m USING (metric_seq) WHERE m.metric_key NOT IN ({keys_sql})")),
-  cell_share = msens::hash_query(con, glue("SELECT m.metric_key, cm.cell_id, CAST(cm.val AS FLOAT) AS val
+  # the per-cell shares are sums over thousands of species whose parallel summation order differs
+  # between two correct runs (measured: 4,822 of 6,217 GAA species sums differ in the last bits,
+  # max relative 1e-13), and over 3.9 M cells x 15 keys a FLOAT cast still flips somewhere (the first
+  # same-flag rerun failed on this surface alone). Four significant digits leave an expected
+  # 0.01 flips per run; the zone-level surfaces reproduce at FLOAT precision and keep it.
+  cell_share = msens::hash_query(con, glue("SELECT m.metric_key, cm.cell_id, printf('%.3e', cm.val) AS val
     FROM cell_metric cm JOIN metric m USING (metric_seq) WHERE m.metric_key NOT IN ({keys_sql})")),
   zone_taxon_share = msens::hash_query(con, "SELECT zone_fld, zone_value, mdl_key, CAST(share_global AS FLOAT) AS a,
     CAST(share_usa AS FLOAT) AS b, CAST(share_v10_contrib AS FLOAT) AS c FROM zone_taxon WHERE share_global IS NOT NULL")) else list()
