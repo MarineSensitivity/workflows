@@ -43,6 +43,13 @@ bio_oracle_tif <- glue::glue("{dir_raw}/bio-oracle.org/bio-oracle_v3.tif")
 # cell_id by position. Shared across versions.
 cellid_tif <- glue::glue("{dir_derived}/r_cellid_global.tif")
 
+# SWFSC Becker et al. (2020b) California Current cetacean densities: one Esri file geodatabase, 13 layers
+# (ingest_swfsc_cce.qmd). Local under dir_raw (hydrated by scripts/pull_from_laptop.sh), not Google Drive;
+# CCE_GDB overrides it.
+cce_gdb <- Sys.getenv("CCE_GDB", unset = glue::glue(
+  "{dir_raw}/sdm/swfsc/Predictive Models of Cetacean Densities in the California Current Ecosystem, 2020b/",
+  "swfsc_cce_becker_et_al_2020b.gdb"))
+
 # OBIS + WoRMS export of marinebon/obisindicators (v11 Q1): one folder per monthly release
 # (`obis-h3/vYYYYMMDD/`: obis_cell.parquet, worms_taxon.parquet, release.json beside the indicators).
 # `~/_big` is the external disk on the Mac mini (a symlink to /Volumes/msens_big/_big), so one spelling
