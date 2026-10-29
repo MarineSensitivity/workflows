@@ -1,10 +1,10 @@
 # shared version and path configuration ----
 # sourced by all workflow notebooks and apps
 
-ver <- Sys.getenv("MS_VER", "v10") # version string; change on branches (e.g., "v3b"). MS_VER overrides it for a
+ver <- Sys.getenv("MS_VER", "v11") # version string; change on branches (e.g., "v3b"). MS_VER overrides it for a
                                   # version-agnostic run of ONE notebook (e.g. DEPLOY_STAC=1 MS_VER=v8); a pipeline
-                                  # run never sets it (ver_prev below still names v10's predecessor)
-ver_prev <- "v8" # previous version (bootstrap_version.qmd clones its unchanged ingests; the
+                                  # run never sets it (ver_prev below still names v11's predecessor)
+ver_prev <- "v10" # previous version (bootstrap_version.qmd clones its unchanged ingests; the
                  # score gate compares against it)
 
 # v8 spatial sampling unit: GLOBAL 0.05 degree raster cell in [-180,180]

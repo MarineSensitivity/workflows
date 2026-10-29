@@ -44,3 +44,22 @@ dps_fetch <- .flag("DPS_FETCH")   # re-download the NMFS critical-habitat servic
 
 # build_taxon_global_total.qmd (v10 P2)
 redo_denom <- .flag("REDO_DENOM")  # build_taxon_global_total.qmd: rebuild taxon_denom
+
+# v11 method flags (plan 2026-10-29 §4, §4.10 Q0): every flag OFF reproduces v10 — the control run
+# `scripts/run_version.sh --control` is every flag off and its digests must equal v10's. Each flag is
+# read HERE and consumed by the stage it enters (named in the comment); a stage that does not yet
+# implement its flag asserts it is off, so a flag can never be silently ignored.
+vgpm_integrated <- .flag("VGPM_INTEGRATED")                        # ingest_productivity: year integrated, polar night = 0 (Q4)
+turtle_suit     <- match.arg(Sys.getenv("TURTLE_SUIT", "am"), c("am", "ogm"))      # merge_models_prep/merge_models: turtle suitability source (Q3)
+turtle_rule     <- match.arg(Sys.getenv("TURTLE_RULE", "turtle"), c("turtle", "dps"))  # merge_models: turtles through dps_sql (Q3)
+occ_rule        <- .flag("OCC_RULE")                               # merge_models: msens::occurrence_rule() zone exclusions (Q2)
+region_weight   <- .flag("REGION_WEIGHT")                          # merge_models: msens::encounter_weight() per species x ecoregion (Q3)
+fold_density    <- .flag("FOLD_DENSITY")                           # merge: density datasets replace suitability inside their domain (Q6)
+worms_source    <- match.arg(Sys.getenv("WORMS_SOURCE", "download"), c("download", "obisindicators"))  # ingest_worms (Q1)
+components_v11  <- .flag("COMPONENTS_V11")                         # data/components.csv labels: Flora / Productivity (Q5)
+v11_flags <- list(VGPM_INTEGRATED = vgpm_integrated, TURTLE_SUIT = turtle_suit, TURTLE_RULE = turtle_rule,
+                  OCC_RULE = occ_rule, REGION_WEIGHT = region_weight, FOLD_DENSITY = fold_density,
+                  WORMS_SOURCE = worms_source, COMPONENTS_V11 = components_v11)
+v11_flags_off <- identical(v11_flags, list(VGPM_INTEGRATED = FALSE, TURTLE_SUIT = "am", TURTLE_RULE = "turtle",
+                                           OCC_RULE = FALSE, REGION_WEIGHT = FALSE, FOLD_DENSITY = FALSE,
+                                           WORMS_SOURCE = "download", COMPONENTS_V11 = FALSE))
