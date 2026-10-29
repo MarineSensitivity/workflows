@@ -61,10 +61,10 @@ librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, quiet = T
 source(here("libs/paths.R"))
 source(here("libs/vars.R"))
 # v11 method flags (libs/vars.R): this stage implements TURTLE_SUIT (og supersedes am/ax for the
-# turtles inside the og footprint) and TURTLE_RULE (turtles merged by dps_sql); OCC_RULE and
-# REGION_WEIGHT arrive with Q2/Q3b; every other flag must be at its control value here
+# turtles inside the og footprint), TURTLE_RULE (turtles merged by dps_sql), OCC_RULE (the occurrence
+# gate) and REGION_WEIGHT (the encounter weight); every other flag must be at its control value here
 stopifnot("a v11 flag this stage does not implement is on (libs/vars.R v11_flags)" =
-            !occ_rule && !region_weight && !fold_density && worms_source == "download")
+            !fold_density && worms_source == "download")   # OCC_RULE / REGION_WEIGHT wired below (v11 Q2)
 
 dir_atlas   <- glue("{dir_big_v}/marine-atlas")
 dir_dist    <- glue("{dir_atlas}/dist")
@@ -215,6 +215,57 @@ all_ids <- dbGetQuery(con, "SELECT mkey_id FROM mkey_map ORDER BY mkey_id")$mkey
 log_info("partitioned merge input: {length(all_ids)} taxa by mkey_id; US trim {n_us} in_usa cells; memory_limit={mem_gb}GB")
 ```
 
+## The occurrence gate and the encounter weight (v11 Q2: `OCC_RULE`, `REGION_WEIGHT`)
+
+D11 "gate + weight" (`explore_occurrence_rule.qmd`): under `OCC_RULE=1` a species leaves an ecoregion where it has
+NO OBIS record under adequate effort (`data/v11/zone_exclusions_occ.csv`, `msens::zone_exclude_sql()` — the v7c
+mechanism, critical habitat never excluded); under `REGION_WEIGHT=1` a species recorded in an ecoregion well below
+its rate elsewhere keeps its cells at `val × w` (`data/v11/zone_weights_occ.csv`, `msens::encounter_weight()` →
+`zone_weight_sql()`; critical habitat never downweighted). Both resolve a cell to its MAJORITY ecoregion
+(`cell_zone_major_sql()` over the shared `zone_cell.parquet`) and are applied by ONE wrapper,
+`msens::zone_adjust_sql()`, to every written surface — both viz and scoring, so what the app draws is what is
+scored — but never to the per-cell ER. With both flags off the relation is empty and the wrapper is not applied
+(the control run is byte-identical to v10's merge).
+
+```{r}
+#| label: zone-adjust
+
+use_adj <- occ_rule || region_weight
+dbExecute(con, "CREATE OR REPLACE TABLE zone_adj (mdl_key VARCHAR, cell_id INTEGER, w DOUBLE)")
+if (use_adj) {
+  zsets <- readr::read_csv(here("data/zone_sets.csv"), show_col_types = FALSE)
+  zkey  <- zsets$zone_set_key[zsets$zone_type == "ecoregion" & grepl(glue("\\b{ver}\\b"), zsets$versions, perl = TRUE)]
+  grid_id <- msens::grid_for_ver(ver)
+  stopifnot("exactly one ecoregion zone set must be registered for this version (data/zone_sets.csv)" = length(zkey) == 1)
+  f_zc <- glue("{dir_derived}/zones/{zkey}/{grid_id}/zone_cell.parquet")
+  stopifnot("the shared ecoregion zone_cell.parquet is missing (run build_zone_cells)" = file_exists(f_zc))
+  dbExecute(con, glue("CREATE OR REPLACE TABLE zc_eco AS SELECT zone_key, cell_id, pct_covered FROM read_parquet('{f_zc}')"))
+  dbExecute(con, paste("CREATE OR REPLACE TABLE cell_zone AS", msens::cell_zone_major_sql(zone_cell = "zc_eco", zone = NULL)))
+  gate <- if (occ_rule) readr::read_csv(here("data/v11/zone_exclusions_occ.csv"), show_col_types = FALSE) else tibble(mdl_key = character(), zone_key = character())
+  wts  <- if (region_weight) readr::read_csv(here("data/v11/zone_weights_occ.csv"), show_col_types = FALSE) |> filter(w > 0) else tibble(mdl_key = character(), zone_key = character(), w = numeric())
+  stopifnot("a pair cannot be both gated and weighted" = !any(paste(wts$mdl_key, wts$zone_key) %in% paste(gate$mdl_key, gate$zone_key)))
+  keys <- union(gate$mdl_key, wts$mdl_key)
+  stopifnot("every gated / weighted key must be a merged taxon of this version" = all(keys %in% dbGetQuery(con, "SELECT ms_merge_key FROM mkey_map")$ms_merge_key))
+  # the footprint the rules act on: every merge-input cell of the affected taxa inside an ecoregion; critical
+  # habitat = the ch datasets' own cells, which neither rule may touch
+  key_sql <- paste(sprintf("'%s'", keys), collapse = ",")
+  dbExecute(con, glue("CREATE OR REPLACE TABLE adj_src AS
+    SELECT DISTINCT mc.ms_merge_key AS mdl_key, mc.cell_id
+    FROM mc_parts mc JOIN cell_zone cz USING (cell_id) WHERE mc.ms_merge_key IN ({key_sql})"))
+  dbExecute(con, glue("CREATE OR REPLACE TABLE adj_ch AS
+    SELECT DISTINCT ms_merge_key AS mdl_key, cell_id FROM mc_parts WHERE ds_key IN ({ch_sql}) AND ms_merge_key IN ({key_sql})"))
+  if (nrow(gate)) dbExecute(con, paste("INSERT INTO zone_adj SELECT mdl_key, cell_id, 0 FROM (",
+    msens::zone_exclude_sql(gate, src = "adj_src", cell_zone = "cell_zone", ch_src = "adj_ch", id_col = "mdl_key"), ")"))
+  if (nrow(wts))  dbExecute(con, paste("INSERT INTO zone_adj SELECT mdl_key, cell_id, w FROM (",
+    msens::zone_weight_sql(wts, src = "adj_src", cell_zone = "cell_zone", ch_src = "adj_ch", id_col = "mdl_key"), ")"))
+  adj_n <- dbGetQuery(con, "SELECT count(*) FILTER (WHERE w = 0) gated, count(*) FILTER (WHERE w > 0) weighted,
+                             count(DISTINCT mdl_key) taxa FROM zone_adj")
+  stopifnot("zone_adj must not repeat a (taxon, cell)" = dbGetQuery(con, "SELECT count(*) - count(DISTINCT (mdl_key, cell_id)) d FROM zone_adj")$d == 0)
+  log_info("zone_adj: {adj_n$gated} cells gated (OCC_RULE={occ_rule}), {adj_n$weighted} weighted (REGION_WEIGHT={region_weight}), {adj_n$taxa} taxa")
+} else log_info("OCC_RULE / REGION_WEIGHT off: zone_adj empty, surfaces written unadjusted")
+adj <- function(sql) if (use_adj) msens::zone_adjust_sql(sql, adj = "zone_adj", id_col = "mdl_key") else sql
+```
+
 ## Spatial extinction risk — sea turtles (×) and NMFS DPS species (suitability + ER per cell)
 
 ```{r}
@@ -300,16 +351,16 @@ write_spatial <- function() {
     if (dir_exists(d)) dir_delete(d)
   dir_create(dir_merged_er)
   # turtles → whole-range global + US-trim (ER baked in)
-  msens::copy_atlas_parquet(con, "SELECT mdl_key, cell_id, val FROM mc_turtle",
+  msens::copy_atlas_parquet(con, adj("SELECT mdl_key, cell_id, val FROM mc_turtle"),
     glue("{dir_global}/turtle"), per_thread = TRUE)
   msens::copy_atlas_parquet(con,
-    "SELECT mt.mdl_key, mt.cell_id, mt.val FROM mc_turtle mt JOIN us_cells u ON mt.cell_id = u.cell_id",
+    adj("SELECT mt.mdl_key, mt.cell_id, mt.val FROM mc_turtle mt JOIN us_cells u ON mt.cell_id = u.cell_id"),
     glue("{dir_merged}/turtle"), per_thread = TRUE)
-  # dps → whole-range global + US-trim (the distribution) + US-trim ER beside it
-  msens::copy_atlas_parquet(con, "SELECT mdl_key, cell_id, val FROM mc_dps",
+  # dps → whole-range global + US-trim (the distribution) + US-trim ER beside it (the ER is never adjusted)
+  msens::copy_atlas_parquet(con, adj("SELECT mdl_key, cell_id, val FROM mc_dps"),
     glue("{dir_global}/dps"), per_thread = TRUE)
   msens::copy_atlas_parquet(con,
-    "SELECT d.mdl_key, d.cell_id, d.val FROM mc_dps d JOIN us_cells u ON d.cell_id = u.cell_id",
+    adj("SELECT d.mdl_key, d.cell_id, d.val FROM mc_dps d JOIN us_cells u ON d.cell_id = u.cell_id"),
     glue("{dir_merged}/dps"), per_thread = TRUE)
   msens::copy_atlas_parquet(con,
     "SELECT d.mdl_key, d.cell_id, d.er FROM mc_dps d JOIN us_cells u ON d.cell_id = u.cell_id",
@@ -352,8 +403,8 @@ log_info("merging {length(nonturtle)} non-turtle taxa in {length(batches)} cell-
 #    IUCN range lies WHOLLY outside the US gets NO US presence — the iucn_range_outside_us_eez
 #    exclusion (e.g. Sotalia guianensis). See ?msens::merge_sql for the full rationale.
 msq             <- msens::merge_sql(suit_ds)
-glob_global_sql <- msq$global
-us_sql          <- msq$us
+glob_global_sql <- adj(msq$global)   # the gate + weight wrapper (identity with the flags off)
+us_sql          <- adj(msq$us)
 for (i in seq_along(batches)) {
   dbExecute(con, glue("CREATE OR REPLACE TABLE b AS
     SELECT ms_merge_key, ds_key, cell_id, val FROM {parts_sql(batches[[i]])}"))
