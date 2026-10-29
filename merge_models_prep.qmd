@@ -249,13 +249,17 @@ worms_flags <- dbGetQuery(con_spp, "SELECT CAST(scientificNameID AS VARCHAR) AS 
   as_tibble() |> mutate(across(c(spp_marine, spp_extinct), as.logical)) |> distinct(taxon_id, .keep_all = TRUE)
 dbDisconnect(con_spp, shutdown = TRUE)
 n_na0 <- sum(is.na(taxon$worms_is_marine) & taxon$taxon_authority == "worms")
+# a taxon ver_prev already carried keeps ver_prev's flags EXACTLY, NA included (v8 left ~10,600 WoRMS taxa unflagged:
+# filling them from WoRMS flips 34 validity verdicts, which is a method change for a flag, not the control);
+# only a taxon NEW to this version is looked up in WoRMS by AphiaID
 taxon <- taxon |>
-  left_join(prev_tax, by = "ms_merge_key") |>
+  left_join(prev_tax |> mutate(in_prev = TRUE), by = "ms_merge_key") |>
   left_join(worms_flags |> mutate(taxon_authority = "worms"), by = c("taxon_authority", "taxon_id")) |>
-  mutate(worms_is_marine  = coalesce(worms_is_marine,  prev_marine,  spp_marine),
-         worms_is_extinct = coalesce(worms_is_extinct, prev_extinct, spp_extinct)) |>
-  select(-prev_marine, -prev_extinct, -spp_marine, -spp_extinct)
-log_info("WoRMS flags: {n_na0} reused WoRMS taxa had none from this run's resolution; {sum(is.na(taxon$worms_is_marine) & taxon$taxon_authority == 'worms')} remain NA after ver_prev + WoRMS by AphiaID")
+  mutate(in_prev = coalesce(in_prev, FALSE),
+         worms_is_marine  = if_else(in_prev, coalesce(worms_is_marine,  prev_marine),  coalesce(worms_is_marine,  spp_marine)),
+         worms_is_extinct = if_else(in_prev, coalesce(worms_is_extinct, prev_extinct), coalesce(worms_is_extinct, spp_extinct))) |>
+  select(-prev_marine, -prev_extinct, -spp_marine, -spp_extinct, -in_prev)
+log_info("WoRMS flags: {n_na0} reused WoRMS taxa had none from this run's resolution; {sum(is.na(taxon$worms_is_marine) & taxon$taxon_authority == 'worms')} NA after carrying ver_prev's (NA included) + WoRMS by AphiaID for new taxa")
 
 con <- dbConnect(duckdb(glue("{dir_atlas}/merge.duckdb")))
 dbWriteTable(con, "taxon_model", taxon_model, overwrite = TRUE)
