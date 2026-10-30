@@ -35,8 +35,10 @@ hexagons are clipped, the Shelf ones "Unclipped") and the densities are **summed
   cells strictly denser than this one, so the densest cell is 100 and `val >= 100 - p` is exactly the p % core.
   Cells with `val < 1` are dropped (the merge's floor). The old recipe (`GM_TRANSFORM=cap`: linear to the species'
   pooled p99.5 of positive density, now applied to the *regridded* densities) stays available and is compared below.
-- **Annual** = `msens::density_annual(n_intervals = 12)` on the DENSITIES — a month the model does not cover counts
-  as zero — and THEN the same transform. The v8 ingest averaged the transformed values over the months a cell was
+- **Annual** = the DAY-WEIGHTED mean of the twelve months, `msens::density_annual(n_intervals = 12, interval = "interval",
+  weights = msens::month_day_weights())` (msens >= 0.65.1; February counts 28/365) on the DENSITIES — a month the model
+  does not cover counts as zero over its weight — and THEN the same transform. (v11 first used the plain mean of the
+  twelve; the day weights match the annual MDAT delivers for the Atlantic birds and a climatological year.) The v8 ingest averaged the transformed values over the months a cell was
   *present* in; the Kogia model covers April–November only, so its annual was biased upward by 12/8.
 - **Guilds** (`is_guild`): a `sp_id` whose WoRMS rank is not Species (Delphinidae for the blackfish, *Ziphius*
   for all beaked whales, *Globicephala*, *Kogia*), or whose `spp_gmx` row names several species. They keep their
@@ -249,47 +251,54 @@ to_val <- function(dens, cell_id, how, cap = NA_real_) {
 }
 ```
 
-### The annual surface is the mean over ALL twelve months
+### The annual surface is the day-weighted mean over ALL twelve months
 
-A month the model does not cover counts as zero. Checked on the densities, before any transform, on
-hand-picked species: with twelve months the annual equals the plain mean of the months; the Kogia model covers
-April–November only, so its annual is exactly 8/12 of the mean over its modelled months, and lower than the
-present-only mean the v8 ingest used (by n_present / 12).
+A month the model does not cover counts as zero over its weight. Checked on the densities, before any transform, on
+hand-picked species: with twelve months the annual equals the day-weighted mean of the months; the Kogia model covers
+April–November only (244 of 365 days), so its annual is exactly 244/365 of the day-weighted mean over its modelled
+months, and lower than the present-only mean the v8 ingest used.
 
 ```{r}
 #| label: annual-check
 
+stopifnot("this notebook needs msens >= 0.65.1 (density_annual weights / month_day_weights)" = utils::packageVersion("msens") >= "0.65.1")
+w_day   <- msens::month_day_weights()                                       # days per month, names "01".."12"
+annual_dw <- \(d) msens::density_annual(d, n_intervals = 12, interval = "interval", weights = w_day)
 wide_of <- \(d) d |> pivot_wider(names_from = interval, values_from = dens, values_fill = 0)
+dw_mean <- \(w, months) as.vector(as.matrix(w[, months]) %*% w_day[months]) / sum(w_day[months])   # day-weighted mean over `months`
 
-# twelve months: annual == plain mean of the twelve (checked on three species, one of them Rice's whale)
+# twelve months: annual == day-weighted mean of the twelve (checked on three species, one of them Rice's whale)
 chk12 <- c(`Sperm whale` = "WORMS:137119", `Rice's whale` = "WORMS:1576133", `Loggerhead` = "WORMS:137205")
 for (nm_ in names(chk12)) {
   d   <- sp_dens(chk12[[nm_]]); stopifnot(n_distinct(d$interval) == 12)
-  ann <- msens::density_annual(d, n_intervals = 12)
-  plain <- wide_of(d) |> transmute(cell_id, mean12 = rowMeans(across(-cell_id)))
-  j <- inner_join(ann, plain, by = "cell_id")
-  stopifnot("annual != plain 12-month mean" = nrow(j) == nrow(ann), nrow(j) == nrow(plain),
+  ann <- annual_dw(d)
+  wd  <- wide_of(d)
+  dw  <- tibble(cell_id = wd$cell_id, mean12 = dw_mean(wd, names(w_day)))
+  j <- inner_join(ann, dw, by = "cell_id")
+  stopifnot("annual != day-weighted 12-month mean" = nrow(j) == nrow(ann), nrow(j) == nrow(dw),
             max(abs(j$dens - j$mean12)) < 1e-12 * max(j$mean12))
 }
 
 # Kogia, April-November only
 kg <- sp_dens("WORMS:159024")
 stopifnot("Kogia months changed (expected Apr-Nov)" = setequal(unique(kg$interval), sprintf("%02d", 4:11)))
-ann_kg <- msens::density_annual(kg, n_intervals = 12)
+ann_kg <- annual_dw(kg)
 w_kg   <- wide_of(kg)
-mean_modelled <- w_kg |> transmute(cell_id, m8 = rowMeans(across(-cell_id)))              # mean over the 8 modelled months (zeros counted)
+mo_kg  <- sprintf("%02d", 4:11)
+frac_kg <- sum(w_day[mo_kg]) / sum(w_day)                                                  # the modelled share of the year in days: 244/365
+stopifnot("Kogia's modelled days changed (expected 244 of 365)" = sum(w_day[mo_kg]) == 244, sum(w_day) == 365)
+mean_modelled <- w_kg |> transmute(cell_id, m8 = dw_mean(w_kg, mo_kg))                     # DAY-WEIGHTED mean over the 8 modelled months (zeros counted)
 present_only  <- kg |> group_by(cell_id) |> summarise(po = mean(dens), n_ssn = n(), .groups = "drop")   # the v8 recipe's statistic
 j <- ann_kg |> inner_join(mean_modelled, by = "cell_id") |> inner_join(present_only, by = "cell_id")
-stopifnot("Kogia annual != 8/12 of the mean over its modelled months" =
-            nrow(j) == nrow(ann_kg), all(abs(j$dens - j$m8 * 8 / 12) < 1e-12 * max(j$m8)),
-          "Kogia annual != present-only mean x n_present/12" = all(abs(j$dens - j$po * j$n_ssn / 12) < 1e-12 * max(j$po)),
+stopifnot("Kogia annual != sum(days Apr..Nov)/365 x the day-weighted mean over its modelled months" =
+            nrow(j) == nrow(ann_kg), all(abs(j$dens - j$m8 * frac_kg) < 1e-12 * max(j$m8)),
           "Kogia annual is not below the present-only mean" = all(j$dens < j$po))
 chk_tbl <- tibble(model = "Kogia (Apr-Nov)", months = 8L, cells = nrow(j),
                   mean_annual = mean(j$dens), mean_modelled_months = mean(j$m8), mean_present_only = mean(j$po))
-log_info("annual checks passed: {length(chk12)} twelve-month species (annual == plain mean); Kogia (8 months): annual == 8/12 x modelled-month mean")
+log_info("annual checks passed: {length(chk12)} twelve-month species (annual == day-weighted mean); Kogia (8 months): annual == 244/365 x day-weighted modelled-month mean")
 knitr::kable(chk_tbl |> mutate(across(starts_with("mean"), \(v) signif(v, 3))),
              caption = "Kogia: annual vs the mean over its modelled months and the present-only mean the v8 ingest used (cell means)")
-rm(kg, ann_kg, w_kg, mean_modelled, present_only, j)
+rm(kg, ann_kg, w_kg, mean_modelled, present_only, j, mo_kg, frac_kg)
 ```
 
 ```{r}
@@ -309,7 +318,7 @@ for (sid in sp_ids) {
   # the v8 recipe's 100 point: pooled p99.5 of the species' positive (regridded) densities, all months
   cap <- as.numeric(quantile(dd$dens, p_cap, names = FALSE))
   if (!is.finite(cap) || cap <= 0) cap <- max(dd$dens)
-  ann <- msens::density_annual(dd, n_intervals = 12) |> mutate(interval = "annual")
+  ann <- annual_dw(dd) |> mutate(interval = "annual")
   res <- bind_rows(dd, ann) |> group_by(interval) |>
     group_modify(\(x, k) tibble(cell_id = x$cell_id, dens = x$dens,
                                 v_ud = to_val(x$dens, x$cell_id, "ud"), v_cap = to_val(x$dens, x$cell_id, "cap", cap))) |>
@@ -448,7 +457,7 @@ msens::write_manifest(
   stats = list(
     ds_key = ds_key, n_sp_id = n_distinct(model_gm$sp_id), n_mdl = nrow(model_gm),
     n_guild = n_distinct(model_gm$sp_id[model_gm$is_guild]), transform = gm_transform, p_cap = p_cap,
-    note = "monthly + annual density -> population percentile [1,100]; annual = mean over 12 months (uncovered = 0) then transformed; Oceanic+Shelf summed per cell; guilds ingested, excluded from the merge; NOT yet folded into merge/scoring unless FOLD_DENSITY"),
+    note = "monthly + annual density -> population percentile [1,100]; annual = day-weighted mean over 12 months (uncovered = 0 over its weight) then transformed; Oceanic+Shelf summed per cell; guilds ingested, excluded from the merge; NOT yet folded into merge/scoring unless FOLD_DENSITY"),
   force = msens::force_target("ingest_sdm_gm"))
 ```
 
