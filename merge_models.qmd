@@ -530,16 +530,24 @@ the union of every non-am dataset, so the identity doesn't apply — `msens::tur
 #| label: masking_check
 
 if (dbExistsTable(con, "range_counts")) {
+  # the occurrence gate (OCC_RULE, zone_adj w = 0) REMOVES range cells from both surfaces by design, so a gated
+  # taxon's global surface is SMALLER than its footprint by at most its gated-cell count; a taxon the gate
+  # never touched must match exactly, and NO taxon may exceed its footprint (apps#8)
   bad <- dbGetQuery(con, glue("
     WITH g AS (SELECT mdl_key, count(*) AS n_global
-               FROM read_parquet('{dir_global}/**/*.parquet') GROUP BY 1)
-    SELECT g.mdl_key, r.n_range, g.n_global, g.n_global - r.n_range AS n_surplus
-    FROM g JOIN range_counts r ON r.ms_merge_key = g.mdl_key
-    WHERE g.n_global <> r.n_range ORDER BY n_surplus DESC"))
+               FROM read_parquet('{dir_global}/**/*.parquet') GROUP BY 1),
+         gt AS (SELECT mdl_key, count(*) AS n_gated FROM zone_adj WHERE w = 0 GROUP BY 1)
+    SELECT g.mdl_key, r.n_range, g.n_global, g.n_global - r.n_range AS n_surplus, coalesce(gt.n_gated, 0) AS n_gated
+    FROM g JOIN range_counts r ON r.ms_merge_key = g.mdl_key LEFT JOIN gt ON gt.mdl_key = g.mdl_key
+    WHERE g.n_global > r.n_range OR g.n_global < r.n_range - coalesce(gt.n_gated, 0)
+    ORDER BY n_surplus DESC"))
   n_ck <- dbGetQuery(con, "SELECT count(*) n FROM range_counts")$n
-  if (nrow(bad)) msens::report_table(head(bad, 20), caption = "UNMASKED taxa (am beyond the range)")
-  log_info("masking check: {n_ck - nrow(bad)}/{n_ck} taxa masked to their range footprint")
-  stopifnot("global surface has cells beyond the range footprint (apps#8)" = nrow(bad) == 0)
+  n_gated_taxa <- dbGetQuery(con, glue("
+    WITH g AS (SELECT mdl_key, count(*) AS n_global FROM read_parquet('{dir_global}/**/*.parquet') GROUP BY 1)
+    SELECT count(*) n FROM g JOIN range_counts r ON r.ms_merge_key = g.mdl_key WHERE g.n_global < r.n_range"))$n
+  if (nrow(bad)) msens::report_table(head(bad, 20), caption = "UNMASKED taxa (am beyond the range) or over-gated taxa")
+  log_info("masking check: {n_ck - nrow(bad)}/{n_ck} taxa masked to their range footprint ({n_gated_taxa} smaller than it by the occurrence gate)")
+  stopifnot("global surface has cells beyond the range footprint (apps#8), or a gated taxon lost more cells than the gate holds" = nrow(bad) == 0)
 } else log_info("range_counts absent (merge skipped by a prior run) — REDO_MERGE=1 to re-check")
 
 # v9 supersession check, on the partitioned INPUT (what both surfaces read): for every superseded
