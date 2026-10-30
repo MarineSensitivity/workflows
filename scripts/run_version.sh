@@ -60,7 +60,7 @@ STAGES=(
   "score_zones         score_zones.qmd"
   "score_cell_metrics  score_cell_metrics.qmd"
   "score_zone_metrics  score_zone_metrics.qmd"
-  "build_taxon_global_total build_taxon_global_total.qmd"
+  "build_taxon_global_total build_taxon_global_total.qmd REDO_DENOM=1"   # the denominators follow the merge: never reuse a prior run's
   "score_share_metrics score_share_metrics.qmd    SHARE_METRICS=1"
   "snapshot_scores     snapshot_scores.qmd"
   "build_registry      build_registry.qmd"
