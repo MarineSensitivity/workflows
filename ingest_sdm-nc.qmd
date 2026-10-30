@@ -68,11 +68,12 @@ the dataset when `2023` is on).
 Under `2023`: each species' 12 monthly rasters are reprojected bilinearly to EPSG:4326 and regridded to the
 0.05 degree cells exactly as the Pacific COGs are (`cells_from_raster(digits = NULL, min_value = 1e-12)`),
 transformed month by month with `density_to_suit("ud")` (cell-area weighted), and the **annual** is OUR
-integration `density_annual(n_intervals = 12)` of the twelve densities, then transformed. The package's own
-**delivered Annual** layer is regridded the same way and compared per species
-(`data/nc_atl2023_annual_compare.csv`): the delivered one is the **day-weighted** mean of the twelve months
-(checked here on the native grid), ours the plain mean, so the two differ by up to 8 % in a cell and agree
-in rank; the notebook keeps ours as the model and reports the delivered one. The package carries no
+integration of the twelve densities, **day-weighted**: `density_annual(n_intervals = 12, interval = <month>,
+weights = msens::month_day_weights())` (msens >= 0.65.1; February counts 28/365), then transformed. The package's own
+**delivered Annual** layer is the day-weighted mean of its twelve months (checked here on the native grid to float
+precision), so the two should now agree to the regrid's rounding; it is regridded the same way and compared per
+species (`data/nc_atl2023_annual_compare.csv`), with the plain 12-month mean kept as a sensitivity (it differs by
+up to 8 % in a cell). The Pacific seasons stay equal-weighted (4 seasons, as the 2018 control). The package carries no
 "no survey effort" raster: the hatched mask of the MDAT map services is an overlay that is not part of
 the download, and every one of the 637 density rasters is strictly positive on the same 13,419 modelled
 cells (NaN elsewhere; no zeros, no -9999). The provenance columns `source`, `accession`, `citation` of the
@@ -477,6 +478,17 @@ dens_cells <- function(region_ds, sp_code, season) {
 # intervals per year: 4 seasons, or the 12 months of the 2023 Atlantic package
 n_int <- function(region) if (src_2023 && region == "Atlantic") 12L else 4L
 
+# the annual DENSITY of one region's (cell_id, interval, dens) rows: the mean over ALL intervals, an unmodelled one = 0.
+# 2023 Atlantic = the DAY-WEIGHTED mean of the 12 months (what the package's own Annual layer is; msens >= 0.65.1);
+# the Pacific seasons (and the whole 2018 control) stay equal-weighted, 4 seasons, exactly as before
+annual_of <- function(x, region, plain = FALSE) {
+  if (src_2023 && region == "Atlantic" && !plain)
+    msens::density_annual(x, n_intervals = 12, interval = "interval", weights = msens::month_day_weights())
+  else msens::density_annual(x, n_intervals = n_int(region))
+}
+if (src_2023) stopifnot("NC_ATL_SOURCE=2023 needs msens >= 0.65.1 (density_annual weights / month_day_weights)" =
+                          utils::packageVersion("msens") >= "0.65.1")
+
 # density -> [0,100]: the v11 population percentile (ud, area-weighted by the cell table), or the v8
 # recipe (cap: linear to the species' pooled p99.5 of positive density, clamped)
 to_val <- function(dens, cell_id, how, cap = NA_real_) {
@@ -495,8 +507,8 @@ region_dens <- function(sp_code, region) {
 
 An unmodelled interval counts as zero (NCCOS fits a season only where the species was sighted enough to
 model; the 2023 Atlantic package models every species in all twelve months). Checked on the densities, before
-any transform, on hand-picked species: with every interval modelled the annual equals the plain mean of the
-intervals (4 seasons, or 12 months for the 2023 Atlantic); a species missing a season has a LOWER annual than the
+any transform, on hand-picked species: with every interval modelled the annual equals the mean of the
+intervals (plain for the 4 seasons; DAY-WEIGHTED for the 12 months of the 2023 Atlantic); a species missing a season has a LOWER annual than the
 present-only mean (by exactly n_present / 4).
 
 ```{r}
@@ -504,7 +516,7 @@ present-only mean (by exactly n_present / 4).
 
 chk <- function(code, region) {
   d   <- region_dens(code, region)
-  ann <- msens::density_annual(d, n_intervals = n_int(region))
+  ann <- annual_of(d, region)
   wide <- d |> pivot_wider(names_from = interval, values_from = dens, values_fill = 0)
   list(d = d, ann = ann, wide = wide, n = n_distinct(d$interval))
 }
@@ -514,9 +526,13 @@ chk_full <- if (src_2023) list(BFAL = "Pacific", CAAU = "Pacific", ATPU = "Atlan
                           list(ATPU = "Atlantic", AUSH = "Atlantic", BFAL = "Pacific", CAAU = "Pacific")
 for (code in names(chk_full)) {
   x <- chk(code, chk_full[[code]]); stopifnot(x$n == n_int(chk_full[[code]]))
-  plain <- x$wide |> transmute(cell_id, mean_all = rowMeans(across(-cell_id)))
+  weighted <- src_2023 && chk_full[[code]] == "Atlantic"      # the 2023 Atlantic annual is the day-weighted mean of the 12 months
+  plain <- if (weighted) {
+    w <- msens::month_day_weights(); iv <- setdiff(names(x$wide), "cell_id")
+    x$wide |> transmute(cell_id, mean_all = as.vector(as.matrix(x$wide[, names(w)]) %*% w) / sum(w))
+  } else x$wide |> transmute(cell_id, mean_all = rowMeans(across(-cell_id)))
   j <- inner_join(x$ann, plain, by = "cell_id")
-  stopifnot("annual != plain mean over the intervals" = nrow(j) == nrow(x$ann), nrow(j) == nrow(plain),
+  stopifnot("annual != the (day-weighted for 2023 Atlantic, else plain) mean over the intervals" = nrow(j) == nrow(x$ann), nrow(j) == nrow(plain),
             max(abs(j$dens - j$mean_all)) < 1e-12 * max(j$mean_all))
 }
 # species missing an interval (three of four seasons): annual = present-only mean x n_present / n_intervals, always lower
@@ -550,23 +566,27 @@ if (length(nc_test_sp)) {                                  # smoke test: named c
 } else if (nc_test_n > 0) sp_ids <- head(sp_ids, nc_test_n)
 cmp_rows <- list(); cap_rows <- list(); acmp_rows <- list()
 
-# 2023: our annual (density_annual over the 12 months) against the package's delivered Annual layer, per species.
-# On the 0.05 degree cells both went through the same regrid; `nat_*` check on the NATIVE grid how the delivered Annual is
-# built (plain mean of the 12 months vs day-weighted: the package's is day-weighted, to float precision)
+# 2023: our annual (the day-weighted density_annual over the 12 months) against the package's delivered Annual layer, per
+# species, plus the plain 12-month mean as a sensitivity (`*_plain`). On the 0.05 degree cells all went through the same
+# regrid; `nat_*` check on the NATIVE grid how the delivered Annual is built (plain vs day-weighted mean of the months)
 days_in_month <- c(31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
-annual_compare <- function(code, ours, deliv) {
-  j    <- full_join(ours |> select(cell_id, ours = dens), deliv |> select(cell_id, deliv = dens), by = "cell_id") |>
-    mutate(across(c(ours, deliv), \(v) coalesce(v, 0)))
-  both <- j |> filter(ours > 0, deliv > 0)
+annual_compare <- function(code, ours, deliv, plain) {
+  stat <- \(a, b) {
+    j    <- full_join(a |> select(cell_id, a = dens), b |> select(cell_id, b = dens), by = "cell_id") |>
+      mutate(across(c(a, b), \(v) coalesce(v, 0)))
+    both <- j |> filter(a > 0, b > 0)
+    list(r = cor(j$a, j$b), med = median(both$a / both$b), p05 = quantile(both$a / both$b, .05, names = FALSE),
+         p95 = quantile(both$a / both$b, .95, names = FALSE), sum = sum(j$a) / sum(j$b), n_both = nrow(both))
+  }
+  d <- stat(ours, deliv); p <- stat(plain, deliv)
   nat  <- \(iv) terra::values(terra::rast(src_path(mdat_ds, code, iv)), mat = FALSE)
   M <- vapply(sprintf("%02d", 1:12), nat, numeric(terra::ncell(terra::rast(src_path(mdat_ds, code, "01")))))
   A <- nat("annual"); ok <- !is.na(A)
-  plain <- rowMeans(M); dw <- as.vector(M %*% (days_in_month / sum(days_in_month)))
-  tibble(sp_code = code, n_cells_ours = nrow(ours), n_cells_deliv = nrow(deliv), n_both = nrow(both),
-         r_pearson = cor(j$ours, j$deliv), r_spearman = cor(both$ours, both$deliv, method = "spearman"),
-         median_ratio = median(both$ours / both$deliv), p05_ratio = quantile(both$ours / both$deliv, .05, names = FALSE),
-         p95_ratio = quantile(both$ours / both$deliv, .95, names = FALSE), sum_ratio = sum(j$ours) / sum(j$deliv),
-         nat_maxrel_plain = max(abs(A[ok] - plain[ok]) / plain[ok]), nat_maxrel_dayweighted = max(abs(A[ok] - dw[ok]) / dw[ok]))
+  pl <- rowMeans(M); dw <- as.vector(M %*% (days_in_month / sum(days_in_month)))
+  tibble(sp_code = code, n_cells_ours = nrow(ours), n_cells_deliv = nrow(deliv), n_both = d$n_both,
+         r_pearson = d$r, median_ratio = d$med, p05_ratio = d$p05, p95_ratio = d$p95, sum_ratio = d$sum,
+         r_pearson_plain = p$r, median_ratio_plain = p$med, p05_ratio_plain = p$p05, p95_ratio_plain = p$p95, sum_ratio_plain = p$sum,
+         nat_maxrel_plain = max(abs(A[ok] - pl[ok]) / pl[ok]), nat_maxrel_dayweighted = max(abs(A[ok] - dw[ok]) / dw[ok]))
 }
 
 for (sid in sp_ids) {
@@ -583,13 +603,14 @@ for (sid in sp_ids) {
   # the v8 recipe's 100 point: pooled p99.5 of the species' positive densities (all seasons, both regions)
   cap <- as.numeric(quantile(dd$dens, p_cap, names = FALSE))
   if (!is.finite(cap) || cap <= 0) cap <- max(dd$dens)
-  # annual per region: mean over ALL intervals of the year (4 seasons; 12 months for the 2023 Atlantic), an unmodelled one = 0
+  # annual per region: mean over ALL intervals of the year (4 seasons; the day-weighted 12 months for the 2023 Atlantic), an unmodelled one = 0
   ann <- dd |> group_by(region) |>
-    group_modify(\(x, k) msens::density_annual(x, n_intervals = n_int(k$region))) |> ungroup() |> mutate(interval = "annual")
+    group_modify(\(x, k) annual_of(x, k$region)) |> ungroup() |> mutate(interval = "annual")
   if (src_2023 && any(mi$region_ds == mdat_ds)) {            # report the delivered Annual layer beside ours (ours is the model)
     code <- mi$sp_code[mi$region_ds == mdat_ds][1]
     dv   <- dens_cells(mdat_ds, code, "annual"); stopifnot("no delivered annual raster" = !is.null(dv))
-    acmp_rows[[sid]] <- annual_compare(code, ann |> filter(region == "Atlantic"), dv) |> mutate(sp_id = sid, .before = 1)
+    plain_atl <- annual_of(dd |> filter(region == "Atlantic"), "Atlantic", plain = TRUE)     # sensitivity: the plain 12-month mean
+    acmp_rows[[sid]] <- annual_compare(code, ann |> filter(region == "Atlantic"), dv, plain_atl) |> mutate(sp_id = sid, .before = 1)
   }
   res <- bind_rows(dd, ann) |> group_by(region, interval) |>
     group_modify(\(x, k) tibble(cell_id = x$cell_id, dens = x$dens,
@@ -619,6 +640,8 @@ if (src_2023) {                                             # persisted so a res
   if (file_exists(acmp_csv)) acmp <- bind_rows(acmp, read_csv(acmp_csv) |> filter(!sp_id %in% acmp$sp_id))
   acmp <- acmp |> arrange(sp_code)
   write_csv(acmp |> mutate(across(where(is.double), \(v) signif(v, 6))), acmp_csv)
+  off <- acmp$sp_code[abs(acmp$median_ratio - 1) > 1e-3 | acmp$r_pearson < 0.9999]       # the day-weighted annual should now reproduce the delivered one
+  if (length(off)) log_warn("our day-weighted annual departs from the delivered Annual (median ratio off by > 1e-3 or r < 0.9999) for: {paste(off, collapse = ', ')}")
   if (any(acmp$nat_maxrel_dayweighted > 1e-5)) log_warn("the delivered Annual is not the day-weighted mean of the months for: {paste(acmp$sp_code[acmp$nat_maxrel_dayweighted > 1e-5], collapse = ', ')}")
 }
 ```
@@ -729,11 +752,12 @@ cat("\n\n</details>\n\n")
 #| results: asis
 
 if (src_2023) cat(glue("### 2023 Atlantic: our annual vs the package's delivered Annual\n\n",
-         "**{nrow(acmp)} species.** Our annual (`density_annual(n_intervals = 12)`, the plain mean of the twelve monthly ",
-         "densities) is the model; the delivered Annual layer is regridded the same way and reported. `median_ratio` is ",
-         "ours / delivered over the cells both cover, `sum_ratio` the ratio of totals, `r_*` the correlations; ",
-         "`nat_maxrel_*` is the largest relative difference on the NATIVE grid between the delivered Annual and the plain ",
-         "mean of the months / the day-weighted mean (the delivered one is day-weighted: February counts 28/365).\n\n"))
+         "**{nrow(acmp)} species.** Our annual (`density_annual` day-weighted by `month_day_weights()`, then the same regrid) is ",
+         "the model; the delivered Annual layer is regridded the same way and reported. `median_ratio` is ",
+         "ours / delivered over the cells both cover, `sum_ratio` the ratio of totals, `r_pearson` the correlation; the `*_plain` ",
+         "columns are the SENSITIVITY: the plain 12-month mean against the same delivered layer. `nat_maxrel_*` is the largest ",
+         "relative difference on the NATIVE grid between the delivered Annual and the plain mean of the months / the ",
+         "day-weighted mean (the delivered one is day-weighted: February counts 28/365).\n\n"))
 if (src_2023) print(knitr::kable(acmp |> select(-sp_id) |> mutate(across(where(is.double), \(v) signif(v, 4))), caption = "annual: ours vs delivered"))
 cat("\n\n")
 ```
