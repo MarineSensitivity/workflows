@@ -37,6 +37,12 @@ flowchart LR
 ```{r}
 #| label: setup
 
+# REDO_ZONE_TAXON=1: rebuild ONLY the per-zone species list (msens::build_zone_taxon) on an existing scored version
+# and leave zone_metric / cell_metric / the manifest untouched. v8's zone_taxon (cloned into v10, published) was
+# built against an earlier subregion geometry and never rebuilt: no Atlantic rows, a third of the Pacific ones
+# (found by the v11 control run, 2026-10-30). The share columns on zone_taxon are re-set by score_share_metrics.
+redo_zone_taxon_only <- nzchar(Sys.getenv("REDO_ZONE_TAXON"))
+
 librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, sf, quiet = T)
 source(here("libs/paths.R")); source(here("libs/vars.R"))
 manifest <- here("data/manifests/score_zone_metrics.json"); dir_create(path_dir(manifest))
@@ -68,6 +74,7 @@ log_info("scoring zone fields: {paste(zone_flds, collapse=', ')}")
 
 ```{r}
 #| label: zone_agg
+#| eval: !expr Sys.getenv("REDO_ZONE_TAXON") == ""
 
 for (k in comp_keys) {
   bs <- mseq_of(k)
@@ -97,6 +104,7 @@ log_info("zone components + pct_area done for {length(comp_keys)} metrics")
 
 ```{r}
 #| label: pa_score
+#| eval: !expr Sys.getenv("REDO_ZONE_TAXON") == ""
 
 sc <- mseq_new("score_extriskspcat_primprod_ecoregionrescaled_equalweights", "Equal-weight composite (PA)")
 seqs_sql <- paste(comp_seqs, collapse=",")
@@ -132,8 +140,10 @@ synthetic v7 **and** v8 fixtures, so this notebook and the tests cannot drift.
 ```{r}
 #| label: zone_taxon
 
-# the pa_score chunk closes `con`; reopen for this step
+# the pa_score chunk closes `con`; reopen for this step (under REDO_ZONE_TAXON it was never opened for metrics)
+if (exists("con") && inherits(con, "DBIConnection") && dbIsValid(con)) try(dbDisconnect(con, shutdown = TRUE), silent = TRUE)
 con <- dbConnect(duckdb(sdm_db))
+if (redo_zone_taxon_only) log_info("REDO_ZONE_TAXON: rebuilding zone_taxon only; zone_metric, cell_metric and the manifest are untouched")
 n_zt <- msens::build_zone_taxon(con)
 d_zt <- tbl(con, "zone_taxon") |>
   group_by(zone_fld) |>
@@ -148,6 +158,7 @@ d_zt
 
 ```{r}
 #| label: validate
+#| eval: !expr Sys.getenv("REDO_ZONE_TAXON") == ""
 
 v7_pa <- st_read(pa_gpkg, quiet=TRUE) |> st_drop_geometry() |>
   transmute(programarea_key, score_prev = round(score_extriskspcat_primprod_ecoregionrescaled_equalweights, 2))
