@@ -63,9 +63,13 @@ region_weight   <- .flag("REGION_WEIGHT")                          # merge_model
 fold_density    <- .flag("FOLD_DENSITY")                           # merge: density datasets replace suitability inside their domain (Q6)
 worms_source    <- match.arg(Sys.getenv("WORMS_SOURCE", "download"), c("download", "obisindicators"))  # ingest_worms (Q1)
 components_v11  <- .flag("COMPONENTS_V11")                         # data/components.csv labels: Flora / Productivity (Q5)
+# NC_ATL_SOURCE is consumed by ingest_sdm-nc.qmd ALONE (which Atlantic seabird models exist in dist/dataset=nc: the 2018 Winship set, the
+# control, or the 2023 MDAT v3 / BOEM 2023-060 set). Nothing downstream implements or asserts it: the merge, the scoring and the
+# attribution harness read whatever the ingest left, and a variant's flags record which source it was (snapshot_scores).
+nc_atl_source   <- match.arg(Sys.getenv("NC_ATL_SOURCE", "2018"), c("2018", "2023"))                  # ingest_sdm-nc: Atlantic bird source (Q6c)
 v11_flags <- list(VGPM_INTEGRATED = vgpm_integrated, TURTLE_SUIT = turtle_suit, TURTLE_RULE = turtle_rule,
                   OCC_RULE = occ_rule, REGION_WEIGHT = region_weight, FOLD_DENSITY = fold_density,
-                  WORMS_SOURCE = worms_source, COMPONENTS_V11 = components_v11)
+                  WORMS_SOURCE = worms_source, COMPONENTS_V11 = components_v11, NC_ATL_SOURCE = nc_atl_source)
 v11_flags_off <- identical(v11_flags, list(VGPM_INTEGRATED = FALSE, TURTLE_SUIT = "am", TURTLE_RULE = "turtle",
                                            OCC_RULE = FALSE, REGION_WEIGHT = FALSE, FOLD_DENSITY = FALSE,
-                                           WORMS_SOURCE = "download", COMPONENTS_V11 = FALSE))
+                                           WORMS_SOURCE = "download", COMPONENTS_V11 = FALSE, NC_ATL_SOURCE = "2018"))
