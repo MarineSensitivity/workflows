@@ -167,10 +167,18 @@ The `ud` transform weights each cell by its area (the population in a cell is de
 
 cell_dbs    <- c(sdm_db, glue("{dir_big}/{ver_prev}/sdm.duckdb"))
 if (nc_smoke) cell_dbs <- rev(cell_dbs)     # a smoke run reads ver_prev's: this version's sdm.duckdb may be open for writing by a pipeline run
-sdm_cell_db <- cell_dbs |> path_expand() |> keep(file_exists) |> first()
-stopifnot("no sdm.duckdb with a cell table (this version's or ver_prev's)" = !is.null(sdm_cell_db))
+cell_dbs    <- cell_dbs |> path_expand() |> keep(file_exists)
+stopifnot("no sdm.duckdb with a cell table (this version's or ver_prev's)" = length(cell_dbs) > 0)
+# the `cell` table is the grid's, identical in every release on it: when this version's database is locked by another process
+# (a pipeline stage writing to it) the next candidate (ver_prev's) is read instead
+con_sdm <- NULL
+for (sdm_cell_db in cell_dbs) {
+  con_sdm <- tryCatch(dbConnect(duckdb(sdm_cell_db, read_only = TRUE)),
+                      error = \(e) { log_warn("cell areas: {sdm_cell_db} is not readable ({conditionMessage(e)}); trying the next"); NULL })
+  if (!is.null(con_sdm)) break
+}
+stopifnot("no readable sdm.duckdb with a cell table" = !is.null(con_sdm))
 log_info("cell areas from {sdm_cell_db}")
-con_sdm <- dbConnect(duckdb(sdm_cell_db, read_only = TRUE))
 duckdb_tune(con_sdm, tmp_nc)
 ca <- dbGetQuery(con_sdm, "SELECT cell_id, area_km2 FROM cell")
 dbDisconnect(con_sdm, shutdown = TRUE)
