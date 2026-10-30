@@ -356,13 +356,15 @@ ref <- if (file_exists(manifest)) fromJSON(manifest) else NULL
 is_ref <- nzchar(Sys.getenv("BUILD_REFERENCE"))
 flags <- list(share_metrics = share_metrics, share_denom = share_denom, share_kappa = share_kappa, share_floor_strip = share_strip,
               cell_denoms = paste(cell_denoms, collapse = ","))
-same_flags <- !is.null(ref) && all(vapply(names(flags), \(k) isTRUE(all.equal(ref[[k]], flags[[k]])), TRUE))
+# the committed reference is the CONTROL's (every v11 method flag at its control value, == v10): a method run
+# (snapshot_scores records its variant) is never compared to it and never overwrites it
+same_flags <- !is.null(ref) && all(vapply(names(flags), \(k) isTRUE(all.equal(ref[[k]], flags[[k]])), TRUE)) && isTRUE(v11_flags_off)
 if (share_metrics) {
   d_ref <- tibble(surface = names(h_share), digest = unlist(h_share),
                   reference = vapply(names(h_share), \(k) ref[[glue("digest_{k}")]] %||% NA_character_, ""))
   knitr::kable(d_ref, caption = "share-row digests vs the committed reference")
   if (is_ref || is.null(ref) || !isTRUE(ref$share_metrics)) log_info("BUILD_REFERENCE / no reference yet: these digests BECOME the reference")
-  else if (!same_flags) log_info("flags differ from the committed reference's — a sensitivity render, reference not compared")
+  else if (!same_flags) log_info("flags differ from the committed reference's ({if (!isTRUE(v11_flags_off)) paste('v11 method run:', paste(v11_flags_on, collapse = ', ')) else 'a share-flag sensitivity render'}) — reference not compared")
   # zone_taxon_share: v8's zone_taxon (cloned into v10) was STALE for the subregion zone set -- no Atlantic (AT)
   # rows at all, 3,605 of 11,631 Pacific rows, 9,632 of 17,103 USA rows -- while its zone_cell and zone_metric
   # tables had every subregion. A version scored from scratch (v11, 2026-10-30) rebuilds zone_taxon in full, so
@@ -433,7 +435,8 @@ dbDisconnect(con, shutdown = TRUE)
 # the reference is the share run's: a control render writes the manifest only when none exists yet,
 # never over a share reference; a share run writes it under BUILD_REFERENCE, when no share reference
 # exists, or when its flags equal the reference's (a sensitivity render never moves it)
-write_mf <- if (share_metrics) (is_ref || is.null(ref) || !isTRUE(ref$share_metrics) || same_flags) else is.null(ref)
+write_mf <- if (share_metrics) ((is_ref || is.null(ref) || !isTRUE(ref$share_metrics) || same_flags) && isTRUE(v11_flags_off)) else is.null(ref)
+if (!write_mf) log_info("manifest not rewritten (the committed reference stays the control's); this run's digests: {paste(names(h_share), unlist(h_share), sep = '=', collapse = ' ')}")
 if (write_mf) msens::write_manifest(
   manifest, target = "score_share_metrics",
   content_hash = if (share_metrics) msens::hash_query(dbConnect(duckdb()), glue("SELECT '{paste(unlist(h_share), collapse = '')}' AS a")) else paste(unlist(after), collapse = ""),
