@@ -41,11 +41,20 @@ variant_extra() { case "$1" in
   no_occ_rule|no_region_weight) echo "REDO_MC_PARTS= REDO_MERGE=1" ;;
   no_turtle_rule)               echo "REDO_MC_PARTS= REDO_MERGE= REDO_MERGE_SPATIAL=1" ;;
   *) echo "" ;; esac; }
-VARIANTS="full2023 no_turtle_suit no_fold_density nc_atl_2018 no_occ_rule no_region_weight no_turtle_rule no_vgpm no_components"
+# ORDER MATTERS: a variant resumes on what the previous one left in derived/v11. The scoring-only and the
+# spatial-only variants must follow the candidate directly (they read ITS merged surfaces); the merge-rewriting
+# ones come next (each rewrites every surface); the two re-prep ones last; nc_atl_2018 needs ingest_sdm-nc
+# re-rendered with NC_ATL_SOURCE=2018 in between (`--all` does that render itself).
+VARIANTS="full2023 no_vgpm no_components no_turtle_rule no_occ_rule no_region_weight no_turtle_suit no_fold_density nc_atl_2018"
 if [ "${1:-}" = "--list" ]; then for v in $VARIANTS; do echo "$v  from $(variant_from "$v")  $(variant_extra "$v")  $(variant_flags "$v")"; done; exit 0; fi
-[ $# -gt 0 ] || { echo "usage: $0 <variant> [<variant> ...] | --list" >&2; exit 2; }
+[ $# -gt 0 ] || { echo "usage: $0 <variant> [<variant> ...] | --all | --list" >&2; exit 2; }
 mkdir -p _output/logs
+if [ "$1" = "--all" ]; then set -- $VARIANTS; fi
 for v in "$@"; do
+  if [ "$v" = nc_atl_2018 ]; then
+    echo "==> ingest_sdm-nc with NC_ATL_SOURCE=2018 for the $v variant ($(date +%H:%M))"
+    env NC_ATL_SOURCE=2018 REDO_INGEST=1 BUILD_THREADS=4 BUILD_MEMORY_GB=8 quarto render ingest_sdm-nc.qmd > _output/logs/ingest_sdm_nc.log 2>&1 || { echo "!! ingest_sdm-nc (2018) FAILED" >&2; exit 1; }
+  fi
   flags=$(variant_flags "$v"); from=$(variant_from "$v"); extra=$(variant_extra "$v")
   [ -n "$flags" ] || { echo "unknown variant: $v" >&2; exit 2; }
   src_want=$(echo "$flags" | grep -o "NC_ATL_SOURCE=[0-9]*" | cut -d= -f2)
