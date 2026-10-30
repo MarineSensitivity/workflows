@@ -70,6 +70,8 @@ nc_atl_source   <- match.arg(Sys.getenv("NC_ATL_SOURCE", "2018"), c("2018", "202
 v11_flags <- list(VGPM_INTEGRATED = vgpm_integrated, TURTLE_SUIT = turtle_suit, TURTLE_RULE = turtle_rule,
                   OCC_RULE = occ_rule, REGION_WEIGHT = region_weight, FOLD_DENSITY = fold_density,
                   WORMS_SOURCE = worms_source, COMPONENTS_V11 = components_v11, NC_ATL_SOURCE = nc_atl_source)
-v11_flags_off <- identical(v11_flags, list(VGPM_INTEGRATED = FALSE, TURTLE_SUIT = "am", TURTLE_RULE = "turtle",
-                                           OCC_RULE = FALSE, REGION_WEIGHT = FALSE, FOLD_DENSITY = FALSE,
-                                           WORMS_SOURCE = "download", COMPONENTS_V11 = FALSE, NC_ATL_SOURCE = "2018"))
+v11_flag_defaults <- list(VGPM_INTEGRATED = FALSE, TURTLE_SUIT = "am", TURTLE_RULE = "turtle",
+                          OCC_RULE = FALSE, REGION_WEIGHT = FALSE, FOLD_DENSITY = FALSE,
+                          WORMS_SOURCE = "download", COMPONENTS_V11 = FALSE, NC_ATL_SOURCE = "2018")
+v11_flags_off <- identical(v11_flags, v11_flag_defaults)                 # TRUE = the control run (== v10)
+v11_flags_on  <- names(v11_flags)[!mapply(identical, v11_flags, v11_flag_defaults[names(v11_flags)])]   # the flags a method run set
