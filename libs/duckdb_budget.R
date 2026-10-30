@@ -22,9 +22,20 @@ duckdb_budget <- function() {
   if (file.exists("/proc/meminfo")) {
     l     <- grep("^MemAvailable:", readLines("/proc/meminfo"), value = TRUE)
     avail <- as.numeric(gsub("\\D", "", l)) / 1024^2                  # kB -> GB
+  } else if (Sys.info()[["sysname"]] == "Darwin") {
+    # macOS has no MemAvailable: free + inactive + speculative pages (vm_stat) is the reclaimable estimate.
+    # Without this the budget fell back to 12 GB on a 48 GB machine, and a spill-heavy pass (the share
+    # family's floor-strip variant, 2026-10-30) ran I/O-bound for hours on the external volume.
+    vs <- tryCatch(system("vm_stat", intern = TRUE), error = function(e) character())
+    pg <- suppressWarnings(as.numeric(sub(".*page size of (\\d+) bytes.*", "\\1", vs[1])))
+    n  <- function(k) suppressWarnings(as.numeric(gsub("\\D", "", grep(k, vs, value = TRUE)[1])))
+    if (is.finite(pg)) avail <- sum(n("^Pages free"), n("^Pages inactive"), n("^Pages speculative"), na.rm = TRUE) * pg / 1024^3
   }
+  # the cap: 12 GB protects the 16 GB server (shared with production); a dedicated render machine
+  # (the 48 GB Mac mini) may take up to 24 GB -- the output is identical at any budget
+  cap <- if (Sys.info()[["sysname"]] == "Darwin") 24 else 12
   list(
-    gb      = if (!is.na(gb_env)) gb_env else if (!is.na(avail)) max(1.5, min(12, round(avail * 0.4, 1))) else 12,
+    gb      = if (!is.na(gb_env)) gb_env else if (!is.na(avail)) max(1.5, min(cap, round(avail * 0.4, 1))) else 12,
     threads = if (!is.na(th_env)) th_env else min(6L, parallel::detectCores()),
     avail   = avail)
 }
