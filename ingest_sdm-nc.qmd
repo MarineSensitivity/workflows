@@ -559,6 +559,34 @@ knitr::kable(bind_rows(chk_rows) |> mutate(across(starts_with("mean"), \(v) sign
 # per sp_id: regrid every (region × season) model, add the per-region annual (density_annual on the
 # DENSITIES), transform each model on its own cells (both recipes, for the comparison), write the
 # selected one with the regions unioned per season. resumable (skip existing parquet) unless REDO_INGEST.
+# SWITCHING THE ATLANTIC SOURCE on an existing dist/dataset=nc. The 2018 and 2023 Atlantic surfaces share files with the
+# Pacific ones for the 11 species both oceans model (one parquet per sp_id x interval, regions unioned), and a species whose
+# files exist is skipped below, so a dist written under the other source would be resumed INTO the new one. The marker records
+# which source the directory holds (none = the 2018 render that predates the switch); when it differs, every species with an
+# Atlantic model in EITHER source loses its files and is regridded, Pacific-only species and guilds are kept.
+atl_marker <- path(path_dir(mdl_csv), "nc_atl_source.txt")
+prev_src   <- if (file_exists(atl_marker)) str_trim(readLines(atl_marker, n = 1)) else "2018"
+dist_files <- dir_ls(dir_dist, glob = "*.parquet")
+atl_ids    <- character()
+if (length(dist_files) && prev_src != nc_atl_source) {
+  atl_codes_2018 <- read_csv(here("data/nc_models.csv"), col_types = cols(.default = "c")) |> filter(region == "Atlantic") |> pull(sp_code) |> unique()
+  atl_ids <- union(cw_file$sp_id[match(atl_codes_2018, cw_file$sp_code)], m$sp_id[m$region == "Atlantic"])
+  if (file_exists(mdl_csv)) atl_ids <- union(atl_ids, read_csv(mdl_csv, col_types = cols(.default = "c")) |>
+                                               filter(str_detect(regions, "Atlantic")) |> pull(sp_id))
+  atl_ids <- na.omit(atl_ids)
+  safes   <- gsub("[^A-Za-z0-9._-]", "_", atl_ids)
+  # a file nc_{safe}.parquet or nc_{safe}_{interval}.parquet (the interval has no underscore) belongs to species `safe`
+  is_of   <- \(stem, safe) stem == paste0("nc_", safe) ||
+    (startsWith(stem, paste0("nc_", safe, "_")) && !grepl("_", substring(stem, nchar(safe) + 5), fixed = TRUE))
+  stale   <- dist_files[map_lgl(path_ext_remove(path_file(dist_files)), \(st) any(map_lgl(safes, \(sf) is_of(st, sf))))]
+  log_info("Atlantic source {prev_src} -> {nc_atl_source}: removing {length(stale)} of {length(dist_files)} files of the {length(atl_ids)} species with an Atlantic model in either source")
+  file_delete(stale)
+  left <- dir_ls(dir_dist, glob = "*.parquet")
+  stopifnot("a file of an Atlantic species survived the source switch" =
+              !any(map_lgl(path_ext_remove(path_file(left)), \(st) any(map_lgl(safes, \(sf) is_of(st, sf))))))
+}
+writeLines(nc_atl_source, atl_marker)
+
 sp_ids   <- sort(unique(m$sp_id))
 if (length(nc_test_sp)) {                                  # smoke test: named codes (NC_TEST_SP) or the first n sp_id (NC_TEST_N)
   stopifnot("NC_TEST_SP names a code that is not an ingested model" = all(nc_test_sp %in% m$sp_code))
@@ -659,6 +687,10 @@ surf <- dbGetQuery(con, glue("
   FROM read_parquet('{dir_dist}/*.parquet') GROUP BY mdl_key"))
 dbDisconnect(con, shutdown = TRUE)
 
+# every surface in the directory is one of THIS run's models: nothing left over from the other Atlantic source
+exp_keys <- c(glue("{ds_key}|{unique(m$sp_id)}"), m |> distinct(sp_id, season) |> transmute(k = glue("{ds_key}|{sp_id}|{season}")) |> pull(k))
+stopifnot("dist/dataset=nc holds surfaces that are not this run's models (a stale Atlantic source?)" = length(setdiff(surf$mdl_key, exp_keys)) == 0)
+
 # dens_cap per sp_id: this run's, else the previous registry's (resume)
 caps <- bind_rows(cap_rows)
 prev_nc <- if (file_exists(mdl_csv)) read_csv(mdl_csv) else tibble()
@@ -692,11 +724,13 @@ model_nc <- meta |> rowwise() |>
   left_join(caps, by = "sp_id") |>
   inner_join(surf, by = "mdl_key") |>
   (\(d) if (src_2023) left_join(d, src_int, by = c("sp_id", "interval")) else d)() |>
+  (\(d) if (src_2023) mutate(d, atl_source = if_else(str_detect(regions, "Atlantic") & (interval == "annual" | str_detect(interval, "^[0-9]{2}$")),
+                                                    "2023", NA_character_)) else d)() |>
   left_join(m |> group_by(sp_id, interval = season) |>
               summarise(cog_url = if (all(is.na(cog_url))) NA_character_ else paste(na.omit(cog_url), collapse = "|"), .groups = "drop"),
             by = c("sp_id", "interval")) |>
   select(mdl_key, interval, sp_id, sp_code, common_name, scientific_name, nc_scientific_name, is_guild, sisid, worms_id,
-         match_by, regions, response_type, transform, dens_cap, val_min, val_max, n_cells, cog_url, any_of(c("source", "accession", "citation"))) |>
+         match_by, regions, response_type, transform, dens_cap, val_min, val_max, n_cells, cog_url, any_of(c("atl_source", "source", "accession", "citation"))) |>
   arrange(sp_id, interval)
 stopifnot("val outside [1,100]" = all(model_nc$val_min >= 1 & model_nc$val_max <= 100),
           "a model has no dens_cap" = !anyNA(model_nc$dens_cap),
