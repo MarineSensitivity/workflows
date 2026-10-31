@@ -35,6 +35,13 @@ hexagons are clipped, the Shelf ones "Unclipped") and the densities are **summed
   cells strictly denser than this one, so the densest cell is 100 and `val >= 100 - p` is exactly the p % core.
   Cells with `val < 1` are dropped (the merge's floor). The old recipe (`GM_TRANSFORM=cap`: linear to the species'
   pooled p99.5 of positive density, now applied to the *regridded* densities) stays available and is compared below.
+- **`GM_TRANSFORM=qmap` (v11 evaluation, default stays `ud`).** The `ud` percentile puts the densest survey cell at 100 whatever
+  AquaMaps says elsewhere. `qmap` instead quantile-maps each model's densities onto the species' OWN AquaMaps `val` over that
+  model's cells (`density_to_suit(d, "qmap", ref = ..., digits = 2)`): the survey keeps its spatial pattern and takes AquaMaps'
+  scale. The helper is `libs/density_ref.R` (shared with `nc` and `cce`): the AquaMaps keys come from `ver_prev`'s `taxon_model`
+  (WoRMS id), the surfaces from `dist/dataset=am`. A species with no AquaMaps model, or fewer than 50 reference cells in the
+  domain, keeps `ud` and the model row says `transform = ud(fallback: no am ref)`; `n_ref_cells`, `ref_p50`, `ref_p95` and
+  `ref_am_keys` ride beside it in `model_gm.csv`, and the `qmap_*` quantiles beside `ud_*` / `cap_*` in `gm_transform_compare.csv`.
 - **Annual** = the DAY-WEIGHTED mean of the twelve months, `msens::density_annual(n_intervals = 12, interval = "interval",
   weights = msens::month_day_weights())` (msens >= 0.65.1; February counts 28/365) on the DENSITIES — a month the model
   does not cover counts as zero over its weight — and THEN the same transform. (v11 first used the plain mean of the
@@ -59,16 +66,18 @@ library(msens)                      # the installed msens (density_to_suit / den
 source(here("libs/paths.R"))
 source(here("libs/vars.R"))
 source(here("libs/duckdb_budget.R"))
+source(here("libs/density_ref.R"))   # GM_TRANSFORM=qmap: the species' AquaMaps reference (shared by the three density ingests)
 sf_use_s2(FALSE)
 options(readr.show_col_types = FALSE)
 
 ds_key    <- "gm"
 dir_atlas <- glue("{dir_big_v}/marine-atlas")
-dir_dist  <- glue("{dir_atlas}/dist/dataset={ds_key}"); dir_create(dir_dist)
+dir_dist  <- glue("{dir_atlas}/dist/dataset={ds_key}")
 mdl_csv   <- glue("{dir_atlas}/dist/model_{ds_key}.csv")
 manifest  <- here("data/manifests/ingest_sdm_gm.json"); dir_create(path_dir(manifest))
 cmp_csv   <- here("data/gm_transform_compare.csv")
 cog_base  <- "https://file.marinesensitivity.org/cog/sdm/raw"
+tmp_gm    <- glue("{dir_big_v}/_tmp/gm")
 p_cap     <- 0.995                     # the density percentile the OLD recipe used as the 100 point
 NA_VAL    <- -9999                     # the shapefiles' no-data
 shp_dir   <- path.expand(gm_shp_dir)
@@ -77,9 +86,39 @@ stopifnot("gm inputs not found: hydrate raw/sdm/gm (scripts/pull_from_laptop.sh 
             dir_exists(shp_dir) && file_exists(taxa_xls), file_exists(cellid_tif))
 
 # flags (this notebook's own; default = the v11 recipe) ----
-gm_transform <- tolower(Sys.getenv("GM_TRANSFORM", "ud"))         # ud (v11) | cap (the v8 recipe, for comparison)
-stopifnot("GM_TRANSFORM must be 'ud' or 'cap'" = gm_transform %in% c("ud", "cap"))
-log_info("gm: transform = {gm_transform}; inputs = {shp_dir}; redo = {redo_ingest}")
+gm_transform <- tolower(Sys.getenv("GM_TRANSFORM", "ud"))         # ud (v11) | cap (the v8 recipe, for comparison) | qmap (densities quantile-mapped onto the species' AquaMaps val in the domain)
+stopifnot("GM_TRANSFORM must be 'ud', 'cap' or 'qmap'" = gm_transform %in% c("ud", "cap", "qmap"))
+
+# smoke test: GM_SMOKE_DIR redirects EVERYTHING this notebook writes (dataset partition, model_gm.csv, comparison table, tmp)
+# to a scratch directory and skips the manifest; GM_TEST_SP (AphiaIDs, e.g. 137119,137205) restricts the regridding to those
+# species. It never touches the version's dist/ (the guard refuses a path under dir_big).
+gm_smoke_dir <- Sys.getenv("GM_SMOKE_DIR", "")
+gm_test_sp   <- str_trim(str_split(Sys.getenv("GM_TEST_SP", ""), ",")[[1]]); gm_test_sp <- gm_test_sp[nzchar(gm_test_sp)]
+gm_smoke     <- nzchar(gm_smoke_dir)
+if (length(gm_test_sp)) stopifnot("GM_TEST_SP needs GM_SMOKE_DIR: a partial ingest must not land in dist/" = gm_smoke)
+if (gm_smoke) {
+  gm_smoke_dir <- path_abs(path_expand(gm_smoke_dir))
+  stopifnot("GM_SMOKE_DIR is inside the big-data root" = !str_starts(gm_smoke_dir, as.character(path_abs(path_expand(dir_big)))))
+  dir_dist <- glue("{gm_smoke_dir}/dist/dataset={ds_key}")
+  mdl_csv  <- glue("{gm_smoke_dir}/dist/model_{ds_key}.csv")
+  cmp_csv  <- glue("{gm_smoke_dir}/gm_transform_compare.csv")
+  tmp_gm   <- glue("{gm_smoke_dir}/_tmp")
+  for (d in c("dist", "_tmp")) if (dir_exists(path(gm_smoke_dir, d))) dir_delete(path(gm_smoke_dir, d))   # a smoke run is always from scratch
+  if (file_exists(cmp_csv)) file_delete(cmp_csv)
+  dir_create(path_dir(mdl_csv))
+}
+dir_create(dir_dist)
+log_info("gm: transform = {gm_transform}; inputs = {shp_dir}; redo = {redo_ingest}; smoke = {gm_smoke}")
+
+# GM_TRANSFORM=qmap: the AquaMaps reference. am_idx = ver_prev's crosswalk of the `am|` models (taxon_model), am_dir = the
+# AquaMaps dataset of THIS version's dist/ (read-only). Neither is touched under ud / cap.
+am_dir <- am_idx <- NULL
+if (gm_transform == "qmap") {
+  am_dir <- path_expand(glue("{dir_atlas}/dist/dataset=am"))
+  stopifnot("GM_TRANSFORM=qmap needs the AquaMaps dataset (dist/dataset=am)" = dir_exists(am_dir))
+  am_idx <- density_am_index(dir_big, ver_prev)
+  log_info("qmap reference: {nrow(am_idx)} {ver_prev}-crosswalked am models; parquets in {am_dir}")
+}
 
 if (redo_ingest && dir_exists(dir_dist)) { dir_delete(dir_dist); dir_create(dir_dist) }
 
@@ -105,7 +144,9 @@ The `ud` transform weights each cell by its area (the population in a cell is de
 ```{r}
 #| label: cell-area
 
-cell_dbs    <- c(sdm_db, glue("{dir_big}/{ver_prev}/sdm.duckdb")) |> path_expand() |> keep(file_exists)
+cell_dbs    <- c(sdm_db, glue("{dir_big}/{ver_prev}/sdm.duckdb"))
+if (gm_smoke) cell_dbs <- rev(cell_dbs)     # a smoke run reads ver_prev's: this version's sdm.duckdb may be open for writing by a pipeline run
+cell_dbs    <- cell_dbs |> path_expand() |> keep(file_exists)
 stopifnot("no sdm.duckdb with a cell table (this version's or ver_prev's)" = length(cell_dbs) > 0)
 # the `cell` table is the grid's, identical in every release on it: when this version's database is locked by another process
 # (a pipeline stage writing to it) the next candidate (ver_prev's) is read instead
@@ -117,7 +158,7 @@ for (sdm_cell_db in cell_dbs) {
 }
 stopifnot("no readable sdm.duckdb with a cell table" = !is.null(con_sdm))
 log_info("cell areas from {sdm_cell_db}")
-duckdb_tune(con_sdm, glue("{dir_big_v}/_tmp/gm"))
+duckdb_tune(con_sdm, tmp_gm)
 ca <- dbGetQuery(con_sdm, "SELECT cell_id, area_km2 FROM cell")
 dbDisconnect(con_sdm, shutdown = TRUE)
 area_by_id <- rep(NA_real_, 7200 * 3600); area_by_id[ca$cell_id] <- ca$area_km2
@@ -316,7 +357,11 @@ rm(kg, ann_kg, w_kg, mean_modelled, present_only, j, mo_kg, frac_kg)
 # each model on its own cells (both recipes, for the comparison), write the selected one.
 # resumable (skip existing parquet) unless REDO_INGEST.
 sp_ids   <- sort(unique(m$sp_id))
-cmp_rows <- list(); cap_rows <- list()
+if (length(gm_test_sp)) {                                  # smoke test: named AphiaIDs (GM_TEST_SP)
+  stopifnot("GM_TEST_SP names an AphiaID that is not an ingested model" = all(paste0("WORMS:", gm_test_sp) %in% sp_ids))
+  sp_ids <- sort(paste0("WORMS:", gm_test_sp))
+}
+cmp_rows <- list(); cap_rows <- list(); qm_rows <- list()
 for (sid in sp_ids) {
   safe <- gsub("[^A-Za-z0-9._-]", "_", sid)
   if (file_exists(pq_path(safe, NA)) && !redo_ingest) next
@@ -330,7 +375,23 @@ for (sid in sp_ids) {
   res <- bind_rows(dd, ann) |> group_by(interval) |>
     group_modify(\(x, k) tibble(cell_id = x$cell_id, dens = x$dens,
                                 v_ud = to_val(x$dens, x$cell_id, "ud"), v_cap = to_val(x$dens, x$cell_id, "cap", cap))) |>
-    ungroup() |> mutate(val = if (gm_transform == "ud") v_ud else v_cap)
+    ungroup() |> mutate(val = if (gm_transform == "cap") v_cap else v_ud)
+
+  # qmap: each model (month | annual) quantile-mapped onto the species' AquaMaps val over THAT model's cells; a species with
+  # no AquaMaps model (or < 50 reference cells in the domain) keeps its ud percentile, recorded as a fallback
+  qg <- NULL
+  if (gm_transform == "qmap") {
+    sp_m    <- m |> filter(sp_id == sid)
+    am_keys <- if (any(sp_m$is_guild)) character() else density_am_keys(am_idx, worms = unique(sp_m$worms_id))
+    qg <- density_qmap_groups(res, "interval", density_am_cells(am_keys, am_dir, cell_ids = res$cell_id), cell_area)
+    res$v_qmap <- qg$val; res$val <- qg$val
+    qm_rows[[sid]] <- qg$stats |> transmute(sp_id = sid, interval, transform, n_ref_cells, ref_p50, ref_p95,
+                                            ref_am_keys = paste(am_keys, collapse = "|"))
+    if (all(qg$stats$transform == density_ref_fallback)) {
+      if (any(sp_m$is_guild)) log_info("qmap: {sid} is a guild: no AquaMaps reference, ud")
+      else log_warn("qmap: {sid} ({sp_m$common_name[1]}) has no usable AquaMaps reference ({length(am_keys)} am model(s), {max(qg$stats$n_ref_cells)} cells in the domain): ud")
+    }
+  }
 
   # per-model comparison of the two recipes (cells written = val >= 1)
   q <- \(v) if (length(v)) quantile(v, c(.1, .5, .9), names = FALSE) else rep(NA_real_, 3)
@@ -340,6 +401,12 @@ for (sid in sp_ids) {
               cap_q10 = q(v_cap[v_cap >= 1])[1], cap_q50 = q(v_cap[v_cap >= 1])[2], cap_q90 = q(v_cap[v_cap >= 1])[3],
               .groups = "drop") |>
     mutate(sp_id = sid, common_name = m$common_name[m$sp_id == sid][1], .before = 1)
+  if (!is.null(qg))                                     # qmap: its own quantiles + the reference, beside ud / cap
+    cmp_rows[[sid]] <- cmp_rows[[sid]] |>
+      left_join(qg$stats |> transmute(interval, transform, n_ref_cells, ref_p50, ref_p95,
+                                      qmap_q10 = val_q10, qmap_q50 = val_q50, qmap_q90 = val_q90) |>
+                  left_join(res |> group_by(interval) |> summarise(n_qmap = sum(v_qmap >= 1), .groups = "drop"), by = "interval"),
+                by = "interval")
   cap_rows[[sid]] <- tibble(sp_id = sid, dens_cap = cap)
 
   for (iv in unique(res$interval)) {
@@ -358,7 +425,7 @@ log_info("rasterized {length(cmp_rows)} sp_id ({gm_transform})")
 
 # stats of every written surface, read back from the parquet (so a resumed run is complete too)
 con <- dbConnect(duckdb())
-duckdb_tune(con, glue("{dir_big_v}/_tmp/gm"))
+duckdb_tune(con, tmp_gm)
 surf <- dbGetQuery(con, glue("
   SELECT mdl_key, count(*) AS n_cells, round(min(val), 2) AS val_min, round(max(val), 2) AS val_max
   FROM read_parquet('{dir_dist}/*.parquet') GROUP BY mdl_key"))
@@ -385,14 +452,28 @@ model_gm <- surf |>
   select(mdl_key, interval, sp_id, common_name, scientific_name, rank, is_guild, worms_id, populations,
          response_type, transform, dens_cap, val_min, val_max, n_cells, taxa_shp) |>
   arrange(sp_id, interval)
+# qmap: per model the transform actually used ("qmap", or the ud fallback) + the reference's size and quantiles + the AquaMaps keys;
+# this run's, else the previous registry's (resume)
+if (gm_transform == "qmap") {
+  qm_cols <- c("sp_id", "interval", "transform", "n_ref_cells", "ref_p50", "ref_p95", "ref_am_keys")
+  qm <- bind_rows(qm_rows)
+  if ("n_ref_cells" %in% names(prev_gm))
+    qm <- bind_rows(qm, prev_gm |> mutate(sp_id = as.character(sp_id), interval = as.character(interval), ref_am_keys = as.character(ref_am_keys)) |>
+                          filter(!sp_id %in% qm$sp_id) |> select(all_of(qm_cols)))
+  model_gm <- model_gm |> select(-transform) |> left_join(qm |> select(all_of(qm_cols)), by = c("sp_id", "interval")) |>
+    relocate(transform, .after = response_type)
+  stopifnot("a qmap model row has no transform record" = !anyNA(model_gm$transform))
+}
 stopifnot("val outside [1,100]" = all(model_gm$val_min >= 1 & model_gm$val_max <= 100),
           "a model has no dens_cap" = !anyNA(model_gm$dens_cap),
           "a surface has no species row" = !anyNA(model_gm$worms_id),
-          "every guild must be ingested" = setequal(model_gm$sp_id[model_gm$is_guild], unique(m$sp_id[m$is_guild])),
-          "17 annual surfaces expected" = sum(model_gm$interval == "annual") == 17,
+          "every guild must be ingested" = gm_smoke || setequal(model_gm$sp_id[model_gm$is_guild], unique(m$sp_id[m$is_guild])),
+          "17 annual surfaces expected" = gm_smoke || sum(model_gm$interval == "annual") == 17,
           "every species has exactly one annual surface" = all(table(model_gm$sp_id, model_gm$interval == "annual")[, "TRUE"] == 1))
 if (gm_transform == "ud")
   stopifnot("a ud model's densest cell is not 100" = all(model_gm$val_max == 100))
+if (gm_transform == "qmap")                               # a fallen-back model is ud: its densest cell is 100
+  stopifnot("a ud-fallback model's densest cell is not 100" = all(model_gm$val_max[model_gm$transform == density_ref_fallback] == 100))
 write_csv(model_gm, mdl_csv)
 log_info("model_gm.csv: {nrow(model_gm)} mdl_keys ({sum(model_gm$interval=='annual')} annual, {n_distinct(model_gm$sp_id)} sp_id, {n_distinct(model_gm$sp_id[model_gm$is_guild])} guilds)")
 knitr::kable(model_gm |> count(interval, name = "n"))
@@ -421,6 +502,12 @@ print(knitr::kable(
     summarise(models = n(), across(c(n_cells, n_ud, n_cap, ud_q10, ud_q50, ud_q90, cap_q10, cap_q50, cap_q90), \(v) round(median(v, na.rm = TRUE), 1)),
               .groups = "drop"),
   caption = "median over models, by kind"))
+if (gm_transform == "qmap") {
+  cat("\n\n**qmap reference.** `n_ref_cells` = the species' AquaMaps cells inside the model's domain; a species with no AquaMaps ",
+      "model (the four guilds, Rice's whale), or fewer than 50 such cells, keeps its `ud` percentile (`transform = ud(fallback: no am ref)`).\n\n")
+  print(knitr::kable(model_gm |> filter(interval == "annual") |> count(transform, name = "n_species_annual"),
+                     caption = "annual models by the transform actually used"))
+}
 cat("\n\n<details><summary>every model, both recipes</summary>\n\n")
 print(knitr::kable(cmp |> mutate(across(where(is.double), \(v) round(v, 1)))))
 cat("\n\n</details>\n\n")
@@ -436,6 +523,7 @@ model, which includes Cuvier's beaked whale.
 #| label: rounding-fault
 
 dir_prev <- path.expand(glue("{dir_big}/{ver_prev}/marine-atlas/dist/dataset={ds_key}"))
+if (!gm_smoke) {                                           # a smoke run holds a few species, not these two
 con <- dbConnect(duckdb())
 qs  <- \(dir, tag) dbGetQuery(con, glue("
   SELECT '{tag}' AS run, mdl_key, count(*) AS n_cells, round(min(val), 2) AS min, round(quantile_cont(val, 0.1), 2) AS q10,
@@ -445,6 +533,7 @@ qs  <- \(dir, tag) dbGetQuery(con, glue("
 fault <- bind_rows(if (dir_exists(dir_prev)) qs(dir_prev, ver_prev), qs(dir_dist, ver)) |> arrange(mdl_key, desc(run))
 dbDisconnect(con, shutdown = TRUE)
 knitr::kable(fault, caption = glue("annual surfaces: {ver_prev} (cap recipe on rounded densities) vs {ver} ({gm_transform})"))
+}
 ```
 
 ## Manifest
@@ -454,6 +543,9 @@ knitr::kable(fault, caption = glue("annual surfaces: {ver_prev} (cap recipe on r
 
 # content-addressed, deterministic manifest (Phase A) — no wall-clock, so an identical re-ingest
 # produces byte-identical bytes and does NOT invalidate downstream targets.
+if (gm_smoke) {
+  log_info("smoke test: manifest not written; {nrow(model_gm)} models in {dir_dist}")
+} else {
 h    <- msens::hash_parquet(glue("{dir_dist}/*.parquet"))
 smry <- arrow::open_dataset(dir_dist) |>
   summarise(n_rows = n(), n_mdl = n_distinct(mdl_key),
@@ -467,6 +559,7 @@ msens::write_manifest(
     n_guild = n_distinct(model_gm$sp_id[model_gm$is_guild]), transform = gm_transform, p_cap = p_cap,
     note = "monthly + annual density -> population percentile [1,100]; annual = day-weighted mean over 12 months (uncovered = 0 over its weight) then transformed; Oceanic+Shelf summed per cell; guilds ingested, excluded from the merge; NOT yet folded into merge/scoring unless FOLD_DENSITY"),
   force = msens::force_target("ingest_sdm_gm"))
+}
 ```
 
 ## Compare with AquaMaps
