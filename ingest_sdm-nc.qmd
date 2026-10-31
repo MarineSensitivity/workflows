@@ -38,6 +38,15 @@ by the **population-percentile** transform (`msens::density_to_suit(method = "ud
   scale-free, which is why the Atlantic 2018 index and the Pacific densities are treated alike.
   The old recipe (`NC_TRANSFORM=cap`: linear to the species' pooled p99.5 of positive density, which left
   most cells near 0) stays available and is compared with it below.
+- **`NC_TRANSFORM=qmap` (v11 evaluation, default stays `ud`).** The `ud` percentile puts the densest survey cell at 100 whatever
+  AquaMaps says elsewhere, which inflates a surveyed species' global share inside the survey domain. `qmap` instead
+  quantile-maps each model's densities onto the species' OWN AquaMaps `val` over that model's cells
+  (`density_to_suit(d, "qmap", ref = ..., digits = 2)`): the survey keeps its spatial pattern and takes AquaMaps' scale. The
+  helper is `libs/density_ref.R` (shared with `gm` and `cce`): the AquaMaps keys come from `ver_prev`'s `taxon_model`
+  (BOTW sisid, else WoRMS id), the surfaces from `dist/dataset=am`. A species with no AquaMaps model, or fewer than 50 reference
+  cells in the domain, keeps `ud` and the model row says `transform = ud(fallback: no am ref)`; `n_ref_cells`, `ref_p50`,
+  `ref_p95` and `ref_am_keys` ride beside it in `model_nc.csv`, and the `qmap_*` quantiles beside `ud_*` / `cap_*` in
+  `nc_transform_compare.csv`. (None of the 72 NCCOS species has an AquaMaps model, so for `nc` every model falls back.)
 - **Annual** = `msens::density_annual(n_intervals = 4)` on the DENSITIES — a season NCCOS did not
   model counts as zero — and THEN the same transform. The v8 ingest averaged the transformed values
   over the seasons a cell was *present* in, biasing the annual upward for the sparsest species.
@@ -96,6 +105,7 @@ library(msens)                      # the installed msens (density_to_suit / den
 source(here("libs/paths.R"))
 source(here("libs/vars.R"))
 source(here("libs/duckdb_budget.R"))
+source(here("libs/density_ref.R"))   # NC_TRANSFORM=qmap: the species' AquaMaps reference (shared by the three density ingests)
 options(readr.show_col_types = FALSE)
 `%||%` <- function(a, b) if (is.null(a) || length(a) == 0 || all(is.na(a))) b else a
 
@@ -114,9 +124,9 @@ p_cap    <- 0.995                      # the density percentile the OLD recipe u
 stopifnot(file_exists(cellid_tif))
 
 # flags (this notebook's own; default = the v11 recipe) ----
-nc_transform  <- tolower(Sys.getenv("NC_TRANSFORM", "ud"))        # ud (v11) | cap (the v8 recipe, for comparison)
+nc_transform  <- tolower(Sys.getenv("NC_TRANSFORM", "ud"))        # ud (v11) | cap (the v8 recipe, for comparison) | qmap (survey densities quantile-mapped onto the species' AquaMaps val in the domain)
 # nc_atl_source (libs/vars.R, a v11 method flag): Atlantic source, 2018 (Winship 2018, control) | 2023 (MDAT v3, BOEM 2023-060)
-stopifnot("NC_TRANSFORM must be 'ud' or 'cap'" = nc_transform %in% c("ud", "cap"),
+stopifnot("NC_TRANSFORM must be 'ud', 'cap' or 'qmap'" = nc_transform %in% c("ud", "cap", "qmap"),
           "NC_ATL_SOURCE must be '2018' or '2023'" = nc_atl_source %in% c("2018", "2023"))
 src_2023 <- nc_atl_source == "2023"
 
@@ -142,6 +152,16 @@ if (nzchar(nc_smoke_dir)) {
 } else dir_create(path_dir(manifest))
 dir_create(dir_dist); dir_create(tmp_nc)
 log_info("nc: transform = {nc_transform}; Atlantic source = {nc_atl_source}; redo = {redo_ingest}; smoke = {nc_smoke}")
+
+# NC_TRANSFORM=qmap: the AquaMaps reference. am_idx = ver_prev's crosswalk of the `am|` models (taxon_model), am_dir = the
+# AquaMaps dataset of THIS version's dist/ (read-only). Neither is touched under ud / cap.
+am_dir <- am_idx <- NULL
+if (nc_transform == "qmap") {
+  am_dir <- path_expand(glue("{dir_atlas}/dist/dataset=am"))
+  stopifnot("NC_TRANSFORM=qmap needs the AquaMaps dataset (dist/dataset=am)" = dir_exists(am_dir))
+  am_idx <- density_am_index(dir_big, ver_prev)
+  log_info("qmap reference: {nrow(am_idx)} {ver_prev}-crosswalked am models ({n_distinct(am_idx$authority)} authorities); parquets in {am_dir}")
+}
 
 if (redo_ingest && dir_exists(dir_dist)) { dir_delete(dir_dist); dir_create(dir_dist) }
 
@@ -600,7 +620,7 @@ if (length(nc_test_sp)) {                                  # smoke test: named c
   stopifnot("NC_TEST_SP names a code that is not an ingested model" = all(nc_test_sp %in% m$sp_code))
   sp_ids <- sort(unique(m$sp_id[m$sp_code %in% nc_test_sp]))
 } else if (nc_test_n > 0) sp_ids <- head(sp_ids, nc_test_n)
-cmp_rows <- list(); cap_rows <- list(); acmp_rows <- list()
+cmp_rows <- list(); cap_rows <- list(); acmp_rows <- list(); qm_rows <- list()
 
 # 2023: our annual (the day-weighted density_annual over the 12 months) against the package's delivered Annual layer, per
 # species, plus the plain 12-month mean as a sensitivity (`*_plain`). On the 0.05 degree cells all went through the same
@@ -651,7 +671,27 @@ for (sid in sp_ids) {
   res <- bind_rows(dd, ann) |> group_by(region, interval) |>
     group_modify(\(x, k) tibble(cell_id = x$cell_id, dens = x$dens,
                                 v_ud = to_val(x$dens, x$cell_id, "ud"), v_cap = to_val(x$dens, x$cell_id, "cap", cap))) |>
-    ungroup() |> mutate(val = if (nc_transform == "ud") v_ud else v_cap)
+    ungroup() |> mutate(val = if (nc_transform == "cap") v_cap else v_ud)
+
+  # qmap: each model (region x interval) quantile-mapped onto the species' AquaMaps val over THAT model's cells; a species
+  # with no AquaMaps model (or < 50 reference cells in the domain) keeps its ud percentile, recorded as a fallback
+  qg <- NULL
+  if (nc_transform == "qmap") {
+    sp_m <- m |> filter(sp_id == sid)
+    am_keys <- if (any(sp_m$is_guild)) character() else
+      density_am_keys(am_idx, worms = unique(sp_m$worms_id), botw = unique(sp_m$sisid))
+    qg <- density_qmap_groups(res, c("region", "interval"), density_am_cells(am_keys, am_dir, cell_ids = res$cell_id), cell_area)
+    res$v_qmap <- qg$val; res$val <- qg$val
+    qm_rows[[sid]] <- map_dfr(unique(res$interval), \(iv) {
+      s <- which(qg$stats$interval == iv)
+      bind_cols(tibble(sp_id = sid, interval = iv), density_qmap_pool(qg$stats[s, ], qg$refs[s]),
+                tibble(ref_am_keys = paste(am_keys, collapse = "|")))
+    })
+    if (all(qm_rows[[sid]]$transform == density_ref_fallback)) {
+      if (any(sp_m$is_guild)) log_info("qmap: {sid} is a guild: no AquaMaps reference, ud")
+      else log_warn("qmap: {sid} ({sp_m$sp_code[1]}, {sp_m$common_name[1]}) has no usable AquaMaps reference ({length(am_keys)} am model(s), {max(qg$stats$n_ref_cells)} cells in the domain): ud")
+    }
+  }
 
   # per-model comparison of the two recipes (cells written = val >= 1)
   q <- \(v) quantile(v, c(.1, .5, .9), names = FALSE)
@@ -661,6 +701,12 @@ for (sid in sp_ids) {
               cap_q10 = q(v_cap[v_cap >= 1])[1], cap_q50 = q(v_cap[v_cap >= 1])[2], cap_q90 = q(v_cap[v_cap >= 1])[3],
               .groups = "drop") |>
     mutate(sp_id = sid, sp_code = mi$sp_code[1], .before = 1)
+  if (!is.null(qg))                                     # qmap: its own quantiles + the reference, beside ud / cap
+    cmp_rows[[sid]] <- cmp_rows[[sid]] |>
+      left_join(qg$stats |> transmute(region, interval, transform, n_ref_cells, ref_p50, ref_p95,
+                                      qmap_q10 = val_q10, qmap_q50 = val_q50, qmap_q90 = val_q90) |>
+                  left_join(res |> group_by(region, interval) |> summarise(n_qmap = sum(v_qmap >= 1), .groups = "drop"),
+                            by = c("region", "interval")), by = c("region", "interval"))
   cap_rows[[sid]] <- tibble(sp_id = sid, dens_cap = cap)
 
   # one surface per interval, regions unioned (disjoint; max where they touch)
@@ -740,6 +786,17 @@ model_nc <- meta |> rowwise() |>
   select(mdl_key, interval, sp_id, sp_code, common_name, scientific_name, nc_scientific_name, is_guild, sisid, worms_id,
          match_by, regions, response_type, transform, dens_cap, val_min, val_max, n_cells, cog_url, any_of(c("atl_source", "source", "accession", "citation"))) |>
   arrange(sp_id, interval)
+# qmap: per model the transform actually used ("qmap", or the ud fallback) + the reference's size and quantiles + the AquaMaps keys;
+# this run's, else the previous registry's (resume)
+if (nc_transform == "qmap") {
+  qm_cols <- c("sp_id", "interval", "transform", "n_ref_cells", "ref_p50", "ref_p95", "ref_am_keys")
+  qm <- bind_rows(qm_rows)
+  if ("n_ref_cells" %in% names(prev_nc))
+    qm <- bind_rows(qm, prev_nc |> filter(!sp_id %in% qm$sp_id) |> mutate(ref_am_keys = as.character(ref_am_keys)) |> select(all_of(qm_cols)))
+  model_nc <- model_nc |> select(-transform) |> left_join(qm |> select(all_of(qm_cols)), by = c("sp_id", "interval")) |>
+    relocate(transform, .after = response_type)
+  stopifnot("a qmap model row has no transform record" = !anyNA(model_nc$transform))
+}
 stopifnot("val outside [1,100]" = all(model_nc$val_min >= 1 & model_nc$val_max <= 100),
           "a model has no dens_cap" = !anyNA(model_nc$dens_cap),
           "every guild code must be ingested" = nc_smoke || setequal(model_nc$sp_code[model_nc$is_guild], cw_out$sp_code[cw_out$is_guild]),
@@ -753,7 +810,7 @@ if (src_2023) {
     mutate(mdl_key = if_else(interval == "annual", glue("{ds_key}|{sp_id}"), glue("{ds_key}|{sp_id}|{interval}")))
   atl_mod <- model_nc |> filter(mdl_key %in% need$mdl_key)
   stopifnot("a 2023 Atlantic species lacks one of its 12 monthly surfaces or the annual" = all(need$mdl_key %in% model_nc$mdl_key),
-            "a 2023 Atlantic surface whose densest cell is not 100" = all(atl_mod$val_max == 100),
+            "a 2023 Atlantic surface whose densest cell is not 100" = all(atl_mod$val_max == 100 | grepl("qmap", atl_mod$transform, fixed = TRUE)),   # qmap tops out at the reference's maximum
             "expected 49 Atlantic species" = nc_smoke || length(atl_ids) == 49,
             "the 2018 Atlantic response type leaked in" = all(atl_mod$response_type %in% c("relative_index", "mixed")))
   log_info("2023 gates: {length(atl_ids)} Atlantic species x 13 surfaces = {nrow(need)} (all present), val_max == 100 for all {nrow(atl_mod)}")
@@ -784,6 +841,12 @@ print(knitr::kable(
     summarise(models = n(), across(c(n_cells, n_ud, n_cap, ud_q10, ud_q50, ud_q90, cap_q10, cap_q50, cap_q90), \(v) round(median(v), 1)),
               .groups = "drop"),
   caption = "median over models, by kind"))
+if (nc_transform == "qmap") {
+  cat("\n\n**qmap reference.** `n_ref_cells` = the species' AquaMaps cells inside the model's domain; a species with no AquaMaps ",
+      "model, or fewer than 50 such cells, keeps its `ud` percentile (`transform = ud(fallback: no am ref)`).\n\n")
+  print(knitr::kable(model_nc |> filter(interval == "annual", !is_guild) |> count(transform, name = "n_species_annual"),
+                     caption = "annual models by the transform actually used"))
+}
 cat("\n\n<details><summary>every model, both recipes</summary>\n\n")
 print(knitr::kable(cmp |> mutate(across(where(is.double), \(v) round(v, 1)))))
 cat("\n\n</details>\n\n")
