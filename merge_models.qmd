@@ -214,9 +214,15 @@ if (fold_density_cal != "none") {
     FROM read_parquet([{dens_glob}], hive_partitioning = false) mc JOIN taxon_model tm USING (mdl_key)
     WHERE split_part(tm.mdl_key, '|', 1) IN ({dens_sql}) AND len(string_split(tm.mdl_key, '|')) = 2
     GROUP BY 1, 2"))
+  # the prior scans every dist/ parquet (~13 B rows) joined to the 94 density taxa's domain: hand the join a taxon_model
+  # already cut to those taxa so the first hash join is tiny and its build side filters the parquet scan (the full
+  # taxon_model build ran the 20 GB budget out of memory on 2026-10-31), and do not preserve insertion order
+  dbExecute(con, "SET preserve_insertion_order = false")
   dbExecute(con, paste("CREATE OR REPLACE TABLE dens_replaced AS", msens::density_prior_sql(
     glue("read_parquet('{dir_dist}/*/*.parquet')"), prior_ds = prior_ds, dens_ds = dens_ds,
-    mode = c(mass = "value", suit = "suit")[[fold_density_cal]])))
+    mode = c(mass = "value", suit = "suit")[[fold_density_cal]],
+    taxon_model = "(SELECT mdl_key, ms_merge_key FROM taxon_model WHERE ms_merge_key IN (SELECT ms_merge_key FROM dens_taxa))")))
+  dbExecute(con, "SET preserve_insertion_order = true")
   dbExecute(con, paste("CREATE OR REPLACE TABLE dens_cal AS", msens::density_cal_factors_sql("dens_vals", "dens_replaced")))
   name_col <- intersect(c("scientific_name", "scientificname", "name"), dbListFields(con, "taxon"))[1]
   cal <- dbGetQuery(con, glue("SELECT c.*{if (!is.na(name_col)) glue(', t.\"{name_col}\" AS scientific_name') else ''}

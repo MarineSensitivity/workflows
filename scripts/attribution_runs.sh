@@ -55,7 +55,7 @@ mkdir -p _output/logs
 # --keep-parts: re-run a merge-INPUT variant from merge_models on the EXISTING mc_parts (REDO_MC_PARTS unset, REDO_MERGE=1)
 # -- for a merge-RULE change that leaves the partitioned input as it is (the 2026-10-31 dps_sql er_floor fix); the
 # caller asserts the partitions on disk are the variant's own
-KEEP_PARTS=0; if [ "${1:-}" = "--keep-parts" ]; then KEEP_PARTS=1; shift; fi
+KEEP_PARTS=; if [ "${1:-}" = "--keep-parts" ]; then KEEP_PARTS=1; shift; fi
 if [ "$1" = "--all" ]; then set -- $VARIANTS; fi
 for v in "$@"; do
   flags=$(variant_flags "$v"); from=$(variant_from "$v"); extra=$(variant_extra "$v")
