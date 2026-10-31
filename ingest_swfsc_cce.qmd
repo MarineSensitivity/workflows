@@ -84,6 +84,13 @@ Cuvier's beaked whale). Those surfaces are **not** in this geodatabase, which ho
    `val >= 100 - p` are exactly the p % core. Cells with `val < 1` are dropped (the merge's floor).
    The transform is scale-free. The old recipe (`CCE_TRANSFORM=cap`: linear to the species' p99.5 of
    positive density) stays available and is compared per model in `data/cce_transform_compare.csv`.
+   **`CCE_TRANSFORM=qmap`** (v11 evaluation, default stays `ud`) quantile-maps each model's densities onto the species' OWN
+   AquaMaps `val` over that model's cells (`density_to_suit(d, "qmap", ref = ..., digits = 2)`), so the survey keeps its spatial
+   pattern and takes AquaMaps' scale instead of putting its densest cell at 100. The helper is `libs/density_ref.R` (shared
+   with `nc` and `gm`): the AquaMaps keys come from `ver_prev`'s `taxon_model` (the delivered AphiaID, else the accepted one),
+   the surfaces from `dist/dataset=am`. A species with no AquaMaps model, or fewer than 50 reference cells in the domain, keeps
+   `ud` and its model rows say `transform = ud(fallback: no am ref)`; `n_ref_cells`, `ref_p50`, `ref_p95` and `ref_am_keys`
+   ride beside it in `model_cce.csv`, the `qmap_*` quantiles beside `ud_*` / `cap_*` in `cce_transform_compare.csv`.
 6. **Interval and annual models.** CCE models one interval, `summer-fall`, so the **annual model is
    that interval**: `msens::density_annual(n_intervals = 1)` is the identity on the density (asserted),
    and the annual surface is the same `ud` transform of the same cells. Both keys are written
@@ -133,6 +140,7 @@ library(msens)                      # the installed msens (poly_cell_overlap / d
 source(here("libs/paths.R"))
 source(here("libs/vars.R"))
 source(here("libs/duckdb_budget.R"))
+source(here("libs/density_ref.R"))   # CCE_TRANSFORM=qmap: the species' AquaMaps reference (shared by the three density ingests)
 options(readr.show_col_types = FALSE)
 stopifnot(
   "msens >= 0.64.1 needed (poly_cell_overlap, cells_area_mean, density_to_suit, density_annual)" =
@@ -147,13 +155,14 @@ stopifnot("source gdb not found; set CCE_GDB or hydrate raw/sdm/swfsc (scripts/p
 
 # outputs: the version's dist/ (the merge and build_registry read it), model_cce.csv beside it
 dir_atlas  <- glue("{dir_big_v}/marine-atlas")
-dir_dist   <- path_expand(glue("{dir_atlas}/dist/dataset={ds_key}")); dir_create(dir_dist)
+dir_dist   <- path_expand(glue("{dir_atlas}/dist/dataset={ds_key}"))
 mdl_csv    <- path_expand(glue("{dir_atlas}/dist/model_{ds_key}.csv"))
 dir_cog    <- path_expand(glue("{dir_atlas}/cce_cog"))             # CCE_COG=1 only
 dir_inport <- path_expand(glue("{dir_raw}/sdm/swfsc/inport_cce")); dir_create(dir_inport)
 repo_csv   <- here("data/swfsc_cce_models.csv")
 cmp_csv    <- here("data/cce_transform_compare.csv")
 manifest   <- here("data/manifests/ingest_swfsc_cce.json"); dir_create(path_dir(manifest))
+tmp_cce    <- glue("{dir_big_v}/_tmp/cce")
 p_cap      <- 0.995                                                # the density percentile the OLD recipe used as the 100 point
 
 cellid_tif <- path_expand(cellid_tif)          # GDAL does not expand "~"
@@ -161,12 +170,41 @@ stopifnot(file_exists(cellid_tif))
 grid <- msens::grid_spec_for("global05", cellid_tif)
 
 # flags (this notebook's own; default = the v11 recipe) ----
-cce_transform <- tolower(Sys.getenv("CCE_TRANSFORM", "ud"))        # ud (v11) | cap (the linear-to-p99.5 recipe, for comparison)
-stopifnot("CCE_TRANSFORM must be 'ud' or 'cap'" = cce_transform %in% c("ud", "cap"))
+cce_transform <- tolower(Sys.getenv("CCE_TRANSFORM", "ud"))        # ud (v11) | cap (the linear-to-p99.5 recipe, for comparison) | qmap (densities quantile-mapped onto the species' AquaMaps val in the domain)
+stopifnot("CCE_TRANSFORM must be 'ud', 'cap' or 'qmap'" = cce_transform %in% c("ud", "cap", "qmap"))
 cce_cog   <- .flag("CCE_COG")                  # also write one 2-band (density, CV) Float32 COG per species
 cce_fetch <- .flag("CCE_FETCH")                # re-download the InPort metadata records
-log_info("cce: transform = {cce_transform}; COG = {cce_cog}; redo = {redo_ingest}")
+
+# smoke test: CCE_SMOKE_DIR redirects EVERYTHING this notebook writes (dataset partition, model_cce.csv, the committed copy,
+# the comparison table, tmp) to a scratch directory and skips the manifest. All 13 layers are processed (they share one geometry
+# and regrid in seconds). It never touches the version's dist/ (the guard refuses a path under dir_big) or the COG directory.
+cce_smoke_dir <- Sys.getenv("CCE_SMOKE_DIR", "")
+cce_smoke     <- nzchar(cce_smoke_dir)
+if (cce_smoke) {
+  stopifnot("CCE_SMOKE_DIR and CCE_COG are exclusive" = !cce_cog)
+  cce_smoke_dir <- path_abs(path_expand(cce_smoke_dir))
+  stopifnot("CCE_SMOKE_DIR is inside the big-data root" = !str_starts(cce_smoke_dir, as.character(path_abs(path_expand(dir_big)))))
+  dir_dist <- glue("{cce_smoke_dir}/dist/dataset={ds_key}")
+  mdl_csv  <- glue("{cce_smoke_dir}/dist/model_{ds_key}.csv")
+  repo_csv <- glue("{cce_smoke_dir}/swfsc_cce_models.csv")
+  cmp_csv  <- glue("{cce_smoke_dir}/cce_transform_compare.csv")
+  tmp_cce  <- glue("{cce_smoke_dir}/_tmp")
+  for (d in c("dist", "_tmp")) if (dir_exists(path(cce_smoke_dir, d))) dir_delete(path(cce_smoke_dir, d))   # a smoke run is always from scratch
+  dir_create(path_dir(mdl_csv))
+}
+dir_create(dir_dist)
+log_info("cce: transform = {cce_transform}; COG = {cce_cog}; redo = {redo_ingest}; smoke = {cce_smoke}")
 log_info("source: {gdb}")
+
+# CCE_TRANSFORM=qmap: the AquaMaps reference. am_idx = ver_prev's crosswalk of the `am|` models (taxon_model), am_dir = the
+# AquaMaps dataset of THIS version's dist/ (read-only). Neither is touched under ud / cap.
+am_dir <- am_idx <- NULL
+if (cce_transform == "qmap") {
+  am_dir <- path_expand(glue("{dir_atlas}/dist/dataset=am"))
+  stopifnot("CCE_TRANSFORM=qmap needs the AquaMaps dataset (dist/dataset=am)" = dir_exists(am_dir))
+  am_idx <- density_am_index(dir_big, ver_prev)
+  log_info("qmap reference: {nrow(am_idx)} {ver_prev}-crosswalked am models; parquets in {am_dir}")
+}
 log_info("outputs: {dir_dist}")
 
 # REDO_INGEST starts the dataset clean; otherwise the 26 files are simply overwritten in place (the
@@ -185,12 +223,13 @@ opened read-only.
 ```{r}
 #| label: cell-area
 
-sdm_cell_db <- c(sdm_db, glue("{dir_big}/{ver_prev}/sdm.duckdb")) |> path_expand() |> keep(file_exists) |> first()
+sdm_cell_dbs <- c(sdm_db, glue("{dir_big}/{ver_prev}/sdm.duckdb"))
+if (cce_smoke) sdm_cell_dbs <- rev(sdm_cell_dbs)     # a smoke run reads ver_prev's: this version's sdm.duckdb may be open for writing by a pipeline run
+sdm_cell_db <- sdm_cell_dbs |> path_expand() |> keep(file_exists) |> first()
 stopifnot("no sdm.duckdb with a cell table (this version's or ver_prev's)" = !is.null(sdm_cell_db))
 log_info("cell areas from {sdm_cell_db}")
-dir_create(glue("{dir_big_v}/_tmp/cce"))
 con_sdm <- dbConnect(duckdb(sdm_cell_db, read_only = TRUE))
-duckdb_tune(con_sdm, glue("{dir_big_v}/_tmp/cce"))
+duckdb_tune(con_sdm, tmp_cce)
 ca <- dbGetQuery(con_sdm, "SELECT cell_id, area_km2 FROM cell")
 dbDisconnect(con_sdm, shutdown = TRUE)
 area_by_id <- rep(NA_real_, 7200 * 3600); area_by_id[ca$cell_id] <- ca$area_km2
@@ -514,10 +553,26 @@ surf <- imap(cells, \(d, l) {
   ann <- msens::density_annual(tibble(cell_id = d$cell_id, dens = d$density), n_intervals = 1)
   stopifnot("annual (one interval) is not the interval's density" =
               identical(ann$cell_id, d$cell_id), isTRUE(all(ann$dens == d$density)))
-  mk <- \(dens) tibble(cell_id = d$cell_id, dens = dens, cv = d$cv, frac = d$frac,
-                       v_ud = to_val(dens, d$cell_id, "ud"), v_cap = to_val(dens, d$cell_id, "cap", cap)) |>
-    mutate(val = if (cce_transform == "ud") v_ud else v_cap)
-  list(cap = cap, interval = mk(d$density), annual = mk(ann$dens))
+  # qmap: the density quantile-mapped onto the species' AquaMaps val over the cells of this model (the interval and the annual
+  # are the same cells, hence the same reference); no AquaMaps model, or < 50 reference cells in the domain: the ud percentile.
+  # The delivered name's AphiaID first, then the accepted one (Delphinus capensis is a synonym AquaMaps files under D. delphis)
+  tx    <- taxa[taxa$layer == l, ]
+  am_k  <- if (cce_transform == "qmap") density_am_keys(am_idx, worms = c(tx$worms_id, tx$worms_id_accepted)) else character()
+  am_c  <- if (cce_transform == "qmap") density_am_cells(am_k, am_dir, cell_ids = d$cell_id)
+  mk <- \(dens) {
+    o <- tibble(cell_id = d$cell_id, dens = dens, cv = d$cv, frac = d$frac,
+                v_ud = to_val(dens, d$cell_id, "ud"), v_cap = to_val(dens, d$cell_id, "cap", cap))
+    if (cce_transform == "qmap") {
+      q <- density_qmap_one(dens, d$cell_id, am_c, cell_area(d$cell_id))
+      o$v_qmap <- q$val; o$val <- q$val
+      attr(o, "qm") <- list(transform = q$transform, n_ref_cells = q$n_ref_cells, ref_p50 = q$ref_p50, ref_p95 = q$ref_p95,
+                            ref_am_keys = paste(am_k, collapse = "|"))
+    } else o$val <- if (cce_transform == "cap") o$v_cap else o$v_ud
+    o
+  }
+  out <- list(cap = cap, interval = mk(d$density), annual = mk(ann$dens))
+  out$qm <- attr(out$interval, "qm")
+  out
 })
 stopifnot("annual val != interval val" =
             all(map_lgl(surf, \(s) identical(s$interval$val, s$annual$val))))
@@ -538,7 +593,7 @@ kable(tf |> mutate(across(starts_with("pop_"), \(v) round(100 * v, 2))),
                      "% of the population in cells with ud val >= 50 (>= 50 by construction) and % dropped below val 1 (< 1), ",
                      "quantiles of the kept val"))
 stopifnot(
-  "no model reaches 100"                        = all(tf$val_max == 100),
+  "no model reaches 100"                        = all(tf$val_max == 100 | cce_transform == "qmap"),   # qmap tops out at the reference's maximum
   "a model has no kept cells"                   = all(tf$n_kept > 0),
   "ud: the 50 % core holds < 50 % of the population" = all(tf$pop_in_val_ge_50 >= 0.5 - 1e-9),
   "ud: dropped tail holds > 1 % of the population"   = all(tf$pop_dropped_val_lt_1 <= 0.01 + 1e-9))
@@ -551,7 +606,12 @@ cmp <- imap_dfr(surf, \(s, l) {
          n_cells = nrow(x), n_ud = sum(x$v_ud >= 1), n_cap = sum(x$v_cap >= 1),
          ud_q10 = q3(x$v_ud[x$v_ud >= 1])[1], ud_q50 = q3(x$v_ud[x$v_ud >= 1])[2], ud_q90 = q3(x$v_ud[x$v_ud >= 1])[3],
          cap_q10 = q3(x$v_cap[x$v_cap >= 1])[1], cap_q50 = q3(x$v_cap[x$v_cap >= 1])[2], cap_q90 = q3(x$v_cap[x$v_cap >= 1])[3],
-         dens_cap = s$cap)
+         dens_cap = s$cap) |>
+    (\(r) if (cce_transform == "qmap") {                # qmap: its own quantiles + the reference, beside ud / cap
+      v <- x$val[x$val >= 1]
+      mutate(r, transform = s$qm$transform, n_ref_cells = s$qm$n_ref_cells, ref_p50 = s$qm$ref_p50, ref_p95 = s$qm$ref_p95,
+             n_qmap = length(v), qmap_q10 = q3(v)[1], qmap_q50 = q3(v)[2], qmap_q90 = q3(v)[3])
+    } else r)()
 }) |> arrange(sp_id, interval)
 write_csv(cmp |> mutate(across(where(is.double), \(v) signif(v, 5))), cmp_csv)
 kable(cmp |> filter(interval == season) |> select(-layer, -interval, -sp_id) |>
@@ -686,7 +746,7 @@ stopifnot("not exactly 26 parquet files in dist/dataset=cce (stale files? REDO_I
 
 # read back through DuckDB: one mdl_key per file, the expected rows and range
 con <- dbConnect(duckdb())
-duckdb_tune(con, glue("{dir_big_v}/_tmp/cce"))
+duckdb_tune(con, tmp_cce)
 pq  <- dbGetQuery(con, glue(
   "SELECT mdl_key, count(*) AS n_cells, count(DISTINCT cell_id) AS n_distinct, min(val) AS val_min,
           max(val) AS val_max, min(dens) AS dens_min, max(frac) AS frac_max
@@ -703,7 +763,7 @@ stopifnot(
   "row counts != the transform's"  = all(pq_chk$n_cells == pq_chk$n_exp),
   "duplicate cell in a model"      = all(pq$n_distinct == pq$n_cells),
   "val outside [1,100]"            = all(pq$val_min >= 1 & pq$val_max <= 100),
-  "a model's max val is not 100"   = all(pq$val_max == 100),
+  "a model's max val is not 100"   = all(pq$val_max == 100 | cce_transform == "qmap"),   # qmap tops out at the reference's maximum
   "negative density"               = all(pq$dens_min >= 0))
 kable(pq, digits = 6, format.args = list(big.mark = ","),
       caption = glue("dist/dataset={ds_key}/ read back (content hash {pq_hash})"))
@@ -722,6 +782,10 @@ mm <- taxa |>
     density_max = map_dbl(layer, \(l) max(cells[[l]]$density)),
     cv_median   = map_dbl(layer, \(l) median(cells[[l]]$cv, na.rm = TRUE)),
     dens_cap    = map_dbl(layer, \(l) surf[[l]]$cap))
+if (cce_transform == "qmap")                           # the transform actually used per model, and its reference (interval and annual alike)
+  mm <- mm |> mutate(qm_transform = map_chr(layer, \(l) surf[[l]]$qm$transform), n_ref_cells = map_int(layer, \(l) surf[[l]]$qm$n_ref_cells),
+                     ref_p50 = map_dbl(layer, \(l) surf[[l]]$qm$ref_p50), ref_p95 = map_dbl(layer, \(l) surf[[l]]$qm$ref_p95),
+                     ref_am_keys = map_chr(layer, \(l) surf[[l]]$qm$ref_am_keys))
 
 # one row per written model: the interval and the annual
 model_cce <- bind_rows(
@@ -730,8 +794,9 @@ model_cce <- bind_rows(
   inner_join(pq |> select(mdl_key, n_cells, val_min, val_max), by = "mdl_key") |>
   transmute(
     mdl_key, interval, sp_id, layer, common_name = species, scientific_name,
-    is_guild = FALSE, worms_id, response_type = "density", transform = cce_transform,
+    is_guild = FALSE, worms_id, response_type = "density", transform = if (cce_transform == "qmap") qm_transform else cce_transform,
     dens_cap = signif(dens_cap, 6), val_min, val_max, n_cells,
+    across(any_of(c("n_ref_cells", "ref_p50", "ref_p95", "ref_am_keys"))),     # qmap only
     abundance_source = round(abundance_source, 3), abundance_regridded = round(abundance_regridded, 3),
     density_min = signif(density_min, 6), density_p98 = signif(density_p98, 6),
     density_max = signif(density_max, 6), cv_median = signif(cv_median, 6),
@@ -870,6 +935,9 @@ carry no information about winter–spring distribution.
 
 # content-addressed, deterministic manifest (Phase A) -- no wall-clock, so an identical re-ingest
 # produces byte-identical bytes and does NOT invalidate downstream targets
+if (cce_smoke) {
+  log_info("smoke test: manifest not written; {nrow(model_cce)} models in {dir_dist}")
+} else {
 smry <- arrow::open_dataset(dir_dist) |>
   summarise(n_rows = n(), n_mdl = n_distinct(mdl_key),
             val_min = round(min(val), 2), val_max = round(max(val), 2)) |> collect()
@@ -883,6 +951,7 @@ msens::write_manifest(
     worms_snapshot = worms_ver$worms_ver, msens = as.character(packageVersion("msens")),
     note = "13 CCE species, one summer-fall interval -> population percentile [1,100]; annual = that interval (one interval); registered, merged only under FOLD_DENSITY"),
   force = msens::force_target("ingest_swfsc_cce"))
+}
 
 kable(tibble(output = c(dir_dist, mdl_csv, repo_csv, cmp_csv, manifest, if (cce_cog) dir_cog),
              n_files = map_int(output, \(p) if (dir_exists(p)) length(dir_ls(p)) else as.integer(file_exists(p)))),
