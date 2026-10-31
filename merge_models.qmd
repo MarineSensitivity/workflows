@@ -201,8 +201,13 @@ if (fold_density) {
 # (The AquaX / og supersession predicates are not applied to the prior: v11 has no ax ingest and og covers only the
 # turtles, which never take density.) Cells with no prior value keep the survey's pattern at that scale; a taxon with
 # no prior anywhere is left at f = 1 and flagged. The factors are written to data/{ver}/density_cal_factors.csv.
-cal_wrap <- function(sql) if (fold_density_cal == "mass") msens::density_calibrate_sql(sql, dens_ds, factors = "dens_cal") else sql
-if (fold_density_cal == "mass") {
+# FOLD_DENSITY_CAL=suit reads the replaced surface as the SUITABILITY where any suitability dataset models the cell and the
+# er_score only where none does (msens::density_prior_sql(mode = "suit")) -- what dps_sql() gives an er_mode = 'cell' taxon,
+# which is how a density taxon merges here: under "mass" an Endangered cetacean's prior is ~100 wherever its range covers
+# it (the control's VALUE) and the calibrated survey saturates at the cap, losing the pattern again; under "suit" the ER
+# rides beside the value and the survey pattern survives. The birds (no suitability model) calibrate identically either way.
+cal_wrap <- function(sql) if (fold_density_cal != "none") msens::density_calibrate_sql(sql, dens_ds, factors = "dens_cal") else sql
+if (fold_density_cal != "none") {
   prior_ds  <- setdiff(suit_ds, dens_ds)
   prior_sql <- paste(sprintf("'%s'", prior_ds), collapse = ",")
   dbExecute(con, glue("CREATE OR REPLACE TABLE dens_vals AS
@@ -210,22 +215,16 @@ if (fold_density_cal == "mass") {
     FROM read_parquet([{dens_glob}], hive_partitioning = false) mc JOIN taxon_model tm USING (mdl_key)
     WHERE split_part(tm.mdl_key, '|', 1) IN ({dens_sql}) AND len(string_split(tm.mdl_key, '|')) = 2
     GROUP BY 1, 2"))
-  dbExecute(con, glue("CREATE OR REPLACE TABLE dens_replaced AS
-    SELECT ms_merge_key, cell_id, max(val) AS val FROM (
-      SELECT tm.ms_merge_key, mc.cell_id,
-             CASE WHEN split_part(mc.mdl_key, '|', 1) IN ({prior_sql}) THEN mc.val ELSE t.er_score::DOUBLE END AS val
-      FROM read_parquet('{dir_dist}/*/*.parquet') mc JOIN taxon_model tm USING (mdl_key)
-      JOIN dens_dom d ON d.ms_merge_key = tm.ms_merge_key AND d.cell_id = mc.cell_id
-      JOIN taxon t ON t.ms_merge_key = tm.ms_merge_key
-      WHERE split_part(mc.mdl_key, '|', 1) NOT IN ({dens_sql}))
-    GROUP BY 1, 2"))
+  dbExecute(con, paste("CREATE OR REPLACE TABLE dens_replaced AS", msens::density_prior_sql(
+    glue("read_parquet('{dir_dist}/*/*.parquet')"), prior_ds = prior_ds, dens_ds = dens_ds,
+    mode = c(mass = "value", suit = "suit")[[fold_density_cal]])))
   dbExecute(con, paste("CREATE OR REPLACE TABLE dens_cal AS", msens::density_cal_factors_sql("dens_vals", "dens_replaced")))
   name_col <- intersect(c("scientific_name", "scientificname", "name"), dbListFields(con, "taxon"))[1]
   cal <- dbGetQuery(con, glue("SELECT c.*{if (!is.na(name_col)) glue(', t.\"{name_col}\" AS scientific_name') else ''}
     FROM dens_cal c LEFT JOIN taxon t USING (ms_merge_key) ORDER BY f"))
   dir_create(here(glue("data/{ver}")))
-  readr::write_csv(cal, here(glue("data/{ver}/density_cal_factors.csv")))
-  log_info("FOLD_DENSITY_CAL=mass: {nrow(cal)} density taxa, {sum(!cal$calibrated)} without a prior value (f = 1); f median {signif(median(cal$f), 3)}, range {signif(min(cal$f), 3)}-{signif(max(cal$f), 3)}; {sum(cal$f < 1)} shrink, {sum(cal$f > 1)} grow")
+  readr::write_csv(cal, here(glue("data/{ver}/density_cal_factors_{fold_density_cal}.csv")))
+  log_info("FOLD_DENSITY_CAL={fold_density_cal}: {nrow(cal)} density taxa, {sum(!cal$calibrated)} without a prior value (f = 1); f median {signif(median(cal$f), 3)}, range {signif(min(cal$f), 3)}-{signif(max(cal$f), 3)}; {sum(cal$f < 1)} shrink, {sum(cal$f > 1)} grow")
 } else log_info("FOLD_DENSITY_CAL=none: the folded-in survey values enter at the ingest's 0-100 transform")
 # the merge-input filter: AquaX's supersession (v9) AND, for the turtles under ogm, am and ax inside og AND, for
 # the density taxa under FOLD_DENSITY, am and ax inside each taxon's own survey domain

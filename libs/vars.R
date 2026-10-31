@@ -61,7 +61,7 @@ turtle_rule     <- match.arg(Sys.getenv("TURTLE_RULE", "turtle"), c("turtle", "d
 occ_rule        <- .flag("OCC_RULE")                               # merge_models: msens::occurrence_rule() zone exclusions (Q2)
 region_weight   <- .flag("REGION_WEIGHT")                          # merge_models: msens::encounter_weight() per species x ecoregion (Q3)
 fold_density    <- .flag("FOLD_DENSITY")                           # merge: density datasets replace suitability inside their domain (Q6)
-fold_density_cal <- match.arg(Sys.getenv("FOLD_DENSITY_CAL", "none"), c("none", "mass"))  # merge: calibrate the folded-in survey -- "mass" = msens::density_cal_factors_sql(), the domain keeps the mass the replaced surface gave it (Q6, after the 2026-10-31 attribution)
+fold_density_cal <- match.arg(Sys.getenv("FOLD_DENSITY_CAL", "none"), c("none", "mass", "suit"))  # merge: calibrate the folded-in survey (msens::density_cal_factors_sql(): the domain keeps the mass the replaced surface gave it; Q6, after the 2026-10-31 attribution) -- "mass": the replaced surface is the control's VALUE max(er, suit); "suit": the suitability where modeled, er_score elsewhere (msens::density_prior_sql())
 if (fold_density_cal != "none" && !fold_density) stop("FOLD_DENSITY_CAL needs FOLD_DENSITY=1")
 worms_source    <- match.arg(Sys.getenv("WORMS_SOURCE", "download"), c("download", "obisindicators"))  # ingest_worms (Q1)
 components_v11  <- .flag("COMPONENTS_V11")                         # data/components.csv labels: Flora / Productivity (Q5)
