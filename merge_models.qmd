@@ -65,7 +65,7 @@ source(here("libs/vars.R"))
 # gate) and REGION_WEIGHT (the encounter weight); every other flag must be at its control value here, except NC_ATL_SOURCE
 # (the nc ingest decides which Atlantic bird models exist; the merge takes what is in dist/)
 stopifnot("a v11 flag this stage does not implement is on (libs/vars.R v11_flags)" =
-            worms_source == "download")   # TURTLE_SUIT, TURTLE_RULE, OCC_RULE, REGION_WEIGHT, FOLD_DENSITY are implemented here; VGPM_INTEGRATED / COMPONENTS_V11 belong to scoring
+            worms_source == "download")   # TURTLE_SUIT, TURTLE_RULE, OCC_RULE, REGION_WEIGHT, FOLD_DENSITY (+ FOLD_DENSITY_CAL) are implemented here; VGPM_INTEGRATED / COMPONENTS_V11 belong to scoring
 
 dir_atlas   <- glue("{dir_big_v}/marine-atlas")
 dir_dist    <- glue("{dir_atlas}/dist")
@@ -189,6 +189,44 @@ if (fold_density) {
   dbExecute(con, "CREATE OR REPLACE TABLE dens_dom (ms_merge_key VARCHAR, cell_id INTEGER)")
   dbExecute(con, "CREATE OR REPLACE TABLE dens_taxa (ms_merge_key VARCHAR)")
 }
+# v11 Q6, FOLD_DENSITY_CAL=mass (libs/vars.R; msens 0.66.0): the 2026-10-31 attribution showed the uncalibrated fold-in
+# tripling the California bird scores and halving Alaska's by proportion -- the survey's percentiles (densest cell = 100)
+# replaced AquaMaps' modest suitability, or for the NCCOS birds (none of the 72 has an AquaMaps model) a range at a
+# constant er_score, so the surveyed species' global share piled into the surveyed areas. The survey knows the PATTERN
+# inside its domain; it knows nothing about how much of the species the domain holds relative to the rest of the range,
+# and neither does any other source we have. So per taxon the survey values are scaled so the domain keeps the MASS the
+# replaced surface gave it (msens::density_cal_factors_sql(): f = mean(replaced) / mean(survey) over the domain cells that
+# had a prior value, capped at 100 per cell) -- the replaced surface being what the control merge gave those cells:
+# the suitability (am / ax / og) where one existed, else the governing er_score where a range dataset covered the cell.
+# (The AquaX / og supersession predicates are not applied to the prior: v11 has no ax ingest and og covers only the
+# turtles, which never take density.) Cells with no prior value keep the survey's pattern at that scale; a taxon with
+# no prior anywhere is left at f = 1 and flagged. The factors are written to data/{ver}/density_cal_factors.csv.
+cal_wrap <- function(sql) if (fold_density_cal == "mass") msens::density_calibrate_sql(sql, dens_ds, factors = "dens_cal") else sql
+if (fold_density_cal == "mass") {
+  prior_ds  <- setdiff(suit_ds, dens_ds)
+  prior_sql <- paste(sprintf("'%s'", prior_ds), collapse = ",")
+  dbExecute(con, glue("CREATE OR REPLACE TABLE dens_vals AS
+    SELECT tm.ms_merge_key, mc.cell_id, max(mc.val) AS val
+    FROM read_parquet([{dens_glob}], hive_partitioning = false) mc JOIN taxon_model tm USING (mdl_key)
+    WHERE split_part(tm.mdl_key, '|', 1) IN ({dens_sql}) AND len(string_split(tm.mdl_key, '|')) = 2
+    GROUP BY 1, 2"))
+  dbExecute(con, glue("CREATE OR REPLACE TABLE dens_replaced AS
+    SELECT ms_merge_key, cell_id, max(val) AS val FROM (
+      SELECT tm.ms_merge_key, mc.cell_id,
+             CASE WHEN split_part(mc.mdl_key, '|', 1) IN ({prior_sql}) THEN mc.val ELSE t.er_score::DOUBLE END AS val
+      FROM read_parquet('{dir_dist}/*/*.parquet') mc JOIN taxon_model tm USING (mdl_key)
+      JOIN dens_dom d ON d.ms_merge_key = tm.ms_merge_key AND d.cell_id = mc.cell_id
+      JOIN taxon t ON t.ms_merge_key = tm.ms_merge_key
+      WHERE split_part(mc.mdl_key, '|', 1) NOT IN ({dens_sql}))
+    GROUP BY 1, 2"))
+  dbExecute(con, paste("CREATE OR REPLACE TABLE dens_cal AS", msens::density_cal_factors_sql("dens_vals", "dens_replaced")))
+  name_col <- intersect(c("scientific_name", "scientificname", "name"), dbListFields(con, "taxon"))[1]
+  cal <- dbGetQuery(con, glue("SELECT c.*{if (!is.na(name_col)) glue(', t.\"{name_col}\" AS scientific_name') else ''}
+    FROM dens_cal c LEFT JOIN taxon t USING (ms_merge_key) ORDER BY f"))
+  dir_create(here(glue("data/{ver}")))
+  readr::write_csv(cal, here(glue("data/{ver}/density_cal_factors.csv")))
+  log_info("FOLD_DENSITY_CAL=mass: {nrow(cal)} density taxa, {sum(!cal$calibrated)} without a prior value (f = 1); f median {signif(median(cal$f), 3)}, range {signif(min(cal$f), 3)}-{signif(max(cal$f), 3)}; {sum(cal$f < 1)} shrink, {sum(cal$f > 1)} grow")
+} else log_info("FOLD_DENSITY_CAL=none: the folded-in survey values enter at the ingest's 0-100 transform")
 # the merge-input filter: AquaX's supersession (v9) AND, for the turtles under ogm, am and ax inside og AND, for
 # the density taxa under FOLD_DENSITY, am and ax inside each taxon's own survey domain
 # Only the predicates whose taxa table is non-empty are applied: an anti-join of 13 B rows against an EMPTY table
@@ -227,14 +265,14 @@ if (!dir_exists(dir_parts) || nzchar(Sys.getenv("REDO_MC_PARTS"))) {
     chunk_sql <- if (n_chunks > 1L) glue("WHERE mm.mkey_id BETWEEN {lo} AND {hi}") else ""
     dens_rows_sql <- dens_rows_fn(chunk_sql)
     if (n_chunks > 1L) log_info("mc_parts chunk {k}/{length(bounds) - 1L}: mkey_id {lo}-{hi} ({format(Sys.time(), '%H:%M')})")
-    msens::copy_atlas_parquet(con, glue(
+    msens::copy_atlas_parquet(con, cal_wrap(glue(
       "SELECT mkey_id, ms_merge_key, ds_key, cell_id, val FROM (
          SELECT mm.mkey_id, tm.ms_merge_key, split_part(mc.mdl_key,'|',1) AS ds_key, mc.cell_id, mc.val
          FROM read_parquet('{dir_dist}/*/*.parquet') mc JOIN taxon_model tm USING (mdl_key)
          JOIN mkey_map mm USING (ms_merge_key)
          {chunk_sql}
          {dens_rows_sql}) mc
-       WHERE {keep_sql}"),
+       WHERE {keep_sql}")),
       dir_parts, partition_by = "mkey_id")
   }
 } else if (nzchar(Sys.getenv("REDO_MC_PARTS_SPATIAL"))) {
@@ -250,14 +288,14 @@ if (!dir_exists(dir_parts) || nzchar(Sys.getenv("REDO_MC_PARTS"))) {
   for (id in sp_ids) { pd <- glue("{dir_parts}/mkey_id={id}"); if (dir_exists(pd)) dir_delete(pd) }
   dbExecute(con, "SET partitioned_write_max_open_files=512")
   dens_rows_sql <- dens_rows_fn()
-  msens::copy_atlas_parquet(con, glue(
+  msens::copy_atlas_parquet(con, cal_wrap(glue(
     "SELECT mkey_id, ms_merge_key, ds_key, cell_id, val FROM (
        SELECT mm.mkey_id, tm.ms_merge_key, split_part(mc.mdl_key,'|',1) AS ds_key, mc.cell_id, mc.val
        FROM read_parquet('{dir_dist}/*/*.parquet') mc JOIN taxon_model tm USING (mdl_key)
        JOIN mkey_map mm USING (ms_merge_key)
        {dens_rows_sql}
        WHERE mm.mkey_id IN ({paste(sp_ids, collapse = ',')})) mc
-     WHERE {keep_sql}"),
+     WHERE {keep_sql}")),
     dir_parts, partition_by = "mkey_id")
   log_info("REDO_MC_PARTS_SPATIAL: re-partitioned {length(sp_ids)} spatial-ER taxa; the other partitions are kept")
 } else log_info("mc_parts exists — skipping repartition (REDO_MC_PARTS=1 to force, REDO_MC_PARTS_SPATIAL=1 for the spatial-ER taxa only)")

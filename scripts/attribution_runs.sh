@@ -29,9 +29,10 @@ variant_flags() { case "$1" in
   no_turtle_rule)   echo "${FULL/TURTLE_RULE=dps/TURTLE_RULE=turtle}" ;;
   no_vgpm)          echo "${FULL/VGPM_INTEGRATED=1/VGPM_INTEGRATED=0}" ;;
   no_components)    echo "${FULL/COMPONENTS_V11=1/COMPONENTS_V11=0}" ;;
+  full2023_cal)     echo "$FULL FOLD_DENSITY_CAL=mass" ;;   # the candidate + the mass-preserving density calibration (2026-10-31)
   *) echo "" ;; esac; }
 variant_from()  { case "$1" in
-  full2023|no_turtle_suit|no_fold_density|nc_atl_2018) echo merge_models_prep ;;
+  full2023|no_turtle_suit|no_fold_density|nc_atl_2018|full2023_cal) echo merge_models_prep ;;
   no_occ_rule|no_region_weight|no_turtle_rule)         echo merge_models ;;
   no_vgpm)                                             echo score_cell_metrics ;;
   no_components)                                       echo merge_taxon ;;
@@ -46,20 +47,23 @@ variant_extra() { case "$1" in
 # ones come next (each rewrites every surface); the two re-prep ones last; nc_atl_2018 needs ingest_sdm-nc
 # re-rendered with NC_ATL_SOURCE=2018 in between (`--all` does that render itself).
 VARIANTS="full2023 no_vgpm no_components no_turtle_rule no_occ_rule no_region_weight no_turtle_suit no_fold_density nc_atl_2018"
-if [ "${1:-}" = "--list" ]; then for v in $VARIANTS; do echo "$v  from $(variant_from "$v")  $(variant_extra "$v")  $(variant_flags "$v")"; done; exit 0; fi
+EXTRA_VARIANTS="full2023_cal"   # follow-ups, not part of --all
+if [ "${1:-}" = "--list" ]; then for v in $VARIANTS $EXTRA_VARIANTS; do echo "$v  from $(variant_from "$v")  $(variant_extra "$v")  $(variant_flags "$v")"; done; exit 0; fi
 [ $# -gt 0 ] || { echo "usage: $0 <variant> [<variant> ...] | --all | --list" >&2; exit 2; }
 mkdir -p _output/logs
 if [ "$1" = "--all" ]; then set -- $VARIANTS; fi
 for v in "$@"; do
-  if [ "$v" = nc_atl_2018 ]; then
-    echo "==> ingest_sdm-nc with NC_ATL_SOURCE=2018 for the $v variant ($(date +%H:%M))"
-    env NC_ATL_SOURCE=2018 REDO_INGEST=1 BUILD_THREADS=4 BUILD_MEMORY_GB=8 quarto render ingest_sdm-nc.qmd > _output/logs/ingest_sdm_nc.log 2>&1 || { echo "!! ingest_sdm-nc (2018) FAILED" >&2; exit 1; }
-  fi
   flags=$(variant_flags "$v"); from=$(variant_from "$v"); extra=$(variant_extra "$v")
   [ -n "$flags" ] || { echo "unknown variant: $v" >&2; exit 2; }
+  # dist/dataset=nc holds ONE Atlantic bird set; a variant wanting the other re-renders the ingest first (~20 min)
   src_want=$(echo "$flags" | grep -o "NC_ATL_SOURCE=[0-9]*" | cut -d= -f2)
   src_have=$(cat ~/_big/msens/derived/v11/marine-atlas/dist/nc_atl_source.txt 2>/dev/null || echo 2018)
-  [ "$src_want" = "$src_have" ] || { echo "!! $v wants NC_ATL_SOURCE=$src_want but dist/dataset=nc holds $src_have: render ingest_sdm-nc first" >&2; exit 1; }
+  if [ "$src_want" != "$src_have" ]; then
+    echo "==> ingest_sdm-nc with NC_ATL_SOURCE=$src_want for the $v variant ($(date +%H:%M))"
+    env NC_ATL_SOURCE=$src_want REDO_INGEST=1 BUILD_THREADS=4 BUILD_MEMORY_GB=8 quarto render ingest_sdm-nc.qmd > _output/logs/ingest_sdm_nc.log 2>&1 || { echo "!! ingest_sdm-nc ($src_want) FAILED" >&2; exit 1; }
+    src_have=$(cat ~/_big/msens/derived/v11/marine-atlas/dist/nc_atl_source.txt 2>/dev/null || echo 2018)
+    [ "$src_want" = "$src_have" ] || { echo "!! ingest_sdm-nc did not leave NC_ATL_SOURCE=$src_want in dist/nc_atl_source.txt" >&2; exit 1; }
+  fi
   echo "==> variant $v  ($(date +%H:%M))  from $from  $extra"
   # the runner's own merge stage sets REDO_MC_PARTS=1 REDO_MERGE=1; a variant that keeps mc_parts overrides it
   # by rendering the merge directly, then hands the rest to the runner
