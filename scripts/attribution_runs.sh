@@ -30,9 +30,10 @@ variant_flags() { case "$1" in
   no_vgpm)          echo "${FULL/VGPM_INTEGRATED=1/VGPM_INTEGRATED=0}" ;;
   no_components)    echo "${FULL/COMPONENTS_V11=1/COMPONENTS_V11=0}" ;;
   full2023_cal)     echo "$FULL FOLD_DENSITY_CAL=mass" ;;   # the candidate + the mass-preserving density calibration (2026-10-31)
+  full2023_cal_suit) echo "$FULL FOLD_DENSITY_CAL=suit" ;;  # ... calibrated to the suitability prior (er beside), the basis the fold-in's cell-mode merge uses
   *) echo "" ;; esac; }
 variant_from()  { case "$1" in
-  full2023|no_turtle_suit|no_fold_density|nc_atl_2018|full2023_cal) echo merge_models_prep ;;
+  full2023|no_turtle_suit|no_fold_density|nc_atl_2018|full2023_cal|full2023_cal_suit) echo merge_models_prep ;;
   no_occ_rule|no_region_weight|no_turtle_rule)         echo merge_models ;;
   no_vgpm)                                             echo score_cell_metrics ;;
   no_components)                                       echo merge_taxon ;;
@@ -47,7 +48,7 @@ variant_extra() { case "$1" in
 # ones come next (each rewrites every surface); the two re-prep ones last; nc_atl_2018 needs ingest_sdm-nc
 # re-rendered with NC_ATL_SOURCE=2018 in between (`--all` does that render itself).
 VARIANTS="full2023 no_vgpm no_components no_turtle_rule no_occ_rule no_region_weight no_turtle_suit no_fold_density nc_atl_2018"
-EXTRA_VARIANTS="full2023_cal"   # follow-ups, not part of --all
+EXTRA_VARIANTS="full2023_cal full2023_cal_suit"   # follow-ups, not part of --all
 if [ "${1:-}" = "--list" ]; then for v in $VARIANTS $EXTRA_VARIANTS; do echo "$v  from $(variant_from "$v")  $(variant_extra "$v")  $(variant_flags "$v")"; done; exit 0; fi
 [ $# -gt 0 ] || { echo "usage: $0 [--keep-parts] <variant> [<variant> ...] | --all | --list" >&2; exit 2; }
 mkdir -p _output/logs
