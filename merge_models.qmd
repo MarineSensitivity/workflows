@@ -409,12 +409,28 @@ for (id in dps_ids) {
 # the suitability (am / ax outside the domain, the survey inside it) is the value, the ER rides beside per cell
 dens_keys <- if (fold_density) setdiff(dbGetQuery(con, "SELECT ms_merge_key FROM dens_taxa")$ms_merge_key, c(turtle_keys, dps_keys)) else character(0)
 dens_ids  <- ids_of(dens_keys)
+# a density taxon is NOT a listed-entity species: its ER rows carry what their ingests wrote (a BirdLife range row the
+# IUCN category alone), so its governing er_score (merge_models_prep: MMPA / MBTA floors, US listings over IUCN -- what
+# the control's merge_sql values every range cell at) must be the FLOOR under the per-cell ER, or the taxon loses every
+# national floor outside its survey domain (a LC murre merged at 1 instead of its MBTA 10 over 980k cells: the
+# 2026-10-31 attribution's "bird / mammal reshuffle" was mostly this). msens::dps_sql(er_floor), test-merge.R.
+dens_er <- if (length(dens_keys)) dbGetQuery(con, glue("SELECT ms_merge_key, er_score FROM taxon WHERE ms_merge_key IN ({paste(sprintf(\"'%s'\", dens_keys), collapse = ',')})")) else data.frame(ms_merge_key = character(), er_score = numeric())
+stopifnot("every density taxon has a governing er_score" = nrow(dens_er) == length(dens_keys), !anyNA(dens_er$er_score))
 for (id in dens_ids) {
   dbExecute(con, glue("CREATE OR REPLACE VIEW dps_src AS
     SELECT ms_merge_key, ds_key, cell_id, val FROM {parts_sql(id)}"))
   er_ds <- dbGetQuery(con, glue("SELECT DISTINCT ds_key FROM dps_src WHERE ds_key NOT IN ({paste(sprintf(\"'%s'\", suit_ds), collapse = ',')})"))$ds_key
   stopifnot("a density taxon needs at least one range dataset (dens_dom at least)" = length(er_ds) > 0)
-  dbExecute(con, paste("INSERT INTO mc_dps", msens::dps_sql(er_ds, suit_ds, src = "dps_src")))
+  k_id  <- dbGetQuery(con, glue("SELECT ms_merge_key FROM mkey_map WHERE mkey_id = {id}"))$ms_merge_key
+  floor <- dens_er$er_score[dens_er$ms_merge_key == k_id]
+  stopifnot("one governing er_score per density taxon" = length(floor) == 1L)
+  dbExecute(con, paste("INSERT INTO mc_dps", msens::dps_sql(er_ds, suit_ds, src = "dps_src", er_floor = floor)))
+}
+if (length(dens_ids)) {
+  # regression guard: no density taxon's per-cell ER may fall below its governing er_score
+  below <- dbGetQuery(con, glue("SELECT count(*) n FROM mc_dps d JOIN taxon t ON t.ms_merge_key = d.mdl_key
+    WHERE d.mdl_key IN ({paste(sprintf(\"'%s'\", dens_keys), collapse = ',')}) AND d.er < t.er_score"))$n
+  stopifnot("a density taxon carries a per-cell ER below its governing er_score (dps_sql er_floor not applied)" = below == 0)
 }
 if (length(dens_ids)) log_info("FOLD_DENSITY: {length(dens_ids)} density taxa merged through dps_sql (er_mode = cell); {length(intersect(dbGetQuery(con, 'SELECT ms_merge_key FROM dens_taxa')$ms_merge_key, c(turtle_keys, dps_keys)))} density taxa are turtles / DPS species and keep their own rule (density rows dropped)")
 if (turtle_rule == "dps") for (id in turtle_ids) {

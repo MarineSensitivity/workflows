@@ -49,8 +49,12 @@ variant_extra() { case "$1" in
 VARIANTS="full2023 no_vgpm no_components no_turtle_rule no_occ_rule no_region_weight no_turtle_suit no_fold_density nc_atl_2018"
 EXTRA_VARIANTS="full2023_cal"   # follow-ups, not part of --all
 if [ "${1:-}" = "--list" ]; then for v in $VARIANTS $EXTRA_VARIANTS; do echo "$v  from $(variant_from "$v")  $(variant_extra "$v")  $(variant_flags "$v")"; done; exit 0; fi
-[ $# -gt 0 ] || { echo "usage: $0 <variant> [<variant> ...] | --all | --list" >&2; exit 2; }
+[ $# -gt 0 ] || { echo "usage: $0 [--keep-parts] <variant> [<variant> ...] | --all | --list" >&2; exit 2; }
 mkdir -p _output/logs
+# --keep-parts: re-run a merge-INPUT variant from merge_models on the EXISTING mc_parts (REDO_MC_PARTS unset, REDO_MERGE=1)
+# -- for a merge-RULE change that leaves the partitioned input as it is (the 2026-10-31 dps_sql er_floor fix); the
+# caller asserts the partitions on disk are the variant's own
+KEEP_PARTS=0; if [ "${1:-}" = "--keep-parts" ]; then KEEP_PARTS=1; shift; fi
 if [ "$1" = "--all" ]; then set -- $VARIANTS; fi
 for v in "$@"; do
   flags=$(variant_flags "$v"); from=$(variant_from "$v"); extra=$(variant_extra "$v")
@@ -64,7 +68,8 @@ for v in "$@"; do
     src_have=$(cat ~/_big/msens/derived/v11/marine-atlas/dist/nc_atl_source.txt 2>/dev/null || echo 2018)
     [ "$src_want" = "$src_have" ] || { echo "!! ingest_sdm-nc did not leave NC_ATL_SOURCE=$src_want in dist/nc_atl_source.txt" >&2; exit 1; }
   fi
-  echo "==> variant $v  ($(date +%H:%M))  from $from  $extra"
+  if [ "$KEEP_PARTS" = 1 ] && [ "$from" = merge_models_prep ]; then from=merge_models; extra="REDO_MC_PARTS= REDO_MERGE=1"; fi
+  echo "==> variant $v  ($(date +%H:%M))  from $from  $extra${KEEP_PARTS:+  (--keep-parts)}"
   # the runner's own merge stage sets REDO_MC_PARTS=1 REDO_MERGE=1; a variant that keeps mc_parts overrides it
   # by rendering the merge directly, then hands the rest to the runner
   if [ "$from" = merge_models ]; then
