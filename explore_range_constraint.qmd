@@ -1,0 +1,1022 @@
+---
+title: "Constraining AquaMaps where no range map exists"
+subtitle: "Calibrating a cutoff and an island rule on the AquaMaps x IUCN pairs: Jaccard by cutoff, connected components, occurrence support, and the FAO-area consistency check"
+msens:
+  target_name: explore_range_constraint
+  workflow_type: explore
+  dependency: [ingest_aquamaps, ingest_rng_iucn]
+  output: data/explore/range_constraint_pairs.csv
+format: html
+editor_options:
+  chunk_output_type: console
+---
+
+<!--
+READ-ONLY against the pipeline: reads dist/dataset=am + dataset=rng_iucn of the current version (one parquet per model,
+each opened by its own path), the v8 merge.duckdb (taxon_model crosswalk, taxon flags) and v8 sdm.duckdb (cell) with
+read_only, am.duckdb read_only, and the local OBIS obisindicators release (obis_cell on global05). Nothing under the
+version's sdm.duckdb / merge.duckdb is opened.
+
+CACHES under ~/_big/msens/derived/explore/range_constraint/ (pairs, cells, occurrences, one batch/ file set per 100
+pairs, the FAO check): a re-render reads them; REDO_EXPLORE=1 rebuilds everything. EXPLORE_TEST_N=<n> runs n pairs
+into a test_<n>/ cache and writes nothing to data/. DuckDB budget: BUILD_MEMORY_GB (default 4), BUILD_THREADS (2).
+
+Plan (the spec): notes vault, msens/plans_todo/2026-11-01 constraining AquaMaps suitability where no range map exists.md
+-->
+
+## Goal
+
+The merge masks AquaMaps suitability to a species range map (IUCN, BirdLife, FWS) where one exists. About 15,000
+scored taxa have only AquaMaps, so their whole envelope, over-prediction included, enters the score. This notebook
+builds the evidence for a quantitative rule (`AM_RANGE_RULE`, default off) that constrains AquaMaps where no range map
+exists, calibrated on the taxa that have **both** an AquaMaps model and an IUCN range:
+
+1. per pair, the suitability mass inside the range, and for cutoffs t the footprint {val >= t} against the range
+   (Jaccard, range kept, footprint outside), with t* = the cutoff of best Jaccard;
+2. whether t* is one number, follows a covariate available without a range map, or follows taxonomy;
+3. the islands a cutoff leaves (8-neighbour connected components), and how many of them hold an AquaMaps occurrence
+   cell or an OBIS record;
+4. illustrative maps;
+5. the FAO-area consistency check of the AquaMaps native maps (plan section 6).
+
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "Calibration pairs through cutoffs, components and occurrence support"
+flowchart LR
+  am[("dist/dataset=am<br/>one parquet per model<br/>val = P x 100")] --> pr
+  rng[("dist/dataset=rng_iucn<br/>one parquet per range")] --> pr
+  xw[("v8 merge.duckdb<br/>taxon_model crosswalk")] --> pairs["calibration pairs<br/>(am model x IUCN range)"]
+  pairs --> pr["per pair: mass in range r,<br/>footprint at t = 1..90"]
+  cell[("v8 cell: ocean cells,<br/>in_usa")] --> pr
+  pr --> cut["Jaccard, range kept,<br/>footprint outside, t*"]
+  pr --> cc["8-neighbour components<br/>(runs + igraph)"]
+  occ[("am.duckdb spp_occs<br/>0.5-degree occurrence cells")] --> cc
+  obis[("OBIS obis_cell<br/>(global05)")] --> cc
+  cc --> isl["islands: count, size, mass,<br/>occurrence support"]
+  cut --> sum["t* by class / order / covariates;<br/>one cutoff vs covariate vs taxonomy (5-fold CV)"]
+  isl --> maps["illustrative maps"]
+  meta[("am.duckdb spp, spp_prefs, cells")] --> fao["FAO-area consistency check"]
+  sum --> csv["data/explore/range_constraint_*.csv"]
+```
+
+## Setup
+
+```{r}
+#| label: setup
+#| message: false
+
+librarian::shelf(
+  arrow, data.table, DBI, dplyr, duckdb, fs, ggplot2, glue, here, igraph, knitr, patchwork,
+  purrr, readr, rnaturalearth, rpart, scales, sf, stringr, terra, tibble, tidyr, tidyterra, quiet = T)
+options(readr.show_col_types = F, dplyr.summarise.inform = F)
+source(here("libs/paths.R"))     # ver, dir_big, dir_big_v, am_db, obis_h3_*
+source(here("libs/vars.R"))      # .flag()
+source(here("libs/obis_h3.R"))   # obis_h3_src()
+sf_use_s2(FALSE)
+data.table::setDTthreads(2)
+
+# parameters ----
+redo     <- .flag("REDO_EXPLORE")                                 # rebuild every cache below
+test_n   <- as.integer(Sys.getenv("EXPLORE_TEST_N", "0"))         # smoke test: n pairs, nothing written to data/
+mem_gb   <- Sys.getenv("BUILD_MEMORY_GB", "4")   # small: runs beside the attribution loop on the same volume
+n_thr    <- Sys.getenv("BUILD_THREADS", "2")
+ts       <- c(1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90)           # cutoffs on val (= AquaMaps probability x 100)
+t_isl    <- c(10, 30, 50)                                         # cutoffs whose components are kept in full
+year_min <- 1950                                                  # OBIS records dated earlier are ignored (as explore_occurrence_rule)
+nc       <- 7200L; nr <- 3600L; n_grid <- nc * nr; res <- 0.05    # global05
+batch_sz <- 100
+
+# paths ----
+dir_dist <- path_expand(glue("{dir_big_v}/marine-atlas/dist"))
+merge_v8 <- path_expand(glue("{dir_big}/v8/marine-atlas/merge.duckdb"))   # crosswalk + taxon flags (read-only)
+sdm_v8   <- path_expand(glue("{dir_big}/v8/sdm.duckdb"))                  # cell table (read-only)
+f_am_db  <- path_expand(am_db)
+f_obis   <- path_expand(obis_h3_src("obis_cell.parquet")$path)
+f_worms  <- path_expand(obis_h3_src("worms_taxon.parquet")$path)
+dir_rc0  <- path_expand(glue("{dir_big}/explore/range_constraint"))
+dir_rc   <- if (test_n > 0) glue("{dir_rc0}/test_{test_n}") else dir_rc0
+dir_bat  <- glue("{dir_rc}/batch")
+dir_tmp  <- path_expand(glue("{dir_big}/tmp_explore"))
+dir_out  <- here("data/explore")
+dir_create(c(dir_rc, dir_bat, dir_tmp, dir_out))
+if (redo) file_delete(dir_ls(dir_bat))
+stopifnot(
+  "dist/ of the version not found" = dir_exists(dir_dist),
+  "v8 merge.duckdb not found"      = file_exists(merge_v8),
+  "v8 sdm.duckdb not found"        = file_exists(sdm_v8),
+  "am.duckdb not found"            = file_exists(f_am_db),
+  "OBIS release not on local disk" = file_exists(f_obis) && file_exists(f_worms))
+
+con <- dbConnect(duckdb())
+dbExecute(con, glue("SET memory_limit='{mem_gb}GB'"))
+dbExecute(con, glue("SET threads={n_thr}"))
+dbExecute(con, glue("SET temp_directory='{dir_tmp}'"))
+dbExecute(con, "SET preserve_insertion_order=false")
+dbExecute(con, glue("ATTACH '{merge_v8}' AS m8 (READ_ONLY)"))
+dbExecute(con, glue("ATTACH '{f_am_db}' AS am (READ_ONLY)"))
+
+# cell arithmetic on global05: cell_id = row * 7200 + col + 1 (0-based row from 90N, col from 180W)
+cell_lon <- \(id) -180 + (((id - 1L) %% nc) + 0.5) * res
+cell_lat <- \(id)   90 - (((id - 1L) %/% nc) + 0.5) * res
+message(glue("explore_range_constraint: dist {dir_dist}, cache {dir_rc}, test_n {test_n}, redo {redo}"))
+```
+
+## Calibration pairs
+
+The spec pairs `model_am.csv$iucn_id` with `model_rng_iucn.csv$id_no`, falling back on the scientific name. In this
+release **`iucn_id` is empty for every AquaMaps model** (and `spp.iucn_id` in `am.duckdb` is too), so the id join
+yields nothing. The merge itself pairs models through WoRMS (`merge_models_prep`: every model's scientific name to an
+accepted WoRMS id, so synonyms meet), and that crosswalk is in v8's `merge.duckdb` `taxon_model`. The calibration set
+is the merge's own pairing: every (AquaMaps model, IUCN range) that share an `ms_merge_key`.
+
+```{r}
+#| label: pairs
+
+m_am  <- read_csv(glue("{dir_dist}/model_am.csv"), na = "NA", col_types = cols(.default = "c"))
+m_rng <- read_csv(glue("{dir_dist}/model_rng_iucn.csv"), na = "NA", col_types = cols(.default = "c")) |>
+  distinct(mdl_key, .keep_all = TRUE)    # a few id_no appear under two IUCN groups (MAMMALS + MAMMALS_MARINE_ONLY)
+
+p_id   <- m_am |> filter(!is.na(iucn_id)) |> inner_join(m_rng, by = c("iucn_id" = "id_no"), suffix = c("", "_rng"))
+p_name <- m_am |> inner_join(m_rng, by = c("taxa" = "sci_name"), suffix = c("", "_rng")) |>
+  transmute(am_key = mdl_key, rng_key = mdl_key_rng)
+p_worms <- dbGetQuery(con, "
+  SELECT DISTINCT a.mdl_key AS am_key, r.mdl_key AS rng_key, a.taxon_id, a.ms_merge_key
+  FROM m8.taxon_model a JOIN m8.taxon_model r USING (ms_merge_key)
+  WHERE a.mdl_key LIKE 'am|%' AND r.mdl_key LIKE 'rng_iucn|%'") |>
+  semi_join(m_am,  by = c("am_key"  = "mdl_key")) |>
+  semi_join(m_rng, by = c("rng_key" = "mdl_key"))
+
+tibble(
+  pairing     = c("iucn_id = id_no", "taxa = sci_name", "WoRMS crosswalk (v8 taxon_model)"),
+  pairs       = c(nrow(p_id), nrow(p_name), nrow(p_worms)),
+  am_models   = c(n_distinct(p_id$mdl_key), n_distinct(p_name$am_key), n_distinct(p_worms$am_key)),
+  iucn_ranges = c(n_distinct(p_id$mdl_key_rng), n_distinct(p_name$rng_key), n_distinct(p_worms$rng_key)),
+  also_by_name = c(NA, nrow(p_name), nrow(semi_join(p_worms, p_name, by = c("am_key", "rng_key"))))) |>
+  kable(caption = "Pairing methods. iucn_id is empty in model_am.csv, so the name match and the WoRMS crosswalk carry the pairing")
+stopifnot("every name pair is a WoRMS pair" = nrow(anti_join(p_name, p_worms, by = c("am_key", "rng_key"))) == 0)
+```
+
+```{r}
+#| label: pairs-cov
+
+f_pairs0 <- glue("{dir_rc}/pairs0.parquet")
+if (redo || !file_exists(f_pairs0)) {
+  duckdb_register(con, "p_worms", p_worms |> mutate(sp_key = sub("^am\\|", "", am_key)))
+  duckdb_register(con, "m_rng", m_rng)
+  pairs0 <- dbGetQuery(con, '
+    SELECT p.am_key, p.rng_key, p.sp_key, CAST(p.taxon_id AS INTEGER) AS taxon_id, p.ms_merge_key,
+           t.scientific_name, t.sp_cat, COALESCE(t.is_valid_usa AND t.is_marine, FALSE) AS is_scored_v8,
+           s.genus || \' \' || s.species AS am_name, s.phylum, s."class", s."order", s.family, s.provider,
+           s.occur_recs, s.occur_cells,
+           sp.map_opt, sp.pelagic, sp.layer, COALESCE(sp.reviewed, 0) AS reviewed, sp.fao_areas,
+           r.id_no AS iucn_id, r.class AS iucn_class, r.category AS iucn_category, r.grp AS iucn_grp
+    FROM p_worms p
+    JOIN am.spp s        ON s.sp_key  = p.sp_key
+    JOIN am.spp_prefs sp ON sp.sp_key = p.sp_key
+    JOIN m_rng r         ON r.mdl_key = p.rng_key
+    LEFT JOIN m8.taxon t ON t.ms_merge_key = p.ms_merge_key
+    ORDER BY p.am_key, p.rng_key') |> as_tibble()
+  duckdb_unregister(con, "p_worms"); duckdb_unregister(con, "m_rng")
+  write_parquet(pairs0, f_pairs0)
+}
+pairs0 <- read_parquet(f_pairs0) |>
+  mutate(
+    rng_id = sub("^rng_iucn\\|", "", rng_key),
+    f_am   = as.character(glue("{dir_dist}/dataset=am/{sp_key}.parquet")),
+    f_rng  = as.character(glue("{dir_dist}/dataset=rng_iucn/{rng_id}.parquet")))
+stopifnot("every pair resolves to its am + range files" = all(file_exists(pairs0$f_am)) && all(file_exists(pairs0$f_rng)))
+
+# the class used for grouping: AquaMaps class, small classes lumped
+cls_keep <- pairs0 |> count(class) |> filter(n >= 20) |> pull(class)
+pairs0   <- pairs0 |> mutate(cls = if_else(class %in% cls_keep, class, "other"))
+```
+
+```{r}
+#| label: pairs-by-class
+
+tab_cat <- pairs0 |>
+  group_by(sp_cat = coalesce(sp_cat, "(not in v8 taxon)")) |>
+  summarise(pairs = n(), taxa = n_distinct(ms_merge_key),
+            pairs_scored = sum(is_scored_v8), taxa_scored = n_distinct(ms_merge_key[is_scored_v8])) |>
+  arrange(desc(pairs))
+bind_rows(tab_cat, tab_cat |> summarise(sp_cat = "total", across(where(is.numeric), sum))) |>
+  kable(caption = "Calibration pairs by MST category (sp_cat). scored = is_valid_usa AND is_marine in v8 (the plan's 1,590 set); the global set is used for calibration")
+
+pairs0 |> count(class, sort = TRUE, name = "pairs") |>
+  mutate(scored = map_int(class, \(k) sum(pairs0$is_scored_v8[pairs0$class %in% k]))) |>
+  kable(caption = "Calibration pairs by AquaMaps class")
+```
+
+## Cells and occurrences
+
+Ocean cells come from v8's `cell` table (17.07 M cells of the 25.9 M on the grid); IUCN range cells are cut to them
+(a range polygon also covers land, which AquaMaps never predicts). lon / lat follow from the cell id by arithmetic,
+checked against the table.
+
+```{r}
+#| label: cells
+
+f_cell <- glue("{dir_rc0}/cell_ocean.parquet")
+f_cchk <- glue("{dir_rc0}/cell_check.csv")
+if (redo || !file_exists(f_cell)) {
+  dbExecute(con, glue("ATTACH '{sdm_v8}' AS s8 (READ_ONLY)"))
+  chk <- dbGetQuery(con, glue("
+    SELECT count(*) AS n, max(abs(lon - (-180 + (((cell_id - 1) % {nc}) + 0.5) * {res}))) AS dlon,
+           max(abs(lat - (90 - (((cell_id - 1) // {nc}) + 0.5) * {res}))) AS dlat FROM s8.cell"))
+  dbExecute(con, glue("COPY (SELECT cell_id, area_km2, in_usa FROM s8.cell) TO '{f_cell}' (FORMAT parquet)"))
+  dbExecute(con, "DETACH s8")
+  write_csv(chk, f_cchk)
+}
+chk <- read_csv(f_cchk)
+stopifnot("cell lon/lat arithmetic disagrees with v8 cell" = chk$dlon < 1e-4, chk$dlat < 1e-4)   # the table stores float32-rounded centres (~6e-6 deg)
+cell <- read_parquet(f_cell)
+ocean <- logical(n_grid); ocean[cell$cell_id] <- TRUE
+in_us <- logical(n_grid); in_us[cell$cell_id[cell$in_usa]] <- TRUE
+message(glue("ocean cells {sum(ocean)}, in_usa {sum(in_us)}; lon/lat arithmetic max error {signif(max(chk$dlon, chk$dlat), 2)} deg"))
+```
+
+**AquaMaps occurrence cells** are AquaMaps' own 0.5-degree cells (`spp_occs`, `good_cell = 1` = the cells it fitted
+the envelope on). A 0.5-degree cell is 10 x 10 cells of our grid; a component "holds an occurrence" when it contains any
+of them. **OBIS records** are the obisindicators release on our grid (`obis_cell`: each H3 res-7 hexagon's records
+credited to the cell holding its centroid), credited to the accepted species exactly as `explore_occurrence_rule.qmd`
+does, records before `r year_min` ignored. This release covers every calibration taxon, so OBIS support is computed for
+all of them, not only the illustrative species, and nothing is fetched with `robis`.
+
+```{r}
+#| label: occurrences
+
+f_amocc <- glue("{dir_rc}/am_occ.parquet")
+f_obis_c <- glue("{dir_rc}/obis.parquet")
+duckdb_register(con, "calib", pairs0 |> distinct(sp_key, taxon_id))
+if (redo || !file_exists(f_amocc)) {
+  dbExecute(con, glue("
+    COPY (SELECT o.sp_key, o.center_lat, o.center_long, o.good_cell, o.obis_yn, o.gbif_yn
+          FROM am.spp_occs o WHERE o.sp_key IN (SELECT sp_key FROM calib)) TO '{f_amocc}' (FORMAT parquet)"))
+}
+if (redo || !file_exists(f_obis_c)) {
+  dbExecute(con, glue("CREATE OR REPLACE VIEW worms AS SELECT * FROM read_parquet('{f_worms}')"))
+  dbExecute(con, "
+    CREATE OR REPLACE TEMP TABLE w_alias AS
+    SELECT w.taxonID AS aphiaid,
+           CASE WHEN a.taxonID IS NULL THEN w.taxonID
+                WHEN a.taxonRank IN ('Subspecies', 'Variety', 'Subvariety', 'Forma', 'Subforma') THEN COALESCE(a.parentNameUsageID, a.taxonID)
+                ELSE a.taxonID END AS sp_id
+    FROM worms w LEFT JOIN worms a ON a.taxonID = COALESCE(w.acceptedNameUsageID, w.taxonID)")
+  dbExecute(con, glue("
+    COPY (
+      SELECT CAST(a.sp_id AS INTEGER) AS taxon_id, o.cell_id, sum(o.records)::INTEGER AS records
+      FROM read_parquet('{f_obis}') o JOIN w_alias a ON a.aphiaid = o.aphiaid
+      WHERE a.sp_id IN (SELECT taxon_id FROM calib) AND (o.date_year IS NULL OR o.date_year >= {year_min})
+      GROUP BY ALL) TO '{f_obis_c}' (FORMAT parquet)"))
+}
+duckdb_unregister(con, "calib")
+am_occ  <- read_parquet(f_amocc)
+obis_c  <- read_parquet(f_obis_c)
+am_occ_l <- split(am_occ, am_occ$sp_key)
+obis_l   <- split(obis_c[, c("cell_id", "records")], obis_c$taxon_id)
+
+tibble(
+  source = c("AquaMaps occurrence cells (0.5 deg)", "  of which good_cell = 1", "OBIS records (>= 1950)"),
+  rows   = c(nrow(am_occ), sum(am_occ$good_cell == 1, na.rm = TRUE), sum(obis_c$records)),
+  taxa   = c(n_distinct(am_occ$sp_key), n_distinct(am_occ$sp_key[am_occ$good_cell %in% 1]), n_distinct(obis_c$taxon_id)),
+  of_calibration_taxa = c(n_distinct(pairs0$sp_key), n_distinct(pairs0$sp_key), n_distinct(pairs0$taxon_id))) |>
+  kable(caption = "Occurrence sources over the calibration taxa", format.args = list(big.mark = ","))
+
+# 0.5-degree occurrence cell -> its 100 global05 cell ids (column of a 100 x n matrix)
+occ_cells <- function(lat, lon) {
+  if (!length(lat)) return(matrix(integer(), 100, 0))
+  br <- floor((90 - lat) / 0.5); bc <- floor((lon + 180) / 0.5)
+  o  <- expand.grid(dr = 0:9, dc = 0:9)
+  matrix(as.integer((rep(br * 10, each = 100) + o$dr) * nc + (rep(bc * 10, each = 100) + o$dc) + 1L), nrow = 100)
+}
+```
+
+## Connected components
+
+`terra::patches()` on a global 0.05-degree raster took 2 min for one wide species (yellowfin tuna, 10.7 M cells, 11
+cutoffs), so ~1,600+ pairs would take days. Instead `cc8()` labels 8-neighbour components from **horizontal runs**:
+each row's runs of consecutive cells are nodes, a run touches the runs of the next row whose column span overlaps its
+own widened by one cell (that is the diagonal), and `igraph::components()` labels the graph. Runs at column 1 and 7200
+also touch across the antimeridian (`terra::patches` does not wrap). The check below reproduces `terra::patches` exactly
+with the wrap off, on a coral (80 k cells) and the walrus (1.3 M cells).
+
+```{r}
+#| label: cc8
+
+cc8 <- function(id, nc = 7200L, wrap = TRUE) {
+  # id: sorted global05 cell ids; returns the component of each, 1..n
+  n <- length(id)
+  if (n == 0) return(integer())
+  id0 <- id - 1L; row <- id0 %/% nc; col <- id0 %% nc
+  brk <- c(TRUE, diff(id0) != 1L | diff(row) != 0L)
+  run <- cumsum(brk)
+  R   <- data.table(run = seq_len(sum(brk)), row = row[brk], c0 = col[brk], c1 = col[c(brk[-1], TRUE)])
+  A   <- R[, .(run, row = row + 1L, lo = c0 - 1L, hi = c1 + 1L)]
+  e   <- R[A, on = .(row, c0 <= hi, c1 >= lo), .(a = i.run, b = x.run), nomatch = NULL, allow.cartesian = TRUE]
+  if (wrap) {
+    w0 <- R[c0 == 0L, .(run, row)]; w1 <- R[c1 == nc - 1L, .(run, row)]
+    if (nrow(w0) && nrow(w1))
+      e <- rbindlist(c(list(e), lapply(-1:1, \(d) w1[, .(row = row + d, b = run)][w0, on = .(row), .(a = i.run, b), nomatch = NULL])))
+  }
+  g <- make_graph(as.vector(t(as.matrix(e))), n = nrow(R), directed = FALSE)
+  components(g)$membership[run]
+}
+
+cc_check <- map_dfr(c("W-Scl-288227", "ITS-Mam-180639"), \(k) {
+  am <- read_parquet(glue("{dir_dist}/dataset=am/{k}.parquet"), col_select = c("cell_id", "val")) |> arrange(cell_id)
+  row <- (am$cell_id - 1L) %/% nc; col <- (am$cell_id - 1L) %% nc
+  r0 <- min(row); c0 <- min(col); nrr <- max(row) - r0 + 1L; ncc <- max(col) - c0 + 1L
+  idx <- (row - r0) * ncc + (col - c0) + 1L
+  map_dfr(c(10, 50), \(t) {
+    x <- rast(nrows = nrr, ncols = ncc, xmin = 0, xmax = ncc, ymin = 0, ymax = nrr)
+    v <- rep(NA_integer_, nrr * ncc); v[idx[am$val >= t]] <- 1L; values(x) <- v
+    k_t <- am$val >= t
+    tibble(model = k, t = t, cells = sum(k_t),
+           terra_patches = length(unique(na.omit(values(patches(x, directions = 8))))),
+           cc8_nowrap = max(cc8(am$cell_id[k_t], wrap = FALSE)),
+           cc8_wrap   = max(cc8(am$cell_id[k_t])))
+  })
+})
+kable(cc_check, caption = "cc8() against terra::patches(directions = 8): identical without the antimeridian wrap")
+stopifnot("cc8 disagrees with terra::patches" = all(cc_check$terra_patches == cc_check$cc8_nowrap))
+```
+
+## Per-pair statistics
+
+For each pair: total suitability mass M = sum(val) over the AquaMaps cells, mass inside the IUCN range M_in, r =
+M_in / M; for each cutoff t the footprint F_t = {val >= t} against the ocean cells R of the range: Jaccard |F n R| /
+|F u R|, range kept |F n R| / |R|, footprint outside 1 - |F n R| / |F|, the number of components of F_t, and how many of
+them hold an AquaMaps occurrence cell and / or an OBIS record. Two connectivity rules are scored at every t: **C1** keeps
+the components holding an AquaMaps occurrence cell, **C2** those holding an AquaMaps occurrence cell or an OBIS record.
+The same statistics are computed inside US waters (`in_usa`), where the score is. t* = the cutoff of best Jaccard
+(ties to the lower t). Counts are cells, not km^2 (a 0.05-degree cell shrinks with latitude). Batches of
+`r batch_sz` pairs are cached; a re-render reads them.
+
+```{r}
+#| label: pair-loop
+
+calib <- if (test_n > 0) { set.seed(42); pairs0[sort(sample(nrow(pairs0), test_n)), ] } else pairs0
+calib$batch <- (seq_len(nrow(calib)) - 1L) %/% batch_sz + 1L
+
+mark_rng <- logical(n_grid)    # the pair's range cells (set, used, reset: never reallocated)
+mark_occ <- logical(n_grid)    # the pair's AquaMaps good occurrence cells
+obis_n   <- integer(n_grid)    # the pair's OBIS records per cell
+
+comp_stats <- function(comp, v, in_r, in_u, occ, nob) {
+  n_cc <- max(comp)
+  rs   <- \(x) rowsum(x, comp, reorder = TRUE)[, 1]    # comp ids are 1..n_cc, all present
+  # (computed before tibble(): inside it a column named comp would shadow the argument)
+  out  <- list(n_cells = tabulate(comp, n_cc), mass = rs(v), n_in_rng = rs(as.integer(in_r)), n_us = rs(as.integer(in_u)),
+               n_amocc = rs(as.integer(occ)), obis_rec = rs(nob))
+  tibble(comp = seq_len(n_cc), !!!out)
+}
+
+t0_all <- Sys.time()
+for (b in sort(unique(calib$batch))) {
+  f_b <- glue("{dir_bat}/{c('pairs', 'cutoffs', 'comps')}_{sprintf('%03d', b)}.parquet")
+  if (all(file_exists(f_b))) next
+  t0 <- Sys.time()
+  pb <- calib |> filter(batch == b)
+  out_p <- out_t <- out_c <- vector("list", nrow(pb))
+  for (i in seq_len(nrow(pb))) {
+    p  <- pb[i, ]
+    am <- read_parquet(p$f_am, col_select = c("mdl_key", "cell_id", "val"))
+    stopifnot("am parquet holds another model" = all(am$mdl_key == p$am_key), "duplicate am cells" = !anyDuplicated(am$cell_id))
+    am <- am[order(am$cell_id), ]
+    id <- am$cell_id; v <- am$val
+    rg <- read_parquet(p$f_rng, col_select = c("mdl_key", "cell_id"))
+    stopifnot("range parquet holds another model" = all(rg$mdl_key == p$rng_key))
+    rg_all <- unique(rg$cell_id); rg <- rg_all[ocean[rg_all]]
+    n_rng <- length(rg); n_rng_us <- sum(in_us[rg])
+
+    oc  <- am_occ_l[[p$sp_key]]
+    ocg <- if (is.null(oc)) matrix(integer(), 100, 0) else occ_cells(oc$center_lat[oc$good_cell %in% 1], oc$center_long[oc$good_cell %in% 1])
+    ob  <- obis_l[[as.character(p$taxon_id)]]
+    if (is.null(ob)) ob <- tibble(cell_id = integer(), records = integer())
+
+    mark_rng[rg] <- TRUE; mark_occ[ocg] <- TRUE; obis_n[ob$cell_id] <- ob$records
+    in_r <- mark_rng[id]; in_u <- in_us[id]; occ <- mark_occ[id]; nob <- obis_n[id]
+    occ_blk_in_rng <- if (ncol(ocg)) colSums(matrix(mark_rng[ocg], nrow = 100)) > 0 else logical()
+    obis_in_rng    <- sum(ob$records[mark_rng[ob$cell_id]])
+    mark_rng[rg] <- FALSE; mark_occ[ocg] <- FALSE; obis_n[ob$cell_id] <- 0L
+
+    rows_t <- vector("list", length(ts)); comps_t <- vector("list", length(ts))
+    for (j in seq_along(ts)) {
+      k <- v >= ts[j]
+      n_fp <- sum(k); n_int <- sum(in_r[k]); n_fp_us <- sum(in_u[k]); n_int_us <- sum(in_r[k] & in_u[k])
+      if (n_fp > 0) {
+        cs <- comp_stats(cc8(id[k]), v[k], in_r[k], in_u[k], occ[k], nob[k])
+        c1 <- cs$n_amocc > 0; c2 <- c1 | cs$obis_rec > 0
+      } else { cs <- NULL; c1 <- c2 <- logical() }
+      sc <- \(keep) c(n = sum(cs$n_cells[keep]), int = sum(cs$n_in_rng[keep]))
+      k1 <- sc(c1); k2 <- sc(c2)
+      jac <- \(a, i, r) if (a + r - i > 0) i / (a + r - i) else NA_real_
+      rows_t[[j]] <- tibble(
+        t = ts[j], n_fp = n_fp, mass_fp = sum(v[k]), n_int = n_int,
+        jac = jac(n_fp, n_int, n_rng), keep_rng = if (n_rng > 0) n_int / n_rng else NA_real_,
+        out_fp = if (n_fp > 0) 1 - n_int / n_fp else NA_real_,
+        n_cc = length(c1), n_cc_amocc = sum(c1), n_cc_occ = sum(c2), n_cc_obis = sum(cs$obis_rec > 0),
+        n_c1 = k1[["n"]], jac_c1 = jac(k1[["n"]], k1[["int"]], n_rng), keep_rng_c1 = if (n_rng > 0) k1[["int"]] / n_rng else NA_real_,
+        n_c2 = k2[["n"]], jac_c2 = jac(k2[["n"]], k2[["int"]], n_rng), keep_rng_c2 = if (n_rng > 0) k2[["int"]] / n_rng else NA_real_,
+        n_fp_us = n_fp_us, n_int_us = n_int_us, jac_us = jac(n_fp_us, n_int_us, n_rng_us))
+      comps_t[[j]] <- cs
+    }
+    tt <- bind_rows(rows_t)
+    j_star <- which.max(replace(tt$jac, is.na(tt$jac), -1))
+    t_star <- ts[j_star]
+    keep_j <- which(ts %in% c(t_isl, t_star))
+    out_c[[i]] <- map_dfr(keep_j, \(j) if (!is.null(comps_t[[j]])) comps_t[[j]] |> mutate(t = ts[j], .before = 1)) |>
+      mutate(am_key = p$am_key, rng_key = p$rng_key, is_tstar = t == t_star, .before = 1)
+    out_t[[i]] <- tt |> mutate(am_key = p$am_key, rng_key = p$rng_key, .before = 1)
+    out_p[[i]] <- tibble(
+      am_key = p$am_key, rng_key = p$rng_key,
+      mass = sum(v), mass_in = sum(v[in_r]), r = sum(v[in_r]) / sum(v),
+      n_am = length(id), n_am_land = sum(!ocean[id]), n_am_us = sum(in_u),
+      n_rng_all = length(rg_all), n_rng = n_rng, n_rng_us = n_rng_us,
+      n_amocc_blk = ncol(ocg), share_amocc_in_rng = if (ncol(ocg)) mean(occ_blk_in_rng) else NA_real_,
+      obis_rec = sum(ob$records), obis_cells = nrow(ob),
+      share_obis_in_rng = if (nrow(ob)) obis_in_rng / sum(ob$records) else NA_real_,
+      t_star = t_star, jac_star = tt$jac[j_star], keep_rng_star = tt$keep_rng[j_star],
+      out_fp_star = tt$out_fp[j_star], n_cc_star = tt$n_cc[j_star], jac_t1 = tt$jac[1], jac_us_star = tt$jac_us[j_star])
+  }
+  write_parquet(bind_rows(out_p), f_b[1]); write_parquet(bind_rows(out_t), f_b[2]); write_parquet(bind_rows(out_c), f_b[3])
+  message(glue("batch {b} / {max(calib$batch)}: {nrow(pb)} pairs in {round(as.numeric(Sys.time() - t0, units = 'secs'))} s"))
+}
+message(glue("pair loop: {round(as.numeric(Sys.time() - t0_all, units = 'mins'), 1)} min"))
+
+rd <- \(x) map_dfr(dir_ls(dir_bat, glob = glue("*/{x}_*.parquet")), read_parquet)
+ps <- rd("pairs"); ct <- rd("cutoffs"); cp <- rd("comps")
+stopifnot(
+  "every calibration pair has its statistics (stale batch/ files? REDO_EXPLORE=1)" =
+    nrow(ps) == nrow(calib) && nrow(anti_join(calib, ps, by = c("am_key", "rng_key"))) == 0,
+  nrow(ct) == nrow(calib) * length(ts))
+pairs <- calib |> select(-f_am, -f_rng, -rng_id, -batch) |> inner_join(ps, by = c("am_key", "rng_key"))
+ct    <- ct |> inner_join(pairs |> select(am_key, rng_key, cls, sp_cat, is_scored_v8), by = c("am_key", "rng_key"))
+```
+
+```{r}
+#| label: write-csv
+
+if (test_n == 0) {
+  write_csv(pairs |> select(-fao_areas), glue("{dir_out}/range_constraint_pairs.csv"))
+  write_csv(ct |> select(am_key, rng_key, t:jac_us), glue("{dir_out}/range_constraint_cutoffs.csv"))
+}
+tibble(
+  n_pairs = nrow(pairs), am_cells = sum(pairs$n_am), am_cells_off_ocean = sum(pairs$n_am_land),
+  range_cells_all = sum(pairs$n_rng_all), range_cells_ocean = sum(pairs$n_rng),
+  pairs_without_ocean_range = sum(pairs$n_rng == 0)) |>
+  kable(caption = "Cells over all pairs: AquaMaps cells off the ocean grid, IUCN range cells on land (cut)", format.args = list(big.mark = ","))
+```
+
+## Cutoffs: one number, a covariate, or taxonomy?
+
+### Mass inside the range and t*
+
+```{r}
+#| label: tstar-by-class
+
+q <- \(x, p) unname(quantile(x, p, na.rm = TRUE))
+summ_t <- \(d) d |> summarise(
+  pairs = n(), r_median = median(r, na.rm = TRUE),
+  t_star_median = median(t_star), t_star_q25 = q(t_star, 0.25), t_star_q75 = q(t_star, 0.75),
+  jac_star_median = median(jac_star, na.rm = TRUE), jac_t1_median = median(jac_t1, na.rm = TRUE),
+  keep_rng_star = median(keep_rng_star, na.rm = TRUE), out_fp_star = median(out_fp_star, na.rm = TRUE),
+  n_cc_star_median = median(n_cc_star))
+pv <- pairs |> filter(n_rng > 0)
+bind_rows(pv |> group_by(cls) |> summ_t() |> arrange(desc(pairs)), pv |> summ_t() |> mutate(cls = "all")) |>
+  kable(digits = 2, caption = "By AquaMaps class: r = suitability mass inside the IUCN range; t* = cutoff of best Jaccard; jac_t1 = Jaccard of the whole AquaMaps footprint (t = 1)")
+bind_rows(pv |> group_by(sp_cat) |> summ_t() |> arrange(desc(pairs)), pv |> filter(is_scored_v8) |> summ_t() |> mutate(sp_cat = "all scored (v8)")) |>
+  kable(digits = 2, caption = "By MST category, and the scored subset")
+pv |> count(t_star) |> mutate(share = n / sum(n)) |> kable(digits = 3, caption = "Distribution of t* over all pairs")
+```
+
+```{r}
+#| label: fig-tstar-box
+#| fig-cap: "t* (cutoff of best Jaccard with the IUCN range) by AquaMaps class; points jittered; n in the labels"
+#| fig-height: 5
+
+lab_n <- pv |> count(cls) |> mutate(lab = glue("{cls}\n(n={n})"))
+pv |> left_join(lab_n, by = "cls") |>
+  mutate(lab = reorder(as.character(lab), t_star, median)) |>
+  ggplot(aes(lab, t_star)) +
+  geom_jitter(width = 0.25, height = 1.5, alpha = 0.15, size = 0.6) +
+  geom_boxplot(outlier.shape = NA, fill = NA, colour = "steelblue4", linewidth = 0.6) +
+  scale_y_continuous(breaks = ts) + labs(x = NULL, y = "t* (val cutoff, P x 100)") +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+```{r}
+#| label: fig-jac-curves
+#| fig-cap: "Jaccard with the IUCN range vs cutoff t, median and interquartile range by AquaMaps class"
+#| fig-height: 5
+
+ct |> filter(!is.na(jac)) |>
+  group_by(cls, t) |> summarise(med = median(jac), lo = q(jac, 0.25), hi = q(jac, 0.75), n = n()) |>
+  ggplot(aes(t, med)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), fill = "steelblue", alpha = 0.25) +
+  geom_line(colour = "steelblue4") + geom_point(colour = "steelblue4", size = 0.8) +
+  facet_wrap(~cls) + scale_x_continuous(breaks = c(1, 20, 40, 60, 80)) +
+  labs(x = "cutoff t", y = "Jaccard (footprint vs IUCN range)") + theme_minimal()
+```
+
+```{r}
+#| label: fig-tstar-recs
+#| fig-cap: "t* vs AquaMaps occurrence records (log scale), coloured by class; the line is a loess smooth over all pairs"
+#| fig-height: 5
+
+pv |> ggplot(aes(occur_recs, t_star)) +
+  geom_jitter(aes(colour = cls), width = 0, height = 1.5, alpha = 0.4, size = 0.8) +
+  geom_smooth(method = "loess", colour = "black", se = TRUE, linewidth = 0.6) +
+  scale_x_log10(labels = label_comma()) + scale_y_continuous(breaks = ts) +
+  labs(x = "AquaMaps occurrence records (occur_recs)", y = "t*", colour = "class") + theme_minimal()
+```
+
+### By order within the three largest classes, and by covariates
+
+```{r}
+#| label: tstar-by-order
+
+big3 <- pv |> count(cls) |> filter(cls != "other") |> slice_max(n, n = 3) |> pull(cls)
+pv |> filter(cls %in% big3) |> group_by(cls, order) |> summ_t() |> filter(pairs >= 10) |>
+  arrange(cls, desc(pairs)) |>
+  kable(digits = 2, caption = glue("By order (>= 10 pairs) within {paste(big3, collapse = ', ')}"))
+```
+
+```{r}
+#| label: tstar-by-covariate
+
+cov_tab <- bind_rows(
+  pv |> group_by(level = cut(log10(occur_recs), c(-Inf, 1.5, 2, 2.5, 3, Inf), labels = c("< 32", "32-100", "100-316", "316-1000", "> 1000"))) |> summ_t() |> mutate(covariate = "occur_recs"),
+  pv |> group_by(level = cut(n_rng, quantile(n_rng, 0:5 / 5), include.lowest = TRUE, dig.lab = 6)) |> summ_t() |> mutate(covariate = "IUCN range cells (quintiles)"),
+  pv |> group_by(level = cut(n_am, quantile(n_am, 0:5 / 5), include.lowest = TRUE, dig.lab = 6)) |> summ_t() |> mutate(covariate = "AquaMaps footprint cells (quintiles)"),
+  pv |> group_by(level = as.character(pelagic)) |> summ_t() |> mutate(covariate = "pelagic"),
+  pv |> group_by(level = layer) |> summ_t() |> mutate(covariate = "layer"),
+  pv |> group_by(level = as.character(map_opt)) |> summ_t() |> mutate(covariate = "map_opt"),
+  pv |> group_by(level = as.character(reviewed)) |> summ_t() |> mutate(covariate = "reviewed")) |>
+  relocate(covariate, level)
+kable(cov_tab |> select(covariate, level, pairs, t_star_median, t_star_q25, t_star_q75, jac_star_median, jac_t1_median, r_median),
+      digits = 2, caption = "t* and Jaccard by covariate level (range size is known only for calibration taxa; the others are available for every AquaMaps taxon)")
+
+cor_tab <- pv |> summarise(
+  across(c(occur_recs, occur_cells, n_am, n_rng), list(
+    rho = \(x) cor(log10(x + 1), t_star, method = "spearman")))) |>
+  pivot_longer(everything(), names_to = "covariate", values_to = "spearman_rho_with_t_star")
+kable(cor_tab, digits = 3, caption = "Spearman correlation of t* with log covariates")
+```
+
+### One cutoff vs taxonomy vs a covariate rule (5-fold cross-validation)
+
+Each rule picks a cutoff for a species without looking at its range; the score is the Jaccard that cutoff achieves
+against the held-out species' IUCN range, compared with the oracle t*. **Single**: the one t maximizing mean Jaccard
+over the training folds. **Class**: the best t per AquaMaps class on the training folds (single t where a class is
+absent). **Covariate tree**: `rpart` regression of t* on log occurrence records, log occurrence cells, log footprint
+cells, class, pelagic, layer, map_opt and reviewed, prediction snapped to the nearest cutoff on the grid. **Leaf best**: the same tree's leaves, each given the cutoff that maximizes mean Jaccard over its
+training pairs (the tree as a grouping, not a predictor of t*).
+
+```{r}
+#| label: cv
+
+J <- ct |> semi_join(pv, by = c("am_key", "rng_key")) |>
+  select(am_key, rng_key, t, jac) |> mutate(jac = coalesce(jac, 0)) |>
+  pivot_wider(names_from = t, values_from = jac, names_prefix = "t") |>
+  inner_join(pv |> select(am_key, rng_key, cls, t_star, jac_star, occur_recs, occur_cells, n_am, pelagic, layer, map_opt, reviewed), by = c("am_key", "rng_key"))
+jm   <- as.matrix(J[, paste0("t", ts)])
+best <- \(rows) ts[which.max(colMeans(jm[rows, , drop = FALSE]))]
+snap <- \(x) ts[findInterval(x, (head(ts, -1) + tail(ts, -1)) / 2) + 1]
+Jd <- J |> mutate(lrec = log10(occur_recs + 1), lcel = log10(occur_cells + 1), lfp = log10(n_am),
+                  pelagic = factor(coalesce(as.integer(pelagic), 0L)), layer = factor(coalesce(layer, "NA")),
+                  map_opt = factor(map_opt), reviewed = factor(reviewed), cls = factor(cls))
+f_tree <- t_star ~ lrec + lcel + lfp + cls + pelagic + layer + map_opt + reviewed
+ctl    <- rpart.control(cp = 0.01, minbucket = 30)
+set.seed(1); fold <- sample(rep(1:5, length.out = nrow(J)))
+pick <- matrix(NA_real_, nrow(J), 4, dimnames = list(NULL, c("single", "class", "covariate_tree", "leaf_best")))
+for (f in 1:5) {
+  tr <- which(fold != f); te <- which(fold == f)
+  t1 <- best(tr); pick[te, "single"] <- t1
+  for (k in unique(J$cls[te])) { trk <- tr[J$cls[tr] == k]; pick[te[J$cls[te] == k], "class"] <- if (length(trk) >= 10) best(trk) else t1 }
+  fit <- rpart(f_tree, data = Jd[tr, ], control = ctl)
+  y_tr <- round(predict(fit, Jd[tr, ]), 8); y_te <- round(predict(fit, Jd[te, ]), 8)   # a leaf = its fitted value
+  pick[te, "covariate_tree"] <- snap(y_te)
+  for (lf in unique(y_te)) pick[te[y_te == lf], "leaf_best"] <- best(tr[y_tr == lf])
+}
+jac_at <- \(tsel) jm[cbind(seq_len(nrow(jm)), match(tsel, ts))]
+cv <- J |> select(am_key, rng_key, cls, jac_star) |>
+  mutate(whole_footprint = jm[, "t1"], single = jac_at(pick[, "single"]), class = jac_at(pick[, "class"]),
+         covariate_tree = jac_at(pick[, "covariate_tree"]), leaf_best = jac_at(pick[, "leaf_best"]))
+rules   <- c("whole_footprint", "single", "class", "covariate_tree", "leaf_best", "jac_star")
+cv_long <- cv |> pivot_longer(all_of(rules), names_to = "rule", values_to = "jac") |> mutate(rule = factor(rule, rules))
+bind_rows(cv_long |> group_by(cls, rule) |> summarise(mean_jac = mean(jac), n = n()),
+          cv_long |> group_by(rule) |> summarise(mean_jac = mean(jac), n = n()) |> mutate(cls = "all")) |>
+  pivot_wider(names_from = rule, values_from = mean_jac) |> arrange(cls == "all", desc(n)) |>
+  kable(digits = 3, caption = "Mean held-out Jaccard by rule (5-fold CV). whole_footprint = no cutoff (t = 1: today's merge for an AquaMaps-only taxon); jac_star = the per-species oracle")
+cv_long |> group_by(rule) |> summarise(mean = mean(jac), median = median(jac), q25 = q(jac, 0.25), q75 = q(jac, 0.75)) |>
+  kable(digits = 3, caption = "Held-out Jaccard by rule, all pairs")
+tibble(rule = colnames(pick), cutoffs_picked = map_chr(colnames(pick), \(k) { tb <- table(pick[, k]); paste(names(tb), tb, sep = ":", collapse = " ") })) |>
+  kable(caption = "Cutoffs the rules picked (t:count over held-out pairs)")
+fit_all <- rpart(f_tree, data = Jd, control = ctl)
+t_single <- best(seq_len(nrow(J)))
+message(glue("single best cutoff over all pairs: t = {t_single}"))
+```
+
+```{r}
+#| label: tree-print
+
+print(fit_all, digits = 3)
+tibble(variable = names(fit_all$variable.importance), importance = round(fit_all$variable.importance / sum(fit_all$variable.importance), 3)) |>
+  kable(caption = "Covariate tree (all pairs): relative variable importance")
+```
+
+### What a cutoff costs inside the range
+
+```{r}
+#| label: tradeoff
+#| fig-cap: "Median share of the IUCN range kept (solid) and of the footprint lying outside it (dashed) vs cutoff, by class"
+#| fig-height: 5
+
+ct |> semi_join(pv, by = c("am_key", "rng_key")) |>
+  group_by(cls, t) |> summarise(`range kept` = median(keep_rng, na.rm = TRUE), `footprint outside range` = median(out_fp, na.rm = TRUE)) |>
+  pivot_longer(-c(cls, t)) |>
+  ggplot(aes(t, value, linetype = name)) + geom_line() + facet_wrap(~cls) +
+  labs(x = "cutoff t", y = "median share", linetype = NULL) + theme_minimal() + theme(legend.position = "bottom")
+
+ct |> semi_join(pv, by = c("am_key", "rng_key")) |> filter(t %in% c(1, 10, 30, 50)) |>
+  group_by(t) |> summarise(jac = median(jac, na.rm = TRUE), keep_rng = median(keep_rng, na.rm = TRUE), out_fp = median(out_fp, na.rm = TRUE),
+                           jac_us = median(jac_us, na.rm = TRUE)) |>
+  kable(digits = 3, caption = "All pairs at selected cutoffs (t = 50 is O'Hara et al. 2017's P >= 0.5); jac_us = Jaccard inside US waters")
+```
+
+## Islands
+
+At t = 10, 30 and 50 every component of the footprint is kept with its size, mass and support: an AquaMaps
+occurrence cell (good cell, 0.5 degree), an OBIS record (>= `r year_min`), or overlap with the IUCN range.
+
+```{r}
+#| label: islands
+
+isl <- cp |> filter(t %in% t_isl) |> semi_join(pv, by = c("am_key", "rng_key")) |>
+  group_by(am_key, rng_key, t) |>
+  mutate(mass_share = mass / sum(mass), is_main = n_cells == max(n_cells)) |> ungroup() |>
+  left_join(pairs |> select(am_key, rng_key, cls), by = c("am_key", "rng_key"))
+isl_pair <- isl |> group_by(am_key, rng_key, cls, t) |> summarise(
+  n_cc = n(), n_cc_amocc = sum(n_amocc > 0), n_cc_obis = sum(obis_rec > 0), n_cc_occ = sum(n_amocc > 0 | obis_rec > 0),
+  n_cc_rng = sum(n_in_rng > 0), mass_unsupported = sum(mass_share[n_amocc == 0 & obis_rec == 0]),
+  cells_unsupported = sum(n_cells[n_amocc == 0 & obis_rec == 0]) / sum(n_cells))
+isl_tab <- \(d) d |> summarise(
+  pairs = n(), cc_median = median(n_cc), cc_q75 = q(n_cc, 0.75), cc_max = max(n_cc),
+  share_single = mean(n_cc == 1),
+  share_cc_amocc = sum(n_cc_amocc) / sum(n_cc), share_cc_obis = sum(n_cc_obis) / sum(n_cc),
+  share_cc_occ = sum(n_cc_occ) / sum(n_cc), share_cc_in_rng = sum(n_cc_rng) / sum(n_cc),
+  mass_unsupported_median = median(mass_unsupported), cells_unsupported_median = median(cells_unsupported))
+bind_rows(isl_pair |> group_by(t, cls) |> isl_tab(), isl_pair |> group_by(t) |> isl_tab() |> mutate(cls = "all")) |>
+  arrange(t, cls == "all", desc(pairs)) |>
+  kable(digits = 3, caption = "Components per pair by cutoff and class: share_cc_* = share of all components holding an AquaMaps occurrence cell / an OBIS record / either / overlapping the IUCN range; *_unsupported = median per-pair share of mass / cells in components with no occurrence of either kind")
+
+isl |> filter(t == 30) |>
+  mutate(size = cut(n_cells, c(0, 1, 10, 100, 1000, 1e4, Inf), labels = c("1", "2-10", "11-100", "101-1k", "1k-10k", "> 10k")),
+         support = case_when(n_amocc > 0 ~ "AquaMaps occurrence", obis_rec > 0 ~ "OBIS only", TRUE ~ "none")) |>
+  count(size, support) |> group_by(size) |> mutate(share = n / sum(n)) |> ungroup() |>
+  pivot_wider(names_from = support, values_from = c(n, share), values_fill = 0) |>
+  kable(digits = 3, caption = "t = 30: components by size (cells) and support, all pairs")
+```
+
+Connectivity rules at every cutoff: C1 keeps components holding an AquaMaps occurrence cell, C2 those holding an
+AquaMaps occurrence cell or an OBIS record.
+
+```{r}
+#| label: connectivity-rules
+
+ct |> semi_join(pv, by = c("am_key", "rng_key")) |>
+  group_by(t) |> summarise(
+    jac = mean(jac, na.rm = TRUE), jac_c1 = mean(jac_c1, na.rm = TRUE), jac_c2 = mean(jac_c2, na.rm = TRUE),
+    keep_rng = median(keep_rng, na.rm = TRUE), keep_rng_c1 = median(keep_rng_c1, na.rm = TRUE), keep_rng_c2 = median(keep_rng_c2, na.rm = TRUE),
+    cells_dropped_c1 = 1 - sum(n_c1) / sum(n_fp), cells_dropped_c2 = 1 - sum(n_c2) / sum(n_fp)) |>
+  kable(digits = 3, caption = "Mean Jaccard and median range kept, cutoff alone vs + C1 / C2; cells_dropped = share of footprint cells the rule removes (all pairs pooled)")
+```
+
+## Illustrative species
+
+Twelve pairs, each the best candidate for one criterion that is not already chosen, preferring taxa scored in v8 with
+at least 10 AquaMaps occurrence cells. The criterion and its value are recorded in
+`data/explore/range_constraint_examples.csv`.
+
+```{r}
+#| label: examples
+
+cand <- pairs |> filter(is_scored_v8, n_rng > 0, n_amocc_blk >= 10)
+if (nrow(cand) < 30) cand <- pairs |> filter(n_rng > 0)
+chosen <- tibble()
+pick1 <- function(d, why, val) {
+  if (nrow(chosen)) d <- d |> filter(!am_key %in% chosen$am_key, !taxon_id %in% chosen$taxon_id)
+  if (!nrow(d)) return(invisible())
+  row1 <- d[1, ]; cv1 <- as.character(signif(row1[[val]], 4))
+  chosen <<- bind_rows(chosen, row1 |> mutate(criterion = why, criterion_value = cv1))
+}
+med_near <- \(d, x) d |> arrange(abs(.data[[x]] - median(.data[[x]])))
+pick1(cand |> filter(sp_cat == "fish") |> arrange(n_rng), "fish, small IUCN range", "n_rng")
+pick1(cand |> filter(sp_cat == "fish") |> arrange(desc(n_rng)), "fish, large IUCN range", "n_rng")
+pick1(cand |> arrange(occur_recs), "few AquaMaps records", "occur_recs")
+pick1(cand |> arrange(desc(occur_recs)), "many AquaMaps records", "occur_recs")
+pick1(cand |> filter(pelagic == 1) |> arrange(desc(occur_recs)), "pelagic (spp_prefs.pelagic = 1)", "occur_recs")
+pick1(cand |> filter(layer == "b") |> med_near("jac_star"), "benthic (layer = b), median Jaccard", "jac_star")
+pick1(cand |> filter(jac_star >= 0.3) |> arrange(desc(n_cc_star)), "many islands at t*", "n_cc_star")
+pick1(cand |> filter(n_cc_star == 1) |> arrange(desc(jac_star)), "no islands at t*, best Jaccard", "jac_star")
+pick1(cand |> filter(sp_cat == "coral") |> med_near("jac_star"), "coral, median Jaccard", "jac_star")
+pick1(cand |> filter(sp_cat == "invertebrate") |> med_near("jac_star"), "invertebrate, median Jaccard", "jac_star")
+pick1(cand |> filter(sp_cat == "mammal") |> med_near("jac_star"), "mammal, median Jaccard", "jac_star")
+pick1(cand |> filter(n_amocc_blk >= 20) |> arrange(share_amocc_in_rng, share_obis_in_rng), "IUCN range looks wrong: fewest AquaMaps occurrence cells inside it", "share_amocc_in_rng")
+ex <- chosen |> select(criterion, criterion_value, am_key, rng_key, taxon_id, scientific_name, sp_cat, class, order, occur_recs,
+                       pelagic, layer, n_am, n_rng, r, t_star, jac_star, n_cc_star, share_amocc_in_rng, share_obis_in_rng)
+if (test_n == 0) write_csv(ex, glue("{dir_out}/range_constraint_examples.csv"))
+kable(ex, digits = 3, caption = "Illustrative pairs and why each was chosen")
+```
+
+Each map: AquaMaps suitability (fill), the IUCN range (black outline), the footprint at t* drawn by component (green =
+kept by C2: holds an AquaMaps occurrence cell or an OBIS record; red = dropped), AquaMaps good occurrence cells (white
+squares, 0.5-degree centres) and OBIS records (black dots, cell centres). Wide extents are averaged to at most ~0.5 M
+display cells; a Pacific species is drawn on 0 to 360 longitude.
+
+```{r}
+#| label: map-fun
+
+# land on -180..540: the natural-earth polygons are already split at the antimeridian, so a copy shifted by 360
+# draws a 0..360 frame without the giant wrapped polygons st_shift_longitude() makes
+land0   <- ne_countries(scale = 50, returnclass = "sf") |> st_geometry() |> st_make_valid()
+land_all <- c(land0, st_set_crs(land0 + c(360, 0), st_crs(land0)))
+
+map_pair <- function(p) {
+  am <- read_parquet(p$f_am, col_select = c("cell_id", "val")); am <- am[order(am$cell_id), ]
+  rg <- read_parquet(p$f_rng, col_select = "cell_id")$cell_id |> unique(); rg <- sort(rg[ocean[rg]])
+  id <- am$cell_id; v <- am$val
+  col_all <- c((id - 1L) %% nc, (rg - 1L) %% nc)
+  s <- if (diff(range((col_all + 3600L) %% nc)) < diff(range(col_all))) 3600L else 0L
+  xy <- \(ids) { cs <- ((ids - 1L) %% nc + s) %% nc; list(c = cs, r = (ids - 1L) %/% nc) }
+  a <- xy(id); g <- xy(rg)
+  c0 <- max(0L, min(a$c, g$c) - 20L); c1 <- min(nc - 1L, max(a$c, g$c) + 20L)
+  r0 <- max(0L, min(a$r, g$r) - 20L); r1 <- min(nr - 1L, max(a$r, g$r) + 20L)
+  ncl <- c1 - c0 + 1L; nrw <- r1 - r0 + 1L
+  x0 <- c0 * res - 180 + s * res; y1 <- 90 - r0 * res
+  tmpl <- rast(nrows = nrw, ncols = ncl, xmin = x0, xmax = x0 + ncl * res, ymin = y1 - nrw * res, ymax = y1, crs = "EPSG:4326")
+  ix <- \(l) (l$r - r0) * ncl + (l$c - c0) + 1L
+  ia <- ix(a)
+  r_suit <- tmpl; vv <- rep(NA_real_, ncell(tmpl)); vv[ia] <- v; values(r_suit) <- vv
+  r_rng  <- tmpl; vv <- rep(NA_real_, ncell(tmpl)); vv[ix(g)] <- 1; values(r_rng) <- vv
+  # components at t*, kept = holds an AquaMaps good occurrence cell or an OBIS record (C2)
+  oc  <- am_occ_l[[p$sp_key]]; oc <- oc[oc$good_cell %in% 1, ]
+  ob  <- obis_l[[as.character(p$taxon_id)]]; if (is.null(ob)) ob <- tibble(cell_id = integer(), records = integer())
+  occ_ids <- if (nrow(oc)) as.vector(occ_cells(oc$center_lat, oc$center_long)) else integer()
+  k <- v >= p$t_star; comp <- cc8(id[k])
+  sup <- rowsum(as.integer(id[k] %in% occ_ids | id[k] %in% ob$cell_id), comp)[, 1] > 0
+  r_cmp <- tmpl; vv <- rep(NA_real_, ncell(tmpl)); vv[ia[k]] <- ifelse(sup[comp], 2, 1); values(r_cmp) <- vv
+  fact <- max(1L, ceiling(sqrt(ncell(tmpl) / 5e5)))
+  if (fact > 1) {
+    r_suit <- aggregate(r_suit, fact, mean, na.rm = TRUE)
+    r_rng  <- aggregate(r_rng,  fact, max,  na.rm = TRUE)
+    r_cmp  <- aggregate(r_cmp,  fact, max,  na.rm = TRUE)
+  }
+  p_rng <- as.polygons(r_rng) |> st_as_sf()
+  p_cmp <- as.polygons(r_cmp) |> st_as_sf() |> rename(status = 1) |> mutate(status = factor(if_else(status == 2, "kept (occurrence)", "dropped"), c("kept (occurrence)", "dropped")))
+  lon_s <- \(lon) if (s > 0) ifelse(lon < 0, lon + 360, lon) else lon
+  d_occ <- tibble(x = lon_s(oc$center_long), y = oc$center_lat)
+  d_ob  <- tibble(x = lon_s(cell_lon(ob$cell_id)), y = cell_lat(ob$cell_id))
+  e <- as.vector(ext(tmpl))    # xmin, xmax, ymin, ymax
+  land <- suppressMessages(suppressWarnings(st_crop(land_all, st_bbox(c(xmin = e[[1]], ymin = e[[3]], xmax = e[[2]], ymax = e[[4]]), crs = st_crs(land0)))))
+  names(r_suit) <- "val"
+  ggplot() +
+    geom_spatraster(data = r_suit, maxcell = 1e6) +
+    scale_fill_viridis_c(option = "mako", direction = -1, limits = c(1, 100), na.value = NA, name = "AquaMaps\nval") +
+    geom_sf(data = land, fill = "grey85", colour = NA) +
+    geom_sf(data = p_rng, fill = NA, colour = "black", linewidth = 0.45) +
+    geom_sf(data = p_cmp, aes(colour = status), fill = NA, linewidth = 0.35) +
+    scale_colour_manual(values = c("kept (occurrence)" = "forestgreen", "dropped" = "red3"), drop = FALSE, name = glue("t* = {p$t_star}")) +
+    geom_point(data = d_occ, aes(x, y), shape = 22, size = 0.9, fill = "white", colour = "grey20", stroke = 0.2) +
+    geom_point(data = d_ob, aes(x, y), size = 0.25, colour = "black", alpha = 0.6) +
+    coord_sf(xlim = e[1:2], ylim = e[3:4], expand = FALSE) +
+    labs(x = NULL, y = NULL) + theme_minimal(base_size = 9)
+}
+```
+
+```{r}
+#| label: maps
+#| results: asis
+#| fig-width: 9
+#| fig-height: 5.5
+
+exm <- chosen |> left_join(pairs0 |> select(am_key, rng_key, f_am, f_rng), by = c("am_key", "rng_key"))
+for (i in seq_len(nrow(exm))) {
+  p <- exm[i, ]
+  cat(glue("\n\n### {p$scientific_name} ({p$sp_cat}, {p$class}): {p$criterion}\n\n"))
+  print(map_pair(p))
+  cat(glue("\n\n*{p$scientific_name}*, `{p$am_key}` x `{p$rng_key}`: r = {round(p$r, 2)} of the suitability mass inside the IUCN range; ",
+           "t* = {p$t_star}, Jaccard at t* = {round(p$jac_star, 2)} (whole footprint {round(p$jac_t1, 2)}); {p$n_cc_star} components at t*; ",
+           "{format(p$occur_recs, big.mark = ',')} AquaMaps records, {format(p$obis_rec, big.mark = ',')} OBIS records ",
+           "({round(100 * coalesce(p$share_obis_in_rng, NA), 0)} % inside the IUCN range); ",
+           "{round(100 * p$share_amocc_in_rng, 0)} % of AquaMaps occurrence cells touch the range.\n\n"))
+}
+```
+
+## FAO-area consistency of the AquaMaps native maps
+
+Plan section 6: every one of the 118 M `spp_cells` rows is flagged `fao_area_yn = 1`, yet for 12.7 M of them the cell's
+FAO area (`cells.fao_area_m`) is not in the species' `spp_prefs.fao_areas`. Four candidate explanations are tested per
+off-list cell: (a) the cell's **inland** FAO code (`fao_area_in`) is listed; (b) the species has an AquaMaps
+**occurrence** in that FAO area (`spp_occs.fao_area_m`), so the list is incomplete rather than the map wrong; (c) the
+cell's area **borders** a listed area (FAO areas adjacent on the 0.5-degree grid, 8-neighbour, across the antimeridian);
+(d) the cell's distance to the nearest cell of a listed area (geodesic, cell centres).
+
+```{r}
+#| label: fao
+
+f_fao   <- glue("{dir_rc0}/fao_check_dist.parquet")
+f_fao_t <- glue("{dir_rc0}/fao_check_total.parquet")
+f_fao_m <- glue("{dir_rc0}/fao_check_mapopt.parquet")
+f_fao_s <- glue("{dir_rc0}/fao_check_species.parquet")
+f_fao_r <- glue("{dir_rc0}/fao_check_ring.parquet")
+if (redo || !all(file_exists(c(f_fao, f_fao_t, f_fao_m, f_fao_s, f_fao_r)))) {
+  # 0.5-degree cells, their grid position, and each FAO area's distance surface
+  hc <- dbGetQuery(con, "SELECT cell_id, center_lat, center_long, fao_area_m, fao_area_in FROM am.cells") |>
+    mutate(r = as.integer(round((90 - center_lat) / 0.5 - 0.5)), c = as.integer(round((center_long + 180) / 0.5 - 0.5)), idx = r * 720L + c + 1L)
+  stopifnot("0.5-degree cells must map 1:1 to the 720 x 360 grid" = !anyDuplicated(hc$idx), !anyNA(hc$fao_area_m))
+  r720  <- rast(nrows = 360, ncols = 720, xmin = -180, xmax = 180, ymin = -90, ymax = 90, crs = "EPSG:4326")
+  areas <- sort(unique(hc$fao_area_m))
+  dist_l <- map_dfr(areas, \(a) {
+    vv <- rep(NA_real_, ncell(r720)); vv[hc$idx[hc$fao_area_m == a]] <- 1; x <- r720; values(x) <- vv
+    tibble(cell_id = hc$cell_id, fao = a, d_km = values(distance(x))[hc$idx] / 1000)
+  })
+  # FAO-area adjacency: 8-neighbour 0.5-degree cells (wrapping in longitude) of different areas
+  nb <- map_dfr(list(c(-1,-1), c(-1,0), c(-1,1), c(0,-1), c(0,1), c(1,-1), c(1,0), c(1,1)), \(d)
+    tibble(idx = hc$idx, idx2 = (hc$r + d[1]) * 720L + ((hc$c + d[2]) %% 720L) + 1L, ok = hc$r + d[1] >= 0 & hc$r + d[1] < 360)) |>
+    filter(ok) |> inner_join(hc |> select(idx, a = fao_area_m), by = "idx") |>
+    inner_join(hc |> select(idx2 = idx, b = fao_area_m), by = "idx2") |> filter(a != b) |> distinct(a, b)
+  duckdb_register(con, "fao_dist", dist_l); duckdb_register(con, "fao_adj", nb)
+  dbExecute(con, "
+    CREATE OR REPLACE TEMP TABLE sp_fao AS
+    SELECT DISTINCT sp_key, fao FROM (
+      SELECT sp_key, TRY_CAST(trim(unnest(string_split(fao_areas, ','))) AS INTEGER) AS fao FROM am.spp_prefs) WHERE fao IS NOT NULL")
+  dbExecute(con, "CREATE OR REPLACE TEMP TABLE sp_occ_fao AS SELECT DISTINCT sp_key, fao_area_m AS fao FROM am.spp_occs")
+  x_sql <- "
+    SELECT sc.sp_key, sc.cell_id, c.fao_area_m, c.fao_area_in, f.fao IS NOT NULL AS m_in, fi.fao IS NOT NULL AS in_in
+    FROM am.spp_cells sc JOIN am.cells c ON c.cell_id = sc.cell_id
+    LEFT JOIN sp_fao f  ON f.sp_key  = sc.sp_key AND f.fao  = c.fao_area_m
+    LEFT JOIN sp_fao fi ON fi.sp_key = sc.sp_key AND fi.fao = c.fao_area_in
+    WHERE sc.fao_area_yn = 1"
+  mo <- dbGetQuery(con, glue("
+    SELECT p.map_opt, count(*) AS cells_flagged, sum((NOT x.m_in)::INT) AS cells_off_list, avg((NOT x.m_in)::INT) AS share_off_list,
+           count(DISTINCT x.sp_key) AS species, count(DISTINCT x.sp_key) FILTER (WHERE NOT x.m_in) AS species_off_list
+    FROM ({x_sql}) x JOIN am.spp_prefs p USING (sp_key) GROUP BY 1 ORDER BY 1"))
+  dbExecute(con, glue("
+    CREATE OR REPLACE TEMP TABLE fao_off AS
+    WITH off AS (SELECT * FROM ({x_sql}) WHERE NOT m_in),
+    adj AS (SELECT DISTINCT o.sp_key, o.fao_area_m FROM (SELECT DISTINCT sp_key, fao_area_m FROM off) o
+            JOIN sp_fao f ON f.sp_key = o.sp_key JOIN fao_adj a ON a.a = o.fao_area_m AND a.b = f.fao),
+    dmin AS (SELECT o.sp_key, o.cell_id, min(d.d_km) AS d_km FROM off o
+             JOIN sp_fao f ON f.sp_key = o.sp_key JOIN fao_dist d ON d.cell_id = o.cell_id AND d.fao = f.fao GROUP BY ALL)
+    SELECT o.*, so.fao IS NOT NULL AS m_occ, ad.sp_key IS NOT NULL AS m_adj, dm.d_km
+    FROM off o
+    LEFT JOIN sp_occ_fao so ON so.sp_key = o.sp_key AND so.fao = o.fao_area_m
+    LEFT JOIN adj ad  ON ad.sp_key = o.sp_key AND ad.fao_area_m = o.fao_area_m
+    LEFT JOIN dmin dm ON dm.sp_key = o.sp_key AND dm.cell_id = o.cell_id"))
+  fao <- dbGetQuery(con, "
+    SELECT CASE WHEN d_km IS NULL THEN 'no listed area on grid' WHEN d_km <= 60 THEN 'a: <= 60 km' WHEN d_km <= 120 THEN 'b: 60-120 km'
+                WHEN d_km <= 300 THEN 'c: 120-300 km' WHEN d_km <= 600 THEN 'd: 300-600 km' WHEN d_km <= 1200 THEN 'e: 600-1200 km' ELSE 'f: > 1200 km' END AS dist_to_listed,
+           count(*) AS cells, count(DISTINCT sp_key) AS species,
+           avg(in_in::INT) AS share_inland_listed, avg(m_occ::INT) AS share_area_has_occurrence, avg(m_adj::INT) AS share_area_adjacent,
+           avg((m_occ OR m_adj OR in_in)::INT) AS share_any
+    FROM fao_off GROUP BY 1 ORDER BY 1")
+  tot <- dbGetQuery(con, "
+    SELECT (SELECT count(*) FROM am.spp_cells WHERE fao_area_yn = 1) AS cells_flagged, count(*) AS cells_off_list, count(DISTINCT sp_key) AS species_off_list,
+           sum(in_in::INT) AS inland_listed, sum(m_occ::INT) AS area_has_occurrence, sum(m_adj::INT) AS area_adjacent,
+           sum((m_occ OR m_adj)::INT) AS occurrence_or_adjacent, sum((m_occ AND NOT m_adj)::INT) AS occurrence_not_adjacent,
+           sum((NOT m_occ AND NOT m_adj AND NOT in_in)::INT) AS unexplained,
+           sum((d_km <= 120)::INT) AS within_120km, sum((d_km <= 600)::INT) AS within_600km,
+           sum((NOT m_occ AND NOT m_adj AND NOT in_in AND d_km > 600)::INT) AS unexplained_beyond_600km
+    FROM fao_off")
+  sp_top <- dbGetQuery(con, '
+    SELECT o.sp_key, s.genus || \' \' || s.species AS species, p.fao_areas, p.map_opt, count(*) AS cells_off,
+           string_agg(DISTINCT CAST(o.fao_area_m AS VARCHAR), \', \') AS off_areas, avg(o.m_occ::INT) AS share_occ,
+           avg(o.m_adj::INT) AS share_adj, median(o.d_km) AS d_km_median
+    FROM fao_off o JOIN am.spp s USING (sp_key) JOIN am.spp_prefs p USING (sp_key)
+    GROUP BY ALL ORDER BY cells_off DESC LIMIT 15')
+  # the ring test: every (species x marine FAO area) as listed / adjacent to a listed area / two or more areas away,
+  # and whether the species' native map paints any cell there
+  ring <- dbGetQuery(con, "
+    WITH sp AS (SELECT DISTINCT sp_key FROM am.spp_prefs), ar AS (SELECT DISTINCT a AS fao FROM fao_adj),
+    lst  AS (SELECT f.sp_key, f.fao FROM sp_fao f JOIN ar USING (fao)),
+    adj1 AS (SELECT DISTINCT l.sp_key, j.b AS fao FROM lst l JOIN fao_adj j ON j.a = l.fao),
+    pnt  AS (SELECT sc.sp_key, c.fao_area_m AS fao, count(*) AS n FROM am.spp_cells sc JOIN am.cells c ON c.cell_id = sc.cell_id
+             WHERE sc.fao_area_yn = 1 GROUP BY ALL),
+    g AS (
+      SELECT sp.sp_key, ar.fao,
+             CASE WHEN l.fao IS NOT NULL THEN '1 listed' WHEN a1.fao IS NOT NULL THEN '2 adjacent to a listed area' ELSE '3 two or more areas away' END AS ring,
+             so.fao IS NOT NULL AS has_occurrence, p.n
+      FROM sp CROSS JOIN ar
+      LEFT JOIN lst l          ON l.sp_key  = sp.sp_key AND l.fao  = ar.fao
+      LEFT JOIN adj1 a1        ON a1.sp_key = sp.sp_key AND a1.fao = ar.fao
+      LEFT JOIN sp_occ_fao so  ON so.sp_key = sp.sp_key AND so.fao = ar.fao
+      LEFT JOIN pnt p          ON p.sp_key  = sp.sp_key AND p.fao  = ar.fao)
+    SELECT pr.map_opt, g.ring, g.has_occurrence, count(*) AS species_x_area, count(g.n) AS painted,
+           avg((g.n IS NOT NULL)::INT) AS share_painted, COALESCE(sum(g.n), 0) AS cells
+    FROM g JOIN am.spp_prefs pr USING (sp_key) GROUP BY ALL ORDER BY ALL")
+  write_parquet(fao, f_fao); write_parquet(tot, f_fao_t); write_parquet(mo, f_fao_m); write_parquet(sp_top, f_fao_s); write_parquet(ring, f_fao_r)
+  dbExecute(con, "DROP TABLE fao_off")
+  duckdb_unregister(con, "fao_dist"); duckdb_unregister(con, "fao_adj")
+}
+fao <- read_parquet(f_fao); fao_tot <- read_parquet(f_fao_t); fao_mo <- read_parquet(f_fao_m); fao_sp <- read_parquet(f_fao_s); fao_ring <- read_parquet(f_fao_r)
+fao_tot |> pivot_longer(everything(), values_to = "n") |>
+  kable(format.args = list(big.mark = ","), caption = "Off-list cells (the cell's FAO area is not in the species' fao_areas, yet fao_area_yn = 1) and how many each explanation covers")
+kable(fao, digits = 3, format.args = list(big.mark = ","), caption = "Off-list cells by distance to the nearest cell of a listed FAO area, with the share each explanation covers")
+kable(fao_mo, digits = 3, format.args = list(big.mark = ","), caption = "Off-list share by map_opt (1 = bounding box AND FAO areas, 2 = FAO areas only, 3 = bounding box only)")
+kable(fao_sp, digits = 2, caption = "The 15 species with the most off-list cells")
+kable(fao_ring, digits = 3, format.args = list(big.mark = ","),
+      caption = "The ring test: species x marine FAO area by position relative to the listed areas, split by whether the species has an AquaMaps occurrence in the area; painted = the native map has a cell there")
+fao_far <- fao_ring |> filter(str_detect(ring, "^3")) |> summarise(n = sum(species_x_area), painted = sum(painted))
+fao_adj_p <- fao_ring |> filter(str_detect(ring, "^2")) |> group_by(map_opt) |> summarise(share = sum(painted) / sum(species_x_area))
+stopifnot("the ring test is the finding the prose states: nothing painted two or more areas away" = fao_far$painted == 0)
+```
+
+## Reading
+
+```{r}
+#| label: reading-numbers
+
+cvm   <- cv_long |> group_by(rule) |> summarise(m = mean(jac)) |> deframe()
+t30   <- isl_pair |> filter(t == 30)
+ts_cl <- pv |> group_by(cls) |> summarise(n = n(), med = median(t_star), iqr = IQR(t_star)) |> arrange(desc(n))
+ct30  <- ct |> semi_join(pv, by = c("am_key", "rng_key")) |> filter(t == t_single)
+p_t1  <- mean(pv$t_star == 1)
+conn1 <- ct |> semi_join(pv, by = c("am_key", "rng_key")) |> filter(t == 1) |>
+  summarise(jac = mean(jac, na.rm = TRUE), jac_c2 = mean(jac_c2, na.rm = TRUE), keep = median(keep_rng, na.rm = TRUE),
+            keep_c2 = median(keep_rng_c2, na.rm = TRUE), dropped = 1 - sum(n_c2) / sum(n_fp))
+cls_gain <- cv |> group_by(cls) |> summarise(gain = mean(class) - mean(whole_footprint), n = n()) |> arrange(desc(gain))
+pct <- \(x, d = 0) paste0(format(round(100 * x, d), nsmall = d), " %")
+f3  <- \(x) format(round(x, 3), nsmall = 3)
+```
+
+**No probability cutoff is supported as a single rule.** Over the `r format(nrow(pv), big.mark = ",")` calibration pairs the
+best cutoff t* is bimodal: for `r pct(p_t1)` of species the whole AquaMaps footprint (t = 1, today's merge for an
+AquaMaps-only taxon) is already the best match to the IUCN range, and the rest spread almost evenly from 5 to 90.
+In 5-fold cross-validation the single best cutoff is t = `r t_single` in every fold, so the "single" rule IS the
+whole footprint (mean held-out Jaccard `r f3(cvm[["single"]])`); the per-species oracle reaches only
+`r f3(cvm[["jac_star"]])`. A cutoff mainly trades range for footprint: at t = 30 the median species keeps 51 % of
+its IUCN range (72 % at t = 1) while the share of footprint outside the range falls from 53 % to 43 %. O'Hara et al.
+(2017)'s P >= 0.5 keeps 40 % of the range.
+
+**Taxonomy carries what signal there is, and it is the cartilaginous fishes.** A per-class cutoff lifts the held-out
+mean to `r f3(cvm[["class"]])`, almost all of it from Elasmobranchii (+`r f3(cls_gain$gain[cls_gain$cls == "Elasmobranchii"])`,
+cutoff 50 to 60), Holocephali and Myxini, whose envelopes hold only a third or less of their suitability mass inside
+the IUCN range (median r 0.34, 0.17, 0.25) against 0.56 for ray-finned fishes, 0.83 for corals and 0.72 for mammals.
+The covariate tree (`r f3(cvm[["covariate_tree"]])`) does no better than the class rule and puts 68 % of its
+importance on class itself; the one strong continuous correlate of t* is range size (Spearman -0.50: small ranges want
+high cutoffs), which is unknown for exactly the taxa the rule is for. Species clipped by FAO areas alone
+(`map_opt` 2, 44 % of AquaMaps) match their ranges far worse (median Jaccard 0.26 vs 0.47) and want higher cutoffs.
+
+**Connectivity beats any cutoff.** The footprint of a median species breaks into about 50 connected components at
+any cutoff, and at t = 30 only `r pct(mean(t30$n_cc_occ / t30$n_cc))` of a species' components (`r pct(sum(t30$n_cc_occ) / sum(t30$n_cc))` of all components) hold an AquaMaps occurrence cell or an OBIS record.
+Support scales with size: at t = 30, 96 % of components of 100 cells or fewer have no occurrence of either kind, while
+85 % of components over 10,000 cells have one. Keeping only occurrence-supported components (rule C2) at t = 1 raises
+mean Jaccard from `r f3(conn1$jac)` to `r f3(conn1$jac_c2)` while removing `r pct(conn1$dropped)` of footprint cells and
+lowering the median range kept from `r pct(conn1$keep)` to `r pct(conn1$keep_c2)`. That gain is larger than any cutoff
+rule's and close to the cutoff oracle's, and it is the one rule that removes exactly what the maps show as islands.
+
+**Limits of the calibration.** The IUCN range is the target, not the truth: 40 % of components overlap it, and the
+"range looks wrong" example (*Micropogonias furnieri*, 1,961 range cells against 97,038 AquaMaps cells, no occurrence
+inside the range) shows the target can fail. Jaccard inside US waters is low for every rule (0.14 at t = 1), so the
+agreement measured here is mostly a global statement; the US-scoring effect of a rule needs the pipeline's own
+attribution run. OBIS records enter without effort correction.
+
+### Proposed rule for `AM_RANGE_RULE` (default off)
+
+1. `connected`: keep the whole AquaMaps footprint (no cutoff) but drop every connected component (8-neighbour, antimeridian
+   wrapped) that holds neither an AquaMaps good cell nor an OBIS record since `r year_min`. This is rule C2 above: the
+   best measured agreement, 11 % of cells removed, the islands gone.
+2. `connected_chondrichthyes` (option to evaluate against 1): the same, plus a cutoff of 50 for Elasmobranchii,
+   Holocephali and Myxini, the one taxonomic group where a cutoff is supported out of sample. The joint effect of
+   cutoff and connectivity for that group is not measured here.
+3. Not proposed: a global cutoff (none beats t = 1), a covariate rule (no better than class, and range size is
+   unavailable for the target taxa), or an FAO-area rule (AquaMaps already clips to the listed areas plus one ring of
+   adjacent areas; a rule built on `fao_areas` would remove 11 % of cells AquaMaps deliberately painted).
+
+The rule belongs in the merge input as a filter like `supersede_sql()`, behind the flag, with fixtures in msens, and
+its US-scoring effect read from one attribution variant before it is a v11 or v12 default.
+
+
+### Open questions for Tim
+
+- The evidence favours an occurrence-connectivity rule over any probability cutoff, and a cutoff only for the
+  cartilaginous fishes. Is that acceptable to BOEM, or does the review want the broader taxonomy-based rule the
+  tranche proposed?
+- The IUCN range is the calibration target, and some ranges disagree with AquaMaps' own occurrence cells (the
+  "range looks wrong" example): should such pairs be excluded from the calibration, and should occurrence support
+  override a range map where both exist?
+- OBIS-supported components: is an OBIS record (any year since `r year_min`, no effort correction) enough to keep an
+  island, or should rule D's effort test (as in `explore_occurrence_rule.qmd`) decide?
+- Scope: should the rule apply worldwide (it changes the global surface the Atlas draws) or only to the scored US
+  surface?
+
+```{r}
+#| label: cleanup
+#| include: false
+
+dbDisconnect(con, shutdown = TRUE)
+```
