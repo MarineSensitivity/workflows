@@ -647,11 +647,13 @@ if (has_v10) {
     cv <- col_of(scores_b, cov)
     # absent v10 row + coverage present = "n/r"; no coverage either = blank
     fmt <- function(v) ifelse(!is.na(v), sprintf("%.1f", v), ifelse(!is.na(cv), "n/r", ""))
+    # .env$: the column named after version A (`va`, e.g. "v10") is built first in this tibble() and would
+    # otherwise shadow the function argument of the same name inside the data mask (render of v10 vs v11, 2026-11-02)
     tibble(`Program Area` = pa$zone_key, Component = component,
-           !!va := round(col_of(scores_a_m, eco), 1), `B ecoregional` = round(col_of(scores_b, eco), 1),
-           `v10 global` = fmt(col_of(scores_b, v10)), `% of world` = round(col_of(scores_b, world), 2),
-           coverage = round(cv, 3), `n species` = col_of(scores_b, nsp),
-           `v10 usa` = fmt(col_of(scores_b, usa)), `v10 pooled` = fmt(col_of(scores_b, pooled)))
+           !!va := round(col_of(scores_a_m, .env$eco), 1), `B ecoregional` = round(col_of(scores_b, .env$eco), 1),
+           `v10 global` = fmt(col_of(scores_b, .env$v10)), `% of world` = round(col_of(scores_b, .env$world), 2),
+           coverage = round(cv, 3), `n species` = col_of(scores_b, .env$nsp),
+           `v10 usa` = fmt(col_of(scores_b, .env$usa)), `v10 pooled` = fmt(col_of(scores_b, .env$pooled)))
   }) |>
     filter(!is.na(.data[[va]]) | !is.na(`B ecoregional`) | `v10 global` != "" | !is.na(coverage))
   DT::datatable(comp_tab, rownames = FALSE, filter = "top",
@@ -813,6 +815,387 @@ if (has_v10 && DBI::dbExistsTable(con_b, "release_method")) {
   dbGetQuery(con_b, "SELECT method_key, value, description FROM release_method ORDER BY method_key") |>
     knitr::kable(caption = glue("release_method of {vb}"))
 } else if (has_v10) cat(glue("`{vb}` has no `release_method` table.\n"))
+```
+
+## v11 attribution: which flag moved which score
+
+v11 changes the method in eight independent ways, each a flag in `libs/vars.R` (`vgpm_integrated`,
+`turtle_suit`, `turtle_rule`, `occ_rule`, `region_weight`, `fold_density`, `components_v11`,
+`nc_atl_source`). The **control** run has every flag at its v10 value (so it reproduces v10); the
+**candidate** has every flag on. Each other run is the candidate with **one** flag back at its control
+value (`no_<flag>`, and `nc_atl_2018` for the Atlantic bird source), so the candidate minus that run is what
+the flag owns. `scripts/attribution_runs.sh` makes the runs and `snapshot_scores.qmd` writes each run's
+zone scores to `data/v11/attribution/{variant}.parquet`; this section reads whatever of that set exists,
+says which runs are missing, and computes every number below from the files. It reads no `sdm.duckdb`.
+
+```{r}
+#| label: v11-att-setup
+#| results: asis
+
+# the registry of variants and their single flag swaps is PARSED from the runner, so it cannot drift
+att_dir <- here::here("data/v11/attribution")
+runs_sh <- readLines(here::here("scripts/attribution_runs.sh"), warn = FALSE)
+sh_get  <- function(key) sub(sprintf('^%s="([^"]*)".*$', key), "\\1", grep(sprintf('^%s="', key), runs_sh, value = TRUE))[1]   # a trailing comment is allowed
+kv      <- strsplit(strsplit(sh_get("FULL"), " ")[[1]], "=")
+cand_kv <- tibble(flag = tolower(sapply(kv, `[`, 1)), candidate = sapply(kv, `[`, 2))
+variants_all <- strsplit(sh_get("VARIANTS"), " ")[[1]]
+variants_extra <- strsplit(sh_get("EXTRA_VARIANTS"), " ")[[1]]   # follow-ups on the candidate (full2023_cal = + FOLD_DENSITY_CAL=mass), not in --all
+variants_extra <- variants_extra[!is.na(variants_extra) & nzchar(variants_extra)]
+sw <- regmatches(runs_sh, regexec('^\\s*(\\w+)\\)\\s+echo "\\$\\{FULL/(\\w+)=([^/]+)/\\w+=([^}]+)\\}"', runs_sh, perl = TRUE))
+sw <- sw[lengths(sw) == 5]
+# the runner spells booleans 0/1, the snapshots TRUE/FALSE
+bool <- \(x) ifelse(x == "1", "TRUE", ifelse(x == "0", "FALSE", x))
+swaps <- tibble(variant = sapply(sw, `[`, 2), flag = tolower(sapply(sw, `[`, 3)),
+                on = bool(sapply(sw, `[`, 4)), off = bool(sapply(sw, `[`, 5)))
+
+# the component labels (v11 names: Flora, Productivity) by component stem
+comp_lab <- readr::read_csv(here::here("data/components.csv"), show_col_types = FALSE) |>
+  select(stem = key, label, label_v10)
+
+att_files <- list.files(att_dir, "\\.parquet$", full.names = TRUE)
+att <- if (length(att_files)) bind_rows(lapply(att_files, arrow::read_parquet)) else tibble()
+flag_cols <- setdiff(names(att), c("ver", "variant", "zone_set_key", "zone_fld", "zone_value", "metric_key", "val"))
+# a snapshot taken before a flag existed lacks its column: that flag was at its control value then
+if (nrow(att)) {
+  if (!"nc_atl_source" %in% names(att)) att$nc_atl_source <- NA_character_
+  if (!"fold_density_cal" %in% names(att)) att$fold_density_cal <- NA_character_
+  att <- att |> mutate(nc_atl_source = coalesce(nc_atl_source, "2018"), fold_density_cal = coalesce(fold_density_cal, "none"))
+}
+present <- unique(att$variant)
+
+cand <- c("full2023", "full")[c("full2023", "full") %in% present][1]
+has_att <- length(present) > 0 && "control" %in% present && !is.na(cand)
+cand_note <- if (!has_att) {
+  "The attribution needs at least `control` and a candidate (`full2023` or `full`); the section is skipped."
+} else if (cand == "full") {
+  "`full2023` (the candidate) is not yet snapshotted: every comparison below uses **`full`** (every flag on, the 2018 Atlantic bird source) as the candidate until it exists."
+} else {
+  "The candidate is **`full2023`**; `full` (the same with the 2018 Atlantic bird source) is shown as a run of its own."
+}
+cat(cand_note, "\n")
+```
+
+### Variants
+
+```{r}
+#| label: v11-att-variants
+
+if (has_att) {
+  flag_of <- att |> distinct(variant, across(all_of(flag_cols))) |> mutate(across(everything(), as.character))
+  cand_flags <- flag_of[flag_of$variant == cand, flag_cols, drop = FALSE]
+  differs <- function(v) {
+    if (v %in% present) {
+      f <- flag_of[flag_of$variant == v, flag_cols, drop = FALSE]
+      d <- flag_cols[unlist(f[1, ]) != unlist(cand_flags[1, ])]
+      if (!length(d)) return(if (v == cand) "(the candidate)" else "(none)")
+      paste(sprintf("%s=%s", d, unlist(f[1, d])), collapse = ", ")
+    } else if (v %in% swaps$variant) {
+      s <- swaps[swaps$variant == v, ]
+      sprintf("%s=%s", s$flag, s$off)
+    } else if (v == "full2023") "(the candidate: every flag on, nc_atl_source=2023)" else "?"
+  }
+  vt <- tibble(variant = unique(c("control", "full", variants_all, variants_extra))) |>
+    mutate(role = case_when(variant == cand ~ "candidate", variant == "control" ~ "control (== v10)",
+                            variant %in% swaps$variant ~ "one flag at its control value",
+                            variant %in% variants_extra ~ "the candidate + a follow-up setting",
+                            TRUE ~ "all flags on"),
+           `differs from the candidate` = sapply(variant, differs),
+           status = ifelse(variant %in% present, "present", "MISSING"),
+           `zone-metric rows` = sapply(variant, \(v) sum(att$variant == v)))
+  miss <- vt$variant[vt$status == "MISSING"]
+  knitr::kable(vt, caption = glue("{sum(vt$status == 'present')} of {nrow(vt)} variants present"))
+}
+```
+
+```{r}
+#| label: v11-att-missing
+#| results: asis
+
+if (has_att) cat(if (length(miss)) glue("**Missing variants:** {paste0('`', miss, '`', collapse = ', ')}. Their flags have no attribution row below until `scripts/attribution_runs.sh` has run them and `snapshot_scores` has written the file; every table lists only what exists.\n")
+                 else "All variants are present.\n")
+```
+
+```{r}
+#| label: v11-att-helpers
+#| results: asis
+
+if (has_att) {
+  PA <- "programarea_key"
+  att_pa <- att |> filter(zone_fld == PA)
+  m_nat <- "score_v10_equalweights_global"
+  m_eco <- grep("^score_.*ecoregion", unique(att_pa$metric_key), value = TRUE)[1]
+  vec <- function(v, metric, d = att_pa) {
+    x <- d[d$variant == v & d$metric_key == metric, ]
+    setNames(x$val, x$zone_value)
+  }
+  area_nm <- function(k) if (exists("pa") && "zone_name" %in% names(pa)) pa$zone_name[match(k, pa$zone_key)] else NA_character_
+  # one-flag variants that exist, in the runner's order, with the flag each owns
+  singles <- swaps |> filter(variant %in% present, variant %in% variants_all) |>
+    mutate(ord = match(variant, variants_all)) |> arrange(ord)
+  # x, y = named vectors by area; deltas on the areas where both exist
+  delta_stats <- function(x, y) {
+    k <- intersect(names(x), names(y)); k <- k[!is.na(x[k]) & !is.na(y[k])]
+    if (!length(k)) return(tibble(areas = 0L, `mean |Δ|` = NA_real_, `max |Δ|` = NA_real_, `at` = NA_character_, r = NA_real_, `Spearman ρ` = NA_real_))
+    d <- abs(y[k] - x[k])
+    tibble(areas = length(k), `mean |Δ|` = mean(d), `max |Δ|` = max(d), `at` = k[which.max(d)],
+           r = if (length(k) > 2) cor(x[k], y[k]) else NA_real_,
+           `Spearman ρ` = if (length(k) > 2) cor(x[k], y[k], method = "spearman") else NA_real_)
+  }
+  runs_vs_cand <- setdiff(intersect(c("control", "full", singles$variant), present), cand)
+  mets <- c(national = m_nat, `ecoregion-rescaled` = m_eco)
+  cat(glue("Program-Area composites: national `{m_nat}`; ecoregion-rescaled `{m_eco}`.\n"))
+}
+```
+
+### Headline attribution
+
+Each row compares one run with the candidate on the 20 Program Areas (areas where both runs have a
+score): the mean and maximum absolute difference, the area of the maximum, and the Pearson r and Spearman ρ
+between the two sets of scores. The **control** row is the whole change (v10 → candidate); each `no_<flag>`
+row is what removing that one flag does. The national composite is the v10 concentration index
+(100 = national average); the ecoregion-rescaled composite is a 0–100 index, so their Δ are on different scales.
+
+```{r}
+#| label: v11-att-headline
+#| results: asis
+
+if (has_att) {
+  for (nm in names(mets)) {
+    mm <- mets[[nm]]
+    cat(glue("\n\n**{nm} composite** (`{mm}`)\n\n"))
+    h <- purrr::map_dfr(runs_vs_cand, \(v) bind_cols(tibble(`run vs candidate` = v), delta_stats(vec(cand, mm), vec(v, mm)))) |>
+      left_join(swaps |> select(`run vs candidate` = variant, flag), by = "run vs candidate") |>
+      mutate(`flag it removes` = ifelse(is.na(flag), ifelse(`run vs candidate` == "control", "all", ""), flag), .after = 1) |>
+      select(-flag) |>
+      mutate(across(c(`mean |Δ|`, `max |Δ|`), \(x) round(x, 2)), across(c(r, `Spearman ρ`), \(x) round(x, 3)))
+    if (nrow(h)) print(knitr::kable(h, caption = glue("{nm}: runs vs the candidate `{cand}`"))) else cat("No run to compare yet.\n")
+  }
+}
+```
+
+#### Per Program Area: the delta each flag owns
+
+For each Program Area: the candidate's score, the control's, and the delta each flag owns (candidate minus
+the run without that flag). **sum of flag deltas** adds the single-flag deltas of the flags present;
+**candidate − control** is the whole change. The difference between the two is the **interaction**:
+what the flags do together that none does alone (or the flags whose run is still missing).
+
+```{r}
+#| label: v11-att-area-fn
+
+area_tab <- function(mm) {
+  ck <- vec(cand, mm); k0 <- vec("control", mm)
+  keys <- names(ck)
+  out <- tibble(`Program Area` = keys, Name = area_nm(keys), candidate = unname(ck), control = unname(k0[keys]))
+  for (i in seq_len(nrow(singles))) out[[singles$flag[i]]] <- unname(ck[keys] - vec(singles$variant[i], mm)[keys])
+  fl <- if (nrow(singles)) singles$flag else character()
+  out |> mutate(`sum of flag deltas` = if (length(fl)) rowSums(across(all_of(fl)), na.rm = TRUE) else NA_real_,
+                `candidate − control` = candidate - control,
+                interaction = `candidate − control` - `sum of flag deltas`) |>
+    arrange(desc(candidate))
+}
+area_dt <- function(nm) {
+  at <- area_tab(mets[[nm]])
+  DT::datatable(at, rownames = FALSE, options = list(pageLength = 20, dom = "t", scrollX = TRUE),
+                caption = glue("{nm}: candidate `{cand}`, control, and the delta each flag owns (candidate minus the run without it); flags present: ",
+                               "{if (nrow(singles)) paste(singles$flag, collapse = ', ') else 'none'}")) |>
+    DT::formatRound(setdiff(names(at), c("Program Area", "Name")), 1)
+}
+```
+
+**National composite**
+
+```{r}
+#| label: v11-att-area-nat
+
+if (has_att) area_dt("national")
+```
+
+**Ecoregion-rescaled composite**
+
+```{r}
+#| label: v11-att-area-eco
+
+if (has_att) area_dt("ecoregion-rescaled")
+```
+
+### Components
+
+The same comparison for each component score under the national scoring (`extrisk_{category}_v10_global`
+and `primprod_v10`), over the Program Areas: per flag and component, the mean and maximum |Δ| where both runs
+report it, and the Program Areas where the flag **adds** the component (the candidate reports it, the run without the
+flag does not) or **removes** it (the reverse). An absent row is a component with too little coverage in that
+area to report under the 5 % floor, never a zero. Labels are the v11 names from `data/components.csv`.
+
+```{r}
+#| label: v11-att-components
+
+if (has_att) {
+  cmet <- grep("^(extrisk_.*_v10_global|primprod_v10)$", unique(att_pa$metric_key), value = TRUE)
+  cstem <- ifelse(cmet == "primprod_v10", "primprod", sub("^extrisk_(.*)_v10_global$", "\\1", cmet))
+  clab  <- comp_lab$label[match(cstem, comp_lab$stem)]
+  clab  <- ifelse(is.na(clab), cstem, clab)
+  runs_c <- c(control = "control", setNames(singles$variant, singles$flag))
+  runs_c <- runs_c[runs_c %in% present & runs_c != cand]
+  ct <- purrr::map_dfr(names(runs_c), \(fl) purrr::map_dfr(seq_along(cmet), \(i) {
+    x <- vec(cand, cmet[i]); y <- vec(runs_c[[fl]], cmet[i])
+    s <- delta_stats(x, y)
+    tibble(`flag removed` = fl, Component = clab[i], `both report` = s$areas,
+           `mean |Δ|` = s$`mean |Δ|`, `max |Δ|` = s$`max |Δ|`, `at` = s$at,
+           `flag adds it in` = paste(sort(setdiff(names(x), names(y))), collapse = " "),
+           `flag removes it in` = paste(sort(setdiff(names(y), names(x))), collapse = " "))
+  }))
+  if (nrow(ct)) {
+    wide <- ct |> select(`flag removed`, Component, `mean |Δ|`) |>
+      mutate(`mean |Δ|` = round(`mean |Δ|`, 2)) |> pivot_wider(names_from = Component, values_from = `mean |Δ|`)
+    print(knitr::kable(wide, caption = glue("Mean |Δ| per Program Area, candidate `{cand}` minus the run without the flag ('control' = every flag removed)")))
+  } else cat("No run to compare yet.\n")
+}
+```
+
+```{r}
+#| label: v11-att-components-detail
+
+if (has_att && exists("ct") && nrow(ct)) {
+  DT::datatable(ct |> mutate(across(c(`mean |Δ|`, `max |Δ|`), \(x) round(x, 2))), rownames = FALSE, filter = "top",
+                options = list(pageLength = 20, scrollX = TRUE),
+                caption = glue("Flag × component over Program Areas. flag adds it in = areas where `{cand}` reports the component and the run without the flag does not; flag removes it in = the reverse"))
+}
+```
+
+### The occurrence rule's reach
+
+The occurrence rule (`occ_rule`) gates a species out of an ecoregion where records are significantly and
+materially fewer than elsewhere; `region_weight` downweights it by its encounter weight `w` there.
+`data/v11/zone_exclusions_occ.csv` holds the gated pairs and `data/v11/zone_weights_occ.csv` the weighted ones
+(a gated pair is `w = 0` there); both come from [the exploration notebook](explore_occurrence_rule.html).
+The denominator is each component's species count in the ecoregion (`extrisk_{category}_n_species`) of the run
+without the rule, so the percentage is the share of the component's species there that the rule touches.
+
+```{r}
+#| label: v11-att-occ
+#| results: asis
+
+f_ex <- here::here("data/v11/zone_exclusions_occ.csv"); f_w <- here::here("data/v11/zone_weights_occ.csv")
+has_occ <- file.exists(f_ex) && file.exists(f_w)
+if (!has_occ) cat("The occurrence-rule CSVs are not on disk: this subsection is skipped.\n")
+if (has_occ) {
+  ex <- readr::read_csv(f_ex, show_col_types = FALSE)
+  wt <- readr::read_csv(f_w,  show_col_types = FALSE)
+  base_run <- c("no_occ_rule", "control")[c("no_occ_rule", "control") %in% present][1]
+  den <- att |> filter(zone_fld == "ecoregion_key", variant == base_run, grepl("^extrisk_.*_n_species$", metric_key)) |>
+    transmute(ecoregion = zone_value, sp_cat = sub("^extrisk_(.*)_n_species$", "\\1", metric_key), n_in_zone = val)
+  gated <- ex |> distinct(mdl_key, ecoregion = zone_key, sp_cat) |> count(ecoregion, sp_cat, name = "gated")
+  wtd   <- wt |> filter(w > 0, w < 1) |> group_by(ecoregion = zone_key, sp_cat) |>
+    summarise(weighted = n_distinct(mdl_key), `median w` = median(w), .groups = "drop")
+  reach <- full_join(gated, wtd, by = c("ecoregion", "sp_cat")) |>
+    left_join(den, by = c("ecoregion", "sp_cat")) |>
+    mutate(across(c(gated, weighted), \(x) coalesce(x, 0L)),
+           affected = gated + weighted,
+           `% of the component's species` = 100 * affected / n_in_zone,
+           Component = coalesce(comp_lab$label[match(sp_cat, comp_lab$stem)], sp_cat)) |>
+    arrange(ecoregion, sp_cat)
+  cat(glue("Species counts from `{base_run}`; {nrow(ex)} gated and {sum(wt$w > 0 & wt$w < 1)} downweighted ",
+           "(species, ecoregion) pairs over {n_distinct(c(ex$mdl_key, wt$mdl_key))} species.\n"))
+}
+```
+
+```{r}
+#| label: v11-att-occ-table
+
+if (has_occ && nrow(reach)) {
+  reach |> transmute(Ecoregion = ecoregion, Component, `species in zone` = n_in_zone, gated, weighted,
+                     `median w` = round(`median w`, 3), `% affected` = round(`% of the component's species`, 1)) |>
+    DT::datatable(rownames = FALSE, filter = "top", options = list(pageLength = 15, scrollX = TRUE),
+                  caption = "Occurrence rule: species gated (w = 0) and downweighted (0 < w < 1) per ecoregion and component")
+}
+```
+
+```{r}
+#| label: v11-att-occ-wide
+
+if (has_occ && nrow(reach)) {
+  reach |> transmute(Ecoregion = ecoregion, Component, pct = round(`% of the component's species`, 1)) |>
+    pivot_wider(names_from = Component, values_from = pct) |>
+    knitr::kable(caption = "Share (%) of each component's species in the ecoregion that the rule gates or downweights")
+}
+```
+
+```{r}
+#| label: v11-att-occ-mt
+
+if (has_occ) {
+  mt <- c("mammal", "turtle")
+  g <- ex |> filter(sp_cat %in% mt) |>
+    transmute(Ecoregion = zone_key, Component = comp_lab$label[match(sp_cat, comp_lab$stem)], Species = scientific_name,
+              `Common name` = common_name, w = 0, `n searched` = n_searched, `n occupied` = n_occupied, Reason = reason) |>
+    arrange(Component, Species, Ecoregion)
+  if (nrow(g)) DT::datatable(g, rownames = FALSE, filter = "top", options = list(pageLength = 10, scrollX = TRUE),
+                             caption = glue("Marine mammal and sea turtle pairs gated out ({nrow(g)}; w = 0)"))
+}
+```
+
+```{r}
+#| label: v11-att-occ-low
+
+if (has_occ) {
+  lo <- wt |> filter(sp_cat %in% c("mammal", "turtle"), w > 0, w < 1) |> arrange(w) |> slice_head(n = 20) |>
+    transmute(Ecoregion = zone_key, Component = comp_lab$label[match(sp_cat, comp_lab$stem)], Species = scientific_name,
+              `Common name` = common_name, w = signif(w, 3), `n searched` = n_searched, `n occupied` = n_occupied,
+              rate = signif(rate, 3), `baseline rate` = signif(p_core, 3))
+  if (nrow(lo)) knitr::kable(lo, caption = "The 20 most downweighted marine mammal and sea turtle pairs that are not gated (smallest w > 0)")
+}
+```
+
+### Figures
+
+```{r}
+#| label: v11-att-lollipop
+#| fig-height: 7.5
+#| fig-width: 9
+
+if (has_att) {
+  run_ord <- c("control", singles$variant, cand) |> unique() |> intersect(present)
+  lp <- purrr::map_dfr(run_ord, \(v) tibble(run = v, area = names(vec(v, m_nat)), score = unname(vec(v, m_nat))))
+  area_lv <- names(sort(vec(cand, m_nat)))
+  lp <- lp |> mutate(area = factor(area, area_lv), run = factor(run, run_ord))
+  # Okabe-Ito for the flag runs; the control is an open circle, the candidate a large black dot
+  pal <- setNames(c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7", "#999999")[seq_len(nrow(singles))], singles$variant)
+  ggplot(lp, aes(score, area)) +
+    geom_line(aes(group = area), colour = "grey75", linewidth = 0.5) +
+    geom_point(data = filter(lp, run %in% singles$variant), aes(colour = run), size = 2.4) +
+    geom_point(data = filter(lp, run == "control"), shape = 21, fill = "white", size = 3) +
+    geom_point(data = filter(lp, run == cand), colour = "black", size = 3.4) +
+    geom_vline(xintercept = 100, linetype = "dashed", linewidth = 0.4) +
+    scale_colour_manual(values = pal, name = "candidate minus one flag") +
+    labs(x = glue("national composite {m_nat}  (100 = national average)"), y = NULL,
+         title = glue("Program Areas: control (open), each single-flag run, candidate {cand} (black)")) +
+    theme_minimal(base_size = 11) + theme(legend.position = "top")
+}
+```
+
+```{r}
+#| label: v11-att-heatmap
+#| fig-height: 5
+#| fig-width: 10
+
+if (has_att && nrow(singles)) {
+  hm <- purrr::map_dfr(c(singles$variant, "control"), \(v) {
+    x <- vec(cand, m_nat); y <- vec(v, m_nat)
+    tibble(flag = if (v == "control") "all flags (vs control)" else singles$flag[match(v, singles$variant)],
+           area = names(x), delta = unname(x - y[names(x)]))
+  }) |> mutate(area = factor(area, names(sort(vec(cand, m_nat), decreasing = TRUE))),
+               flag = factor(flag, rev(unique(flag))))
+  lim <- max(abs(hm$delta), na.rm = TRUE)
+  ggplot(hm, aes(area, flag, fill = delta)) +
+    geom_tile(colour = "white") +
+    geom_text(aes(label = ifelse(is.na(delta), "", format(round(delta), trim = TRUE)), colour = abs(delta) > 0.6 * lim), size = 2.8, show.legend = FALSE) +
+    scale_colour_manual(values = c(`TRUE` = "white", `FALSE` = "black")) +
+    scale_fill_gradient2(low = "#0072B2", mid = "white", high = "#D55E00", midpoint = 0, limits = c(-lim, lim), na.value = "grey90",
+                         name = "Δ") +
+    labs(x = NULL, y = NULL, title = glue("National composite: candidate {cand} minus the run without each flag")) +
+    theme_minimal(base_size = 11) + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1), panel.grid = element_blank())
+}
 ```
 
 ```{r}

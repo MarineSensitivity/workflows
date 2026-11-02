@@ -1,0 +1,289 @@
+---
+title: "Range fill: what a range cell no model covers is worth (SHARE_BASIS, RANGE_FILL)"
+subtitle: "Four species under the taxon basis, the cell basis with the er, presence and calibrated-mean fills: maps and zone shares"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    embed-resources: true
+    lightbox: false
+editor_options:
+  chunk_output_type: console
+msens:
+  target_name: explore_range_fill
+  workflow_type: explore
+  dependency:
+    - merge_models
+  output: data/explore/range_fill_shares.csv
+---
+
+## Goal
+
+v11's Call 2 asks for **single counting**: the merged value of a cell should be the species'
+suitability there, and extinction risk should enter once, as the weight at scoring. The v4 to v10
+rule values a range cell `max(er_score, suitability)`, so the governing risk is baked into the
+surface and multiplied in again at scoring. The new flag `SHARE_BASIS=cell` values a range cell by
+its suitability alone wherever a suitability model covers it. That leaves one term open: **a range
+cell no suitability model covers**. `RANGE_FILL` decides it:
+
+- `er`: the cell is worth the governing `er_score` on the 0 to 100 scale (an MBTA bird: 10, an
+  Endangered whale: 100). This is what the DPS rule has done since v9 and what the fold-in's
+  density taxa inherited. Scoring multiplies by the same number again, so such a cell scores
+  `er_score^2 / 100`.
+- `presence`: the cell is worth 100, the range taken as presence. Scoring multiplies by the risk
+  once.
+- a **calibrated mean** (not built yet): the cell is worth what an average modelled cell of the
+  species is worth, the mean of the suitability model over the cells it covers (for a density
+  taxon, the survey's mean percentile value over its domain, after calibration). The unmodelled
+  range then neither vanishes (er for a low-risk species) nor swamps the model (presence).
+
+For a **range-only** species the fill is a constant over the whole range, so the share (value
+divided by the species' own total) is the same under every fill. The fill matters for species
+that have a model over part of their range: the density seabirds (survey domain vs the rest of
+their BirdLife range), the DPS species (AquaMaps over part of the listed footprint), and any
+range-and-AquaMaps taxon whose range extends beyond AquaMaps' cells.
+
+This notebook reconstructs four species' merged surfaces from the committed merge input
+(`mc_parts`) with the msens rules under each setting, maps them, and tabulates their global
+totals and Program-Area shares. It changes nothing in the pipeline. The zone edits (occurrence
+gate, encounter weight) are not applied here: they wrap every setting identically.
+
+```{r}
+#| label: setup
+
+librarian::shelf(DBI, dplyr, duckdb, fs, ggplot2, glue, here, logger, readr, sf, tidyr, quiet = T)
+source(here("libs/paths.R"))
+dir_atlas <- glue("{dir_big_v}/marine-atlas")
+dir_parts <- glue("{dir_atlas}/mc_parts")
+merge_db  <- glue("{dir_atlas}/merge.duckdb")
+stopifnot(dir_exists(dir_parts), file_exists(merge_db), file_exists(sdm_db))
+g <- msens::grid_spec_for("global05")
+con <- dbConnect(duckdb())
+dbExecute(con, "SET threads = 4; SET memory_limit = '6GB'")
+dbExecute(con, glue("SET temp_directory = '{dir_big}/derived/tmp_explore'"))
+dbExecute(con, glue("ATTACH '{merge_db}' AS m (READ_ONLY)"))
+dbExecute(con, glue("ATTACH '{sdm_db}' AS s (READ_ONLY)"))
+dbExecute(con, "CREATE TABLE cell AS SELECT cell_id, lon, lat, area_km2, in_usa FROM s.cell")
+dbExecute(con, "CREATE TABLE us_cells AS SELECT cell_id FROM cell WHERE in_usa")
+dbExecute(con, "CREATE TABLE zone_pa AS SELECT z.val AS zone_key, zc.cell_id, zc.pct_covered
+  FROM s.zone z JOIN s.zone_cell zc USING (zone_seq) WHERE z.fld = 'programarea_key'")
+log_info("cells {dbGetQuery(con, 'SELECT count(*) n FROM cell')$n}; program-area cells {dbGetQuery(con, 'SELECT count(*) n FROM zone_pa')$n}")
+
+# the four species: a density seabird, a listed fish with an FWS range and AquaMaps, an Arctic whale with an
+# IUCN range and AquaMaps, and a DPS-listed pinniped (dps rule, AquaMaps over part of the footprint)
+spp <- tribble(
+  ~slug,        ~ms_merge_key,            ~zones,
+  "shearwater", "ms_merge|BOTW:22698246", c("SOC", "CEC", "NOC"),
+  "smelt",      "ms_merge|WORMS:282844",  c("CEC", "NOC"),
+  "bowhead",    "ms_merge|WORMS:137086",  c("HOP", "CHU", "BFT"),
+  "sealion",    "ms_merge|WORMS:254999",  c("COK", "GOA", "KOD", "SHU"))
+spp <- spp |> inner_join(dbGetQuery(con, glue("SELECT mm.ms_merge_key, mm.mkey_id, t.er_score, t.scientific_name, t.common_name
+  FROM m.mkey_map mm JOIN m.taxon t USING (ms_merge_key)
+  WHERE mm.ms_merge_key IN ({paste(sprintf(\"'%s'\", spp$ms_merge_key), collapse = ',')})")), by = "ms_merge_key")
+stopifnot(nrow(spp) == 4)
+knitr::kable(spp |> select(slug, scientific_name, common_name, er_score, mkey_id))
+```
+
+## Reconstructing one species under each setting
+
+```{r}
+#| label: rules
+
+suit_all <- c("am", "ax", "og", "gm", "nc", "cce")   # every suitability-type dataset the v11 merge knows
+surfaces_of <- function(sp) {
+  dbExecute(con, "DROP TABLE IF EXISTS b")
+  dbExecute(con, glue("CREATE TABLE b AS SELECT ms_merge_key, ds_key, cell_id, val
+    FROM read_parquet('{dir_parts}/mkey_id={sp$mkey_id}/*.parquet')"))
+  ds <- dbGetQuery(con, "SELECT ds_key, count(*) n FROM b GROUP BY 1 ORDER BY 1")
+  suit_ds <- intersect(suit_all, ds$ds_key)
+  is_dens <- "dens_dom" %in% ds$ds_key
+  is_dps  <- "dps_nmfs" %in% ds$ds_key
+  # supersession as the merge applies it: a density survey replaces AquaMaps / AquaX inside its own domain
+  if (is_dens) dbExecute(con, "DELETE FROM b WHERE ds_key IN ('am', 'ax') AND cell_id IN (SELECT cell_id FROM b WHERE ds_key = 'dens_dom')")
+  dbExecute(con, "DROP TABLE IF EXISTS taxon; DROP TABLE IF EXISTS taxon_flags")
+  dbExecute(con, glue("CREATE TABLE taxon AS SELECT '{sp$ms_merge_key}' AS ms_merge_key, {sp$er_score}::DOUBLE AS er_score"))
+  dbExecute(con, glue("CREATE TABLE taxon_flags AS SELECT '{sp$ms_merge_key}' AS ms_merge_key,
+    {length(suit_ds) > 0} AS has_suit, {any(!ds$ds_key %in% suit_all)} AS has_range"))
+  out <- list()
+  one <- function(sql) dbGetQuery(con, sql) |> select(cell_id, val) |> as_tibble()
+  if (is_dps || is_dens) {
+    # the cell-mode rules (dps_sql): no taxon basis exists for them; the baseline is today's er fill
+    er_ds <- setdiff(ds$ds_key, suit_all); if (is_dps) er_ds <- "dps_nmfs"
+    floor <- if (is_dens) sp$er_score else NULL
+    for (fl in c("er", "presence")) {
+      dbExecute(con, "DROP VIEW IF EXISTS dps_src"); dbExecute(con, "CREATE VIEW dps_src AS SELECT * FROM b WHERE ds_key NOT IN ('ch_nmfs', 'ch_fws', 'ca_nmfs')")
+      out[[paste0("cell_", fl)]] <- one(msens::dps_sql(er_ds, suit_ds, src = "dps_src", er_floor = floor, fill = fl))
+    }
+    out$taxon <- NULL
+  } else {
+    msq <- msens::merge_sql(suit_ds, basis = "taxon")
+    dbExecute(con, msq$b_range); dbExecute(con, msq$b_am_rng)
+    out$taxon <- one(msq$global)
+    for (fl in c("er", "presence")) out[[paste0("cell_", fl)]] <- one(msens::merge_sql(suit_ds, basis = "cell", fill = fl)$global)
+  }
+  # the calibrated-mean fill, derived: cells a suitability model covers keep their value; the rest take the
+  # mean of those values (for a density taxon this is the survey's mean percentile over its domain)
+  modelled <- dbGetQuery(con, glue("SELECT DISTINCT cell_id FROM b WHERE ds_key IN ({paste(sprintf(\"'%s'\", suit_ds), collapse = ',')})"))$cell_id
+  base <- out$cell_er
+  modelled <- intersect(modelled, base$cell_id)   # model cells INSIDE the footprint (beyond it they are masked away)
+  m_val <- base |> filter(cell_id %in% modelled)
+  fill_mean <- mean(m_val$val)
+  out$cell_mean <- base |> mutate(val = if_else(cell_id %in% modelled, val, fill_mean))
+  list(surfaces = out, ds = ds, suit_ds = suit_ds, rule = if (is_dps) "dps_sql (DPS-listed)" else if (is_dens) "dps_sql with er_floor (density taxon)" else "merge_sql",
+       n_modelled = length(modelled), n_footprint = nrow(base), fill_mean = fill_mean)
+}
+```
+
+```{r}
+#| label: compute
+
+res <- list()
+for (i in seq_len(nrow(spp))) {
+  sp <- spp[i, ]; t0 <- Sys.time()
+  res[[sp$slug]] <- surfaces_of(sp)
+  log_info("{sp$slug}: rule {res[[sp$slug]]$rule}; footprint {res[[sp$slug]]$n_footprint} cells, {res[[sp$slug]]$n_modelled} modelled; mean modelled value {round(res[[sp$slug]]$fill_mean, 1)}; {round(as.numeric(difftime(Sys.time(), t0, units = 'secs')))} s")
+}
+knitr::kable(bind_rows(lapply(names(res), \(k) tibble(
+  species = k, rule = res[[k]]$rule, datasets = paste(res[[k]]$ds$ds_key, res[[k]]$ds$n, sep = ":", collapse = " "),
+  footprint_cells = res[[k]]$n_footprint, modelled_cells = res[[k]]$n_modelled,
+  unmodelled_share = round(1 - res[[k]]$n_modelled / res[[k]]$n_footprint, 3), mean_modelled_value = round(res[[k]]$fill_mean, 1)))),
+  caption = "What each species' merge input holds, and how much of its footprint no suitability model covers (the cells the fill decides)")
+```
+
+## Global totals and Program-Area shares under each setting
+
+The share of a zone is the species' value-weighted area inside it divided by the species'
+global total (what `taxon_denom` and `share_run()` compute from the global surface, without the
+zone edits). The composite's contribution is this share times the species' risk weight, so a
+change in share is a proportional change in the species' contribution to every component score.
+
+```{r}
+#| label: shares
+
+share_tab <- function(k) {
+  r <- res[[k]]; sp <- spp[spp$slug == k, ]
+  bind_rows(lapply(names(r$surfaces), \(s) {
+    dbExecute(con, "DROP TABLE IF EXISTS surf"); duckdb_register(con, "surf_df", r$surfaces[[s]])
+    dbExecute(con, "CREATE TABLE surf AS SELECT * FROM surf_df"); duckdb_unregister(con, "surf_df")
+    tot <- dbGetQuery(con, "SELECT sum(v.val / 100.0 * c.area_km2) AS total, sum(CASE WHEN c.in_usa THEN v.val / 100.0 * c.area_km2 ELSE 0 END) AS total_usa
+      FROM surf v JOIN cell c USING (cell_id)")
+    z <- dbGetQuery(con, glue("SELECT z.zone_key, sum(v.val / 100.0 * c.area_km2 * z.pct_covered / 100.0) AS mass
+      FROM surf v JOIN cell c USING (cell_id) JOIN zone_pa z USING (cell_id)
+      WHERE z.zone_key IN ({paste(sprintf(\"'%s'\", sp$zones[[1]]), collapse = ',')}) GROUP BY 1"))
+    tibble(species = k, setting = s, total_global = tot$total, total_usa = tot$total_usa) |>
+      bind_cols(z |> mutate(share_pct = 100 * mass / tot$total) |> select(zone_key, share_pct) |> pivot_wider(names_from = zone_key, values_from = share_pct))
+  }))
+}
+shares <- bind_rows(lapply(names(res), share_tab)) |>
+  mutate(setting = factor(setting, c("taxon", "cell_er", "cell_presence", "cell_mean")), across(where(is.numeric), ~ round(.x, 3))) |>
+  arrange(species, setting)
+write_csv(shares, here("data/explore/range_fill_shares.csv"))
+knitr::kable(shares, caption = "Global value-weighted area (km2-equivalents), its US part, and the share (%) of the species' global total in the listed Program Areas, per setting. 'taxon' = the v4-v10 rule (max(er, suit) on range cells); the three 'cell' rows single-count on modelled cells and differ only in the unmodelled fill. Species on the DPS rule have no 'taxon' row: today's rule is cell_er.")
+```
+
+## Maps
+
+Each panel is the merged value the species would carry under that setting, 0 to 100, on the
+whole-range surface (what the Atlas would draw). Cells are averaged to 0.25 degree blocks for
+species with large ranges. The outlined polygons are the Program Areas in the table.
+
+```{r}
+#| label: map-fun
+
+ply <- tryCatch(st_read(glue("{dir_big}/derived/v2/ply_programareas_2026.gpkg"), quiet = TRUE), error = \(e) NULL)
+shift360 <- function(x) ifelse(x < 0, x + 360, x)
+map_species <- function(k) {
+  r <- res[[k]]; sp <- spp[spp$slug == k, ]
+  d <- bind_rows(lapply(names(r$surfaces), \(s) r$surfaces[[s]] |> mutate(setting = s)), .id = NULL) |>
+    inner_join(dbGetQuery(con, "SELECT cell_id, lon, lat FROM cell") |> as_tibble(), by = "cell_id")
+  big <- r$n_footprint > 150000
+  pacific <- k %in% c("bowhead", "sealion")
+  if (pacific) d$lon <- shift360(d$lon)
+  if (big) d <- d |> mutate(lon = floor(lon * 4) / 4 + 0.125, lat = floor(lat * 4) / 4 + 0.125) |>
+    group_by(setting, lon, lat) |> summarise(val = mean(val), .groups = "drop")
+  lims <- d |> summarise(x0 = quantile(lon, 0.005), x1 = quantile(lon, 0.995), y0 = quantile(lat, 0.005), y1 = quantile(lat, 0.995))
+  d$setting <- factor(d$setting, c("taxon", "cell_er", "cell_presence", "cell_mean"),
+                      labels = c("taxon basis: max(er, suit)", "cell basis, er fill", "cell basis, presence fill", "cell basis, calibrated-mean fill"))
+  p <- ggplot(d, aes(lon, lat, fill = val)) + geom_raster() +
+    scale_fill_viridis_c(limits = c(0, 100), name = "value") +
+    coord_quickmap(xlim = c(lims$x0, lims$x1), ylim = c(lims$y0, lims$y1), expand = FALSE) +
+    facet_wrap(~ setting, ncol = 2, drop = TRUE) + theme_minimal(base_size = 10) +
+    labs(title = glue("{sp$common_name} ({sp$scientific_name}), er_score {sp$er_score}\nrule: {r$rule}"),
+         subtitle = glue("{format(r$n_footprint, big.mark = ',')} footprint cells, {format(r$n_modelled, big.mark = ',')} covered by a model; calibrated-mean fill = {round(r$fill_mean, 1)}"),
+         x = NULL, y = NULL) + theme(legend.position = "bottom")
+  if (!is.null(ply)) {
+    pz <- ply |> filter(programarea_key %in% sp$zones[[1]]) |> st_geometry()
+    if (pacific) pz <- st_shift_longitude(pz)
+    p <- p + geom_sf(data = st_sf(geometry = pz), inherit.aes = FALSE, fill = NA, colour = "red", linewidth = 0.5) +
+      coord_sf(xlim = c(lims$x0, lims$x1), ylim = c(lims$y0, lims$y1), expand = FALSE, default_crs = st_crs(4326))
+  }
+  p
+}
+```
+
+```{r}
+#| label: fig-shearwater
+#| fig-cap: "Black-vented shearwater: a Pacific density seabird (NCCOS survey inside its California Current domain, BirdLife range elsewhere). Under the er fill the unsurveyed range is worth 10; under presence 100; under the calibrated mean the survey's domain mean."
+#| fig-width: 10
+#| fig-height: 8
+map_species("shearwater")
+```
+
+```{r}
+#| label: fig-smelt
+#| fig-cap: "Longfin smelt (Endangered, er_score 100): an FWS range of a few hundred cells and AquaMaps across them. The taxon basis is a flat 100 over the range; the cell basis is AquaMaps' suitability there."
+#| fig-width: 10
+#| fig-height: 8
+map_species("smelt")
+```
+
+```{r}
+#| label: fig-bowhead
+#| fig-cap: "Bowhead whale (er_score 100): IUCN range and AquaMaps. The taxon basis paints the whole range 100; the cell basis is AquaMaps' suitability inside the range, with the fill where AquaMaps has no cell."
+#| fig-width: 10
+#| fig-height: 8
+map_species("bowhead")
+```
+
+```{r}
+#| label: fig-sealion
+#| fig-cap: "Steller sea lion: a DPS-listed species on the dps rule since v9 (no taxon basis exists for it). AquaMaps covers part of the listed footprint; the fill decides the rest, where today's rule already uses the cell's own risk."
+#| fig-width: 10
+#| fig-height: 8
+map_species("sealion")
+```
+
+## Reading
+
+```{r}
+#| label: reading
+#| output: asis
+
+s <- shares |> group_by(species) |> summarise(across(where(is.numeric), ~ NA)) |> select(species)
+pick <- function(k, setting, col) shares |> filter(species == k, setting == !!setting) |> pull(all_of(col))
+cat(glue("
+- **Shearwater** (density seabird): the fill decides its California vs Alaska weight. Southern California share: er fill {round(pick('shearwater','cell_er','SOC'), 1)} %, presence {round(pick('shearwater','cell_presence','SOC'), 1)} %, calibrated mean {round(pick('shearwater','cell_mean','SOC'), 1)} %. Northern California: {round(pick('shearwater','cell_er','NOC'), 2)} / {round(pick('shearwater','cell_presence','NOC'), 2)} / {round(pick('shearwater','cell_mean','NOC'), 2)} %. (The Alaska bird changes come from wider-ranging density seabirds whose BirdLife range reaches Alaska; this one stops at British Columbia.)
+- **Longfin smelt** (range + AquaMaps, er 100): the taxon basis gives Central California {round(pick('smelt','taxon','CEC'), 1)} % of the species; the cell basis {round(pick('smelt','cell_er','CEC'), 1)} % (er fill), {round(pick('smelt','cell_presence','CEC'), 1)} % (presence), {round(pick('smelt','cell_mean','CEC'), 1)} % (mean). Here the basis matters more than the fill.
+- **Bowhead** (range + AquaMaps, er 100): Hope Basin {round(pick('bowhead','taxon','HOP'), 2)} % under the taxon basis vs {round(pick('bowhead','cell_er','HOP'), 2)} / {round(pick('bowhead','cell_presence','HOP'), 2)} / {round(pick('bowhead','cell_mean','HOP'), 2)} % under the cell basis with the three fills.
+- **Steller sea lion** (dps rule): Cook Inlet {round(pick('sealion','cell_er','COK'), 2)} % (today's er fill), {round(pick('sealion','cell_presence','COK'), 2)} % (presence), {round(pick('sealion','cell_mean','COK'), 2)} % (mean).
+
+"))
+```
+
+The table and maps say the same thing from two sides. The basis (max of risk and suitability vs
+suitability alone) changes the **shape** of a high-risk species' surface wherever AquaMaps covers
+its range. The fill changes the **balance** between the modelled and unmodelled parts of a
+species' footprint, and that balance is only an issue for species modelled over part of their
+range: the density seabirds above all, then the DPS species. For them `er` makes the unsurveyed
+range nearly weightless for a low-risk species and dominant for a high-risk one (the fill tracks
+the risk, which has nothing to do with how much of the species lives there), `presence` makes the
+unsurveyed range outweigh the survey, and the calibrated mean treats an unsurveyed cell as an
+average surveyed one, which is the only one of the three that does not depend on the risk score
+or on an arbitrary ceiling. It is not yet a flag; this notebook derives it after the fact.
+
+```{r}
+#| label: cleanup
+#| include: false
+dbDisconnect(con, shutdown = TRUE)
+```
