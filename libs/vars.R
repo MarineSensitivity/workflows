@@ -72,8 +72,8 @@ nc_atl_source   <- match.arg(Sys.getenv("NC_ATL_SOURCE", "2018"), c("2018", "202
 # SHARE_BASIS (Call 2, Ben 2026-11-01): "taxon" = the v4-v10 rule, a range cell valued max(er, suit) with the governing ER
 # multiplied in AGAIN at scoring (a range-only cell scores er^2/100; the risk shapes the distribution and weights it);
 # "cell" = single counting: the merged value is the suitability alone where a model covers the cell, RANGE_FILL where
-# none does ("er" = the governing score, the dps fitting point; "presence" = 100, the range as presence), and the ER
-# enters once, as the weight. merge_models passes both to msens::merge_sql() / dps_sql() (test-merge.R fixtures).
+# none does ("er" = the governing score, the dps fitting point, which still counts the ER twice on such a cell; "presence" =
+# 100, the range as presence, which counts it once). merge_models passes both to msens::merge_sql() / dps_sql() (test-merge.R).
 share_basis     <- match.arg(Sys.getenv("SHARE_BASIS", "taxon"), c("taxon", "cell"))
 range_fill      <- match.arg(Sys.getenv("RANGE_FILL", "er"), c("er", "presence"))
 if (range_fill != "er" && share_basis != "cell") stop("RANGE_FILL=presence needs SHARE_BASIS=cell (the taxon basis has no fill)")
