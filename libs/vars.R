@@ -75,8 +75,8 @@ nc_atl_source   <- match.arg(Sys.getenv("NC_ATL_SOURCE", "2018"), c("2018", "202
 # none does ("er" = the governing score, the dps fitting point, which still counts the ER twice on such a cell; "presence" =
 # 100, the range as presence, which counts it once). merge_models passes both to msens::merge_sql() / dps_sql() (test-merge.R).
 share_basis     <- match.arg(Sys.getenv("SHARE_BASIS", "taxon"), c("taxon", "cell"))
-range_fill      <- match.arg(Sys.getenv("RANGE_FILL", "er"), c("er", "presence"))
-if (range_fill != "er" && share_basis != "cell") stop("RANGE_FILL=presence needs SHARE_BASIS=cell (the taxon basis has no fill)")
+range_fill      <- match.arg(Sys.getenv("RANGE_FILL", "er"), c("er", "presence", "mean"))   # "mean" = the taxon's modelled-cell mean, presence when it has none (v11 decision, Ben 2026-11-02)
+if (range_fill != "er" && share_basis != "cell") stop("RANGE_FILL=presence|mean needs SHARE_BASIS=cell (the taxon basis has no fill)")
 v11_flags <- list(VGPM_INTEGRATED = vgpm_integrated, TURTLE_SUIT = turtle_suit, TURTLE_RULE = turtle_rule,
                   OCC_RULE = occ_rule, REGION_WEIGHT = region_weight, FOLD_DENSITY = fold_density,
                   FOLD_DENSITY_CAL = fold_density_cal, WORMS_SOURCE = worms_source, COMPONENTS_V11 = components_v11, NC_ATL_SOURCE = nc_atl_source,

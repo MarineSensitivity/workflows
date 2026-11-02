@@ -16,6 +16,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 FULL="TURTLE_SUIT=ogm TURTLE_RULE=dps OCC_RULE=1 REGION_WEIGHT=1 FOLD_DENSITY=1 VGPM_INTEGRATED=1 COMPONENTS_V11=1 NC_ATL_SOURCE=2023"
+V11="$FULL FOLD_DENSITY_CAL=suit SHARE_BASIS=cell RANGE_FILL=mean"   # the decided v11 method set (see the v11 variant)
 BUDGET="AX_SUPERSEDE=0 MERGE_PARTS_CHUNKS=16 MERGE_MEM_GB=20 MERGE_TEMP_GB=900 BUILD_MEMORY_GB=22 BUILD_THREADS=8"
 # variant -> flags (the candidate's, with the one change), first stage, extra stage envs (bash 3 on macOS: no
 # associative arrays, so one function per lookup)
@@ -33,16 +34,19 @@ variant_flags() { case "$1" in
   full2023_cal_suit) echo "$FULL FOLD_DENSITY_CAL=suit" ;;  # ... calibrated to the suitability prior (er beside), the basis the fold-in's cell-mode merge uses
   full2023_basis)    echo "$FULL SHARE_BASIS=cell RANGE_FILL=presence" ;;  # Call 2 (2026-11-02): single counting for every taxon, a range cell no model covers = presence (100)
   full2023_basis_er) echo "$FULL SHARE_BASIS=cell RANGE_FILL=er" ;;        # ... the same with the dps fitting point (the governing er_score) as the fill
+  full2023_basis_mean) echo "$FULL SHARE_BASIS=cell RANGE_FILL=mean" ;;    # ... the same with the modelled-cell mean as the fill (the v11 decision, 2026-11-02)
+  v11)               echo "$V11" ;;                                       # the DECIDED v11 setting (Ben 2026-11-01/02): the candidate + FOLD_DENSITY_CAL=suit (the calibration prior on the cell basis; same scores as mass within 0.1) + SHARE_BASIS=cell RANGE_FILL=mean
   *) echo "" ;; esac; }
 variant_from()  { case "$1" in
   full2023|no_turtle_suit|no_fold_density|nc_atl_2018|full2023_cal|full2023_cal_suit) echo merge_models_prep ;;
-  no_occ_rule|no_region_weight|no_turtle_rule|full2023_basis|full2023_basis_er) echo merge_models ;;
+  no_occ_rule|no_region_weight|no_turtle_rule|full2023_basis|full2023_basis_er|full2023_basis_mean) echo merge_models ;;
+  v11)                                                 echo merge_models_prep ;;
   no_vgpm)                                             echo score_cell_metrics ;;
   no_components)                                       echo merge_taxon ;;
   *) echo "" ;; esac; }
 # the merge notebook tests nzchar(): an EMPTY value is "off", a "0" would be "on"
 variant_extra() { case "$1" in
-  no_occ_rule|no_region_weight|full2023_basis|full2023_basis_er) echo "REDO_MC_PARTS= REDO_MERGE=1" ;;
+  no_occ_rule|no_region_weight|full2023_basis|full2023_basis_er|full2023_basis_mean) echo "REDO_MC_PARTS= REDO_MERGE=1" ;;
   no_turtle_rule)               echo "REDO_MC_PARTS= REDO_MERGE= REDO_MERGE_SPATIAL=1" ;;
   *) echo "" ;; esac; }
 # ORDER MATTERS: a variant resumes on what the previous one left in derived/v11. The scoring-only and the
@@ -50,7 +54,7 @@ variant_extra() { case "$1" in
 # ones come next (each rewrites every surface); the two re-prep ones last; nc_atl_2018 needs ingest_sdm-nc
 # re-rendered with NC_ATL_SOURCE=2018 in between (`--all` does that render itself).
 VARIANTS="full2023 no_vgpm no_components no_turtle_rule no_occ_rule no_region_weight no_turtle_suit no_fold_density nc_atl_2018"
-EXTRA_VARIANTS="full2023_cal full2023_cal_suit full2023_basis full2023_basis_er"   # follow-ups, not part of --all
+EXTRA_VARIANTS="full2023_cal full2023_cal_suit full2023_basis full2023_basis_er full2023_basis_mean v11"   # follow-ups, not part of --all
 if [ "${1:-}" = "--list" ]; then for v in $VARIANTS $EXTRA_VARIANTS; do echo "$v  from $(variant_from "$v")  $(variant_extra "$v")  $(variant_flags "$v")"; done; exit 0; fi
 [ $# -gt 0 ] || { echo "usage: $0 [--keep-parts] <variant> [<variant> ...] | --all | --list" >&2; exit 2; }
 mkdir -p _output/logs
