@@ -31,16 +31,18 @@ variant_flags() { case "$1" in
   no_components)    echo "${FULL/COMPONENTS_V11=1/COMPONENTS_V11=0}" ;;
   full2023_cal)     echo "$FULL FOLD_DENSITY_CAL=mass" ;;   # the candidate + the mass-preserving density calibration (2026-10-31)
   full2023_cal_suit) echo "$FULL FOLD_DENSITY_CAL=suit" ;;  # ... calibrated to the suitability prior (er beside), the basis the fold-in's cell-mode merge uses
+  full2023_basis)    echo "$FULL SHARE_BASIS=cell RANGE_FILL=presence" ;;  # Call 2 (2026-11-02): single counting for every taxon, a range cell no model covers = presence (100)
+  full2023_basis_er) echo "$FULL SHARE_BASIS=cell RANGE_FILL=er" ;;        # ... the same with the dps fitting point (the governing er_score) as the fill
   *) echo "" ;; esac; }
 variant_from()  { case "$1" in
   full2023|no_turtle_suit|no_fold_density|nc_atl_2018|full2023_cal|full2023_cal_suit) echo merge_models_prep ;;
-  no_occ_rule|no_region_weight|no_turtle_rule)         echo merge_models ;;
+  no_occ_rule|no_region_weight|no_turtle_rule|full2023_basis|full2023_basis_er) echo merge_models ;;
   no_vgpm)                                             echo score_cell_metrics ;;
   no_components)                                       echo merge_taxon ;;
   *) echo "" ;; esac; }
 # the merge notebook tests nzchar(): an EMPTY value is "off", a "0" would be "on"
 variant_extra() { case "$1" in
-  no_occ_rule|no_region_weight) echo "REDO_MC_PARTS= REDO_MERGE=1" ;;
+  no_occ_rule|no_region_weight|full2023_basis|full2023_basis_er) echo "REDO_MC_PARTS= REDO_MERGE=1" ;;
   no_turtle_rule)               echo "REDO_MC_PARTS= REDO_MERGE= REDO_MERGE_SPATIAL=1" ;;
   *) echo "" ;; esac; }
 # ORDER MATTERS: a variant resumes on what the previous one left in derived/v11. The scoring-only and the
@@ -48,7 +50,7 @@ variant_extra() { case "$1" in
 # ones come next (each rewrites every surface); the two re-prep ones last; nc_atl_2018 needs ingest_sdm-nc
 # re-rendered with NC_ATL_SOURCE=2018 in between (`--all` does that render itself).
 VARIANTS="full2023 no_vgpm no_components no_turtle_rule no_occ_rule no_region_weight no_turtle_suit no_fold_density nc_atl_2018"
-EXTRA_VARIANTS="full2023_cal full2023_cal_suit"   # follow-ups, not part of --all
+EXTRA_VARIANTS="full2023_cal full2023_cal_suit full2023_basis full2023_basis_er"   # follow-ups, not part of --all
 if [ "${1:-}" = "--list" ]; then for v in $VARIANTS $EXTRA_VARIANTS; do echo "$v  from $(variant_from "$v")  $(variant_extra "$v")  $(variant_flags "$v")"; done; exit 0; fi
 [ $# -gt 0 ] || { echo "usage: $0 [--keep-parts] <variant> [<variant> ...] | --all | --list" >&2; exit 2; }
 mkdir -p _output/logs

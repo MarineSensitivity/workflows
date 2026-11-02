@@ -65,7 +65,12 @@ source(here("libs/vars.R"))
 # gate) and REGION_WEIGHT (the encounter weight); every other flag must be at its control value here, except NC_ATL_SOURCE
 # (the nc ingest decides which Atlantic bird models exist; the merge takes what is in dist/)
 stopifnot("a v11 flag this stage does not implement is on (libs/vars.R v11_flags)" =
-            worms_source == "download")   # TURTLE_SUIT, TURTLE_RULE, OCC_RULE, REGION_WEIGHT, FOLD_DENSITY (+ FOLD_DENSITY_CAL) are implemented here; VGPM_INTEGRATED / COMPONENTS_V11 belong to scoring
+            worms_source == "download")   # TURTLE_SUIT, TURTLE_RULE, OCC_RULE, REGION_WEIGHT, FOLD_DENSITY (+ FOLD_DENSITY_CAL), SHARE_BASIS (+ RANGE_FILL) are implemented here; VGPM_INTEGRATED / COMPONENTS_V11 belong to scoring
+# SHARE_BASIS / RANGE_FILL (libs/vars.R): the value of a range cell -- "taxon" bakes the governing ER in (max(er, suit),
+# v4-v10), "cell" is the suitability alone with RANGE_FILL where nothing models the cell (single counting). Passed to
+# msens::merge_sql() for the batched taxa and as `fill` to every dps_sql() call (the cell-mode taxa already single-count).
+log_info("SHARE_BASIS={share_basis} RANGE_FILL={range_fill}: a range cell is {if (share_basis == 'taxon') 'max(er, suit)' else paste0('the suitability alone, ', if (range_fill == 'er') 'its governing er_score' else '100 (presence)', ' where no model covers it')}")
+if (share_basis == "cell" && fold_density_cal == "mass") log_warn("SHARE_BASIS=cell with FOLD_DENSITY_CAL=mass: the mass prior is the control's max(er, suit) value; FOLD_DENSITY_CAL=suit is the prior on this basis")
 
 dir_atlas   <- glue("{dir_big_v}/marine-atlas")
 dir_dist    <- glue("{dir_atlas}/dist")
@@ -412,7 +417,7 @@ dbExecute(con, "CREATE OR REPLACE TABLE mc_dps (mdl_key VARCHAR, cell_id INTEGER
 for (id in dps_ids) {
   dbExecute(con, glue("CREATE OR REPLACE VIEW dps_src AS
     SELECT ms_merge_key, ds_key, cell_id, val FROM {parts_sql(id)} WHERE ds_key NOT IN ({ch_sql}){dens_filter}"))
-  dbExecute(con, paste("INSERT INTO mc_dps", msens::dps_sql(dps_ds, suit_ds, src = "dps_src")))
+  dbExecute(con, paste("INSERT INTO mc_dps", msens::dps_sql(dps_ds, suit_ds, src = "dps_src", fill = range_fill)))
 }
 # v11 Q6: the density taxa (not turtles, not DPS-listed) merge the same way -- every range dataset of the taxon
 # (IUCN / FWS / NMFS ranges, critical habitat, the dens_dom footprint) is the ER layer at the governing er_score,
@@ -434,7 +439,7 @@ for (id in dens_ids) {
   k_id  <- dbGetQuery(con, glue("SELECT ms_merge_key FROM mkey_map WHERE mkey_id = {id}"))$ms_merge_key
   floor <- dens_er$er_score[dens_er$ms_merge_key == k_id]
   stopifnot("one governing er_score per density taxon" = length(floor) == 1L)
-  dbExecute(con, paste("INSERT INTO mc_dps", msens::dps_sql(er_ds, suit_ds, src = "dps_src", er_floor = floor)))
+  dbExecute(con, paste("INSERT INTO mc_dps", msens::dps_sql(er_ds, suit_ds, src = "dps_src", er_floor = floor, fill = range_fill)))
 }
 if (length(dens_ids)) {
   # regression guard: no density taxon's per-cell ER may fall below its governing er_score
@@ -448,7 +453,7 @@ if (turtle_rule == "dps") for (id in turtle_ids) {
   # (dps_sql takes max(val) over the ER datasets, so a critical-habitat cell carries its own ER)
   dbExecute(con, glue("CREATE OR REPLACE VIEW dps_src AS
     SELECT ms_merge_key, ds_key, cell_id, val FROM {parts_sql(id)}"))
-  dbExecute(con, paste("INSERT INTO mc_dps", msens::dps_sql(c(turtle_ds, ch_ds), suit_ds, src = "dps_src")))
+  dbExecute(con, paste("INSERT INTO mc_dps", msens::dps_sql(c(turtle_ds, ch_ds), suit_ds, src = "dps_src", fill = range_fill)))
 }
 if (length(dps_ids) || turtle_rule == "dps" || length(dens_ids)) dbExecute(con, "DROP VIEW IF EXISTS dps_src")
 log_info("mc_dps (whole-range): {dbGetQuery(con, 'SELECT count(*) n FROM mc_dps')$n} cells over {length(dps_ids)} taxa")
@@ -535,7 +540,7 @@ log_info("merging {length(nonturtle)} non-turtle taxa in {length(batches)} cell-
 #    range is MASKED] UNION raw am∩US for TRUE am-only taxa (global has_range=FALSE). A species whose
 #    IUCN range lies WHOLLY outside the US gets NO US presence — the iucn_range_outside_us_eez
 #    exclusion (e.g. Sotalia guianensis). See ?msens::merge_sql for the full rationale.
-msq             <- msens::merge_sql(suit_ds)
+msq             <- msens::merge_sql(suit_ds, basis = share_basis, fill = range_fill)   # SHARE_BASIS / RANGE_FILL (v11 Call 2)
 glob_global_sql <- adj(msq$global)   # the gate + weight wrapper (identity with the flags off)
 us_sql          <- adj(msq$us)
 for (i in seq_along(batches)) {

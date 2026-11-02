@@ -69,11 +69,21 @@ components_v11  <- .flag("COMPONENTS_V11")                         # data/compon
 # control, or the 2023 MDAT v3 / BOEM 2023-060 set). Nothing downstream implements or asserts it: the merge, the scoring and the
 # attribution harness read whatever the ingest left, and a variant's flags record which source it was (snapshot_scores).
 nc_atl_source   <- match.arg(Sys.getenv("NC_ATL_SOURCE", "2018"), c("2018", "2023"))                  # ingest_sdm-nc: Atlantic bird source (Q6c)
+# SHARE_BASIS (Call 2, Ben 2026-11-01): "taxon" = the v4-v10 rule, a range cell valued max(er, suit) with the governing ER
+# multiplied in AGAIN at scoring (a range-only cell scores er^2/100; the risk shapes the distribution and weights it);
+# "cell" = single counting: the merged value is the suitability alone where a model covers the cell, RANGE_FILL where
+# none does ("er" = the governing score, the dps fitting point; "presence" = 100, the range as presence), and the ER
+# enters once, as the weight. merge_models passes both to msens::merge_sql() / dps_sql() (test-merge.R fixtures).
+share_basis     <- match.arg(Sys.getenv("SHARE_BASIS", "taxon"), c("taxon", "cell"))
+range_fill      <- match.arg(Sys.getenv("RANGE_FILL", "er"), c("er", "presence"))
+if (range_fill != "er" && share_basis != "cell") stop("RANGE_FILL=presence needs SHARE_BASIS=cell (the taxon basis has no fill)")
 v11_flags <- list(VGPM_INTEGRATED = vgpm_integrated, TURTLE_SUIT = turtle_suit, TURTLE_RULE = turtle_rule,
                   OCC_RULE = occ_rule, REGION_WEIGHT = region_weight, FOLD_DENSITY = fold_density,
-                  FOLD_DENSITY_CAL = fold_density_cal, WORMS_SOURCE = worms_source, COMPONENTS_V11 = components_v11, NC_ATL_SOURCE = nc_atl_source)
+                  FOLD_DENSITY_CAL = fold_density_cal, WORMS_SOURCE = worms_source, COMPONENTS_V11 = components_v11, NC_ATL_SOURCE = nc_atl_source,
+                  SHARE_BASIS = share_basis, RANGE_FILL = range_fill)
 v11_flag_defaults <- list(VGPM_INTEGRATED = FALSE, TURTLE_SUIT = "am", TURTLE_RULE = "turtle",
                           OCC_RULE = FALSE, REGION_WEIGHT = FALSE, FOLD_DENSITY = FALSE,
-                          FOLD_DENSITY_CAL = "none", WORMS_SOURCE = "download", COMPONENTS_V11 = FALSE, NC_ATL_SOURCE = "2018")
+                          FOLD_DENSITY_CAL = "none", WORMS_SOURCE = "download", COMPONENTS_V11 = FALSE, NC_ATL_SOURCE = "2018",
+                          SHARE_BASIS = "taxon", RANGE_FILL = "er")
 v11_flags_off <- identical(v11_flags, v11_flag_defaults)                 # TRUE = the control run (== v10)
 v11_flags_on  <- names(v11_flags)[!mapply(identical, v11_flags, v11_flag_defaults[names(v11_flags)])]   # the flags a method run set
