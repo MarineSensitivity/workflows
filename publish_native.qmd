@@ -887,8 +887,33 @@ native_asset <- native_asset |> relocate(all_of(msens:::.NATIVE_ASSET_COLS))
 
 # the registry is CUMULATIVE: a run may not delete a class it did not rebuild. The PUBLISHED pointer table
 # is the prior (what readers see today); the local sdm.duckdb copy only when the release is not yet published.
+# NATIVE_PRIOR_FROM=<ver>: a version whose merge is a VERIFIED clone of that version's (bootstrap_version.json:
+# clone_merge + merge_verified, same ver_prev) takes that version's PUBLISHED native_asset as (1) the prior for
+# registry_merge while it is itself unpublished (the local table a bootstrap clones is the parent's PRE-store copy,
+# whose vector `model` COG rows name the pruned {parent}/native/vec_grid/ files) and (2) the source of the ms_merge
+# `model` pointers for the taxa this build has no surface for. v10 (2026-11-05): 192 multi-AquaMaps taxa are in dist_merged (US) but absent from
+# dist_merged_global (the known v8 gap), while v8's published table points them at catalogued store objects painted
+# from v8's own surfaces -- v10's are byte-identical, so the pointers are v10's too. Rows for taxa the build DOES
+# paint are never taken from the parent; every carried URL must be a catalogued store object (the store gate below).
+carry_from <- Sys.getenv("NATIVE_PRIOR_FROM")
+if (nzchar(carry_from)) {
+  stopifnot("NATIVE_PRIOR_FROM must be a version label" = grepl("^v[0-9]+[a-z]?$", carry_from))
+  bs <- fromJSON(here("data/manifests/bootstrap_version.json"))
+  stopifnot("NATIVE_PRIOR_FROM: this version's merge is not a verified clone of that version's (bootstrap_version.json)" =
+              identical(bs$ver, ver) && identical(bs$ver_prev, carry_from) && isTRUE(bs$clone_merge) && isTRUE(bs$merge_verified))
+  parent_na <- as_tibble(read_parquet(fetch(glue("{base}/{carry_from}/tables/native_asset.parquet"))))
+  carry_rows <- parent_na |> filter(ds_key == "ms_merge", asset_type == "cog", representation == "model",
+                                    !mdl_key %in% native_asset$mdl_key[native_asset$ds_key == "ms_merge"]) |>
+    mutate(ms_merge_key = mdl_key)
+  stopifnot("carried pointers must be store objects" = all(grepl("/cog/global05/[0-9a-f]{16}\\.tif$", carry_rows$asset_url)),
+            "carried pointers must be catalogued" = all(sub(paste0(base, "/"), "", carry_rows$asset_url, fixed = TRUE) %in% catalog$key))
+  for (cc in setdiff(msens:::.NATIVE_ASSET_COLS, names(carry_rows))) carry_rows[[cc]] <- NA
+  native_asset <- bind_rows(native_asset, carry_rows |> select(all_of(msens:::.NATIVE_ASSET_COLS))) |> relocate(all_of(msens:::.NATIVE_ASSET_COLS))
+  log_info("NATIVE_PRIOR_FROM={carry_from}: {nrow(carry_rows)} ms_merge model pointers carried from its published table")
+}
 pub_na <- tryCatch(as_tibble(read_parquet(fetch(glue("{base}/{ver}/tables/native_asset.parquet")))), error = function(e) NULL)
-prior_asset <- if (!is.null(pub_na)) { log_info("prior = published {ver}/tables/native_asset.parquet ({nrow(pub_na)} rows)"); pub_na } else {
+prior_asset <- if (!is.null(pub_na)) { log_info("prior = published {ver}/tables/native_asset.parquet ({nrow(pub_na)} rows)"); pub_na } else if (nzchar(carry_from)) {
+  log_info("prior = published {carry_from}/tables/native_asset.parquet ({nrow(parent_na)} rows; NATIVE_PRIOR_FROM, release not published)"); parent_na } else {
   c0 <- dbConnect(duckdb(sdm_db, read_only = TRUE))
   p0 <- if (dbExistsTable(c0, "native_asset")) { log_info("prior = local sdm.duckdb native_asset (release not published)"); dbReadTable(c0, "native_asset") } else NULL
   dbDisconnect(c0, shutdown = TRUE); p0
