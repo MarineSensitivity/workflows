@@ -207,6 +207,32 @@ zone_tiles <- setNames(
   zone_sets$zone_set_key)
 message(glue("zone tile sets: {length(zone_tiles)}"))
 
+# the Atlas's `app/` bundle, when build_app_bundle.qmd has published it: `msens::app_manifest_block()`
+# probes the pushed objects by anonymous HEAD -- the same probe the bundle notebook runs when it patches
+# the live manifest -- so a manifest rebuilt AFTER the bundle keeps the block instead of erasing it
+# (2026-11-05: a second render after v10's bundle push left v10/manifest.json with no `app` at all).
+# A release with no boot.json gets no block, exactly as before.
+boot_status <- tryCatch(httr2::resp_status(httr2::req_perform(httr2::req_error(
+  httr2::req_method(httr2::request(glue("{http_root}/{ver}/app/boot.json")), "HEAD"),
+  is_error = function(resp) FALSE))), error = function(e) NA_integer_)
+# the `cell` probe must HEAD a tile that EXISTS: tiles are written only where the release has cells, so
+# msens's default `tile=0` answers 404 for every release (round 4's lesson in build_app_bundle.qmd) --
+# take the first published tile key from the bucket listing, as the bundle notebook does
+first_cell_tile <- function() {
+  out <- suppressWarnings(system2("aws", c("s3api", "list-objects-v2", "--bucket", "oceanmetrics.io-public",
+    "--prefix", shQuote(glue("marine-atlas/{ver}/app/cell/tile=")), "--max-keys", "1", "--query", "Contents[0].Key", "--output", "text"),
+    stdout = TRUE, stderr = FALSE))
+  m <- regmatches(out, regexpr("tile=[0-9]+", out))
+  if (length(m)) sub("tile=", "", m[1]) else NULL
+}
+app_block <- if (isTRUE(boot_status %in% c(200L, 206L))) {
+  ct <- first_cell_tile()
+  message(glue("app bundle: first cell tile on S3 = {ct %||% 'none'}"))
+  msens::app_manifest_block(ver, base = http_root,
+    capabilities = msens::app_capabilities(ver, base = http_root, cell_tile = ct))
+} else NULL
+message(glue("app bundle: boot.json HEAD {boot_status} -> app block {if (is.null(app_block)) 'absent' else 'recorded'}"))
+
 mfst  <- msens::manifest_build(
   con, ver,
   status       = v_row$status,
@@ -215,6 +241,7 @@ mfst  <- msens::manifest_build(
   metrics      = scog,
   zone_tiles   = zone_tiles,
   capabilities = caps_override,
+  app          = app_block,
   extra  = c(list(
     title    = v_row$title,
     released = as.character(v_row$released),
