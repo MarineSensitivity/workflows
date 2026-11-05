@@ -313,6 +313,8 @@ if (share_metrics) {
 #| label: release_method
 
 onoff <- function(x) if (isTRUE(x)) "on" else "off"
+bs_rec <- tryCatch(fromJSON(here("data/manifests/bootstrap_version.json")), error = function(e) NULL)
+merge_is_clone <- !is.null(bs_rec) && identical(bs_rec$ver, ver) && isTRUE(bs_rec$clone_merge) && isTRUE(bs_rec$merge_verified)
 rm_rows <- tibble(
   method_key = c("share_metrics", "share_denom", "share_kappa_pct", "share_floor_strip", "share_components", "components_labels", "prev"),
   value = c(onoff(share_metrics), share_denom, as.character(share_kappa * 100), onoff(share_strip), paste(sp_cats, collapse = ","), if (components_v11) "v11" else "v10", ver_prev),
@@ -323,7 +325,31 @@ rm_rows <- tibble(
     "Whether the floored (val = 1) cells of the premultiplied sea turtles are zeroed on both sides of the share (off = kept, the surface stays continuous)",
     "The scored components; v8's taxonomy-based categories (no 'other'); primary productivity joins as primprod_v10",
     "Which component names the manifest shows: v10 (Primary Producers, Primary productivity) or v11 (Flora, Productivity; data/components.csv, msens::component_label())",
-    "The release whose merge and within-ecoregion scoring this version keeps unchanged"))
+    if (isTRUE(merge_is_clone)) "The release whose merge and within-ecoregion scoring this version keeps unchanged" else
+      "The release this version is compared against; the merge was re-run under the method flags listed above"))
+# the v11 method flags (libs/vars.R `v11_flags`) as data, so the docs state the rules from the release rather than
+# from prose: every flag with its value as this run saw it (a flag at its default = v10's rule). Recorded for every
+# version from v10 on -- v10's rows all read their control values, which is itself the statement that v10 is v8's merge.
+flag_desc <- c(
+  VGPM_INTEGRATED  = "Primary productivity as the year-integrated VGPM (polar night = 0) instead of the mean of available months (off: v8/v10)",
+  TURTLE_SUIT      = "Sea-turtle suitability source: am = AquaMaps, ogm = the project's own occurrence-based models",
+  TURTLE_RULE      = "Sea-turtle merge rule: turtle = multiplicative er x suit (v4b-v10), dps = suitability with the per-cell ER beside (dps_sql)",
+  OCC_RULE         = "Zero-record occurrence gate: a species is excluded from an ecoregion with no OBIS/GBIF/iNaturalist record (msens::occurrence_rule)",
+  REGION_WEIGHT    = "Encounter weights per species x ecoregion (msens::encounter_weight)",
+  FOLD_DENSITY     = "Survey density datasets (gm, nc, cce) replace suitability inside their domain",
+  FOLD_DENSITY_CAL = "Calibration of the folded-in survey: none, mass (the control's value basis) or suit (the suitability prior where modelled)",
+  WORMS_SOURCE     = "WoRMS taxonomy source: download or obisindicators",
+  COMPONENTS_V11   = "Component labels Flora / Productivity (data/components.csv)",
+  NC_ATL_SOURCE    = "NCCOS Atlantic seabird set: 2018 (Winship et al.) or 2023 (MDAT v3 / BOEM 2023-060)",
+  SHARE_BASIS      = "Merged value basis: taxon = max(er, suit) with the governing ER multiplied in again at scoring; cell = suitability alone, ER beside (single counting)",
+  RANGE_FILL       = "Value of a range cell no suitability model covers under the cell basis: er (the governing score), presence (100) or mean (the taxon's modelled-cell mean)")
+if (exists("v11_flags")) {
+  fl <- v11_flags[names(flag_desc)]
+  rm_rows <- bind_rows(rm_rows, tibble(
+    method_key  = tolower(names(fl)),
+    value       = vapply(fl, function(x) if (is.logical(x)) onoff(x) else as.character(x), ""),
+    description = unname(flag_desc[names(fl)])))
+}
 if (share_metrics) dbWriteTable(con, "release_method", rm_rows, overwrite = TRUE)
 knitr::kable(rm_rows)
 ```
