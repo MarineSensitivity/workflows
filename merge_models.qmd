@@ -189,8 +189,18 @@ if (fold_density) {
     SELECT DISTINCT tm.ms_merge_key, mc.cell_id
     FROM read_parquet([{dens_glob}], hive_partitioning = false) mc JOIN taxon_model tm USING (mdl_key)
     WHERE split_part(tm.mdl_key, '|', 1) IN ({dens_sql}) AND len(string_split(tm.mdl_key, '|')) = 2"))
+  # the density fold-in is for the density taxa that are NOT turtles and NOT DPS-listed (those merge through their own
+  # rules, and `dens_filter` keeps the survey out of their suitability): their survey domain must then not supersede
+  # their am / ax either, or the domain is a HOLE the fill paints flat -- the humpback (cce + dps_nmfs) carried the
+  # mean 70.697 over 15,900 of its 16,484 California Current cells on 2026-11-06
+  n_dom0 <- dbGetQuery(con, "SELECT count(*) n FROM dens_dom")$n
+  dbExecute(con, glue("DELETE FROM dens_dom WHERE ms_merge_key IN (
+    SELECT DISTINCT ms_merge_key FROM taxon_model WHERE mdl_key LIKE 'rng_turtle_swot_dps|%' OR mdl_key LIKE '{dps_ds}|%')"))
   dbExecute(con, "CREATE OR REPLACE TABLE dens_taxa AS SELECT DISTINCT ms_merge_key FROM dens_dom")
-  log_info("FOLD_DENSITY: {dbGetQuery(con, 'SELECT count(*) n FROM dens_taxa')$n} density taxa, {dbGetQuery(con, 'SELECT count(*) n FROM dens_dom')$n} (taxon, cell) domain rows replace am / ax")
+  stopifnot("a turtle or DPS-listed taxon is in dens_taxa (its am / ax would be superseded by a survey it never takes)" =
+    dbGetQuery(con, glue("SELECT count(*) n FROM dens_taxa WHERE ms_merge_key IN (
+      SELECT ms_merge_key FROM taxon_model WHERE mdl_key LIKE 'rng_turtle_swot_dps|%' OR mdl_key LIKE '{dps_ds}|%')"))$n == 0)
+  log_info("FOLD_DENSITY: {dbGetQuery(con, 'SELECT count(*) n FROM dens_taxa')$n} density taxa, {dbGetQuery(con, 'SELECT count(*) n FROM dens_dom')$n} (taxon, cell) domain rows replace am / ax ({n_dom0 - dbGetQuery(con, 'SELECT count(*) n FROM dens_dom')$n} turtle / DPS domain rows set aside)")
 } else {
   dbExecute(con, "CREATE OR REPLACE TABLE dens_dom (ms_merge_key VARCHAR, cell_id INTEGER)")
   dbExecute(con, "CREATE OR REPLACE TABLE dens_taxa (ms_merge_key VARCHAR)")
@@ -550,6 +560,7 @@ for (i in seq_along(batches)) {
     SELECT ms_merge_key, ds_key, cell_id, val FROM {parts_sql(batches[[i]])}"))
   dbExecute(con, msq$b_range)    # range footprint (non-am) valued by governing er_score
   dbExecute(con, msq$b_am_rng)   # am AT range cells only → range-footprint max(er, am-at-range)
+  dbExecute(con, msq$b_fill)     # one fill per taxon: whole-range mean of the modelled range cells (RANGE_FILL=mean)
   # per-taxon range-cell tally, accumulated while b_range is in hand (free) — the masking check
   # below needs it and would otherwise have to re-scan 12 GB of range parquet on every render
   dbExecute(con, "INSERT INTO range_counts SELECT ms_merge_key, count(*) FROM b_range GROUP BY 1")
