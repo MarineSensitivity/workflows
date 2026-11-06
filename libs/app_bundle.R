@@ -1502,7 +1502,12 @@ app_bundle_budgets <- function() {
               "cell/tile=*/data_0.parquet", "taxon.parquet",
               "taxonomy.parquet"),
     kind = c("gzip", "gzip", "gzip", "gzip", "raw", "raw", "raw"),
-    budget_bytes = as.integer(c(60, 1024, 25, 15, 250, 1024, 1024) * 1024),
+    # boot.json 60 -> 96 KB gz and the cell tile 250 -> 512 KB raw on 2026-11-05: v10's across-the-nation
+    # share family triples the metric registry (41 -> 184 keys, every zone's `metrics` block with it) and
+    # adds 15 cell layers (22 -> 37 tile columns; v8's largest tile was 213 KB, v10's 466 KB). Both scale
+    # with the metric family a release carries, the same lesson zone_taxon taught below; the Atlas fetches
+    # one tile per inspected cell and boot.json once per load.
+    budget_bytes = as.integer(c(96, 1024, 25, 15, 512, 1024, 1024) * 1024),
     stringsAsFactors = FALSE)
 }
 
