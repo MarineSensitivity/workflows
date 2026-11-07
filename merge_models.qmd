@@ -60,6 +60,18 @@ flowchart LR
 librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, quiet = T)
 source(here("libs/paths.R"))
 source(here("libs/vars.R"))
+# v11 method flags (libs/vars.R): this stage implements TURTLE_SUIT (og supersedes am/ax for the
+# turtles inside the og footprint), TURTLE_RULE (turtles merged by dps_sql), OCC_RULE (the occurrence
+# gate) and REGION_WEIGHT (the encounter weight); every other flag must be at its control value here, except NC_ATL_SOURCE
+# (the nc ingest decides which Atlantic bird models exist; the merge takes what is in dist/)
+stopifnot("a v11 flag this stage does not implement is on (libs/vars.R v11_flags)" =
+            worms_source == "download")   # TURTLE_SUIT, TURTLE_RULE, OCC_RULE, REGION_WEIGHT, FOLD_DENSITY (+ FOLD_DENSITY_CAL), SHARE_BASIS (+ RANGE_FILL) are implemented here; VGPM_INTEGRATED / COMPONENTS_V11 belong to scoring
+# SHARE_BASIS / RANGE_FILL (libs/vars.R): the value of a range cell -- "taxon" bakes the governing ER in (max(er, suit),
+# v4-v10), "cell" is the suitability alone with RANGE_FILL where nothing models the cell (single counting). Passed to
+# msens::merge_sql() for the batched taxa and as `fill` to every dps_sql() call (the cell-mode taxa single-count where a model
+# covers the cell; a footprint cell no model covers is valued at its ER under fill = er, so it scores er^2/100 there too).
+log_info("SHARE_BASIS={share_basis} RANGE_FILL={range_fill}: a range cell is {if (share_basis == 'taxon') 'max(er, suit)' else paste0('the suitability alone, ', switch(range_fill, er = 'its governing er_score', presence = '100 (presence)', mean = 'the mean of the modelled range cells of the taxon (presence when it has none)'), ' where no model covers it')}")
+if (share_basis == "cell" && fold_density_cal == "mass") log_warn("SHARE_BASIS=cell with FOLD_DENSITY_CAL=mass: the mass prior is the control's max(er, suit) value; FOLD_DENSITY_CAL=suit is the prior on this basis")
 
 dir_atlas   <- glue("{dir_big_v}/marine-atlas")
 dir_dist    <- glue("{dir_atlas}/dist")
@@ -73,6 +85,19 @@ stopifnot("run merge_models_prep first" = file_exists(merge_db),
           "run build_cell_grid first"   = file_exists(sdm_db))
 
 suit_ds   <- c("am", "ax")      # v9: AquaX joins AquaMaps as a suitability dataset (msens::merge_sql)
+# v11 Q3 (D9): under TURTLE_SUIT=ogm our own OBIS-method models (`og`) are a third suitability
+# dataset -- present only for the six turtles (merge_models_prep admits og only then), superseding
+# am and ax inside the og footprint (og_mask) exactly as AquaX supersedes AquaMaps inside its mask
+if (turtle_suit == "ogm") suit_ds <- c(suit_ds, "og")
+# v11 Q6 (D12, FOLD_DENSITY): the annual density surfaces (gm, nc; density_to_suit "ud" percentiles) are a
+# suitability source too -- replacing am / ax inside each species' own survey domain (dens_dom, per taxon),
+# the domain admitted to the range footprint (synthetic `dens_dom` rows at the governing er_score), and the
+# taxon merged through dps_sql so its value stays the distribution and the ER rides beside it per cell
+# (er_mode = 'cell': under max(er, suit) an Endangered whale is a flat 100 and the survey never shows)
+dens_ds   <- if (fold_density) c("gm", "nc", "cce") else character(0)
+if (fold_density) suit_ds <- c(suit_ds, dens_ds)
+dens_sql  <- paste(sprintf("'%s'", dens_ds), collapse = ",")
+dens_filter <- if (length(dens_ds)) glue(" AND ds_key NOT IN ({dens_sql})") else ""   # turtle / DPS taxa never take density
 turtle_ds <- "rng_turtle_swot_dps"
 # SPATIAL extinction risk, two rules (both msens, both unit-tested in test-merge.R):
 #  * sea turtles (v4b, msens::turtle_sql): val = greatest(1, round(er x suit / 100)), critical
@@ -98,7 +123,9 @@ dbExecute(con, glue("PRAGMA memory_limit='{mem_gb}GB'"))
 # streaming COPY/aggregates need no insertion order; keeping it pins buffers the OOM guard then hits
 dbExecute(con, "SET preserve_insertion_order = false")
 dbExecute(con, glue("PRAGMA temp_directory='{dir_atlas}/duckdb_tmp'"))
-dbExecute(con, glue("PRAGMA max_temp_directory_size='400GB'"))
+# the mc_parts repartition of ~13 B rows spills far beyond RAM (v8: ~500 GB); MERGE_TEMP_GB raises the cap where
+# the disk allows (the mini's 2 TB volume), MERGE_MEM_GB the buffer pool (48 GB machine, nothing else running)
+dbExecute(con, glue("PRAGMA max_temp_directory_size='{as.integer(Sys.getenv('MERGE_TEMP_GB', '400'))}GB'"))
 dbExecute(con, glue("PRAGMA threads={min(4L, max(1L, parallel::detectCores() - 1L))}"))
 
 # ONE GLOBAL merge, two outputs from the same data: the whole-range merged surface
@@ -143,20 +170,135 @@ if (has_ax) {
   dbExecute(con, "CREATE OR REPLACE TABLE supersede (ms_merge_key VARCHAR)")
   log_info("no ax ingest found — no supersession (v8-style merge)")
 }
+# v11 Q3: the og footprint + the turtle keys whose am/ax rows it supersedes (TURTLE_SUIT=ogm);
+# an empty table under the control so the predicate below keeps every row
+og_dir <- glue("{dir_dist}/dataset=og")
+if (turtle_suit == "ogm") {
+  stopifnot("TURTLE_SUIT=ogm but dist/dataset=og is missing (run ingest_og first)" = dir_exists(og_dir))
+  dbExecute(con, glue("CREATE OR REPLACE TABLE og_mask AS SELECT DISTINCT cell_id FROM read_parquet('{og_dir}/*.parquet')"))
+  dbExecute(con, "CREATE OR REPLACE TABLE turtle_og AS SELECT DISTINCT ms_merge_key FROM taxon_model WHERE mdl_key LIKE 'og|%'")
+  log_info("TURTLE_SUIT=ogm: {dbGetQuery(con, 'SELECT count(*) n FROM turtle_og')$n} taxa lose am + ax inside the og footprint ({dbGetQuery(con, 'SELECT count(*) n FROM og_mask')$n} cells)")
+} else {
+  dbExecute(con, "CREATE OR REPLACE TABLE og_mask (cell_id INTEGER)")
+  dbExecute(con, "CREATE OR REPLACE TABLE turtle_og (ms_merge_key VARCHAR)")
+}
+# v11 Q6: each density taxon's survey domain (its annual model's cells) and the taxa it supersedes am / ax for
+if (fold_density) {
+  dens_glob <- paste(sprintf("'%s/dataset=%s/*.parquet'", dir_dist, dens_ds), collapse = ", ")
+  dbExecute(con, glue("CREATE OR REPLACE TABLE dens_dom AS
+    SELECT DISTINCT tm.ms_merge_key, mc.cell_id
+    FROM read_parquet([{dens_glob}], hive_partitioning = false) mc JOIN taxon_model tm USING (mdl_key)
+    WHERE split_part(tm.mdl_key, '|', 1) IN ({dens_sql}) AND len(string_split(tm.mdl_key, '|')) = 2"))
+  # the density fold-in is for the density taxa that are NOT turtles and NOT DPS-listed (those merge through their own
+  # rules, and `dens_filter` keeps the survey out of their suitability): their survey domain must then not supersede
+  # their am / ax either, or the domain is a HOLE the fill paints flat -- the humpback (cce + dps_nmfs) carried the
+  # mean 70.697 over 15,900 of its 16,484 California Current cells on 2026-11-06
+  n_dom0 <- dbGetQuery(con, "SELECT count(*) n FROM dens_dom")$n
+  dbExecute(con, glue("DELETE FROM dens_dom WHERE ms_merge_key IN (
+    SELECT DISTINCT ms_merge_key FROM taxon_model WHERE mdl_key LIKE 'rng_turtle_swot_dps|%' OR mdl_key LIKE '{dps_ds}|%')"))
+  dbExecute(con, "CREATE OR REPLACE TABLE dens_taxa AS SELECT DISTINCT ms_merge_key FROM dens_dom")
+  stopifnot("a turtle or DPS-listed taxon is in dens_taxa (its am / ax would be superseded by a survey it never takes)" =
+    dbGetQuery(con, glue("SELECT count(*) n FROM dens_taxa WHERE ms_merge_key IN (
+      SELECT ms_merge_key FROM taxon_model WHERE mdl_key LIKE 'rng_turtle_swot_dps|%' OR mdl_key LIKE '{dps_ds}|%')"))$n == 0)
+  log_info("FOLD_DENSITY: {dbGetQuery(con, 'SELECT count(*) n FROM dens_taxa')$n} density taxa, {dbGetQuery(con, 'SELECT count(*) n FROM dens_dom')$n} (taxon, cell) domain rows replace am / ax ({n_dom0 - dbGetQuery(con, 'SELECT count(*) n FROM dens_dom')$n} turtle / DPS domain rows set aside)")
+} else {
+  dbExecute(con, "CREATE OR REPLACE TABLE dens_dom (ms_merge_key VARCHAR, cell_id INTEGER)")
+  dbExecute(con, "CREATE OR REPLACE TABLE dens_taxa (ms_merge_key VARCHAR)")
+}
+# v11 Q6, FOLD_DENSITY_CAL=mass (libs/vars.R; msens 0.66.0): the 2026-10-31 attribution showed the uncalibrated fold-in
+# tripling the California bird scores and halving Alaska's by proportion -- the survey's percentiles (densest cell = 100)
+# replaced AquaMaps' modest suitability, or for the NCCOS birds (none of the 72 has an AquaMaps model) a range at a
+# constant er_score, so the surveyed species' global share piled into the surveyed areas. The survey knows the PATTERN
+# inside its domain; it knows nothing about how much of the species the domain holds relative to the rest of the range,
+# and neither does any other source we have. So per taxon the survey values are scaled so the domain keeps the MASS the
+# replaced surface gave it (msens::density_cal_factors_sql(): f = mean(replaced) / mean(survey) over the domain cells that
+# had a prior value, capped at 100 per cell) -- the replaced surface being what the control merge gave those cells:
+# the suitability (am / ax / og) where one existed, else the governing er_score where a range dataset covered the cell.
+# (The AquaX / og supersession predicates are not applied to the prior: v11 has no ax ingest and og covers only the
+# turtles, which never take density.) Cells with no prior value keep the survey's pattern at that scale; a taxon with
+# no prior anywhere is left at f = 1 and flagged. The factors are written to data/{ver}/density_cal_factors.csv.
+# FOLD_DENSITY_CAL=suit reads the replaced surface as the SUITABILITY where any suitability dataset models the cell and the
+# er_score only where none does (msens::density_prior_sql(mode = "suit")) -- what dps_sql() gives an er_mode = 'cell' taxon,
+# which is how a density taxon merges here: under "mass" an Endangered cetacean's prior is ~100 wherever its range covers
+# it (the control's VALUE) and the calibrated survey saturates at the cap, losing the pattern again; under "suit" the ER
+# rides beside the value and the survey pattern survives. The birds (no suitability model) calibrate identically either way.
+cal_wrap <- function(sql) if (fold_density_cal != "none") msens::density_calibrate_sql(sql, dens_ds, factors = "dens_cal") else sql
+if (fold_density_cal != "none") {
+  prior_ds  <- setdiff(suit_ds, dens_ds)
+  dbExecute(con, glue("CREATE OR REPLACE TABLE dens_vals AS
+    SELECT tm.ms_merge_key, mc.cell_id, max(mc.val) AS val
+    FROM read_parquet([{dens_glob}], hive_partitioning = false) mc JOIN taxon_model tm USING (mdl_key)
+    WHERE split_part(tm.mdl_key, '|', 1) IN ({dens_sql}) AND len(string_split(tm.mdl_key, '|')) = 2
+    GROUP BY 1, 2"))
+  # the prior needs only the density taxa's OTHER models (a few hundred of the ~37k): dist/ holds one parquet per model,
+  # so a CONSTANT `mdl_key IN (...)` predicate prunes every other file by its row-group statistics and the scan stays
+  # small -- a join to taxon_model (full or cut to the 94 taxa) is not pushed into the scan and ran the 20 GB budget out
+  # of memory twice on 2026-10-31
+  prior_keys <- dbGetQuery(con, glue("SELECT mdl_key FROM taxon_model WHERE ms_merge_key IN (SELECT ms_merge_key FROM dens_taxa)
+    AND split_part(mdl_key, '|', 1) NOT IN ({dens_sql})"))$mdl_key
+  stopifnot("the density taxa have other models to calibrate against" = length(prior_keys) > 0)
+  dbExecute(con, "SET preserve_insertion_order = false")
+  dbExecute(con, paste("CREATE OR REPLACE TABLE dens_replaced AS", msens::density_prior_sql(
+    glue("(SELECT mdl_key, cell_id, val FROM read_parquet('{dir_dist}/*/*.parquet') WHERE mdl_key IN ({paste(sprintf(\"'%s'\", prior_keys), collapse = ',')}))"),
+    prior_ds = prior_ds, dens_ds = dens_ds, mode = c(mass = "value", suit = "suit")[[fold_density_cal]])))
+  dbExecute(con, "SET preserve_insertion_order = true")
+  log_info("FOLD_DENSITY_CAL prior: {length(prior_keys)} models of the density taxa scanned")
+  dbExecute(con, paste("CREATE OR REPLACE TABLE dens_cal AS", msens::density_cal_factors_sql("dens_vals", "dens_replaced")))
+  name_col <- intersect(c("scientific_name", "scientificname", "name"), dbListFields(con, "taxon"))[1]
+  cal <- dbGetQuery(con, glue("SELECT c.*{if (!is.na(name_col)) glue(', t.\"{name_col}\" AS scientific_name') else ''}
+    FROM dens_cal c LEFT JOIN taxon t USING (ms_merge_key) ORDER BY f"))
+  dir_create(here(glue("data/{ver}")))
+  readr::write_csv(cal, here(glue("data/{ver}/density_cal_factors_{fold_density_cal}.csv")))
+  log_info("FOLD_DENSITY_CAL={fold_density_cal}: {nrow(cal)} density taxa, {sum(!cal$calibrated)} without a prior value (f = 1); f median {signif(median(cal$f), 3)}, range {signif(min(cal$f), 3)}-{signif(max(cal$f), 3)}; {sum(cal$f < 1)} shrink, {sum(cal$f > 1)} grow")
+} else log_info("FOLD_DENSITY_CAL=none: the folded-in survey values enter at the ingest's 0-100 transform")
+# the merge-input filter: AquaX's supersession (v9) AND, for the turtles under ogm, am and ax inside og AND, for
+# the density taxa under FOLD_DENSITY, am and ax inside each taxon's own survey domain
+# Only the predicates whose taxa table is non-empty are applied: an anti-join of 13 B rows against an EMPTY table
+# is not free (each IN (subquery) is a hash join the planner materializes), and the control run must send the
+# SAME query the v9 / v10 merge sent -- the AquaX predicate alone -- so its spill and its hash are reproducible
+n_tab <- function(t) dbGetQuery(con, glue("SELECT count(*) n FROM {t}"))$n
+keep_parts <- c(
+  msens::supersede_sql(src = "mc"),
+  if (n_tab("turtle_og")) c(msens::supersede_sql("am", taxa = "turtle_og", mask = "og_mask", src = "mc"),
+                            msens::supersede_sql("ax", taxa = "turtle_og", mask = "og_mask", src = "mc")),
+  if (n_tab("dens_taxa")) c(msens::supersede_sql("am", taxa = "dens_taxa", mask = "dens_dom", src = "mc", by_taxon = TRUE),
+                            msens::supersede_sql("ax", taxa = "dens_taxa", mask = "dens_dom", src = "mc", by_taxon = TRUE)))
+keep_sql <- paste(keep_parts, collapse = " AND ")
+log_info("merge-input filter: {length(keep_parts)} supersession predicate(s)")
+# the survey domain joins the range footprint as its own pseudo-dataset at the governing er_score (nothing off:
+# the control's partition query is byte-identical to v10's)
+dens_rows_fn <- function(chunk_sql = "") if (fold_density) glue(
+  "UNION ALL SELECT mm.mkey_id, d.ms_merge_key, 'dens_dom' AS ds_key, d.cell_id, t.er_score::DOUBLE AS val
+       FROM dens_dom d JOIN mkey_map mm USING (ms_merge_key) JOIN taxon t USING (ms_merge_key) {chunk_sql}") else ""
 dir_parts <- glue("{dir_atlas}/mc_parts")
 # the partition write is the ~40-min step; skip it if the input already exists (REDO_MC_PARTS=1 forces)
 if (!dir_exists(dir_parts) || nzchar(Sys.getenv("REDO_MC_PARTS"))) {
   if (dir_exists(dir_parts)) dir_delete(dir_parts)
   dbExecute(con, "SET partitioned_write_max_open_files=512")
   # the supersession filter is applied HERE, on the partitioned merge input, so every consumer
-  # downstream (both surfaces, turtles, the masking check) sees the same input
-  msens::copy_atlas_parquet(con, glue(
-    "SELECT mkey_id, ms_merge_key, ds_key, cell_id, val FROM (
-       SELECT mm.mkey_id, tm.ms_merge_key, split_part(mc.mdl_key,'|',1) AS ds_key, mc.cell_id, mc.val
-       FROM read_parquet('{dir_dist}/*/*.parquet') mc JOIN taxon_model tm USING (mdl_key)
-       JOIN mkey_map mm USING (ms_merge_key)) mc
-     WHERE {msens::supersede_sql(src = 'mc')}"),
-    dir_parts, partition_by = "mkey_id")
+  # downstream (both surfaces, turtles, the masking check) sees the same input.
+  # MERGE_PARTS_CHUNKS=n (default 1) writes the partitions in n passes over disjoint mkey_id ranges: the
+  # one-pass write of ~13 B rows spilled past 700 GB on the Mac mini (every partition's buffer in flight at
+  # once); chunks bound the spill at the cost of n scans of dist/. The output is identical -- a partition
+  # is written by exactly one chunk (OVERWRITE_OR_IGNORE never touches another chunk's directories).
+  n_chunks <- max(1L, as.integer(Sys.getenv("MERGE_PARTS_CHUNKS", "1")))
+  id_max   <- dbGetQuery(con, "SELECT max(mkey_id) m FROM mkey_map")$m
+  bounds   <- unique(as.integer(round(seq(0, id_max, length.out = n_chunks + 1L))))
+  for (k in seq_len(length(bounds) - 1L)) {
+    lo <- bounds[k] + 1L; hi <- bounds[k + 1L]
+    chunk_sql <- if (n_chunks > 1L) glue("WHERE mm.mkey_id BETWEEN {lo} AND {hi}") else ""
+    dens_rows_sql <- dens_rows_fn(chunk_sql)
+    if (n_chunks > 1L) log_info("mc_parts chunk {k}/{length(bounds) - 1L}: mkey_id {lo}-{hi} ({format(Sys.time(), '%H:%M')})")
+    msens::copy_atlas_parquet(con, cal_wrap(glue(
+      "SELECT mkey_id, ms_merge_key, ds_key, cell_id, val FROM (
+         SELECT mm.mkey_id, tm.ms_merge_key, split_part(mc.mdl_key,'|',1) AS ds_key, mc.cell_id, mc.val
+         FROM read_parquet('{dir_dist}/*/*.parquet') mc JOIN taxon_model tm USING (mdl_key)
+         JOIN mkey_map mm USING (ms_merge_key)
+         {chunk_sql}
+         {dens_rows_sql}) mc
+       WHERE {keep_sql}")),
+      dir_parts, partition_by = "mkey_id")
+  }
 } else if (nzchar(Sys.getenv("REDO_MC_PARTS_SPATIAL"))) {
   # refresh ONLY the spatial-ER taxa's partitions (a re-ingested dps_nmfs / turtle surface): mkey_id
   # is dense_rank over the taxon set, so refreshing in place is valid only while the set -- and
@@ -165,16 +307,19 @@ if (!dir_exists(dir_parts) || nzchar(Sys.getenv("REDO_MC_PARTS"))) {
   stopifnot("mc_parts partition count != taxa in mkey_map: the map moved, REDO_MC_PARTS=1" =
               length(dir_ls(dir_parts)) == n_map)
   sp_ids <- dbGetQuery(con, "SELECT DISTINCT mm.mkey_id FROM taxon_model tm JOIN mkey_map mm USING (ms_merge_key)
-    WHERE tm.mdl_key LIKE 'rng_turtle_swot_dps|%' OR tm.mdl_key LIKE 'dps_nmfs|%'")$mkey_id
+    WHERE tm.mdl_key LIKE 'rng_turtle_swot_dps|%' OR tm.mdl_key LIKE 'dps_nmfs|%'
+       OR (split_part(tm.mdl_key, '|', 1) IN ({if (length(dens_ds)) dens_sql else \"''\"}))")$mkey_id
   for (id in sp_ids) { pd <- glue("{dir_parts}/mkey_id={id}"); if (dir_exists(pd)) dir_delete(pd) }
   dbExecute(con, "SET partitioned_write_max_open_files=512")
-  msens::copy_atlas_parquet(con, glue(
+  dens_rows_sql <- dens_rows_fn()
+  msens::copy_atlas_parquet(con, cal_wrap(glue(
     "SELECT mkey_id, ms_merge_key, ds_key, cell_id, val FROM (
        SELECT mm.mkey_id, tm.ms_merge_key, split_part(mc.mdl_key,'|',1) AS ds_key, mc.cell_id, mc.val
        FROM read_parquet('{dir_dist}/*/*.parquet') mc JOIN taxon_model tm USING (mdl_key)
        JOIN mkey_map mm USING (ms_merge_key)
+       {dens_rows_sql}
        WHERE mm.mkey_id IN ({paste(sp_ids, collapse = ',')})) mc
-     WHERE {msens::supersede_sql(src = 'mc')}"),
+     WHERE {keep_sql}")),
     dir_parts, partition_by = "mkey_id")
   log_info("REDO_MC_PARTS_SPATIAL: re-partitioned {length(sp_ids)} spatial-ER taxa; the other partitions are kept")
 } else log_info("mc_parts exists — skipping repartition (REDO_MC_PARTS=1 to force, REDO_MC_PARTS_SPATIAL=1 for the spatial-ER taxa only)")
@@ -188,6 +333,57 @@ dbExecute(con, glue("CREATE OR REPLACE VIEW mc_parts AS
 parts_sql <- function(ids) glue("read_parquet([{paste0(\"'\", dir_parts, \"/mkey_id=\", ids, \"/*.parquet'\", collapse = \", \")}], hive_partitioning = true)")
 all_ids <- dbGetQuery(con, "SELECT mkey_id FROM mkey_map ORDER BY mkey_id")$mkey_id
 log_info("partitioned merge input: {length(all_ids)} taxa by mkey_id; US trim {n_us} in_usa cells; memory_limit={mem_gb}GB")
+```
+
+## The occurrence gate and the encounter weight (v11 Q2: `OCC_RULE`, `REGION_WEIGHT`)
+
+D11 "gate + weight" (`explore_occurrence_rule.qmd`): under `OCC_RULE=1` a species leaves an ecoregion where it has
+NO OBIS record under adequate effort (`data/v11/zone_exclusions_occ.csv`, `msens::zone_exclude_sql()` — the v7c
+mechanism, critical habitat never excluded); under `REGION_WEIGHT=1` a species recorded in an ecoregion well below
+its rate elsewhere keeps its cells at `val × w` (`data/v11/zone_weights_occ.csv`, `msens::encounter_weight()` →
+`zone_weight_sql()`; critical habitat never downweighted). Both resolve a cell to its MAJORITY ecoregion
+(`cell_zone_major_sql()` over the shared `zone_cell.parquet`) and are applied by ONE wrapper,
+`msens::zone_adjust_sql()`, to every written surface — both viz and scoring, so what the app draws is what is
+scored — but never to the per-cell ER. With both flags off the relation is empty and the wrapper is not applied
+(the control run is byte-identical to v10's merge).
+
+```{r}
+#| label: zone-adjust
+
+use_adj <- occ_rule || region_weight
+dbExecute(con, "CREATE OR REPLACE TABLE zone_adj (mdl_key VARCHAR, cell_id INTEGER, w DOUBLE)")
+if (use_adj) {
+  zsets <- readr::read_csv(here("data/zone_sets.csv"), show_col_types = FALSE)
+  zkey  <- zsets$zone_set_key[zsets$zone_type == "ecoregion" & grepl(glue("\\b{ver}\\b"), zsets$versions, perl = TRUE)]
+  grid_id <- msens::grid_for_ver(ver)
+  stopifnot("exactly one ecoregion zone set must be registered for this version (data/zone_sets.csv)" = length(zkey) == 1)
+  f_zc <- glue("{dir_derived}/zones/{zkey}/{grid_id}/zone_cell.parquet")
+  stopifnot("the shared ecoregion zone_cell.parquet is missing (run build_zone_cells)" = file_exists(f_zc))
+  dbExecute(con, glue("CREATE OR REPLACE TABLE zc_eco AS SELECT zone_key, cell_id, pct_covered FROM read_parquet('{f_zc}')"))
+  dbExecute(con, paste("CREATE OR REPLACE TABLE cell_zone AS", msens::cell_zone_major_sql(zone_cell = "zc_eco", zone = NULL)))
+  gate <- if (occ_rule) readr::read_csv(here("data/v11/zone_exclusions_occ.csv"), show_col_types = FALSE) else tibble(mdl_key = character(), zone_key = character())
+  wts  <- if (region_weight) readr::read_csv(here("data/v11/zone_weights_occ.csv"), show_col_types = FALSE) |> filter(w > 0) else tibble(mdl_key = character(), zone_key = character(), w = numeric())
+  stopifnot("a pair cannot be both gated and weighted" = !any(paste(wts$mdl_key, wts$zone_key) %in% paste(gate$mdl_key, gate$zone_key)))
+  keys <- union(gate$mdl_key, wts$mdl_key)
+  stopifnot("every gated / weighted key must be a merged taxon of this version" = all(keys %in% dbGetQuery(con, "SELECT ms_merge_key FROM mkey_map")$ms_merge_key))
+  # the footprint the rules act on: every merge-input cell of the affected taxa inside an ecoregion; critical
+  # habitat = the ch datasets' own cells, which neither rule may touch
+  key_sql <- paste(sprintf("'%s'", keys), collapse = ",")
+  dbExecute(con, glue("CREATE OR REPLACE TABLE adj_src AS
+    SELECT DISTINCT mc.ms_merge_key AS mdl_key, mc.cell_id
+    FROM mc_parts mc JOIN cell_zone cz USING (cell_id) WHERE mc.ms_merge_key IN ({key_sql})"))
+  dbExecute(con, glue("CREATE OR REPLACE TABLE adj_ch AS
+    SELECT DISTINCT ms_merge_key AS mdl_key, cell_id FROM mc_parts WHERE ds_key IN ({ch_sql}) AND ms_merge_key IN ({key_sql})"))
+  if (nrow(gate)) dbExecute(con, paste("INSERT INTO zone_adj SELECT mdl_key, cell_id, 0 FROM (",
+    msens::zone_exclude_sql(gate, src = "adj_src", cell_zone = "cell_zone", ch_src = "adj_ch", id_col = "mdl_key"), ")"))
+  if (nrow(wts))  dbExecute(con, paste("INSERT INTO zone_adj SELECT mdl_key, cell_id, w FROM (",
+    msens::zone_weight_sql(wts, src = "adj_src", cell_zone = "cell_zone", ch_src = "adj_ch", id_col = "mdl_key"), ")"))
+  adj_n <- dbGetQuery(con, "SELECT count(*) FILTER (WHERE w = 0) gated, count(*) FILTER (WHERE w > 0) weighted,
+                             count(DISTINCT mdl_key) taxa FROM zone_adj")
+  stopifnot("zone_adj must not repeat a (taxon, cell)" = dbGetQuery(con, "SELECT count(*) - count(DISTINCT (mdl_key, cell_id)) d FROM zone_adj")$d == 0)
+  log_info("zone_adj: {adj_n$gated} cells gated (OCC_RULE={occ_rule}), {adj_n$weighted} weighted (REGION_WEIGHT={region_weight}), {adj_n$taxa} taxa")
+} else log_info("OCC_RULE / REGION_WEIGHT off: zone_adj empty, surfaces written unadjusted")
+adj <- function(sql) if (use_adj) msens::zone_adjust_sql(sql, adj = "zone_adj", id_col = "mdl_key") else sql
 ```
 
 ## Spatial extinction risk — sea turtles (×) and NMFS DPS species (suitability + ER per cell)
@@ -206,10 +402,20 @@ log_info("spatial-ER taxa: {length(turtle_keys)} turtles (multiplicative) + {len
 # turtles: whole-range multiplicative merge, reading ONLY the turtle taxa's partitions
 # (mkey_id IN (...) → partition-pruned, tiny). Rule = msens::turtle_sql() (unit-tested).
 dbExecute(con, glue("CREATE OR REPLACE TABLE turtle_src AS
-  SELECT ms_merge_key, ds_key, cell_id, val FROM {parts_sql(turtle_ids)}"))
-dbExecute(con, paste("CREATE OR REPLACE TABLE mc_turtle AS",
-  msens::turtle_sql(turtle_ds, suit_ds, ch_ds, src = "turtle_src")))
-log_info("mc_turtle (whole-range): {dbGetQuery(con, 'SELECT count(*) n FROM mc_turtle')$n} cells")
+  SELECT ms_merge_key, ds_key, cell_id, val FROM {parts_sql(turtle_ids)} WHERE TRUE{dens_filter}"))
+if (turtle_rule == "turtle") {
+  dbExecute(con, paste("CREATE OR REPLACE TABLE mc_turtle AS",
+    msens::turtle_sql(turtle_ds, suit_ds, ch_ds, src = "turtle_src")))
+  log_info("mc_turtle (whole-range, multiplicative rule): {dbGetQuery(con, 'SELECT count(*) n FROM mc_turtle')$n} cells")
+} else {
+  # v11 Q3 (D8, TURTLE_RULE=dps): the turtles merge like every DPS-listed species -- the value is the
+  # suitability masked to the ER footprint, the per-cell SWOT-DPS ER rides beside it, and the
+  # critical-habitat datasets EXTEND the footprint at their own (species-level) ER; fill = ER where
+  # nothing models the cell. They join mc_dps below, so scoring reads them in er_mode = 'cell';
+  # mc_turtle stays empty. test-merge.R pins the rule.
+  dbExecute(con, "CREATE OR REPLACE TABLE mc_turtle (mdl_key VARCHAR, cell_id INTEGER, val DOUBLE)")
+  log_info("TURTLE_RULE=dps: the {length(turtle_keys)} turtles merge through dps_sql (mc_dps), CH extending the footprint")
+}
 
 # NMFS DPS species: msens::dps_sql() -- (mdl_key, cell_id, val = suitability, er = per-cell ER).
 # The critical-habitat datasets are NOT an input: dps_nmfs was built from the same designations
@@ -221,10 +427,46 @@ log_info("mc_turtle (whole-range): {dbGetQuery(con, 'SELECT count(*) n FROM mc_t
 dbExecute(con, "CREATE OR REPLACE TABLE mc_dps (mdl_key VARCHAR, cell_id INTEGER, val DOUBLE, er DOUBLE)")
 for (id in dps_ids) {
   dbExecute(con, glue("CREATE OR REPLACE VIEW dps_src AS
-    SELECT ms_merge_key, ds_key, cell_id, val FROM {parts_sql(id)} WHERE ds_key NOT IN ({ch_sql})"))
-  dbExecute(con, paste("INSERT INTO mc_dps", msens::dps_sql(dps_ds, suit_ds, src = "dps_src")))
+    SELECT ms_merge_key, ds_key, cell_id, val FROM {parts_sql(id)} WHERE ds_key NOT IN ({ch_sql}){dens_filter}"))
+  dbExecute(con, paste("INSERT INTO mc_dps", msens::dps_sql(dps_ds, suit_ds, src = "dps_src", fill = range_fill)))
 }
-if (length(dps_ids)) dbExecute(con, "DROP VIEW IF EXISTS dps_src")
+# v11 Q6: the density taxa (not turtles, not DPS-listed) merge the same way -- every range dataset of the taxon
+# (IUCN / FWS / NMFS ranges, critical habitat, the dens_dom footprint) is the ER layer at the governing er_score,
+# the suitability (am / ax outside the domain, the survey inside it) is the value, the ER rides beside per cell
+dens_keys <- if (fold_density) setdiff(dbGetQuery(con, "SELECT ms_merge_key FROM dens_taxa")$ms_merge_key, c(turtle_keys, dps_keys)) else character(0)
+dens_ids  <- ids_of(dens_keys)
+# a density taxon is NOT a listed-entity species: its ER rows carry what their ingests wrote (a BirdLife range row the
+# IUCN category alone), so its governing er_score (merge_models_prep: MMPA / MBTA floors, US listings over IUCN -- what
+# the control's merge_sql values every range cell at) must be the FLOOR under the per-cell ER, or the taxon loses every
+# national floor outside its survey domain (a LC murre merged at 1 instead of its MBTA 10 over 980k cells: the
+# 2026-10-31 attribution's "bird / mammal reshuffle" was mostly this). msens::dps_sql(er_floor), test-merge.R.
+dens_er <- if (length(dens_keys)) dbGetQuery(con, glue("SELECT ms_merge_key, er_score FROM taxon WHERE ms_merge_key IN ({paste(sprintf(\"'%s'\", dens_keys), collapse = ',')})")) else data.frame(ms_merge_key = character(), er_score = numeric())
+stopifnot("every density taxon has a governing er_score" = nrow(dens_er) == length(dens_keys), !anyNA(dens_er$er_score))
+for (id in dens_ids) {
+  dbExecute(con, glue("CREATE OR REPLACE VIEW dps_src AS
+    SELECT ms_merge_key, ds_key, cell_id, val FROM {parts_sql(id)}"))
+  er_ds <- dbGetQuery(con, glue("SELECT DISTINCT ds_key FROM dps_src WHERE ds_key NOT IN ({paste(sprintf(\"'%s'\", suit_ds), collapse = ',')})"))$ds_key
+  stopifnot("a density taxon needs at least one range dataset (dens_dom at least)" = length(er_ds) > 0)
+  k_id  <- dbGetQuery(con, glue("SELECT ms_merge_key FROM mkey_map WHERE mkey_id = {id}"))$ms_merge_key
+  floor <- dens_er$er_score[dens_er$ms_merge_key == k_id]
+  stopifnot("one governing er_score per density taxon" = length(floor) == 1L)
+  dbExecute(con, paste("INSERT INTO mc_dps", msens::dps_sql(er_ds, suit_ds, src = "dps_src", er_floor = floor, fill = range_fill)))
+}
+if (length(dens_ids)) {
+  # regression guard: no density taxon's per-cell ER may fall below its governing er_score
+  below <- dbGetQuery(con, glue("SELECT count(*) n FROM mc_dps d JOIN taxon t ON t.ms_merge_key = d.mdl_key
+    WHERE d.mdl_key IN ({paste(sprintf(\"'%s'\", dens_keys), collapse = ',')}) AND d.er < t.er_score"))$n
+  stopifnot("a density taxon carries a per-cell ER below its governing er_score (dps_sql er_floor not applied)" = below == 0)
+}
+if (length(dens_ids)) log_info("FOLD_DENSITY: {length(dens_ids)} density taxa merged through dps_sql (er_mode = cell); {length(intersect(dbGetQuery(con, 'SELECT ms_merge_key FROM dens_taxa')$ms_merge_key, c(turtle_keys, dps_keys)))} density taxa are turtles / DPS species and keep their own rule (density rows dropped)")
+if (turtle_rule == "dps") for (id in turtle_ids) {
+  # the turtles: the SWOT-DPS surface is the ER layer and the ch_* datasets are kept IN as ER
+  # (dps_sql takes max(val) over the ER datasets, so a critical-habitat cell carries its own ER)
+  dbExecute(con, glue("CREATE OR REPLACE VIEW dps_src AS
+    SELECT ms_merge_key, ds_key, cell_id, val FROM {parts_sql(id)}"))
+  dbExecute(con, paste("INSERT INTO mc_dps", msens::dps_sql(c(turtle_ds, ch_ds), suit_ds, src = "dps_src", fill = range_fill)))
+}
+if (length(dps_ids) || turtle_rule == "dps" || length(dens_ids)) dbExecute(con, "DROP VIEW IF EXISTS dps_src")
 log_info("mc_dps (whole-range): {dbGetQuery(con, 'SELECT count(*) n FROM mc_dps')$n} cells over {length(dps_ids)} taxa")
 ```
 
@@ -258,16 +500,16 @@ write_spatial <- function() {
     if (dir_exists(d)) dir_delete(d)
   dir_create(dir_merged_er)
   # turtles → whole-range global + US-trim (ER baked in)
-  msens::copy_atlas_parquet(con, "SELECT mdl_key, cell_id, val FROM mc_turtle",
+  msens::copy_atlas_parquet(con, adj("SELECT mdl_key, cell_id, val FROM mc_turtle"),
     glue("{dir_global}/turtle"), per_thread = TRUE)
   msens::copy_atlas_parquet(con,
-    "SELECT mt.mdl_key, mt.cell_id, mt.val FROM mc_turtle mt JOIN us_cells u ON mt.cell_id = u.cell_id",
+    adj("SELECT mt.mdl_key, mt.cell_id, mt.val FROM mc_turtle mt JOIN us_cells u ON mt.cell_id = u.cell_id"),
     glue("{dir_merged}/turtle"), per_thread = TRUE)
-  # dps → whole-range global + US-trim (the distribution) + US-trim ER beside it
-  msens::copy_atlas_parquet(con, "SELECT mdl_key, cell_id, val FROM mc_dps",
+  # dps → whole-range global + US-trim (the distribution) + US-trim ER beside it (the ER is never adjusted)
+  msens::copy_atlas_parquet(con, adj("SELECT mdl_key, cell_id, val FROM mc_dps"),
     glue("{dir_global}/dps"), per_thread = TRUE)
   msens::copy_atlas_parquet(con,
-    "SELECT d.mdl_key, d.cell_id, d.val FROM mc_dps d JOIN us_cells u ON d.cell_id = u.cell_id",
+    adj("SELECT d.mdl_key, d.cell_id, d.val FROM mc_dps d JOIN us_cells u ON d.cell_id = u.cell_id"),
     glue("{dir_merged}/dps"), per_thread = TRUE)
   msens::copy_atlas_parquet(con,
     "SELECT d.mdl_key, d.cell_id, d.er FROM mc_dps d JOIN us_cells u ON d.cell_id = u.cell_id",
@@ -283,8 +525,9 @@ dbExecute(con, "CREATE OR REPLACE TABLE range_counts (ms_merge_key VARCHAR, n_ra
 write_spatial()
 
 # BATCH the rest so each merge reads ONLY its taxa's pruned partitions (bounded memory). Two surfaces
-# come off the same batch (see glob_global_sql / us_sql below): the GLOBAL viz surface = am ∪ range
-# (whole-range merged model, FULL OUTER); the US SCORING surface = v7-faithful US-boundary-aware rule
+# come off the same batch (see glob_global_sql / us_sql below): the GLOBAL viz surface = the whole range
+# footprint under the same rule and the same range mask (NOT am ∪ range: that FULL OUTER union was the apps#8
+# regression); the US SCORING surface = v7-faithful US-boundary-aware rule
 # (range footprint ∩ US valued max(er, am-at-range), UNION am ∩ US for taxa with no range in the US).
 # The US rule keeps the 750 am-in-US taxa whose IUCN range lies wholly outside the US (silently
 # dropped before) yet still masks am to the range for taxa that DO have US range — so it reproduces
@@ -294,7 +537,7 @@ write_spatial()
 # Batch by CELL COUNT, not taxa count: a few taxa have global ranges (10-25M cells each), so a
 # fixed 150-taxa batch OOMs. Pack taxa until ~40M cells/batch (a single taxon maxes at the 25.9M
 # grid, so it always fits one batch). Counts come from parquet metadata (fast, no data scan).
-nonturtle <- setdiff(all_ids, c(turtle_ids, dps_ids))
+nonturtle <- setdiff(all_ids, c(turtle_ids, dps_ids, dens_ids))
 cnt <- dbGetQuery(con, "SELECT mkey_id, count(*) AS n FROM mc_parts GROUP BY mkey_id")
 cnt <- cnt[cnt$mkey_id %in% nonturtle, ]; cnt <- cnt[order(cnt$mkey_id), ]
 batches <- unname(split(cnt$mkey_id, cumsum(as.numeric(cnt$n)) %/% 40e6))
@@ -309,14 +552,15 @@ log_info("merging {length(nonturtle)} non-turtle taxa in {length(batches)} cell-
 #    range is MASKED] UNION raw am∩US for TRUE am-only taxa (global has_range=FALSE). A species whose
 #    IUCN range lies WHOLLY outside the US gets NO US presence — the iucn_range_outside_us_eez
 #    exclusion (e.g. Sotalia guianensis). See ?msens::merge_sql for the full rationale.
-msq             <- msens::merge_sql(suit_ds)
-glob_global_sql <- msq$global
-us_sql          <- msq$us
+msq             <- msens::merge_sql(suit_ds, basis = share_basis, fill = range_fill)   # SHARE_BASIS / RANGE_FILL (v11 Call 2)
+glob_global_sql <- adj(msq$global)   # the gate + weight wrapper (identity with the flags off)
+us_sql          <- adj(msq$us)
 for (i in seq_along(batches)) {
   dbExecute(con, glue("CREATE OR REPLACE TABLE b AS
     SELECT ms_merge_key, ds_key, cell_id, val FROM {parts_sql(batches[[i]])}"))
   dbExecute(con, msq$b_range)    # range footprint (non-am) valued by governing er_score
   dbExecute(con, msq$b_am_rng)   # am AT range cells only → range-footprint max(er, am-at-range)
+  dbExecute(con, msq$b_fill)     # one fill per taxon: whole-range mean of the modelled range cells (RANGE_FILL=mean)
   # per-taxon range-cell tally, accumulated while b_range is in hand (free) — the masking check
   # below needs it and would otherwise have to re-scan 12 GB of range parquet on every render
   dbExecute(con, "INSERT INTO range_counts SELECT ms_merge_key, count(*) FROM b_range GROUP BY 1")
@@ -366,16 +610,24 @@ the union of every non-am dataset, so the identity doesn't apply — `msens::tur
 #| label: masking_check
 
 if (dbExistsTable(con, "range_counts")) {
+  # the occurrence gate (OCC_RULE, zone_adj w = 0) REMOVES range cells from both surfaces by design, so a gated
+  # taxon's global surface is SMALLER than its footprint by at most its gated-cell count; a taxon the gate
+  # never touched must match exactly, and NO taxon may exceed its footprint (apps#8)
   bad <- dbGetQuery(con, glue("
     WITH g AS (SELECT mdl_key, count(*) AS n_global
-               FROM read_parquet('{dir_global}/**/*.parquet') GROUP BY 1)
-    SELECT g.mdl_key, r.n_range, g.n_global, g.n_global - r.n_range AS n_surplus
-    FROM g JOIN range_counts r ON r.ms_merge_key = g.mdl_key
-    WHERE g.n_global <> r.n_range ORDER BY n_surplus DESC"))
+               FROM read_parquet('{dir_global}/**/*.parquet') GROUP BY 1),
+         gt AS (SELECT mdl_key, count(*) AS n_gated FROM zone_adj WHERE w = 0 GROUP BY 1)
+    SELECT g.mdl_key, r.n_range, g.n_global, g.n_global - r.n_range AS n_surplus, coalesce(gt.n_gated, 0) AS n_gated
+    FROM g JOIN range_counts r ON r.ms_merge_key = g.mdl_key LEFT JOIN gt ON gt.mdl_key = g.mdl_key
+    WHERE g.n_global > r.n_range OR g.n_global < r.n_range - coalesce(gt.n_gated, 0)
+    ORDER BY n_surplus DESC"))
   n_ck <- dbGetQuery(con, "SELECT count(*) n FROM range_counts")$n
-  if (nrow(bad)) msens::report_table(head(bad, 20), caption = "UNMASKED taxa (am beyond the range)")
-  log_info("masking check: {n_ck - nrow(bad)}/{n_ck} taxa masked to their range footprint")
-  stopifnot("global surface has cells beyond the range footprint (apps#8)" = nrow(bad) == 0)
+  n_gated_taxa <- dbGetQuery(con, glue("
+    WITH g AS (SELECT mdl_key, count(*) AS n_global FROM read_parquet('{dir_global}/**/*.parquet') GROUP BY 1)
+    SELECT count(*) n FROM g JOIN range_counts r ON r.ms_merge_key = g.mdl_key WHERE g.n_global < r.n_range"))$n
+  if (nrow(bad)) msens::report_table(head(bad, 20), caption = "UNMASKED taxa (am beyond the range) or over-gated taxa")
+  log_info("masking check: {n_ck - nrow(bad)}/{n_ck} taxa masked to their range footprint ({n_gated_taxa} smaller than it by the occurrence gate)")
+  stopifnot("global surface has cells beyond the range footprint (apps#8), or a gated taxon lost more cells than the gate holds" = nrow(bad) == 0)
 } else log_info("range_counts absent (merge skipped by a prior run) — REDO_MERGE=1 to re-check")
 
 # v9 supersession check, on the partitioned INPUT (what both surfaces read): for every superseded

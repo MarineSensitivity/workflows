@@ -1,53 +1,167 @@
 ---
 title: "Ingest SDMs: NCCOS Atlantic & Pacific Seabird Densities"
-subtitle: "Seasonal seabird density (#/km²) → suitability [0,100] on the global 0.05° grid"
+subtitle: "Seasonal seabird density (#/km²) → population-percentile suitability [1,100] on the global 0.05° grid"
 msens:
   target_name: ingest_sdm_nc
   workflow_type: ingest
   dependency: [build_cell_grid]
   output: data/manifests/ingest_sdm_nc.json
-  dataset: {ds_key: nc, response_type: density, source_authority: NOAA NCCOS, temporal_interval: seasonal, native_format: raster}
+  dataset: {ds_key: nc, response_type: density, source_authority: NOAA NCCOS, temporal_interval: seasonal, native_format: raster,
+            description: "NOAA NCCOS at-sea seabird models. Pacific (Leirness et al. 2021) are seasonal densities (n per km2). Atlantic is a RELATIVE density index, not an absolute abundance, from ONE of two sources chosen by NC_ATL_SOURCE (default 2018; the active source is recorded per model in model_nc.csv and in the ingest manifest): 2018 = Winship et al. 2018, seasonal, 2 km, observations 1978-2016; 2023 = Winship et al. 2023 (BOEM OCS Study 2023-060), the MDAT Avian Relative Density v3.0 package (Duke MGEL, April 2024 release), 49 species x 12 months + annual, 10 km, observations 1998-2019, downloaded 2026-10-30 from seamap.env.duke.edu, package ZIP sha256 5ffb8e3f20c98f30526c5b70d32d4ea711ebdbedbca5aa8bcd98a07fb197f777 (289 MB, Last-Modified 2026-06-01). Mapped onto [1,100] by the population-percentile transform (ud), which is scale-free, so every source is treated alike. Multi-species guilds are ingested for review (is_guild) and excluded from the merge.",
+            value_info: "population percentile of the cell's density within its model (100 = densest cell; val >= 100 - p is the p % core); per-model response_type is density (Pacific) or relative_index (Atlantic 2018 and 2023)",
+            regions: "US Atlantic OCS (Winship 2018 or MDAT v3 2023) and US Pacific OCS (Leirness 2021)",
+            citation: "Atlantic 2023 (NC_ATL_SOURCE=2023): Winship AJ, Leirness JB, Coyne M, Howell J, Saba VS, Christensen J. 2023. Modeling the distributions of marine birds at sea to inform planning of energy development on the US Atlantic Outer Continental Shelf. Sterling (VA): U.S. Department of the Interior, Bureau of Ocean Energy Management. 413 p. OCS Study BOEM 2023-060. https://espis.boem.gov/Final%20Reports/BOEM_2023-060.pdf; distributed by the Marine-life Data and Analysis Team (MDAT), Duke University MGEL, Avian Relative Density v3.0 (Curtice C, Cleary J, Shumchenia E, Halpin PN. 2018. MDAT technical report. http://seamap.env.duke.edu/models/MDAT/MDAT-Technical-Report.pdf). Atlantic 2018 (default): Winship AJ, Kinlan BP, White TP, Leirness JB, Christensen J. 2018. Modeling at-sea density of marine birds to support Atlantic marine renewable energy planning. OCS Study BOEM 2018-010. Pacific: Leirness JB et al. 2021. Modeling at-sea density of marine birds to support renewable energy planning on the Pacific outer continental shelf of the contiguous United States. https://repository.library.noaa.gov/view/noaa/49073",
+            link_info: "https://espis.boem.gov/Final%20Reports/BOEM_2023-060.pdf",
+            link_download: "https://seamap.env.duke.edu/seamap-models-files/mdat/MDAT_Avian_Relative_Density.zip",
+            link_metadata: "https://seamap.env.duke.edu/models/mdat/Avian/MDAT_Avian_Model_Metadata.pdf"}
 editor_options:
   chunk_output_type: console
 ---
 
 NCCOS at-sea seabird **density** models, Atlantic [@winship2018] + Pacific [@leirness2021], as
-seasonal COGs (`n_per_km2`, 2-km, oblique-mercator). v8 rasterizes each (species × season) onto
-the global 0.05° cell grid and rescales the heavy-tailed density to a graded **suitability [0,100]**
-per species (so seasons/regions share a scale), plus an **annual** mean surface for scoring.
+seasonal COGs (`n_per_km2`, 2-km, oblique-mercator). v11 rasterizes each (species × season × region)
+onto the global 0.05° cell grid and maps the heavy-tailed density onto the merge's **[1,100]** scale
+by the **population-percentile** transform (`msens::density_to_suit(method = "ud")`), plus an
+**annual** surface for scoring.
 
 - **Source COGs** (in-repo): `data/sdm/raw/nc_atl_birds_dens/*.tif` (140) + `nc_pac_birds_dens/*.tif`
   (135); band 1 = `n_per_km2` (bands 2/3 = CV/CI). Also public at
   `file.marinesensitivity.org/cog/sdm/raw/{ds}/{sp_code}_{season}.tif` (served natively via titiler).
-- **`mdl_key`**: seasonal `nc|{sp_id}|{season}` + annual `nc|{sp_id}` (`sp_id` = `GBIF:…`, or
-  `GUILD:{sp_code}` for the multi-species guilds that lack a single taxon id). Regions (atl/pac) are
-  spatially disjoint and **unioned** per `sp_id`.
+- **`mdl_key`**: seasonal `nc|{sp_id}|{season}` + annual `nc|{sp_id}`. `sp_id` is `GBIF:…` for a
+  species and `GUILD:{sp_code}` for the 13 multi-species guilds (these used to land under the
+  genus/family GBIF id with `is_guild = FALSE`, and three of them shared an id with a real species).
+  Regions (atl/pac) are spatially disjoint and **unioned** per `sp_id`.
+- **Value transform (v11 Q6, D12).** Per model (species × season × region), AFTER regridding:
+  `val = density_to_suit(d, "ud", area = cell area_km2)` — 100 minus the percent of the modelled
+  population in cells strictly denser than this one, so the densest cell is 100 and the cells with
+  `val >= 100 - p` are exactly the p % core. Cells with `val < 1` are dropped (the merge's floor). It is
+  scale-free, which is why the Atlantic 2018 index and the Pacific densities are treated alike.
+  The old recipe (`NC_TRANSFORM=cap`: linear to the species' pooled p99.5 of positive density, which left
+  most cells near 0) stays available and is compared with it below.
+- **`NC_TRANSFORM=qmap` (v11 evaluation, default stays `ud`).** The `ud` percentile puts the densest survey cell at 100 whatever
+  AquaMaps says elsewhere, which inflates a surveyed species' global share inside the survey domain. `qmap` instead
+  quantile-maps each model's densities onto the species' OWN AquaMaps `val` over that model's cells
+  (`density_to_suit(d, "qmap", ref = ..., digits = 2)`): the survey keeps its spatial pattern and takes AquaMaps' scale. The
+  helper is `libs/density_ref.R` (shared with `gm` and `cce`): the AquaMaps keys come from `ver_prev`'s `taxon_model`
+  (BOTW sisid, else WoRMS id), the surfaces from `dist/dataset=am`. A species with no AquaMaps model, or fewer than 50 reference
+  cells in the domain, keeps `ud` and the model row says `transform = ud(fallback: no am ref)`; `n_ref_cells`, `ref_p50`,
+  `ref_p95` and `ref_am_keys` ride beside it in `model_nc.csv`, and the `qmap_*` quantiles beside `ud_*` / `cap_*` in
+  `nc_transform_compare.csv`. (None of the 72 NCCOS species has an AquaMaps model, so for `nc` every model falls back.)
+- **Annual** = `msens::density_annual(n_intervals = 4)` on the DENSITIES — a season NCCOS did not
+  model counts as zero — and THEN the same transform. The v8 ingest averaged the transformed values
+  over the seasons a cell was *present* in, biasing the annual upward for the sparsest species.
+- **Crosswalk** (`data/nc_taxon_crosswalk.csv`, written HERE): common name first, then scientific
+  name, then explicit overrides, resolved to the BirdLife `sisid` (the `bl` model table) and the WoRMS
+  AphiaID (`spp.duckdb`). `model_nc.csv` carries `sisid`, `worms_id`, `is_guild`, `response_type`;
+  `merge_models_prep.qmd` excludes `is_guild` rows.
 
-> **Density → [0,100] is a modeling choice**, not a v7-faithful recipe (v7 never scored nc). Here:
-> per-`sp_id` linear rescale to the pooled **p99.5** of non-zero density (caps outliers), stored as
-> `val_cap` in `model_nc.csv` for reversibility. **NOT yet folded into merge/scoring** — see the note
-> at the end (merge treats non-`am` datasets as binary ranges; folding density in is a scoring change
-> to validate with `pra_score_delta`).
+> **Not yet folded into merge/scoring** (a flagged scoring change, `FOLD_DENSITY`).
+
+## The Atlantic source: `NC_ATL_SOURCE` (`2018` default = control, `2023`)
+
+The Pacific half (Leirness et al. 2021, seasonal) is the same under both. The Atlantic half has two
+sources, selected by `NC_ATL_SOURCE`; **the control is `2018`**, which reproduces v10 / the pre-2023
+ingest exactly, and **only one Atlantic source is ever ingested in a run** (the 2018 Atlantic models leave
+the dataset when `2023` is on).
+
+| | `2018` (default, control) | `2023` |
+|---|---|---|
+| model | Winship et al. 2018 [@winship2018], OCS Study BOEM 2018-010 | Winship et al. 2023 [@winship2023], OCS Study BOEM 2023-060 |
+| product | in-repo COGs `data/sdm/raw/nc_atl_birds_dens/` | MDAT **Avian Relative Density v3.0** (Duke MGEL, April 2024 release) [@curtice2018] |
+| species | 47 (140 seasonal models) | 49 (incl. black tern, Forster's tern, lesser black-backed gull; bridled tern dropped) |
+| intervals | 4 seasons (+ annual) | 12 months `01`..`12` (+ annual) |
+| grid | 2 km, Hotine oblique Mercator | 10 km, Hotine oblique Mercator (NAD83, azimuth 40, centre 75W 35N, k 0.9996) |
+| observations | 1978-2016 | 1998-2019 (the files are named `1993_2019`) |
+| download | -- | `raw/seamap.env.duke.edu/mdat/v3/` (this notebook downloads it, pins the sha256, records `SOURCE.json`) |
+
+Under `2023`: each species' 12 monthly rasters are reprojected bilinearly to EPSG:4326 and regridded to the
+0.05 degree cells exactly as the Pacific COGs are (`cells_from_raster(digits = NULL, min_value = 1e-12)`),
+transformed month by month with `density_to_suit("ud")` (cell-area weighted), and the **annual** is OUR
+integration of the twelve densities, **day-weighted**: `density_annual(n_intervals = 12, interval = <month>,
+weights = msens::month_day_weights())` (msens >= 0.65.1; February counts 28/365), then transformed. The package's own
+**delivered Annual** layer is the day-weighted mean of its twelve months (checked here on the native grid to float
+precision), so the two should now agree to the regrid's rounding; it is regridded the same way and compared per
+species (`data/nc_atl2023_annual_compare.csv`), with the plain 12-month mean kept as a sensitivity (it differs by
+up to 8 % in a cell). The Pacific seasons stay equal-weighted (4 seasons, as the 2018 control). The package carries no
+"no survey effort" raster: the hatched mask of the MDAT map services is an overlay that is not part of
+the download, and every one of the 637 density rasters is strictly positive on the same 13,419 modelled
+cells (NaN elsewhere; no zeros, no -9999). The provenance columns `source`, `accession`, `citation` of the
+2023 models come from `SOURCE.json`; the front matter above cannot be conditional, so it describes both
+sources and `model_nc.csv` / the manifest say which one ran.
+
+**Smoke test (writes nothing to the version's `dist/`).** `NC_SMOKE_DIR=<scratch dir>` redirects the dataset
+partition, `model_nc.csv`, the crosswalk and both comparison tables to that directory and skips the
+manifest; `NC_TEST_SP=ATPU,BLTE,COMU` (or `NC_TEST_N=<n>`) restricts the regridding to those species.
+It refuses a directory inside the big-data root.
 
 ## Setup
 
 ```{r}
 #| label: setup
 
-librarian::shelf(arrow, dplyr, fs, glue, here, jsonlite, logger, purrr, readr, sf, terra, tibble,
-                 tidyr, MarineSensitivity/msens, quiet = T)
+librarian::shelf(arrow, DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, purrr, readr, sf, stringr,
+                 terra, tibble, tidyr, quiet = T)
+library(msens)                      # the installed msens (density_to_suit / density_annual); never via shelf(), which can reinstall a stale main
 source(here("libs/paths.R"))
 source(here("libs/vars.R"))
+source(here("libs/duckdb_budget.R"))
+source(here("libs/density_ref.R"))   # NC_TRANSFORM=qmap: the species' AquaMaps reference (shared by the three density ingests)
 options(readr.show_col_types = FALSE)
 `%||%` <- function(a, b) if (is.null(a) || length(a) == 0 || all(is.na(a))) b else a
 
 ds_key   <- "nc"
-dir_dist <- glue("{dir_big_v}/marine-atlas/dist/dataset={ds_key}"); dir_create(dir_dist)
-mdl_csv  <- glue("{dir_big_v}/marine-atlas/dist/model_{ds_key}.csv")
-manifest <- here("data/manifests/ingest_sdm_nc.json"); dir_create(path_dir(manifest))
+dir_atlas <- glue("{dir_big_v}/marine-atlas")
+dir_dist <- glue("{dir_atlas}/dist/dataset={ds_key}")
+mdl_csv  <- glue("{dir_atlas}/dist/model_{ds_key}.csv")
+manifest <- here("data/manifests/ingest_sdm_nc.json")
+xw_csv   <- here("data/nc_taxon_crosswalk.csv")
+xw_csv_in <- xw_csv                                          # the committed crosswalk is the INPUT registry (new species are appended)
+cmp_csv  <- here("data/nc_transform_compare.csv")
+acmp_csv <- here("data/nc_atl2023_annual_compare.csv")      # NC_ATL_SOURCE=2023: our annual vs the package's delivered Annual
+tmp_nc   <- glue("{dir_big_v}/_tmp/nc")
 cog_base <- "https://file.marinesensitivity.org/cog/sdm/raw"
-p_cap    <- 0.995                                        # density percentile used as the 100 point
+p_cap    <- 0.995                      # the density percentile the OLD recipe used as the 100 point
 stopifnot(file_exists(cellid_tif))
+
+# flags (this notebook's own; default = the v11 recipe) ----
+nc_transform  <- tolower(Sys.getenv("NC_TRANSFORM", "ud"))        # ud (v11) | cap (the v8 recipe, for comparison) | qmap (survey densities quantile-mapped onto the species' AquaMaps val in the domain)
+# nc_atl_source (libs/vars.R, a v11 method flag): Atlantic source, 2018 (Winship 2018, control) | 2023 (MDAT v3, BOEM 2023-060)
+stopifnot("NC_TRANSFORM must be 'ud', 'cap' or 'qmap'" = nc_transform %in% c("ud", "cap", "qmap"),
+          "NC_ATL_SOURCE must be '2018' or '2023'" = nc_atl_source %in% c("2018", "2023"))
+src_2023 <- nc_atl_source == "2023"
+
+# smoke test: NC_SMOKE_DIR redirects EVERYTHING this notebook writes (dataset partition, model_nc.csv, crosswalk,
+# comparison tables, tmp) to a scratch directory and skips the manifest; NC_TEST_SP (codes) / NC_TEST_N restrict
+# the regridding to a few species. It never touches the version's dist/ (the guard refuses a path under dir_big).
+nc_smoke_dir <- Sys.getenv("NC_SMOKE_DIR", "")
+nc_test_sp   <- toupper(str_trim(str_split(Sys.getenv("NC_TEST_SP", ""), ",")[[1]])); nc_test_sp <- nc_test_sp[nzchar(nc_test_sp)]
+nc_test_n    <- as.integer(Sys.getenv("NC_TEST_N", "0"))
+nc_smoke     <- nzchar(nc_smoke_dir) || length(nc_test_sp) > 0 || nc_test_n > 0
+if (nc_smoke) stopifnot("NC_TEST_SP / NC_TEST_N need NC_SMOKE_DIR: a partial ingest must not land in dist/" = nzchar(nc_smoke_dir))
+if (nzchar(nc_smoke_dir)) {
+  nc_smoke_dir <- path_abs(path_expand(nc_smoke_dir))
+  stopifnot("NC_SMOKE_DIR is inside the big-data root" = !str_starts(nc_smoke_dir, as.character(path_abs(path_expand(dir_big)))))
+  dir_dist <- glue("{nc_smoke_dir}/dist/dataset={ds_key}")
+  mdl_csv  <- glue("{nc_smoke_dir}/dist/model_{ds_key}.csv")
+  xw_csv   <- glue("{nc_smoke_dir}/nc_taxon_crosswalk.csv")
+  cmp_csv  <- glue("{nc_smoke_dir}/nc_transform_compare.csv")
+  acmp_csv <- glue("{nc_smoke_dir}/nc_atl2023_annual_compare.csv")
+  tmp_nc   <- glue("{nc_smoke_dir}/_tmp")
+  for (d in c("dist", "_tmp")) if (dir_exists(path(nc_smoke_dir, d))) dir_delete(path(nc_smoke_dir, d))   # a smoke run is always from scratch
+  dir_create(path_dir(mdl_csv))
+} else dir_create(path_dir(manifest))
+dir_create(dir_dist); dir_create(tmp_nc)
+log_info("nc: transform = {nc_transform}; Atlantic source = {nc_atl_source}; redo = {redo_ingest}; smoke = {nc_smoke}")
+
+# NC_TRANSFORM=qmap: the AquaMaps reference. am_idx = ver_prev's crosswalk of the `am|` models (taxon_model), am_dir = the
+# AquaMaps dataset of THIS version's dist/ (read-only). Neither is touched under ud / cap.
+am_dir <- am_idx <- NULL
+if (nc_transform == "qmap") {
+  am_dir <- path_expand(glue("{dir_atlas}/dist/dataset=am"))
+  stopifnot("NC_TRANSFORM=qmap needs the AquaMaps dataset (dist/dataset=am)" = dir_exists(am_dir))
+  am_idx <- density_am_index(dir_big, ver_prev)
+  log_info("qmap reference: {nrow(am_idx)} {ver_prev}-crosswalked am models ({n_distinct(am_idx$authority)} authorities); parquets in {am_dir}")
+}
 
 if (redo_ingest && dir_exists(dir_dist)) { dir_delete(dir_dist); dir_create(dir_dist) }
 
@@ -62,54 +176,475 @@ write_parquet_row <- function(d, sid, ssn, safe) {
 }
 ```
 
+## Cell areas
+
+The `ud` transform weights each cell by its area (the population in a cell is density × area). The
+`cell` table is a property of the grid, not of the release: this version's `sdm.duckdb` is used when
+`build_cell_grid` has written it, else `ver_prev`'s (which `build_cell_grid` copies unchanged).
+
+```{r}
+#| label: cell-area
+
+cell_dbs    <- c(sdm_db, glue("{dir_big}/{ver_prev}/sdm.duckdb"))
+if (nc_smoke) cell_dbs <- rev(cell_dbs)     # a smoke run reads ver_prev's: this version's sdm.duckdb may be open for writing by a pipeline run
+cell_dbs    <- cell_dbs |> path_expand() |> keep(file_exists)
+stopifnot("no sdm.duckdb with a cell table (this version's or ver_prev's)" = length(cell_dbs) > 0)
+# the `cell` table is the grid's, identical in every release on it: when this version's database is locked by another process
+# (a pipeline stage writing to it) the next candidate (ver_prev's) is read instead
+con_sdm <- NULL
+for (sdm_cell_db in cell_dbs) {
+  con_sdm <- tryCatch(dbConnect(duckdb(sdm_cell_db, read_only = TRUE)),
+                      error = \(e) { log_warn("cell areas: {sdm_cell_db} is not readable ({conditionMessage(e)}); trying the next"); NULL })
+  if (!is.null(con_sdm)) break
+}
+stopifnot("no readable sdm.duckdb with a cell table" = !is.null(con_sdm))
+log_info("cell areas from {sdm_cell_db}")
+duckdb_tune(con_sdm, tmp_nc)
+ca <- dbGetQuery(con_sdm, "SELECT cell_id, area_km2 FROM cell")
+dbDisconnect(con_sdm, shutdown = TRUE)
+area_by_id <- rep(NA_real_, 7200 * 3600); area_by_id[ca$cell_id] <- ca$area_km2
+# the cell table holds the OCEAN cells only (17.07 M of 25.92 M), while the regridded surfaces fade into
+# land cells along the coast (whole range, no land mask): those take the area of their latitude row
+# (a cell's area depends on its row alone; the table's rows are constant to 1e-9 relative)
+row_of <- \(id) (id - 1L) %/% 7200L + 1L
+a_row  <- ca |> mutate(row = row_of(cell_id)) |> group_by(row) |>
+  summarise(a = first(area_km2), spread = max(area_km2) / min(area_km2) - 1, .groups = "drop")
+stopifnot("cell area is not constant within a row" = max(a_row$spread) < 1e-6)
+area_by_row <- rep(NA_real_, 3600); area_by_row[a_row$row] <- a_row$a
+cell_area <- function(id) {
+  a <- area_by_id[id]; miss <- is.na(a)
+  if (any(miss)) a[miss] <- area_by_row[row_of(id[miss])]
+  stopifnot("a cell id has no area (no ocean cell in its row)" = !anyNA(a), all(a > 0))
+  a }
+log_info("cell table: {nrow(ca)} ocean cells, area {round(min(ca$area_km2), 3)}-{round(max(ca$area_km2), 1)} km2; ",
+         "land cells take their row's area")
+rm(ca)
+```
+
+## The 2023 Atlantic package (`NC_ATL_SOURCE=2023`)
+
+MDAT Avian Relative Density **v3.0** (`MDAT_Avian_Relative_Density.zip`, 289 MB; Duke MGEL, distributing the
+NCCOS models of Winship et al. 2023). It is **downloaded into `raw/seamap.env.duke.edu/mdat/v3/`** (never read from
+a Drive mirror), its **sha256 is pinned here** (the package is rebuilt on the server without a version change:
+Last-Modified 2026-06-01 against a 2024-04 release), and `SOURCE.json` beside it records url, sha256, bytes,
+Last-Modified, the download date and the cited report. Layout (inspected 2026-10-30): the ZIP unpacks to
+`Avian_Relative_Density/commondata/raster_data{N}/{code}_predicted_density_1993_2019_{01..12|annual}.tiff`, one folder per
+species (49), 13 single-band Float32 GeoTIFFs each (637), plus the same trees for the CV and 90 % CI
+(`Avian_Relative_Density_CV`, `_CI90`; not used) and the ArcGIS map file `esri_mapfile/*.mapx`, which is the only
+place the common names are written. All 637 share one grid (176 x 233, 10 km, Hotine oblique Mercator), nodata
+`NaN`, 13,419 modelled cells, strictly positive.
+
+```{r}
+#| label: mdat-source
+
+mdat_ds   <- "mdat_v3"                                   # the region_ds label of the 2023 Atlantic models
+mdat_dir  <- path_expand(glue("{dir_raw}/seamap.env.duke.edu/mdat/v3"))
+mdat_urls <- c(zip     = "https://seamap.env.duke.edu/seamap-models-files/mdat/MDAT_Avian_Relative_Density.zip",
+               summary = "https://seamap.env.duke.edu/seamap-models-files/mdat/MDAT_Avian_SummaryProducts.zip",
+               meta    = "https://seamap.env.duke.edu/models/mdat/Avian/MDAT_Avian_Model_Metadata.pdf",
+               changes = "https://seamap.env.duke.edu/models/mdat/Avian/MDAT_Avian_Summary_of_Changes_v3.pdf")
+mdat_zip_sha256 <- "5ffb8e3f20c98f30526c5b70d32d4ea711ebdbedbca5aa8bcd98a07fb197f777"   # the package read on 2026-10-30
+mdat_root <- path(mdat_dir, "unzipped/relative_density/MDAT_Avian_Relative_Density/Avian_Relative_Density")
+mdat_src  <- NULL; mdat_files <- NULL; mdat_sp <- NULL
+
+# download (what is missing), verify the pinned hash, write SOURCE.json once, unzip (the ZIP is kept)
+mdat_acquire <- function() {
+  dir_create(mdat_dir)
+  dest <- path(mdat_dir, path_file(mdat_urls))
+  old  <- options(timeout = 3600); on.exit(options(old), add = TRUE)
+  for (i in seq_along(mdat_urls)) if (!file_exists(dest[i])) {
+    log_info("downloading {mdat_urls[[i]]}")
+    download.file(mdat_urls[[i]], dest[i], mode = "wb", quiet = TRUE)
+  }
+  sha <- digest::digest(dest[1], algo = "sha256", file = TRUE)
+  stopifnot("the MDAT ZIP differs from the package this ingest was written against (sha256) -- re-inspect before ingesting" =
+              identical(sha, mdat_zip_sha256))
+  sj <- path(mdat_dir, "SOURCE.json")
+  if (!file_exists(sj)) {
+    lm <- \(u) { h <- curlGetHeaders(u); sub("^[Ll]ast-[Mm]odified: *", "", trimws(grep("^[Ll]ast-[Mm]odified", h, value = TRUE)[1])) }
+    files <- imap(mdat_urls, \(u, k) list(url = u, file = path_file(u), sha256 = digest::digest(path(mdat_dir, path_file(u)), algo = "sha256", file = TRUE),
+                                          bytes = file_size(path(mdat_dir, path_file(u))) |> as.numeric(), last_modified = lm(u), downloaded = as.character(Sys.Date())))
+    write_json(list(url = mdat_urls[["zip"]], sha256 = sha, bytes = as.numeric(file_size(dest[1])), last_modified = lm(mdat_urls[["zip"]]),
+                    downloaded = as.character(Sys.Date()), cited_report = "BOEM 2023-060",
+                    product = "MDAT Avian Relative Density v3.0 (Duke MGEL; NOAA NCCOS models)",
+                    citation = "Winship AJ, Leirness JB, Coyne M, Howell J, Saba VS, Christensen J. 2023. Modeling the distributions of marine birds at sea to inform planning of energy development on the US Atlantic Outer Continental Shelf. Sterling (VA): U.S. Department of the Interior, Bureau of Ocean Energy Management. 413 p. Report No.: OCS Study BOEM 2023-060. https://espis.boem.gov/Final%20Reports/BOEM_2023-060.pdf",
+                    accession = NULL, files = unname(files)), sj, auto_unbox = TRUE, pretty = TRUE, null = "null")
+  }
+  if (!dir_exists(mdat_root)) {
+    log_info("unzipping {dest[1]}")
+    unzip(dest[1], exdir = path(mdat_dir, "unzipped/relative_density"))
+  }
+  stopifnot(dir_exists(mdat_root))
+  read_json(sj, simplifyVector = FALSE)
+}
+
+# species + files from the package itself: the .mapx layer list carries the common names; the files carry the AOU-style code
+mdat_index <- function() {
+  lay <- read_json(path(mdat_root, "esri_mapfile/Avian_Relative_Density.mapx"), simplifyVector = FALSE)$layerDefinitions
+  idx <- map_dfr(lay, \(l) tibble(name = l$name, file = l$dataConnection$dataset %||% NA_character_)) |> filter(!is.na(file)) |>
+    mutate(code = str_extract(file, "^[a-z]+(?=_predicted_density)"), interval = str_extract(file, "[0-9a-z]+(?=\\.tiff$)"),
+           common = str_remove(name, ", (January|February|March|April|May|June|July|August|September|October|November|December|Annual) relative density$"))
+  fl  <- dir_ls(path(mdat_root, "commondata"), recurse = TRUE, glob = "*.tiff")
+  stopifnot("a basename occurs twice in the package" = !anyDuplicated(path_file(fl)))
+  idx <- idx |> mutate(path = fl[match(file, path_file(fl))])
+  stopifnot("a layer of the map file has no GeoTIFF" = !anyNA(idx$path),
+            "expected 49 species x 13 rasters" = nrow(idx) == 637, n_distinct(idx$code) == 49,
+            "each species needs the 12 months and the annual" = all(table(idx$code, idx$interval %in% c(sprintf("%02d", 1:12), "annual"))[, "TRUE"] == 13),
+            "one common name per code" = nrow(distinct(idx, code, common)) == 49)
+  idx
+}
+
+if (src_2023) {
+  mdat_src   <- mdat_acquire()
+  mdat_files <- mdat_index()
+  mdat_sp    <- mdat_files |> distinct(code, common)
+  # all 637 rasters share ONE grid, as the regridding below assumes
+  sig <- vapply(mdat_files$path, \(f) { r <- terra::rast(f); paste(c(dim(r), terra::res(r), round(as.vector(terra::ext(r)), 3)), collapse = "|") }, "")
+  stopifnot("the package's rasters are not on one grid" = n_distinct(sig) == 1)
+  log_info("MDAT v3: {nrow(mdat_sp)} species, {nrow(mdat_files)} rasters, grid {sig[[1]]}; sha256 {substr(mdat_src$sha256, 1, 12)}")
+}
+```
+
 ## Models + species crosswalk
 
 ```{r}
 #| label: models
 
+# normalised name key (letters only, lower case): the AOU codes are defined by common name
+norm <- function(x) str_to_lower(str_replace_all(x, "[^A-Za-z]", ""))
+
 # one row per (region, sp_code, season) at band 1 (density)
 m <- read_csv(here("data/nc_models.csv")) |>
   filter(var == "n_per_km2") |>
-  transmute(region_ds = ds_key, region, sp_code, season, cog_url, bidx)
+  transmute(region_ds = ds_key, region, sp_code, season, cog_url,
+            response_type = if_else(region == "Atlantic", "relative_index", "density"))
+stopifnot("unexpected region" = all(m$region %in% c("Atlantic", "Pacific")))
 
-# sp_code -> sp_id / names, unioned across the two regions' crosswalks; guilds get GUILD:{sp_code}
-read_xw <- function(f) {
-  if (!file_exists(f)) return(tibble())
-  read_csv(f) |> transmute(sp_code, sp_id = as.character(sp_id), sp_common, sp_scientific)
-}
-xw <- bind_rows(
+# sp_code -> GBIF id / names, unioned across the two regions' crosswalks
+read_xw <- function(f) read_csv(f) |>
+  transmute(sp_code, gbif_id = as.character(sp_id), sp_common, sp_scientific)
+nc_xw_all <- bind_rows(
   read_xw(here("data/sdm/derived/nc_atl_birds_dens/mw_spp.csv")),
   read_xw(here("data/sdm/derived/nc_pac_birds_dens/m_spp.csv")),
-  read_xw(here("data/sdm/derived/nc_pac_birds_dens/m_spp-multiple.csv")),
-  read_xw(here("data/sdm/derived/nc_atl_birds_dens/mw_spp-multiple.csv"))) |>
+  read_xw(here("data/sdm/derived/nc_pac_birds_dens/m_spp-multiple.csv"))) |>
   distinct(sp_code, .keep_all = TRUE)
+nc_multi <- read_csv(here("data/sdm/derived/nc_pac_birds_dens/m_spp-multiple.csv"))$sp_code
 
-m <- m |> left_join(xw, by = "sp_code") |>
-  mutate(
-    is_guild = is.na(sp_id) | grepl("/", sp_scientific %||% ""),
-    sp_id    = ifelse(is.na(sp_id), glue("GUILD:{sp_code}"), sp_id),
-    scientific_name = sp_scientific %||% sp_code)
-log_info("nc models: {nrow(m)} (species×season×region); {n_distinct(m$sp_id)} sp_id; guilds: {sum(m$is_guild & !duplicated(m$sp_id))}")
+if (src_2023) {
+  # the 2018 Atlantic models are NOT ingested under 2023 (a species the 2018 set had and 2023 dropped, bridled
+  # tern, leaves the dataset; its crosswalk row stays). The 49 species of the package are the Atlantic half.
+  m <- m |> filter(region != "Atlantic") |>
+    bind_rows(mdat_files |> filter(interval != "annual") |>
+                transmute(region_ds = mdat_ds, region = "Atlantic", sp_code = str_to_upper(code), season = interval,
+                          cog_url = NA_character_, response_type = "relative_index"))
+
+  # NAME FIRST: the package carries a code and a COMMON name only. A species is the crosswalk's when its common
+  # name matches a crosswalk row (and then its code must agree); otherwise it is new and must be curated below,
+  # with a scientific name and a GBIF id, which the BirdLife crosswalk chunk then resolves like any other species.
+  # (GBIF usageKeys: api.gbif.org/v1/species/match, 2026-10-30, all three EXACT / ACCEPTED species.)
+  nc_new <- tribble(
+    ~sp_code, ~sp_scientific,      ~gbif_id,
+    "BLTE",   "Chlidonias niger",  "GBIF:2481119",     # black tern
+    "FOTE",   "Sterna forsteri",   "GBIF:5229247",     # Forster's tern
+    "LBBG",   "Larus fuscus",      "GBIF:2481174")     # lesser black-backed gull
+  sp23 <- mdat_sp |> transmute(sp_code = str_to_upper(code), mdat_common = common, k = norm(common))
+  xw_hit <- sp23 |> left_join(nc_xw_all |> transmute(k = norm(sp_common), hit_code = sp_code, gbif_id, sp_common, sp_scientific), by = "k")
+  stopifnot("a MDAT common name matched more than one crosswalk row" = nrow(xw_hit) == nrow(sp23),
+            "a MDAT code disagrees with the crosswalk's code for the same common name" = all(is.na(xw_hit$hit_code) | xw_hit$hit_code == xw_hit$sp_code))
+  xw_new <- xw_hit |> filter(is.na(hit_code)) |> select(sp_code, mdat_common) |> left_join(nc_new, by = "sp_code")
+  stopifnot("a MDAT species is neither in the crosswalk by common name nor curated in nc_new" = !anyNA(xw_new$gbif_id),
+            "a 'new' MDAT code is already a crosswalk code under another name" = !any(xw_new$sp_code %in% nc_xw_all$sp_code),
+            "nc_new lists a species the crosswalk already resolves" = all(nc_new$sp_code %in% xw_new$sp_code))
+  xw_2023 <- bind_rows(
+    xw_hit |> filter(!is.na(hit_code)) |> transmute(sp_code, gbif_id, sp_common, sp_scientific, how = "common name (crosswalk)"),
+    xw_new |> transmute(sp_code, gbif_id, sp_common = mdat_common, sp_scientific, how = "new species (curated, then BirdLife)"))
+  nc_xw <- bind_rows(nc_xw_all |> filter(sp_code %in% m$sp_code[m$region == "Pacific"]), xw_2023 |> select(-how)) |>
+    distinct(sp_code, .keep_all = TRUE)
+  knitr::kable(xw_2023 |> count(how, name = "n_species"), caption = "2023 Atlantic species by how the crosswalk row was found")
+} else nc_xw <- nc_xw_all
+
+stopifnot("a model's sp_code has no species row" = all(m$sp_code %in% nc_xw$sp_code))
+nc_xw <- nc_xw |> filter(sp_code %in% m$sp_code) |>
+  mutate(is_guild = sp_code %in% nc_multi | str_detect(sp_code, "-") | !str_detect(sp_scientific, " ") |
+                    str_detect(sp_common, "spp\\.|/"))
+# 2018: 82 codes (47 Atlantic + 46 Pacific - 11 shared), 13 guilds. 2023: 49 Atlantic + 46 Pacific - 11 shared = 84, the same 13 guilds
+n_codes_expected <- if (src_2023) 84L else 82L
+stopifnot("unexpected number of NCCOS codes / guilds" = nrow(nc_xw) == n_codes_expected, sum(nc_xw$is_guild) == 13)
+```
+
+### Crosswalk: common name → scientific name → override, to BirdLife `sisid` and WoRMS AphiaID
+
+The AOU codes are defined by common name, so a common name is the strongest key; the NCCOS scientific
+names follow an older taxonomy (`Puffinus gravis` vs *Ardenna gravis*), which is why a name-only match
+missed 20 of 79 species and matched three to the WRONG one.
+
+```{r}
+#| label: crosswalk
+
+# BirdLife species table (the `bl` model table merge_models_prep.qmd reads its birds from)
+bl <- read_csv(glue("{dir_atlas}/dist/model_bl.csv")) |>
+  transmute(sisid = as.character(sisid), bl_sci = sci_name, bl_common = common)
+bl <- bl |> mutate(k_common = norm(bl_common), k_sci = norm(bl_sci))
+
+# curated overrides (a match the names cannot make)
+nc_override <- tribble(
+  ~sp_code, ~sisid,     ~note,
+  "HERG",   "62030590", "American herring gull = BirdLife Larus smithsonianus (the GBIF name L. argentatus is the European species)")
+
+# common name first; an ambiguous common name is narrowed by scientific name, never guessed
+pick_bl <- function(k_common, k_sci) {
+  by_common <- bl |> filter(k_common == !!k_common)
+  if (nrow(by_common) == 1) return(tibble(sisid = by_common$sisid, match_by = "common name", note = NA_character_))
+  if (nrow(by_common) > 1) {
+    narrowed <- by_common |> filter(k_sci == !!k_sci)
+    if (nrow(narrowed) == 1) return(tibble(sisid = narrowed$sisid, match_by = "common name", note = "common name ambiguous; narrowed by scientific name"))
+  }
+  by_sci <- bl |> filter(k_sci == !!k_sci)
+  if (nrow(by_sci) == 1) return(tibble(sisid = by_sci$sisid, match_by = "scientific name", note = NA_character_))
+  tibble(sisid = NA_character_, match_by = NA_character_, note = NA_character_)
+}
+
+cw <- nc_xw |> mutate(k_common = norm(sp_common), k_sci = norm(sp_scientific)) |>
+  bind_cols(pmap_dfr(list(norm(nc_xw$sp_common), norm(nc_xw$sp_scientific)), pick_bl) |>
+              rename(sisid_name = sisid, match_by_name = match_by, note_name = note)) |>
+  left_join(nc_override, by = "sp_code") |>
+  mutate(sisid    = if_else(is_guild, NA_character_, coalesce(sisid, sisid_name)),
+         match_by = case_when(is_guild ~ NA_character_, !is.na(note) & !is.na(sisid) ~ "override",
+                              TRUE ~ match_by_name),
+         note     = case_when(is_guild ~ sp_common, TRUE ~ coalesce(note, note_name))) |>
+  select(-sisid_name, -match_by_name, -note_name, -k_common, -k_sci) |>
+  left_join(bl |> select(sisid, bl_sci, bl_common), by = "sisid")
+
+# WoRMS AphiaID by name (BirdLife's accepted name first, then NCCOS's), accepted species of class Aves;
+# an unaccepted hit resolves to its accepted AphiaID. WoRMS covers birds poorly, so a miss is a note,
+# not a stop: the bird authority is BirdLife (BOTW:{sisid}).
+con_spp <- dbConnect(duckdb(path_expand(spp_db), read_only = TRUE))
+nm <- unique(na.omit(c(cw$bl_sci, cw$sp_scientific[!cw$is_guild])))
+wm <- dbGetQuery(con_spp, glue("
+  SELECT scientificName AS nm, CAST(COALESCE(acceptedNameUsageID, taxonID) AS VARCHAR) AS worms_id,
+         taxonomicStatus = 'accepted' AS is_acc
+  FROM worms WHERE \"class\" = 'Aves' AND taxonRank = 'Species'
+    AND scientificName IN ({paste(dbQuoteString(con_spp, nm), collapse = ',')})")) |>
+  arrange(desc(is_acc)) |> distinct(nm, .keep_all = TRUE)
+dbDisconnect(con_spp, shutdown = TRUE)
+cw <- cw |>
+  left_join(wm |> transmute(bl_sci = nm, w_bl = worms_id), by = "bl_sci") |>
+  left_join(wm |> transmute(sp_scientific = nm, w_nc = worms_id), by = "sp_scientific") |>
+  mutate(worms_id = if_else(is_guild, NA_character_, coalesce(w_bl, w_nc))) |> select(-w_bl, -w_nc)
+
+# --- hard stops ----
+nong <- cw |> filter(!is_guild)
+stopifnot("a non-guild code resolves to nothing" = !anyNA(nong$sisid),
+          "two codes resolve to the same BirdLife species" = !anyDuplicated(nong$sisid),
+          "two codes share a GBIF id" = !anyDuplicated(nong$gbif_id))
+# the three formerly WRONG matches (name-only on GBIF scientific names) must stay impossible:
+#  Cory's shearwater -> Calonectris diomedea (Scopoli's, Mediterranean) instead of C. borealis;
+#  herring gull -> Larus argentatus (the European species) instead of L. smithsonianus;
+#  white-winged scoter -> the European velvet scoter instead of Melanitta deglandi
+want <- c(COSH = "Calonectris borealis", HERG = "Larus smithsonianus", WWSC = "Melanitta deglandi")
+got  <- setNames(cw$bl_sci[match(names(want), cw$sp_code)], names(want))
+stopifnot("the Cory's / herring gull / white-winged scoter crosswalk regressed" = identical(got, want))
+# a common-name match must agree with the crosswalk's common name; a name or override match may
+# differ only for a curated, known BirdLife rename
+common_renamed_ok <- c("DOVE", "PAJA", "HERG")          # Dovekie = Little Auk; Parasitic = Arctic Jaeger; American = Arctic Herring Gull
+bad <- nong |> filter(norm(sp_common) != norm(bl_common), !sp_code %in% common_renamed_ok)
+stopifnot("a matched species' common name disagrees with the crosswalk" = nrow(bad) == 0)
+stopifnot("an override/name match outside the curated list" =
+            all(nong$sp_code[nong$match_by != "common name"] %in% common_renamed_ok))
+
+cw_out <- cw |>
+  transmute(sp_code, common_name = sp_common, scientific_name = sp_scientific, match_by, worms_id, sisid, is_guild,
+            note, gbif_id, sp_id = if_else(is_guild, glue("GUILD:{sp_code}"), gbif_id),
+            bl_scientific = bl_sci, bl_common) |>
+  arrange(is_guild, sp_code)
+# the committed crosswalk is a registry: this run's codes are (re)written, every other code is kept as it is (the 2018 run
+# keeps the 2023-only species, the 2023 run keeps bridled tern), so the file does not flip between the two sources
+prev_xw <- if (file_exists(xw_csv_in)) read_csv(xw_csv_in, col_types = cols(.default = "c")) else NULL
+cw_chr  <- cw_out |> mutate(across(everything(), as.character))
+cw_file <- bind_rows(cw_chr, if (!is.null(prev_xw)) prev_xw |> filter(!sp_code %in% cw_chr$sp_code)) |>
+  arrange(is_guild == "TRUE", sp_code)
+write_csv(cw_file, xw_csv, na = "")
+log_info("crosswalk file: {nrow(cw_file)} codes ({nrow(cw_file) - nrow(cw_chr)} kept from the committed file)")
+log_info("crosswalk: {nrow(cw_out)} codes; {sum(cw_out$is_guild)} guilds; WoRMS id for {sum(!is.na(cw_out$worms_id))} of {sum(!cw_out$is_guild)} species")
+knitr::kable(cw_out |> mutate(match_by = coalesce(match_by, "guild")) |> count(match_by, name = "n_codes"),
+             caption = "crosswalk: codes by match_by")
+knitr::kable(cw_out |> filter(!is_guild, match_by != "common name" | scientific_name != bl_scientific) |>
+               select(sp_code, common_name, scientific_name, bl_scientific, bl_common, match_by, sisid, worms_id),
+             caption = "species whose NCCOS scientific name differs from BirdLife's, or that matched off the common name")
+knitr::kable(cw_out |> filter(is_guild) |> select(sp_code, common_name, scientific_name, sp_id),
+             caption = "guilds: ingested as nc|GUILD:{code}, excluded from the merge")
+
+# model table with the ingest's sp_id / names
+m <- m |> left_join(cw_out |> select(sp_code, sp_id, common_name, nc_scientific = scientific_name, scientific_name = bl_scientific,
+                                     is_guild, sisid, worms_id, match_by), by = "sp_code") |>
+  mutate(scientific_name = coalesce(scientific_name, nc_scientific))
+log_info("nc models: {nrow(m)} (species×season×region); {n_distinct(m$sp_id)} sp_id; guilds: {n_distinct(m$sp_id[m$is_guild])}")
 knitr::kable(m |> count(region, season, name = "n") |> pivot_wider(names_from = season, values_from = n))
 ```
 
-## Rasterize + rescale per species
+## Regrid + transform
+
+```{r}
+#| label: functions
+
+# a source model's density on the 0.05° cells: bilinear reprojection of the omerc COG to EPSG:4326, then
+# cells_from_raster() (bilinear onto the cell grid, zero-filled so the surface fades to 0 at its edge).
+# digits = NULL: the raster holds NATIVE density, which rounds to 0 at 2 decimals; min_value is a
+# positive epsilon, i.e. "any positive density" (the default 1 would drop every cell of a density < 1).
+# The 2023 Atlantic rasters (Hotine oblique Mercator, 10 km, NaN nodata) take exactly this path.
+src_path <- function(region_ds, sp_code, season) {
+  if (region_ds == mdat_ds) mdat_files$path[mdat_files$code == str_to_lower(sp_code) & mdat_files$interval == season]
+  else here(glue("data/sdm/raw/{region_ds}/{sp_code}_{season}.tif"))
+}
+dens_cells <- function(region_ds, sp_code, season) {
+  f <- src_path(region_ds, sp_code, season)
+  if (length(f) != 1 || !file_exists(f)) return(NULL)
+  r <- terra::project(terra::rast(f, lyrs = 1), "EPSG:4326", method = "bilinear")
+  msens::cells_from_raster(r, cellid_tif, min_value = 1e-12, digits = NULL) |> rename(dens = val)
+}
+
+# intervals per year: 4 seasons, or the 12 months of the 2023 Atlantic package
+n_int <- function(region) if (src_2023 && region == "Atlantic") 12L else 4L
+
+# the annual DENSITY of one region's (cell_id, interval, dens) rows: the mean over ALL intervals, an unmodelled one = 0.
+# 2023 Atlantic = the DAY-WEIGHTED mean of the 12 months (what the package's own Annual layer is; msens >= 0.65.1);
+# the Pacific seasons (and the whole 2018 control) stay equal-weighted, 4 seasons, exactly as before
+annual_of <- function(x, region, plain = FALSE) {
+  if (src_2023 && region == "Atlantic" && !plain)
+    msens::density_annual(x, n_intervals = 12, interval = "interval", weights = msens::month_day_weights())
+  else msens::density_annual(x, n_intervals = n_int(region))
+}
+if (src_2023) stopifnot("NC_ATL_SOURCE=2023 needs msens >= 0.65.1 (density_annual weights / month_day_weights)" =
+                          utils::packageVersion("msens") >= "0.65.1")
+
+# density -> [0,100]: the v11 population percentile (ud, area-weighted by the cell table), or the v8
+# recipe (cap: linear to the species' pooled p99.5 of positive density, clamped)
+to_val <- function(dens, cell_id, how, cap = NA_real_) {
+  if (how == "ud") msens::density_to_suit(dens, "ud", area = cell_area(cell_id), digits = 2)
+  else             round(100 * pmin(dens / cap, 1), 2)
+}
+
+# a species' models in one region as (cell_id, interval, dens)
+region_dens <- function(sp_code, region) {
+  mi <- m |> filter(sp_code == !!sp_code, region == !!region)
+  map2_dfr(mi$region_ds, mi$season, \(rd, s) dens_cells(rd, sp_code, s) |> mutate(interval = s))
+}
+```
+
+### The annual surface is the mean over ALL intervals of the year
+
+An unmodelled interval counts as zero (NCCOS fits a season only where the species was sighted enough to
+model; the 2023 Atlantic package models every species in all twelve months). Checked on the densities, before
+any transform, on hand-picked species: with every interval modelled the annual equals the mean of the
+intervals (plain for the 4 seasons; DAY-WEIGHTED for the 12 months of the 2023 Atlantic); a species missing a season has a LOWER annual than the
+present-only mean (by exactly n_present / 4).
+
+```{r}
+#| label: annual-check
+
+chk <- function(code, region) {
+  d   <- region_dens(code, region)
+  ann <- annual_of(d, region)
+  wide <- d |> pivot_wider(names_from = interval, values_from = dens, values_fill = 0)
+  list(d = d, ann = ann, wide = wide, n = n_distinct(d$interval))
+}
+# species modelled in every interval of the year (annual == plain mean of the intervals); under 2023 the Atlantic ones
+# carry 12 months, so a species is checked against ITS region's interval count
+chk_full <- if (src_2023) list(BFAL = "Pacific", CAAU = "Pacific", ATPU = "Atlantic", COSH = "Atlantic", BLTE = "Atlantic") else
+                          list(ATPU = "Atlantic", AUSH = "Atlantic", BFAL = "Pacific", CAAU = "Pacific")
+for (code in names(chk_full)) {
+  x <- chk(code, chk_full[[code]]); stopifnot(x$n == n_int(chk_full[[code]]))
+  weighted <- src_2023 && chk_full[[code]] == "Atlantic"      # the 2023 Atlantic annual is the day-weighted mean of the 12 months
+  plain <- if (weighted) {
+    w <- msens::month_day_weights(); iv <- setdiff(names(x$wide), "cell_id")
+    x$wide |> transmute(cell_id, mean_all = as.vector(as.matrix(x$wide[, names(w)]) %*% w) / sum(w))
+  } else x$wide |> transmute(cell_id, mean_all = rowMeans(across(-cell_id)))
+  j <- inner_join(x$ann, plain, by = "cell_id")
+  stopifnot("annual != the (day-weighted for 2023 Atlantic, else plain) mean over the intervals" = nrow(j) == nrow(x$ann), nrow(j) == nrow(plain),
+            max(abs(j$dens - j$mean_all)) < 1e-12 * max(j$mean_all))
+}
+# species missing an interval (three of four seasons): annual = present-only mean x n_present / n_intervals, always lower
+chk3 <- if (src_2023) list(ASSP = "Pacific", BLSP = "Pacific", BVSH = "Pacific") else
+                      list(ASSP = "Pacific", BLSP = "Pacific", BVSH = "Pacific", BLKI = "Atlantic")
+chk_rows <- list()
+for (code in names(chk3)) {
+  x <- chk(code, chk3[[code]]); stopifnot(x$n == 3)
+  present <- x$d |> group_by(cell_id) |> summarise(present_mean = mean(dens), n_ssn = n(), .groups = "drop")
+  j <- inner_join(x$ann, present, by = "cell_id")
+  stopifnot("annual is not below the present-only mean" = all(j$dens < j$present_mean),
+            "annual != present-only mean x n_present/4" = all(abs(j$dens - j$present_mean * j$n_ssn / 4) < 1e-12 * max(j$present_mean)))
+  chk_rows[[code]] <- tibble(sp_code = code, seasons = x$n, cells = nrow(j),
+                             mean_annual = mean(j$dens), mean_present_only = mean(j$present_mean))
+}
+log_info("annual checks passed: {length(chk_full)} species modelled in every interval (annual == the interval mean: day-weighted for the 2023 Atlantic), {length(chk3)} three-season species (annual < present-only mean)")
+knitr::kable(bind_rows(chk_rows) |> mutate(across(starts_with("mean"), \(v) signif(v, 3))),
+             caption = "three-season species: annual vs the present-only mean the v8 ingest used (cell means)")
+```
 
 ```{r}
 #| label: rasterize
 
-# local source cog for a model row (reproject omerc -> 4326, band 1)
-read_cog <- function(region_ds, sp_code, season) {
-  f <- here(glue("data/sdm/raw/{region_ds}/{sp_code}_{season}.tif"))
-  if (!file_exists(f)) return(NULL)
-  r <- rast(f, lyrs = 1)
-  terra::project(r, "EPSG:4326", method = "bilinear")
+# per sp_id: regrid every (region × season) model, add the per-region annual (density_annual on the
+# DENSITIES), transform each model on its own cells (both recipes, for the comparison), write the
+# selected one with the regions unioned per season. resumable (skip existing parquet) unless REDO_INGEST.
+# SWITCHING THE ATLANTIC SOURCE on an existing dist/dataset=nc. The 2018 and 2023 Atlantic surfaces share files with the
+# Pacific ones for the 11 species both oceans model (one parquet per sp_id x interval, regions unioned), and a species whose
+# files exist is skipped below, so a dist written under the other source would be resumed INTO the new one. The marker records
+# which source the directory holds (none = the 2018 render that predates the switch); when it differs, every species with an
+# Atlantic model in EITHER source loses its files and is regridded, Pacific-only species and guilds are kept.
+atl_marker <- path(path_dir(mdl_csv), "nc_atl_source.txt")
+prev_src   <- if (file_exists(atl_marker)) str_trim(readLines(atl_marker, n = 1)) else "2018"
+dist_files <- dir_ls(dir_dist, glob = "*.parquet")
+atl_ids    <- character()
+if (length(dist_files) && prev_src != nc_atl_source) {
+  atl_codes_2018 <- read_csv(here("data/nc_models.csv"), col_types = cols(.default = "c")) |> filter(region == "Atlantic") |> pull(sp_code) |> unique()
+  atl_ids <- union(cw_file$sp_id[match(atl_codes_2018, cw_file$sp_code)], m$sp_id[m$region == "Atlantic"])
+  if (file_exists(mdl_csv)) atl_ids <- union(atl_ids, read_csv(mdl_csv, col_types = cols(.default = "c")) |>
+                                               filter(str_detect(regions, "Atlantic")) |> pull(sp_id))
+  atl_ids <- na.omit(atl_ids)
+  safes   <- gsub("[^A-Za-z0-9._-]", "_", atl_ids)
+  # a file nc_{safe}.parquet or nc_{safe}_{interval}.parquet (the interval has no underscore) belongs to species `safe`
+  is_of   <- \(stem, safe) stem == paste0("nc_", safe) ||
+    (startsWith(stem, paste0("nc_", safe, "_")) && !grepl("_", substring(stem, nchar(safe) + 5), fixed = TRUE))
+  stale   <- dist_files[map_lgl(path_ext_remove(path_file(dist_files)), \(st) any(map_lgl(safes, \(sf) is_of(st, sf))))]
+  log_info("Atlantic source {prev_src} -> {nc_atl_source}: removing {length(stale)} of {length(dist_files)} files of the {length(atl_ids)} species with an Atlantic model in either source")
+  file_delete(stale)
+  left <- dir_ls(dir_dist, glob = "*.parquet")
+  stopifnot("a file of an Atlantic species survived the source switch" =
+              !any(map_lgl(path_ext_remove(path_file(left)), \(st) any(map_lgl(safes, \(sf) is_of(st, sf))))))
+}
+writeLines(nc_atl_source, atl_marker)
+
+sp_ids   <- sort(unique(m$sp_id))
+if (length(nc_test_sp)) {                                  # smoke test: named codes (NC_TEST_SP) or the first n sp_id (NC_TEST_N)
+  stopifnot("NC_TEST_SP names a code that is not an ingested model" = all(nc_test_sp %in% m$sp_code))
+  sp_ids <- sort(unique(m$sp_id[m$sp_code %in% nc_test_sp]))
+} else if (nc_test_n > 0) sp_ids <- head(sp_ids, nc_test_n)
+cmp_rows <- list(); cap_rows <- list(); acmp_rows <- list(); qm_rows <- list()
+
+# 2023: our annual (the day-weighted density_annual over the 12 months) against the package's delivered Annual layer, per
+# species, plus the plain 12-month mean as a sensitivity (`*_plain`). On the 0.05 degree cells all went through the same
+# regrid; `nat_*` check on the NATIVE grid how the delivered Annual is built (plain vs day-weighted mean of the months)
+days_in_month <- c(31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+annual_compare <- function(code, ours, deliv, plain) {
+  stat <- \(a, b) {
+    j    <- full_join(a |> select(cell_id, a = dens), b |> select(cell_id, b = dens), by = "cell_id") |>
+      mutate(across(c(a, b), \(v) coalesce(v, 0)))
+    both <- j |> filter(a > 0, b > 0)
+    list(r = cor(j$a, j$b), med = median(both$a / both$b), p05 = quantile(both$a / both$b, .05, names = FALSE),
+         p95 = quantile(both$a / both$b, .95, names = FALSE), sum = sum(j$a) / sum(j$b), n_both = nrow(both))
+  }
+  d <- stat(ours, deliv); p <- stat(plain, deliv)
+  nat  <- \(iv) terra::values(terra::rast(src_path(mdat_ds, code, iv)), mat = FALSE)
+  M <- vapply(sprintf("%02d", 1:12), nat, numeric(terra::ncell(terra::rast(src_path(mdat_ds, code, "01")))))
+  A <- nat("annual"); ok <- !is.na(A)
+  pl <- rowMeans(M); dw <- as.vector(M %*% (days_in_month / sum(days_in_month)))
+  tibble(sp_code = code, n_cells_ours = nrow(ours), n_cells_deliv = nrow(deliv), n_both = d$n_both,
+         r_pearson = d$r, median_ratio = d$med, p05_ratio = d$p05, p95_ratio = d$p95, sum_ratio = d$sum,
+         r_pearson_plain = p$r, median_ratio_plain = p$med, p05_ratio_plain = p$p05, p95_ratio_plain = p$p95, sum_ratio_plain = p$sum,
+         nat_maxrel_plain = max(abs(A[ok] - pl[ok]) / pl[ok]), nat_maxrel_dayweighted = max(abs(A[ok] - dw[ok]) / dw[ok]))
 }
 
-# process per sp_id: pool all its (season×region) densities for a shared p99.5 cap, then write one
-# seasonal surface per season (regions unioned) + an annual mean. resumable (skip existing parquet).
-sp_ids   <- sort(unique(m$sp_id))
-reg_rows <- list()
 for (sid in sp_ids) {
   mi   <- m |> filter(sp_id == sid)
   safe <- gsub("[^A-Za-z0-9._-]", "_", sid)
@@ -117,68 +652,219 @@ for (sid in sp_ids) {
           file_exists(glue("{dir_dist}/{ds_key}_{safe}.parquet"))
   if (done && !redo_ingest) next
 
-  # read every source raster for this sp_id, pool non-zero densities -> cap
-  rs   <- pmap(list(mi$region_ds, mi$sp_code, mi$season), read_cog)
-  keep <- !vapply(rs, is.null, logical(1)); mi <- mi[keep, ]; rs <- rs[keep]
-  if (!length(rs)) { log_warn("no source rasters for {sid}"); next }
-  vals <- unlist(lapply(rs, function(r) { v <- values(r, mat = FALSE); v[!is.na(v) & v > 0] }))
-  cap  <- as.numeric(quantile(vals, p_cap, names = FALSE))
-  if (!is.finite(cap) || cap <= 0) cap <- max(vals, na.rm = TRUE)
+  dl   <- pmap(list(mi$region_ds, mi$sp_code, mi$season), dens_cells)
+  keep <- !vapply(dl, is.null, logical(1)); mi <- mi[keep, ]; dl <- dl[keep]
+  if (!length(dl)) { log_warn("no source rasters for {sid}"); next }
+  dd <- map_dfr(seq_along(dl), \(j) dl[[j]] |> mutate(region = mi$region[j], interval = mi$season[j]))
+  # the v8 recipe's 100 point: pooled p99.5 of the species' positive densities (all seasons, both regions)
+  cap <- as.numeric(quantile(dd$dens, p_cap, names = FALSE))
+  if (!is.finite(cap) || cap <= 0) cap <- max(dd$dens)
+  # annual per region: mean over ALL intervals of the year (4 seasons; the day-weighted 12 months for the 2023 Atlantic), an unmodelled one = 0
+  ann <- dd |> group_by(region) |>
+    group_modify(\(x, k) annual_of(x, k$region)) |> ungroup() |> mutate(interval = "annual")
+  if (src_2023 && any(mi$region_ds == mdat_ds)) {            # report the delivered Annual layer beside ours (ours is the model)
+    code <- mi$sp_code[mi$region_ds == mdat_ds][1]
+    dv   <- dens_cells(mdat_ds, code, "annual"); stopifnot("no delivered annual raster" = !is.null(dv))
+    plain_atl <- annual_of(dd |> filter(region == "Atlantic"), "Atlantic", plain = TRUE)     # sensitivity: the plain 12-month mean
+    acmp_rows[[sid]] <- annual_compare(code, ann |> filter(region == "Atlantic"), dv, plain_atl) |> mutate(sp_id = sid, .before = 1)
+  }
+  res <- bind_rows(dd, ann) |> group_by(region, interval) |>
+    group_modify(\(x, k) tibble(cell_id = x$cell_id, dens = x$dens,
+                                v_ud = to_val(x$dens, x$cell_id, "ud"), v_cap = to_val(x$dens, x$cell_id, "cap", cap))) |>
+    ungroup() |> mutate(val = if (nc_transform == "cap") v_cap else v_ud)
 
-  # per season: union regions' cells, rescale density->[0,100] by the shared cap
-  cells_season <- list()
-  for (ssn in unique(mi$season)) {
-    idx <- which(mi$season == ssn)
-    d <- map_dfr(idx, function(j) {
-      r <- rs[[j]]; r <- terra::clamp(r / cap * 100, upper = 100, values = TRUE)
-      msens::cells_from_raster(r, cellid_tif, min_value = 1)
+  # qmap: each model (region x interval) quantile-mapped onto the species' AquaMaps val over THAT model's cells; a species
+  # with no AquaMaps model (or < 50 reference cells in the domain) keeps its ud percentile, recorded as a fallback
+  qg <- NULL
+  if (nc_transform == "qmap") {
+    sp_m <- m |> filter(sp_id == sid)
+    am_keys <- if (any(sp_m$is_guild)) character() else
+      density_am_keys(am_idx, worms = unique(sp_m$worms_id), botw = unique(sp_m$sisid))
+    qg <- density_qmap_groups(res, c("region", "interval"), density_am_cells(am_keys, am_dir, cell_ids = res$cell_id), cell_area)
+    res$v_qmap <- qg$val; res$val <- qg$val
+    qm_rows[[sid]] <- map_dfr(unique(res$interval), \(iv) {
+      s <- which(qg$stats$interval == iv)
+      bind_cols(tibble(sp_id = sid, interval = iv), density_qmap_pool(qg$stats[s, ], qg$refs[s]),
+                tibble(ref_am_keys = paste(am_keys, collapse = "|")))
     })
+    if (all(qm_rows[[sid]]$transform == density_ref_fallback)) {
+      if (any(sp_m$is_guild)) log_info("qmap: {sid} is a guild: no AquaMaps reference, ud")
+      else log_warn("qmap: {sid} ({sp_m$sp_code[1]}, {sp_m$common_name[1]}) has no usable AquaMaps reference ({length(am_keys)} am model(s), {max(qg$stats$n_ref_cells)} cells in the domain): ud")
+    }
+  }
+
+  # per-model comparison of the two recipes (cells written = val >= 1)
+  q <- \(v) quantile(v, c(.1, .5, .9), names = FALSE)
+  cmp_rows[[sid]] <- res |> group_by(region, interval) |>
+    summarise(n_cells = n(), n_ud = sum(v_ud >= 1), n_cap = sum(v_cap >= 1),
+              ud_q10 = q(v_ud[v_ud >= 1])[1], ud_q50 = q(v_ud[v_ud >= 1])[2], ud_q90 = q(v_ud[v_ud >= 1])[3],
+              cap_q10 = q(v_cap[v_cap >= 1])[1], cap_q50 = q(v_cap[v_cap >= 1])[2], cap_q90 = q(v_cap[v_cap >= 1])[3],
+              .groups = "drop") |>
+    mutate(sp_id = sid, sp_code = mi$sp_code[1], .before = 1)
+  if (!is.null(qg))                                     # qmap: its own quantiles + the reference, beside ud / cap
+    cmp_rows[[sid]] <- cmp_rows[[sid]] |>
+      left_join(qg$stats |> transmute(region, interval, transform, n_ref_cells, ref_p50, ref_p95,
+                                      qmap_q10 = val_q10, qmap_q50 = val_q50, qmap_q90 = val_q90) |>
+                  left_join(res |> group_by(region, interval) |> summarise(n_qmap = sum(v_qmap >= 1), .groups = "drop"),
+                            by = c("region", "interval")), by = c("region", "interval"))
+  cap_rows[[sid]] <- tibble(sp_id = sid, dens_cap = cap)
+
+  # one surface per interval, regions unioned (disjoint; max where they touch)
+  for (iv in unique(res$interval)) {
+    d <- res |> filter(interval == iv, val >= 1) |> group_by(cell_id) |> summarise(val = max(val), .groups = "drop")
     if (!nrow(d)) next
-    d <- d |> group_by(cell_id) |> summarise(val = max(val), .groups = "drop")   # union regions (disjoint)
-    write_parquet_row(d, sid, ssn, safe)
-    cells_season[[ssn]] <- d
+    write_parquet_row(d, sid, if (iv == "annual") NA_character_ else iv, safe)
   }
-  # annual = mean across the available seasons (per cell)
-  if (length(cells_season)) {
-    da <- bind_rows(cells_season, .id = "season") |>
-      group_by(cell_id) |> summarise(val = round(mean(val), 2), .groups = "drop")
-    write_parquet_row(da, sid, NA, safe)
-  }
-  reg_rows[[sid]] <- mi |> distinct(sp_id, sp_code, scientific_name, is_guild) |>
-    slice(1) |> mutate(val_cap = round(cap, 4),
-                       seasons = paste(sort(unique(mi$season)), collapse = "|"),
-                       regions = paste(sort(unique(mi$region)), collapse = "|"))
+}
+log_info("rasterized {length(cmp_rows)} sp_id ({nc_transform})")
+if (src_2023) {                                             # persisted so a resumed run keeps the rows of the species it skipped
+  acmp <- bind_rows(acmp_rows)
+  if (file_exists(acmp_csv)) acmp <- bind_rows(acmp, read_csv(acmp_csv) |> filter(!sp_id %in% acmp$sp_id, sp_id %in% m$sp_id))
+  acmp <- acmp |> arrange(sp_code)
+  write_csv(acmp |> mutate(across(where(is.double), \(v) signif(v, 6))), acmp_csv)
+  off <- acmp$sp_code[abs(acmp$median_ratio - 1) > 1e-3 | acmp$r_pearson < 0.9999]       # the day-weighted annual should now reproduce the delivered one
+  if (length(off)) log_warn("our day-weighted annual departs from the delivered Annual (median ratio off by > 1e-3 or r < 0.9999) for: {paste(off, collapse = ', ')}")
+  if (any(acmp$nat_maxrel_dayweighted > 1e-5)) log_warn("the delivered Annual is not the day-weighted mean of the months for: {paste(acmp$sp_code[acmp$nat_maxrel_dayweighted > 1e-5], collapse = ', ')}")
 }
 ```
 
-## Model registry (`model_nc.csv`)
+## Model registry (`model_nc.csv`) + transform comparison
 
 ```{r}
 #| label: model-csv
 
-# resumable: a re-render with every surface already on disk leaves reg_rows empty (the rasterize
-# loop `next`s), so keep the existing registry rather than rebuilding it from nothing.
-if (length(reg_rows) == 0 && file_exists(mdl_csv)) {
-  model_nc <- read_csv(mdl_csv)
-} else {
-  reg <- bind_rows(reg_rows)
-  # expand to one mdl_key per (seasonal + annual) surface actually written
-  model_nc <- reg |> rowwise() |> do({
-    r <- .; ssns <- strsplit(r$seasons, "\\|")[[1]]
-    tibble(
-      mdl_key = c(glue("{ds_key}|{r$sp_id}|{ssns}"), glue("{ds_key}|{r$sp_id}")),
-      interval = c(ssns, "annual"),
-      sp_id = r$sp_id, sp_code = r$sp_code, scientific_name = r$scientific_name,
-      is_guild = r$is_guild, val_cap = r$val_cap, regions = r$regions,
-      cog_url = c(glue("{cog_base}/nc_{ifelse(r$regions=='Atlantic','atl','pac')}_birds_dens/{r$sp_code}_{ssns}.tif"), NA))
-  }) |> ungroup() |>
-    rowwise() |>
-    filter(file_exists(glue("{dir_dist}/{ds_key}_{gsub('[^A-Za-z0-9._-]','_',sp_id)}{ifelse(interval=='annual','', paste0('_',interval))}.parquet"))) |>
-    ungroup()
-  write_csv(model_nc, mdl_csv)
+# stats of every written surface, read back from the parquet (so a resumed run is complete too)
+con <- dbConnect(duckdb())
+duckdb_tune(con, tmp_nc)
+surf <- dbGetQuery(con, glue("
+  SELECT mdl_key, count(*) AS n_cells, round(min(val), 2) AS val_min, round(max(val), 2) AS val_max
+  FROM read_parquet('{dir_dist}/*.parquet') GROUP BY mdl_key"))
+dbDisconnect(con, shutdown = TRUE)
+
+# every surface in the directory is one of THIS run's models: nothing left over from the other Atlantic source
+exp_keys <- c(glue("{ds_key}|{unique(m$sp_id)}"), m |> distinct(sp_id, season) |> transmute(k = glue("{ds_key}|{sp_id}|{season}")) |> pull(k))
+stopifnot("dist/dataset=nc holds surfaces that are not this run's models (a stale Atlantic source?)" = length(setdiff(surf$mdl_key, exp_keys)) == 0)
+
+# dens_cap per sp_id: this run's, else the previous registry's (resume)
+caps <- bind_rows(cap_rows)
+prev_nc <- if (file_exists(mdl_csv)) read_csv(mdl_csv) else tibble()
+if ("dens_cap" %in% names(prev_nc))
+  caps <- bind_rows(caps, prev_nc |> distinct(sp_id, dens_cap) |> filter(!sp_id %in% caps$sp_id))
+meta <- m |> group_by(sp_id) |>
+  summarise(sp_code = first(sp_code), common_name = first(common_name), scientific_name = first(scientific_name),
+            nc_scientific_name = first(nc_scientific), is_guild = first(is_guild), sisid = first(sisid),
+            worms_id = first(worms_id), match_by = first(match_by),
+            regions = paste(sort(unique(region)), collapse = "|"),
+            response_type = if (n_distinct(response_type) == 1) first(response_type) else "mixed",
+            seasons = list(sort(unique(season))), .groups = "drop")
+# 2023: the provenance of each region's source (SOURCE.json for the Atlantic package), one entry per region in the order of `regions`
+if (src_2023) {
+  src_tbl <- tibble(region    = c("Atlantic", "Pacific"),
+                    source    = c("MDAT v3 2023-060", "NCCOS Pacific Leirness 2021"),
+                    accession = c(mdat_src$accession %||% NA_character_, NA_character_),
+                    citation  = c(mdat_src$citation, "Leirness JB et al. 2021. Modeling at-sea density of marine birds to support renewable energy planning on the Pacific outer continental shelf of the contiguous United States. https://repository.library.noaa.gov/view/noaa/49073"))
+  # provenance PER SURFACE: a month is the Atlantic package's alone, a season the Pacific's alone, the annual of a species both regions model is both
+  src_int <- bind_rows(m |> distinct(sp_id, interval = season, region), m |> distinct(sp_id, region) |> mutate(interval = "annual")) |>
+    left_join(src_tbl, by = "region") |> arrange(sp_id, interval, region) |> group_by(sp_id, interval) |>
+    summarise(source = paste(source, collapse = "|"), accession = paste(accession, collapse = "|") |> na_if("NA|NA") |> na_if("NA"),
+              citation = paste(unique(citation), collapse = " || "), .groups = "drop")
 }
-log_info("model_nc.csv: {nrow(model_nc)} mdl_keys ({sum(model_nc$interval=='annual')} annual)")
+# a model row per surface written: the seasonal ones + the annual
+model_nc <- meta |> rowwise() |>
+  reframe(sp_id, interval = c(seasons, "annual")) |>
+  left_join(meta |> select(-seasons), by = "sp_id") |>
+  mutate(mdl_key = if_else(interval == "annual", glue("{ds_key}|{sp_id}"), glue("{ds_key}|{sp_id}|{interval}")),
+         transform = nc_transform) |>
+  left_join(caps, by = "sp_id") |>
+  inner_join(surf, by = "mdl_key") |>
+  (\(d) if (src_2023) left_join(d, src_int, by = c("sp_id", "interval")) else d)() |>
+  (\(d) if (src_2023) mutate(d, atl_source = if_else(str_detect(regions, "Atlantic") & (interval == "annual" | str_detect(interval, "^[0-9]{2}$")),
+                                                    "2023", NA_character_)) else d)() |>
+  left_join(m |> group_by(sp_id, interval = season) |>
+              summarise(cog_url = if (all(is.na(cog_url))) NA_character_ else paste(na.omit(cog_url), collapse = "|"), .groups = "drop"),
+            by = c("sp_id", "interval")) |>
+  select(mdl_key, interval, sp_id, sp_code, common_name, scientific_name, nc_scientific_name, is_guild, sisid, worms_id,
+         match_by, regions, response_type, transform, dens_cap, val_min, val_max, n_cells, cog_url, any_of(c("atl_source", "source", "accession", "citation"))) |>
+  arrange(sp_id, interval)
+# qmap: per model the transform actually used ("qmap", or the ud fallback) + the reference's size and quantiles + the AquaMaps keys;
+# this run's, else the previous registry's (resume)
+if (nc_transform == "qmap") {
+  qm_cols <- c("sp_id", "interval", "transform", "n_ref_cells", "ref_p50", "ref_p95", "ref_am_keys")
+  qm <- bind_rows(qm_rows)
+  if ("n_ref_cells" %in% names(prev_nc))
+    qm <- bind_rows(qm, prev_nc |> filter(!sp_id %in% qm$sp_id) |> mutate(ref_am_keys = as.character(ref_am_keys)) |> select(all_of(qm_cols)))
+  model_nc <- model_nc |> select(-transform) |> left_join(qm |> select(all_of(qm_cols)), by = c("sp_id", "interval")) |>
+    relocate(transform, .after = response_type)
+  stopifnot("a qmap model row has no transform record" = !anyNA(model_nc$transform))
+}
+stopifnot("val outside [1,100]" = all(model_nc$val_min >= 1 & model_nc$val_max <= 100),
+          "a model has no dens_cap" = !anyNA(model_nc$dens_cap),
+          "every guild code must be ingested" = nc_smoke || setequal(model_nc$sp_code[model_nc$is_guild], cw_out$sp_code[cw_out$is_guild]),
+          "nc|GUILD key missing" = all(grepl("^nc\\|GUILD:", model_nc$mdl_key[model_nc$is_guild])),
+          "every species has an annual surface" = all(table(model_nc$sp_id, model_nc$interval == "annual")[, "TRUE"] == 1))
+# 2023 gates: every Atlantic species of the package (the ones processed, under a smoke test) has its 12 monthly surfaces and the
+# annual (13 in all, more for the 11 species the Pacific also models), val inside [1,100] and the densest cell of each at 100
+if (src_2023) {
+  atl_ids <- m |> filter(region == "Atlantic") |> distinct(sp_id) |> pull(sp_id) |> intersect(sp_ids)
+  need    <- tidyr::expand_grid(sp_id = atl_ids, interval = c(sprintf("%02d", 1:12), "annual")) |>
+    mutate(mdl_key = if_else(interval == "annual", glue("{ds_key}|{sp_id}"), glue("{ds_key}|{sp_id}|{interval}")))
+  atl_mod <- model_nc |> filter(mdl_key %in% need$mdl_key)
+  stopifnot("a 2023 Atlantic species lacks one of its 12 monthly surfaces or the annual" = all(need$mdl_key %in% model_nc$mdl_key),
+            "a 2023 Atlantic surface whose densest cell is not 100" = all(atl_mod$val_max == 100 | grepl("qmap", atl_mod$transform, fixed = TRUE)),   # qmap tops out at the reference's maximum
+            "expected 49 Atlantic species" = nc_smoke || length(atl_ids) == 49,
+            "the 2018 Atlantic response type leaked in" = all(atl_mod$response_type %in% c("relative_index", "mixed")))
+  log_info("2023 gates: {length(atl_ids)} Atlantic species x 13 surfaces = {nrow(need)} (all present), val_max == 100 for all {nrow(atl_mod)}")
+}
+write_csv(model_nc, mdl_csv)
+log_info("model_nc.csv: {nrow(model_nc)} mdl_keys ({sum(model_nc$interval=='annual')} annual, {n_distinct(model_nc$sp_id)} sp_id, {n_distinct(model_nc$sp_id[model_nc$is_guild])} guilds)")
 knitr::kable(model_nc |> count(interval, name = "n"))
+knitr::kable(model_nc |> distinct(sp_id, .keep_all = TRUE) |> count(response_type, regions, is_guild, name = "n_sp_id"),
+             caption = "sp_id by response type (Atlantic Winship 2018 = relative_index), regions and guild")
+
+# the two recipes side by side, per model (species × region × season|annual); persisted so a resumed
+# run keeps the rows of the species it skipped
+cmp <- bind_rows(cmp_rows)
+if (file_exists(cmp_csv)) cmp <- bind_rows(cmp, read_csv(cmp_csv) |> filter(!sp_id %in% cmp$sp_id, sp_id %in% m$sp_id))   # kept rows of resumed species; a species this run does not model (bridled tern under 2023) is dropped
+cmp <- cmp |> arrange(sp_id, region, interval)
+write_csv(cmp |> mutate(across(where(is.double), \(v) signif(v, 5))), cmp_csv)
+```
+
+```{r}
+#| label: compare-transforms
+#| results: asis
+
+cat(glue("**{nrow(cmp)} models** (species × region × season, plus annual per region). `n_cells` = cells with a positive ",
+         "density; `n_ud` / `n_cap` = cells kept (`val >= 1`) under each recipe; the quantiles are over the kept cells. ",
+         "The written surface is `{nc_transform}`.\n\n"))
+print(knitr::kable(
+  cmp |> mutate(kind = if_else(interval == "annual", "annual", "seasonal")) |> group_by(kind) |>
+    summarise(models = n(), across(c(n_cells, n_ud, n_cap, ud_q10, ud_q50, ud_q90, cap_q10, cap_q50, cap_q90), \(v) round(median(v), 1)),
+              .groups = "drop"),
+  caption = "median over models, by kind"))
+if (nc_transform == "qmap") {
+  cat("\n\n**qmap reference.** `n_ref_cells` = the species' AquaMaps cells inside the model's domain; a species with no AquaMaps ",
+      "model, or fewer than 50 such cells, keeps its `ud` percentile (`transform = ud(fallback: no am ref)`).\n\n")
+  print(knitr::kable(model_nc |> filter(interval == "annual", !is_guild) |> count(transform, name = "n_species_annual"),
+                     caption = "annual models by the transform actually used"))
+}
+cat("\n\n<details><summary>every model, both recipes</summary>\n\n")
+print(knitr::kable(cmp |> mutate(across(where(is.double), \(v) round(v, 1)))))
+cat("\n\n</details>\n\n")
+```
+
+```{r}
+#| label: annual-compare
+#| results: asis
+
+if (src_2023) cat(glue("### 2023 Atlantic: our annual vs the package's delivered Annual\n\n",
+         "**{nrow(acmp)} species.** Our annual (`density_annual` day-weighted by `month_day_weights()`, then the same regrid) is ",
+         "the model; the delivered Annual layer is regridded the same way and reported. `median_ratio` is ",
+         "ours / delivered over the cells both cover, `sum_ratio` the ratio of totals, `r_pearson` the correlation; the `*_plain` ",
+         "columns are the SENSITIVITY: the plain 12-month mean against the same delivered layer. `nat_maxrel_*` is the largest ",
+         "relative difference on the NATIVE grid between the delivered Annual and the plain mean of the months / the ",
+         "day-weighted mean (the delivered one is day-weighted: February counts 28/365).\n\n"))
+if (src_2023) print(knitr::kable(acmp |> select(-sp_id) |> mutate(across(where(is.double), \(v) signif(v, 4))), caption = "annual: ours vs delivered"))
+cat("\n\n")
 ```
 
 ## Manifest
@@ -187,17 +873,27 @@ knitr::kable(model_nc |> count(interval, name = "n"))
 #| label: manifest
 
 # content-addressed, deterministic manifest (Phase A) — no wall-clock, so an identical re-ingest
-# produces byte-identical bytes and does NOT invalidate downstream targets.
-h    <- msens::hash_parquet(glue("{dir_dist}/*.parquet"))
-smry <- arrow::open_dataset(dir_dist) |>
-  summarise(n_rows = n(), n_mdl = n_distinct(mdl_key),
-            val_min = round(min(val), 2), val_max = round(max(val), 2)) |> collect()
-msens::report_table(smry, caption = "nc density model_cell surface (density → suitability [0,100])")
+# produces byte-identical bytes and does NOT invalidate downstream targets. (A smoke test writes none.)
+if (nc_smoke) {
+  log_info("smoke test: manifest not written; {nrow(model_nc)} models in {dir_dist}")
+} else {
+  h    <- msens::hash_parquet(glue("{dir_dist}/*.parquet"))
+  smry <- arrow::open_dataset(dir_dist) |>
+    summarise(n_rows = n(), n_mdl = n_distinct(mdl_key),
+              val_min = round(min(val), 2), val_max = round(max(val), 2)) |> collect()
+  msens::report_table(smry, caption = glue("nc density model_cell surface (density → population percentile [1,100], {nc_transform})"))
 
-msens::write_manifest(
-  manifest, target = "ingest_sdm_nc", content_hash = h,
-  stats = list(
-    ds_key = ds_key, n_sp_id = n_distinct(model_nc$sp_id), n_mdl = nrow(model_nc), p_cap = p_cap,
-    note = "seasonal + annual density->[0,100]; NOT yet folded into merge/scoring"),
-  force = msens::force_target("ingest_sdm_nc"))
+  stats <- list(
+    ds_key = ds_key, n_sp_id = n_distinct(model_nc$sp_id), n_mdl = nrow(model_nc),
+    n_guild = n_distinct(model_nc$sp_id[model_nc$is_guild]), transform = nc_transform, p_cap = p_cap,
+    atl_source = nc_atl_source,
+    note = "seasonal + annual density -> population percentile [1,100]; annual = mean over 4 seasons (unmodelled = 0) then transformed; guilds ingested, excluded from the merge; NOT yet folded into merge/scoring")
+  if (src_2023) {                                          # which Atlantic package fed the surface (absent under the 2018 control)
+    stats$atl_sha256 <- mdat_src$sha256
+    stats$atl_report <- mdat_src$cited_report
+    stats$note       <- "Pacific seasonal + Atlantic MDAT v3 (BOEM 2023-060) monthly density -> population percentile [1,100]; annual = mean over ALL intervals (4 seasons Pacific, 12 months Atlantic; unmodelled = 0) then transformed; guilds ingested, excluded from the merge; NOT yet folded into merge/scoring"
+  }
+  msens::write_manifest(manifest, target = "ingest_sdm_nc", content_hash = h, stats = stats,
+                        force = msens::force_target("ingest_sdm_nc"))
+}
 ```

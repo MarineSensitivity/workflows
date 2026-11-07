@@ -1,0 +1,58 @@
+---
+title: "snapshot_scores: zone scores of one method variant, for the v10 → v11 attribution"
+msens:
+  target_name: snapshot_scores
+  workflow_type: validate
+  dependency: [score_share_metrics]
+  output: data/manifests/snapshot_scores.json
+editor_options:
+  chunk_output_type: console
+---
+
+One v11 question is *which flag moved which score*. Every method flag (`libs/vars.R`) is a run of the
+same pipeline on the same base, and the attribution is the difference between runs — so each run's
+zone-level scores are snapshotted here, named by `ATTRIBUTION_VARIANT`, into
+`data/v11/attribution/{variant}.parquet` (committed: ~2 MB per variant), with the flags that produced
+them recorded beside the rows. `compare_versions.qmd` reads the set and tabulates the per-flag deltas
+(Program-Area composite and components, under the national and the ecoregion scoring). The control
+(`control`: every flag off) is proven equal to v10 by the stage gates; the `full` variant is the
+candidate v11.
+
+```{r}
+#| label: setup
+
+librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, readr, quiet = T)
+source(here("libs/paths.R")); source(here("libs/vars.R"))
+variant <- Sys.getenv("ATTRIBUTION_VARIANT", "")
+stopifnot("ATTRIBUTION_VARIANT names this run (e.g. control, full, no_occ_rule)" = grepl("^[a-z0-9_]+$", variant),
+          "run score_share_metrics first" = file_exists(sdm_db))
+dir_out  <- here(glue("data/{ver}/attribution")); dir_create(dir_out)
+manifest <- here("data/manifests/snapshot_scores.json"); dir_create(path_dir(manifest))
+f_out    <- glue("{dir_out}/{variant}.parquet")
+flags    <- c(v11_flags, list(AX_SUPERSEDE = ax_supersede))
+log_info("snapshot_scores: {ver} variant {variant}: {paste(names(flags), unlist(flags), sep = '=', collapse = ' ')}")
+```
+
+```{r}
+#| label: snapshot
+
+con <- dbConnect(duckdb(sdm_db, read_only = TRUE))
+z <- dbGetQuery(con, "
+  SELECT z.zone_set_key, z.fld AS zone_fld, z.val AS zone_value, m.metric_key, zm.val
+  FROM zone_metric zm JOIN zone z USING (zone_seq) JOIN metric m USING (metric_seq)
+  ORDER BY 1, 2, 3, 4") |> as_tibble()
+tx <- dbGetQuery(con, "SELECT count(*) n_taxa, count(*) FILTER (WHERE is_valid_usa) n_valid_usa FROM taxon")
+dbDisconnect(con, shutdown = TRUE)
+stopifnot("no zone metrics to snapshot" = nrow(z) > 0,
+          "a (zone, metric) must appear once" = !anyDuplicated(z[c("zone_fld", "zone_value", "metric_key")]))
+z <- z |> mutate(ver = ver, variant = variant, .before = 1)
+for (k in names(flags)) z[[tolower(k)]] <- as.character(flags[[k]])
+arrow::write_parquet(z, f_out)
+h <- msens::parquet_digest(f_out)
+log_info("{nrow(z)} zone-metric rows -> {f_out} ({h})")
+msens::write_manifest(manifest, target = "snapshot_scores", content_hash = h,
+  stats = list(version = ver, variant = variant, flags = flags, n_rows = nrow(z), n_metrics = n_distinct(z$metric_key),
+               n_taxa = tx$n_taxa, n_valid_usa = tx$n_valid_usa, parquet = as.character(path_rel(f_out, here()))),
+  force = TRUE)
+z |> filter(zone_fld == "programarea_key", grepl("^score_", metric_key)) |> count(metric_key, name = "n_areas")
+```

@@ -77,7 +77,8 @@ share_kappa    <- as.numeric(Sys.getenv("SHARE_KAPPA", "0.05"))
 share_strip    <- .flag("SHARE_FLOOR_STRIP")
 cell_denoms    <- strsplit(Sys.getenv("SHARE_CELL_DENOMS", share_denom), ",")[[1]]
 denoms         <- c("global", "usa", "pooled")
-sp_cats        <- c("bird", "coral", "fish", "invertebrate", "mammal", "primary_producer", "turtle")
+stopifnot("msens >= 0.61.1 (components_registry)" = packageVersion("msens") >= "0.61.1")
+sp_cats        <- msens::components_registry() |> dplyr::filter(kind == "species", key != "other") |> dplyr::pull(key)
 stopifnot(!is.na(share_kappa), share_kappa >= 0, share_kappa <= 1, all(cell_denoms %in% denoms))
 log_info("SHARE_METRICS={share_metrics} denom={share_denom} kappa={share_kappa} floor_strip={share_strip} cell_denoms={paste(cell_denoms, collapse=',')}")
 
@@ -131,7 +132,12 @@ ck_prev <- fromJSON(here(glue("data/manifests/checkpoints_{ver_prev}.json")))$ta
 # the whole-table checkpoints of ver_prev hold as long as nothing has been added: the FIRST run of
 # this stage (no share rows yet) must reproduce them exactly, which ties this gate to the clone's
 n_share_keys <- dbGetQuery(con, "SELECT count(*) n FROM metric")$n - length(v8_keys)
-if (n_share_keys == 0) {
+# the ver_prev gate is a CONTROL gate: it holds only when every v11 method flag sits at its control value (the
+# v8 scoring family is then ver_prev's by construction). A method run (any flag on) changes those rows on
+# purpose; its evidence is the attribution harness (snapshot_scores + compare_versions), not this gate.
+v11_control <- isTRUE(v11_flags_off)
+if (n_share_keys == 0 && !v11_control) log_info("v11 method flags on ({paste(v11_flags_on, collapse = ', ')}): the ver_prev scoring gate does not apply")
+if (n_share_keys == 0 && v11_control) {
   whole <- list(cell_metric = msens::hash_query(con, "cell_metric"), zone_metric = msens::hash_query(con, "zone_metric"))
   exact <- identical(whole$cell_metric, ck_prev$score_cell_metrics$content_hash) &&
            identical(whole$zone_metric, ck_prev$score_zone_metrics$content_hash)
@@ -307,16 +313,43 @@ if (share_metrics) {
 #| label: release_method
 
 onoff <- function(x) if (isTRUE(x)) "on" else "off"
+bs_rec <- tryCatch(fromJSON(here("data/manifests/bootstrap_version.json")), error = function(e) NULL)
+merge_is_clone <- !is.null(bs_rec) && identical(bs_rec$ver, ver) && isTRUE(bs_rec$clone_merge) && isTRUE(bs_rec$merge_verified)
 rm_rows <- tibble(
-  method_key = c("share_metrics", "share_denom", "share_kappa_pct", "share_floor_strip", "share_components", "prev"),
-  value = c(onoff(share_metrics), share_denom, as.character(share_kappa * 100), onoff(share_strip), paste(sp_cats, collapse = ","), ver_prev),
+  method_key = c("share_metrics", "share_denom", "share_kappa_pct", "share_floor_strip", "share_components", "components_labels", "prev"),
+  value = c(onoff(share_metrics), share_denom, as.character(share_kappa * 100), onoff(share_strip), paste(sp_cats, collapse = ","), if (components_v11) "v11" else "v10", ver_prev),
   description = c(
     "The across-the-nation score family (each species' risk-weighted share of its range per km2 against the national average = 100) computed beside the within-ecoregion metrics (v8: off)",
     "The headline denominator of each species' share: global (its whole modelled range), usa (its US distribution), pooled (no per-species normalization); the other two are written beside it",
     "A zone component is reportable only if its scored cells cover at least this percent of the zone's area (area-weighted); below it there is no score, never a zero",
-    "Whether the floored (val = 1) cells of the premultiplied sea turtles are zeroed on both sides of the share (off = kept, the surface stays continuous)",
+    "Whether the floored (val = 1) cells of premultiplied taxa (the v4b-v10 sea-turtle rule; none under TURTLE_RULE=dps) are zeroed on both sides of the share (off = kept, the surface stays continuous)",
     "The scored components; v8's taxonomy-based categories (no 'other'); primary productivity joins as primprod_v10",
-    "The release whose merge and within-ecoregion scoring this version keeps unchanged"))
+    "Which component names the manifest shows: v10 (Primary Producers, Primary productivity) or v11 (Flora, Productivity; data/components.csv, msens::component_label())",
+    if (isTRUE(merge_is_clone)) "The release whose merge and within-ecoregion scoring this version keeps unchanged" else
+      "The release this version is compared against; the merge was re-run under the method flags recorded in the rows that follow"))
+# the v11 method flags (libs/vars.R `v11_flags`) as data, so the docs state the rules from the release rather than
+# from prose: every flag with its value as this run saw it (a flag at its default = v10's rule). Recorded for every
+# version from v10 on -- v10's rows all read their control values, which is itself the statement that v10 is v8's merge.
+flag_desc <- c(
+  VGPM_INTEGRATED  = "Primary productivity as the year-integrated VGPM (polar night = 0) instead of the mean of available months (off: v8/v10)",
+  TURTLE_SUIT      = "Sea-turtle suitability source: am = AquaMaps, ogm = the project's own occurrence-based models",
+  TURTLE_RULE      = "Sea-turtle merge rule: turtle = multiplicative er x suit (v4b-v10), dps = suitability with the per-cell ER beside (dps_sql)",
+  OCC_RULE         = "Zero-record occurrence gate: a species is excluded from an ecoregion with no OBIS record (0.5-degree blocks; protected, narrow-range and unsearched overrides; msens::occurrence_rule)",
+  REGION_WEIGHT    = "Encounter weights per species x ecoregion (msens::encounter_weight)",
+  FOLD_DENSITY     = "Survey density datasets (gm, nc, cce) replace suitability inside their domain",
+  FOLD_DENSITY_CAL = "Calibration of the folded-in survey: none, mass (the control's value basis) or suit (the suitability prior where modelled)",
+  WORMS_SOURCE     = "WoRMS taxonomy source: download or obisindicators",
+  COMPONENTS_V11   = "Component labels Flora / Productivity (data/components.csv)",
+  NC_ATL_SOURCE    = "NCCOS Atlantic seabird set: 2018 (Winship et al.) or 2023 (MDAT v3 / BOEM 2023-060)",
+  SHARE_BASIS      = "Merged value basis: taxon = max(er, suit) with the governing ER multiplied in again at scoring; cell = suitability alone, ER beside (single counting)",
+  RANGE_FILL       = "Value of a range cell no suitability model covers under the cell basis: er (the governing score), presence (100) or mean (the taxon's modelled-cell mean)")
+if (exists("v11_flags")) {
+  fl <- v11_flags[names(flag_desc)]
+  rm_rows <- bind_rows(rm_rows, tibble(
+    method_key  = tolower(names(fl)),
+    value       = vapply(fl, function(x) if (is.logical(x)) onoff(x) else as.character(x), ""),
+    description = unname(flag_desc[names(fl)])))
+}
 if (share_metrics) dbWriteTable(con, "release_method", rm_rows, overwrite = TRUE)
 knitr::kable(rm_rows)
 ```
@@ -349,13 +382,15 @@ ref <- if (file_exists(manifest)) fromJSON(manifest) else NULL
 is_ref <- nzchar(Sys.getenv("BUILD_REFERENCE"))
 flags <- list(share_metrics = share_metrics, share_denom = share_denom, share_kappa = share_kappa, share_floor_strip = share_strip,
               cell_denoms = paste(cell_denoms, collapse = ","))
-same_flags <- !is.null(ref) && all(vapply(names(flags), \(k) isTRUE(all.equal(ref[[k]], flags[[k]])), TRUE))
+# the committed reference is the CONTROL's (every v11 method flag at its control value, == v10): a method run
+# (snapshot_scores records its variant) is never compared to it and never overwrites it
+same_flags <- !is.null(ref) && all(vapply(names(flags), \(k) isTRUE(all.equal(ref[[k]], flags[[k]])), TRUE)) && isTRUE(v11_flags_off)
 if (share_metrics) {
   d_ref <- tibble(surface = names(h_share), digest = unlist(h_share),
                   reference = vapply(names(h_share), \(k) ref[[glue("digest_{k}")]] %||% NA_character_, ""))
   knitr::kable(d_ref, caption = "share-row digests vs the committed reference")
   if (is_ref || is.null(ref) || !isTRUE(ref$share_metrics)) log_info("BUILD_REFERENCE / no reference yet: these digests BECOME the reference")
-  else if (!same_flags) log_info("flags differ from the committed reference's — a sensitivity render, reference not compared")
+  else if (!same_flags) log_info("flags differ from the committed reference's ({if (!isTRUE(v11_flags_off)) paste('v11 method run:', paste(v11_flags_on, collapse = ', ')) else 'a share-flag sensitivity render'}) — reference not compared")
   # zone_taxon_share: v8's zone_taxon (cloned into v10) was STALE for the subregion zone set -- no Atlantic (AT)
   # rows at all, 3,605 of 11,631 Pacific rows, 9,632 of 17,103 USA rows -- while its zone_cell and zone_metric
   # tables had every subregion. A version scored from scratch (v11, 2026-10-30) rebuilds zone_taxon in full, so
@@ -417,7 +452,15 @@ if (share_metrics) {
   rho <- cor(cmp$score, cmp$score_v8, method = "spearman")
   msens::report_table(cmp |> transmute(zone_key, score_v8 = round(score_v8, 1), score_v10 = round(score, 1), n_components) |> arrange(desc(score_v10)),
                       caption = glue("Program-Area composite: within ecoregion (v8) vs across the nation (v10, {share_denom}); Spearman rho = {round(rho, 3)}"))
-  stopifnot("a plausibility target failed — inspect the tables above before trusting the family" = all(checks$pass))
+  # the plausibility targets are the CONTROL's expectations (v10: the Alaska turtles below 2 %, Kemp's ridley topping
+  # the Gulf, ...). A method variant may legitimately move them -- `no_occ_rule` puts the turtles back into Alaska,
+  # which is the point of the variant -- so a method run WARNS and the attribution report is its gate; the control
+  # (every v11 flag at its control value) still stops.
+  if (isTRUE(v11_flags_off)) {
+    stopifnot("a plausibility target failed — inspect the tables above before trusting the family" = all(checks$pass))
+  } else if (!all(checks$pass)) {
+    log_warn("plausibility target(s) failed in a v11 method run ({paste(v11_flags_on, collapse = ', ')}): {paste(checks$check[!checks$pass], collapse = ' | ')} — expected to move for some variants; the attribution report judges it")
+  } else log_info("plausibility targets all pass")
 } else log_info("control run: plausibility checks skipped")
 ```
 
@@ -431,7 +474,8 @@ dbDisconnect(con, shutdown = TRUE)
 # the reference is the share run's: a control render writes the manifest only when none exists yet,
 # never over a share reference; a share run writes it under BUILD_REFERENCE, when no share reference
 # exists, or when its flags equal the reference's (a sensitivity render never moves it)
-write_mf <- if (share_metrics) (is_ref || is.null(ref) || !isTRUE(ref$share_metrics) || same_flags) else is.null(ref)
+write_mf <- if (share_metrics) ((is_ref || is.null(ref) || !isTRUE(ref$share_metrics) || same_flags) && isTRUE(v11_flags_off)) else is.null(ref)
+if (!write_mf) log_info("manifest not rewritten (the committed reference stays the control's); this run's digests: {paste(names(h_share), unlist(h_share), sep = '=', collapse = ' ')}")
 if (write_mf) msens::write_manifest(
   manifest, target = "score_share_metrics",
   content_hash = if (share_metrics) msens::hash_query(dbConnect(duckdb()), glue("SELECT '{paste(unlist(h_share), collapse = '')}' AS a")) else paste(unlist(after), collapse = ""),

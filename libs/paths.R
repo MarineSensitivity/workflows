@@ -1,10 +1,10 @@
 # shared version and path configuration ----
 # sourced by all workflow notebooks and apps
 
-ver <- Sys.getenv("MS_VER", "v10") # version string; change on branches (e.g., "v3b"). MS_VER overrides it for a
+ver <- Sys.getenv("MS_VER", "v11") # version string; change on branches (e.g., "v3b"). MS_VER overrides it for a
                                   # version-agnostic run of ONE notebook (e.g. DEPLOY_STAC=1 MS_VER=v8); a pipeline
-                                  # run never sets it (ver_prev below still names v10's predecessor)
-ver_prev <- "v8" # previous version (bootstrap_version.qmd clones its unchanged ingests; the
+                                  # run never sets it (ver_prev below still names v11's predecessor)
+ver_prev <- "v10" # previous version (bootstrap_version.qmd clones its unchanged ingests; the
                  # score gate compares against it)
 
 # v8 spatial sampling unit: GLOBAL 0.05 degree raster cell in [-180,180]
@@ -42,6 +42,28 @@ bio_oracle_tif <- glue::glue("{dir_raw}/bio-oracle.org/bio-oracle_v3.tif")
 # any SDM raster on this topology (Bio-Oracle, AquaX, resampled AquaMaps) maps to
 # cell_id by position. Shared across versions.
 cellid_tif <- glue::glue("{dir_derived}/r_cellid_global.tif")
+
+# NOAA SEFSC Gulf of Mexico cetacean + sea-turtle monthly density shapefiles (NCEI 0256800 v2.2; 19 shapefiles
+# plus ../spp_gmx.xlsx) read by ingest_sdm-gm.qmd. Local under dir_raw (hydrated by scripts/pull_from_laptop.sh,
+# `--drive`), not Google Drive; GM_SHP_DIR overrides.
+gm_shp_dir <- Sys.getenv("GM_SHP_DIR", unset = glue::glue(
+  "{dir_raw}/sdm/gm/0256800/2.2/data/0-data/NOAA_SEFSC_Cetacean_SeaTurtle_SDM_shapefiles"))
+
+# SWFSC Becker et al. (2020b) California Current cetacean densities: one Esri file geodatabase, 13 layers
+# (ingest_swfsc_cce.qmd). Local under dir_raw (hydrated by scripts/pull_from_laptop.sh), not Google Drive;
+# CCE_GDB overrides it.
+cce_gdb <- Sys.getenv("CCE_GDB", unset = glue::glue(
+  "{dir_raw}/sdm/swfsc/Predictive Models of Cetacean Densities in the California Current Ecosystem, 2020b/",
+  "swfsc_cce_becker_et_al_2020b.gdb"))
+
+# OBIS + WoRMS export of marinebon/obisindicators (v11 Q1): one folder per monthly release
+# (`obis-h3/vYYYYMMDD/`: obis_cell.parquet, worms_taxon.parquet, release.json beside the indicators).
+# `~/_big` is the external disk on the Mac mini (a symlink to /Volumes/msens_big/_big), so one spelling
+# serves the laptop and the mini. libs/obis_h3.R reads from here and falls back to obis_h3_url (HTTPS)
+# when the folder is absent -- the published location after the monthly job (first run 2026-11-01).
+obis_h3_dir     <- ifelse(is_server, "/share/data/obis/obis-h3", "~/_big/obis/obis-h3")
+obis_h3_release <- Sys.getenv("OBIS_H3_RELEASE", "v20261012")   # the release every v11 record count comes from
+obis_h3_url     <- "https://s3.us-east-1.amazonaws.com/oceanmetrics.io-public/obis-h3"
 
 # AquaMaps source db + precomputed bilinear weight table (HCAF 0.5 deg -> 0.05 deg
 # cells; built once by ingest_aquamaps.qmd, shared across versions on this grid).

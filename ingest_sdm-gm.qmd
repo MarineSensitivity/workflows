@@ -1,77 +1,183 @@
 ---
 title: "Ingest SDMs: NOAA SEFSC GoMex Cetacean & Sea-Turtle Densities"
-subtitle: "Monthly hexagon abundance (#/40 km²) → density → suitability [0,100] on the global 0.05° grid"
+subtitle: "Monthly hexagon abundance (#/40 km²) → density → population-percentile suitability [1,100] on the global 0.05° grid"
 msens:
   target_name: ingest_sdm_gm
   workflow_type: ingest
   dependency: [build_cell_grid]
   output: data/manifests/ingest_sdm_gm.json
-  dataset: {ds_key: gm, response_type: density, source_authority: NOAA SEFSC, temporal_interval: monthly, native_format: vector}
+  dataset: {ds_key: gm, response_type: density, source_authority: NOAA SEFSC, temporal_interval: monthly, native_format: vector,
+            description: "NOAA SEFSC Gulf of Mexico cetacean and sea-turtle spatial density models (NCEI 0256800 v2.2), monthly, 40 km2 hexagons. Mapped onto [1,100] by the population-percentile transform (ud), which is scale-free. Species groups (genus / family models, or a model covering several species) are ingested for review (is_guild).",
+            value_info: "population percentile of the cell's density within its model (100 = densest cell; val >= 100 - p is the p % core)"}
 editor_options:
   chunk_output_type: console
 ---
 
 NOAA SEFSC [Gulf-of-Mexico cetacean & sea-turtle spatial density models](https://www.ncei.noaa.gov/access/metadata/landing-page/bin/iso?id=gov.noaa.nodc:256800)
-(NCEI 0256800) — 19 hexagon shapefiles, one per species/population, each carrying monthly abundance
-`{Mon}_n` (individuals per 40 km² hexagon, `-9999` = no data). v8 mirrors the **nc** density ingest
-(`ingest_sdm-nc.qmd`): rasterize each (species × month) onto the global 0.05° grid, rescale the
-heavy-tailed density to a graded **suitability [0,100]** per species (so months share a scale), plus
-an **annual** mean surface. Two dolphins are modelled as split **Oceanic + Shelf** populations whose
-densities are **summed** per hexagon before rasterizing.
+(NCEI 0256800 v2.2) — 19 hexagon shapefiles, one per species/population, each carrying monthly abundance
+`{Mon}_n` (individuals per 40 km² hexagon, `-9999` = no data). Like the **nc** seabird ingest
+(`ingest_sdm-nc.qmd`), v11 rasterizes each (species × month) onto the global 0.05° cell grid and maps the
+heavy-tailed density onto the merge's **[1,100]** scale by the **population-percentile** transform
+(`msens::density_to_suit(method = "ud")`), plus an **annual** surface for scoring. Two dolphins are modelled
+as split **Oceanic + Shelf** populations; each population is rasterized on its own geometry (the Oceanic
+hexagons are clipped, the Shelf ones "Unclipped") and the densities are **summed** per cell.
 
-- **`mdl_key`**: monthly `gm|{sp_id}|{01..12}` + annual `gm|{sp_id}`. `sp_id` = `WORMS:{aphia}` when
-  `taxa_sci` resolves to a single WoRMS AphiaID, else `GUILD:{taxa_shp}` for species groups.
-- **Density → [0,100] is a modeling choice** (v7 never scored gm): per-`sp_id` linear rescale to the
-  pooled **p99.5** of non-zero density, stored as `val_cap` in `model_gm.csv`. **NOT yet folded into
-  merge/scoring** (merge treats non-`am` datasets as binary ranges; a scoring change to validate with
-  `pra_score_delta`).
+- **Inputs are local** (`gm_shp_dir` in `libs/paths.R`, `GM_SHP_DIR` overrides): the 19 shapefiles and
+  `../spp_gmx.xlsx` under `{dir_raw}/sdm/gm/0256800/2.2/data/0-data/`, hydrated by `scripts/pull_from_laptop.sh --drive`.
+- **`mdl_key`**: monthly `gm|{sp_id}|{01..12}` + annual `gm|{sp_id}`; `sp_id = WORMS:{AphiaID}` of `taxa_sci`,
+  resolved offline from `spp.duckdb`'s `worms` table (no API call).
+- **Density** = `{Mon}_n / 40` individuals km⁻², regridded with `cells_from_raster(digits = NULL, min_value = 1e-12)`.
+  The v8 ingest left `digits` at its default 2, which rounded the RAW densities (0.001–0.01 individuals km⁻² for the
+  rare species) to 0.00 / 0.01 *before* dividing by the cap: Rice's whale (`gm|WORMS:1576133`) and the beaked-whale
+  model (`gm|WORMS:137035`) came out flat 100 over their range.
+- **Value transform (v11 Q6, D12).** Per model (species × month) AFTER regridding:
+  `val = density_to_suit(d, "ud", area = cell area_km2)` — 100 minus the percent of the modelled population in
+  cells strictly denser than this one, so the densest cell is 100 and `val >= 100 - p` is exactly the p % core.
+  Cells with `val < 1` are dropped (the merge's floor). The old recipe (`GM_TRANSFORM=cap`: linear to the species'
+  pooled p99.5 of positive density, now applied to the *regridded* densities) stays available and is compared below.
+- **`GM_TRANSFORM=qmap` (v11 evaluation, default stays `ud`).** The `ud` percentile puts the densest survey cell at 100 whatever
+  AquaMaps says elsewhere. `qmap` instead quantile-maps each model's densities onto the species' OWN AquaMaps `val` over that
+  model's cells (`density_to_suit(d, "qmap", ref = ..., digits = 2)`): the survey keeps its spatial pattern and takes AquaMaps'
+  scale. The helper is `libs/density_ref.R` (shared with `nc` and `cce`): the AquaMaps keys come from `ver_prev`'s `taxon_model`
+  (WoRMS id), the surfaces from `dist/dataset=am`. A species with no AquaMaps model, or fewer than 50 reference cells in the
+  domain, keeps `ud` and the model row says `transform = ud(fallback: no am ref)`; `n_ref_cells`, `ref_p50`, `ref_p95` and
+  `ref_am_keys` ride beside it in `model_gm.csv`, and the `qmap_*` quantiles beside `ud_*` / `cap_*` in `gm_transform_compare.csv`.
+- **Annual** = the DAY-WEIGHTED mean of the twelve months, `msens::density_annual(n_intervals = 12, interval = "interval",
+  weights = msens::month_day_weights())` (msens >= 0.65.1; February counts 28/365) on the DENSITIES — a month the model
+  does not cover counts as zero over its weight — and THEN the same transform. (v11 first used the plain mean of the
+  twelve; the day weights match the annual MDAT delivers for the Atlantic birds and a climatological year.) The v8 ingest averaged the transformed values over the months a cell was
+  *present* in; the Kogia model covers April–November only, so its annual was biased upward by 12/8.
+- **Guilds** (`is_guild`): a `sp_id` whose WoRMS rank is not Species (Delphinidae for the blackfish, *Ziphius*
+  for all beaked whales, *Globicephala*, *Kogia*), or whose `spp_gmx` row names several species. They keep their
+  `gm|WORMS:{id}` keys, so nothing downstream is renamed, and `merge_models_prep.qmd` excludes `is_guild` rows.
+- The sea turtles in this dataset are real species and are ingested like any other; the merge gives turtles
+  their own rule.
 
-> **Inputs are on Drive, not in-repo.** Set `GM_SHP_DIR` to the shapefile folder (or hydrate it to
-> `~/_big/msens/raw/sdm/gm`). This notebook was authored against the nc pattern but **must be run on
-> a host with the Drive inputs** (e.g. `msens1`); it is not executed in the in-repo CI render.
+> **Not yet folded into merge/scoring** unless `FOLD_DENSITY` is set (`merge_models_prep.qmd`).
+
+## Setup
 
 ```{r}
 #| label: setup
 
-librarian::shelf(dplyr, fs, glue, here, janitor, jsonlite, logger, purrr, readr, readxl,
-                 sf, stringr, terra, tibble, tidyr, worrms, MarineSensitivity/msens, quiet = T)
+librarian::shelf(arrow, DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, purrr, readr, sf, stringr,
+                 terra, tibble, tidyr, xml2, quiet = T)
+library(msens)                      # the installed msens (density_to_suit / density_annual); never via shelf(), which can reinstall a stale main
 source(here("libs/paths.R"))
 source(here("libs/vars.R"))
+source(here("libs/duckdb_budget.R"))
+source(here("libs/density_ref.R"))   # GM_TRANSFORM=qmap: the species' AquaMaps reference (shared by the three density ingests)
 sf_use_s2(FALSE)
 options(readr.show_col_types = FALSE)
 
-ds_key   <- "gm"
-dir_dist <- glue("{dir_big_v}/marine-atlas/dist/dataset={ds_key}"); dir_create(dir_dist)
-mdl_csv  <- glue("{dir_big_v}/marine-atlas/dist/model_{ds_key}.csv")
-manifest <- here("data/manifests/ingest_sdm_gm.json"); dir_create(path_dir(manifest))
-cog_base <- "https://file.marinesensitivity.org/cog/sdm/raw"
-p_cap    <- 0.995
-NA_VAL   <- -9999
+ds_key    <- "gm"
+dir_atlas <- glue("{dir_big_v}/marine-atlas")
+dir_dist  <- glue("{dir_atlas}/dist/dataset={ds_key}")
+mdl_csv   <- glue("{dir_atlas}/dist/model_{ds_key}.csv")
+manifest  <- here("data/manifests/ingest_sdm_gm.json"); dir_create(path_dir(manifest))
+cmp_csv   <- here("data/gm_transform_compare.csv")
+cog_base  <- "https://file.marinesensitivity.org/cog/sdm/raw"
+tmp_gm    <- glue("{dir_big_v}/_tmp/gm")
+p_cap     <- 0.995                     # the density percentile the OLD recipe used as the 100 point
+NA_VAL    <- -9999                     # the shapefiles' no-data
+shp_dir   <- path.expand(gm_shp_dir)
+taxa_xls  <- path.expand(glue("{shp_dir}/../spp_gmx.xlsx"))
+stopifnot("gm inputs not found: hydrate raw/sdm/gm (scripts/pull_from_laptop.sh --drive) or set GM_SHP_DIR" =
+            dir_exists(shp_dir) && file_exists(taxa_xls), file_exists(cellid_tif))
 
-# Drive-hosted inputs (override with GM_SHP_DIR); default to a hydrated ~/_big copy if present.
-# local default (Ben's Drive); override on any other host by exporting GM_SHP_DIR in the environment
-if (!nzchar(Sys.getenv("GM_SHP_DIR")))
-  Sys.setenv(GM_SHP_DIR = "~/My Drive/projects/msens/data/raw/ncei.noaa.gov - GoMex cetacean & sea turtle SDMs/0256800/2.2/data/0-data/NOAA_SEFSC_Cetacean_SeaTurtle_SDM_shapefiles")
-shp_dir  <- Sys.getenv("GM_SHP_DIR", unset = path.expand("~/_big/msens/raw/sdm/gm"))
-taxa_xls <- if (file_exists(glue("{shp_dir}/spp_gmx.xlsx"))) {
-  glue("{shp_dir}/spp_gmx.xlsx")
-} else glue("{shp_dir}/../spp_gmx.xlsx")
-stopifnot("run on a host with the Drive gm inputs (set GM_SHP_DIR)" = dir_exists(shp_dir),
-          file_exists(cellid_tif))
+# flags (this notebook's own; default = the v11 recipe) ----
+gm_transform <- tolower(Sys.getenv("GM_TRANSFORM", "ud"))         # ud (v11) | cap (the v8 recipe, for comparison) | qmap (densities quantile-mapped onto the species' AquaMaps val in the domain)
+stopifnot("GM_TRANSFORM must be 'ud', 'cap' or 'qmap'" = gm_transform %in% c("ud", "cap", "qmap"))
+
+# smoke test: GM_SMOKE_DIR redirects EVERYTHING this notebook writes (dataset partition, model_gm.csv, comparison table, tmp)
+# to a scratch directory and skips the manifest; GM_TEST_SP (AphiaIDs, e.g. 137119,137205) restricts the regridding to those
+# species. It never touches the version's dist/ (the guard refuses a path under dir_big).
+gm_smoke_dir <- Sys.getenv("GM_SMOKE_DIR", "")
+gm_test_sp   <- str_trim(str_split(Sys.getenv("GM_TEST_SP", ""), ",")[[1]]); gm_test_sp <- gm_test_sp[nzchar(gm_test_sp)]
+gm_smoke     <- nzchar(gm_smoke_dir)
+if (length(gm_test_sp)) stopifnot("GM_TEST_SP needs GM_SMOKE_DIR: a partial ingest must not land in dist/" = gm_smoke)
+if (gm_smoke) {
+  gm_smoke_dir <- path_abs(path_expand(gm_smoke_dir))
+  stopifnot("GM_SMOKE_DIR is inside the big-data root" = !str_starts(gm_smoke_dir, as.character(path_abs(path_expand(dir_big)))))
+  dir_dist <- glue("{gm_smoke_dir}/dist/dataset={ds_key}")
+  mdl_csv  <- glue("{gm_smoke_dir}/dist/model_{ds_key}.csv")
+  cmp_csv  <- glue("{gm_smoke_dir}/gm_transform_compare.csv")
+  tmp_gm   <- glue("{gm_smoke_dir}/_tmp")
+  for (d in c("dist", "_tmp")) if (dir_exists(path(gm_smoke_dir, d))) dir_delete(path(gm_smoke_dir, d))   # a smoke run is always from scratch
+  if (file_exists(cmp_csv)) file_delete(cmp_csv)
+  dir_create(path_dir(mdl_csv))
+}
+dir_create(dir_dist)
+log_info("gm: transform = {gm_transform}; inputs = {shp_dir}; redo = {redo_ingest}; smoke = {gm_smoke}")
+
+# GM_TRANSFORM=qmap: the AquaMaps reference. am_idx = ver_prev's crosswalk of the `am|` models (taxon_model), am_dir = the
+# AquaMaps dataset of THIS version's dist/ (read-only). Neither is touched under ud / cap.
+am_dir <- am_idx <- NULL
+if (gm_transform == "qmap") {
+  am_dir <- path_expand(glue("{dir_atlas}/dist/dataset=am"))
+  stopifnot("GM_TRANSFORM=qmap needs the AquaMaps dataset (dist/dataset=am)" = dir_exists(am_dir))
+  am_idx <- density_am_index(dir_big, ver_prev)
+  log_info("qmap reference: {nrow(am_idx)} {ver_prev}-crosswalked am models; parquets in {am_dir}")
+}
 
 if (redo_ingest && dir_exists(dir_dist)) { dir_delete(dir_dist); dir_create(dir_dist) }
 
-r_grid <- rast(cellid_tif)                               # global 0.05° template (values = cell_id)
+r_grid <- rast(cellid_tif)             # global 0.05° template (values = cell_id)
 
-# write one model surface as (mdl_key, cell_id, val) parquet (V2/zstd). mm = NA -> annual.
+# write one model surface as (mdl_key, cell_id, val) parquet. mm = NA -> annual key/file.
 pq_path <- function(safe, mm) if (is.na(mm)) glue("{dir_dist}/{ds_key}_{safe}.parquet") else
-                                            glue("{dir_dist}/{ds_key}_{safe}_{mm}.parquet")
+                                             glue("{dir_dist}/{ds_key}_{safe}_{mm}.parquet")
 write_surface <- function(d, sid, mm, safe) {
   mk <- if (is.na(mm)) glue("{ds_key}|{sid}") else glue("{ds_key}|{sid}|{mm}")
-  msens::write_atlas_parquet(
+  msens::write_atlas_parquet(                              # V2/zstd/80MB row groups (Phase A)
     tibble(mdl_key = as.character(mk), cell_id = as.integer(d$cell_id), val = d$val),
     pq_path(safe, mm))
 }
+```
+
+## Cell areas
+
+The `ud` transform weights each cell by its area (the population in a cell is density × area). The
+`cell` table is a property of the grid, not of the release: this version's `sdm.duckdb` is used when
+`build_cell_grid` has written it, else `ver_prev`'s (which `build_cell_grid` copies unchanged).
+
+```{r}
+#| label: cell-area
+
+cell_dbs    <- c(sdm_db, glue("{dir_big}/{ver_prev}/sdm.duckdb"))
+if (gm_smoke) cell_dbs <- rev(cell_dbs)     # a smoke run reads ver_prev's: this version's sdm.duckdb may be open for writing by a pipeline run
+cell_dbs    <- cell_dbs |> path_expand() |> keep(file_exists)
+stopifnot("no sdm.duckdb with a cell table (this version's or ver_prev's)" = length(cell_dbs) > 0)
+# the `cell` table is the grid's, identical in every release on it: when this version's database is locked by another process
+# (a pipeline stage writing to it) the next candidate (ver_prev's) is read instead
+con_sdm <- NULL
+for (sdm_cell_db in cell_dbs) {
+  con_sdm <- tryCatch(dbConnect(duckdb(sdm_cell_db, read_only = TRUE)),
+                      error = \(e) { log_warn("cell areas: {sdm_cell_db} is not readable ({conditionMessage(e)}); trying the next"); NULL })
+  if (!is.null(con_sdm)) break
+}
+stopifnot("no readable sdm.duckdb with a cell table" = !is.null(con_sdm))
+log_info("cell areas from {sdm_cell_db}")
+duckdb_tune(con_sdm, tmp_gm)
+ca <- dbGetQuery(con_sdm, "SELECT cell_id, area_km2 FROM cell")
+dbDisconnect(con_sdm, shutdown = TRUE)
+area_by_id <- rep(NA_real_, 7200 * 3600); area_by_id[ca$cell_id] <- ca$area_km2
+# the cell table holds the OCEAN cells only, while the regridded surfaces fade into land cells along the
+# coast (whole range, no land mask): those take the area of their latitude row (a cell's area depends on
+# its row alone; the table's rows are constant to 1e-9 relative)
+row_of <- \(id) (id - 1L) %/% 7200L + 1L
+a_row  <- ca |> mutate(row = row_of(cell_id)) |> group_by(row) |>
+  summarise(a = first(area_km2), spread = max(area_km2) / min(area_km2) - 1, .groups = "drop")
+stopifnot("cell area is not constant within a row" = max(a_row$spread) < 1e-6)
+area_by_row <- rep(NA_real_, 3600); area_by_row[a_row$row] <- a_row$a
+cell_area <- function(id) {
+  a <- area_by_id[id]; miss <- is.na(a)
+  if (any(miss)) a[miss] <- area_by_row[row_of(id[miss])]
+  stopifnot("a cell id has no area (no ocean cell in its row)" = !anyNA(a), all(a > 0))
+  a }
+log_info("cell table: {nrow(ca)} ocean cells, area {round(min(ca$area_km2), 3)}-{round(max(ca$area_km2), 1)} km2; ",
+         "land cells take their row's area")
+rm(ca)
 ```
 
 ## Models + species crosswalk
@@ -79,115 +185,355 @@ write_surface <- function(d, sid, mm, safe) {
 ```{r}
 #| label: models
 
-# one row per shapefile: species (+ Oceanic/Shelf population), monthly abundance columns.
-d_taxa <- read_excel(taxa_xls)                           # cols: taxa_shp, taxa_sci, taxa_doc, taxa_common
-m <- tibble(path_shp = dir_ls(shp_dir, glob = "*.shp")) |>
-  mutate(
-    base_shp = path_ext_remove(path_file(path_shp)),
-    taxa_shp = str_replace(base_shp, "(.*)_Monthly_.*", "\\1"),
-    # the two split-population dolphins: Oceanic_* / Shelf_* -> combine per taxa
-    population = if_else(str_detect(base_shp, "^(Oceanic|Shelf)_"),
-                         str_replace(base_shp, "^(Oceanic|Shelf)_.*", "\\1"), NA_character_)) |>
-  left_join(select(d_taxa, taxa_shp, taxa_sci, taxa_common = any_of("taxa_common")), by = "taxa_shp")
-
-# resolve taxa_sci -> single WoRMS AphiaID (WORMS:{id}); species groups fall back to GUILD:{taxa_shp}
-resolve_sp_id <- function(sci, shp) {
-  id <- tryCatch(worrms::wm_name2id(sci), error = function(e) NA_integer_)
-  if (length(id) == 1 && !is.na(id)) glue("WORMS:{id}") else glue("GUILD:{shp}")
+# spp_gmx.xlsx (one sheet, header row 1: taxa_doc, taxa_sci, repeats, taxa_common, taxa_code_auto, taxa_shp).
+# A minimal reader (zip + xml2) so the notebook needs no spreadsheet package.
+read_xlsx_sheet1 <- function(path) {
+  td <- tempfile(); dir_create(td); on.exit(dir_delete(td))
+  utils::unzip(path, exdir = td)
+  ns <- c(d = "http://schemas.openxmlformats.org/spreadsheetml/2006/main")
+  ss <- read_xml(file.path(td, "xl/sharedStrings.xml")) |> xml_find_all("//d:si", ns) |>
+    map_chr(\(x) paste(xml_text(xml_find_all(x, ".//d:t", ns)), collapse = ""))
+  cells <- read_xml(file.path(td, "xl/worksheets/sheet1.xml")) |> xml_find_all("//d:sheetData/d:row/d:c", ns)
+  typ <- xml_attr(cells, "t")
+  v   <- map_chr(cells, \(x) { n <- xml_find_first(x, "d:v", ns); if (inherits(n, "xml_missing")) NA_character_ else xml_text(n) })
+  is_s <- !is.na(typ) & typ == "s" & !is.na(v)
+  v[is_s] <- ss[as.integer(v[is_s]) + 1L]
+  ref <- xml_attr(cells, "r")
+  d <- tibble(col = sub("[0-9]+$", "", ref), row = as.integer(sub("^[A-Z]+", "", ref)), v = v)
+  hdr <- d |> filter(row == 1) |> select(col, name = v)
+  d |> filter(row > 1) |> left_join(hdr, by = "col") |> select(row, name, v) |>
+    pivot_wider(names_from = name, values_from = v) |> select(-row)
 }
-m <- m |> mutate(sp_id = map2_chr(taxa_sci, taxa_shp, resolve_sp_id))
-log_info("gm shapefiles: {nrow(m)}; sp_id: {n_distinct(m$sp_id)}; split-pop taxa: {sum(!is.na(m$population))}")
-knitr::kable(m |> count(sp_id, name = "n_shp") |> arrange(desc(n_shp)) |> head(8))
+d_taxa <- read_xlsx_sheet1(taxa_xls)
+stopifnot("spp_gmx.xlsx columns changed" = all(c("taxa_doc", "taxa_sci", "taxa_common", "taxa_shp") %in% names(d_taxa)),
+          nrow(d_taxa) == 19)
+
+# one row per shapefile; the two split-population dolphins are Oceanic_* / Shelf_*
+m <- tibble(path_shp = as.character(dir_ls(shp_dir, glob = "*.shp"))) |>
+  mutate(base_shp   = path_ext_remove(path_file(path_shp)),
+         taxa_shp   = str_replace(base_shp, "(.*)_Monthly_.*", "\\1"),
+         population = if_else(str_detect(base_shp, "^(Oceanic|Shelf)_"),
+                              str_replace(base_shp, "^(Oceanic|Shelf)_.*", "\\1"), NA_character_)) |>
+  left_join(d_taxa |> select(taxa_shp, taxa_sci, taxa_common, taxa_doc), by = "taxa_shp")
+stopifnot("19 shapefiles expected" = nrow(m) == 19, "a shapefile has no spp_gmx row" = !anyNA(m$taxa_sci))
 ```
 
-## Rasterize + rescale per species
+`sp_id` = `WORMS:{AphiaID}` of `taxa_sci`, resolved from the `worms` table (accepted, animal, exactly one
+hit per name). A WoRMS rank other than *Species*, or a `spp_gmx` description naming several species (inside
+the parentheses: a comma, "and", or "sp."/"spp."), makes the `sp_id` a **guild**.
+
+```{r}
+#| label: crosswalk
+
+con_spp <- dbConnect(duckdb(path.expand(spp_db), read_only = TRUE))
+nm <- unique(m$taxa_sci)
+wm <- dbGetQuery(con_spp, glue("
+  SELECT scientificName AS taxa_sci, CAST(taxonID AS VARCHAR) AS worms_id, taxonRank AS rank
+  FROM worms WHERE taxonomicStatus = 'accepted' AND kingdom = 'Animalia'
+    AND scientificName IN ({paste(dbQuoteString(con_spp, nm), collapse = ',')})"))
+dbDisconnect(con_spp, shutdown = TRUE)
+stopifnot("a taxa_sci has no / several accepted WoRMS animal records" = setequal(wm$taxa_sci, nm), !anyDuplicated(wm$taxa_sci))
+
+# a spp_gmx description that names several species ("Ziphius and Mesoplodon spp.", "Orcinus orca, ... combined", "Globicephala sp.")
+names_several <- \(doc) { inner <- str_extract(doc, "\\(([^)]*)\\)", group = 1)
+                          !is.na(inner) & str_detect(inner, ",| and |spp?\\.") }
+m <- m |> left_join(wm, by = "taxa_sci") |>
+  mutate(sp_id           = glue("WORMS:{worms_id}") |> as.character(),
+         names_several   = names_several(taxa_doc),
+         is_guild        = rank != "Species" | names_several,
+         # a split-population model is ONE taxon: drop the Oceanic / Shelf prefix from the common name
+         common_name     = str_remove(taxa_common, "^(Oceanic|Shelf) "))
+
+# regression: the ids the v8-v10 ingests produced (via the WoRMS API) are the ones resolved here, and the
+# guilds are exactly the four genus / family models
+ids_v10 <- c(136980, 137017, 137035, 137098, 137105, 137106, 137107, 137108, 137109, 137111, 137119,
+             137205, 137206, 137208, 137209, 1576133, 159024)
+ids_v10 <- paste0("WORMS:", ids_v10)
+stopifnot("sp_id set differs from v8-v10's 17" = setequal(unique(m$sp_id), ids_v10),
+          "guild set changed (expected Delphinidae, Globicephala, Ziphius, Kogia)" =
+            setequal(unique(m$sp_id[m$is_guild]), paste0("WORMS:", c(136980, 137017, 137035, 159024))))
+stopifnot("one sp_id has several is_guild values" = all(tapply(m$is_guild, m$sp_id, \(x) length(unique(x))) == 1),
+          "one sp_id has several common names" = all(tapply(m$common_name, m$sp_id, \(x) length(unique(x))) == 1))
+log_info("gm shapefiles: {nrow(m)}; sp_id: {n_distinct(m$sp_id)}; split-population shapefiles: {sum(!is.na(m$population))}; guild sp_id: {n_distinct(m$sp_id[m$is_guild])}")
+knitr::kable(m |> distinct(sp_id, taxa_sci, rank, names_several, is_guild) |> arrange(desc(is_guild), sp_id),
+             caption = "sp_id by WoRMS rank; a guild is a non-Species rank or a description naming several species")
+knitr::kable(m |> count(sp_id, taxa_sci, name = "n_shp") |> filter(n_shp > 1), caption = "sp_id with several shapefiles (populations summed)")
+```
+
+## Regrid + transform
+
+```{r}
+#| label: functions
+
+# one shapefile (one population) -> long (cell_id, interval, dens) on the 0.05° cells: density = {Mon}_n / 40
+# individuals km-2, each month rasterized on a template cropped from the cell-id COG, then cells_from_raster()
+# (zero-filled; digits = NULL because the raster holds NATIVE density, which rounds to 0 at 2 decimals; min_value is
+# a positive epsilon, i.e. "any positive density"). A month with no modelled hexagon (-9999 everywhere) is absent.
+dens_cells_shp <- function(path) {
+  x   <- read_sf(path) |> st_transform(4326)
+  mos <- intersect(glue("{month.abb}_n"), names(x))
+  v   <- terra::vect(x |> select(all_of(mos)))
+  tmpl <- terra::crop(r_grid, terra::ext(v), snap = "out")
+  map_dfr(mos, \(mo) {
+    f  <- as.numeric(v[[mo]][, 1])
+    ok <- which(f != NA_VAL & !is.na(f))
+    if (!length(ok)) return(NULL)
+    vv <- v[ok]; vv$dens <- f[ok] / 40
+    r  <- terra::rasterize(vv, tmpl, field = "dens")
+    msens::cells_from_raster(r, cellid_tif, min_value = 1e-12, digits = NULL) |> rename(dens = val) |>
+      mutate(interval = sprintf("%02d", match(str_remove(mo, "_n$"), month.abb)))
+  })
+}
+
+# a sp_id's models as (cell_id, interval, dens): populations summed per cell and month
+sp_dens <- function(sid) {
+  paths <- m$path_shp[m$sp_id == sid]
+  map_dfr(paths, dens_cells_shp) |>
+    group_by(cell_id, interval) |> summarise(dens = sum(dens), .groups = "drop")
+}
+
+# density -> [0,100]: the v11 population percentile (ud, area-weighted by the cell table), or the v8
+# recipe (cap: linear to the species' pooled p99.5 of positive density, clamped)
+to_val <- function(dens, cell_id, how, cap = NA_real_) {
+  if (how == "ud") msens::density_to_suit(dens, "ud", area = cell_area(cell_id), digits = 2)
+  else             round(100 * pmin(dens / cap, 1), 2)
+}
+```
+
+### The annual surface is the day-weighted mean over ALL twelve months
+
+A month the model does not cover counts as zero over its weight. Checked on the densities, before any transform, on
+hand-picked species: with twelve months the annual equals the day-weighted mean of the months; the Kogia model covers
+April–November only (244 of 365 days), so its annual is exactly 244/365 of the day-weighted mean over its modelled
+months, and lower than the present-only mean the v8 ingest used.
+
+```{r}
+#| label: annual-check
+
+stopifnot("this notebook needs msens >= 0.65.1 (density_annual weights / month_day_weights)" = utils::packageVersion("msens") >= "0.65.1")
+w_day   <- msens::month_day_weights()                                       # days per month, names "01".."12"
+annual_dw <- \(d) msens::density_annual(d, n_intervals = 12, interval = "interval", weights = w_day)
+wide_of <- \(d) d |> pivot_wider(names_from = interval, values_from = dens, values_fill = 0)
+dw_mean <- \(w, months) as.vector(as.matrix(w[, months]) %*% w_day[months]) / sum(w_day[months])   # day-weighted mean over `months`
+
+# twelve months: annual == day-weighted mean of the twelve (checked on three species, one of them Rice's whale)
+chk12 <- c(`Sperm whale` = "WORMS:137119", `Rice's whale` = "WORMS:1576133", `Loggerhead` = "WORMS:137205")
+for (nm_ in names(chk12)) {
+  d   <- sp_dens(chk12[[nm_]]); stopifnot(n_distinct(d$interval) == 12)
+  ann <- annual_dw(d)
+  wd  <- wide_of(d)
+  dw  <- tibble(cell_id = wd$cell_id, mean12 = dw_mean(wd, names(w_day)))
+  j <- inner_join(ann, dw, by = "cell_id")
+  stopifnot("annual != day-weighted 12-month mean" = nrow(j) == nrow(ann), nrow(j) == nrow(dw),
+            max(abs(j$dens - j$mean12)) < 1e-12 * max(j$mean12))
+}
+
+# Kogia, April-November only
+kg <- sp_dens("WORMS:159024")
+stopifnot("Kogia months changed (expected Apr-Nov)" = setequal(unique(kg$interval), sprintf("%02d", 4:11)))
+ann_kg <- annual_dw(kg)
+w_kg   <- wide_of(kg)
+mo_kg  <- sprintf("%02d", 4:11)
+frac_kg <- sum(w_day[mo_kg]) / sum(w_day)                                                  # the modelled share of the year in days: 244/365
+stopifnot("Kogia's modelled days changed (expected 244 of 365)" = sum(w_day[mo_kg]) == 244, sum(w_day) == 365)
+mean_modelled <- w_kg |> transmute(cell_id, m8 = dw_mean(w_kg, mo_kg))                     # DAY-WEIGHTED mean over the 8 modelled months (zeros counted)
+present_only  <- kg |> group_by(cell_id) |> summarise(po = mean(dens), n_ssn = n(), .groups = "drop")   # the v8 recipe's statistic
+j <- ann_kg |> inner_join(mean_modelled, by = "cell_id") |> inner_join(present_only, by = "cell_id")
+stopifnot("Kogia annual != sum(days Apr..Nov)/365 x the day-weighted mean over its modelled months" =
+            nrow(j) == nrow(ann_kg), all(abs(j$dens - j$m8 * frac_kg) < 1e-12 * max(j$m8)),
+          "Kogia annual is not below the present-only mean" = all(j$dens < j$po))
+chk_tbl <- tibble(model = "Kogia (Apr-Nov)", months = 8L, cells = nrow(j),
+                  mean_annual = mean(j$dens), mean_modelled_months = mean(j$m8), mean_present_only = mean(j$po))
+log_info("annual checks passed: {length(chk12)} twelve-month species (annual == day-weighted mean); Kogia (8 months): annual == 244/365 x day-weighted modelled-month mean")
+knitr::kable(chk_tbl |> mutate(across(starts_with("mean"), \(v) signif(v, 3))),
+             caption = "Kogia: annual vs the mean over its modelled months and the present-only mean the v8 ingest used (cell means)")
+rm(kg, ann_kg, w_kg, mean_modelled, present_only, j, mo_kg, frac_kg)
+```
 
 ```{r}
 #| label: rasterize
 
-# per hexagon shapefile -> long monthly density (#/km2 = {Mon}_n / 40), summed across populations.
-hex_density <- function(paths) {
-  sf <- bind_rows(lapply(paths, function(p) {
-    x <- read_sf(p) |> st_transform(4326)
-    mos <- intersect(glue("{month.abb}_n"), names(x))
-    x |> select(hexid = HEXID, all_of(mos), geom = geometry)
-  }))
-  mos <- intersect(glue("{month.abb}_n"), names(sf))
-  long <- sf |> st_drop_geometry() |>
-    pivot_longer(all_of(mos), names_to = "mo_n", values_to = "n") |>
-    filter(n != NA_VAL) |>
-    mutate(mm = sprintf("%02d", match(str_remove(mo_n, "_n"), month.abb)),
-           density = n / 40)                             # individuals / km2
-  geoms <- sf |> select(hexid) |> distinct()
-  list(long = long, geoms = geoms)
-}
-
-# rasterize a per-hexagon density onto the 0.05° grid, then read grid cells
-cells_from_hex <- function(geoms, dens) {                # dens: tibble(hexid, density)
-  g <- geoms |> left_join(dens, by = "hexid") |> filter(!is.na(density))
-  if (!nrow(g)) return(tibble(cell_id = integer(), val = numeric()))
-  r <- terra::rasterize(terra::vect(g), r_grid, field = "density")
-  msens::cells_from_raster(r, cellid_tif, min_value = 0)
-}
-
+# per sp_id: regrid every month (populations summed), add the annual (density_annual on the DENSITIES), transform
+# each model on its own cells (both recipes, for the comparison), write the selected one.
+# resumable (skip existing parquet) unless REDO_INGEST.
 sp_ids   <- sort(unique(m$sp_id))
-reg_rows <- list()
-for (sid in sp_ids) {
-  mi   <- m |> filter(sp_id == sid)
-  safe <- gsub("[^A-Za-z0-9._-]", "_", sid)
-  if (all(file_exists(pq_path(safe, NA))) && !redo_ingest) next
-
-  hd    <- hex_density(mi$path_shp)                      # combine Oceanic+Shelf populations
-  geoms <- hd$geoms
-  # sum densities across populations per (hexid, month)
-  bym   <- hd$long |> group_by(hexid, mm) |> summarise(density = sum(density), .groups = "drop")
-  cap   <- as.numeric(quantile(bym$density[bym$density > 0], p_cap, names = FALSE))
-  if (!is.finite(cap) || cap <= 0) cap <- max(bym$density, na.rm = TRUE)
-
-  cells_mo <- list()
-  for (mm in sort(unique(bym$mm))) {
-    d <- cells_from_hex(geoms, bym |> filter(mm == !!mm) |> select(hexid, density))
-    if (!nrow(d)) next
-    d <- d |> mutate(val = pmin(val / cap * 100, 100)) |> filter(val >= 1)
-    write_surface(d, sid, mm, safe); cells_mo[[mm]] <- d
-  }
-  if (length(cells_mo)) {                                # annual = mean across months per cell
-    da <- bind_rows(cells_mo) |> group_by(cell_id) |>
-      summarise(val = round(mean(val), 2), .groups = "drop")
-    write_surface(da, sid, NA, safe)
-  }
-  reg_rows[[sid]] <- mi |> distinct(sp_id, taxa_sci) |> slice(1) |>
-    mutate(val_cap = round(cap, 4), months = paste(sort(unique(bym$mm)), collapse = "|"),
-           populations = paste(sort(unique(na.omit(mi$population))), collapse = "|"))
+if (length(gm_test_sp)) {                                  # smoke test: named AphiaIDs (GM_TEST_SP)
+  stopifnot("GM_TEST_SP names an AphiaID that is not an ingested model" = all(paste0("WORMS:", gm_test_sp) %in% sp_ids))
+  sp_ids <- sort(paste0("WORMS:", gm_test_sp))
 }
+cmp_rows <- list(); cap_rows <- list(); qm_rows <- list()
+for (sid in sp_ids) {
+  safe <- gsub("[^A-Za-z0-9._-]", "_", sid)
+  if (file_exists(pq_path(safe, NA)) && !redo_ingest) next
+
+  dd <- sp_dens(sid)
+  if (!nrow(dd)) { log_warn("no positive density for {sid}"); next }
+  # the v8 recipe's 100 point: pooled p99.5 of the species' positive (regridded) densities, all months
+  cap <- as.numeric(quantile(dd$dens, p_cap, names = FALSE))
+  if (!is.finite(cap) || cap <= 0) cap <- max(dd$dens)
+  ann <- annual_dw(dd) |> mutate(interval = "annual")
+  res <- bind_rows(dd, ann) |> group_by(interval) |>
+    group_modify(\(x, k) tibble(cell_id = x$cell_id, dens = x$dens,
+                                v_ud = to_val(x$dens, x$cell_id, "ud"), v_cap = to_val(x$dens, x$cell_id, "cap", cap))) |>
+    ungroup() |> mutate(val = if (gm_transform == "cap") v_cap else v_ud)
+
+  # qmap: each model (month | annual) quantile-mapped onto the species' AquaMaps val over THAT model's cells; a species with
+  # no AquaMaps model (or < 50 reference cells in the domain) keeps its ud percentile, recorded as a fallback
+  qg <- NULL
+  if (gm_transform == "qmap") {
+    sp_m    <- m |> filter(sp_id == sid)
+    am_keys <- if (any(sp_m$is_guild)) character() else density_am_keys(am_idx, worms = unique(sp_m$worms_id))
+    qg <- density_qmap_groups(res, "interval", density_am_cells(am_keys, am_dir, cell_ids = res$cell_id), cell_area)
+    res$v_qmap <- qg$val; res$val <- qg$val
+    qm_rows[[sid]] <- qg$stats |> transmute(sp_id = sid, interval, transform, n_ref_cells, ref_p50, ref_p95,
+                                            ref_am_keys = paste(am_keys, collapse = "|"))
+    if (all(qg$stats$transform == density_ref_fallback)) {
+      if (any(sp_m$is_guild)) log_info("qmap: {sid} is a guild: no AquaMaps reference, ud")
+      else log_warn("qmap: {sid} ({sp_m$common_name[1]}) has no usable AquaMaps reference ({length(am_keys)} am model(s), {max(qg$stats$n_ref_cells)} cells in the domain): ud")
+    }
+  }
+
+  # per-model comparison of the two recipes (cells written = val >= 1)
+  q <- \(v) if (length(v)) quantile(v, c(.1, .5, .9), names = FALSE) else rep(NA_real_, 3)
+  cmp_rows[[sid]] <- res |> group_by(interval) |>
+    summarise(n_cells = n(), n_ud = sum(v_ud >= 1), n_cap = sum(v_cap >= 1),
+              ud_q10 = q(v_ud[v_ud >= 1])[1], ud_q50 = q(v_ud[v_ud >= 1])[2], ud_q90 = q(v_ud[v_ud >= 1])[3],
+              cap_q10 = q(v_cap[v_cap >= 1])[1], cap_q50 = q(v_cap[v_cap >= 1])[2], cap_q90 = q(v_cap[v_cap >= 1])[3],
+              .groups = "drop") |>
+    mutate(sp_id = sid, common_name = m$common_name[m$sp_id == sid][1], .before = 1)
+  if (!is.null(qg))                                     # qmap: its own quantiles + the reference, beside ud / cap
+    cmp_rows[[sid]] <- cmp_rows[[sid]] |>
+      left_join(qg$stats |> transmute(interval, transform, n_ref_cells, ref_p50, ref_p95,
+                                      qmap_q10 = val_q10, qmap_q50 = val_q50, qmap_q90 = val_q90) |>
+                  left_join(res |> group_by(interval) |> summarise(n_qmap = sum(v_qmap >= 1), .groups = "drop"), by = "interval"),
+                by = "interval")
+  cap_rows[[sid]] <- tibble(sp_id = sid, dens_cap = cap)
+
+  for (iv in unique(res$interval)) {
+    d <- res |> filter(interval == iv, val >= 1)
+    if (!nrow(d)) next
+    write_surface(d, sid, if (iv == "annual") NA_character_ else iv, safe)
+  }
+}
+log_info("rasterized {length(cmp_rows)} sp_id ({gm_transform})")
 ```
 
-## Model registry (`model_gm.csv`)
+## Model registry (`model_gm.csv`) + transform comparison
 
 ```{r}
 #| label: model-csv
 
-# resumable: a re-render with every surface already on disk leaves reg_rows empty (the rasterize
-# loop `next`s), so keep the existing registry rather than rebuilding it from nothing.
-if (length(reg_rows) == 0 && file_exists(mdl_csv)) {
-  model_gm <- read_csv(mdl_csv)
-} else {
-  reg <- bind_rows(reg_rows)
-  model_gm <- reg |> rowwise() |> do({
-    r <- .; mos <- strsplit(r$months, "\\|")[[1]]
-    tibble(
-      mdl_key  = c(glue("{ds_key}|{r$sp_id}|{mos}"), glue("{ds_key}|{r$sp_id}")),
-      interval = c(mos, "annual"),
-      sp_id = r$sp_id, scientific_name = r$taxa_sci,
-      val_cap = r$val_cap, populations = r$populations)
-  }) |> ungroup()
-  model_gm <- model_gm |> rowwise() |> filter(file_exists(
-    glue("{dir_dist}/{ds_key}_{gsub('[^A-Za-z0-9._-]','_',sp_id)}{ifelse(interval=='annual','', paste0('_',interval))}.parquet"))) |>
-    ungroup()
-  write_csv(model_gm, mdl_csv)
+# stats of every written surface, read back from the parquet (so a resumed run is complete too)
+con <- dbConnect(duckdb())
+duckdb_tune(con, tmp_gm)
+surf <- dbGetQuery(con, glue("
+  SELECT mdl_key, count(*) AS n_cells, round(min(val), 2) AS val_min, round(max(val), 2) AS val_max
+  FROM read_parquet('{dir_dist}/*.parquet') GROUP BY mdl_key"))
+dbDisconnect(con, shutdown = TRUE)
+
+# dens_cap per sp_id: this run's, else the previous registry's (resume)
+caps <- bind_rows(cap_rows)
+prev_gm <- if (file_exists(mdl_csv)) read_csv(mdl_csv) else tibble()
+if ("dens_cap" %in% names(prev_gm))
+  caps <- bind_rows(caps, prev_gm |> distinct(sp_id, dens_cap) |> filter(!sp_id %in% caps$sp_id))
+
+meta <- m |> group_by(sp_id) |>
+  summarise(common_name = first(common_name), scientific_name = first(taxa_sci), rank = first(rank),
+            is_guild = first(is_guild), worms_id = first(worms_id),
+            populations = paste(sort(unique(na.omit(population))), collapse = "|"),
+            taxa_shp = paste(sort(unique(taxa_shp)), collapse = "|"), .groups = "drop")
+# one model row per surface written: the months + the annual
+model_gm <- surf |>
+  mutate(sp_id = str_extract(mdl_key, "^gm\\|([^|]+)", group = 1),
+         interval = coalesce(str_extract(mdl_key, "\\|(\\d\\d)$", group = 1), "annual")) |>
+  left_join(meta, by = "sp_id") |>
+  left_join(caps, by = "sp_id") |>
+  mutate(response_type = "density", transform = gm_transform) |>
+  select(mdl_key, interval, sp_id, common_name, scientific_name, rank, is_guild, worms_id, populations,
+         response_type, transform, dens_cap, val_min, val_max, n_cells, taxa_shp) |>
+  arrange(sp_id, interval)
+# qmap: per model the transform actually used ("qmap", or the ud fallback) + the reference's size and quantiles + the AquaMaps keys;
+# this run's, else the previous registry's (resume)
+if (gm_transform == "qmap") {
+  qm_cols <- c("sp_id", "interval", "transform", "n_ref_cells", "ref_p50", "ref_p95", "ref_am_keys")
+  qm <- bind_rows(qm_rows)
+  if ("n_ref_cells" %in% names(prev_gm))
+    qm <- bind_rows(qm, prev_gm |> mutate(sp_id = as.character(sp_id), interval = as.character(interval), ref_am_keys = as.character(ref_am_keys)) |>
+                          filter(!sp_id %in% qm$sp_id) |> select(all_of(qm_cols)))
+  model_gm <- model_gm |> select(-transform) |> left_join(qm |> select(all_of(qm_cols)), by = c("sp_id", "interval")) |>
+    relocate(transform, .after = response_type)
+  stopifnot("a qmap model row has no transform record" = !anyNA(model_gm$transform))
 }
-log_info("model_gm.csv: {nrow(model_gm)} mdl_keys ({sum(model_gm$interval=='annual')} annual)")
+stopifnot("val outside [1,100]" = all(model_gm$val_min >= 1 & model_gm$val_max <= 100),
+          "a model has no dens_cap" = !anyNA(model_gm$dens_cap),
+          "a surface has no species row" = !anyNA(model_gm$worms_id),
+          "every guild must be ingested" = gm_smoke || setequal(model_gm$sp_id[model_gm$is_guild], unique(m$sp_id[m$is_guild])),
+          "17 annual surfaces expected" = gm_smoke || sum(model_gm$interval == "annual") == 17,
+          "every species has exactly one annual surface" = all(table(model_gm$sp_id, model_gm$interval == "annual")[, "TRUE"] == 1))
+if (gm_transform == "ud")
+  stopifnot("a ud model's densest cell is not 100" = all(model_gm$val_max == 100))
+if (gm_transform == "qmap")                               # a fallen-back model is ud: its densest cell is 100
+  stopifnot("a ud-fallback model's densest cell is not 100" = all(model_gm$val_max[model_gm$transform == density_ref_fallback] == 100))
+write_csv(model_gm, mdl_csv)
+log_info("model_gm.csv: {nrow(model_gm)} mdl_keys ({sum(model_gm$interval=='annual')} annual, {n_distinct(model_gm$sp_id)} sp_id, {n_distinct(model_gm$sp_id[model_gm$is_guild])} guilds)")
 knitr::kable(model_gm |> count(interval, name = "n"))
+knitr::kable(model_gm |> distinct(sp_id, .keep_all = TRUE) |> count(response_type, rank, is_guild, name = "n_sp_id"),
+             caption = "sp_id by response type, WoRMS rank and guild")
+knitr::kable(model_gm |> filter(is_guild, interval == "annual") |> select(mdl_key, common_name, scientific_name, rank, n_cells),
+             caption = "guilds: ingested as gm|WORMS:{id}, excluded from the merge (is_guild)")
+
+# the two recipes side by side, per model (species × month|annual); persisted so a resumed run keeps
+# the rows of the species it skipped
+cmp <- bind_rows(cmp_rows)
+if (file_exists(cmp_csv)) cmp <- bind_rows(cmp, read_csv(cmp_csv) |> filter(!sp_id %in% cmp$sp_id))
+cmp <- cmp |> arrange(sp_id, interval)
+write_csv(cmp |> mutate(across(where(is.double), \(v) signif(v, 5))), cmp_csv)
+```
+
+```{r}
+#| label: compare-transforms
+#| results: asis
+
+cat(glue("**{nrow(cmp)} models** (species × month, plus the annual). `n_cells` = cells with a positive ",
+         "density; `n_ud` / `n_cap` = cells kept (`val >= 1`) under each recipe; the quantiles are over the kept cells. ",
+         "The written surface is `{gm_transform}`.\n\n"))
+print(knitr::kable(
+  cmp |> mutate(kind = if_else(interval == "annual", "annual", "monthly")) |> group_by(kind) |>
+    summarise(models = n(), across(c(n_cells, n_ud, n_cap, ud_q10, ud_q50, ud_q90, cap_q10, cap_q50, cap_q90), \(v) round(median(v, na.rm = TRUE), 1)),
+              .groups = "drop"),
+  caption = "median over models, by kind"))
+if (gm_transform == "qmap") {
+  cat("\n\n**qmap reference.** `n_ref_cells` = the species' AquaMaps cells inside the model's domain; a species with no AquaMaps ",
+      "model (the four guilds, Rice's whale), or fewer than 50 such cells, keeps its `ud` percentile (`transform = ud(fallback: no am ref)`).\n\n")
+  print(knitr::kable(model_gm |> filter(interval == "annual") |> count(transform, name = "n_species_annual"),
+                     caption = "annual models by the transform actually used"))
+}
+cat("\n\n<details><summary>every model, both recipes</summary>\n\n")
+print(knitr::kable(cmp |> mutate(across(where(is.double), \(v) round(v, 1)))))
+cat("\n\n</details>\n\n")
+```
+
+### The rounding fault: Rice's whale and the beaked whales, `ver_prev` vs this run
+
+The annual surfaces of the two models the v8 ingest left flat at 100, read from `ver_prev`'s `dist/dataset=gm`
+and from this run. Rice's whale (`WORMS:1576133`) is the species; `WORMS:137035` (*Ziphius*) is the beaked-whale
+model, which includes Cuvier's beaked whale.
+
+```{r}
+#| label: rounding-fault
+
+dir_prev <- path.expand(glue("{dir_big}/{ver_prev}/marine-atlas/dist/dataset={ds_key}"))
+if (!gm_smoke) {                                           # a smoke run holds a few species, not these two
+con <- dbConnect(duckdb())
+qs  <- \(dir, tag) dbGetQuery(con, glue("
+  SELECT '{tag}' AS run, mdl_key, count(*) AS n_cells, round(min(val), 2) AS min, round(quantile_cont(val, 0.1), 2) AS q10,
+         round(quantile_cont(val, 0.5), 2) AS q50, round(quantile_cont(val, 0.9), 2) AS q90, round(max(val), 2) AS max,
+         round(avg(CASE WHEN val >= 99.999 THEN 1.0 ELSE 0.0 END), 3) AS frac_100
+  FROM read_parquet(['{dir}/gm_WORMS_1576133.parquet', '{dir}/gm_WORMS_137035.parquet']) GROUP BY mdl_key"))
+fault <- bind_rows(if (dir_exists(dir_prev)) qs(dir_prev, ver_prev), qs(dir_dist, ver)) |> arrange(mdl_key, desc(run))
+dbDisconnect(con, shutdown = TRUE)
+knitr::kable(fault, caption = glue("annual surfaces: {ver_prev} (cap recipe on rounded densities) vs {ver} ({gm_transform})"))
+}
 ```
 
 ## Manifest
@@ -195,18 +541,25 @@ knitr::kable(model_gm |> count(interval, name = "n"))
 ```{r}
 #| label: manifest
 
+# content-addressed, deterministic manifest (Phase A) — no wall-clock, so an identical re-ingest
+# produces byte-identical bytes and does NOT invalidate downstream targets.
+if (gm_smoke) {
+  log_info("smoke test: manifest not written; {nrow(model_gm)} models in {dir_dist}")
+} else {
 h    <- msens::hash_parquet(glue("{dir_dist}/*.parquet"))
 smry <- arrow::open_dataset(dir_dist) |>
   summarise(n_rows = n(), n_mdl = n_distinct(mdl_key),
             val_min = round(min(val), 2), val_max = round(max(val), 2)) |> collect()
-msens::report_table(smry, caption = "gm density model_cell surface (density → suitability [0,100])")
+msens::report_table(smry, caption = glue("gm density model_cell surface (density → population percentile [1,100], {gm_transform})"))
 
 msens::write_manifest(
   manifest, target = "ingest_sdm_gm", content_hash = h,
   stats = list(
-    ds_key = ds_key, n_sp_id = n_distinct(model_gm$sp_id), n_mdl = nrow(model_gm), p_cap = p_cap,
-    note = "monthly + annual density->[0,100]; Oceanic+Shelf summed; NOT yet in merge/scoring"),
+    ds_key = ds_key, n_sp_id = n_distinct(model_gm$sp_id), n_mdl = nrow(model_gm),
+    n_guild = n_distinct(model_gm$sp_id[model_gm$is_guild]), transform = gm_transform, p_cap = p_cap,
+    note = "monthly + annual density -> population percentile [1,100]; annual = day-weighted mean over 12 months (uncovered = 0 over its weight) then transformed; Oceanic+Shelf summed per cell; guilds ingested, excluded from the merge; NOT yet folded into merge/scoring unless FOLD_DENSITY"),
   force = msens::force_target("ingest_sdm_gm"))
+}
 ```
 
 ## Compare with AquaMaps

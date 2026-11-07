@@ -44,3 +44,46 @@ dps_fetch <- .flag("DPS_FETCH")   # re-download the NMFS critical-habitat servic
 
 # build_taxon_global_total.qmd (v10 P2)
 redo_denom <- .flag("REDO_DENOM")  # build_taxon_global_total.qmd: rebuild taxon_denom
+
+# ingest_productivity.qmd (v11 Q4)
+redo_vgpm_download <- .flag("REDO_VGPM_DOWNLOAD")  # ingest_productivity.qmd: re-download + re-untar the OSU monthly VGPM tarballs
+
+# ingest_obis-occurrence.qmd (v11 Q1)
+occ_buffer_km <- as.numeric(Sys.getenv("OCC_BUFFER_KM", "100"))  # rng_occ: cells within d km of a cell with >= 1 OBIS record
+
+# v11 method flags (plan 2026-10-29 §4, §4.10 Q0): every flag OFF reproduces v10 — the control run
+# `scripts/run_version.sh --control` is every flag off and its digests must equal v10's. Each flag is
+# read HERE and consumed by the stage it enters (named in the comment); a stage that does not yet
+# implement its flag asserts it is off, so a flag can never be silently ignored.
+vgpm_integrated <- .flag("VGPM_INTEGRATED")                        # ingest_productivity: year integrated, polar night = 0 (Q4)
+turtle_suit     <- match.arg(Sys.getenv("TURTLE_SUIT", "am"), c("am", "ogm"))      # merge_models_prep/merge_models: turtle suitability source (Q3)
+turtle_rule     <- match.arg(Sys.getenv("TURTLE_RULE", "turtle"), c("turtle", "dps"))  # merge_models: turtles through dps_sql (Q3)
+occ_rule        <- .flag("OCC_RULE")                               # merge_models: msens::occurrence_rule() zone exclusions (Q2)
+region_weight   <- .flag("REGION_WEIGHT")                          # merge_models: msens::encounter_weight() per species x ecoregion (Q3)
+fold_density    <- .flag("FOLD_DENSITY")                           # merge: density datasets replace suitability inside their domain (Q6)
+fold_density_cal <- match.arg(Sys.getenv("FOLD_DENSITY_CAL", "none"), c("none", "mass", "suit"))  # merge: calibrate the folded-in survey (msens::density_cal_factors_sql(): the domain keeps the mass the replaced surface gave it; Q6, after the 2026-10-31 attribution) -- "mass": the replaced surface is the control's VALUE max(er, suit); "suit": the suitability where modeled, er_score elsewhere (msens::density_prior_sql())
+if (fold_density_cal != "none" && !fold_density) stop("FOLD_DENSITY_CAL needs FOLD_DENSITY=1")
+worms_source    <- match.arg(Sys.getenv("WORMS_SOURCE", "download"), c("download", "obisindicators"))  # ingest_worms (Q1)
+components_v11  <- .flag("COMPONENTS_V11")                         # data/components.csv labels: Flora / Productivity (Q5)
+# NC_ATL_SOURCE is consumed by ingest_sdm-nc.qmd ALONE (which Atlantic seabird models exist in dist/dataset=nc: the 2018 Winship set, the
+# control, or the 2023 MDAT v3 / BOEM 2023-060 set). Nothing downstream implements or asserts it: the merge, the scoring and the
+# attribution harness read whatever the ingest left, and a variant's flags record which source it was (snapshot_scores).
+nc_atl_source   <- match.arg(Sys.getenv("NC_ATL_SOURCE", "2018"), c("2018", "2023"))                  # ingest_sdm-nc: Atlantic bird source (Q6c)
+# SHARE_BASIS (Call 2, Ben 2026-11-01): "taxon" = the v4-v10 rule, a range cell valued max(er, suit) with the governing ER
+# multiplied in AGAIN at scoring (a range-only cell scores er^2/100; the risk shapes the distribution and weights it);
+# "cell" = single counting: the merged value is the suitability alone where a model covers the cell, RANGE_FILL where
+# none does ("er" = the governing score, the dps fitting point, which still counts the ER twice on such a cell; "presence" =
+# 100, the range as presence, which counts it once). merge_models passes both to msens::merge_sql() / dps_sql() (test-merge.R).
+share_basis     <- match.arg(Sys.getenv("SHARE_BASIS", "taxon"), c("taxon", "cell"))
+range_fill      <- match.arg(Sys.getenv("RANGE_FILL", "er"), c("er", "presence", "mean"))   # "mean" = the taxon's modelled-cell mean, presence when it has none (v11 decision, Ben 2026-11-02)
+if (range_fill != "er" && share_basis != "cell") stop("RANGE_FILL=presence|mean needs SHARE_BASIS=cell (the taxon basis has no fill)")
+v11_flags <- list(VGPM_INTEGRATED = vgpm_integrated, TURTLE_SUIT = turtle_suit, TURTLE_RULE = turtle_rule,
+                  OCC_RULE = occ_rule, REGION_WEIGHT = region_weight, FOLD_DENSITY = fold_density,
+                  FOLD_DENSITY_CAL = fold_density_cal, WORMS_SOURCE = worms_source, COMPONENTS_V11 = components_v11, NC_ATL_SOURCE = nc_atl_source,
+                  SHARE_BASIS = share_basis, RANGE_FILL = range_fill)
+v11_flag_defaults <- list(VGPM_INTEGRATED = FALSE, TURTLE_SUIT = "am", TURTLE_RULE = "turtle",
+                          OCC_RULE = FALSE, REGION_WEIGHT = FALSE, FOLD_DENSITY = FALSE,
+                          FOLD_DENSITY_CAL = "none", WORMS_SOURCE = "download", COMPONENTS_V11 = FALSE, NC_ATL_SOURCE = "2018",
+                          SHARE_BASIS = "taxon", RANGE_FILL = "er")
+v11_flags_off <- identical(v11_flags, v11_flag_defaults)                 # TRUE = the control run (== v10)
+v11_flags_on  <- names(v11_flags)[!mapply(identical, v11_flags, v11_flag_defaults[names(v11_flags)])]   # the flags a method run set

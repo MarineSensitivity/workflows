@@ -1,0 +1,352 @@
+---
+title: "Ingest own SDMs (OBIS method, `og`) → global 0.05° cells (position-mapped)"
+subtitle: "v11 Q3: ensemble habitat suitability for the six sea turtles (and, when named, the right whale), fitted with the OBIS / MPA Europe SDM pipeline on the global05 grid"
+msens:
+  target_name: ingest_og
+  workflow_type: ingest
+  dependency: [build_cell_grid]
+  output: data/manifests/ingest_og.json
+  dataset: {ds_key: og, response_type: suitability, source_authority: "Ocean Metrics (OBIS method)", temporal_interval: static,
+            native_format: raster, name_short: "Own SDMs (OBIS method)", name_display: "Own species distribution models (OBIS method)",
+            description: "Ensemble habitat suitability (present day) from our own species distribution models, fitted with the OBIS / MPA Europe SDM pipeline (maxent + random forest + xgboost, target-group background, depth-surface predictors) on the 0.05 degree global grid. Thresholds (training P10, held-out) are recorded with each model and not applied.",
+            value_info: "ensemble median habitat suitability, probability x 100 (continuous; P10 / held-out thresholds recorded, not applied)",
+            regions: "global (whole modelled ocean)", is_mask: false, on_grid: true,
+            citation: "Ocean Metrics (2026) Species distribution models fitted with the OBIS / MPA Europe SDM pipeline (mpaeu_sdm, github.com/iobis/mpaeu_sdm, with our msens-patches branch). Ensemble of maxent, random forest and xgboost; models fitted 2026-10 on the Mac mini.",
+            link_info: "https://github.com/iobis/mpaeu_sdm"}
+format: html
+editor_options:
+  chunk_output_type: console
+---
+
+`og` is **our own SDM**, fitted with the OBIS / MPA Europe pipeline (`iobis/mpaeu_sdm`, our
+`msens-patches` branch) to the same global 0.05° grid the atlas uses. The fitted ensemble's
+prediction for the present day (`model=ogm`, `method=ensemble`, `scen=current`) is a two-band
+COG per species:
+
+- band 1 `current` — the ensemble **median** habitat suitability, **Byte 0–100** (probability × 100),
+  NoData 255;
+- band 2 `current_sd` — the spread among the algorithms (not ingested here).
+
+The grid is `global05` exactly (7200 × 3600, −180..180, −90..90), up to a ~6e-6° float drift in the
+origin, so `cell_id` is the **pixel index** (asserted; no resample), as for AquaX.
+
+What this notebook does, and does not do:
+
+1. **Position map, `val` = band 1 as delivered.** No rescale (already [0,100]); NoData 255 → NA.
+   Cells with `val ≥ 1` are kept (`min_value = 1`): a pixel at 0 is **absent** from the Parquet, the
+   same threshold every suitability dataset gets. For a Byte raster that means the pixel's
+   probability is at least 1 %.
+2. **Thresholds are recorded, not applied.** `thr_p10` (the ensemble's training P10, from the
+   model's `what=thresholds.parquet`) and `thr_heldout` (the held-out threshold of
+   `_obis_range_constraint.qmd`, scorecard table `og_thr`) go into `model_og.csv`. Values stay
+   continuous; a footprint option (like AquaX's cutoff) can use them later.
+3. **The ingest does not depend on `TURTLE_SUIT`.** The dataset must exist for the control (`am`) and
+   the treatment (`ogm`) alike; the flag acts in `merge_models_prep` / `merge_models`.
+4. **No COGs and no supersession here.** `publish_native.qmd` paints and keys the COGs; which dataset
+   a merge uses for a taxon is the merge's job.
+5. **Acceptance gate (a proposal).** The ensemble's evaluation AUC / TSS per species are printed against
+   `OG_AUC_MIN` (0.80) and `OG_TSS_MIN` (0.60); a species below is **warned about, not stopped**. The floor
+   is one of the three decisions the plan leaves open.
+
+Species: env `OG_SPECIES` (comma-separated AphiaIDs), default the six sea turtles — loggerhead 137205, green
+137206, hawksbill 137207, Kemp's ridley 137208, leatherback 137209, olive ridley 220293. The North
+Atlantic right whale (159023) is plan item D9b: **not** in the default, but allowed when named. Other
+env: `REDO_INGEST` (rebuild `dist/dataset=og/`), `OG_DIR` (default `~/_big/sdm/og`), `OG_SCORECARD`
+(default `~/_big/sdm/scorecard/ogm.duckdb`), `OG_AUC_MIN`, `OG_TSS_MIN`. Runs on the **laptop / Mac mini**
+(the only hosts with the TIFs).
+
+## Design
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "Fitted ensemble COGs (already on the grid) → per-species Parquet by pixel position; thresholds and evaluation metrics recorded beside"
+flowchart LR
+  tif["~/_big/sdm/og/taxonid={id}/model=ogm/predictions/<br/>…ensemble_scen=current_cog.tif<br/>Byte 0–100 · NoData 255"] --> pos["cells_from_aligned_raster<br/>cell_id = pixel index (asserted) · val ≥ 1"]
+  pos --> pq[("dist/dataset=og/{AphiaID}.parquet<br/>(mdl_key, cell_id, val)")]
+  thr["what=thresholds.parquet (P10)<br/>scorecard og_thr (held-out)"] --> csv
+  cv["data/og/cv_metrics.csv<br/>what=manifest.json · what=log.json"] --> csv["model_og.csv<br/>og|{AphiaID} · thr_p10 · thr_heldout · AUC/CBI/TSS · n_fit"]
+  csv --> gate["acceptance gate<br/>OG_AUC_MIN · OG_TSS_MIN (warn)"]
+  pq --> mf["hash_parquet → content-addressed manifest"]
+```
+
+## Setup
+
+```{r}
+#| label: setup
+
+librarian::shelf(
+  arrow, DBI, dplyr, duckdb, fs, glue, here, jsonlite, knitr, logger, purrr, readr,
+  stringr, terra, tibble, tidyr, MarineSensitivity/msens, quiet = TRUE)
+source(here("libs/paths.R"))   # ver, ver_prev, dir_big, dir_big_v, cellid_tif, spp_db
+source(here("libs/vars.R"))    # redo_ingest
+options(readr.show_col_types = FALSE)
+
+ds_key    <- "og"
+threshold <- 1        # keep val >= 1 (probability x 100), as every suitability ingest does
+dir_atlas <- glue("{dir_big_v}/marine-atlas")
+dir_dist  <- glue("{dir_atlas}/dist/dataset={ds_key}")
+mdl_csv   <- glue("{dir_atlas}/dist/model_{ds_key}.csv")
+manifest  <- here("data/manifests/ingest_og.json")
+cv_csv    <- here("data/og/cv_metrics.csv")
+
+# og-specific inputs and the acceptance floor (read here: the other ingests' flags live in libs/vars.R)
+og_dir      <- path.expand(Sys.getenv("OG_DIR", "~/_big/sdm/og"))
+og_card_db  <- path.expand(Sys.getenv("OG_SCORECARD", "~/_big/sdm/scorecard/ogm.duckdb"))
+og_acro     <- "ogm"                                                  # the model scored (basevars + METHOD predictors, as the scorecard)
+og_auc_min  <- as.numeric(Sys.getenv("OG_AUC_MIN", "0.80"))
+og_tss_min  <- as.numeric(Sys.getenv("OG_TSS_MIN", "0.60"))
+og_turtles  <- c(137205, 137206, 137207, 137208, 137209, 220293)      # loggerhead, green, hawksbill, Kemp's, leatherback, olive ridley
+og_ids      <- Sys.getenv("OG_SPECIES", paste(og_turtles, collapse = ",")) |>
+  str_split_1(",") |> str_trim() |> discard(\(x) !nzchar(x))
+stopifnot("OG_SPECIES must be numeric AphiaIDs" = all(str_detect(og_ids, "^[0-9]+$")), !anyDuplicated(og_ids))
+
+must <- function(cond, msg) if (!isTRUE(cond)) stop(msg, call. = FALSE)   # stopifnot with a glue()d message
+f_mod <- function(id, what = "predictions", pattern) {                # one file of a species' model folder
+  d <- glue("{og_dir}/taxonid={id}/model={og_acro}/{what}")
+  if (what == ".") d <- glue("{og_dir}/taxonid={id}/model={og_acro}")
+  hit <- dir_ls(d, regexp = pattern)
+  must(length(hit) == 1, glue("exactly one file for taxon {id} matching {pattern} in {d} (found {length(hit)})"))
+  as.character(hit)
+}
+tif_of <- \(id) f_mod(id, "predictions", "method=ensemble_scen=current_cog\\.tif$")
+
+dir_create(c(dir_dist, path_dir(manifest), path_dir(mdl_csv)))
+stopifnot(
+  "OBIS-method model folder missing (laptop / Mac mini input)" = dir_exists(og_dir),
+  "scorecard db (held-out thresholds) missing"                 = file_exists(og_card_db),
+  "cv_metrics.csv missing"                                     = file_exists(cv_csv),
+  "run build_cell_grid.qmd first (need cellid_tif)"            = file_exists(cellid_tif),
+  "spp.duckdb (WoRMS) missing"                                 = file_exists(spp_db))
+if (redo_ingest && dir_exists(dir_dist)) { dir_delete(dir_dist); dir_create(dir_dist) }
+
+# a leftover Parquet of a species that was NOT asked for would be hashed into the manifest and read by
+# merge_models_prep as part of `og` -- stop rather than silently include (name it, or REDO_INGEST=1)
+on_disk <- dir_ls(dir_dist, glob = "*.parquet") |> path_file() |> path_ext_remove()
+must(length(setdiff(on_disk, og_ids)) == 0,
+     glue("dist/dataset=og holds species not in OG_SPECIES ({paste(setdiff(on_disk, og_ids), collapse = ', ')}): add them to OG_SPECIES or REDO_INGEST=1"))
+log_info("og ingest: {length(og_ids)} species ({paste(og_ids, collapse = ', ')}); thresholds recorded, not applied; gate AUC>={og_auc_min} TSS>={og_tss_min}")
+```
+
+## Source inventory + the position-map premise
+
+```{r}
+#| label: inventory
+
+rc       <- rast(cellid_tif)
+cell_ids <- values(rc, mat = FALSE)                                    # read ONCE (100 MB); reused below
+stopifnot(
+  "cell-id COG is not 7200 x 3600" = ncell(rc) == 7200 * 3600,
+  "cell_id != pixel index on this grid — the position map does not hold" =
+    all(cell_ids[!is.na(cell_ids)] == which(!is.na(cell_ids))))
+
+inv <- map_dfr(og_ids, function(id) {
+  f <- tif_of(id); r <- rast(f)
+  g <- describe(f)
+  must(identical(names(r), c("current", "current_sd")), glue("{id}: bands are not (current, current_sd)"))
+  must(compareGeom(r, rc, stopOnError = FALSE, tolerance = 1e-3), glue("{id}: not the global05 grid (compareGeom vs cellid_tif)"))
+  must(ncell(r) == 7200 * 3600, glue("{id}: ncell != 7200 x 3600"))
+  must(any(str_detect(g, "Band 1 .*Type=Byte")), glue("{id}: band 1 is not Byte"))
+  must(sum(str_detect(g, "NoData Value=255")) >= 1, glue("{id}: NoData is not 255"))
+  v <- values(r[[1]], mat = FALSE)                                     # GDAL NoData 255 -> NA on read
+  must(all(v[!is.na(v)] >= 0 & v[!is.na(v)] <= 100), glue("{id}: band 1 outside [0,100]"))
+  tibble(sp_id = id, tif = f,
+         n_px = length(v), n_nodata = sum(is.na(v)), pct_nodata = round(100 * mean(is.na(v)), 1),
+         n_zero = sum(v == 0, na.rm = TRUE), n_ge1 = sum(v >= threshold, na.rm = TRUE),
+         n_ge1_no_cellid = sum(!is.na(v) & v >= threshold & is.na(cell_ids)),
+         src_max = max(v, na.rm = TRUE))
+})
+stopifnot("cells with val >= 1 but no cell_id (land / off-grid) — the position map drops them" = all(inv$n_ge1_no_cellid == 0))
+kable(inv |> select(-tif), format.args = list(big.mark = ","),
+      caption = "Source TIFs: NoData share (land), pixels at 0 (absent from the Parquet) and pixels >= 1 (what is ingested)")
+log_info("position map holds: cell_id == index on all {sum(!is.na(cell_ids))} cells; {nrow(inv)} TIFs on global05")
+```
+
+## Species crosswalk → `model_og.csv`
+
+`mdl_key = og|{AphiaID}`, `worms_id = AphiaID` (used directly by `merge_models_prep`, no
+`match_taxa`). Taxonomy from the WoRMS snapshot; `sp_cat` from `msens::sp_cat_from_taxonomy()` with
+`is_turtle` = WoRMS order *Testudines* (WoRMS leaves the turtles' class empty). Thresholds are
+the model's own: `thr_p10` = the ensemble's training P10 (`what=thresholds.parquet`, × 100) and
+`thr_heldout` = the held-out threshold of the scorecard (`og_thr`, [0,100]). Evaluation metrics are the
+ensemble's, from `data/og/cv_metrics.csv` (`origin = eval`: the held-out evaluation records; `cv`:
+cross-validation).
+
+```{r}
+#| label: crosswalk
+
+# WoRMS taxonomy (+ the AlgaeBase supplement is irrelevant here: animals only)
+con_spp <- dbConnect(duckdb(spp_db, read_only = TRUE))
+duckdb_register(con_spp, "og_ids", tibble(worms_id = og_ids))
+worms_tax <- dbGetQuery(con_spp, "
+  SELECT CAST(w.scientificNameID AS VARCHAR) AS worms_id, w.scientificName AS scientific_name,
+         w.kingdom, w.phylum, w.\"class\" AS cls, w.\"order\" AS ord, w.family
+  FROM worms w JOIN og_ids a ON CAST(w.scientificNameID AS VARCHAR) = a.worms_id") |>
+  distinct(worms_id, .keep_all = TRUE)
+dbDisconnect(con_spp, shutdown = TRUE)
+stopifnot("an OG species is missing from the WoRMS snapshot" = all(og_ids %in% worms_tax$worms_id))
+
+# common names + the held-out and P10 thresholds from the scorecard db (read-only)
+con_card <- dbConnect(duckdb(og_card_db, read_only = TRUE))
+card_thr <- dbGetQuery(con_card, "SELECT CAST(taxon AS VARCHAR) AS sp_id, thr AS thr_heldout FROM og_thr")
+card_sp  <- dbGetQuery(con_card, "SELECT CAST(taxon AS VARCHAR) AS sp_id, common AS common_name, thr_p10 AS thr_p10_card FROM sc_species")
+dbDisconnect(con_card, shutdown = TRUE)
+stopifnot("scorecard og_thr lacks an OG species (was the scorecard rendered for these?)" = all(og_ids %in% card_thr$sp_id),
+          "scorecard sc_species lacks an OG species"                                       = all(og_ids %in% card_sp$sp_id))
+
+# per-species model metadata: the fit's log.json / manifest.json, thresholds.parquet
+meta <- map_dfr(og_ids, function(id) {
+  j  <- read_json(f_mod(id, ".", "what=log\\.json$"),      simplifyVector = TRUE)
+  mf <- read_json(f_mod(id, ".", "what=manifest\\.json$"), simplifyVector = TRUE)
+  th <- read_parquet(f_mod(id, "metrics", "what=thresholds\\.parquet$")) |> filter(model == "ensemble")
+  must(nrow(th) == 1, glue("{id}: thresholds.parquet lacks exactly one ensemble row"))
+  tibble(sp_id = id,
+         n_fit      = as.integer(j$model_fit_points),
+         n_eval_log = as.integer(j$model_eval_points),
+         algorithms = paste(mf$algorithms, collapse = ","),
+         algorithms_good = paste(j$model_good, collapse = ","),
+         bg_type    = mf$background$type,
+         bg_from    = mf$options$bg_from,
+         n_background = as.integer(mf$background$n_background),
+         hab_depth  = j$hab_depth,
+         fit_start  = mf$start, fit_end = mf$end,
+         mpaeu_sdm_sha = mf$git$mpaeu_sdm$sha, mpaeu_sdm_branch = mf$git$mpaeu_sdm$branch,
+         thr_p10    = th$p10 * 100)
+})
+
+# ensemble evaluation metrics (data/og/cv_metrics.csv): held-out evaluation records and cross-validation
+cv <- read_csv(cv_csv, col_types = cols(taxon = "c")) |>
+  filter(acro == og_acro, method == "ensemble", taxon %in% og_ids) |>
+  select(sp_id = taxon, origin, auc, cbi, tss = tss_p10, n_fit_cv = n_fit, n_eval) |>
+  pivot_wider(names_from = origin, values_from = c(auc, cbi, tss, n_eval),
+              names_glue = "{.value}_{origin}")
+stopifnot("cv_metrics.csv lacks an ensemble eval row for an OG species" = all(og_ids %in% cv$sp_id[!is.na(cv$auc_eval)]))
+
+model_og <- tibble(sp_id = og_ids, worms_id = og_ids) |>
+  mutate(mdl_key = msens::mdl_key_raw(ds_key, sp_id)) |>
+  left_join(worms_tax, by = "worms_id") |>
+  left_join(card_sp, by = "sp_id") |>
+  left_join(card_thr, by = "sp_id") |>
+  left_join(meta, by = "sp_id") |>
+  left_join(cv |> select(-n_fit_cv), by = "sp_id") |>
+  mutate(sp_cat = msens::sp_cat_from_taxonomy(cls, kingdom, is_botw = FALSE, is_turtle = ord %in% "Testudines"),
+         thr_p10 = round(thr_p10, 2), thr_heldout = round(thr_heldout, 2))
+stopifnot(
+  "n_fit in log.json differs from cv_metrics.csv" = all(model_og$n_fit == cv$n_fit_cv[match(model_og$sp_id, cv$sp_id)], na.rm = TRUE),
+  "thresholds.parquet P10 disagrees with the scorecard's (> 1 point)" = all(abs(model_og$thr_p10 - model_og$thr_p10_card) <= 1),
+  "no birds / non-animals expected" = all(model_og$sp_cat %in% c("turtle", "mammal")))
+if (any(!og_ids %in% og_turtles)) log_warn("non-turtle species in this run: {paste(setdiff(og_ids, og_turtles), collapse = ', ')} (D9b: right whale is opt-in)")
+kable(model_og |> transmute(mdl_key, scientific_name, common_name, sp_cat, n_fit, algorithms, bg_type, hab_depth,
+                            thr_p10, thr_heldout, auc_eval, cbi_eval, tss_eval, n_eval_eval),
+      caption = "og crosswalk: thresholds (recorded, not applied) and ensemble held-out evaluation metrics")
+```
+
+## TIF → Parquet (position map, resumable)
+
+```{r}
+#| label: ingest
+
+pq_of <- \(sp) glue("{dir_dist}/{sp}.parquet")
+todo  <- model_og |> select(sp_id, mdl_key) |> left_join(inv |> select(sp_id, tif), by = "sp_id")
+done  <- file_exists(pq_of(todo$sp_id))
+log_info("og: {sum(done)} done; ingesting {sum(!done)} of {nrow(todo)} species ...")
+
+t0 <- Sys.time()
+for (i in which(!done)) {
+  sp <- todo$sp_id[i]
+  # band 1 only; val = probability x 100 as delivered (scale 1), pixels < 1 dropped, NoData 255 -> NA
+  d  <- msens::cells_from_aligned_raster(rast(todo$tif[i], lyrs = 1), cell_ids, scale = 1, min_value = threshold)
+  # write to a temp name then rename: a crash mid-write must not leave a truncated file that a
+  # resumed run mistakes for done
+  tmp <- glue("{pq_of(sp)}.tmp")
+  msens::write_atlas_parquet(tibble(mdl_key = as.character(todo$mdl_key[i]), cell_id = d$cell_id, val = d$val), tmp)
+  file_move(tmp, pq_of(sp))
+  log_info("  {sp}: {nrow(d)} cells, val {min(d$val)}..{max(d$val)}")
+}
+log_info("ingest done in {round(as.numeric(Sys.time() - t0, units = 'mins'), 1)} min")
+```
+
+## Verify the surface
+
+```{r}
+#| label: verify
+
+con <- dbConnect(duckdb())
+q <- dbGetQuery(con, glue("
+  SELECT mdl_key, count(*) AS n_cells, min(val) AS val_min, max(val) AS val_max, round(avg(val), 2) AS val_mean,
+         min(cell_id) AS id_min, max(cell_id) AS id_max, count(DISTINCT cell_id) AS n_distinct
+  FROM read_parquet('{dir_dist}/*.parquet') GROUP BY mdl_key ORDER BY mdl_key"))
+chk <- model_og |> select(mdl_key, sp_id) |> left_join(inv |> select(sp_id, n_ge1), by = "sp_id") |> left_join(q, by = "mdl_key")
+stopifnot(
+  "a species has no Parquet rows"                                  = !any(is.na(chk$n_cells)),
+  "Parquet row count != source pixels >= 1 (per species)"          = all(chk$n_cells == chk$n_ge1),
+  "a cell_id is repeated within a species"                         = all(chk$n_distinct == chk$n_cells),
+  "val must be within [1, 100]"                                    = all(chk$val_min >= threshold & chk$val_max <= 100),
+  "cell_id outside the global05 grid"                              = all(chk$id_min >= 1 & chk$id_max <= 7200 * 3600),
+  "the Parquet holds a model that is not in OG_SPECIES"            = nrow(q) == nrow(model_og))
+kable(chk |> select(mdl_key, n_src_ge1 = n_ge1, n_cells, val_min, val_max, val_mean), format.args = list(big.mark = ","),
+      caption = "og model_cell surface: rows per species equal the source pixels >= 1")
+
+# ROUND TRIP, every species: re-rasterise the Parquet by pixel position and compare with the TIF.
+# Pixels >= 1 must come back with the same value; every other pixel (0 or NoData) must be absent.
+for (id in model_og$sp_id) {
+  v <- values(rast(inv$tif[inv$sp_id == id], lyrs = 1), mat = FALSE)
+  d <- dbGetQuery(con, glue("SELECT cell_id, val FROM read_parquet('{pq_of(id)}')"))
+  w <- rep(NA_real_, length(v)); w[d$cell_id] <- d$val                   # cell_id == pixel index (asserted above)
+  must(isTRUE(all.equal(w[!is.na(v) & v >= threshold], v[!is.na(v) & v >= threshold])),
+       glue("{id}: round-trip mismatch — Parquet re-rasterised != TIF band 1 where >= 1"))
+  must(all(is.na(w[is.na(v) | v < threshold])), glue("{id}: Parquet has cells where the TIF is 0 / NoData"))
+}
+log_info("round trip verified (Parquet == TIF band 1 where >= 1; absent elsewhere) on {nrow(model_og)} species")
+
+# the registry CSV: crosswalk + the measured surface
+model_og <- model_og |> left_join(chk |> select(mdl_key, n_cells, val_min, val_max, val_mean), by = "mdl_key") |>
+  left_join(inv |> select(sp_id, n_src_nodata = n_nodata, n_src_zero = n_zero), by = "sp_id")
+write_csv(model_og |> select(-thr_p10_card, -ord), mdl_csv)
+dbDisconnect(con, shutdown = TRUE)
+```
+
+## Acceptance gate (proposed floor)
+
+The plan leaves the floor open; this prints the ensemble's **held-out evaluation** AUC and TSS (at the
+training P10) beside `OG_AUC_MIN` = `r og_auc_min` and `OG_TSS_MIN` = `r og_tss_min` and **warns, does not stop**,
+on any species below. CBI and the cross-validation figures are shown for context (a species that passes on evaluation but fails on cross-validation is warned about separately). `n_eval` is small
+(about 11–24 held-out records per species), so a single metric is a coarse judge.
+
+```{r}
+#| label: gate
+
+gate <- model_og |>
+  transmute(mdl_key, common_name, n_fit, n_eval = n_eval_eval, auc_eval, cbi_eval, tss_eval, auc_cv, tss_cv,
+            pass_auc = !is.na(auc_eval) & auc_eval >= og_auc_min,
+            pass_tss = !is.na(tss_eval) & tss_eval >= og_tss_min,
+            pass = pass_auc & pass_tss,
+            pass_cv = !is.na(auc_cv) & !is.na(tss_cv) & auc_cv >= og_auc_min & tss_cv >= og_tss_min)   # context only: not part of the gate
+kable(gate, caption = glue("Ensemble evaluation metrics vs the proposed floor (AUC >= {og_auc_min}, TSS >= {og_tss_min})"))
+for (i in which(!gate$pass))
+  log_warn("{gate$mdl_key[i]} ({gate$common_name[i]}) is BELOW the proposed floor: eval AUC {gate$auc_eval[i]} (min {og_auc_min}), eval TSS {gate$tss_eval[i]} (min {og_tss_min})")
+# cross-validation is the harsher judge for a thinly fitted species (Kemp's ridley: 155 fit points); say so
+for (i in which(gate$pass & !gate$pass_cv))
+  log_warn("{gate$mdl_key[i]} ({gate$common_name[i]}) passes on held-out evaluation but its CROSS-VALIDATION is below the floor: AUC {gate$auc_cv[i]}, TSS {gate$tss_cv[i]} (n_fit {gate$n_fit[i]})")
+log_info("acceptance gate: {sum(gate$pass)} of {nrow(gate)} species at or above the proposed floor")
+```
+
+## Manifest
+
+```{r}
+#| label: manifest
+
+con <- dbConnect(duckdb())
+h <- msens::hash_parquet(glue("{dir_dist}/*.parquet"), con)
+dbDisconnect(con, shutdown = TRUE)
+by_sp <- \(col) setNames(as.list(model_og[[col]]), model_og$sp_id)
+msens::write_manifest(
+  manifest, target = "ingest_og", content_hash = h,
+  stats = list(ds_key = ds_key, ver = ver, species = model_og$sp_id, n_models = nrow(model_og),
+               n_cells_total = sum(model_og$n_cells), n_cells = by_sp("n_cells"),
+               val_min = by_sp("val_min"), val_max = by_sp("val_max"), min_value = threshold,
+               thr_p10 = by_sp("thr_p10"), thr_heldout = by_sp("thr_heldout"), thresholds_applied = FALSE,
+               auc_eval = by_sp("auc_eval"), cbi_eval = by_sp("cbi_eval"), tss_eval = by_sp("tss_eval"),
+               auc_cv = by_sp("auc_cv"), tss_cv = by_sp("tss_cv"), n_fit = by_sp("n_fit"),
+               gate_auc_min = og_auc_min, gate_tss_min = og_tss_min, n_below_gate = sum(!gate$pass)),
+  force = msens::force_target("ingest_og"))
+```

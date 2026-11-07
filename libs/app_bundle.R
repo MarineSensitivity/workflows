@@ -1506,8 +1506,9 @@ app_bundle_budgets <- function() {
     # share family triples the metric registry (41 -> 184 keys, every zone's `metrics` block with it) and
     # adds 15 cell layers (22 -> 37 tile columns; v8's largest tile was 213 KB, v10's 466 KB). Both scale
     # with the metric family a release carries, the same lesson zone_taxon taught below; the Atlas fetches
-    # one tile per inspected cell and boot.json once per load.
-    budget_bytes = as.integer(c(96, 1024, 25, 15, 512, 1024, 1024) * 1024),
+    # one tile per inspected cell and boot.json once per load. Cell tile 512 -> 640 KB on 2026-11-06: v11's
+    # component layers (COMPONENTS_V11) put its largest tile at 526,323 B.
+    budget_bytes = as.integer(c(96, 1024, 25, 15, 640, 1024, 1024) * 1024),
     stringsAsFactors = FALSE)
 }
 

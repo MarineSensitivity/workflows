@@ -24,6 +24,41 @@ this (and every redistributable) WoRMS download, so ~hundreds of algae used by o
 datasets are absent here — `merge_taxon.qmd` fills those on demand from the **WoRMS REST
 API** (`worrms::wm_record`) and caches them in `data/worms_taxonomy_supplement.csv`.
 
+## Two sources (v11 Q1): `WORMS_SOURCE`
+
+`WORMS_SOURCE=download` (the default, `libs/vars.R`) is everything above and below, unchanged: the monthly DwC-A.
+
+`WORMS_SOURCE=obisindicators` builds the same `worms` table from `worms_taxon.parquet` of the
+[obisindicators](https://github.com/marinebon/obisindicators) release `OBIS_H3_RELEASE` (default `v20261012`) —
+the WoRMS taxonomy that the OBIS store's `aphiaid`s were joined against, so every v11 record count and the
+taxonomy that classifies it come from one snapshot (`worms_version` in the release's `release.json`, recorded in
+the manifest). The parquet is a superset of the download (1.58 M taxa against 0.60 M; it carries the AlgaeBase
+taxa the license keeps out of the download, which makes `data/worms_taxonomy_supplement.csv` redundant) but
+has six columns, the download 26, so the rest are **derived or carried**, never invented:
+
+| column(s) of `worms` | from `worms_taxon.parquet` |
+|---|---|
+| `taxonID`, `acceptedNameUsageID`, `parentNameUsageID`, `scientificName`, `taxonRank`, `taxonomicStatus` | as is |
+| `scientificNameID` | `taxonID` (the download's LSID number is the AphiaID; equal for all 596,103 rows) |
+| `acceptedNameUsage`, `parentNameUsage` | the `scientificName` of the row `acceptedNameUsageID` / `parentNameUsageID` names |
+| `kingdom`, `phylum`, `class`, `order`, `family`, `genus`, `subgenus` | walking `parentNameUsageID` from the roots (`phylum` takes rank `Phylum` or `Phylum (Division)`, as the download does for algae, plants and fungi; a synonym takes its parent's classification) |
+| `specificEpithet`, `infraspecificEpithet` | the 2nd / 3rd word of the name without its `(Subgenus)`, for species and below |
+| `isMarine`, `isFreshwater`, `isTerrestrial`, `isExtinct`, `isBrackish` | **not in the parquet**: carried by `taxonID` from the last real DwC-A download (`worms_habitat`, captured from the `worms` table the first time this runs after a download); NULL for a taxon that download did not have |
+| `scientificNameAuthorship`, `nomenclaturalCode`, `nomenclaturalStatus` | **NULL** (not in the parquet; nothing in the pipeline reads them except a display column in `ingest_swfsc_cce.qmd`) |
+
+Measured against the 2026-07-01 download on the 596,077 taxa both hold (same 26 columns, order and types):
+kingdom, phylum and genus agree on 100.00 %, class and subgenus on 99.99 %, family on 99.74 %, order on 99.32 %
+(the differences are WoRMS reclassifications between July and October, e.g. Doridida → Nudibranchia,
+Perciformes → Acanthuriformes), `acceptedNameUsage` / `parentNameUsage` on 99.7 % / 99.9 %, `specificEpithet` on
+99.9 % and `infraspecificEpithet` on 97.6 %. 329 of the 1.58 M taxa have no Kingdom-rank ancestor.
+
+**The habitat flags are carried, not recomputed, and nothing live reads them from `spp.duckdb`:**
+`merge_taxon.qmd`'s `worms_is_marine` comes from `merge_models_prep.qmd` (the previous version's `taxon` table),
+and the only reader of `isExtinct` is a report table in `ingest_aquax.qmd`. 988,701 of the 1.58 M taxa carry NULL
+flags (the download never held them); of v10's 26,056 worms-authority taxa 372 are NULL-or-absent under the
+download and 372 under the parquet. The manifest records `habitat_flags_ver` (the download the flags come from) and
+`n_flags_null`; a fresh download (`WORMS_SOURCE=download`) refreshes `worms_habitat` the next time this runs.
+
 ## Design
 
 ```{mermaid}
@@ -42,20 +77,33 @@ flowchart LR
 #| label: setup
 
 librarian::shelf(DBI, dplyr, duckdb, fs, glue, here, jsonlite, logger, readr, stringr, quiet = T)
-source(here("libs/paths.R"))   # spp_db, dir_raw
+source(here("libs/paths.R"))   # spp_db, dir_raw, obis_h3_*
+source(here("libs/vars.R"))    # worms_source: "download" (default) | "obisindicators" (v11 Q1)
 manifest <- here("data/manifests/ingest_worms.json"); dir_create(path_dir(manifest))
 redo     <- nzchar(Sys.getenv("REDO_WORMS"))
 
-# newest WoRMS_download_<date> folder holding the DwC-A core + speciesprofile
-dl_root <- glue("{dir_raw}/marinespecies.org")
-dls <- dir_ls(dl_root, type = "directory", regexp = "WoRMS_download_\\d{4}-\\d{2}-\\d{2}$")
-stopifnot("no WoRMS_download_<date> folder found" = length(dls) > 0)
-dl_dir   <- dls[order(path_file(dls))] |> tail(1)                    # latest by name (date)
-worms_ver <- str_extract(path_file(dl_dir), "\\d{4}-\\d{2}-\\d{2}")
-taxon_txt <- glue("{dl_dir}/taxon.txt")
-sprof_txt <- glue("{dl_dir}/speciesprofile.txt")
-stopifnot(all(file_exists(c(taxon_txt, sprof_txt))))
-log_info("latest WoRMS download: {path_file(dl_dir)} (version {worms_ver})")
+if (worms_source == "download") {
+  # newest WoRMS_download_<date> folder holding the DwC-A core + speciesprofile
+  dl_root <- glue("{dir_raw}/marinespecies.org")
+  dls <- dir_ls(dl_root, type = "directory", regexp = "WoRMS_download_\\d{4}-\\d{2}-\\d{2}$")
+  stopifnot("no WoRMS_download_<date> folder found" = length(dls) > 0)
+  dl_dir   <- dls[order(path_file(dls))] |> tail(1)                    # latest by name (date)
+  worms_ver <- str_extract(path_file(dl_dir), "\\d{4}-\\d{2}-\\d{2}")
+  taxon_txt <- glue("{dl_dir}/taxon.txt")
+  sprof_txt <- glue("{dl_dir}/speciesprofile.txt")
+  stopifnot(all(file_exists(c(taxon_txt, sprof_txt))))
+  src_label <- path_file(dl_dir)                                       # what worms_meta.source records
+  log_info("latest WoRMS download: {path_file(dl_dir)} (version {worms_ver})")
+} else {
+  # the WoRMS of an obisindicators release (OBIS_H3_RELEASE): local folder, else HTTPS
+  source(here("libs/obis_h3.R"))
+  info      <- obis_h3_info()
+  worms_ver <- info$worms_version
+  src_label <- glue("obisindicators:{info$release}")
+  wt_src    <- obis_h3_src("worms_taxon.parquet")
+  log_info("WoRMS {worms_ver} from obisindicators release {info$release} (OBIS {info$obis_snapshot}), ",
+           "{if (wt_src$remote) 'over HTTPS' else 'local folder'}")
+}
 ```
 
 ## Fetch a fresh monthly download (procedure)
@@ -94,9 +142,100 @@ con <- dbConnect(duckdb(spp_db))
 loaded <- tryCatch(
   dbGetQuery(con, "SELECT worms_ver FROM worms_meta ORDER BY built DESC LIMIT 1")$worms_ver,
   error = function(e) NA_character_)
+# the source too: the same version string from another source is not "already loaded"
+loaded_src <- tryCatch(
+  dbGetQuery(con, "SELECT source FROM worms_meta ORDER BY built DESC LIMIT 1")$source,
+  error = function(e) NA_character_)
+habitat <- list(ver = NA_character_, n_null = NA_integer_)   # obisindicators path only (see manifest)
 
-if (!redo && isTRUE(loaded == worms_ver) && "worms" %in% dbListTables(con)) {
-  log_info("worms table already at version {worms_ver}; skipping (REDO_WORMS=1 to force)")
+if (!redo && isTRUE(loaded == worms_ver) && isTRUE(loaded_src == src_label) && "worms" %in% dbListTables(con)) {
+  log_info("worms table already at version {worms_ver} ({src_label}); skipping (REDO_WORMS=1 to force)")
+} else if (worms_source == "obisindicators") {
+  # v11 Q1: the table from worms_taxon.parquet of the release. Same columns and types as the DwC-A build
+  # below; what the parquet lacks is derived (classification, names, epithets) or carried (habitat flags)
+  # -- see "Two sources" above
+  if (wt_src$remote) dbExecute(con, "INSTALL httpfs; LOAD httpfs;")
+  wt <- wt_src$path
+
+  # habitat flags are not in the parquet: keep them by taxonID from the last real DwC-A download.
+  # (Re)captured whenever the table in place was built from a download, so a fresh download refreshes them.
+  if (isTRUE(grepl("^WoRMS_download_", loaded_src)) && "worms" %in% dbListTables(con)) {
+    dbExecute(con, glue("
+      CREATE OR REPLACE TABLE worms_habitat AS
+      SELECT taxonID, isMarine, isFreshwater, isTerrestrial, isExtinct, isBrackish, '{loaded}' AS flags_ver
+      FROM worms"))
+    log_info("habitat flags captured from the {loaded_src} table (worms_habitat)")
+  }
+  if (!"worms_habitat" %in% dbListTables(con)) {
+    log_warn("no DwC-A download to take habitat flags from: isMarine & co will be NULL for every taxon, ",
+             "and merge_taxon reads coalesce(worms_is_marine, TRUE)")
+    dbExecute(con, "CREATE TABLE worms_habitat (taxonID BIGINT, isMarine BIGINT, isFreshwater BIGINT,
+                    isTerrestrial BIGINT, isExtinct BIGINT, isBrackish BIGINT, flags_ver VARCHAR)")
+  }
+
+  # classification: walk parentNameUsageID from the roots, carrying the nearest ancestor of each rank
+  anc <- function(col, ranks) {   # one ancestor column of the recursive step (class / order are SQL keywords: quoted)
+    inr <- paste0("'", ranks, "'", collapse = ", ")
+    glue("CASE WHEN c.taxonRank IN ({inr}) THEN c.scientificName ELSE p.\"{col}\" END AS \"{col}\"")
+  }
+  root <- function(col, ranks) {   # ... and of the anchor (the roots)
+    inr <- paste0("'", ranks, "'", collapse = ", ")
+    glue("CASE WHEN taxonRank IN ({inr}) THEN scientificName END AS \"{col}\"")
+  }
+  rk <- list(kingdom = "Kingdom", phylum = c("Phylum", "Phylum (Division)"), class = "Class",
+             order = "Order", family = "Family", genus = "Genus", subgenus = "Subgenus")
+  rk_root <- vapply(names(rk), \(k) as.character(root(k, rk[[k]])), "")
+  rk_anc  <- vapply(names(rk), \(k) as.character(anc(k, rk[[k]])), "")
+  nm_plain <- "regexp_replace(t.scientificName, '\\s*\\([^)]*\\)', '')"   # the name without its (Subgenus)
+  dbExecute(con, glue("
+    CREATE OR REPLACE TABLE worms AS
+    WITH RECURSIVE
+    t AS (SELECT taxonID, parentNameUsageID, acceptedNameUsageID, scientificName, taxonRank, taxonomicStatus
+          FROM read_parquet('{wt}')),
+    tr AS (
+      SELECT taxonID, {paste(rk_root, collapse = ', ')}, 0 AS depth
+      FROM t WHERE parentNameUsageID IS NULL
+      UNION ALL
+      SELECT c.taxonID, {paste(rk_anc, collapse = ', ')}, p.depth + 1
+      FROM t c JOIN tr p ON c.parentNameUsageID = p.taxonID WHERE p.depth < 60)
+    SELECT
+      t.taxonID,
+      t.taxonID                       AS scientificNameID,   -- the AphiaID; the DwC-A's LSID number is the same
+      t.acceptedNameUsageID,
+      t.parentNameUsageID,
+      t.scientificName,
+      a.scientificName                AS acceptedNameUsage,
+      pa.scientificName               AS parentNameUsage,
+      tr.kingdom, tr.phylum, tr.\"class\", tr.\"order\", tr.family, tr.genus, tr.subgenus,
+      CASE WHEN t.taxonRank IN ('Species','Subspecies','Variety','Forma','Subvariety','Subforma')
+           THEN nullif(split_part({nm_plain}, ' ', 2), '') END AS specificEpithet,
+      CASE WHEN t.taxonRank IN ('Subspecies','Variety','Forma','Subvariety','Subforma')
+           THEN nullif(split_part({nm_plain}, ' ', 3), '') END AS infraspecificEpithet,
+      t.taxonRank,
+      NULL::VARCHAR                   AS scientificNameAuthorship,
+      NULL::VARCHAR                   AS nomenclaturalCode,
+      t.taxonomicStatus,
+      NULL::VARCHAR                   AS nomenclaturalStatus,
+      h.isMarine, h.isFreshwater, h.isTerrestrial, h.isExtinct, h.isBrackish
+    FROM t
+    LEFT JOIN tr ON tr.taxonID = t.taxonID
+    LEFT JOIN t a  ON a.taxonID  = t.acceptedNameUsageID
+    LEFT JOIN t pa ON pa.taxonID = t.parentNameUsageID
+    LEFT JOIN worms_habitat h ON h.taxonID = t.taxonID"))
+  n_t  <- dbGetQuery(con, glue("SELECT count(*) n FROM read_parquet('{wt}')"))$n
+  n_w  <- dbGetQuery(con, "SELECT count(*) n FROM worms")$n
+  stopifnot("worms lost or duplicated taxa in the join chain" = n_w == n_t)
+  n_nokingdom <- dbGetQuery(con, "SELECT count(*) n FROM worms WHERE kingdom IS NULL")$n
+  habitat$ver    <- dbGetQuery(con, "SELECT max(flags_ver) v FROM worms_habitat")$v
+  habitat$n_null <- dbGetQuery(con, "SELECT count(*) n FROM worms WHERE isMarine IS NULL")$n
+  log_info("worms from obisindicators: {n_w} taxa; {n_nokingdom} without a kingdom (orphans / unclassified); ",
+           "habitat flags from download {ifelse(is.na(habitat$ver), 'NONE', habitat$ver)}, {habitat$n_null} taxa without isMarine")
+
+  for (ix in c("taxonID", "scientificNameID", "acceptedNameUsageID", "scientificName"))
+    try(dbExecute(con, glue("CREATE INDEX worms_{ix}_idx ON worms ({ix})")), silent = TRUE)
+  dbExecute(con, "CREATE TABLE IF NOT EXISTS worms_meta (worms_ver VARCHAR, n_rows BIGINT, source VARCHAR, built TIMESTAMP)")
+  dbExecute(con, glue("INSERT INTO worms_meta VALUES ('{worms_ver}', {n_w}, '{src_label}', now())"))
+  log_info("rebuilt worms: {n_w} rows from {src_label}")
 } else {
   strip <- function(col) glue(
     "TRY_CAST(regexp_replace({col}, 'urn:lsid:marinespecies.org:taxname:', '') AS BIGINT)")
@@ -127,8 +266,8 @@ if (!redo && isTRUE(loaded == worms_ver) && "worms" %in% dbListTables(con)) {
 
   n <- dbGetQuery(con, "SELECT count(*) n FROM worms")$n
   dbExecute(con, "CREATE TABLE IF NOT EXISTS worms_meta (worms_ver VARCHAR, n_rows BIGINT, source VARCHAR, built TIMESTAMP)")
-  dbExecute(con, glue("INSERT INTO worms_meta VALUES ('{worms_ver}', {n}, '{path_file(dl_dir)}', now())"))
-  log_info("rebuilt worms: {n} rows from {path_file(dl_dir)}")
+  dbExecute(con, glue("INSERT INTO worms_meta VALUES ('{worms_ver}', {n}, '{src_label}', now())"))
+  log_info("rebuilt worms: {n} rows from {src_label}")
 }
 ```
 
@@ -145,7 +284,11 @@ msens::report_table(smry, caption = "worms taxonomy table summary")
 knitr::kable(dbGetQuery(con, "SELECT kingdom, count(*) n FROM worms GROUP BY 1 ORDER BY n DESC LIMIT 8"))
 # AlgaeBase check: these should be ABSENT here (filled by the WoRMS API in merge_taxon)
 alg <- dbGetQuery(con, "SELECT count(*) n FROM worms WHERE scientificName IN ('Caulerpa sertularioides','Ulva intestinalis')")$n
-log_info("AlgaeBase spot-check (expect 0, filled via API): {alg}")
+if (worms_source == "download") {
+  log_info("AlgaeBase spot-check (expect 0, filled via API): {alg}")
+} else {
+  log_info("AlgaeBase spot-check (expect 2: the obisindicators WoRMS carries them, the supplement CSV is redundant): {alg}")
+}
 # content fingerprint of the worms table (before disconnect)
 h <- msens::hash_query(con, "worms")
 dbDisconnect(con, shutdown = TRUE)
@@ -158,10 +301,14 @@ dbDisconnect(con, shutdown = TRUE)
 
 # content-addressed manifest: deterministic (no wall-clock) -> downstream targets
 # re-run only when the worms table's content actually changes
+stats <- list(worms_ver = worms_ver, source = src_label,
+              n_rows = smry$n_rows, n_marine = smry$n_marine)
+if (worms_source != "download")   # the download path's manifest keeps exactly its four fields
+  stats <- c(stats, list(worms_source = worms_source, obis_release = info$release, obis_snapshot = info$obis_snapshot,
+                         habitat_flags_ver = habitat$ver, n_flags_null = habitat$n_null))
 msens::write_manifest(
   manifest, target = "ingest_worms", content_hash = h,
-  stats = list(worms_ver = worms_ver, source = path_file(dl_dir),
-               n_rows = smry$n_rows, n_marine = smry$n_marine),
+  stats = stats,
   force = msens::force_target("ingest_worms"))
 manifest
 ```
