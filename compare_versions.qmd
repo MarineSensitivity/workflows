@@ -27,11 +27,19 @@ editor_options:
 > `msens/tests/testthat/test-validate.R` and can't drift from what's reported here.
 >
 > ```r
-> # render with version suffixes in the output filename (see scripts/render_compare.R):
+> # render ONE pair, with the versions in the output filename (see scripts/render_compare.R):
 > source("scripts/render_compare.R"); render_compare("v6", "v9")   # -> _output/compare_versions_v6_vs_v9.html
 > # or from the shell:
 > Rscript scripts/render_compare.R v6 v9
+> # render every registered pair (data/compare_pairs.csv) that is missing, then rebuild the archive index:
+> Rscript scripts/render_compare_sequence.R            # add --redo to re-render them all, or name pairs: v10:v11
 > ```
+>
+> A bare `quarto render compare_versions.qmd` **stops**: its output would be the unversioned
+> `compare_versions.html`, which is the **archive index** of every rendered pair
+> (`scripts/build_compare_index.R`), and a report there is overwritten by the next version bump.
+> The release lineage the archive follows (v7 → v8 → v10 → v11, and the v7 patches) is
+> `data/compare_pairs.csv`.
 >
 > **What is compared.** Scores on each release's **principal reporting unit** — the 20 BOEM
 > **Program Areas** (v2 onward) or, for a release that scored none, the 36 **Planning Areas** (v1).
@@ -58,6 +66,13 @@ va <- params$version_a
 vb <- params$version_b
 mk <- params$metric_key
 stopifnot(va != vb)
+
+# the output must name its two versions: scripts/render_compare.R sets MSENS_COMPARE_OUT to the
+# versioned filename before rendering; an unversioned render would overwrite the archive index
+out_expected <- glue("compare_versions_{va}_vs_{vb}.html")
+if (!identical(Sys.getenv("MSENS_COMPARE_OUT"), as.character(out_expected)))
+  stop(glue("render through scripts/render_compare.R ({va} vs {vb} -> _output/{out_expected}); ",
+            "a bare `quarto render compare_versions.qmd` would overwrite the archive index _output/compare_versions.html"))
 
 # resolve each version's sdm.duckdb by swapping the version segment of the configured path
 sdm_for <- function(v) sub(glue("/{ver}/"), glue("/{v}/"), path.expand(sdm_db))
@@ -556,6 +571,33 @@ headline; `usa` = its US slice; `pooled`), with the companion **percent of the w
 a category with too little coverage in a Program Area is **not reportable** (no row, never zero — the
 floor). This section runs only when version B carries `{r} params$metric_key_v10`.
 
+### How the national score is built {.unnumbered}
+
+The rule is `msens::share_sql()` (unit-tested in `test-share.R`); in words, for each scored species *s*
+and category *g*:
+
+1. **Value × area.** Each cell's merged value (0–100) times its area: how much of the species' habitat
+   the cell holds.
+2. **Divide by the denominator** (below): the species' total, so its cells sum to a fixed amount.
+3. **Weight by extinction risk** and **sum over the species of the category** in the Program Area.
+4. **Per km², against the nation.** Divide the area's total by the nation's, and by the area's share
+   of the national area: **100 = the national-average concentration**; 200 = twice its fair share.
+5. A category whose scored cells cover less than κ = 5 % of the area is **not reportable** (absent,
+   never zero). The **composite** is the equal-weight mean of the reportable categories, productivity
+   included.
+
+**The three denominators** change only step 2, i.e. *how much each species can contribute in total*:
+
+| denominator | each species is divided by | so a species counts | reads as |
+|---|---|---|---|
+| `global` (headline) | its total over its **whole modelled range**, worldwide | in proportion to the **fraction of its range in US waters** (× risk): a US-centred species counts fully, a species mostly elsewhere counts little | "how much of each species' *world* distribution is here" |
+| `usa` | its total over **US waters** only | **the same** for every species nationally (× risk), however widespread | "how much of each species' *US* distribution is here"; areas add to 100 % of the nation |
+| `pooled` | **nothing**: no per-species normalization | in proportion to its **habitat area × value**: widespread species dominate, narrow-range species weigh little | "how much habitat is here"; the RESA 1 arithmetic (value × area, then a percent of the national total) |
+
+*Example.* A species found only in Cook Inlet gives Cook Inlet 100 % of its weight under `usa`. Under
+`global` that weight shrinks by the part of its range outside the US. Under `pooled` it counts only by its
+habitat area, so a small range adds little. Where the three agree, the choice does not matter for that area.
+
 ```{r}
 #| label: v10-setup
 
@@ -773,10 +815,14 @@ if (has_v10) {
 
 ### The three denominators
 
-The same composite under the three denominators, one row per Program Area sorted by the global
-headline. Where the three dots coincide the denominator does not matter; where they spread, the
-answer depends on whether the species' range is read as the world, the US slice, or pooled. The
-dashed line is 100, the national average.
+The same composite under the three denominators (defined in [How the national score is
+built](#how-the-national-score-is-built)), one row per Program Area sorted by the global headline.
+Where the three dots coincide the denominator does not matter; where they spread, the answer depends
+on whether each species is weighed by its share of its **world** range (`global`), of its **US** range
+(`usa`), or by its raw **habitat area** (`pooled`). All three are relative to the national average, so a spread
+says how an area's species differ from the nation's mix: higher under `global` than under `usa` = its
+species are more US-centred than most; higher under `global` than under `pooled` = more of its weight
+comes from narrow-range species. The dashed line is 100, the national average.
 
 ```{r}
 #| label: v10-denominators
@@ -795,7 +841,8 @@ if (has_v10) {
     geom_vline(xintercept = 100, linetype = "dashed", linewidth = 0.4) +
     geom_point(size = 2.6, na.rm = TRUE) +
     scale_colour_manual(values = pal) +
-    labs(x = "v10 composite  (100 = national average)", y = NULL, colour = "denominator",
+    labs(x = glue("{vb} national composite  (100 = national average{if (all(den$score > 0, na.rm = TRUE)) '; log scale' else ''})"),
+         y = NULL, colour = "denominator",
          title = glue("Across-the-nation composite under three denominators ({vb})")) +
     theme_minimal(base_size = 12) + theme(legend.position = "top")
   # log axis when every score is positive (a concentration index spans orders of magnitude)
@@ -817,23 +864,52 @@ if (has_v10 && DBI::dbExistsTable(con_b, "release_method")) {
 } else if (has_v10) cat(glue("`{vb}` has no `release_method` table.\n"))
 ```
 
-## v11 attribution: which flag moved which score
+## Attribution: which flag moved which score
 
-v11 changes the method in eight independent ways, each a flag in `libs/vars.R` (`vgpm_integrated`,
-`turtle_suit`, `turtle_rule`, `occ_rule`, `region_weight`, `fold_density`, `components_v11`,
-`nc_atl_source`). The **control** run has every flag at its v10 value (so it reproduces v10); the
-**candidate** has every flag on. Each other run is the candidate with **one** flag back at its control
-value (`no_<flag>`, and `nc_atl_2018` for the Atlantic bird source), so the candidate minus that run is what
-the flag owns. `scripts/attribution_runs.sh` makes the runs and `snapshot_scores.qmd` writes each run's
-zone scores to `data/v11/attribution/{variant}.parquet`; this section reads whatever of that set exists,
-says which runs are missing, and computes every number below from the files. It reads no `sdm.duckdb`.
+This section runs only when version B has an attribution set (`data/{vb}/attribution/`, today only
+v11) **and** version A is B's `prev` in `data/versions.csv`, since the attribution's control run reproduces
+that release (v11's control reproduces v10).
+
+v11 changes the method in eight independent ways, each a flag in `libs/vars.R`. The **control** run has
+every flag at its v10 value (so it reproduces v10); the **candidate** has every flag on. Each other run is
+the candidate with **one** flag back at its control value (`no_<flag>`, and `nc_atl_2018` for the Atlantic
+bird source), so the candidate minus that run is what the flag owns. Three settings were decided **after**
+the candidate and are shown as steps of their own in [After the candidate](#after-the-candidate-single-counting-and-the-range-fill).
+`scripts/attribution_runs.sh` makes the runs and `snapshot_scores.qmd` writes each run's zone scores to
+`data/v11/attribution/{variant}.parquet`; this section reads whatever of that set exists, says which runs
+are missing, and computes every number below from the files. It reads no `sdm.duckdb`.
+
+**What each flag means**
+
+| flag | off (v10) | on (v11) |
+|---|---|---|
+| `vgpm_integrated` | productivity = mean of the months with a satellite retrieval, which over-weights the Arctic summer | productivity **integrated over all 12 months**, a month without a retrieval (polar night, ice) counting 0 |
+| `turtle_suit` | sea-turtle suitability from AquaMaps | from **our own turtle models** (`og`, the OBIS / MPA Europe method on the global grid) |
+| `turtle_rule` | turtles merged multiplicatively (risk × suitability, v4b rule) | turtles merged by the **DPS rule**: suitability inside the risk footprint, the per-cell risk kept beside it and multiplied in at scoring |
+| `occ_rule` | no occurrence gate | the occurrence **gate**: a species is **dropped** from an ecoregion with **no OBIS record** under adequate search effort (critical habitat, core areas, narrow-range species and unsearched ecoregions excepted) |
+| `region_weight` | no weight | the occurrence **weight**: where a species is recorded but rarely, its value is multiplied by its record rate there over its rate elsewhere (0 < w < 1) |
+| `fold_density` | survey density models catalogued, not scored | survey densities (Gulf cetaceans `gm`, NCCOS seabirds `nc`, California Current cetaceans `cce`), put on the 0–100 scale by their population percentile, **replace suitability inside their survey domain** |
+| `components_v11` | labels "primary producers", "primary productivity" | labels **Flora**, **Productivity** (no score change) |
+| `nc_atl_source` | Atlantic seabird models from 2018 | from the **2023** MDAT v3 models (BOEM 2023-060) |
+
+and, decided after the candidate:
+
+| setting | values | meaning |
+|---|---|---|
+| `share_basis` | `taxon` (v4–v10) / **`cell`** (v11) | **single counting.** Under `taxon` a range cell's merged value is the larger of the species' risk score and its suitability, and the score then multiplies by the risk again, so risk is counted **twice** (on a range-only cell, er²/100). Under `cell` a range cell carries the **suitability alone** and risk enters **once**, at scoring. |
+| `range_fill` | `er` / `presence` / **`mean`** (v11) | with `share_basis = cell`, the value of a **range cell no suitability model covers**: the species' risk score (`er`, which still counts risk twice on those cells), 100 (`presence`, the whole unmodelled range as full habitat), or the **mean of the species' modelled range cells** (`mean`; 100 when nothing models any of its range). |
+| `fold_density_cal` | `none` / `mass` / **`suit`** (v11) | how a folded-in survey is rescaled to the surface it replaces: not at all, preserving its total (`mass`), or matching the suitability's level (`suit`; scores within 0.1 of `mass`) |
 
 ```{r}
 #| label: v11-att-setup
 #| results: asis
 
 # the registry of variants and their single flag swaps is PARSED from the runner, so it cannot drift
-att_dir <- here::here("data/v11/attribution")
+att_dir <- here::here("data", vb, "attribution")
+vers_csv <- readr::read_csv(here::here("data/versions.csv"), show_col_types = FALSE)
+prev_b   <- vers_csv$prev[match(vb, vers_csv$ver)]
+att_ok   <- dir.exists(att_dir) && identical(prev_b, va)
+if (!att_ok) cat(glue("No attribution for {va} vs {vb} (needs `data/{vb}/attribution/` and `prev` of {vb} = {va}): the section is skipped.\n\n"))
 runs_sh <- readLines(here::here("scripts/attribution_runs.sh"), warn = FALSE)
 sh_get  <- function(key) sub(sprintf('^%s="([^"]*)".*$', key), "\\1", grep(sprintf('^%s="', key), runs_sh, value = TRUE))[1]   # a trailing comment is allowed
 kv      <- strsplit(strsplit(sh_get("FULL"), " ")[[1]], "=")
@@ -852,7 +928,7 @@ swaps <- tibble(variant = sapply(sw, `[`, 2), flag = tolower(sapply(sw, `[`, 3))
 comp_lab <- readr::read_csv(here::here("data/components.csv"), show_col_types = FALSE) |>
   select(stem = key, label, label_v10)
 
-att_files <- list.files(att_dir, "\\.parquet$", full.names = TRUE)
+att_files <- if (att_ok) list.files(att_dir, "\\.parquet$", full.names = TRUE) else character()
 att <- if (length(att_files)) bind_rows(lapply(att_files, arrow::read_parquet)) else tibble()
 flag_cols <- setdiff(names(att), c("ver", "variant", "zone_set_key", "zone_fld", "zone_value", "metric_key", "val"))
 # a snapshot taken before a flag existed lacks its column: that flag was at its control value then
@@ -868,8 +944,10 @@ if (nrow(att)) {
 present <- unique(att$variant)
 
 cand <- c("full2023", "full")[c("full2023", "full") %in% present][1]
-has_att <- length(present) > 0 && "control" %in% present && !is.na(cand)
-cand_note <- if (!has_att) {
+has_att <- att_ok && length(present) > 0 && "control" %in% present && !is.na(cand)
+cand_note <- if (!att_ok) {
+  ""
+} else if (!has_att) {
   "The attribution needs at least `control` and a candidate (`full2023` or `full`); the section is skipped."
 } else if (cand == "full") {
   "`full2023` (the candidate) is not yet snapshotted: every comparison below uses **`full`** (every flag on, the 2018 Atlantic bird source) as the candidate until it exists."
@@ -1067,10 +1145,100 @@ if (has_att && exists("ct") && nrow(ct)) {
 }
 ```
 
+### After the candidate: single counting and the range fill
+
+The candidate above still counts extinction risk the v4–v10 way. Three settings decided on 2026-11-02
+(see [What each flag means](#attribution-which-flag-moved-which-score)) take it to the published release,
+one step at a time:
+
+1. **single counting** where a suitability model covers the range cell (`share_basis = cell`), keeping the
+   risk score on unmodelled range cells (`range_fill = er`);
+2. **the mean fill**: an unmodelled range cell takes the mean of the species' modelled range cells
+   (`range_fill = mean`) instead of its risk score;
+3. **the survey calibration** on the suitability prior (`fold_density_cal = suit`): this gives the
+   published **v11**.
+
+`presence` (an unmodelled range cell = 100) was measured as the alternative to step 2 and is shown beside it.
+
+```{r}
+#| label: v11-att-steps-setup
+#| results: asis
+
+STEPS <- tibble(
+  variant = c(if (exists("cand")) cand else NA_character_, "full2023_basis_er", "full2023_basis_mean", "v11"),
+  step    = c("candidate", "1 single counting (er fill)", "2 mean fill", "3 calibration = v11"))
+alt_step <- tibble(variant = "full2023_basis", step = "alt: presence fill")
+has_steps <- has_att && all(STEPS$variant %in% present)
+if (has_att && !has_steps)
+  cat(glue("Steps missing from `data/{vb}/attribution/`: {paste(setdiff(STEPS$variant, present), collapse = ', ')}; the subsection is skipped.\n"))
+```
+
+```{r}
+#| label: v11-att-steps-summary
+#| results: asis
+
+if (has_steps) {
+  st <- bind_rows(STEPS, alt_step |> filter(variant %in% present))
+  prev_of <- c(setNames(STEPS$variant[-nrow(STEPS)], STEPS$variant[-1]), full2023_basis = "full2023_basis_er")
+  for (nm in names(mets)) {
+    mm <- mets[[nm]]
+    s_tab <- purrr::map_dfr(st$variant[-1], \(v) bind_cols(
+      tibble(step = st$step[st$variant == v], `from → to` = glue("{prev_of[[v]]} → {v}")),
+      delta_stats(vec(prev_of[[v]], mm), vec(v, mm)))) |>
+      bind_rows(bind_cols(tibble(step = "all steps", `from → to` = glue("{cand} → v11")), delta_stats(vec(cand, mm), vec("v11", mm))),
+                bind_cols(tibble(step = "whole change", `from → to` = glue("control ({va}) → v11")), delta_stats(vec("control", mm), vec("v11", mm)))) |>
+      mutate(across(c(`mean |Δ|`, `max |Δ|`), \(x) round(x, 2)), across(c(r, `Spearman ρ`), \(x) round(x, 3)))
+    print(knitr::kable(s_tab, caption = glue("{nm} composite: each step vs the one before it, over the Program Areas")))
+  }
+}
+```
+
+```{r}
+#| label: v11-att-steps-area
+
+if (has_steps) {
+  stp <- bind_rows(tibble(variant = "control", step = glue("control ({va})")), STEPS)
+  w <- purrr::map_dfc(seq_len(nrow(stp)), \(i) {
+    x <- vec(stp$variant[i], m_nat); tibble(!!stp$step[i] := unname(x[names(vec(cand, m_nat))]))
+  })
+  at <- bind_cols(tibble(`Program Area` = names(vec(cand, m_nat)), Name = area_nm(names(vec(cand, m_nat)))), w) |>
+    mutate(`Δ steps 1–3` = .data[["3 calibration = v11"]] - .data[["candidate"]],
+           `Δ control → v11` = .data[["3 calibration = v11"]] - .data[[glue("control ({va})")]]) |>
+    arrange(desc(.data[["3 calibration = v11"]]))
+  DT::datatable(at, rownames = FALSE, options = list(pageLength = 20, dom = "t", scrollX = TRUE),
+                caption = "National composite per Program Area at each step (100 = national average)") |>
+    DT::formatRound(setdiff(names(at), c("Program Area", "Name")), 1)
+}
+```
+
+```{r}
+#| label: v11-att-steps-fig
+#| fig-height: 7.5
+#| fig-width: 9
+
+if (has_steps) {
+  stp <- bind_rows(tibble(variant = "control", step = glue("control ({va})")), STEPS)
+  sp <- purrr::map_dfr(seq_len(nrow(stp)), \(i) {
+    x <- vec(stp$variant[i], m_nat); tibble(step = stp$step[i], area = names(x), score = unname(x))
+  }) |> mutate(area = factor(area, names(sort(vec("v11", m_nat)))), step = factor(step, stp$step))
+  pal_s <- setNames(c("grey55", "#000000", "#E69F00", "#56B4E9", "#D55E00"), stp$step)
+  shp_s <- setNames(c(21, 16, 16, 16, 18), stp$step)
+  ggplot(sp, aes(score, area)) +
+    geom_line(aes(group = area), colour = "grey80", linewidth = 0.5, na.rm = TRUE) +
+    geom_point(aes(colour = step, shape = step), size = 2.8, fill = "white", na.rm = TRUE) +
+    geom_vline(xintercept = 100, linetype = "dashed", linewidth = 0.4) +
+    scale_colour_manual(values = pal_s) + scale_shape_manual(values = shp_s) +
+    labs(x = glue("national composite {m_nat}  (100 = national average)"), y = NULL, colour = NULL, shape = NULL,
+         title = glue("Program Areas: control ({va}) → candidate → single counting → mean fill → v11")) +
+    theme_minimal(base_size = 11) + theme(legend.position = "top")
+}
+```
+
 ### The occurrence rule's reach
 
-The occurrence rule (`occ_rule`) gates a species out of an ecoregion where records are significantly and
-materially fewer than elsewhere; `region_weight` downweights it by its encounter weight `w` there.
+The occurrence rule (`occ_rule`) gates a species out of an ecoregion where it has **no OBIS record** under
+adequate search effort; where it is recorded but rarely, `region_weight` downweights it by its encounter weight
+`w` there (its record rate in the ecoregion over its rate elsewhere).
 `data/v11/zone_exclusions_occ.csv` holds the gated pairs and `data/v11/zone_weights_occ.csv` the weighted ones
 (a gated pair is `w = 0` there); both come from [the exploration notebook](explore_occurrence_rule.html).
 The denominator is each component's species count in the ecoregion (`extrisk_{category}_n_species`) of the run
@@ -1080,9 +1248,9 @@ without the rule, so the percentage is the share of the component's species ther
 #| label: v11-att-occ
 #| results: asis
 
-f_ex <- here::here("data/v11/zone_exclusions_occ.csv"); f_w <- here::here("data/v11/zone_weights_occ.csv")
-has_occ <- file.exists(f_ex) && file.exists(f_w)
-if (!has_occ) cat("The occurrence-rule CSVs are not on disk: this subsection is skipped.\n")
+f_ex <- here::here("data", vb, "zone_exclusions_occ.csv"); f_w <- here::here("data", vb, "zone_weights_occ.csv")
+has_occ <- has_att && file.exists(f_ex) && file.exists(f_w)
+if (has_att && !has_occ) cat("The occurrence-rule CSVs are not on disk: this subsection is skipped.\n")
 if (has_occ) {
   ex <- readr::read_csv(f_ex, show_col_types = FALSE)
   wt <- readr::read_csv(f_w,  show_col_types = FALSE)
@@ -1173,7 +1341,8 @@ if (has_att) {
     geom_vline(xintercept = 100, linetype = "dashed", linewidth = 0.4) +
     scale_colour_manual(values = pal, name = "candidate minus one flag") +
     labs(x = glue("national composite {m_nat}  (100 = national average)"), y = NULL,
-         title = glue("Program Areas: control (open), each single-flag run, candidate {cand} (black)")) +
+         title = glue("Program Areas: control (open), each single-flag run, candidate {cand} (black)"),
+         caption = "The candidate precedes single counting and the mean fill; see After the candidate for the steps to the published release.") +
     theme_minimal(base_size = 11) + theme(legend.position = "top")
 }
 ```
