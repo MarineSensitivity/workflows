@@ -274,7 +274,7 @@ registered), `TURTLE_SUIT_MIN` / `TURTLE_FILL` / `COVERAGE_FLOOR` / `REDO_BUILD=
 
 **The pre-release review gate (`preview.marinesensitivity.org`, 2026-08-15).** A release has
 `access` (`public` | `restricted`) beside `status` in `data/versions.csv` → `versions.json`; a
-`restricted` release (a pre-release under review by SDM providers / BOEM-NOAA colleagues) is
+`restricted` release (a pre-release under review by SDM providers / MMA-NOAA colleagues) is
 served ONLY through the signed-in preview host (Cloudflare Access in front, Caddy `jwtauth`
 verifying the Access JWT at the origin). Enforcement in the apps is by **process, not header**:
 Shiny Server OSS opens its own websocket to the R worker, so no proxy header reaches
@@ -624,6 +624,11 @@ and why one didn't.
 ## Gotchas
 
 - `value` is reserved → use `val`. `class`/`order` are reserved in DuckDB → quote (`"class"`).
+- **The agency is MMA** (Marine Minerals Administration; BOEM was reorganized into it in July 2026 — never
+  "renamed"). Present-tense prose says MMA ("MMA Program Areas", lowercase "MMA ecoregions"). BOEM stays
+  where it is history: report numbers (`BOEM 2023-060`), BOEM-published products and file names
+  (`ingest_boem-regions.qmd`, `BOEM_MASKED_*`), `boem.gov` links and addresses, and the notebooks under
+  `old/`, `dev/` and `final-report_2025*`. The full rule is in `../docs/CLAUDE.md`.
 - `library(msens)` can be **stale** — source `../msens/R/*.R` or reinstall after edits.
 - Idempotency: notebooks re-run cleanly (e.g. `merge_taxon` drops derived cols first; ingests skip
   done files). Don't rely on per-ingest table writes that can be silently dropped (the v8 registry
