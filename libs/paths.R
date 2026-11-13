@@ -49,6 +49,12 @@ cellid_tif <- glue::glue("{dir_derived}/r_cellid_global.tif")
 gm_shp_dir <- Sys.getenv("GM_SHP_DIR", unset = glue::glue(
   "{dir_raw}/sdm/gm/0256800/2.2/data/0-data/NOAA_SEFSC_Cetacean_SeaTurtle_SDM_shapefiles"))
 
+# NOAA SEFSC Gulf line-transect survey effort + marine-mammal sightings (vessel 2003-2024, aerial 2011-2018) and the
+# 40 km2 density-model hexagons, Lance Garrison's 2026-11-12 delivery (.rds + shapefiles + ReadMe), read by
+# ingest_sefsc_gm-surveys.qmd. Local under dir_raw (hydrated by scripts/pull_from_laptop.sh, `--drive`), not Google
+# Drive; SEFSC_SRC overrides.
+sefsc_src <- Sys.getenv("SEFSC_SRC", unset = glue::glue("{dir_raw}/sefsc.noaa.gov/2026-11-12"))
+
 # SWFSC Becker et al. (2020b) California Current cetacean densities: one Esri file geodatabase, 13 layers
 # (ingest_swfsc_cce.qmd). Local under dir_raw (hydrated by scripts/pull_from_laptop.sh), not Google Drive;
 # CCE_GDB overrides it.

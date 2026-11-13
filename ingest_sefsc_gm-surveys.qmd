@@ -1,0 +1,835 @@
+---
+title: "SEFSC Gulf survey effort, sightings and density models (OceanMetrics Atlas preview, `sefsc_gm` v2)"
+subtitle: "Vessel 2003–2024 and aerial 2011–2018 line-transect effort + marine-mammal sightings, and the 19 NCEI 0256800 v2.2 density models, on their one native 40 km² hexagon grid"
+msens:
+  target_name: ingest_sefsc_gm_surveys
+  workflow_type: publish
+  dependency: []
+  output: data/manifests/ingest_sefsc_gm_surveys.json
+editor_options:
+  chunk_output_type: console
+---
+
+Lance Garrison (NOAA SEFSC, Marine Mammal and Turtle Division) delivered on 2026-11-12 the broadscale **vessel**
+(2003–2024, including the 2023 and 2024 surveys) and **aerial** (2011–2018) line-transect survey effort and
+marine-mammal sightings in the Gulf that went into the GoMMAPPS spatial density models, together with the 40 km²
+model **hexagons**. This notebook prepares them, with the 19 density models of NCEI accession 0256800 v2.2 (the same
+hexagons, matched by `HEXID`), as the inputs of the OceanMetrics Atlas collection **`sefsc_gm` version 2**. That
+collection is unlisted and shared by link for review with the provider first. Version 1 is the MarineSensitivity
+v8 external collection (`?c=msens-v8-gm`, the annual densities as a 0–100 index on the 0.05° grid).
+
+This is a **preview input, not a MarineSensitivity dataset**: there is no `ds_key`, nothing is written under
+`dist/`, and the scored ingest `ingest_sdm-gm.qmd` is untouched. Its `workflow_type` is `publish`, so the release
+DAG's `[auto]` dependency never pulls it in. The atlas builder (`oceanmetrics/atlas`
+`pipeline/atlas_pipeline/sefsc_gm.py`) reads the output folder and refuses to stage it without the `DONE` marker this
+notebook writes last.
+
+## Source
+
+`sefsc_src` in `libs/paths.R` (`~/_big/msens/raw/sefsc.noaa.gov/2026-11-12`; `SEFSC_SRC` overrides) holds the
+delivery unchanged: four R spatial data frames (`.rds`, the full field names) and shapefiles of the same names (field
+names abbreviated), the hexagon shapefile `GoMex_Hexagons_40km.shp`, and Lance's `SEFSC Line Transect Survey Data
+ReadMe.txt`. The density models are the 19 shapefiles of `gm_shp_dir` (NCEI 0256800 v2.2) with `../spp_gmx.xlsx`
+beside them. They carry `{Mon}_n` (abundance per hexagon), `{Mon}_se` and `{Mon}_cv` for each modelled month, with
+`-9999` for no data.
+
+## What this notebook does
+
+1. Reads the four `.rds` files, the hexagons and the 19 density tables, and asserts what it relies on: row counts,
+   CRSs, unique keys, every `HEXID` of the effort, sightings and density tables in the hexagon set.
+2. Builds the **sighting → density model crosswalk** (`data/sefsc_gm_sighting_taxa.csv`, one row per distinct
+   delivered name per platform). A sighting belongs to every model whose species set contains every candidate of its
+   identification; a higher taxon or a species no model covers belongs to none. AphiaIDs come from `spp.duckdb`'s
+   WoRMS snapshot (offline).
+3. Links each sighting to its effort segment and measures, per sighting, whether it lies in its own `HEXID` hexagon
+   and how far it is from its segment.
+4. Writes per-hexagon survey totals onto the hexagons, and one wide **values** table: per hexagon, the density and
+   CV of every model and month plus the annual density, and the survey effort, groups and individuals per platform
+   and month.
+5. Writes every layer as GeoParquet and FlatGeobuf in EPSG:4326, the tables `layers.csv`, `models.csv`, `taxa.csv`
+   and `checks.csv`, then `DONE`, then the manifest.
+
+```{mermaid}
+%%| label: fig-design
+%%| fig-cap: "Delivery (.rds + hexagons) and the NCEI 0256800 density shapefiles → keys + links + crosswalk → wide values + layers → SEFSC_OUT (DONE last) → the atlas builder"
+flowchart LR
+  rds["SEFSC .rds (2026-11-12)<br/>vessel + aerial effort segments<br/>vessel + aerial sightings"] --> link["links + QA<br/>segment_found, in_own_hex,<br/>dist_to_segment_m, length ratio"]
+  hex["GoMex_Hexagons_40km.shp<br/>42,908 hexagons"] --> link
+  shp["NCEI 0256800 v2.2<br/>19 monthly density shapefiles<br/>+ spp_gmx.xlsx"] --> val["values.parquet<br/>HEXID x layer__month__variable"]
+  worms[("spp.duckdb worms")] --> xw["data/sefsc_gm_sighting_taxa.csv<br/>name -> AphiaID, |model| tokens"]
+  link --> val
+  xw --> lay["sightings + effort<br/>GeoParquet + FlatGeobuf"]
+  link --> lay
+  val --> out[("SEFSC_OUT<br/>layers.csv, models.csv,<br/>checks.csv, DONE (last)")]
+  lay --> out
+  out -.-> atlas["oceanmetrics/atlas<br/>build.py build --collection sefsc_gm"]
+```
+
+## Setup
+
+```{r}
+#| label: setup
+
+librarian::shelf(
+  arrow, DBI, digest, dplyr, duckdb, fs, ggplot2, glue, here, jsonlite, knitr, logger, purrr, readr, sf, stringr,
+  tibble, tidyr, xml2, quiet = T)
+library(msens)                      # the installed msens (density_annual, month_day_weights, write_manifest)
+source(here("libs/paths.R"))
+options(readr.show_col_types = FALSE)
+stopifnot("msens >= 0.65.1 needed (density_annual weights, month_day_weights)" = packageVersion("msens") >= "0.65.1")
+
+# inputs (read-only)
+src      <- path_expand(sefsc_src)                    # Lance's delivery, unchanged
+shp_dir  <- path_expand(gm_shp_dir)                   # NCEI 0256800 v2.2 density shapefiles
+taxa_xls <- path(shp_dir, "..", "spp_gmx.xlsx")
+f <- list(
+  hex  = path(src, "GoMex_Hexagons_40km.shp"),
+  ve   = path(src, "SEFSC_Vessel_Effort_Segments_2003to2024.rds"),
+  vs   = path(src, "SEFSC_Vessel_MM_Sightings_2003to2024.rds"),
+  ae   = path(src, "SEFSC_Aerial_Effort_Segments_2011to2018.rds"),
+  as   = path(src, "SEFSC_Aerial_Effort_Sightings_2011to2018.rds"),
+  read = path(src, "SEFSC Line Transect Survey Data ReadMe.txt"))
+stopifnot("delivery not found; set SEFSC_SRC or hydrate raw/sefsc.noaa.gov (scripts/pull_from_laptop.sh --drive)" =
+            all(file_exists(unlist(f))),
+          "density shapefiles not found; set GM_SHP_DIR" = dir_exists(shp_dir), file_exists(taxa_xls))
+
+# output: cleared and rewritten every run, DONE written last (the atlas builder refuses to stage without it)
+out <- path_abs(path_expand(Sys.getenv("SEFSC_OUT", glue("{dir_derived}/preview/sefsc_gm"))))
+stopifnot("SEFSC_OUT must be a folder named for this product (it is deleted and rewritten)" =
+            str_detect(path_file(out), "sefsc"),
+          "SEFSC_OUT must not hold the delivery" = !path_has_parent(src, out) && !path_has_parent(out, src))
+taxa_csv <- here("data/sefsc_gm_sighting_taxa.csv")
+manifest <- here("data/manifests/ingest_sefsc_gm_surveys.json"); dir_create(path_dir(manifest))
+NA_VAL   <- -9999                                   # the density shapefiles' no-data
+crs_lcc  <- "ESRI:102004"                           # USA Contiguous Lambert Conformal Conic (NAD83), the hexagons' CRS
+sf_use_s2(TRUE)                                     # geodesic lengths and distances on EPSG:4326
+log_info("sefsc_gm: src {src}; density shapefiles {shp_dir}; out {out}")
+
+# the QA counts, collected as the notebook goes (checks.csv; the README and the email quote them)
+checks <- list()
+chk <- function(group, check, value, note = "") {
+  checks[[length(checks) + 1]] <<- tibble(group = group, check = check, value = as.character(value), note = note)
+  invisible(value)
+}
+```
+
+## Read
+
+The `.rds` files are read with `sf`. The aerial effort `.rds` states an unnamed geographic CRS on the WGS 84 datum
+(no EPSG code) and its shapefile's `.prj` is `GCS_unknown` on datum `D_WGS_1984`, so it is labelled EPSG:4326, which is the same CRS (asserted
+against both).
+
+```{r}
+#| label: read
+
+hex <- read_sf(f$hex)
+ve  <- readRDS(f$ve)
+vs  <- readRDS(f$vs)
+ae  <- readRDS(f$ae)
+as_ <- readRDS(f$as)
+
+# the aerial effort rds names no CRS ("unknown", a GEOGCRS on WGS 84, lon/lat), its shapefile .prj says GCS_unknown on D_WGS_1984:
+# labelled EPSG:4326 (the same CRS, no coordinate changes)
+prj_ae <- readLines(path(src, "SEFSC_Aerial_Segments_2011to2018.prj"), warn = FALSE)
+stopifnot(st_crs(ae)$input == "unknown", is.na(st_crs(ae)$epsg), str_detect(st_crs(ae)$wkt, "World Geodetic System 1984"),
+          str_detect(st_crs(ae)$wkt, 'AXIS\\["longitude"'), str_detect(prj_ae, "D_WGS_1984"))
+ae <- suppressWarnings(st_set_crs(ae, 4326))
+
+stopifnot(
+  "hexagons" = nrow(hex) == 42908, st_crs(hex) == st_crs(crs_lcc) || str_detect(st_crs(hex)$wkt, "Lambert_Conformal"),
+  "hex HEXID unique" = !anyDuplicated(hex$HEXID),
+  "vessel effort" = nrow(ve) == 11894, all(st_geometry_type(ve) == "LINESTRING"),
+  "vessel effort Sample.Label unique" = !anyDuplicated(ve$Sample.Label),
+  "vessel effort survey + segment.id unique" = !anyDuplicated(paste(ve$survey, ve$segment.id)),
+  "vessel sightings" = nrow(vs) == 2650, all(st_geometry_type(vs) == "POINT"), !anyDuplicated(vs$sightid),
+  "aerial effort" = nrow(ae) == 18674, all(st_geometry_type(ae) == "MULTILINESTRING"), !anyDuplicated(ae$unique.seg.id),
+  "aerial sightings" = nrow(as_) == 1732, all(st_geometry_type(as_) == "POINT"), !anyDuplicated(as_$unique.id))
+# the field names this notebook relies on, as delivered (the aerial effort length is seg.len.m in the file, though the
+# ReadMe calls it seg.length.m)
+stopifnot(
+  setequal(names(st_drop_geometry(ve)), c("segment.id", "HEXID", "trackline", "s.date", "e.date", "survey", "Sample.Label", "seg.length.m")),
+  setequal(names(st_drop_geometry(vs)), c("sightid", "survey", "segment.id", "HEXID", "date.time", "vernacularName", "scientificName", "group.size")),
+  setequal(names(st_drop_geometry(ae)), c("unique.seg.id", "survey", "date", "HEXID", "seg.len.m")),
+  setequal(names(st_drop_geometry(as_)), c("unique.id", "survey", "date.time", "Common.Name", "group.size", "lat", "lon", "SciName", "HEXID", "unique.seg.id")),
+  setequal(names(st_drop_geometry(hex)), c("HEXID", "Area_km2", "USA_EEZ", "Oceanic", "Shelf")))
+
+# density models: 19 shapefiles on the same 42,908 HEXIDs (attribute tables only; the geometry is the hexagons')
+read_xlsx_sheet1 <- function(path) {   # spp_gmx.xlsx, one sheet, header row 1 (the reader of ingest_sdm-gm.qmd)
+  td <- tempfile(); dir_create(td); on.exit(dir_delete(td))
+  utils::unzip(path, exdir = td)
+  ns <- c(d = "http://schemas.openxmlformats.org/spreadsheetml/2006/main")
+  ss <- read_xml(file.path(td, "xl/sharedStrings.xml")) |> xml_find_all("//d:si", ns) |>
+    map_chr(\(x) paste(xml_text(xml_find_all(x, ".//d:t", ns)), collapse = ""))
+  cells <- read_xml(file.path(td, "xl/worksheets/sheet1.xml")) |> xml_find_all("//d:sheetData/d:row/d:c", ns)
+  typ <- xml_attr(cells, "t")
+  v   <- map_chr(cells, \(x) { n <- xml_find_first(x, "d:v", ns); if (inherits(n, "xml_missing")) NA_character_ else xml_text(n) })
+  is_s <- !is.na(typ) & typ == "s" & !is.na(v)
+  v[is_s] <- ss[as.integer(v[is_s]) + 1L]
+  ref <- xml_attr(cells, "r")
+  d <- tibble(col = sub("[0-9]+$", "", ref), row = as.integer(sub("^[A-Z]+", "", ref)), v = v)
+  hdr <- d |> filter(row == 1) |> select(col, name = v)
+  d |> filter(row > 1) |> left_join(hdr, by = "col") |> select(row, name, v) |>
+    pivot_wider(names_from = name, values_from = v) |> select(-row)
+}
+d_taxa <- read_xlsx_sheet1(taxa_xls)
+stopifnot("spp_gmx.xlsx columns changed" = all(c("taxa_doc", "taxa_sci", "taxa_common", "taxa_code_auto", "taxa_shp") %in% names(d_taxa)),
+          nrow(d_taxa) == 19)
+
+m <- tibble(path_shp = as.character(dir_ls(shp_dir, glob = "*.shp"))) |>
+  mutate(shapefile  = path_file(path_shp),
+         taxa_shp   = str_replace(path_ext_remove(shapefile), "(.*)_Monthly_.*", "\\1"),
+         population = if_else(str_detect(shapefile, "^(Oceanic|Shelf)_"), str_extract(shapefile, "^(Oceanic|Shelf)"), NA_character_)) |>
+  left_join(d_taxa |> select(taxa_shp, taxa_sci, taxa_common, taxa_doc, taxa_code_auto), by = "taxa_shp") |>
+  # the model key: lowercase ASCII of taxa_code_auto (Rice’s_whale -> rices_whale)
+  mutate(layer = str_to_lower(taxa_code_auto) |> str_remove_all("[’']"),
+         taxa_doc = str_squish(str_remove(taxa_doc, "\\s*(;|\\.| and;)\\s*$")))
+stopifnot("19 shapefiles expected" = nrow(m) == 19, "a shapefile has no spp_gmx row" = !anyNA(m$taxa_sci),
+          "model keys must be lowercase ASCII" = all(str_detect(m$layer, "^[a-z_]+$")), !anyDuplicated(m$layer))
+
+m <- m |> mutate(label = case_when(
+  !is.na(population) ~ glue("{str_remove(taxa_common, '^(Oceanic|Shelf) ')} ({str_to_lower(population)} stock)"),
+  TRUE ~ taxa_common) |> as.character() |> str_replace("^(.)", \(x) toupper(x)) |> str_replace("Kemp's Ridley", "Kemp's ridley"))
+dens_tbl <- map(set_names(m$path_shp, m$layer), \(p) st_drop_geometry(read_sf(p)))
+stopifnot("every density shapefile has the 42,908 hexagon HEXIDs" =
+            all(map_lgl(dens_tbl, \(d) nrow(d) == nrow(hex) && setequal(d$HEXID, hex$HEXID))))
+
+chk("rows", "hexagons", nrow(hex), "GoMex_Hexagons_40km.shp, ESRI:102004")
+chk("rows", "vessel effort segments", nrow(ve), "LINESTRING, ESRI:102004")
+chk("rows", "vessel sightings", nrow(vs), "POINT, EPSG:4326")
+chk("rows", "aerial effort segments", nrow(ae), "MULTILINESTRING; the rds names no CRS (an unnamed WGS 84 GEOGCRS), labelled EPSG:4326 (its shapefile .prj: GCS_unknown, D_WGS_1984)")
+chk("rows", "aerial sightings", nrow(as_), "POINT, EPSG:4326")
+chk("rows", "density models", nrow(m), "NCEI 0256800 v2.2 shapefiles, same 42,908 HEXIDs")
+# Area_km2 is the nominal (planar, Lambert conformal) 40 km2; the hexagons' true ellipsoidal area is smaller. The density
+# below is {Mon}_n / Area_km2 as the brief and ingest_sdm-gm.qmd define it (per nominal km2)
+area_geod <- as.numeric(st_area(st_transform(st_geometry(hex), 4326))) / 1e6
+stopifnot("Area_km2 is 40 to 1e-3" = all(abs(hex$Area_km2 - 40) < 1e-3))
+chk("hexagons", "Area_km2, min | max", paste(sprintf("%.6f", range(hex$Area_km2)), collapse = " | "), "nominal 40 km2 (planar, ESRI:102004)")
+chk("hexagons", "ellipsoidal (geodesic) area km2, min | median | max", paste(sprintf("%.2f", quantile(area_geod, c(0, 0.5, 1))), collapse = " | "),
+    "s2 on EPSG:4326: Lambert conformal is not equal-area, so the true area is below the nominal 40")
+chk("hexagons", "USA_EEZ = 1", sum(hex$USA_EEZ == 1))
+for (v in sort(unique(hex$Oceanic))) chk("hexagons", glue("Oceanic = {v}"), sum(hex$Oceanic == v))
+for (v in sort(unique(hex$Shelf))) chk("hexagons", glue("Shelf = {v}"), sum(hex$Shelf == v),
+                                        if (v == 2) "the ReadMe defines 0/1 only (question for the provider)" else "")
+chk("hexagons", "Shelf = 2 with Oceanic = 0", sum(hex$Shelf == 2 & hex$Oceanic == 0))
+chk("hexagons", "Oceanic = 1 and Shelf = 1", sum(hex$Oceanic == 1 & hex$Shelf == 1), "both (the ReadMe makes them exclusive by depth)")
+chk("hexagons", "Oceanic = 0 and Shelf = 0", sum(hex$Oceanic == 0 & hex$Shelf == 0), "neither (estuarine, per the ReadMe's Shelf note?)")
+
+knitr::kable(count(st_drop_geometry(hex), Oceanic, Shelf), caption = "Hexagons by Oceanic x Shelf")
+knitr::kable(m |> select(layer, shapefile, taxa_sci, population), caption = "The 19 density models")
+```
+
+## Dates, text and keys
+
+Dates are kept as ISO strings in the time zone they were delivered in: vessel effort `s.date` / `e.date` UTC,
+vessel sightings `date.time` GMT, aerial sightings `date.time` a string with no time zone, aerial effort `date` a
+date only (an R `POSIXlt` at local midnight, EST/EDT). Year and month are read from the same strings.
+
+```{r}
+#| label: dates
+
+fmt_dt <- \(x, tz) format(x, "%Y-%m-%d %H:%M:%S", tz = tz)
+stopifnot(attr(ve$s.date, "tzone") == "UTC", attr(vs$date.time, "tzone") == "GMT",
+          is.character(as_$date.time), all(str_detect(as_$date.time, "^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}$")),
+          "aerial effort date is a date only (every value local midnight)" = all(format(ae$date, "%H:%M:%S") == "00:00:00"))
+
+# one vessel vernacularName carries a byte that is not UTF-8 (0xE0 between "Bryde" and "or"): decoded as Latin-1
+bad_utf8 <- which(!validUTF8(vs$vernacularName))
+chk("text", "vessel vernacularName not valid UTF-8", length(bad_utf8),
+    paste("decoded as Latin-1:", paste(unique(iconv(vs$vernacularName[bad_utf8], "latin1", "UTF-8")), collapse = "; ")))
+vs$vernacularName[bad_utf8] <- iconv(vs$vernacularName[bad_utf8], "latin1", "UTF-8")
+stopifnot(all(validUTF8(unlist(map(list(ve, vs, ae, as_), \(x) keep(st_drop_geometry(x), is.character))))))
+
+ve <- ve |> mutate(s.date = fmt_dt(s.date, "UTC"), e.date = fmt_dt(e.date, "UTC"))
+vs <- vs |> mutate(date.time = fmt_dt(date.time, "GMT"))
+ae <- ae |> mutate(date = format(date, "%Y-%m-%d"))
+ae <- st_as_sf(as_tibble(ae))                   # POSIXlt gone: a plain tibble-backed sf
+yr <- \(s) as.integer(substr(s, 1, 4))           # year and month from the ISO strings above
+mo <- \(s) as.integer(substr(s, 6, 7))
+nogeo <- \(x) if (inherits(x, "sf")) st_drop_geometry(x) else x
+
+chk("values", "vessel sightings group.size NA", sum(is.na(vs$group.size)))
+chk("values", "vessel sightings group.size = 0", sum(vs$group.size == 0, na.rm = TRUE))
+chk("values", "aerial sightings group.size NA", sum(is.na(as_$group.size)))
+chk("values", "aerial sightings lat/lon = geometry (max abs difference, degrees)",
+    signif(max(abs(c(as_$lon - st_coordinates(as_)[, 1], as_$lat - st_coordinates(as_)[, 2]))), 2))
+
+# every HEXID in the hexagon set
+for (nm in c("ve", "vs", "ae", "as_")) {
+  x <- get(nm)
+  chk("hexid", glue("{c(ve='vessel effort', vs='vessel sightings', ae='aerial effort', as_='aerial sightings')[nm]} HEXID not a hexagon"),
+      sum(!x$HEXID %in% hex$HEXID))
+}
+```
+
+## Sighting → model crosswalk
+
+The delivered names are many higher taxa and "X or Y" / "X/Y" / "X | Y" combinations. The curation below gives each
+distinct name its resolved name, its candidate species (or taxa) and its density models; the code then checks the
+rule: a sighting belongs to every model whose species set contains **every** candidate of its identification. The one
+deliberate exception (Ben, 2026-11-13) is the *Balaenoptera* combinations, which go to the Rice's whale model with
+`id_certain = FALSE` although sei, fin and Bryde's whales are not modelled. `models` is a `|`-delimited string of
+model keys with a leading and trailing `|` (`|rices_whale|`), empty for none, so a filter can match `|key|`.
+
+```{r}
+#| label: crosswalk
+
+# the species set of each model, as candidate -> model keys (a genus or family counts when the model is that taxon)
+cand_models <- list(
+  "Ziphius cavirostris" = "beaked_whales", "Mesoplodon" = "beaked_whales", "Mesoplodon densirostris" = "beaked_whales",
+  "Mesoplodon europaeus" = "beaked_whales", "Ziphiidae" = "beaked_whales",
+  "Orcinus orca" = "blackfish", "Peponocephala electra" = "blackfish", "Feresa attenuata" = "blackfish",
+  "Pseudorca crassidens" = "blackfish",
+  "Globicephala" = "pilot_whales",
+  "Kogia" = "pygmy_or_dwarf_sperm_whales", "Kogia breviceps" = "pygmy_or_dwarf_sperm_whales", "Kogia sima" = "pygmy_or_dwarf_sperm_whales",
+  "Stenella frontalis" = c("oceanic_atlantic_spotted_dolphin", "shelf_atlantic_spotted_dolphin"),
+  "Tursiops truncatus" = c("oceanic_common_bottlenose_dolphin", "shelf_common_bottlenose_dolphin"),
+  "Balaenoptera ricei" = "rices_whale", "Grampus griseus" = "rissos_dolphin", "Physeter macrocephalus" = "sperm_whale",
+  "Stenella attenuata" = "pantropical_spotted_dolphin", "Stenella clymene" = "clymene_dolphin",
+  "Stenella coeruleoalba" = "striped_dolphin", "Stenella longirostris" = "spinner_dolphin")
+stopifnot("a model key in the crosswalk is not a density model" = all(unlist(cand_models) %in% m$layer))
+
+# the curation: one row per distinct delivered name per platform. candidates "|"-separated; exception = TRUE only where
+# `models` deliberately departs from the rule
+bal <- "Balaenoptera combination: assigned to the Rice's whale model with id_certain FALSE (decision 2026-11-13); the other candidates are not modelled"
+cur <- tribble(
+  ~platform, ~name,                                       ~name_resolved,          ~candidates,                                                  ~exception, ~note,
+  "vessel", "B. borealis/ricei",                          "Balaenoptera",          "Balaenoptera borealis|Balaenoptera ricei",                    TRUE,  bal,
+  "vessel", "Balaenoptera borealis or Balaenoptera physalus or Balaenoptera edeni or Balaenoptera ricei", "Balaenoptera",
+                                                                                  "Balaenoptera borealis|Balaenoptera physalus|Balaenoptera edeni|Balaenoptera ricei", TRUE, bal,
+  "vessel", "Balaenoptera borealis/ricei/physalus",       "Balaenoptera",          "Balaenoptera borealis|Balaenoptera ricei|Balaenoptera physalus", TRUE, bal,
+  "vessel", "Balaenoptera ricei",                         "Balaenoptera ricei",    "Balaenoptera ricei",                                          FALSE, "",
+  "vessel", "Cetacea",                                    "Cetacea",               "Cetacea",                                                     FALSE, "higher taxon",
+  "vessel", "Delphinidae",                                "Delphinidae",           "Delphinidae",                                                 FALSE, "higher taxon",
+  "vessel", "Feresa attenuata",                           "Feresa attenuata",      "Feresa attenuata",                                            FALSE, "",
+  "vessel", "Globicephala",                               "Globicephala",          "Globicephala",                                                FALSE, "",
+  "vessel", "Globicephala sp.",                           "Globicephala",          "Globicephala",                                                FALSE, "",
+  "vessel", "Grampus griseus",                            "Grampus griseus",       "Grampus griseus",                                             FALSE, "",
+  "vessel", "Kogia",                                      "Kogia",                 "Kogia",                                                       FALSE, "",
+  "vessel", "Kogia breviceps",                            "Kogia breviceps",       "Kogia breviceps",                                             FALSE, "",
+  "vessel", "Kogia sima",                                 "Kogia sima",            "Kogia sima",                                                  FALSE, "",
+  "vessel", "Kogia sp.",                                  "Kogia",                 "Kogia",                                                       FALSE, "",
+  "vessel", "Lagenodelphis hosei",                        "Lagenodelphis hosei",   "Lagenodelphis hosei",                                         FALSE, "not modelled",
+  "vessel", "Mesoplodon",                                 "Mesoplodon",            "Mesoplodon",                                                  FALSE, "",
+  "vessel", "Mesoplodon densirostris",                    "Mesoplodon densirostris", "Mesoplodon densirostris",                                   FALSE, "",
+  "vessel", "Mesoplodon europaeus",                       "Mesoplodon europaeus",  "Mesoplodon europaeus",                                        FALSE, "",
+  "vessel", "Mesoplodon europeaus",                       "Mesoplodon europaeus",  "Mesoplodon europaeus",                                        FALSE, "typo for Mesoplodon europaeus",
+  "vessel", "Mesoplodon sp.",                             "Mesoplodon",            "Mesoplodon",                                                  FALSE, "",
+  "vessel", "Mysticeti",                                  "Mysticeti",             "Mysticeti",                                                   FALSE, "higher taxon",
+  "vessel", "Odontoceti",                                 "Odontoceti",            "Odontoceti",                                                  FALSE, "higher taxon",
+  "vessel", "Orcinus orca",                               "Orcinus orca",          "Orcinus orca",                                                FALSE, "",
+  "vessel", "P. electra/F. attenuata",                    "Delphinidae",           "Peponocephala electra|Feresa attenuata",                      FALSE, "combination within the blackfish model",
+  "vessel", "P. electra/F. attenuata/P. crassidens",      "Delphinidae",           "Peponocephala electra|Feresa attenuata|Pseudorca crassidens", FALSE, "combination within the blackfish model",
+  "vessel", "Peponocephala electra",                      "Peponocephala electra", "Peponocephala electra",                                       FALSE, "",
+  "vessel", "Peponocephala electra or Feresa attenuata",  "Delphinidae",           "Peponocephala electra|Feresa attenuata",                      FALSE, "combination within the blackfish model",
+  "vessel", "Peponocephala electra or Feresa attenuata or Pseudorca crassidens", "Delphinidae",
+                                                                                  "Peponocephala electra|Feresa attenuata|Pseudorca crassidens", FALSE, "combination within the blackfish model",
+  "vessel", "Physeter macrocephalus",                     "Physeter macrocephalus", "Physeter macrocephalus",                                     FALSE, "",
+  "vessel", "Pseudorca crassidens",                       "Pseudorca crassidens",  "Pseudorca crassidens",                                        FALSE, "",
+  "vessel", "Stenella",                                   "Stenella",              "Stenella",                                                    FALSE, "higher taxon",
+  "vessel", "Stenella attenuata",                         "Stenella attenuata",    "Stenella attenuata",                                          FALSE, "",
+  "vessel", "Stenella clymene",                           "Stenella clymene",      "Stenella clymene",                                            FALSE, "",
+  "vessel", "Stenella coeruleoalba",                      "Stenella coeruleoalba", "Stenella coeruleoalba",                                       FALSE, "",
+  "vessel", "Stenella frontalis",                         "Stenella frontalis",    "Stenella frontalis",                                          FALSE, "both stocks (oceanic, shelf)",
+  "vessel", "Stenella longirostris",                      "Stenella longirostris", "Stenella longirostris",                                       FALSE, "",
+  "vessel", "Stenella longirostris | Stenella clymene",   "Stenella",              "Stenella longirostris|Stenella clymene",                      FALSE, "combination across two models",
+  "vessel", "Stenella sp.",                               "Stenella",              "Stenella",                                                    FALSE, "higher taxon",
+  "vessel", "Steno bredanensis",                          "Steno bredanensis",     "Steno bredanensis",                                           FALSE, "not modelled",
+  "vessel", "T. truncatus/S. frontalis",                  "Delphinidae",           "Tursiops truncatus|Stenella frontalis",                       FALSE, "combination across models",
+  "vessel", "Tursiops truncatus",                         "Tursiops truncatus",    "Tursiops truncatus",                                          FALSE, "both stocks (oceanic, shelf)",
+  "vessel", "Tursiops truncatus or Stenella frontalis",   "Delphinidae",           "Tursiops truncatus|Stenella frontalis",                       FALSE, "combination across models",
+  "vessel", "Unidentified large Cetacea",                 "Cetacea",               "Cetacea",                                                     FALSE, "higher taxon",
+  "vessel", "Unidentified small Cetacea",                 "Cetacea",               "Cetacea",                                                     FALSE, "higher taxon",
+  "vessel", "Ziphiidae",                                  "Ziphiidae",             "Ziphiidae",                                                   FALSE, "",
+  "vessel", "Ziphius cavirostris",                        "Ziphius cavirostris",   "Ziphius cavirostris",                                         FALSE, "",
+  "aerial", "Standard Tursiops",                          "Tursiops truncatus",    "Tursiops truncatus",                                          FALSE, "SEFSC label for common bottlenose dolphin; both stocks",
+  "aerial", "Stenella frontalis",                         "Stenella frontalis",    "Stenella frontalis",                                          FALSE, "both stocks (oceanic, shelf)",
+  "aerial", "Stenella longirostris",                      "Stenella longirostris", "Stenella longirostris",                                       FALSE, "",
+  "aerial", "Stenella sp.",                               "Stenella",              "Stenella",                                                    FALSE, "higher taxon",
+  "aerial", "Steno bredanensis",                          "Steno bredanensis",     "Steno bredanensis",                                           FALSE, "not modelled",
+  "aerial", "Trichechus manatus",                         "Trichechus manatus",    "Trichechus manatus",                                          FALSE, "not modelled (manatee)",
+  "aerial", "Tursiops truncatus/ Stenella frontalis",     "Delphinidae",           "Tursiops truncatus|Stenella frontalis",                       FALSE, "combination across models",
+  "aerial", "unid. dolphin",                              "Delphinidae",           "Delphinidae",                                                 FALSE, "higher taxon",
+  "aerial", "unid. odontocete",                           "Odontoceti",            "Odontoceti",                                                  FALSE, "higher taxon")
+
+# the rule: the models every candidate belongs to; the exception rows take the Rice's whale model
+rule_models <- \(cands) { s <- map(str_split_1(cands, fixed("|")), \(x) cand_models[[x]] %||% character(0)); reduce(s, intersect) }
+tok <- \(x) if (length(x)) paste0("|", paste(sort(x), collapse = "|"), "|") else ""
+cur <- cur |>
+  mutate(n_cand     = str_count(candidates, fixed("|")) + 1L,
+         id_certain = n_cand == 1L,
+         models     = map2_chr(candidates, exception, \(c, e) if (e) "|rices_whale|" else tok(rule_models(c))))
+
+# AphiaIDs: the accepted Animalia record of name_resolved (a synonym to its accepted id), offline from spp.duckdb
+con_spp <- dbConnect(duckdb(path.expand(spp_db), read_only = TRUE))
+nm_all <- unique(c(cur$name_resolved, m$taxa_sci))
+wm <- dbGetQuery(con_spp, glue("
+  SELECT w.scientificName AS name, w.taxonomicStatus AS status, CAST(a.taxonID AS INTEGER) AS aphia_id,
+         a.scientificName AS accepted_name, a.taxonRank AS rank
+  FROM worms w JOIN worms a ON a.taxonID = w.acceptedNameUsageID
+  WHERE w.kingdom = 'Animalia' AND a.taxonomicStatus = 'accepted'
+    AND w.scientificName IN ({paste(dbQuoteString(con_spp, nm_all), collapse = ',')})"))
+worms_ver <- tryCatch(dbGetQuery(con_spp, "SELECT * FROM worms_meta")[1, , drop = FALSE], error = \(e) NULL)
+dbDisconnect(con_spp, shutdown = TRUE)
+# one id per name: the accepted record when the name is accepted, else its single accepted target
+wm1 <- wm |> group_by(name) |> arrange(status != "accepted", .by_group = TRUE) |>
+  filter(if (any(status == "accepted")) status == "accepted" else TRUE) |> distinct(name, aphia_id, accepted_name, rank) |> ungroup()
+stopifnot("a resolved name has no / several accepted WoRMS animal records" =
+            setequal(wm1$name, nm_all), !anyDuplicated(wm1$name))
+
+n_by_name <- bind_rows(
+  st_drop_geometry(vs) |> count(scientificName) |> rename(name = scientificName) |> mutate(platform = "vessel"),
+  st_drop_geometry(as_) |> count(SciName) |> rename(name = SciName) |> mutate(platform = "aerial"))
+stopifnot("every delivered name has exactly one crosswalk row" =
+            nrow(anti_join(n_by_name, cur, by = c("platform", "name"))) == 0,
+          "every crosswalk row names a delivered name" = nrow(anti_join(cur, n_by_name, by = c("platform", "name"))) == 0,
+          !anyDuplicated(cur[c("platform", "name")]))
+
+taxa <- cur |> left_join(n_by_name, by = c("platform", "name")) |>
+  left_join(wm1, by = c(name_resolved = "name")) |>
+  select(name, platform, n, name_resolved, aphia_id, accepted_name, rank, id_certain, models, candidates, note) |>
+  arrange(desc(platform), name)
+write_csv(taxa, taxa_csv, na = "")
+
+# the rule, asserted on named cases (a regression of any of them changes what a model's filter shows)
+xm <- \(p, n) taxa$models[taxa$platform == p & taxa$name == n]
+stopifnot(xm("vessel", "B. borealis/ricei") == "|rices_whale|",
+          xm("vessel", "Ziphiidae") == "|beaked_whales|",
+          xm("vessel", "P. electra/F. attenuata/P. crassidens") == "|blackfish|",
+          xm("vessel", "Stenella frontalis") == "|oceanic_atlantic_spotted_dolphin|shelf_atlantic_spotted_dolphin|",
+          xm("aerial", "Standard Tursiops") == "|oceanic_common_bottlenose_dolphin|shelf_common_bottlenose_dolphin|",
+          xm("vessel", "Tursiops truncatus or Stenella frontalis") == "",
+          xm("vessel", "Stenella longirostris | Stenella clymene") == "",
+          xm("vessel", "Delphinidae") == "", xm("aerial", "Trichechus manatus") == "",
+          !taxa$id_certain[taxa$name == "B. borealis/ricei"])
+
+chk("crosswalk", "distinct vessel names", sum(taxa$platform == "vessel"))
+chk("crosswalk", "distinct aerial names", sum(taxa$platform == "aerial"))
+chk("crosswalk", "vessel sightings with a model", sum(taxa$n[taxa$platform == "vessel" & taxa$models != ""]), glue("of {nrow(vs)}"))
+chk("crosswalk", "aerial sightings with a model", sum(taxa$n[taxa$platform == "aerial" & taxa$models != ""]), glue("of {nrow(as_)}"))
+chk("crosswalk", "sightings named as a combination of taxa (id_certain FALSE)", sum(taxa$n[!taxa$id_certain]))
+knitr::kable(taxa |> select(-candidates), caption = "Sighting names → WoRMS → density models (data/sefsc_gm_sighting_taxa.csv)")
+```
+
+## Links, positions and lengths
+
+```{r}
+#| label: links
+
+ve <- ve |> mutate(seg_key = paste(survey, segment.id))
+vs <- vs |> mutate(seg_key = paste(survey, segment.id))
+
+# segment_found: the sighting's segment is in the effort file (vessel: survey + segment.id; aerial: unique.seg.id)
+vs$segment_found  <- vs$seg_key %in% ve$seg_key
+as_$segment_found <- as_$unique.seg.id %in% ae$unique.seg.id
+chk("links", "vessel sightings whose survey + segment.id is in the effort file", sum(vs$segment_found), glue("of {nrow(vs)}"))
+chk("links", "vessel sightings unlinked", sum(!vs$segment_found), glue("{round(100 * mean(!vs$segment_found), 1)} %"))
+chk("links", "aerial sightings whose unique.seg.id is in the effort file", sum(as_$segment_found), glue("of {nrow(as_)}"))
+unlinked <- st_drop_geometry(vs) |> filter(!segment_found) |> count(survey, name = "n_unlinked") |>
+  left_join(st_drop_geometry(vs) |> count(survey, name = "n_sightings"), by = "survey") |>
+  mutate(pct = round(100 * n_unlinked / n_sightings, 1))
+for (i in seq_len(nrow(unlinked))) chk("links", glue("vessel sightings unlinked, {unlinked$survey[i]}"), unlinked$n_unlinked[i],
+                                       glue("of {unlinked$n_sightings[i]} ({unlinked$pct[i]} %)"))
+
+# in_own_hex: the point lies in the hexagon its HEXID names (planar, in the hexagons' own CRS)
+in_own <- function(pts, hexid) {
+  p <- st_transform(st_geometry(pts), crs_lcc)
+  h <- st_geometry(hex)[match(hexid, hex$HEXID)]
+  ok <- !is.na(match(hexid, hex$HEXID))
+  out <- rep(NA, length(p))
+  out[ok] <- map2_lgl(p[ok], h[ok], \(a, b) st_intersects(a, b, sparse = FALSE)[1, 1])
+  out
+}
+vs$in_own_hex  <- in_own(vs, vs$HEXID)
+as_$in_own_hex <- in_own(as_, as_$HEXID)
+chk("positions", "vessel sightings inside their own HEXID hexagon", sum(vs$in_own_hex, na.rm = TRUE), glue("{round(100 * mean(vs$in_own_hex), 1)} %"))
+chk("positions", "aerial sightings inside their own HEXID hexagon", sum(as_$in_own_hex, na.rm = TRUE), glue("{round(100 * mean(as_$in_own_hex), 1)} %"))
+
+# dist_to_segment_m: geodesic distance (s2, EPSG:4326) from the sighting to its own segment; NA when unlinked
+seg_dist <- function(pts, seg_geom_4326, idx) {
+  d <- rep(NA_real_, nrow(pts))
+  ok <- !is.na(idx)
+  d[ok] <- as.numeric(st_distance(st_geometry(pts)[ok], seg_geom_4326[idx[ok]], by_element = TRUE))
+  d
+}
+ve_4326 <- st_geometry(st_transform(ve, 4326))
+vs$dist_to_segment_m  <- round(seg_dist(vs, ve_4326, match(vs$seg_key, ve$seg_key)), 1)
+as_$dist_to_segment_m <- round(seg_dist(as_, st_geometry(ae), match(as_$unique.seg.id, ae$unique.seg.id)), 1)
+qs <- c(0.5, 0.9, 0.99, 1)
+for (p in c("vessel", "aerial")) {
+  d <- if (p == "vessel") vs$dist_to_segment_m else as_$dist_to_segment_m
+  q <- quantile(d, qs, na.rm = TRUE)
+  for (i in seq_along(qs)) chk("positions", glue("{p} sighting to own segment, {c('median','p90','p99','max')[i]} (m)"), round(q[i]))
+  chk("positions", glue("{p} sightings within 1 m of their segment"), sum(d <= 1, na.rm = TRUE), glue("of {sum(!is.na(d))} linked"))
+}
+
+# segment lengths: the geodesic geometry length vs the delivered length field (reported, not "fixed")
+ve$length_geom_m <- as.numeric(st_length(ve_4326))
+ae$length_geom_m <- as.numeric(st_length(ae))
+for (p in c("vessel", "aerial")) {
+  r <- if (p == "vessel") ve$length_geom_m / ve$seg.length.m else ae$length_geom_m / ae$seg.len.m
+  q <- quantile(r[is.finite(r)], c(0.01, 0.5, 0.99))
+  chk("lengths", glue("{p} effort: geometry length / length field, p1 | median | p99"),
+      paste(sprintf("%.3f", q), collapse = " | "), "geodesic length of the delivered line over the delivered field")
+  chk("lengths", glue("{p} effort: total length field (km)"), round(sum(if (p == "vessel") ve$seg.length.m else ae$seg.len.m) / 1000))
+  chk("lengths", glue("{p} effort: total geometry length (km)"), round(sum(if (p == "vessel") ve$length_geom_m else ae$length_geom_m) / 1000))
+}
+knitr::kable(unlinked, caption = "Vessel sightings whose survey + segment.id is not in the effort file, by survey")
+```
+
+```{r}
+#| label: fig-positions
+#| fig-cap: "Distance from each sighting to its own effort segment (geodesic, m; log scale, 0 m drawn at 0.1 m). Most sightings lie on the trackline: the delivered points look like the platform's position at the time of the sighting."
+#| fig-height: 3.5
+
+bind_rows(tibble(platform = "vessel", d = vs$dist_to_segment_m), tibble(platform = "aerial", d = as_$dist_to_segment_m)) |>
+  filter(!is.na(d)) |>
+  ggplot(aes(pmax(d, 0.1))) + geom_histogram(bins = 40) + scale_x_log10() + facet_wrap(~platform, scales = "free_y") +
+  labs(x = "distance to own segment (m)", y = "sightings") + theme_minimal()
+```
+
+## Derived attributes
+
+Every delivered field keeps its delivered `.rds` name. The derived fields follow, in snake_case.
+
+```{r}
+#| label: derive
+
+# sightings -> the crosswalk
+xw <- taxa |> select(platform, name, name_resolved, aphia_id, accepted_name, rank, id_certain, models)
+seg_v <- st_drop_geometry(ve) |> select(seg_key, trackline, s.date, e.date)
+seg_a <- st_drop_geometry(ae) |> select(unique.seg.id, date)
+
+sightings_vessel <- vs |>
+  mutate(platform = "vessel", year = yr(date.time), month = mo(date.time),
+         lon = round(st_coordinates(vs)[, 1], 7), lat = round(st_coordinates(vs)[, 2], 7)) |>
+  left_join(xw, by = c("platform", scientificName = "name")) |>
+  left_join(seg_v, by = "seg_key") |>
+  select(sightid, survey, segment.id, HEXID, date.time, vernacularName, scientificName, group.size,
+         platform, year, month, lon, lat, name_resolved, aphia_id, accepted_name, rank, id_certain, models,
+         segment_found, in_own_hex, dist_to_segment_m, trackline, s.date, e.date)
+# the aerial rds carries lat and lon itself (equal to the geometry): those are the delivered fields, not repeated
+sightings_aerial <- as_ |>
+  mutate(platform = "aerial", year = yr(date.time), month = mo(date.time)) |>
+  left_join(xw, by = c("platform", SciName = "name")) |>
+  left_join(seg_a, by = "unique.seg.id") |>
+  select(unique.id, survey, date.time, Common.Name, group.size, lat, lon, SciName, HEXID, unique.seg.id,
+         platform, year, month, name_resolved, aphia_id, accepted_name, rank, id_certain, models,
+         segment_found, in_own_hex, dist_to_segment_m, date)
+stopifnot(!anyNA(sightings_vessel$models), !anyNA(sightings_aerial$models),
+          nrow(sightings_vessel) == nrow(vs), nrow(sightings_aerial) == nrow(as_))
+
+n_sight_v <- st_drop_geometry(vs) |> count(seg_key, name = "n_sightings")
+n_sight_a <- st_drop_geometry(as_) |> count(unique.seg.id, name = "n_sightings")
+effort_vessel <- ve |>
+  mutate(platform = "vessel", year = yr(s.date), month = mo(s.date), length_km = seg.length.m / 1000) |>
+  left_join(n_sight_v, by = "seg_key") |> mutate(n_sightings = coalesce(n_sightings, 0L)) |>
+  select(segment.id, HEXID, trackline, s.date, e.date, survey, Sample.Label, seg.length.m,
+         platform, year, month, length_km, n_sightings) |>
+  st_transform(4326)
+effort_aerial <- ae |>
+  mutate(platform = "aerial", year = yr(date), month = mo(date), length_km = seg.len.m / 1000) |>
+  left_join(n_sight_a, by = "unique.seg.id") |> mutate(n_sightings = coalesce(n_sightings, 0L)) |>
+  select(unique.seg.id, survey, date, HEXID, seg.len.m, platform, year, month, length_km, n_sightings)
+stopifnot(sum(effort_vessel$n_sightings) == sum(vs$segment_found), sum(effort_aerial$n_sightings) == nrow(as_))
+chk("years", "vessel effort years", paste(range(effort_vessel$year), collapse = "-"), paste(sort(unique(ve$survey)), collapse = " "))
+chk("years", "aerial effort years", paste(range(effort_aerial$year), collapse = "-"), paste(sort(unique(ae$survey)), collapse = " "))
+chk("years", "vessel sighting years outside the effort years",
+    sum(!sightings_vessel$year %in% unique(effort_vessel$year)))
+```
+
+## Values per hexagon
+
+Per hexagon, one double column per (layer × month × variable), named `{layer}__{month}__{variable}`:
+
+- **Density models** (19 layers): `density` = `{Mon}_n / Area_km2` (animals per km²) and `cv` as delivered, for each
+  month the model covers, `-9999` as NULL; and `annual__density`, the **day-weighted** mean of the twelve monthly
+  densities with a month the model does not cover counting as 0 (`msens::density_annual(..., n_intervals = 12,
+  weights = msens::month_day_weights())`, the annual of `ingest_sdm-gm.qmd`). There is no annual CV.
+- **Surveys** (`survey_vessel`, `survey_aerial`, `survey_all`): `effort_km` (sum of the segment length field / 1000
+  by the segment's `HEXID`), `groups` (number of sightings by the sighting's `HEXID`), `individuals` (sum of
+  `group.size`), per month of the segment or sighting and `annual` (all months). A hexagon with no effort is NULL,
+  not 0 (it was not surveyed), except that `groups` / `individuals` are 0 where `effort_km` > 0, and a sighting whose
+  hexagon has no effort that month still counts.
+
+A column with no value in any hexagon is not written.
+
+```{r}
+#| label: values
+
+months <- sprintf("%02d", 1:12)
+w_day  <- msens::month_day_weights()
+
+# density models: long (HEXID, layer, month, density, cv)
+dens_long <- imap(dens_tbl, \(d, lyr) {
+  mos <- intersect(month.abb, str_remove(grep("_n$", names(d), value = TRUE), "_n$"))
+  map(mos, \(mo) tibble(HEXID = d$HEXID, layer = lyr, month = sprintf("%02d", match(mo, month.abb)),
+                        n = d[[glue("{mo}_n")]], cv = d[[glue("{mo}_cv")]])) |> list_rbind()
+}) |> list_rbind() |>
+  left_join(st_drop_geometry(hex) |> select(HEXID, Area_km2), by = "HEXID") |>
+  mutate(density = if_else(n == NA_VAL, NA_real_, n / Area_km2),
+         cv      = if_else(cv == NA_VAL, NA_real_, cv))
+chk("density", "monthly hexagon values -9999 (no data)", sum(dens_long$n == NA_VAL), glue("of {nrow(dens_long)}"))
+chk("density", "monthly density < 0", sum(dens_long$density < 0, na.rm = TRUE))
+chk("density", "monthly cv < 0 (other than -9999)", sum(dens_long$cv < 0, na.rm = TRUE))
+
+# annual: day-weighted over the twelve months, an uncovered month (or a -9999 hexagon-month) counts as 0
+annual <- dens_long |> filter(!is.na(density)) |> group_by(layer) |>
+  group_modify(\(d, k) msens::density_annual(d |> transmute(cell_id = HEXID, interval = month, dens = density),
+                                             n_intervals = 12, interval = "interval", weights = w_day)) |>
+  ungroup() |> rename(HEXID = cell_id, density = dens) |> mutate(month = "annual")
+# check it: the same mean computed directly as a matrix product over all twelve months
+chk_annual <- dens_long |> filter(!is.na(density)) |>
+  select(layer, HEXID, month, density) |> complete(nesting(layer, HEXID), month = months, fill = list(density = 0)) |>
+  group_by(layer, HEXID) |> summarise(direct = sum(density * w_day[month]) / sum(w_day), .groups = "drop") |>
+  inner_join(annual, by = c("layer", "HEXID"))
+stopifnot("density_annual() == the day-weighted mean over 12 months (uncovered = 0)" =
+            nrow(chk_annual) == nrow(annual), isTRUE(all.equal(chk_annual$direct, chk_annual$density, tolerance = 1e-12)))
+kg <- annual |> filter(layer == "pygmy_or_dwarf_sperm_whales")
+stopifnot("Kogia covers Apr-Nov" = setequal(unique(dens_long$month[dens_long$layer == "pygmy_or_dwarf_sperm_whales"]), sprintf("%02d", 4:11)))
+chk("density", "annual = day-weighted mean (density_annual vs a direct matrix product), max abs difference",
+    signif(max(abs(chk_annual$direct - chk_annual$density)), 2), glue("{nrow(chk_annual)} layer x hexagon values"))
+
+# surveys: long (HEXID, layer, month, variable, val)
+sv <- function(eff, sig, layer) {
+  e <- nogeo(eff) |> transmute(HEXID, month = sprintf("%02d", month), effort_km = length_km)
+  s <- nogeo(sig) |> transmute(HEXID, month = sprintf("%02d", month), groups = 1, individuals = group.size)
+  by_month <- function(e, s) {
+    full_join(e |> group_by(HEXID, month) |> summarise(effort_km = sum(effort_km), .groups = "drop"),
+              s |> group_by(HEXID, month) |> summarise(groups = sum(groups), individuals = sum(individuals, na.rm = TRUE), .groups = "drop"),
+              by = c("HEXID", "month")) |>
+      mutate(groups      = if_else(is.na(groups) & !is.na(effort_km), 0, groups),
+             individuals = if_else(is.na(individuals) & !is.na(effort_km), 0, individuals))
+  }
+  bind_rows(by_month(e, s), by_month(mutate(e, month = "annual"), mutate(s, month = "annual"))) |>
+    pivot_longer(c(effort_km, groups, individuals), names_to = "variable", values_to = "val") |>
+    filter(!is.na(val)) |> mutate(layer = layer)
+}
+surv <- bind_rows(
+  sv(effort_vessel, sightings_vessel, "survey_vessel"),
+  sv(effort_aerial, sightings_aerial, "survey_aerial"),
+  sv(bind_rows(st_drop_geometry(effort_vessel) |> select(HEXID, month, length_km),
+               st_drop_geometry(effort_aerial) |> select(HEXID, month, length_km)),
+     bind_rows(st_drop_geometry(sightings_vessel) |> select(HEXID, month, group.size),
+               st_drop_geometry(sightings_aerial) |> select(HEXID, month, group.size)), "survey_all"))
+chk("surveys", "hexagon-months with sightings but no effort (groups counted, effort_km NULL)",
+    nrow(surv |> filter(month != "annual") |> group_by(layer, HEXID, month) |>
+           filter(!"effort_km" %in% variable) |> distinct(layer, HEXID, month) |> filter(layer != "survey_all")),
+    "vessel + aerial layers")
+for (p in c("survey_vessel", "survey_aerial", "survey_all"))
+  chk("surveys", glue("{p}: hexagons with effort"), n_distinct(surv$HEXID[surv$layer == p & surv$variable == "effort_km" & surv$month == "annual"]))
+
+# the wide table: HEXID + layer__month__variable, the column order = layer order, then annual first, then months
+vals_long <- bind_rows(
+  dens_long |> select(HEXID, layer, month, density, cv) |> pivot_longer(c(density, cv), names_to = "variable", values_to = "val"),
+  annual |> transmute(HEXID, layer, month, variable = "density", val = density),
+  surv |> select(HEXID, layer, month, variable, val)) |>
+  filter(!is.na(val))
+layer_order <- c("survey_all", "survey_vessel", "survey_aerial", m$layer[order(str_to_lower(m$label))])
+var_order   <- c("effort_km", "groups", "individuals", "density", "cv")
+col_index <- vals_long |> distinct(layer, month, variable) |>
+  mutate(column = glue("{layer}__{month}__{variable}") |> as.character()) |>
+  arrange(match(layer, layer_order), match(month, c("annual", months)), match(variable, var_order))
+values <- vals_long |> mutate(column = glue("{layer}__{month}__{variable}") |> as.character()) |>
+  select(HEXID, column, val) |>
+  pivot_wider(names_from = column, values_from = val) |>
+  right_join(st_drop_geometry(hex) |> select(HEXID), by = "HEXID") |>
+  arrange(HEXID) |>
+  select(HEXID, all_of(col_index$column))
+stopifnot(nrow(values) == nrow(hex), !anyDuplicated(values$HEXID),
+          "column names follow {layer}__{month}__{variable}" =
+            all(str_detect(names(values)[-1], "^[a-z_]+__(annual|0[1-9]|1[0-2])__(effort_km|groups|individuals|density|cv)$")))
+chk("values", "values.parquet columns (besides HEXID)", ncol(values) - 1L)
+chk("values", "values.parquet rows (hexagons)", nrow(values))
+```
+
+## Layer and model tables
+
+```{r}
+#| label: tables
+
+month_label <- c(annual = "Annual", setNames(month.name, months))
+var_label <- c(effort_km = "Survey effort (km)", groups = "Sightings (groups)", individuals = "Individuals sighted",
+               density = "Density (animals per km²)", cv = "Coefficient of variation")
+var_unit  <- c(effort_km = "km", groups = "count", individuals = "count", density = "animals/km2", cv = "unitless")
+survey_label <- c(survey_all = "Surveys, vessel + aerial", survey_vessel = "Vessel surveys, 2003–2024",
+                  survey_aerial = "Aerial surveys, 2011–2018")
+layer_label  <- c(survey_label, setNames(m$label, m$layer))
+desc_of <- function(layer, month, variable) {
+  when <- if (month == "annual") (if (str_starts(layer, "survey")) "all months" else "annual") else month.name[as.integer(month)]
+  if (str_starts(layer, "survey")) {
+    plat <- c(survey_all = "vessel (2003-2024) and aerial (2011-2018)", survey_vessel = "vessel (2003-2024)", survey_aerial = "aerial (2011-2018)")[[layer]]
+    switch(variable,
+      effort_km   = glue("On-effort {plat} line-transect survey length in the hexagon, {when}: the sum of the segments' delivered length field / 1000 by the segment's HEXID; NULL where not surveyed."),
+      groups      = glue("Marine-mammal sightings (groups) of {plat} surveys in the hexagon, {when}, by the sighting's HEXID; 0 where surveyed without a sighting."),
+      individuals = glue("Individuals sighted (sum of the best group-size estimates) by {plat} surveys in the hexagon, {when}; 0 where surveyed without a sighting."))
+  } else {
+    mm <- m[m$layer == layer, ]
+    switch(variable,
+      density = if (month == "annual") glue("{mm$label}: annual density (animals per km²), the day-weighted mean of the twelve monthly densities with a month the model does not cover counting as 0 (NCEI 0256800 v2.2, {mm$shapefile}).")
+                else glue("{mm$label}: density in {when} (animals per km²) = {month.abb[as.integer(month)]}_n / Area_km2 (NCEI 0256800 v2.2, {mm$shapefile})."),
+      cv = glue("{mm$label}: coefficient of variation of the {when} abundance, as delivered ({month.abb[as.integer(month)]}_cv, NCEI 0256800 v2.2, {mm$shapefile})."))
+  }
+}
+layers <- col_index |>
+  mutate(title       = glue("{layer_label[layer]} · {if_else(month == 'annual' & str_starts(layer, 'survey'), 'All months', month_label[month])} · {var_label[variable]}") |> as.character(),
+         unit        = unname(var_unit[variable]),
+         description = pmap_chr(list(layer, month, variable), desc_of),
+         n_hex = map_int(column, \(c) sum(!is.na(values[[c]]))),
+         min   = map_dbl(column, \(c) min(values[[c]], na.rm = TRUE)),
+         p98   = map_dbl(column, \(c) unname(quantile(values[[c]], 0.98, na.rm = TRUE))),
+         max   = map_dbl(column, \(c) max(values[[c]], na.rm = TRUE))) |>
+  select(column, layer, month, variable, title, unit, description, n_hex, min, p98, max)
+stopifnot(all(layers$n_hex > 0), all(layers$min >= 0))
+
+ann <- annual |> left_join(st_drop_geometry(hex) |> select(HEXID, Area_km2), by = "HEXID") |>
+  group_by(layer) |> summarise(n_hex_annual = sum(density > 0), abundance_annual = sum(density * Area_km2),
+                               density_p98_annual = unname(quantile(density, 0.98)), .groups = "drop")
+models <- m |>
+  left_join(wm1 |> select(name, aphia_id), by = c(taxa_sci = "name")) |>
+  mutate(months_modelled = map_chr(layer, \(l) paste(sort(unique(dens_long$month[dens_long$layer == l & !is.na(dens_long$density)])), collapse = ","))) |>
+  left_join(ann, by = "layer") |>
+  transmute(layer, shapefile, label, common_name = taxa_common, scientific_name = taxa_sci, taxa_doc, aphia_id, population,
+            months_modelled, n_hex_annual, abundance_annual = round(abundance_annual, 1), density_p98_annual) |>
+  arrange(str_to_lower(label))
+stopifnot(nrow(models) == 19, !anyNA(models$aphia_id), all(models$abundance_annual > 0))
+
+# per-hexagon survey totals, written onto the hexagons
+tot <- function(eff, sig, p) {
+  e <- st_drop_geometry(eff) |> group_by(HEXID) |>
+    summarise(km = sum(length_km), surveys = n_distinct(survey),
+              years = if (min(year) == max(year)) as.character(min(year)) else paste0(min(year), "-", max(year)), .groups = "drop")
+  s <- st_drop_geometry(sig) |> group_by(HEXID) |> summarise(groups = n(), individuals = sum(group.size, na.rm = TRUE), .groups = "drop")
+  full_join(e, s, by = "HEXID") |>
+    mutate(groups = if_else(is.na(groups) & !is.na(km), 0L, groups), individuals = if_else(is.na(individuals) & !is.na(km), 0, individuals)) |>
+    rename_with(\(x) paste0(p, "_", x), -HEXID)
+}
+hexagons <- hex |>
+  select(HEXID, Area_km2, USA_EEZ, Oceanic, Shelf) |>
+  left_join(tot(effort_vessel, sightings_vessel, "vessel"), by = "HEXID") |>
+  left_join(tot(effort_aerial, sightings_aerial, "aerial"), by = "HEXID") |>
+  select(HEXID, Area_km2, USA_EEZ, Oceanic, Shelf, vessel_km, aerial_km, vessel_groups, aerial_groups,
+         vessel_individuals, aerial_individuals, vessel_surveys, aerial_surveys, vessel_years, aerial_years) |>
+  arrange(HEXID) |>
+  st_transform(4326)
+stopifnot(isTRUE(all.equal(sum(hexagons$vessel_km, na.rm = TRUE), sum(ve$seg.length.m) / 1000)),
+          sum(hexagons$vessel_groups, na.rm = TRUE) == nrow(vs), sum(hexagons$aerial_groups, na.rm = TRUE) == nrow(as_))
+
+knitr::kable(models |> select(layer, label, scientific_name, aphia_id, months_modelled, n_hex_annual, abundance_annual),
+             caption = "Density models (models.csv); abundance = sum of annual density x 40 km²")
+knitr::kable(count(layers, layer, variable) |> pivot_wider(names_from = variable, values_from = n, values_fill = 0),
+             caption = "values.parquet columns by layer and variable (months + annual)")
+```
+
+```{r}
+#| label: fig-map
+#| fig-cap: "Delivered effort (vessel dark, aerial light) and sightings (vessel magenta, aerial green) over the hexagon grid's extent."
+#| fig-height: 6
+
+ggplot() +
+  geom_sf(data = st_union(st_geometry(hexagons)), fill = "grey96", colour = NA) +
+  geom_sf(data = effort_aerial, colour = "grey70", linewidth = 0.15) +
+  geom_sf(data = effort_vessel, colour = "grey30", linewidth = 0.15) +
+  geom_sf(data = sightings_aerial, colour = "#1b7837", size = 0.4) +
+  geom_sf(data = sightings_vessel, colour = "#c51b7d", size = 0.4) +
+  theme_minimal()
+```
+
+## Questions for the provider
+
+```{r}
+#| label: questions
+#| results: asis
+
+checks_tbl <- bind_rows(checks)
+q <- c(
+  glue("**Positions.** No bearing or radial distance is delivered, so nothing can be computed by coordinate geometry. The median sighting lies {checks_tbl$value[checks_tbl$check == 'vessel sighting to own segment, median (m)']} m from its own segment (vessel p99 {checks_tbl$value[checks_tbl$check == 'vessel sighting to own segment, p99 (m)']} m, aerial p99 {checks_tbl$value[checks_tbl$check == 'aerial sighting to own segment, p99 (m)']} m): the points look like the platform's position on the trackline at the time of the sighting, not the animal's. Is that right, and could bearing and distance be added so the animal positions can be computed?"),
+  glue("**Unlinked vessel sightings.** {sum(!vs$segment_found)} of {nrow(vs)} ({round(100 * mean(!vs$segment_found), 1)} %) have a survey + segment.id that is not in the effort file ({paste(glue('{unlinked$survey} {unlinked$n_unlinked}'), collapse = ', ')}). Are they off-effort sightings, or segments missing from the effort file?"),
+  glue("**Shelf = 2.** {sum(hex$Shelf == 2)} hexagons have Shelf = 2 (all with Oceanic = 0); the ReadMe defines 0 and 1. {sum(hex$Oceanic == 1 & hex$Shelf == 1)} hexagons are both oceanic and shelf, and {sum(hex$Oceanic == 0 & hex$Shelf == 0)} neither: are those the estuarine areas?"),
+  glue("**Hexagon area.** Area_km2 is 40 for every hexagon (the planar area in USA Contiguous Lambert Conformal Conic), but their ellipsoidal area is {checks_tbl$value[str_starts(checks_tbl$check, 'ellipsoidal')]} km2 (min | median | max). The densities here are abundance / Area_km2, i.e. per nominal km2. Were the models fitted on the nominal 40 km2?"),
+  glue("**Segment lengths.** The geodesic length of a vessel segment's line over its seg.length.m runs {checks_tbl$value[checks_tbl$check == 'vessel effort: geometry length / length field, p1 | median | p99']} (p1 | median | p99): the field is longer than the delivered line by {round(100 * (1 / median(ve$length_geom_m / ve$seg.length.m) - 1), 1)} % at the median. Which is the on-effort length used in the models? (Aerial: {checks_tbl$value[checks_tbl$check == 'aerial effort: geometry length / length field, p1 | median | p99']}.)"),
+  "**Time zones.** Vessel effort s.date / e.date are UTC and vessel sightings date.time GMT in the rds; aerial sightings date.time carries no zone and aerial effort date is a local (EST/EDT) date. Are the vessel times UTC as stored, or local times labelled UTC? Is the aerial date.time local?",
+  glue("**Group sizes.** {sum(vs$group.size == 0, na.rm = TRUE)} vessel sightings have group.size 0 and {sum(is.na(vs$group.size))} has none."),
+  glue("**Names.** One vessel vernacularName holds a byte that is not UTF-8 ('{unique(vs$vernacularName[bad_utf8])}' when read as Latin-1: 'Bryde's or'?); 'Mesoplodon europeaus' is read as M. europaeus; 'Standard Tursiops' as common bottlenose dolphin. The aerial effort length field is seg.len.m in the file (the ReadMe says seg.length.m)."),
+  "**Not here yet:** the RESTORE 2018/2019 surveys (Rice's whale), the pre-2003 surveys, and the sea-turtle sightings of the same vessel and aerial surveys (requested since this delivery).")
+cat(paste0("- ", q), sep = "\n")
+```
+
+## Write
+
+```{r}
+#| label: write
+
+# GeoParquet 1.1 (WKB geometry, CRS = OGC:CRS84 by omission, i.e. EPSG:4326 lon/lat) from arrow; the R GDAL build has no
+# Parquet driver
+write_geoparquet <- function(x, path) {
+  x <- st_transform(x, 4326)
+  g <- st_geometry(x)
+  tbl <- arrow::arrow_table(st_drop_geometry(x) |> as_tibble(),
+                            geometry = arrow::Array$create(unclass(st_as_binary(g, EWKB = FALSE)), type = arrow::binary()))
+  types <- unique(as.character(st_geometry_type(g))) |> str_to_title() |>
+    str_replace("Linestring", "LineString") |> str_replace("Multilinestring", "MultiLineString") |>
+    str_replace("Multipolygon", "MultiPolygon") |> str_replace("Multipoint", "MultiPoint")
+  geo <- list(version = "1.1.0", primary_column = "geometry",
+              columns = list(geometry = list(encoding = "WKB", geometry_types = as.list(types),
+                                             bbox = round(as.numeric(st_bbox(g)), 7))))
+  md <- tbl$metadata; md$r <- NULL; md$geo <- as.character(jsonlite::toJSON(geo, auto_unbox = TRUE, digits = NA))
+  tbl$metadata <- md
+  arrow::write_parquet(tbl, path, compression = "zstd")
+}
+write_fgb <- \(x, path) st_write(st_transform(x, 4326), path, driver = "FlatGeobuf", quiet = TRUE)   # into the emptied folder
+
+if (dir_exists(out)) dir_delete(out)          # cleared every run: nothing a previous run wrote survives
+dir_create(out)
+lyrs <- list(hexagons = hexagons, effort_vessel = effort_vessel, effort_aerial = effort_aerial,
+             sightings_vessel = sightings_vessel, sightings_aerial = sightings_aerial)
+iwalk(lyrs, \(x, nm) { write_geoparquet(x, path(out, glue("{nm}.parquet"))); write_fgb(x, path(out, glue("{nm}.fgb"))) })
+arrow::write_parquet(arrow::arrow_table(values), path(out, "values.parquet"), compression = "zstd", chunk_size = nrow(values))   # one row group: a column is one read
+write_csv(layers, path(out, "layers.csv"), na = "")
+write_csv(models, path(out, "models.csv"), na = "")
+file_copy(taxa_csv, path(out, "taxa.csv"))
+file_copy(f$read, path(out, "SEFSC_Line_Transect_Survey_Data_ReadMe.txt"))
+
+# read back: field names, rows and geometry types survive both formats
+for (nm in names(lyrs)) {
+  a <- read_sf(path(out, glue("{nm}.fgb")))
+  p <- arrow::read_parquet(path(out, glue("{nm}.parquet")))
+  stopifnot(nrow(a) == nrow(lyrs[[nm]]), nrow(p) == nrow(lyrs[[nm]]),
+            identical(setdiff(names(p), "geometry"), names(st_drop_geometry(lyrs[[nm]]))),
+            identical(setdiff(names(a), attr(a, "sf_column")), names(st_drop_geometry(lyrs[[nm]]))))
+}
+
+write_csv(checks_tbl, path(out, "checks.csv"), na = "")
+writeLines(c("# Questions for the provider", "", paste0("- ", q)), path(out, "questions.md"))
+
+# hashes of what was written (DONE and the manifest name them), then DONE last
+out_files <- dir_ls(out, type = "file") |> sort()
+out_md5 <- map_chr(out_files, \(p) digest::digest(file = p, algo = "md5")) |> set_names(path_file(out_files))
+in_files <- c(sort(dir_ls(src, type = "file")), sort(dir_ls(shp_dir, glob = "*.dbf")), taxa_xls)
+in_md5 <- map_chr(in_files, \(p) digest::digest(file = p, algo = "md5")) |>
+  set_names(as.character(path_rel(path_norm(in_files), path_norm(path_expand(dir_raw)))))
+content_hash <- substr(digest::digest(paste(names(out_md5), out_md5, collapse = "\n"), algo = "sha256"), 1, 16)
+writeLines(c(glue("ingest_sefsc_gm-surveys {content_hash}"), paste(out_md5, names(out_md5))), path(out, "DONE"))
+log_info("wrote {length(out_files)} files + DONE to {out}; content hash {content_hash}")
+
+knitr::kable(tibble(file = names(out_md5), bytes = as.numeric(file_size(out_files)), md5 = unname(out_md5)), caption = glue("Written to SEFSC_OUT ({out})"))
+knitr::kable(checks_tbl, caption = "checks.csv")
+```
+
+## Manifest
+
+```{r}
+#| label: manifest
+
+# content-addressed, deterministic manifest: no wall-clock, so an identical re-run writes identical bytes
+msens::write_manifest(
+  manifest, target = "ingest_sefsc_gm_surveys", content_hash = content_hash,
+  stats = list(
+    src = "raw/sefsc.noaa.gov/2026-11-12", out = "derived/preview/sefsc_gm",
+    n_hexagons = nrow(hexagons), n_effort_vessel = nrow(effort_vessel), n_effort_aerial = nrow(effort_aerial),
+    n_sightings_vessel = nrow(sightings_vessel), n_sightings_aerial = nrow(sightings_aerial), n_models = nrow(models),
+    n_values_columns = ncol(values) - 1L, n_taxa_names = nrow(taxa),
+    worms_snapshot = if (!is.null(worms_ver)) as.list(worms_ver) else NULL,
+    msens = as.character(packageVersion("msens")),
+    inputs_md5 = as.list(in_md5), outputs_md5 = as.list(out_md5)),
+  force = msens::force_target("ingest_sefsc_gm_surveys"))
+```

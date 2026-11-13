@@ -28,6 +28,7 @@ PATHS=(
 DRIVE_PATHS=(
   "My Drive/projects/msens/data/raw/ncei.noaa.gov - GoMex cetacean & sea turtle SDMs|raw/sdm/gm"            # v11 Q6: SEFSC Gulf cetacean shapefiles + spp_gmx.xlsx (718 MB)
   "Library/CloudStorage/GoogleDrive-ben@ecoquants.com/My Drive/projects/msens/data/raw/swfsc.noaa.gov|raw/sdm/swfsc"   # v11 Q6: Becker 2020b CCE gdb
+  "My Drive/projects/msens/data/raw/sefsc.noaa.gov|raw/sefsc.noaa.gov/2026-11-12"   # SEFSC Gulf survey effort + sightings + 40 km2 hexagons (Garrison 2026-11-12; ingest_sefsc_gm-surveys.qmd, 45 MB)
   "My Drive/projects/_archive/offhab/data/raw/ncei.noaa.gov - seabirds, atlantic|raw/sdm/nc_atl"   # NCEI 0176682 (Winship 2018): the raw the nc ingest must read again (v11 Q7)
   "My Drive/projects/_archive/offhab/data/raw/ncei.noaa.gov - seabirds, pacific|raw/sdm/nc_pac"    # NCEI 0242882 (Leirness 2021)
 )
